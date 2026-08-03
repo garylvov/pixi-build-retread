@@ -942,6 +942,15 @@ pub struct WheelEntry {
     #[serde(default)]
     pub editable: bool,
 
+    /// Opt in to statically linking GCC's C++ runtime for this source-built
+    /// wheel. This is unsafe for extensions loaded alongside torch or any
+    /// other shared-libstdc++ consumer because C++ ABI, unwind, RTTI, and
+    /// allocator symbols can interpose across extension boundaries. Keep the
+    /// dynamic default unless this is a standalone, non-interoperating
+    /// extension with no shared C++ objects in its process.
+    #[serde(default, rename = "static-cpp-runtime", alias = "static-libstdcxx")]
+    pub static_cpp_runtime: bool,
+
     // ---- Named git source reference ----
     /// Reference to a `[retread-git-sources]` entry. The named entry
     /// provides `url` + `rev`; this wheel entry only contributes

@@ -3980,6 +3980,7 @@ mod tests {
                     .iter()
                     .map(|requirement| (*requirement).to_string())
                     .collect(),
+                retread_conda_run_dependencies: vec![],
                 is_pure_python: true,
                 sha256: format!("sha256-{metadata_name}-{version}"),
                 filename,

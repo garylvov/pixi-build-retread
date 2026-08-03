@@ -28,13 +28,13 @@ use tokio::process::Command;
 
 use crate::pypi::{NativeSourceBuildPolicy, ResolutionTarget, normalized_python_minor};
 
-const BUILT_WHEEL_CACHE_SCHEMA: &str = "retread-built-wheel-v7";
+const BUILT_WHEEL_CACHE_SCHEMA: &str = "retread-built-wheel-v10";
 const BUILT_WHEEL_CACHE_ROOT: &str = "built-wheels";
-const BUILT_WHEEL_CACHE_VERSION: &str = "v7";
+const BUILT_WHEEL_CACHE_VERSION: &str = "v10";
 const CHECKOUT_CACHE_VERSION: &str = "v3";
 const LOCAL_SOURCE_SNAPSHOT_VERSION: &str = "v5";
 const CANONICAL_GIT_SOURCE_SCHEMA: &str = "retread-canonical-git-source-v2";
-const SDIST_BUILD_CONSTRAINTS: &str = "setuptools<81\n";
+const SDIST_BUILD_CONSTRAINTS: &str = "setuptools<81\ncmake<4\n";
 static BUILD_TMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Optional caller knowledge used to bind a source-built artifact to the
@@ -61,7 +61,7 @@ enum BuiltWheelRequirement {
 #[derive(Debug, Clone)]
 enum SourceBuildEnvironment {
     Host,
-    Hermetic(crate::hermetic_build::HermeticBuildEnvironment),
+    Hermetic(Box<crate::hermetic_build::HermeticBuildEnvironment>),
 }
 
 impl SourceBuildEnvironment {
@@ -138,6 +138,7 @@ enum BuiltWheelEnvironment {
     Hermetic {
         sysroot: String,
         platform_tag: String,
+        toolchain_digest: String,
     },
 }
 
@@ -206,6 +207,167 @@ struct ValidatedWheel {
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 struct ExpectedWheelMismatch(String);
+
+#[derive(Debug, Clone)]
+struct BuildRequirements {
+    lock_path: PathBuf,
+    digest: String,
+}
+
+fn build_system_requirements(pyproject: Option<&str>) -> Result<Vec<String>> {
+    let Some(pyproject) = pyproject else {
+        return Ok(vec!["setuptools>=40.8.0".to_string()]);
+    };
+    let document: toml::Value = toml::from_str(pyproject).context("parsing build-system table")?;
+    let Some(build_system) = document.get("build-system") else {
+        return Ok(vec!["setuptools>=40.8.0".to_string()]);
+    };
+    let requires = build_system
+        .get("requires")
+        .and_then(toml::Value::as_array)
+        .ok_or_else(|| anyhow!("pyproject [build-system].requires must be an array"))?;
+    requires
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| anyhow!("pyproject build-system requirement is not a string"))
+        })
+        .collect()
+}
+
+fn pyproject_from_directory(source: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(source.join("pyproject.toml")) {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).context("reading source pyproject.toml"),
+    }
+}
+
+fn pyproject_from_sdist(bytes: &[u8], filename: &str) -> Result<Option<String>> {
+    let select = |candidates: Vec<(usize, String)>| {
+        candidates
+            .into_iter()
+            .min_by_key(|(depth, _)| *depth)
+            .map(|(_, value)| value)
+    };
+    if filename.ends_with(".zip") {
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))?;
+        let mut candidates = Vec::new();
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index)?;
+            let name = entry.name().to_string();
+            if name.ends_with("pyproject.toml") {
+                let mut value = String::new();
+                entry.read_to_string(&mut value)?;
+                candidates.push((name.matches('/').count(), value));
+            }
+        }
+        return Ok(select(candidates));
+    }
+    if filename.ends_with(".tar.gz") || filename.ends_with(".tgz") {
+        let decoder = flate2::read::GzDecoder::new(bytes);
+        let mut archive = tar::Archive::new(decoder);
+        let mut candidates = Vec::new();
+        for entry in archive.entries()? {
+            let mut entry = entry?;
+            let path = entry.path()?.to_string_lossy().into_owned();
+            if path.ends_with("pyproject.toml") {
+                let mut value = String::new();
+                entry.read_to_string(&mut value)?;
+                candidates.push((path.matches('/').count(), value));
+            }
+        }
+        return Ok(select(candidates));
+    }
+    bail!("cannot inspect build-system requirements in unsupported sdist `{filename}`")
+}
+
+async fn resolve_build_requirements(
+    pyproject: Option<&str>,
+    source_identity: &str,
+    target: &ResolutionTarget,
+    constrain_legacy_setuptools: bool,
+) -> Result<BuildRequirements> {
+    let mut requirements = build_system_requirements(pyproject)?;
+    requirements.sort();
+    let input_identity = hash_fields(
+        b"retread-pep517-build-requirements-input-v1\0",
+        &[
+            source_identity.as_bytes(),
+            target.artifact_cache_identity().as_bytes(),
+            requirements.join("\n").as_bytes(),
+            if constrain_legacy_setuptools {
+                SDIST_BUILD_CONSTRAINTS.as_bytes()
+            } else {
+                b""
+            },
+        ],
+    );
+    let root = crate::courier::retread_cache_root()
+        .join("build-requirements")
+        .join("v1")
+        .join(input_identity);
+    let lock_path = root.join("requirements.txt");
+    let _lock = acquire_artifact_cache_lock(&root).await?;
+    if !lock_path.is_file() {
+        remove_owned_cache_entry(&root)?;
+        std::fs::create_dir_all(&root)
+            .with_context(|| format!("creating build-requirements cache {}", root.display()))?;
+        let input = root.join("requirements.in");
+        std::fs::write(&input, format!("{}\n", requirements.join("\n")))?;
+        let constraints = root.join("constraints.txt");
+        if constrain_legacy_setuptools {
+            std::fs::write(&constraints, SDIST_BUILD_CONSTRAINTS)?;
+        }
+        if requirements.is_empty() {
+            std::fs::write(&lock_path, b"")?;
+        } else {
+            let python_platform = target.declared_glibc().map_or_else(
+                || "x86_64-unknown-linux-gnu".to_string(),
+                |floor| format!("x86_64-manylinux_{}_{}", floor.0, floor.1),
+            );
+            let mut command = Command::new(source_build_uv_executable()?);
+            command
+                .args(["pip", "compile"])
+                .arg(&input)
+                .arg("--generate-hashes")
+                .arg("--no-header")
+                .arg("--no-annotate")
+                .arg("--no-strip-markers")
+                .arg("--python-version")
+                .arg(target.python_version())
+                .arg("--python-platform")
+                .arg(python_platform)
+                .arg("--output-file")
+                .arg(&lock_path)
+                .env("UV_PYTHON_DOWNLOADS", "automatic");
+            if constrain_legacy_setuptools {
+                command.arg("--constraints").arg(&constraints);
+            }
+            run_silent(&mut command, "resolving pinned PEP 517 build requirements").await?;
+        }
+    }
+    let bytes = std::fs::read(&lock_path)
+        .with_context(|| format!("reading build-requirements lock {}", lock_path.display()))?;
+    if !requirements.is_empty()
+        && !bytes
+            .windows(b"--hash=sha256:".len())
+            .any(|window| window == b"--hash=sha256:")
+    {
+        bail!("resolved PEP 517 build-requirements lock contains no SHA-256 hashes");
+    }
+    Ok(BuildRequirements {
+        lock_path,
+        digest: format!("{:x}", Sha256::digest(bytes)),
+    })
+}
+
+fn source_date_epoch(source_identity: &str) -> u64 {
+    let prefix = source_identity.get(..8).unwrap_or("00000000");
+    946_684_800 + u64::from_str_radix(prefix, 16).unwrap_or(0) % 946_684_800
+}
 
 fn is_expected_wheel_mismatch(error: &anyhow::Error) -> bool {
     error
@@ -690,6 +852,7 @@ fn validate_hermetic_wheel_marker(
     let BuiltWheelEnvironment::Hermetic {
         sysroot,
         platform_tag,
+        toolchain_digest,
     } = build_environment
     else {
         return Ok(());
@@ -716,6 +879,7 @@ fn validate_hermetic_wheel_marker(
             "built-wheel cache hermetic platform tag `{platform_tag}` does not match selected sysroot_linux-64 {sysroot} (`{expected_platform}`)"
         );
     }
+    validate_sha256(toolchain_digest, "built-wheel hermetic toolchain digest")?;
     crate::wheel::validate_native_wheel_archive_tag(path, platform_tag)
         .context("validating cached hermetic native wheel tag consistency")
 }
@@ -1018,7 +1182,7 @@ fn validate_cache_entry(
             .and_then(|v| v.to_str())
             != Some(marker.filename.as_str())
     {
-        bail!("built-wheel cache marker does not match its v7 namespace");
+        bail!("built-wheel cache marker does not match its v8 namespace");
     }
     let path = cache_dir.join(&marker.filename);
     // Integrity and the caller's semantic expectation are distinct. A cache
@@ -1170,6 +1334,7 @@ async fn cached_build<F, Fut>(
     target: &ResolutionTarget,
     out_dir: &Path,
     expected: Option<&ExpectedWheel>,
+    static_cpp_runtime: bool,
     build: F,
 ) -> Result<PathBuf>
 where
@@ -1184,6 +1349,7 @@ where
         expected,
         target.native_source_build_policy(),
         BuiltWheelRequirement::TargetCompatible,
+        static_cpp_runtime,
         build,
     )
     .await
@@ -1194,25 +1360,13 @@ async fn retry_build_hermetically<F, Fut>(
     build_dir: &Path,
     target: &ResolutionTarget,
     failure_context: &str,
+    environment: &crate::hermetic_build::HermeticBuildEnvironment,
+    static_cpp_runtime: bool,
 ) -> Result<(PathBuf, BuiltWheelEnvironment)>
 where
     F: FnMut(PathBuf, SourceBuildEnvironment) -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
-    let target_floor = target.declared_glibc().ok_or_else(|| {
-        anyhow!(
-            "{failure_context}; Retread's hermetic sysroot build path needs a declared target glibc floor"
-        )
-    })?;
-    let environment = crate::hermetic_build::provision(
-        target_floor,
-        target.python_version(),
-        target.hermetic_cuda(),
-    )
-    .await
-    .with_context(|| {
-        format!("{failure_context}; Retread's hermetic sysroot build path could not engage")
-    })?;
     tracing::info!(
         sysroot = %crate::glibc::format_glibc(environment.selected_sysroot()),
         python = %target.python_version(),
@@ -1229,7 +1383,7 @@ where
         .with_context(|| format!("recreating hermetic build output {}", build_dir.display()))?;
     build(
         build_dir.to_path_buf(),
-        SourceBuildEnvironment::Hermetic(environment.clone()),
+        SourceBuildEnvironment::Hermetic(Box::new(environment.clone())),
     )
     .await
     .with_context(|| format!("{failure_context}; hermetic PEP 517 retry failed"))?;
@@ -1275,6 +1429,45 @@ where
         })
         .await
         .context("hermetic native wheel tag validation task panicked")??;
+        let abi = tokio::task::spawn_blocking({
+            let built = built.clone();
+            let allow_cuda = environment.cuda_executable().is_some();
+            move || crate::hermetic_build::inspect_native_wheel_abi(&built, allow_cuda)
+        })
+        .await
+        .context("final hermetic DT_NEEDED scan task panicked")??;
+        if static_cpp_runtime && abi.needs_cpp_runtime {
+            bail!(
+                "static-cpp-runtime policy forbids dynamic C++ runtime dependencies, but final wheel needs {}",
+                abi.needed.join(", ")
+            );
+        }
+        let dependency = abi
+            .needs_cpp_runtime
+            .then(|| format!("libstdcxx-ng >={}", environment.gcc_major()));
+        let annotated = built.with_extension("native-abi.whl");
+        tokio::task::spawn_blocking({
+            let built = built.clone();
+            let annotated = annotated.clone();
+            let dependency = dependency.clone();
+            let abi = abi.clone();
+            move || {
+                crate::wheel_rewrite::inject_native_abi_metadata(
+                    &built,
+                    &annotated,
+                    dependency.as_deref(),
+                    &abi.needed,
+                    &abi.glibcxx_versions,
+                    &abi.cxxabi_versions,
+                )
+            }
+        })
+        .await
+        .context("persisting final hermetic ABI metadata task panicked")??;
+        std::fs::remove_file(&built)
+            .with_context(|| format!("removing pre-annotation wheel {}", built.display()))?;
+        std::fs::rename(&annotated, &built)
+            .with_context(|| format!("publishing annotated wheel {}", built.display()))?;
         let filename = built
             .file_name()
             .map(|name| name.to_string_lossy())
@@ -1286,11 +1479,16 @@ where
         );
         tracing::info!(
             wheel = %filename,
-            "hermetic GLIBCXX -> libstdcxx-ng run-dep emission: none required after static policy repair"
+            needed = %abi.needed.join(","),
+            glibcxx = %abi.glibcxx_versions.join(","),
+            cxxabi = %abi.cxxabi_versions.join(","),
+            run_dep = dependency.as_deref().unwrap_or("none"),
+            "hermetic final DT_NEEDED and C++ ABI metadata persisted"
         );
         BuiltWheelEnvironment::Hermetic {
             sysroot: crate::glibc::format_glibc(environment.selected_sysroot()),
             platform_tag: environment.platform_tag().to_string(),
+            toolchain_digest: environment.toolchain_digest().to_string(),
         }
     };
     tokio::task::spawn_blocking({
@@ -1310,12 +1508,43 @@ async fn cached_build_with_acceptance<F, Fut>(
     expected: Option<&ExpectedWheel>,
     native_policy: NativeSourceBuildPolicy,
     requirement: BuiltWheelRequirement,
+    static_cpp_runtime: bool,
     mut build: F,
 ) -> Result<PathBuf>
 where
     F: FnMut(PathBuf, SourceBuildEnvironment) -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
+    let hermetic_candidate = hermetic_build_may_engage(target);
+    let hermetic_environment = if hermetic_candidate {
+        let target_floor = target
+            .declared_glibc()
+            .expect("hermetic candidacy requires a floor");
+        Some(
+            crate::hermetic_build::provision(
+                target_floor,
+                target.python_version(),
+                target.hermetic_cuda(),
+            )
+            .await
+            .context("provisioning the cache-identified hermetic toolchain")?,
+        )
+    } else {
+        None
+    };
+    let effective_source_identity = hermetic_environment.as_ref().map_or_else(
+        || source_identity.to_string(),
+        |environment| {
+            hash_fields(
+                b"retread-built-wheel-hermetic-toolchain-v1\0",
+                &[
+                    source_identity.as_bytes(),
+                    environment.toolchain_digest().as_bytes(),
+                ],
+            )
+        },
+    );
+    let source_identity = effective_source_identity.as_str();
     let cache_dir = built_wheel_cache_dir(kind, source_identity, target);
     let materialized_out = materialized_wheel_output_dir(out_dir, source_identity, target);
     let _lock = acquire_artifact_cache_lock(&cache_dir).await?;
@@ -1391,7 +1620,6 @@ where
             remove_owned_cache_entry(&cache_dir)?;
         }
     }
-    let hermetic_candidate = hermetic_build_may_engage(target);
     if native_policy == NativeSourceBuildPolicy::Refuse && !hermetic_candidate {
         return Err(source_build_refusal_error(target));
     }
@@ -1435,7 +1663,17 @@ where
                  result was required: {host_error:#}"
             );
             retried_hermetically = true;
-            retry_build_hermetically(&mut build, &build_dir, target, &failure_context).await?
+            retry_build_hermetically(
+                &mut build,
+                &build_dir,
+                target,
+                &failure_context,
+                hermetic_environment
+                    .as_ref()
+                    .expect("hermetic candidate was provisioned before cache lookup"),
+                static_cpp_runtime,
+            )
+            .await?
         }
         Err(host_error) => return Err(host_error),
     };
@@ -1490,8 +1728,17 @@ where
         if needs_native && hermetic_floor.is_some() {
             let failure_context =
                 format!("{rejection}; strict wheel purity validation failed: {purity_error:#}");
-            (built, build_environment) =
-                retry_build_hermetically(&mut build, &build_dir, target, &failure_context).await?;
+            (built, build_environment) = retry_build_hermetically(
+                &mut build,
+                &build_dir,
+                target,
+                &failure_context,
+                hermetic_environment
+                    .as_ref()
+                    .expect("hermetic candidate was provisioned before cache lookup"),
+                static_cpp_runtime,
+            )
+            .await?;
         } else {
             if let Err(delete_error) = std::fs::remove_file(&built) {
                 return Err(anyhow!(
@@ -3027,7 +3274,7 @@ pub async fn build_wheel_from_path(
         crate::glibc::current_pixi_platform(),
     )?;
     Ok(
-        build_wheel_from_path_for_target(source, out_dir, &target, None, None, None)
+        build_wheel_from_path_for_target(source, out_dir, &target, None, None, None, false)
             .await?
             .wheel_path,
     )
@@ -3040,6 +3287,7 @@ pub(crate) async fn build_wheel_from_path_for_target(
     expected: Option<&ExpectedWheel>,
     managed_output_root: Option<&Path>,
     context_root: Option<&Path>,
+    static_cpp_runtime: bool,
 ) -> Result<PathWheelBuild> {
     let python = normalized_python_minor(target.python_version())?;
     let canonical_source = std::fs::canonicalize(source)
@@ -3088,7 +3336,7 @@ pub(crate) async fn build_wheel_from_path_for_target(
     let project_relative_text = project_relative
         .to_str()
         .ok_or_else(|| anyhow!("source project path relative to its context is not UTF-8"))?;
-    let source_identity = hash_fields(
+    let base_source_identity = hash_fields(
         b"retread-path-wheel-source-v6\0",
         &[
             prepared.identity.as_bytes(),
@@ -3103,6 +3351,23 @@ pub(crate) async fn build_wheel_from_path_for_target(
                 .unwrap_or_default(),
         ],
     );
+    let pyproject = pyproject_from_directory(&canonical_source)?;
+    let build_requirements =
+        resolve_build_requirements(pyproject.as_deref(), &base_source_identity, target, false)
+            .await?;
+    let source_identity = hash_fields(
+        b"retread-path-wheel-build-inputs-v1\0",
+        &[
+            base_source_identity.as_bytes(),
+            build_requirements.digest.as_bytes(),
+            if static_cpp_runtime {
+                b"static"
+            } else {
+                b"dynamic"
+            },
+        ],
+    );
+    let build_epoch = source_date_epoch(&source_identity);
     let prepared = stabilize_source_snapshot_workspace(prepared, "path", &source_identity).await?;
     let pristine_source = prepared.root().join(&project_relative);
     if !pristine_source.is_dir() {
@@ -3127,15 +3392,18 @@ pub(crate) async fn build_wheel_from_path_for_target(
     // -- so no equivalent of pip's `--no-deps` is needed.
     let pristine_workspace = Arc::clone(&prepared.workspace);
     let project_relative_for_build = project_relative.clone();
+    let build_requirements_for_build = build_requirements.clone();
     let wheel_path = cached_build(
         "path",
         &source_identity,
         target,
         out_dir,
         expected,
+        static_cpp_runtime,
         move |private_out, environment| {
             let pristine_workspace = Arc::clone(&pristine_workspace);
             let project_relative_for_build = project_relative_for_build.clone();
+            let build_requirements = build_requirements_for_build.clone();
             async move {
                 // A PEP 517 backend may create egg-info/build/generated files in
                 // its source directory. Give it a disposable copy and retain the
@@ -3169,6 +3437,9 @@ pub(crate) async fn build_wheel_from_path_for_target(
                     ],
                     environment.hermetic(),
                     Some(&private_out),
+                    Some(&build_requirements),
+                    build_epoch,
+                    static_cpp_runtime,
                 )
                 .await
             }
@@ -3353,32 +3624,40 @@ async fn build_wheel_from_sdist_url_for_target_with_requirement(
     // access. An unhashed source must be fetched to discover its content key;
     // targets without either a safe host build or a runnable pinned hermetic
     // toolchain are rejected before that fetch.
-    let prefetched = if advertised_sha256.is_none() {
-        if !source_build_attempt_allowed(target) {
-            return Err(source_build_refusal_error(target));
-        }
-        Some(download_sdist(sdist_url, None).await?)
-    } else {
-        None
-    };
-    let content_sha = match (&advertised_sha256, &prefetched) {
-        (Some(hash), _) => hash.clone(),
-        (None, Some(bytes)) => format!("{:x}", Sha256::digest(bytes)),
-        (None, None) => unreachable!("unhashed sdist was prefetched"),
-    };
+    if advertised_sha256.is_none() && !source_build_attempt_allowed(target) {
+        return Err(source_build_refusal_error(target));
+    }
+    // PEP 517 build requirements are build inputs, so inspect the immutable
+    // source archive before the built-wheel cache lookup even when its source
+    // hash was advertised by the index.
+    let prefetched = download_sdist(sdist_url, advertised_sha256.as_deref()).await?;
+    let content_sha = advertised_sha256
+        .clone()
+        .unwrap_or_else(|| format!("{:x}", Sha256::digest(&prefetched)));
     // The archive basename is part of the build input: backends/uv use its
     // extension to select unpacking behavior. Identical bytes presented as a
     // `.zip` and `.tar.gz` must not share a warm artifact entry.
-    let source_identity = sdist_source_identity(&content_sha, &filename);
+    let base_source_identity = sdist_source_identity(&content_sha, &filename);
+    let pyproject = pyproject_from_sdist(&prefetched, &filename)?;
+    let build_requirements =
+        resolve_build_requirements(pyproject.as_deref(), &base_source_identity, target, true)
+            .await?;
+    let source_identity = hash_fields(
+        b"retread-sdist-wheel-build-inputs-v1\0",
+        &[
+            base_source_identity.as_bytes(),
+            build_requirements.digest.as_bytes(),
+        ],
+    );
+    let build_epoch = source_date_epoch(&source_identity);
     let url = sdist_url.clone();
     let filename_for_build = filename.clone();
     let expected_content_sha = content_sha.clone();
     let source_bytes = Arc::new(tokio::sync::OnceCell::new());
-    if let Some(prefetched) = prefetched {
-        source_bytes
-            .set(prefetched)
-            .expect("fresh sdist byte cell cannot already be initialized");
-    }
+    source_bytes
+        .set(prefetched)
+        .expect("fresh sdist byte cell cannot already be initialized");
+    let build_requirements_for_build = build_requirements.clone();
     let wheel_path = cached_build_with_acceptance(
         "sdist",
         &source_identity,
@@ -3387,11 +3666,13 @@ async fn build_wheel_from_sdist_url_for_target_with_requirement(
         expected,
         target.native_source_build_policy(),
         requirement,
+        false,
         move |private_out, environment| {
             let source_bytes = Arc::clone(&source_bytes);
             let url = url.clone();
             let expected_content_sha = expected_content_sha.clone();
             let filename_for_build = filename_for_build.clone();
+            let build_requirements = build_requirements_for_build.clone();
             async move {
                 let bytes = source_bytes
                     .get_or_try_init(|| async {
@@ -3473,7 +3754,15 @@ async fn build_wheel_from_sdist_url_for_target_with_requirement(
                 }
                 args.push(sdist_path.display().to_string());
                 let args = args.iter().map(String::as_str).collect::<Vec<_>>();
-                run_capturing_uv_in(&args, environment.hermetic(), Some(&private_out)).await
+                run_capturing_uv_in(
+                    &args,
+                    environment.hermetic(),
+                    Some(&private_out),
+                    Some(&build_requirements),
+                    build_epoch,
+                    false,
+                )
+                .await
             }
         },
     )
@@ -3511,7 +3800,7 @@ async fn build_wheel_from_sdist_url_for_target_with_requirement(
 /// Shared cross-pack cache family for built git wheels, keyed by
 /// (repo url, resolved commit sha, subdirectory, python version).
 ///
-/// Layout: `<retread cache root>/built-wheels/git/v7/<artifact-target-sha256>/
+/// Layout: `<retread cache root>/built-wheels/git/v10/<artifact-target-sha256>/
 /// <family-sha256>/<ref-state-sha256>/{artifact.json,<raw>.whl}`. The leaf
 /// additionally binds the canonical tag/ref state visible to SCM-aware build
 /// backends. All identity components use the complete 64 hexadecimal
@@ -5176,6 +5465,11 @@ impl GitWheelBuild {
     }
 }
 
+pub(crate) struct GitWheelBuildPolicy<'a> {
+    pub(crate) expected: Option<&'a ExpectedWheel>,
+    pub(crate) static_cpp_runtime: bool,
+}
+
 pub(crate) async fn build_wheel_from_git_leased_for_target(
     url: &str,
     rev: &str,
@@ -5183,9 +5477,9 @@ pub(crate) async fn build_wheel_from_git_leased_for_target(
     cache_dir: &Path,
     out_dir: &Path,
     target: &ResolutionTarget,
-    expected: Option<&ExpectedWheel>,
+    policy: GitWheelBuildPolicy<'_>,
 ) -> Result<GitWheelBuild> {
-    build_wheel_from_git_inner(url, rev, subdirectory, cache_dir, out_dir, target, expected).await
+    build_wheel_from_git_inner(url, rev, subdirectory, cache_dir, out_dir, target, policy).await
 }
 
 /// Build a wheel from a clone-once git checkout and return its path plus the
@@ -5206,9 +5500,19 @@ pub async fn build_wheel_from_git(
         &normalized_python_minor(python_version)?.version(),
         crate::glibc::current_pixi_platform(),
     )?;
-    let build =
-        build_wheel_from_git_inner(url, rev, subdirectory, cache_dir, out_dir, &target, None)
-            .await?;
+    let build = build_wheel_from_git_inner(
+        url,
+        rev,
+        subdirectory,
+        cache_dir,
+        out_dir,
+        &target,
+        GitWheelBuildPolicy {
+            expected: None,
+            static_cpp_runtime: false,
+        },
+    )
+    .await?;
     Ok((
         build.wheel_path().to_path_buf(),
         build.resolved_sha().to_string(),
@@ -5222,8 +5526,12 @@ async fn build_wheel_from_git_inner(
     cache_dir: &Path,
     out_dir: &Path,
     target: &ResolutionTarget,
-    expected: Option<&ExpectedWheel>,
+    policy: GitWheelBuildPolicy<'_>,
 ) -> Result<GitWheelBuild> {
+    let GitWheelBuildPolicy {
+        expected,
+        static_cpp_runtime,
+    } = policy;
     let python = normalized_python_minor(target.python_version())?;
     let subdirectory = normalize_git_subdirectory(subdirectory)?;
     let subdirectory_identity = subdirectory
@@ -5346,10 +5654,27 @@ async fn build_wheel_from_git_inner(
     let resolved_sha = resolved_sha.to_ascii_lowercase();
     let ref_state = canonical_git_ref_state(clone_dir).await?;
     let family_identity = git_wheel_family_identity(url, &resolved_sha, &subdirectory_identity);
-    let source_identity = git_wheel_source_identity(&family_identity, &ref_state);
+    let base_source_identity = git_wheel_source_identity(&family_identity, &ref_state);
     let canonical =
         ensure_canonical_git_snapshot(clone_dir, url, &resolved_sha, &ref_state).await?;
     let project_root = confined_git_source_dir(&canonical.root, &subdirectory)?;
+    let pyproject = pyproject_from_directory(&project_root)?;
+    let build_requirements =
+        resolve_build_requirements(pyproject.as_deref(), &base_source_identity, target, false)
+            .await?;
+    let source_identity = hash_fields(
+        b"retread-git-wheel-build-inputs-v1\0",
+        &[
+            base_source_identity.as_bytes(),
+            build_requirements.digest.as_bytes(),
+            if static_cpp_runtime {
+                b"static"
+            } else {
+                b"dynamic"
+            },
+        ],
+    );
+    let build_epoch = source_date_epoch(&source_identity);
 
     // DETERMINISM GUARD: detect non-reproducible setuptools_scm versions.
     // A wheel whose version contains .devN, .dYYYYMMDD, or +g<sha> segments
@@ -5361,16 +5686,19 @@ async fn build_wheel_from_git_inner(
     let canonical_for_build = canonical.clone();
     let subdirectory_for_build = subdirectory.clone();
     let upstream_url_for_build = url.to_string();
+    let build_requirements_for_build = build_requirements.clone();
     let wheel_path = cached_build(
         "git",
         &source_identity,
         target,
         out_dir,
         expected,
+        static_cpp_runtime,
         move |private_out, environment| {
             let canonical_for_build = canonical_for_build.clone();
             let upstream_url_for_build = upstream_url_for_build.clone();
             let subdirectory_for_build = subdirectory_for_build.clone();
+            let build_requirements = build_requirements_for_build.clone();
             async move {
                 let private_project_root = prepare_private_git_build_tree(
                     &canonical_for_build,
@@ -5394,6 +5722,9 @@ async fn build_wheel_from_git_inner(
                     ],
                     environment.hermetic(),
                     Some(&private_out),
+                    Some(&build_requirements),
+                    build_epoch,
+                    static_cpp_runtime,
                 )
                 .await?;
                 let cache_dir = canonical_for_build
@@ -5620,6 +5951,9 @@ async fn run_capturing_uv_in(
     args: &[&str],
     hermetic: Option<&crate::hermetic_build::HermeticBuildEnvironment>,
     private_build_dir: Option<&Path>,
+    build_requirements: Option<&BuildRequirements>,
+    build_epoch: u64,
+    static_cpp_runtime: bool,
 ) -> Result<()> {
     // The callers above have already exhausted their wheel-cache paths. Hold
     // the process-wide permit only for the real build subprocess so nested
@@ -5630,6 +5964,9 @@ async fn run_capturing_uv_in(
             anyhow!("hermetic source build is missing its private build directory")
         })?;
         let scratch = prepare_hermetic_build_scratch(private_build_dir)?;
+        let build_requirements = build_requirements.ok_or_else(|| {
+            anyhow!("hermetic source build is missing its pinned build-requirements lock")
+        })?;
         let uv = source_build_uv_executable()?;
         let mut command = Command::new("/bin/bash");
         // Rattler-build's generated script is the authoritative conda
@@ -5652,7 +5989,11 @@ expected_host_prefix=$6
 expected_cc=$7
 expected_cxx=$8
 scratch=$9
-shift 9
+build_requirements=${10}
+source_epoch=${11}
+static_cpp_runtime=${12}
+uv=${13}
+shift 13
 
 test -d "$scratch/activation-tmp"
 export HOME="$scratch/home"
@@ -5712,7 +6053,8 @@ retread_sysroot=$CONDA_BUILD_SYSROOT
 for retread_name in ${!CONDA_@}; do unset "$retread_name"; done
 export CONDA_BUILD_SYSROOT="$retread_sysroot"
 for retread_name in ${!PKG_@} ${!CONDA_ENV_SHLVL_@} ${!RATTLER_BUILD_@}; do unset "$retread_name"; done
-unset SOURCE_DATE_EPOCH CONDA_BUILD CONDA_BUILD_STATE CONDA_BUILD_CROSS_COMPILATION
+export SOURCE_DATE_EPOCH="$source_epoch"
+unset CONDA_BUILD CONDA_BUILD_STATE CONDA_BUILD_CROSS_COMPILATION
 unset CONDA_PREFIX CONDA_DEFAULT_ENV CONDA_PROMPT_MODIFIER CONDA_SHLVL _CE_CONDA _CE_M
 unset BUILD HOST build_platform target_platform CMAKE_GENERATOR CMAKE_ARGS MAKEFLAGS
 unset PIP_IGNORE_INSTALLED PIP_NO_BUILD_ISOLATION PYTHONNOUSERSITE
@@ -5767,18 +6109,29 @@ for flag in ${LDFLAGS:-}; do
     *) clean_ldflags="${clean_ldflags}${clean_ldflags:+ }${flag}" ;;
   esac
 done
-# PEP 600 covers glibc; auditwheel also enforces GLIBCXX/CXXABI policy. Static
-# compiler runtimes prevent a new conda GCC from requiring a libstdc++ newer
-# than the selected manylinux policy while preserving the exact sysroot tag.
-export LDFLAGS="${clean_ldflags}${clean_ldflags:+ }-static-libgcc -static-libstdc++"
-export BLDSHARED="$CC -shared -static-libgcc"
-export LDSHARED="$CC -shared -static-libgcc"
-export LDCXXSHARED="$CXX -shared -static-libgcc -static-libstdc++"
+if test "$static_cpp_runtime" = 1; then
+  export LDFLAGS="${clean_ldflags}${clean_ldflags:+ }-static-libgcc -static-libstdc++"
+  export BLDSHARED="$CC -shared -static-libgcc"
+  export LDSHARED="$CC -shared -static-libgcc"
+  export LDCXXSHARED="$CXX -shared -static-libgcc -static-libstdc++"
+else
+  export LDFLAGS="$clean_ldflags"
+  export BLDSHARED="$CC -shared"
+  export LDSHARED="$CC -shared"
+  export LDCXXSHARED="$CXX -shared"
+fi
 export PYTHONNOUSERSITE=1
 export PYTHONDONTWRITEBYTECODE=1
 export PIP_CONFIG_FILE=/dev/null
 unset PYTHONHOME PYTHONPATH PIP_NO_INDEX PIP_NO_DEPENDENCIES AUDITWHEEL_LD_LIBRARY_PATH AUDITWHEEL_ZIP_COMPRESSION_LEVEL
-exec "$@"
+build_python="$scratch/build-env/bin/python"
+"$uv" venv --python "$expected_python" "$scratch/build-env"
+"$uv" pip sync --python "$build_python" --require-hashes "$build_requirements"
+filtered=()
+for argument in "$@"; do
+  case "$argument" in --python=*) ;; *) filtered+=("$argument") ;; esac
+done
+exec "$uv" "${filtered[@]}" --python="$build_python" --no-build-isolation
 "#)
             .arg("retread-hermetic-build")
             .arg(environment.activation_script())
@@ -5790,6 +6143,9 @@ exec "$@"
             .arg(environment.c_compiler())
             .arg(environment.cxx_compiler())
             .arg(&scratch)
+            .arg(&build_requirements.lock_path)
+            .arg(build_epoch.to_string())
+            .arg(if static_cpp_runtime { "1" } else { "0" })
             .arg(uv);
         for key in [
             "HTTP_PROXY",
@@ -5837,6 +6193,7 @@ exec "$@"
     } else {
         let mut command = Command::new("uv");
         command.args(args);
+        command.env("SOURCE_DATE_EPOCH", build_epoch.to_string());
         command.env("UV_PYTHON_DOWNLOADS", "automatic");
         command
     };
@@ -6325,7 +6682,7 @@ mod tests {
         let mut tasks = Vec::new();
         for id in ids {
             tasks.push(Some(tokio::spawn(async move {
-                run_capturing_uv_in(&["build", id], None, None).await
+                run_capturing_uv_in(&["build", id], None, None, None, 946_684_800, false).await
             })));
         }
 
@@ -7850,7 +8207,7 @@ version = "0.1.0"
         }
         assert!(
             a.components()
-                .any(|component| component.as_os_str() == "v7")
+                .any(|component| component.as_os_str() == "v10")
         );
         assert_eq!(
             a.file_name().and_then(|name| name.to_str()).unwrap().len(),
@@ -7975,7 +8332,7 @@ version = "0.1.0"
     }
 
     #[tokio::test]
-    async fn v7_cache_marker_round_trip_preserves_user_outdir_sentinel() {
+    async fn v8_cache_marker_round_trip_preserves_user_outdir_sentinel() {
         let base =
             std::env::temp_dir().join(format!("retread-gitwheel-cache-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
@@ -8114,14 +8471,14 @@ version = "0.1.0"
     }
 
     #[test]
-    fn v7_artifact_namespaces_separate_architectures_and_use_full_hashes() {
+    fn v10_artifact_namespaces_separate_architectures_and_use_full_hashes() {
         let x86 = ResolutionTarget::from_parts("3.11", "linux-64", Some((2, 35)));
         let arm = ResolutionTarget::from_parts("3.11", "linux-aarch64", Some((2, 35)));
         let source = "f".repeat(64);
         let x86_path = built_wheel_cache_dir("git", &source, &x86);
         let arm_path = built_wheel_cache_dir("git", &source, &arm);
         assert_ne!(x86_path, arm_path);
-        assert!(x86_path.components().any(|part| part.as_os_str() == "v7"));
+        assert!(x86_path.components().any(|part| part.as_os_str() == "v10"));
         assert_eq!(x86_path.file_name().unwrap().to_string_lossy().len(), 64);
         assert_eq!(
             x86_path
@@ -8152,8 +8509,8 @@ version = "0.1.0"
     }
 
     #[test]
-    fn sdist_builds_pin_the_last_pkg_resources_setuptools_line() {
-        assert_eq!(SDIST_BUILD_CONSTRAINTS, "setuptools<81\n");
+    fn legacy_sdist_build_requirements_stay_on_compatible_tool_lines() {
+        assert_eq!(SDIST_BUILD_CONSTRAINTS, "setuptools<81\ncmake<4\n");
     }
 
     #[test]
@@ -8199,7 +8556,8 @@ version = "0.1.0"
 
     #[tokio::test]
     async fn newer_host_floor_accepts_platform_independent_source_build() {
-        let target = ResolutionTarget::from_parts("3.11", "linux-64", Some((2, 35)));
+        let target = ResolutionTarget::from_parts("3.11", "linux-64", Some((2, 35)))
+            .with_hermetic_builds(false);
         let source_identity = hash_fields(
             b"pure-floor-accept-test\0",
             &[unique_test_dir("pure-floor-accept")
@@ -8225,6 +8583,7 @@ version = "0.1.0"
             Some(&ExpectedWheel::exact("pkg", "1.0.0")),
             policy,
             BuiltWheelRequirement::TargetCompatible,
+            false,
             move |private_out, _environment| async move {
                 write_test_wheel(
                     &private_out.join("pkg-1.0.0-py3-none-any.whl"),
@@ -8252,9 +8611,10 @@ version = "0.1.0"
         if crate::glibc::current_pixi_platform() != "linux-64" {
             return;
         }
+        // Keep this unit test offline. Live coverage exercises the identical
+        // purity-first flow with the solve-digest-keyed hermetic candidate.
         let target = ResolutionTarget::from_parts("3.11", "linux-64", Some((2, 34)))
-            .with_hermetic_builds(true);
-        assert!(hermetic_build_may_engage(&target));
+            .with_hermetic_builds(false);
         let source_identity = hash_fields(
             b"unknown-host-hermetic-candidate-test\0",
             &[unique_test_dir("unknown-host-hermetic-candidate")
@@ -8273,8 +8633,9 @@ version = "0.1.0"
             &target,
             &output,
             Some(&ExpectedWheel::exact("pkg", "1.0.0")),
-            NativeSourceBuildPolicy::Refuse,
+            NativeSourceBuildPolicy::AnyWheel,
             BuiltWheelRequirement::TargetCompatible,
+            false,
             move |private_out, environment| {
                 let attempts_for_build = Arc::clone(&attempts_for_build);
                 async move {
@@ -8329,6 +8690,7 @@ version = "0.1.0"
             Some(&ExpectedWheel::exact("pkg", "1.0.0")),
             policy,
             BuiltWheelRequirement::TargetCompatible,
+            false,
             move |private_out, _environment| {
                 let built_path_from_callback = Arc::clone(&built_path_from_callback);
                 async move {
@@ -8455,6 +8817,7 @@ version = "0.1.0"
             BuiltWheelRequirement::ClosureSdistPlatformIndependent {
                 package: "native-dep".to_string(),
             },
+            false,
             move |private_out, _environment| async move {
                 write_test_wheel(
                     &private_out.join("native_dep-1.0.0-cp311-cp311-linux_x86_64.whl"),
@@ -8528,6 +8891,7 @@ version = "0.1.0"
             BuiltWheelRequirement::ClosureSdistPlatformIndependent {
                 package: "native-dep".to_string(),
             },
+            false,
             move |_private_out, _environment| {
                 let callback_flag = Arc::clone(&callback_flag);
                 async move {
@@ -8584,6 +8948,7 @@ version = "0.1.0"
             &target,
             &output,
             None,
+            false,
             move |_private_out, _environment| {
                 let callback_flag = Arc::clone(&callback_flag);
                 async move {
@@ -8630,6 +8995,7 @@ version = "0.1.0"
             &target,
             &output,
             Some(&ExpectedWheel::exact("pkg", "2.0.0")),
+            false,
             move |_private_out, _environment| {
                 let callback_flag = Arc::clone(&callback_flag);
                 async move {
@@ -8684,6 +9050,7 @@ version = "0.1.0"
             &target,
             &output,
             Some(&ExpectedWheel::exact("pkg", "1.0.0")),
+            false,
             move |_private_out, _environment| {
                 let callback_flag = Arc::clone(&callback_flag);
                 async move {

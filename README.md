@@ -132,6 +132,12 @@ Archive policy validation admits Linux x86_64 ET_DYN extensions and
 tuple-gated CUDA `.cubin` payloads; standalone ELF executables and static
 objects fail closed because auditwheel cannot completely attest them.
 
+Hermetic native builds link `libstdc++.so.6` and `libgcc_s.so.1` dynamically
+by default and emit a matching `libstdcxx-ng` conda run dependency. A source
+entry may set `static-cpp-runtime = true` only for a standalone extension that
+will never coexist with torch or another shared-libstdc++ user; static C++
+runtimes can interpose RTTI, exception, unwind, allocator, and vtable symbols.
+
 ## Rust toolchain
 
 Rust `1.97.0` is pinned in `rust-toolchain.toml` (matching CI). Install via

@@ -92,6 +92,16 @@ pub(crate) fn rewrite_wheel_with(
     dst: &Path,
     map: &dyn Fn(&str) -> LineAction,
 ) -> Result<(String, bool)> {
+    rewrite_wheel_metadata_with(src, dst, &|metadata| {
+        rewrite_metadata_text_with(metadata, map)
+    })
+}
+
+fn rewrite_wheel_metadata_with(
+    src: &Path,
+    dst: &Path,
+    transform: &dyn Fn(&str) -> Result<String>,
+) -> Result<(String, bool)> {
     let bytes = std::fs::read(src).with_context(|| format!("reading {}", src.display()))?;
     let mut archive = ZipArchive::new(Cursor::new(&bytes))
         .with_context(|| format!("opening zip {}", src.display()))?;
@@ -127,7 +137,7 @@ pub(crate) fn rewrite_wheel_with(
         .read_to_string(&mut record_str)?;
 
     // Rewrite METADATA via the mapper.
-    let new_metadata = rewrite_metadata_text_with(&metadata_str, map)?;
+    let new_metadata = transform(&metadata_str)?;
     if new_metadata == metadata_str {
         // Nothing changed; hard-link when possible (free for
         // multi-GB wheels on the same filesystem), else copy. Atomic:
@@ -204,6 +214,57 @@ pub(crate) fn rewrite_wheel_with(
     // sha256 of the rewritten wheel file (for recipe.yaml's source: sha256).
     let dst_bytes = std::fs::read(dst)?;
     Ok((sha256_hex(&dst_bytes), true))
+}
+
+pub(crate) fn inject_native_abi_metadata(
+    src: &Path,
+    dst: &Path,
+    conda_run_dependency: Option<&str>,
+    needed: &[String],
+    glibcxx_versions: &[String],
+    cxxabi_versions: &[String],
+) -> Result<String> {
+    rewrite_wheel_metadata_with(src, dst, &|metadata| {
+        let separator = metadata
+            .find("\r\n\r\n")
+            .map(|offset| (offset, "\r\n"))
+            .or_else(|| metadata.find("\n\n").map(|offset| (offset, "\n")));
+        let newline = separator.map_or("\n", |(_, newline)| newline);
+        let mut additions = String::new();
+        if let Some(requirement) = conda_run_dependency {
+            writeln!(additions, "X-Retread-Conda-Run-Depends: {requirement}")?;
+        }
+        writeln!(additions, "X-Retread-DT-Needed: {}", needed.join(","))?;
+        writeln!(
+            additions,
+            "X-Retread-GLIBCXX-Versions: {}",
+            glibcxx_versions.join(",")
+        )?;
+        writeln!(
+            additions,
+            "X-Retread-CXXABI-Versions: {}",
+            cxxabi_versions.join(",")
+        )?;
+        if newline == "\r\n" {
+            additions = additions.replace('\n', "\r\n");
+        }
+        let mut rewritten = String::with_capacity(metadata.len() + additions.len());
+        if let Some((offset, separator_newline)) = separator {
+            rewritten.push_str(&metadata[..offset]);
+            rewritten.push_str(separator_newline);
+            rewritten.push_str(&additions);
+            rewritten.push_str(&metadata[offset + separator_newline.len()..]);
+        } else {
+            rewritten.push_str(metadata);
+            if !metadata.ends_with('\n') {
+                rewritten.push_str(newline);
+            }
+            rewritten.push_str(&additions);
+            rewritten.push_str(newline);
+        }
+        Ok(rewritten)
+    })
+    .map(|(sha, _)| sha)
 }
 
 fn valid_wheel_tag_field(field: &str) -> bool {

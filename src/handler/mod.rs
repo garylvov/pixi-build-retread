@@ -10461,7 +10461,10 @@ async fn materialize_and_rewrite_with_abi_aliases(
             cache_dir,
             &out,
             target,
-            Some(&expected),
+            crate::source_build::GitWheelBuildPolicy {
+                expected: Some(&expected),
+                static_cpp_runtime: entry.static_cpp_runtime,
+            },
         )
         .await
         .with_context(|| {
@@ -10605,6 +10608,7 @@ async fn materialize_and_rewrite_with_abi_aliases(
             Some(&expected),
             Some(download_dir),
             (!Path::new(path).is_absolute()).then_some(source_dir),
+            entry.static_cpp_runtime,
         )
         .await
         .with_context(|| {
@@ -10636,7 +10640,10 @@ async fn materialize_and_rewrite_with_abi_aliases(
             cache_dir,
             &out,
             target,
-            Some(&expected),
+            crate::source_build::GitWheelBuildPolicy {
+                expected: Some(&expected),
+                static_cpp_runtime: entry.static_cpp_runtime,
+            },
         )
         .await
         .with_context(|| {
@@ -12197,7 +12204,12 @@ pub(crate) fn check_output_abi_invariants(
             ));
             continue;
         }
+        // libstdcxx-ng's compatibility contract is the GCC runtime major,
+        // unlike Python/CUDA ABI anchors whose bare major is ambiguous. A
+        // hermetic wheel's final DT_NEEDED scan deliberately emits this form.
+        let gcc_runtime_major = canonical_conda_name(&name) == "libstdcxx-ng";
         if is_bare_major_spec(trimmed)
+            && !gcc_runtime_major
             && !(allow_auto_completed_cap && is_auto_completed_abi_anchor_spec(trimmed))
         {
             violations.push(format!(
@@ -12667,6 +12679,17 @@ fn produce_output_with_conflicts(
     let mut sorted_wheels: Vec<&ResolvedWheel> = bundle.all_wheels().collect();
     sorted_wheels.sort_by_key(|w| canonical_conda_name(&w.pypi_name));
     for wheel in sorted_wheels {
+        for raw in &wheel.metadata.retread_conda_run_dependencies {
+            let dependency = spec_from_str(raw).with_context(|| {
+                format!(
+                    "parsing Retread native conda run dependency `{raw}` from {}",
+                    wheel.metadata.filename
+                )
+            })?;
+            if seen_dep_names.insert(dependency.name.to_string()) {
+                run_dep_specs.push(dependency);
+            }
+        }
         for raw in &wheel.metadata.requires_dist {
             let Some(dep) = crate::relax::translate(
                 raw,
@@ -20114,6 +20137,7 @@ mod emit_wheel_upstream_url_tests {
             name: name.to_string(),
             version: version.to_string(),
             requires_dist: vec![],
+            retread_conda_run_dependencies: vec![],
             is_pure_python: true,
             sha256: "abc".to_string(),
             filename: format!("{name}-{version}-py3-none-any.whl"),

@@ -755,7 +755,7 @@ pub const SCHEMA: u32 = 18;
 /// Epoch 44: source builds may provision a compiler environment pinned to the
 /// newest compatible conda-forge sysroot and emit exact-sysroot manylinux
 /// native wheels, expanding the set of bundleable sdist-only dependencies.
-pub const EMIT_EPOCH: u32 = 44;
+pub const EMIT_EPOCH: u32 = 45;
 
 fn parse_stored_glibc(value: Option<&str>) -> Option<Option<(u32, u32)>> {
     match value {
@@ -1289,7 +1289,7 @@ impl RetreadLock {
         let mut sorted = entry_specs.to_vec();
         sorted.sort();
         let mut h = Sha256::new();
-        h.update(b"retread-inputs-v6\n");
+        h.update(b"retread-inputs-v7\n");
         for s in &sorted {
             h.update(s.as_bytes());
             h.update(b"\n");

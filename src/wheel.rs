@@ -104,6 +104,9 @@ pub struct WheelMetadata {
     pub version: String,
     /// Raw `Requires-Dist:` values, one per line. PEP 508 syntax.
     pub requires_dist: Vec<String>,
+    /// Retread-owned conda run requirements derived from final native ABI
+    /// validation. These are deliberately not PEP 508 `Requires-Dist` values.
+    pub retread_conda_run_dependencies: Vec<String>,
     /// Whether the wheel's tag set includes `none-any` (pure-Python). Used to
     /// emit `noarch: python` in the generated recipe.
     pub is_pure_python: bool,
@@ -1800,6 +1803,7 @@ pub fn parse_metadata(
     let mut name = None;
     let mut version = None;
     let mut requires_dist = Vec::new();
+    let mut retread_conda_run_dependencies = Vec::new();
 
     // RFC 822-style headers terminate at the first blank line. Continuation
     // lines start with whitespace and belong to the preceding header. Ignore
@@ -1820,6 +1824,9 @@ pub fn parse_metadata(
             "Name" => name = Some(value.to_string()),
             "Version" => version = Some(value.to_string()),
             "Requires-Dist" => requires_dist.push(value.to_string()),
+            "X-Retread-Conda-Run-Depends" => {
+                retread_conda_run_dependencies.push(value.to_string());
+            }
             _ => {}
         }
     }
@@ -1828,6 +1835,7 @@ pub fn parse_metadata(
         name: name.ok_or_else(|| anyhow!("METADATA missing Name"))?,
         version: version.ok_or_else(|| anyhow!("METADATA missing Version"))?,
         requires_dist,
+        retread_conda_run_dependencies,
         is_pure_python,
         sha256,
         filename,
@@ -2659,6 +2667,7 @@ mod tests {
                    Version: 1.2.3\n\
                    Requires-Dist: numpy==1.26.4\n\
                    Requires-Dist: torch>=2.7\n\
+                   X-Retread-Conda-Run-Depends: libstdcxx-ng >=13\n\
                    \n\
                    Some description.\n";
         let m = parse_metadata(
@@ -2671,6 +2680,7 @@ mod tests {
         assert_eq!(m.name, "example-pkg");
         assert_eq!(m.version, "1.2.3");
         assert_eq!(m.requires_dist, vec!["numpy==1.26.4", "torch>=2.7"]);
+        assert_eq!(m.retread_conda_run_dependencies, vec!["libstdcxx-ng >=13"]);
         assert!(m.is_pure_python);
     }
 

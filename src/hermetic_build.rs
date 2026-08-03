@@ -16,9 +16,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
 
-const CACHE_SCHEMA: &str = "retread-hermetic-build-environment-v5";
+const CACHE_SCHEMA: &str = "retread-hermetic-build-environment-v6";
 const CACHE_NAMESPACE: &str = "hermetic-build-envs";
-const CACHE_VERSION: &str = "v5";
+const CACHE_VERSION: &str = "v6";
 const COMPLETION_MARKER: &str = "complete.json";
 const MIN_RATTLER_BUILD_VERSION: (u64, u64, u64) = (0, 70, 0);
 
@@ -37,6 +37,8 @@ pub struct HermeticBuildEnvironment {
     cuda_executable: Option<PathBuf>,
     selected_sysroot: (u32, u32),
     platform_tag: String,
+    toolchain_digest: String,
+    gcc_major: u32,
 }
 
 impl HermeticBuildEnvironment {
@@ -79,6 +81,14 @@ impl HermeticBuildEnvironment {
     pub fn platform_tag(&self) -> &str {
         &self.platform_tag
     }
+
+    pub fn toolchain_digest(&self) -> &str {
+        &self.toolchain_digest
+    }
+
+    pub fn gcc_major(&self) -> u32 {
+        self.gcc_major
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -86,6 +96,7 @@ struct ProvisionRequest {
     target_floor: (u32, u32),
     python_minor: String,
     cuda_version: Option<String>,
+    toolchain_digest: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,6 +106,7 @@ struct CompletionMarker {
     target_floor: (u32, u32),
     python_minor: String,
     cuda_version: Option<String>,
+    toolchain_digest: String,
     selected_sysroot_version: String,
     selected_sysroot: (u32, u32),
     root_versions: BTreeMap<String, String>,
@@ -158,6 +170,23 @@ struct DebugRequirements {
     host: Vec<String>,
 }
 
+fn solved_records_digest(solved: &crate::conda_solve::HermeticBuildSolve) -> Result<String> {
+    let mut records = solved
+        .records
+        .iter()
+        .map(serde_json::to_vec)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("serializing hermetic toolchain solve")?;
+    records.sort();
+    let mut digest = Sha256::new();
+    digest.update(b"retread-hermetic-toolchain-solve-v1\0");
+    for record in records {
+        digest.update((record.len() as u64).to_be_bytes());
+        digest.update(record);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
 /// Provision or reuse a conda-forge compiler environment for one compatibility
 /// tuple. `cuda_version = None` omits NVCC; `Some("")` requests an unpinned
 /// NVCC, and numeric `Some("12.9")` requests that CUDA release line.
@@ -168,10 +197,19 @@ pub(crate) async fn provision(
 ) -> Result<HermeticBuildEnvironment> {
     let python_minor = crate::pypi::normalized_python_minor(python)?.version();
     let cuda_version = normalize_cuda_version(cuda_version)?;
+    let solved = crate::conda_solve::solve_hermetic_build_environment(
+        target_floor,
+        &python_minor,
+        cuda_version.as_deref(),
+    )
+    .await
+    .map_err(|reasons| anyhow!(reasons.join("; ")))?;
+    let toolchain_digest = solved_records_digest(&solved)?;
     let request = ProvisionRequest {
         target_floor,
         python_minor,
         cuda_version,
+        toolchain_digest,
     };
     let cache_dir = cache_directory(&request)?;
     validate_shell_safe_cache_path(&cache_dir)?;
@@ -208,7 +246,7 @@ pub(crate) async fn provision(
         .with_context(|| format!("creating hermetic cache {}", cache_dir.display()))?;
 
     let result = async {
-        let marker = provision_uncached(&cache_dir, &request).await?;
+        let marker = provision_uncached(&cache_dir, &request, &solved).await?;
         let environment = validate_marker(&cache_dir, &request, &marker)?;
         write_completion_marker(&marker_path, &marker).await?;
         Ok::<_, anyhow::Error>(environment)
@@ -275,6 +313,10 @@ fn prepare_private_tool_scratch(private_build_dir: &Path, label: &str) -> Result
 struct NativeWheelInventory {
     host_dynamic_elfs: usize,
     cuda_device_elfs: usize,
+    needed: BTreeSet<String>,
+    glibcxx_versions: BTreeSet<String>,
+    cxxabi_versions: BTreeSet<String>,
+    glibc_versions: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -339,7 +381,18 @@ fn validate_native_wheel_archive(wheel: &Path, allow_cuda: bool) -> Result<Nativ
         match validate_native_elf_header(&name, &header, allow_cuda)? {
             NativeElfKind::HostX86_64 => {
                 entry.read_to_end(&mut header)?;
-                validate_elf_dependency_paths(&name, &header)?;
+                inventory
+                    .needed
+                    .extend(validate_elf_dependency_paths(&name, &header)?);
+                inventory
+                    .glibcxx_versions
+                    .extend(scan_elf_version_names(&header, b"GLIBCXX_"));
+                inventory
+                    .cxxabi_versions
+                    .extend(scan_elf_version_names(&header, b"CXXABI_"));
+                inventory
+                    .glibc_versions
+                    .extend(scan_elf_version_names(&header, b"GLIBC_"));
                 let elf_type = read_elf_uint(&header, 16, 2, true);
                 if elf_type != Some(3) || !elf_has_dynamic_program_header(&header) {
                     bail!(
@@ -532,14 +585,31 @@ fn validate_native_elf_header(
     }
 }
 
-fn validate_elf_dependency_paths(member: &str, bytes: &[u8]) -> Result<()> {
+fn scan_elf_version_names(bytes: &[u8], prefix: &[u8]) -> BTreeSet<String> {
+    let mut versions = BTreeSet::new();
+    for start in 0..bytes.len().saturating_sub(prefix.len()) {
+        if !bytes[start..].starts_with(prefix) {
+            continue;
+        }
+        let end = bytes[start..]
+            .iter()
+            .position(|byte| !byte.is_ascii_alphanumeric() && !matches!(byte, b'.' | b'_'))
+            .map_or(bytes.len(), |length| start + length);
+        if let Ok(version) = std::str::from_utf8(&bytes[start..end]) {
+            versions.insert(version.to_string());
+        }
+    }
+    versions
+}
+
+fn validate_elf_dependency_paths(member: &str, bytes: &[u8]) -> Result<BTreeSet<String>> {
     // x86_64 was validated immediately before this function, so the ELF64
     // little-endian offsets below are unambiguous.
     let program_offset = read_elf_usize(bytes, 32, 8, true, member, "program-header offset")?;
     let entry_size = read_elf_usize(bytes, 54, 2, true, member, "program-header entry size")?;
     let entry_count = read_elf_usize(bytes, 56, 2, true, member, "program-header entry count")?;
     if entry_count == 0 {
-        return Ok(());
+        return Ok(BTreeSet::new());
     }
     if entry_size < 56 {
         bail!("native wheel ELF member '{member}' has a truncated program-header entry");
@@ -576,6 +646,7 @@ fn validate_elf_dependency_paths(member: &str, bytes: &[u8]) -> Result<()> {
         }
     }
 
+    let mut dependencies = BTreeSet::new();
     for (dynamic_offset, dynamic_size) in dynamics {
         if dynamic_size % 16 != 0 {
             bail!("native wheel ELF member '{member}' has a malformed dynamic table");
@@ -670,9 +741,53 @@ fn validate_elf_dependency_paths(member: &str, bytes: &[u8]) -> Result<()> {
                     "native wheel ELF member '{member}' has path-valued DT_NEEDED '{dependency}'"
                 );
             }
+            dependencies.insert(dependency.to_string());
+        }
+    }
+    Ok(dependencies)
+}
+
+pub(crate) fn inspect_native_wheel_abi(
+    wheel: &Path,
+    allow_cuda: bool,
+) -> Result<NativeAbiMetadata> {
+    let inventory = validate_native_wheel_archive(wheel, allow_cuda)?;
+    Ok(NativeAbiMetadata {
+        needs_cpp_runtime: inventory.needed.contains("libstdc++.so.6")
+            || inventory.needed.contains("libgcc_s.so.1"),
+        needed: inventory.needed.into_iter().collect(),
+        glibcxx_versions: inventory.glibcxx_versions.into_iter().collect(),
+        cxxabi_versions: inventory.cxxabi_versions.into_iter().collect(),
+    })
+}
+
+fn validate_inventory_glibc_floor(
+    inventory: &NativeWheelInventory,
+    floor: (u32, u32),
+) -> Result<()> {
+    for version in &inventory.glibc_versions {
+        let Some(observed) = crate::glibc::parse_glibc_version(version) else {
+            if version != "GLIBC_PRIVATE" {
+                bail!("native wheel has an unparseable GLIBC symbol version `{version}`");
+            }
+            continue;
+        };
+        if observed > floor {
+            bail!(
+                "native wheel requires {version}, above selected sysroot floor {}",
+                crate::glibc::format_glibc(floor)
+            );
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct NativeAbiMetadata {
+    pub(crate) needs_cpp_runtime: bool,
+    pub(crate) needed: Vec<String>,
+    pub(crate) glibcxx_versions: Vec<String>,
+    pub(crate) cxxabi_versions: Vec<String>,
 }
 
 fn read_elf_usize(
@@ -1007,7 +1122,8 @@ pub(crate) async fn repair_native_wheel(
     // the built archive first so a build-system-injected host path cannot
     // select a host library for grafting, then attest the rewritten RECORD.
     strip_unsafe_native_rpaths(environment, wheel, private_build_dir).await?;
-    validate_native_wheel_archive(wheel, allow_cuda)?;
+    let inventory = validate_native_wheel_archive(wheel, allow_cuda)?;
+    validate_inventory_glibc_floor(&inventory, environment.selected_sysroot())?;
 
     let ldpaths = auditwheel_ldpaths(environment)?;
     preflight_native_dependencies(environment, wheel, private_build_dir, &ldpaths).await?;
@@ -1067,7 +1183,9 @@ export USER=$(/usr/bin/id -un)
 export LOGNAME="$USER"
 unset PREFIX BUILD_PREFIX
 cd "$scratch"
-exec "$PYTHON" -I -m auditwheel repair --only-plat --no-update-tags --ldpaths "${10}" --plat "$4" --wheel-dir "$5" "$6"
+exec "$PYTHON" -I -m auditwheel repair --only-plat --no-update-tags \
+  --exclude 'libstdc++.so.6' --exclude 'libgcc_s.so.1' \
+  --ldpaths "${10}" --plat auto --wheel-dir "$5" "$6"
 "#;
     let mut command = Command::new("/bin/bash");
     command
@@ -1118,7 +1236,8 @@ exec "$PYTHON" -I -m auditwheel repair --only-plat --no-update-tags --ldpaths "$
         );
     }
     let repaired = repaired.pop().expect("length was checked");
-    validate_native_wheel_archive(&repaired, allow_cuda)?;
+    let repaired_inventory = validate_native_wheel_archive(&repaired, allow_cuda)?;
+    validate_inventory_glibc_floor(&repaired_inventory, environment.selected_sysroot())?;
     strip_unsafe_native_rpaths(environment, &repaired, private_build_dir).await?;
     validate_native_wheel_archive(&repaired, allow_cuda)?;
     Ok(repaired)
@@ -1651,19 +1770,13 @@ fn prepare_activation_tmp(path: &Path) -> Result<()> {
 async fn provision_uncached(
     cache_dir: &Path,
     request: &ProvisionRequest,
+    solved: &crate::conda_solve::HermeticBuildSolve,
 ) -> Result<CompletionMarker> {
     let rattler_scratch = prepare_private_tool_scratch(cache_dir, "rattler-setup")?;
     let rattler_build = rattler_build_executable()?;
     ensure_rattler_build_version(&rattler_build, &rattler_scratch).await?;
-    let solved = crate::conda_solve::solve_hermetic_build_environment(
-        request.target_floor,
-        &request.python_minor,
-        request.cuda_version.as_deref(),
-    )
-    .await
-    .map_err(|reasons| anyhow!(reasons.join("; ")))?;
-    let root_versions = root_versions(&solved, request.cuda_version.is_some())?;
-    let root_builds = root_builds(&solved, &root_versions)?;
+    let root_versions = root_versions(solved, request.cuda_version.is_some())?;
+    let root_builds = root_builds(solved, &root_versions)?;
     let recipe = render_debug_recipe(&root_versions, &root_builds, request.cuda_version.is_some())?;
 
     let recipe_dir = cache_dir.join("recipe");
@@ -1889,7 +2002,8 @@ async fn provision_uncached(
         target_floor: request.target_floor,
         python_minor: request.python_minor.clone(),
         cuda_version: request.cuda_version.clone(),
-        selected_sysroot_version: solved.sysroot.conda_version,
+        toolchain_digest: request.toolchain_digest.clone(),
+        selected_sysroot_version: solved.sysroot.conda_version.clone(),
         selected_sysroot,
         root_versions,
         work_dir,
@@ -2025,6 +2139,7 @@ fn validate_marker(
         || marker.target_floor != request.target_floor
         || marker.python_minor != request.python_minor
         || marker.cuda_version != request.cuda_version
+        || marker.toolchain_digest != request.toolchain_digest
     {
         bail!(
             "hermetic build environment marker does not match cache tuple at {}",
@@ -2192,6 +2307,13 @@ fn validate_marker(
         cuda_executable: marker.cuda_executable.clone(),
         selected_sysroot: marker.selected_sysroot,
         platform_tag: marker.platform_tag.clone(),
+        toolchain_digest: marker.toolchain_digest.clone(),
+        gcc_major: marker
+            .root_versions
+            .get("gcc_linux-64")
+            .and_then(|version| version.split('.').next())
+            .and_then(|major| major.parse().ok())
+            .ok_or_else(|| anyhow!("completed hermetic marker has an invalid GCC version"))?,
     })
 }
 
@@ -2204,17 +2326,25 @@ fn cache_directory(request: &ProvisionRequest) -> Result<PathBuf> {
             .context("resolving relative RETREAD_CACHE_DIR")?
             .join(root)
     };
-    let cuda = match request.cuda_version.as_deref() {
-        None => "none".to_string(),
-        Some("") => "any".to_string(),
-        Some(version) => version.replace('.', "-"),
-    };
-    Ok(root.join(CACHE_NAMESPACE).join(CACHE_VERSION).join(format!(
-        "glibc-{}-{}__python-{}__cuda-{cuda}",
-        request.target_floor.0,
-        request.target_floor.1,
-        request.python_minor.replace('.', "-")
-    )))
+    let mut identity = Sha256::new();
+    identity.update(b"retread-hermetic-environment-cache-v1\0");
+    for field in [
+        format!("{}.{}", request.target_floor.0, request.target_floor.1),
+        request.python_minor.clone(),
+        request
+            .cuda_version
+            .as_deref()
+            .unwrap_or("none")
+            .to_string(),
+        request.toolchain_digest.clone(),
+    ] {
+        identity.update((field.len() as u64).to_be_bytes());
+        identity.update(field.as_bytes());
+    }
+    Ok(root
+        .join(CACHE_NAMESPACE)
+        .join(CACHE_VERSION)
+        .join(format!("env-{:x}", identity.finalize())))
 }
 
 fn validate_shell_safe_cache_path(path: &Path) -> Result<()> {
@@ -3136,6 +3266,31 @@ mod tests {
     }
 
     #[test]
+    fn final_inventory_records_dynamic_cpp_runtime_and_abi_versions() {
+        let mut elf = test_elf_with_needed("libstdc++.so.6");
+        elf.extend_from_slice(b"\0GLIBCXX_3.4.29\0CXXABI_1.3.13\0");
+        let record = b"pkg/ext.so,,\ndemo-1.0.dist-info/RECORD,,\n";
+        let (root, wheel) = write_boundary_test_wheel(
+            "dynamic-cpp-runtime",
+            &[("pkg/ext.so", &elf), ("demo-1.0.dist-info/RECORD", record)],
+        );
+        let abi = inspect_native_wheel_abi(&wheel, false).unwrap();
+        assert!(abi.needs_cpp_runtime);
+        assert!(abi.needed.iter().any(|item| item == "libstdc++.so.6"));
+        assert!(
+            abi.glibcxx_versions
+                .iter()
+                .any(|item| item == "GLIBCXX_3.4.29")
+        );
+        assert!(
+            abi.cxxabi_versions
+                .iter()
+                .any(|item| item == "CXXABI_1.3.13")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn auditwheel_ldpaths_are_tuple_local() {
         let root =
             std::env::temp_dir().join(format!("retread-auditwheel-ldpaths-{}", std::process::id()));
@@ -3161,6 +3316,8 @@ mod tests {
             cuda_executable: None,
             selected_sysroot: (2, 28),
             platform_tag: "manylinux_2_28_x86_64".to_string(),
+            toolchain_digest: "0".repeat(64),
+            gcc_major: 13,
         };
         let paths = std::env::split_paths(&auditwheel_ldpaths(&environment).unwrap())
             .collect::<BTreeSet<_>>();
@@ -3226,6 +3383,7 @@ mod tests {
                 target_floor,
                 python_minor: python_minor.to_string(),
                 cuda_version: cuda_version.map(str::to_string),
+                toolchain_digest: "a".repeat(64),
             })
             .unwrap()
             .file_name()
@@ -3237,6 +3395,20 @@ mod tests {
         assert_ne!(base, request((2, 17), "3.11", None));
         assert_ne!(base, request((2, 28), "3.12", None));
         assert_ne!(base, request((2, 28), "3.11", Some("12.9")));
+    }
+
+    #[test]
+    fn cache_leaf_is_keyed_by_complete_solve_digest() {
+        let request = |digest: char| {
+            cache_directory(&ProvisionRequest {
+                target_floor: (2, 28),
+                python_minor: "3.11".to_string(),
+                cuda_version: None,
+                toolchain_digest: digest.to_string().repeat(64),
+            })
+            .unwrap()
+        };
+        assert_ne!(request('a'), request('b'));
     }
 
     #[test]

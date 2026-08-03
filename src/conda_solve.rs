@@ -764,19 +764,23 @@ fn hermetic_toolchain_specs(
     cuda_version: Option<&str>,
 ) -> Vec<String> {
     let mut specs = vec![
-        "gcc_linux-64".to_string(),
-        "gxx_linux-64".to_string(),
+        // Keep the native ABI line stable.  Exact builds are selected below
+        // and included in the environment digest, while these root bounds
+        // prevent a newly-published compiler major from silently changing the
+        // C++ ABI/runtime policy for an otherwise identical request.
+        "gcc_linux-64 13.*".to_string(),
+        "gxx_linux-64 13.*".to_string(),
         format!("sysroot_linux-64 =={sysroot_version}"),
         format!("python {python_minor}.*"),
-        "auditwheel".to_string(),
-        "patchelf".to_string(),
-        "cmake <4".to_string(),
-        "make".to_string(),
-        "ninja".to_string(),
+        "auditwheel 6.*".to_string(),
+        "patchelf 0.18.*".to_string(),
+        "cmake >=3.20,<4".to_string(),
+        "make 4.*".to_string(),
+        "ninja 1.*".to_string(),
     ];
     if let Some(version) = cuda_version {
         specs.push(if version.is_empty() {
-            "cuda-nvcc_linux-64".to_string()
+            "cuda-nvcc_linux-64 12.*".to_string()
         } else {
             format!("cuda-nvcc_linux-64 {version}.*")
         });

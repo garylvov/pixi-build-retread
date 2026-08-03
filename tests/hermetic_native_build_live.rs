@@ -24,6 +24,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use pixi_build_retread::handler::Handler;
 use pixi_build_retread::wheel::read_metadata;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 const TARGET_GLIBC: &str = "2.17";
 const TARGET_PLATFORM_TAG: &str = "manylinux_2_17_x86_64";
@@ -229,6 +230,7 @@ async fn closure_blocking_evdev_entry_builds_hermetically() {
     let test_dir = TestDirectory::new();
     let _environment = ScopedEnvironment::set(vec![
         ("RETREAD_HERMETIC_BUILDS", OsString::from("1")),
+        ("RETREAD_NO_REPLAY", OsString::from("1")),
         ("RETREAD_FAST_TMP", OsString::from("off")),
         (
             "RETREAD_CACHE_DIR",
@@ -328,9 +330,12 @@ version = "1.0.0"
         "expected a sysroot-derived `{TARGET_PLATFORM_TAG}` evdev wheel, found {evdev_wheels:?}; \
          the test host must have glibc newer than {TARGET_GLIBC} to force the hermetic path"
     );
-    let marker_path = test_dir.path().join(
-        "retread-cache/hermetic-build-envs/v5/glibc-2-17__python-3-11__cuda-none/complete.json",
-    );
+    let marker_path = fs::read_dir(test_dir.path().join("retread-cache/hermetic-build-envs/v6"))
+        .expect("read hermetic environment cache")
+        .map(|entry| entry.expect("read hermetic environment entry").path())
+        .find(|path| path.join("complete.json").is_file())
+        .expect("find solve-digest-keyed hermetic environment")
+        .join("complete.json");
     let marker: serde_json::Value =
         serde_json::from_slice(&fs::read(&marker_path).unwrap_or_else(|error| {
             panic!(
@@ -362,4 +367,193 @@ version = "1.0.0"
         &test_dir.path().join("native-member-inspection"),
         test_dir.path(),
     );
+}
+
+async fn run_deterministic_native_build(root: &Path, work_name: &str) -> PathBuf {
+    let workspace = root.join("determinism-workspace");
+    let pack = workspace.join("pack");
+    let native = pack.join("native");
+    fs::create_dir_all(&native).expect("create deterministic native source");
+    fs::write(
+        workspace.join("pixi.toml"),
+        r#"[workspace]
+channels = ["conda-forge"]
+platforms = [{ platform = "linux-64", glibc = "2.17" }]
+
+[dependencies]
+determinism-pack = { path = "./pack" }
+"#,
+    )
+    .expect("write determinism workspace");
+    fs::write(
+        pack.join("pixi.toml"),
+        r#"[package]
+name = "determinism-pack"
+version = "1.0.0"
+"#,
+    )
+    .expect("write determinism pack");
+    fs::write(
+        native.join("pyproject.toml"),
+        r#"[build-system]
+requires = ["setuptools==80.9.0", "wheel==0.45.1"]
+build-backend = "setuptools.build_meta"
+"#,
+    )
+    .expect("write deterministic pyproject");
+    fs::write(
+        native.join("setup.py"),
+        r#"from setuptools import Extension, setup
+setup(name="deterministic-native", version="1.0.0",
+      ext_modules=[Extension("deterministic_native", ["module.cpp"], language="c++")])
+"#,
+    )
+    .expect("write deterministic setup.py");
+    fs::write(
+        native.join("module.cpp"),
+        r#"#include <Python.h>
+#include <string>
+static PyObject* ping(PyObject*, PyObject*) {
+    std::string value("deterministic-native");
+    return PyUnicode_FromStringAndSize(value.data(), value.size());
+}
+static PyMethodDef methods[] = {{"ping", ping, METH_NOARGS, nullptr}, {nullptr, nullptr, 0, nullptr}};
+static PyModuleDef module = {PyModuleDef_HEAD_INIT, "deterministic_native", nullptr, -1, methods};
+PyMODINIT_FUNC PyInit_deterministic_native() { return PyModule_Create(&module); }
+"#,
+    )
+    .expect("write deterministic C++ extension");
+
+    let handler = Handler::new();
+    handler
+        .dispatch(
+            "initialize".to_string(),
+            json!({
+                "manifestPath": pack.join("pixi.toml"),
+                "sourceDirectory": &pack,
+                "workspaceDirectory": &workspace,
+                "cacheDirectory": root.join(format!("handler-cache-{work_name}")),
+                "configuration": {
+                    "retread-wheels": {
+                        "deterministic-native": { "path": "./native" }
+                    },
+                    "retread-python": "3.11",
+                    "retread-auto-bundle": true,
+                    "retread-auto-route": false,
+                    "retread-keep-pypi": ["deterministic-native"],
+                    "retread-name-map": { "deterministic-native": "" },
+                    "retread-relax": "none",
+                    "retread-hermetic": true
+                }
+            }),
+        )
+        .await
+        .expect("initialize determinism handler");
+    handler
+        .dispatch(
+            "conda/outputs".to_string(),
+            json!({
+                "hostPlatform": "linux-64",
+                "buildPlatform": "linux-64",
+                "channels": ["https://prefix.dev/conda-forge"],
+                "workDirectory": root.join(work_name),
+                "variantConfiguration": { "python": ["3.11"] }
+            }),
+        )
+        .await
+        .expect("materialize deterministic native wheel");
+    let cache_root = PathBuf::from(
+        std::env::var_os("RETREAD_CACHE_DIR").expect("determinism test sets RETREAD_CACHE_DIR"),
+    );
+    let mut wheels = Vec::new();
+    collect_named_wheels(
+        &cache_root.join("built-wheels"),
+        "deterministic_native-",
+        &mut wheels,
+    );
+    wheels
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains(TARGET_PLATFORM_TAG))
+        })
+        .max_by_key(|path| fs::metadata(path).and_then(|meta| meta.modified()).ok())
+        .expect("find deterministic hermetic wheel")
+}
+
+fn collect_named_wheels(path: &Path, prefix: &str, wheels: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries {
+        let entry = entry.expect("read deterministic wheel tree");
+        let path = entry.path();
+        if entry
+            .file_type()
+            .expect("read wheel tree file type")
+            .is_dir()
+        {
+            collect_named_wheels(&path, prefix, wheels);
+        } else if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(prefix) && name.ends_with(".whl"))
+        {
+            wheels.push(path);
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "live: two cold wheel-cache native rebuilds need PyPI/conda-forge"]
+async fn hermetic_native_cold_rebuilds_are_byte_identical() {
+    assert_eq!(std::env::consts::OS, "linux");
+    assert_eq!(std::env::consts::ARCH, "x86_64");
+    require_on_path("uv");
+    require_on_path("rattler-build");
+    let test_dir = TestDirectory::new();
+    let retread_cache = std::env::var_os("RETREAD_TEST_HERMETIC_CACHE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| test_dir.path().join("retread-cache"));
+    let _environment = ScopedEnvironment::set(vec![
+        ("RETREAD_HERMETIC_BUILDS", OsString::from("1")),
+        ("RETREAD_NO_REPLAY", OsString::from("1")),
+        ("RETREAD_FAST_TMP", OsString::from("off")),
+        ("RETREAD_CACHE_DIR", retread_cache.clone().into_os_string()),
+        (
+            "RETREAD_WHEEL_STORE",
+            test_dir.path().join("wheel-store").into_os_string(),
+        ),
+        (
+            "UV_CACHE_DIR",
+            test_dir.path().join("uv-cache").into_os_string(),
+        ),
+    ]);
+    let first = run_deterministic_native_build(test_dir.path(), "work-one").await;
+    let first_bytes = fs::read(&first).expect("read first cold wheel");
+    let built_wheels = retread_cache.join("built-wheels");
+    if built_wheels.exists() {
+        fs::remove_dir_all(&built_wheels)
+            .expect("clear built-wheel cache between deterministic builds");
+    }
+    for lock in [
+        test_dir
+            .path()
+            .join("determinism-workspace/pack/retread-determinism-pack.lock.json"),
+        test_dir
+            .path()
+            .join("determinism-workspace/pack/retread.lock.json"),
+    ] {
+        if lock.exists() {
+            fs::remove_file(lock).expect("remove replay lock");
+        }
+    }
+    let second = run_deterministic_native_build(test_dir.path(), "work-two").await;
+    let second_bytes = fs::read(&second).expect("read second cold wheel");
+    let first_hash = format!("{:x}", Sha256::digest(first_bytes));
+    let second_hash = format!("{:x}", Sha256::digest(second_bytes));
+    eprintln!("determinism SHA-256 #1: {first_hash}");
+    eprintln!("determinism SHA-256 #2: {second_hash}");
+    assert_eq!(first_hash, second_hash);
 }

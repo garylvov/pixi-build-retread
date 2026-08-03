@@ -2758,6 +2758,7 @@ fn meta(name: &str, version: &str, requires: Vec<&str>, platform_specific: bool)
         name: name.into(),
         version: version.into(),
         requires_dist: requires.into_iter().map(String::from).collect(),
+        retread_conda_run_dependencies: vec![],
         is_pure_python: !platform_specific,
         sha256: format!("sha-{name}"),
         filename: if platform_specific {
@@ -3693,6 +3694,7 @@ fn relaxed_pure_python_primary_pins_python_to_workspace_variant() {
         name: "isaaclab".into(),
         version: "0.51.1".into(),
         requires_dist: vec![],
+        retread_conda_run_dependencies: vec![],
         is_pure_python: is_pure,
         sha256: "sha".into(),
         filename,
