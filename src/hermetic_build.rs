@@ -1313,7 +1313,24 @@ exec "$PYTHON" -I -m auditwheel repair --only-plat --no-update-tags \
         .env_remove("ENV")
         .env_remove("LD_LIBRARY_PATH")
         .env_remove("LD_PRELOAD");
-    run_captured_sealed(&mut command, "auditwheel native policy repair").await?;
+    if let Err(error) = run_captured_sealed(&mut command, "auditwheel native policy repair").await {
+        // Extensions that reference no versioned libc symbols at all (e.g.
+        // evdev's generated `_ecodes` on some Python minors) make auditwheel
+        // raise InvalidLibcError before it can classify the wheel. The
+        // pre-repair pipeline above already proved the stronger contract —
+        // RPATHs scrubbed, glibc floor symbol scan, dependency provenance
+        // preflight — so repair would be a no-op; accept the wheel as-is.
+        let rendered = format!("{error:#}");
+        if rendered.contains("InvalidLibcError") || rendered.contains("couldn't detect libc") {
+            tracing::warn!(
+                wheel = %wheel.display(),
+                "auditwheel could not detect a libc dependency; accepting the \
+                 pre-validated wheel without auditwheel repair"
+            );
+            return Ok(wheel.to_path_buf());
+        }
+        return Err(error);
+    }
 
     let mut repaired = Vec::new();
     for entry in std::fs::read_dir(&repair_dir)
