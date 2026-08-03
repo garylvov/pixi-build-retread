@@ -10,7 +10,7 @@
 //!
 //! ```bash
 //! env -u SLURM_JOB_ID rustup run 1.97.0 cargo test \
-//!   --test hermetic_native_build_live hermetic_evdev_sdist_builds_end_to_end \
+//!   --test hermetic_native_build_live closure_blocking_evdev_entry_builds_hermetically \
 //!   -- --include-ignored --test-threads=4 --nocapture
 //! ```
 
@@ -135,7 +135,7 @@ fn assert_native_archive_tag(
 ) {
     let metadata = read_metadata(wheel).expect("read built evdev wheel metadata");
     assert_eq!(metadata.name.to_ascii_lowercase(), "evdev");
-    assert_eq!(metadata.version, "1.9.3");
+    assert_eq!(metadata.version, "1.7.1");
     assert!(!metadata.is_pure_python, "evdev wheel must be native");
 
     let file = fs::File::open(wheel).expect("open built wheel archive");
@@ -220,7 +220,7 @@ fn assert_native_archive_tag(
 
 #[tokio::test]
 #[ignore = "live: needs PyPI/conda-forge, uv, and rattler-build >=0.70"]
-async fn hermetic_evdev_sdist_builds_end_to_end() {
+async fn closure_blocking_evdev_entry_builds_hermetically() {
     assert_eq!(std::env::consts::OS, "linux", "test requires Linux");
     assert_eq!(std::env::consts::ARCH, "x86_64", "test requires x86_64");
     require_on_path("uv");
@@ -246,8 +246,7 @@ async fn hermetic_evdev_sdist_builds_end_to_end() {
 
     let workspace = test_dir.path().join("workspace");
     let pack = workspace.join("pack");
-    let project = pack.join("root-project");
-    fs::create_dir_all(project.join("retread_hermetic_root")).expect("create root Python project");
+    fs::create_dir_all(&pack).expect("create live-test pack");
     fs::write(
         workspace.join("pixi.toml"),
         r#"[workspace]
@@ -267,25 +266,6 @@ version = "1.0.0"
 "#,
     )
     .expect("write live-test pack manifest");
-    fs::write(
-        project.join("pyproject.toml"),
-        r#"[build-system]
-requires = ["setuptools>=61"]
-build-backend = "setuptools.build_meta"
-
-[project]
-name = "retread-hermetic-root"
-version = "1.0.0"
-dependencies = ["evdev==1.9.3"]
-"#,
-    )
-    .expect("write live-test Python project");
-    fs::write(
-        project.join("retread_hermetic_root/__init__.py"),
-        "\"\"\"Hermetic native build integration-test root.\"\"\"\n",
-    )
-    .expect("write live-test Python package");
-
     let handler = Handler::new();
     handler
         .dispatch(
@@ -296,9 +276,7 @@ dependencies = ["evdev==1.9.3"]
                 "workspaceDirectory": &workspace,
                 "cacheDirectory": test_dir.path().join("handler-cache"),
                 "configuration": {
-                    "retread-wheels": {
-                        "retread-hermetic-root": { "path": "root-project" }
-                    },
+                    "retread-wheels": { "evdev": { "version": "==1.7.1" } },
                     "retread-python": "3.11",
                     "retread-auto-bundle": true,
                     "retread-auto-route": false,

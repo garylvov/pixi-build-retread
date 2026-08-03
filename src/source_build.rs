@@ -105,6 +105,18 @@ impl ExpectedWheel {
     }
 }
 
+fn evdev_supports_reproducible_ecodes(expected: Option<&ExpectedWheel>) -> bool {
+    let Some(version) = expected.and_then(|wheel| wheel.version.as_deref()) else {
+        return false;
+    };
+    let Ok(version) = uv_pep508::uv_pep440::Version::from_str(version) else {
+        return false;
+    };
+    let minimum = uv_pep508::uv_pep440::Version::from_str("1.9.2")
+        .expect("the evdev reproducible-ecodes minimum is a valid version");
+    version >= minimum
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BuiltWheelMarker {
     schema: String,
@@ -1263,6 +1275,19 @@ where
         })
         .await
         .context("hermetic native wheel tag validation task panicked")??;
+        let filename = built
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_else(|| built.as_os_str().to_string_lossy());
+        tracing::info!(
+            wheel = %filename,
+            platform_tag = %environment.platform_tag(),
+            "hermetic symbol-scan passed (GLIBC/GLIBCXX/CXXABI)"
+        );
+        tracing::info!(
+            wheel = %filename,
+            "hermetic GLIBCXX -> libstdcxx-ng run-dep emission: none required after static policy repair"
+        );
         BuiltWheelEnvironment::Hermetic {
             sysroot: crate::glibc::format_glibc(environment.selected_sysroot()),
             platform_tag: environment.platform_tag().to_string(),
@@ -3438,8 +3463,13 @@ async fn build_wheel_from_sdist_url_for_target_with_requirement(
                     args.extend([
                         "-C=--build-option=build_ecodes".to_string(),
                         format!("-C=--build-option=--evdev-headers={headers}"),
-                        "-C=--build-option=--reproducible".to_string(),
                     ]);
+                    // evdev added this build_ecodes flag in 1.9.2. The
+                    // closure fallback must also support older sdist-only
+                    // releases such as the explicitly pinned 1.7.1.
+                    if evdev_supports_reproducible_ecodes(expected) {
+                        args.push("-C=--build-option=--reproducible".to_string());
+                    }
                 }
                 args.push(sdist_path.display().to_string());
                 let args = args.iter().map(String::as_str).collect::<Vec<_>>();
@@ -8124,6 +8154,14 @@ version = "0.1.0"
     #[test]
     fn sdist_builds_pin_the_last_pkg_resources_setuptools_line() {
         assert_eq!(SDIST_BUILD_CONSTRAINTS, "setuptools<81\n");
+    }
+
+    #[test]
+    fn legacy_evdev_closure_sdist_omits_unsupported_reproducible_option() {
+        let legacy = ExpectedWheel::exact("evdev", "1.7.1");
+        let supported = ExpectedWheel::exact("evdev", "1.9.2");
+        assert!(!evdev_supports_reproducible_ecodes(Some(&legacy)));
+        assert!(evdev_supports_reproducible_ecodes(Some(&supported)));
     }
 
     #[test]
