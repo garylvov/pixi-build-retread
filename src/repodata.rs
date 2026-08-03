@@ -65,9 +65,21 @@ pub async fn sparse(channel_url: &str, subdir: &str) -> Option<Arc<SparseRepoDat
                 .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new())),
         )
     };
-    cell.get_or_init(|| build_sparse(channel_url.to_string(), subdir.to_string()))
+    let handle = cell
+        .get_or_init(|| build_sparse(channel_url.to_string(), subdir.to_string()))
         .await
-        .clone()
+        .clone();
+    // Never memoize a failure: a transient fetch/open error at one call site
+    // must not poison every later solve in this process. Evict the cell so
+    // the next caller rebuilds; a racing duplicate build is harmless.
+    if handle.is_none() {
+        let mut map = SPARSE_CACHE
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap();
+        map.remove(&(channel_url.to_string(), subdir.to_string()));
+    }
+    handle
 }
 
 /// Build the ordered (channel_url, subdir) work list for a given
@@ -128,13 +140,13 @@ async fn build_sparse(channel_url: String, subdir: String) -> Option<Arc<SparseR
             }
             Err(e) => {
                 if !path.exists() {
-                    tracing::debug!(
+                    tracing::warn!(
                         channel = %channel_url, subdir = %subdir, error = %format!("{e:#}"),
                         "repodata: unreachable and no disk cache; pair not consulted",
                     );
                     return None;
                 }
-                tracing::debug!(
+                tracing::warn!(
                     channel = %channel_url, subdir = %subdir, error = %format!("{e:#}"),
                     "repodata: refresh failed; using stale disk cache",
                 );
@@ -144,7 +156,16 @@ async fn build_sparse(channel_url: String, subdir: String) -> Option<Arc<SparseR
     // mmap + sparse header parse on the blocking pool (the LazyRepoData
     // deserialize walks the whole document's key structure once).
     let cfg = ChannelConfig::default_with_root_dir(std::env::temp_dir());
-    let channel = Channel::from_str(&channel_url, &cfg).ok()?;
+    let channel = match Channel::from_str(&channel_url, &cfg) {
+        Ok(channel) => channel,
+        Err(error) => {
+            tracing::warn!(
+                channel = %channel_url, error = %error,
+                "repodata: channel URL failed to parse; pair not consulted",
+            );
+            return None;
+        }
+    };
     let subdir_clone = subdir.clone();
     let path_clone = path.clone();
     let built = match tokio::task::spawn_blocking(move || {
@@ -177,7 +198,7 @@ async fn build_sparse(channel_url: String, subdir: String) -> Option<Arc<SparseR
             Some(Arc::new(s))
         }
         Err(e) => {
-            tracing::debug!(
+            tracing::warn!(
                 channel = %channel_url, subdir = %subdir, error = %e,
                 "repodata: sparse open failed",
             );
