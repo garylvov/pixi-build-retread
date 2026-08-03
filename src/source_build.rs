@@ -252,7 +252,8 @@ fn pyproject_from_sdist(bytes: &[u8], filename: &str) -> Result<Option<String>> 
             .min_by_key(|(depth, _)| *depth)
             .map(|(_, value)| value)
     };
-    if filename.ends_with(".zip") {
+    let lowercase_filename = filename.to_ascii_lowercase();
+    if lowercase_filename.ends_with(".zip") {
         let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))?;
         let mut candidates = Vec::new();
         for index in 0..archive.len() {
@@ -266,8 +267,23 @@ fn pyproject_from_sdist(bytes: &[u8], filename: &str) -> Result<Option<String>> 
         }
         return Ok(select(candidates));
     }
-    if filename.ends_with(".tar.gz") || filename.ends_with(".tgz") {
+    if lowercase_filename.ends_with(".tar.gz") || lowercase_filename.ends_with(".tgz") {
         let decoder = flate2::read::GzDecoder::new(bytes);
+        let mut archive = tar::Archive::new(decoder);
+        let mut candidates = Vec::new();
+        for entry in archive.entries()? {
+            let mut entry = entry?;
+            let path = entry.path()?.to_string_lossy().into_owned();
+            if path.ends_with("pyproject.toml") {
+                let mut value = String::new();
+                entry.read_to_string(&mut value)?;
+                candidates.push((path.matches('/').count(), value));
+            }
+        }
+        return Ok(select(candidates));
+    }
+    if lowercase_filename.ends_with(".tar.bz2") {
+        let decoder = bzip2::read::MultiBzDecoder::new(bytes);
         let mut archive = tar::Archive::new(decoder);
         let mut candidates = Vec::new();
         for entry in archive.entries()? {
@@ -3351,7 +3367,7 @@ pub(crate) async fn build_wheel_from_path_for_target(
                 .unwrap_or_default(),
         ],
     );
-    let pyproject = pyproject_from_directory(&canonical_source)?;
+    let pyproject = pyproject_from_directory(&prepared.root().join(&project_relative))?;
     let build_requirements =
         resolve_build_requirements(pyproject.as_deref(), &base_source_identity, target, false)
             .await?;
@@ -8511,6 +8527,32 @@ version = "0.1.0"
     #[test]
     fn legacy_sdist_build_requirements_stay_on_compatible_tool_lines() {
         assert_eq!(SDIST_BUILD_CONSTRAINTS, "setuptools<81\ncmake<4\n");
+    }
+
+    #[test]
+    fn tar_bz2_sdist_build_requirements_are_inspected() {
+        const PYPROJECT: &[u8] = b"[build-system]\nrequires = [\"setuptools>=68\", \"wheel\"]\n";
+        let encoder = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::best());
+        let mut archive = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(PYPROJECT.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "demo-1.0/pyproject.toml", PYPROJECT)
+            .unwrap();
+        let bytes = archive.into_inner().unwrap().finish().unwrap();
+
+        let pyproject = pyproject_from_sdist(&bytes, "demo-1.0.tar.bz2").unwrap();
+        assert_eq!(
+            build_system_requirements(pyproject.as_deref()).unwrap(),
+            vec!["setuptools>=68", "wheel"]
+        );
+        assert!(
+            pyproject_from_sdist(&bytes, "demo-1.0.TAR.BZ2")
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]

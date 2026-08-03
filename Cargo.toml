@@ -50,6 +50,7 @@ reqwest = { version = "0.12.12", default-features = false, features = ["rustls-t
 zip = { version = "6.0.0", default-features = false, features = ["deflate"] }
 tar = "0.4"
 flate2 = "1"
+bzip2 = "0.6"
 sha2 = "0.10"
 # Match Pixi's detached-environment directory identity exactly.
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }

@@ -1772,6 +1772,7 @@ name = "pixi-build-retread"
 version = "4.10.48"
 dependencies = [
  "anyhow",
+ "bzip2",
  "flate2",
  "fs4",
  "futures",

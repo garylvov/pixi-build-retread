@@ -12,13 +12,14 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{Context, Result, anyhow, bail};
+use rattler_conda_types::{MatchSpec, ParseStrictness, PrefixRecord, RepoDataRecord};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
 
-const CACHE_SCHEMA: &str = "retread-hermetic-build-environment-v6";
+const CACHE_SCHEMA: &str = "retread-hermetic-build-environment-v7";
 const CACHE_NAMESPACE: &str = "hermetic-build-envs";
-const CACHE_VERSION: &str = "v6";
+const CACHE_VERSION: &str = "v7";
 const COMPLETION_MARKER: &str = "complete.json";
 const MIN_RATTLER_BUILD_VERSION: (u64, u64, u64) = (0, 70, 0);
 
@@ -170,21 +171,91 @@ struct DebugRequirements {
     host: Vec<String>,
 }
 
-fn solved_records_digest(solved: &crate::conda_solve::HermeticBuildSolve) -> Result<String> {
-    let mut records = solved
-        .records
-        .iter()
-        .map(serde_json::to_vec)
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .context("serializing hermetic toolchain solve")?;
-    records.sort();
-    let mut digest = Sha256::new();
-    digest.update(b"retread-hermetic-toolchain-solve-v1\0");
-    for record in records {
-        digest.update((record.len() as u64).to_be_bytes());
-        digest.update(record);
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ProvisionedRecordIdentity {
+    channel: String,
+    subdir: String,
+    name: String,
+    version: String,
+    build: String,
+}
+
+impl ProvisionedRecordIdentity {
+    fn from_repodata_record(record: &RepoDataRecord) -> Result<Self> {
+        let channel = record.platform_url().to_string();
+        let channel = channel.trim_end_matches('/');
+        if channel.is_empty() {
+            bail!(
+                "solved hermetic record `{}` has no channel identity",
+                record.package_record.name.as_normalized()
+            );
+        }
+        Ok(Self {
+            channel: channel.to_string(),
+            subdir: record.package_record.subdir.clone(),
+            name: record.package_record.name.as_normalized().to_string(),
+            version: record.package_record.version.as_str().to_string(),
+            build: record.package_record.build.clone(),
+        })
     }
-    Ok(format!("{:x}", digest.finalize()))
+
+    fn exact_match_spec(&self) -> String {
+        format!(
+            "{}::{} =={} {}",
+            self.channel, self.name, self.version, self.build
+        )
+    }
+}
+
+fn provisioned_records_digest(
+    build: &BTreeSet<ProvisionedRecordIdentity>,
+    host: &BTreeSet<ProvisionedRecordIdentity>,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"retread-hermetic-provisioned-records-v1\0");
+    for (prefix, records) in [("build", build), ("host", host)] {
+        digest.update((prefix.len() as u64).to_be_bytes());
+        digest.update(prefix.as_bytes());
+        digest.update((records.len() as u64).to_be_bytes());
+        for record in records {
+            for field in [
+                &record.channel,
+                &record.subdir,
+                &record.name,
+                &record.version,
+                &record.build,
+            ] {
+                digest.update((field.len() as u64).to_be_bytes());
+                digest.update(field.as_bytes());
+            }
+        }
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn prefix_record_identities(
+    prefix: &Path,
+    label: &str,
+) -> Result<BTreeSet<ProvisionedRecordIdentity>> {
+    PrefixRecord::collect_from_prefix::<PrefixRecord>(prefix)
+        .with_context(|| format!("reading provisioned {label} prefix {}", prefix.display()))?
+        .iter()
+        .map(|record| ProvisionedRecordIdentity::from_repodata_record(&record.repodata_record))
+        .collect()
+}
+
+fn actual_provisioned_records_digest(build_prefix: &Path, host_prefix: &Path) -> Result<String> {
+    let build = prefix_record_identities(build_prefix, "build")?;
+    let host = prefix_record_identities(host_prefix, "host")?;
+    Ok(provisioned_records_digest(&build, &host))
+}
+
+fn solved_records_digest(
+    solved: &crate::conda_solve::HermeticBuildSolve,
+    cuda: bool,
+) -> Result<String> {
+    let (build, host) = solved_recipe_records(solved, cuda)?;
+    Ok(provisioned_records_digest(&build, &host))
 }
 
 /// Provision or reuse a conda-forge compiler environment for one compatibility
@@ -204,7 +275,7 @@ pub(crate) async fn provision(
     )
     .await
     .map_err(|reasons| anyhow!(reasons.join("; ")))?;
-    let toolchain_digest = solved_records_digest(&solved)?;
+    let toolchain_digest = solved_records_digest(&solved, cuda_version.is_some())?;
     let request = ProvisionRequest {
         target_floor,
         python_minor,
@@ -1776,8 +1847,7 @@ async fn provision_uncached(
     let rattler_build = rattler_build_executable()?;
     ensure_rattler_build_version(&rattler_build, &rattler_scratch).await?;
     let root_versions = root_versions(solved, request.cuda_version.is_some())?;
-    let root_builds = root_builds(solved, &root_versions)?;
-    let recipe = render_debug_recipe(&root_versions, &root_builds, request.cuda_version.is_some())?;
+    let recipe = render_debug_recipe(solved, request.cuda_version.is_some())?;
 
     let recipe_dir = cache_dir.join("recipe");
     let recipe_path = recipe_dir.join("recipe.yaml");
@@ -2062,49 +2132,104 @@ fn root_versions(
     Ok(versions)
 }
 
-fn root_builds(
+fn solved_records_by_name(
     solved: &crate::conda_solve::HermeticBuildSolve,
-    root_versions: &BTreeMap<String, String>,
-) -> Result<BTreeMap<String, String>> {
-    root_versions
+) -> Result<BTreeMap<String, &RepoDataRecord>> {
+    let mut records = BTreeMap::new();
+    for record in &solved.records {
+        let name = record.package_record.name.as_normalized().to_string();
+        if records.insert(name.clone(), record).is_some() {
+            bail!("hermetic compiler solve selected more than one record for `{name}`");
+        }
+    }
+    Ok(records)
+}
+
+fn record_closure_names(
+    records: &BTreeMap<String, &RepoDataRecord>,
+    roots: &[&str],
+) -> Result<BTreeSet<String>> {
+    let mut pending = roots
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect::<Vec<_>>();
+    let mut selected = BTreeSet::new();
+    while let Some(name) = pending.pop() {
+        if !selected.insert(name.clone()) {
+            continue;
+        }
+        let record = records
+            .get(&name)
+            .ok_or_else(|| anyhow!("hermetic compiler solve omitted required record `{name}`"))?;
+        for dependency in &record.package_record.depends {
+            let spec = MatchSpec::from_str(dependency, ParseStrictness::Lenient)
+                .with_context(|| format!("parsing solved dependency `{dependency}`"))?;
+            let dependency_name = spec
+                .name
+                .as_ref()
+                .and_then(|name| name.as_exact())
+                .ok_or_else(|| anyhow!("solved dependency has no exact name: `{dependency}`"))?
+                .as_normalized();
+            if records.contains_key(dependency_name) {
+                pending.push(dependency_name.to_string());
+            } else if !dependency_name.starts_with("__") {
+                bail!(
+                    "hermetic compiler solve omitted dependency `{dependency_name}` required by `{name}`"
+                );
+            }
+        }
+    }
+    Ok(selected)
+}
+
+fn solved_recipe_records(
+    solved: &crate::conda_solve::HermeticBuildSolve,
+    cuda: bool,
+) -> Result<(
+    BTreeSet<ProvisionedRecordIdentity>,
+    BTreeSet<ProvisionedRecordIdentity>,
+)> {
+    let records = solved_records_by_name(solved)?;
+    let mut build_roots = vec![
+        "gcc_linux-64",
+        "gxx_linux-64",
+        "sysroot_linux-64",
+        "patchelf",
+        "cmake",
+        "make",
+        "ninja",
+    ];
+    if cuda {
+        build_roots.push("cuda-nvcc_linux-64");
+    }
+    let build_names = record_closure_names(&records, &build_roots)?;
+    let host_names = record_closure_names(&records, &["python", "auditwheel"])?;
+    let covered = build_names.union(&host_names).collect::<BTreeSet<_>>();
+    let unpinned = records
         .keys()
-        .map(|name| {
-            let record = solved
-                .records
-                .iter()
-                .find(|record| record.package_record.name.as_normalized() == name)
-                .ok_or_else(|| anyhow!("hermetic compiler solve omitted required root `{name}`"))?;
-            Ok((name.clone(), record.package_record.build.clone()))
-        })
-        .collect()
+        .filter(|name| !covered.contains(name))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unpinned.is_empty() {
+        bail!(
+            "hermetic compiler solve contains records unreachable from rendered roots: {}",
+            unpinned.join(", ")
+        );
+    }
+    let identities = |names: BTreeSet<String>| -> Result<BTreeSet<ProvisionedRecordIdentity>> {
+        names
+            .into_iter()
+            .map(|name| ProvisionedRecordIdentity::from_repodata_record(records[&name]))
+            .collect()
+    };
+    Ok((identities(build_names)?, identities(host_names)?))
 }
 
 fn render_debug_recipe(
-    root_versions: &BTreeMap<String, String>,
-    root_builds: &BTreeMap<String, String>,
+    solved: &crate::conda_solve::HermeticBuildSolve,
     cuda: bool,
 ) -> Result<Vec<u8>> {
-    let exact = |name: &str| -> Result<String> {
-        let version = root_versions
-            .get(name)
-            .ok_or_else(|| anyhow!("missing solved version for `{name}`"))?;
-        let build = root_builds
-            .get(name)
-            .ok_or_else(|| anyhow!("missing solved build string for `{name}`"))?;
-        Ok(format!("{name} =={version} {build}"))
-    };
-    let mut build = vec![
-        exact("gcc_linux-64")?,
-        exact("gxx_linux-64")?,
-        exact("sysroot_linux-64")?,
-        exact("patchelf")?,
-        exact("cmake")?,
-        exact("make")?,
-        exact("ninja")?,
-    ];
-    if cuda {
-        build.push(exact("cuda-nvcc_linux-64")?);
-    }
+    let (build, host) = solved_recipe_records(solved, cuda)?;
     let recipe = DebugRecipe {
         schema_version: 1,
         package: DebugPackage {
@@ -2117,12 +2242,20 @@ fn render_debug_recipe(
             script: vec!["true".to_string()],
         },
         requirements: DebugRequirements {
-            build,
+            // Pin every record reachable from each prefix's roots, including
+            // channel, so debug setup cannot independently choose different
+            // transitives than the solve represented by the cache digest.
+            build: build
+                .into_iter()
+                .map(|record| record.exact_match_spec())
+                .collect(),
             // Python belongs in host, not build. rattler-build's generated
-            // `$PYTHON` points to the host prefix and compiler activation adds
-            // that prefix's include directory, giving PEP 517 the matching
-            // interpreter and Python.h.
-            host: vec![exact("python")?, exact("auditwheel")?],
+            // `$PYTHON` therefore points to the matching interpreter and
+            // compiler activation adds that prefix's Python.h directory.
+            host: host
+                .into_iter()
+                .map(|record| record.exact_match_spec())
+                .collect(),
         },
     };
     serde_yaml::to_string(&recipe)
@@ -2207,6 +2340,16 @@ fn validate_marker(
         (&marker.host_prefix, "Python host prefix"),
     ] {
         validate_cached_path(cache_dir, path, label, CachedPathKind::Directory)?;
+    }
+    let provisioned_digest =
+        actual_provisioned_records_digest(&marker.build_prefix, &marker.host_prefix)?;
+    if provisioned_digest != request.toolchain_digest {
+        bail!(
+            "provisioned hermetic records do not match toolchain digest at {}: expected {}, found {}",
+            cache_dir.display(),
+            request.toolchain_digest,
+            provisioned_digest,
+        );
     }
     validate_cached_path(
         cache_dir,
@@ -2861,6 +3004,74 @@ async fn write_completion_marker(path: &Path, marker: &CompletionMarker) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
+
+    fn test_solved_record(
+        name: &str,
+        version: &str,
+        build: &str,
+        depends: &[&str],
+    ) -> RepoDataRecord {
+        let mut package_record = rattler_conda_types::PackageRecord::new(
+            name.parse().unwrap(),
+            rattler_conda_types::VersionWithSource::from_str(version).unwrap(),
+            build.to_string(),
+        );
+        package_record.subdir = "linux-64".to_string();
+        package_record.depends = depends
+            .iter()
+            .map(|dependency| (*dependency).to_string())
+            .collect();
+        let file_name = format!("{name}-{version}-{build}.conda");
+        RepoDataRecord {
+            package_record,
+            url: url::Url::parse(&format!(
+                "https://prefix.dev/conda-forge/linux-64/{file_name}"
+            ))
+            .unwrap(),
+            file_name,
+            channel: Some("https://prefix.dev/conda-forge/".to_string()),
+        }
+    }
+
+    fn test_hermetic_solve() -> crate::conda_solve::HermeticBuildSolve {
+        let records = vec![
+            test_solved_record("auditwheel", "6.7.0", "pyhd8ed1ab_0", &["host-helper >=1"]),
+            test_solved_record("build-helper", "1.0", "hbuild_0", &[]),
+            test_solved_record("cmake", "3.31.6", "h123456_0", &[]),
+            test_solved_record(
+                "gcc_linux-64",
+                "13.4.0",
+                "h123456_0",
+                &["build-helper >=1", "shared-runtime >=1"],
+            ),
+            test_solved_record(
+                "gxx_linux-64",
+                "13.4.0",
+                "h123456_0",
+                &["shared-runtime >=1"],
+            ),
+            test_solved_record("host-helper", "1.0", "hhost_0", &[]),
+            test_solved_record("make", "4.4.1", "h123456_0", &[]),
+            test_solved_record("ninja", "1.13.1", "h123456_0", &[]),
+            test_solved_record("patchelf", "0.18.0", "h123456_0", &[]),
+            test_solved_record(
+                "python",
+                "3.11.15",
+                "hpython_0",
+                &["host-helper >=1", "shared-runtime >=1"],
+            ),
+            test_solved_record("shared-runtime", "2.0", "hshared_0", &[]),
+            test_solved_record("sysroot_linux-64", "2.28", "h123456_0", &[]),
+        ];
+        crate::conda_solve::HermeticBuildSolve {
+            sysroot: crate::conda_solve::SelectedSysroot {
+                conda_version: "2.28".to_string(),
+                glibc_floor: (2, 28),
+            },
+            records,
+        }
+    }
 
     fn test_elf(machine: u16) -> Vec<u8> {
         let mut bytes = vec![0u8; 64];
@@ -2963,72 +3174,54 @@ mod tests {
     }
 
     #[test]
-    fn debug_recipe_keeps_python_in_host_and_toolchain_in_build() {
-        let roots = BTreeMap::from([
-            ("auditwheel".to_string(), "6.7.0".to_string()),
-            ("cmake".to_string(), "3.31.6".to_string()),
-            ("gcc_linux-64".to_string(), "14.3.0".to_string()),
-            ("gxx_linux-64".to_string(), "14.3.0".to_string()),
-            ("make".to_string(), "4.4.1".to_string()),
-            ("ninja".to_string(), "1.13.1".to_string()),
-            ("patchelf".to_string(), "0.18.0".to_string()),
-            ("python".to_string(), "3.11.15".to_string()),
-            ("sysroot_linux-64".to_string(), "2.28".to_string()),
-        ]);
-        let builds = roots
-            .keys()
-            .map(|name| (name.clone(), "h123456_0".to_string()))
-            .collect();
-        let rendered =
-            String::from_utf8(render_debug_recipe(&roots, &builds, false).unwrap()).unwrap();
+    fn debug_recipe_pins_every_solved_record_in_its_prefix_closure() {
+        let solved = test_hermetic_solve();
+        let rendered = String::from_utf8(render_debug_recipe(&solved, false).unwrap()).unwrap();
         let yaml: serde_yaml::Value = serde_yaml::from_str(&rendered).unwrap();
         let build = yaml["requirements"]["build"].as_sequence().unwrap();
         let host = yaml["requirements"]["host"].as_sequence().unwrap();
-        assert!(
-            build
-                .iter()
-                .any(|value| value.as_str() == Some("gcc_linux-64 ==14.3.0 h123456_0"))
-        );
-        assert!(
-            build
-                .iter()
-                .any(|value| value.as_str() == Some("sysroot_linux-64 ==2.28 h123456_0"))
-        );
-        assert_eq!(host[0].as_str(), Some("python ==3.11.15 h123456_0"));
-        assert!(
-            host.iter()
-                .any(|value| value.as_str() == Some("auditwheel ==6.7.0 h123456_0"))
-        );
-        assert!(
-            build
-                .iter()
-                .any(|value| value.as_str() == Some("cmake ==3.31.6 h123456_0"))
-        );
-        assert!(
-            build
-                .iter()
-                .any(|value| value.as_str() == Some("ninja ==1.13.1 h123456_0"))
-        );
+        assert!(build.iter().any(|value| value.as_str()
+            == Some("https://prefix.dev/conda-forge/linux-64::gcc_linux-64 ==13.4.0 h123456_0")));
+        assert!(build.iter().any(|value| value.as_str()
+            == Some("https://prefix.dev/conda-forge/linux-64::build-helper ==1.0 hbuild_0")));
+        assert!(host.iter().any(|value| value.as_str()
+            == Some("https://prefix.dev/conda-forge/linux-64::host-helper ==1.0 hhost_0")));
+        assert!(build.iter().any(|value| value.as_str()
+            == Some("https://prefix.dev/conda-forge/linux-64::shared-runtime ==2.0 hshared_0")));
+        assert!(host.iter().any(|value| value.as_str()
+            == Some("https://prefix.dev/conda-forge/linux-64::shared-runtime ==2.0 hshared_0")));
         assert!(!build.iter().any(|value| {
             value
                 .as_str()
-                .is_some_and(|value| value.starts_with("python "))
+                .is_some_and(|value| value.contains("::python "))
+        }));
+        assert!(!host.iter().any(|value| {
+            value
+                .as_str()
+                .is_some_and(|value| value.contains("::gcc_linux-64 "))
         }));
 
-        let mut cuda_roots = roots.clone();
-        cuda_roots.insert("cuda-nvcc_linux-64".to_string(), "12.9.1".to_string());
-        let mut cuda_builds = builds;
-        cuda_builds.insert("cuda-nvcc_linux-64".to_string(), "h123456_0".to_string());
+        let mut cuda_solved = solved;
+        cuda_solved.records.push(test_solved_record(
+            "cuda-nvcc_linux-64",
+            "12.9.1",
+            "hcuda_0",
+            &["build-helper >=1"],
+        ));
         let cuda_rendered =
-            String::from_utf8(render_debug_recipe(&cuda_roots, &cuda_builds, true).unwrap())
-                .unwrap();
+            String::from_utf8(render_debug_recipe(&cuda_solved, true).unwrap()).unwrap();
         let cuda_yaml: serde_yaml::Value = serde_yaml::from_str(&cuda_rendered).unwrap();
         assert!(
             cuda_yaml["requirements"]["build"]
                 .as_sequence()
                 .unwrap()
                 .iter()
-                .any(|value| { value.as_str() == Some("cuda-nvcc_linux-64 ==12.9.1 h123456_0") })
+                .any(|value| {
+                    value.as_str()
+                        == Some(
+                            "https://prefix.dev/conda-forge/linux-64::cuda-nvcc_linux-64 ==12.9.1 hcuda_0"
+                        )
+                })
         );
     }
 
