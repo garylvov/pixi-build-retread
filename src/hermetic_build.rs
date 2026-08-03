@@ -1694,6 +1694,16 @@ fn activation_hook_paths(cache_dir: &Path, activation_script: &Path) -> Result<V
             .strip_prefix(". ")
             .ok_or_else(|| anyhow!("unsupported compiler activation hook statement `{line}`"))?
             .trim();
+        // Rattler writes `~`-prefixed rename artifacts (e.g.
+        // `~cuda-nvcc_activate.sh`) into activate.d during transactions;
+        // they are not real hooks and must not be sourced.
+        if candidate
+            .rsplit('/')
+            .next()
+            .is_some_and(|name| name.starts_with('~'))
+        {
+            continue;
+        }
         if candidate.is_empty()
             || !candidate.bytes().all(|byte| {
                 byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-' | b'+')
