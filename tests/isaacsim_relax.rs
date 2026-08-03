@@ -84,6 +84,7 @@ fn baseline_config() -> RetreadConfig {
         ledger_overrides: Default::default(),
         pack_manifest_path: None,
         sdist_build: Default::default(),
+        hermetic: true,
     }
 }
 

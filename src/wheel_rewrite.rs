@@ -11,12 +11,13 @@
 //! it reads the wheel's own METADATA from `$PREFIX/.../dist-info/`.
 //! Rewriting the wheel itself loosens both sides simultaneously.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::io::{Cursor, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use sha2::{Digest, Sha256};
 use uv_pep508::Requirement;
 use uv_pep508::uv_pep440::{Operator, Version};
@@ -91,6 +92,16 @@ pub(crate) fn rewrite_wheel_with(
     dst: &Path,
     map: &dyn Fn(&str) -> LineAction,
 ) -> Result<(String, bool)> {
+    rewrite_wheel_metadata_with(src, dst, &|metadata| {
+        rewrite_metadata_text_with(metadata, map)
+    })
+}
+
+fn rewrite_wheel_metadata_with(
+    src: &Path,
+    dst: &Path,
+    transform: &dyn Fn(&str) -> Result<String>,
+) -> Result<(String, bool)> {
     let bytes = std::fs::read(src).with_context(|| format!("reading {}", src.display()))?;
     let mut archive = ZipArchive::new(Cursor::new(&bytes))
         .with_context(|| format!("opening zip {}", src.display()))?;
@@ -126,7 +137,7 @@ pub(crate) fn rewrite_wheel_with(
         .read_to_string(&mut record_str)?;
 
     // Rewrite METADATA via the mapper.
-    let new_metadata = rewrite_metadata_text_with(&metadata_str, map)?;
+    let new_metadata = transform(&metadata_str)?;
     if new_metadata == metadata_str {
         // Nothing changed; hard-link when possible (free for
         // multi-GB wheels on the same filesystem), else copy. Atomic:
@@ -203,6 +214,362 @@ pub(crate) fn rewrite_wheel_with(
     // sha256 of the rewritten wheel file (for recipe.yaml's source: sha256).
     let dst_bytes = std::fs::read(dst)?;
     Ok((sha256_hex(&dst_bytes), true))
+}
+
+pub(crate) fn inject_native_abi_metadata(
+    src: &Path,
+    dst: &Path,
+    conda_run_dependency: Option<&str>,
+    needed: &[String],
+    glibcxx_versions: &[String],
+    cxxabi_versions: &[String],
+) -> Result<String> {
+    rewrite_wheel_metadata_with(src, dst, &|metadata| {
+        let separator = metadata
+            .find("\r\n\r\n")
+            .map(|offset| (offset, "\r\n"))
+            .or_else(|| metadata.find("\n\n").map(|offset| (offset, "\n")));
+        let newline = separator.map_or("\n", |(_, newline)| newline);
+        let mut additions = String::new();
+        if let Some(requirement) = conda_run_dependency {
+            writeln!(additions, "X-Retread-Conda-Run-Depends: {requirement}")?;
+        }
+        writeln!(additions, "X-Retread-DT-Needed: {}", needed.join(","))?;
+        writeln!(
+            additions,
+            "X-Retread-GLIBCXX-Versions: {}",
+            glibcxx_versions.join(",")
+        )?;
+        writeln!(
+            additions,
+            "X-Retread-CXXABI-Versions: {}",
+            cxxabi_versions.join(",")
+        )?;
+        if newline == "\r\n" {
+            additions = additions.replace('\n', "\r\n");
+        }
+        let mut rewritten = String::with_capacity(metadata.len() + additions.len());
+        if let Some((offset, separator_newline)) = separator {
+            rewritten.push_str(&metadata[..offset]);
+            rewritten.push_str(separator_newline);
+            rewritten.push_str(&additions);
+            rewritten.push_str(&metadata[offset + separator_newline.len()..]);
+        } else {
+            rewritten.push_str(metadata);
+            if !metadata.ends_with('\n') {
+                rewritten.push_str(newline);
+            }
+            rewritten.push_str(&additions);
+            rewritten.push_str(newline);
+        }
+        Ok(rewritten)
+    })
+    .map(|(sha, _)| sha)
+}
+
+fn valid_wheel_tag_field(field: &str) -> bool {
+    !field.is_empty()
+        && field.split('.').all(|component| {
+            !component.is_empty()
+                && component
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        })
+}
+
+fn retagged_native_wheel_filename(
+    filename: &str,
+    expected_platform_tag: &str,
+) -> Result<(String, String, String, String)> {
+    if expected_platform_tag == "any"
+        || expected_platform_tag.contains('.')
+        || !valid_wheel_tag_field(expected_platform_tag)
+    {
+        bail!(
+            "expected native wheel platform tag `{expected_platform_tag}` is not one valid platform component"
+        );
+    }
+    if crate::pypi::wheel_filename_identity(filename).is_none() {
+        bail!("wheel filename `{filename}` is not a valid PEP 427 wheel filename");
+    }
+    let stem = filename
+        .strip_suffix(".whl")
+        .expect("validated wheel filename has .whl suffix");
+    let mut fields = stem.rsplitn(4, '-');
+    let (Some(old_platform), Some(abi), Some(python), Some(identity)) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+    else {
+        bail!("wheel filename `{filename}` has no complete compatibility tag");
+    };
+    if !valid_wheel_tag_field(python)
+        || !valid_wheel_tag_field(abi)
+        || !valid_wheel_tag_field(old_platform)
+    {
+        bail!("wheel filename `{filename}` has a malformed compatibility tag");
+    }
+    Ok((
+        format!("{identity}-{python}-{abi}-{expected_platform_tag}.whl"),
+        python.to_string(),
+        abi.to_string(),
+        old_platform.to_string(),
+    ))
+}
+
+fn rewrite_native_wheel_platform_tags(
+    raw_wheel: &str,
+    expected_platform_tag: &str,
+    filename_python: &str,
+    filename_abi: &str,
+    filename_platform: &str,
+) -> Result<String> {
+    let mut out = String::with_capacity(raw_wheel.len());
+    let mut in_headers = true;
+    let mut root_is_purelib = Vec::new();
+    let expected_tags = filename_python
+        .split('.')
+        .flat_map(|python| {
+            filename_abi.split('.').flat_map(move |abi| {
+                filename_platform
+                    .split('.')
+                    .map(move |platform| format!("{python}-{abi}-{platform}"))
+            })
+        })
+        .collect::<BTreeSet<_>>();
+    let mut seen_tags = BTreeSet::new();
+
+    for line in raw_wheel.split_inclusive('\n') {
+        let (body, ending) = if let Some(body) = line.strip_suffix("\r\n") {
+            (body, "\r\n")
+        } else if let Some(body) = line.strip_suffix('\n') {
+            (body, "\n")
+        } else {
+            (line, "")
+        };
+        if in_headers && body.trim().is_empty() {
+            in_headers = false;
+        }
+        if !in_headers || body.starts_with(' ') || body.starts_with('\t') {
+            out.push_str(line);
+            continue;
+        }
+        let Some((key, value)) = body.split_once(':') else {
+            out.push_str(line);
+            continue;
+        };
+        if key.trim().eq_ignore_ascii_case("Root-Is-Purelib") {
+            root_is_purelib.push(value.trim());
+            out.push_str(line);
+            continue;
+        }
+        if !key.trim().eq_ignore_ascii_case("Tag") {
+            out.push_str(line);
+            continue;
+        }
+
+        let tag = value.trim();
+        let mut fields = tag.split('-');
+        let (Some(python), Some(abi), Some(old_platform)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            bail!("malformed WHEEL metadata tag `{tag}`");
+        };
+        if fields.next().is_some()
+            || python.contains('.')
+            || abi.contains('.')
+            || old_platform.contains('.')
+            || !valid_wheel_tag_field(python)
+            || !valid_wheel_tag_field(abi)
+            || !valid_wheel_tag_field(old_platform)
+        {
+            bail!("malformed WHEEL metadata tag `{tag}`");
+        }
+        let original_tag = format!("{python}-{abi}-{old_platform}");
+        if !expected_tags.contains(&original_tag) {
+            bail!(
+                "WHEEL metadata tag `{tag}` is not compatible with the filename's compressed compatibility tag"
+            );
+        }
+        if !seen_tags.insert(original_tag) {
+            bail!("WHEEL metadata has duplicate tag `{tag}`");
+        }
+        let colon = body
+            .find(':')
+            .expect("split_once found the WHEEL header colon");
+        out.push_str(&body[..=colon]);
+        out.push(' ');
+        out.push_str(python);
+        out.push('-');
+        out.push_str(abi);
+        out.push('-');
+        out.push_str(expected_platform_tag);
+        out.push_str(ending);
+    }
+
+    if root_is_purelib.len() != 1 || !root_is_purelib[0].eq_ignore_ascii_case("false") {
+        bail!("native wheel does not declare exactly one `Root-Is-Purelib: false`");
+    }
+    if seen_tags.is_empty() {
+        bail!("native wheel has no `Tag:` entries in WHEEL metadata");
+    }
+    if seen_tags != expected_tags {
+        bail!(
+            "WHEEL metadata tags do not exactly expand the filename's compressed compatibility tag"
+        );
+    }
+    Ok(out)
+}
+
+/// Retag one native wheel with the exact platform selected for its hermetic
+/// sysroot, updating the filename, root `WHEEL`, and its `RECORD` attestation
+/// together.
+///
+/// The expected tag is a single platform component rather than a compressed
+/// compatibility set. That makes the emitted manylinux claim no broader than
+/// the build environment the caller actually provisioned. The replacement is
+/// built at a same-directory temporary path and atomically promoted before the
+/// old basename is removed; a failed rewrite therefore leaves the input wheel
+/// intact.
+pub(crate) fn retag_native_wheel_platform(
+    wheel_path: &Path,
+    expected_platform_tag: &str,
+) -> Result<PathBuf> {
+    let filename = wheel_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("wheel path has no UTF-8 filename"))?;
+    let (new_filename, filename_python, filename_abi, filename_platform) =
+        retagged_native_wheel_filename(filename, expected_platform_tag)?;
+    let parent = wheel_path
+        .parent()
+        .ok_or_else(|| anyhow!("wheel path has no parent: {}", wheel_path.display()))?;
+    let destination = parent.join(new_filename);
+
+    let bytes = std::fs::read(wheel_path)
+        .with_context(|| format!("reading native wheel {}", wheel_path.display()))?;
+    let mut archive = ZipArchive::new(Cursor::new(&bytes))
+        .with_context(|| format!("opening zip {}", wheel_path.display()))?;
+
+    let mut metadata_entries = Vec::new();
+    let mut wheel_entries = Vec::new();
+    let mut record_entries = Vec::new();
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index)?;
+        let name = entry.name().replace('\\', "/");
+        if name.matches('/').count() != 1 {
+            continue;
+        }
+        if let Some(dist_info) = name.strip_suffix("/METADATA")
+            && dist_info.ends_with(".dist-info")
+        {
+            metadata_entries.push((dist_info.to_string(), name));
+        } else if let Some(dist_info) = name.strip_suffix("/WHEEL")
+            && dist_info.ends_with(".dist-info")
+        {
+            wheel_entries.push((dist_info.to_string(), name));
+        } else if let Some(dist_info) = name.strip_suffix("/RECORD")
+            && dist_info.ends_with(".dist-info")
+        {
+            record_entries.push((dist_info.to_string(), name));
+        }
+    }
+    if metadata_entries.len() != 1 || wheel_entries.len() != 1 {
+        bail!("wheel `{filename}` must contain exactly one root METADATA and WHEEL file");
+    }
+    if record_entries.len() != 1 {
+        bail!("wheel `{filename}` must contain exactly one root RECORD file");
+    }
+    let dist_info = &metadata_entries[0].0;
+    if &wheel_entries[0].0 != dist_info || &record_entries[0].0 != dist_info {
+        bail!(
+            "wheel `{filename}` has METADATA, WHEEL, and RECORD files in different dist-info directories"
+        );
+    }
+    let wheel_name = wheel_entries[0].1.clone();
+    let record_name = record_entries[0].1.clone();
+
+    let mut raw_wheel = String::new();
+    archive
+        .by_name(&wheel_name)?
+        .read_to_string(&mut raw_wheel)
+        .with_context(|| format!("reading `{wheel_name}` in {}", wheel_path.display()))?;
+    let mut raw_record = String::new();
+    archive
+        .by_name(&record_name)?
+        .read_to_string(&mut raw_record)
+        .with_context(|| format!("reading `{record_name}` in {}", wheel_path.display()))?;
+
+    let new_wheel = rewrite_native_wheel_platform_tags(
+        &raw_wheel,
+        expected_platform_tag,
+        &filename_python,
+        &filename_abi,
+        &filename_platform,
+    )?;
+    let new_wheel_bytes = new_wheel.as_bytes();
+    let new_wheel_sha = crate::wheel_inject::sha256_base64_urlsafe_nopad(new_wheel_bytes);
+    let new_record = update_record_line(
+        &raw_record,
+        &wheel_name,
+        &new_wheel_sha,
+        new_wheel_bytes.len(),
+    )?;
+
+    let (tmp, destination_file) = crate::wheel::create_atomic_tmp(&destination)?;
+    let write_result = (|| -> Result<()> {
+        let mut writer = ZipWriter::new(destination_file);
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index)?;
+            let name = entry.name().to_string();
+            let compression = match entry.compression() {
+                CompressionMethod::Stored => CompressionMethod::Stored,
+                _ => CompressionMethod::Deflated,
+            };
+            let mut options = SimpleFileOptions::default()
+                .compression_method(compression)
+                .last_modified_time(zip::DateTime::default())
+                .large_file(entry.size() > u32::MAX as u64);
+            if let Some(mode) = entry.unix_mode() {
+                options = options.unix_permissions(mode);
+            }
+            if entry.is_dir() {
+                writer.add_directory(&name, options)?;
+            } else {
+                writer.start_file(&name, options)?;
+                if name == wheel_name {
+                    writer.write_all(new_wheel_bytes)?;
+                } else if name == record_name {
+                    writer.write_all(new_record.as_bytes())?;
+                } else {
+                    std::io::copy(&mut entry, &mut writer)?;
+                }
+            }
+        }
+        let mut finished = writer.finish()?;
+        finished.flush()?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error).with_context(|| {
+            format!(
+                "rewriting native wheel {} as {}",
+                wheel_path.display(),
+                destination.display()
+            )
+        });
+    }
+    crate::wheel::commit_atomic_write(&tmp, &destination)?;
+
+    if destination != wheel_path {
+        std::fs::remove_file(wheel_path).with_context(|| {
+            format!(
+                "removing original wheel {} after atomically publishing {}",
+                wheel_path.display(),
+                destination.display()
+            )
+        })?;
+    }
+    Ok(destination)
 }
 
 /// Generic form: apply `map` to every `Requires-Dist:` value.
@@ -433,6 +800,9 @@ fn update_record_line(
         let mut fields = trimmed.splitn(3, ',');
         let path = fields.next().unwrap_or("");
         if path == entry_name {
+            if found {
+                bail!("RECORD has duplicate entries for {entry_name}");
+            }
             out.push_str(&format!("{path},sha256={new_sha},{new_size}"));
             if line.ends_with("\r\n") {
                 out.push_str("\r\n");
@@ -448,6 +818,104 @@ fn update_record_line(
         return Err(anyhow!("RECORD has no entry for {entry_name}"));
     }
     Ok(out)
+}
+
+/// Replace binary members after external native-wheel post-processing and
+/// refresh their RECORD attestations without weakening ZIP structure or mode
+/// preservation. The caller supplies archive member names, never filesystem
+/// paths, so extraction traversal is outside this boundary.
+pub(crate) fn replace_wheel_payloads(
+    wheel_path: &Path,
+    replacements: &BTreeMap<String, Vec<u8>>,
+) -> Result<()> {
+    if replacements.is_empty() {
+        return Ok(());
+    }
+    let bytes = std::fs::read(wheel_path)
+        .with_context(|| format!("reading native wheel {}", wheel_path.display()))?;
+    let mut archive = ZipArchive::new(Cursor::new(bytes))
+        .with_context(|| format!("opening native wheel {}", wheel_path.display()))?;
+    let mut record_names = Vec::new();
+    let mut replacement_counts = BTreeMap::<String, usize>::new();
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index)?;
+        let name = entry.name().replace('\\', "/");
+        if name.ends_with(".dist-info/RECORD") && name.matches('/').count() == 1 {
+            record_names.push(name.clone());
+        }
+        if replacements.contains_key(&name) {
+            *replacement_counts.entry(name).or_default() += 1;
+        }
+    }
+    if record_names.len() != 1 {
+        bail!("native wheel must contain exactly one root RECORD file");
+    }
+    for name in replacements.keys() {
+        if replacement_counts.get(name) != Some(&1) {
+            bail!("native wheel does not contain exactly one payload member `{name}`");
+        }
+    }
+    let record_name = record_names.pop().expect("length was checked");
+    if replacements.contains_key(&record_name) {
+        bail!("native payload replacement cannot replace RECORD itself");
+    }
+    let mut raw_record = String::new();
+    archive
+        .by_name(&record_name)?
+        .read_to_string(&mut raw_record)
+        .with_context(|| format!("reading `{record_name}` in {}", wheel_path.display()))?;
+    for (name, replacement) in replacements {
+        raw_record = update_record_line(
+            &raw_record,
+            name,
+            &crate::wheel_inject::sha256_base64_urlsafe_nopad(replacement),
+            replacement.len(),
+        )?;
+    }
+
+    let (temporary, destination_file) = crate::wheel::create_atomic_tmp(wheel_path)?;
+    let write_result = (|| -> Result<()> {
+        let mut writer = ZipWriter::new(destination_file);
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index)?;
+            let name = entry.name().replace('\\', "/");
+            let compression = match entry.compression() {
+                CompressionMethod::Stored => CompressionMethod::Stored,
+                _ => CompressionMethod::Deflated,
+            };
+            let replacement_size = replacements.get(&name).map_or(entry.size(), |bytes| {
+                u64::try_from(bytes.len()).expect("usize always fits u64")
+            });
+            let mut options = SimpleFileOptions::default()
+                .compression_method(compression)
+                .last_modified_time(zip::DateTime::default())
+                .large_file(replacement_size > u32::MAX as u64);
+            if let Some(mode) = entry.unix_mode() {
+                options = options.unix_permissions(mode);
+            }
+            if entry.is_dir() {
+                writer.add_directory(&name, options)?;
+            } else {
+                writer.start_file(&name, options)?;
+                if name == record_name {
+                    writer.write_all(raw_record.as_bytes())?;
+                } else if let Some(replacement) = replacements.get(&name) {
+                    writer.write_all(replacement)?;
+                } else {
+                    std::io::copy(&mut entry, &mut writer)?;
+                }
+            }
+        }
+        let mut finished = writer.finish()?;
+        finished.flush()?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error)
+            .with_context(|| format!("repacking native wheel {}", wheel_path.display()));
+    }
+    crate::wheel::commit_atomic_write(&temporary, wheel_path)
 }
 
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
@@ -825,5 +1293,110 @@ mod tests {
         assert!(out.contains("foo-1.0.0.dist-info/METADATA,sha256=NEWHASH,200"));
         assert!(out.contains("foo/__init__.py,sha256=AAAA,42"));
         assert!(out.contains("foo-1.0.0.dist-info/RECORD,,"));
+    }
+
+    #[test]
+    fn update_record_line_rejects_duplicate_target() {
+        let record = "foo.so,sha256=OLD,1\nfoo.so,sha256=ALSOOLD,1\nfoo.dist-info/RECORD,,\n";
+        let error = update_record_line(record, "foo.so", "NEW", 2).unwrap_err();
+        assert!(format!("{error:#}").contains("duplicate entries"));
+    }
+
+    #[test]
+    fn retags_native_wheel_and_updates_wheel_record_attestation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static TEST_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-native-retag-{}-{}",
+            std::process::id(),
+            TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let source = tmp.join("foo-1.0-cp311-cp311-linux_x86_64.whl");
+        let dist_info = "foo-1.0.dist-info";
+        let metadata = b"Metadata-Version: 2.1\nName: foo\nVersion: 1.0\n\n";
+        let wheel = concat!(
+            "Wheel-Version: 1.0\n",
+            "Root-Is-Purelib: false\n",
+            "Tag: cp311-cp311-linux_x86_64\n",
+        )
+        .as_bytes();
+        let record = format!(
+            "{dist_info}/METADATA,,\n{dist_info}/WHEEL,sha256=OLD,1\n{dist_info}/RECORD,,\n"
+        );
+        let source_file = std::fs::File::create(&source).unwrap();
+        let mut writer = ZipWriter::new(source_file);
+        let options = SimpleFileOptions::default()
+            .compression_method(CompressionMethod::Deflated)
+            .last_modified_time(zip::DateTime::default());
+        writer
+            .add_directory("foo/", options.unix_permissions(0o755))
+            .unwrap();
+        for (name, bytes) in [
+            (format!("{dist_info}/METADATA"), metadata.as_slice()),
+            (format!("{dist_info}/WHEEL"), wheel),
+            (format!("{dist_info}/RECORD"), record.as_bytes()),
+            ("foo/_native.so".to_string(), b"native payload".as_slice()),
+        ] {
+            let entry_options = if name == "foo/_native.so" {
+                options.unix_permissions(0o755)
+            } else {
+                options.unix_permissions(0o644)
+            };
+            writer.start_file(name, entry_options).unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        writer.finish().unwrap();
+
+        let retagged = retag_native_wheel_platform(&source, "manylinux_2_28_x86_64").unwrap();
+        assert_eq!(
+            retagged.file_name().unwrap(),
+            "foo-1.0-cp311-cp311-manylinux_2_28_x86_64.whl"
+        );
+        assert!(retagged.is_file());
+        assert!(!source.exists(), "old wheel basename must be removed");
+        crate::wheel::validate_native_wheel_archive_tag(&retagged, "manylinux_2_28_x86_64")
+            .unwrap();
+
+        let file = std::fs::File::open(&retagged).unwrap();
+        let mut archive = ZipArchive::new(file).unwrap();
+        let mut rewritten_wheel = String::new();
+        archive
+            .by_name(&format!("{dist_info}/WHEEL"))
+            .unwrap()
+            .read_to_string(&mut rewritten_wheel)
+            .unwrap();
+        assert!(rewritten_wheel.contains("Tag: cp311-cp311-manylinux_2_28_x86_64\n"));
+        assert!(!rewritten_wheel.contains("linux_x86_64\n"));
+
+        let directory = archive.by_name("foo/").unwrap();
+        assert!(
+            directory.is_dir(),
+            "retagging must preserve ZIP directories"
+        );
+        drop(directory);
+        let native = archive.by_name("foo/_native.so").unwrap();
+        assert_ne!(
+            native.unix_mode().unwrap_or_default() & 0o111,
+            0,
+            "retagging must preserve executable mode bits",
+        );
+        drop(native);
+
+        let expected_hash =
+            crate::wheel_inject::sha256_base64_urlsafe_nopad(rewritten_wheel.as_bytes());
+        let mut rewritten_record = String::new();
+        archive
+            .by_name(&format!("{dist_info}/RECORD"))
+            .unwrap()
+            .read_to_string(&mut rewritten_record)
+            .unwrap();
+        assert!(rewritten_record.contains(&format!(
+            "{dist_info}/WHEEL,sha256={expected_hash},{}",
+            rewritten_wheel.len()
+        )));
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

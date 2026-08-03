@@ -2013,6 +2013,57 @@ fn wheel_entry_metadata_provenance(entry: &WheelEntry) -> Provenance {
     }
 }
 
+/// Reuse a wheel produced by the closure's shared sdist-heal ladder when the
+/// same package is a direct spec-form `[retread-wheels]` entry. Without this
+/// bridge, primary materialization independently asks the index for a wheel
+/// after the closure has already built and stored one, and fails with "no
+/// wheels listed" for the exact sdist-only root that triggered the heal.
+fn closure_built_entry_override(
+    entry_name: &str,
+    entry: &WheelEntry,
+    closure_wheels: &[crate::lock::LockWheel],
+    store_root: &Path,
+) -> Result<(WheelEntry, Option<crate::lock::SdistWheelSource>)> {
+    if !entry.is_spec() {
+        return Ok((entry.clone(), None));
+    }
+    let canonical_name = canonical_conda_name(entry_name);
+    let Some(wheel) = closure_wheels.iter().find(|wheel| {
+        matches!(wheel.origin, crate::lock::Origin::Built)
+            && wheel.sdist_source.is_some()
+            && canonical_conda_name(&wheel.name) == canonical_name
+            && entry.normalized_version().as_deref() == Some(wheel.version.as_str())
+    }) else {
+        return Ok((entry.clone(), None));
+    };
+    let sha256 = wheel.sha256.as_deref().ok_or_else(|| {
+        anyhow!(
+            "closure-built wheel {}=={} has no wheel-store sha256",
+            wheel.name,
+            wheel.version,
+        )
+    })?;
+    let store_path = store_root.join(sha256).join(&wheel.filename);
+    if !store_path.is_file() {
+        bail!(
+            "closure-built wheel {}=={} is missing from the shared wheel store at {}",
+            wheel.name,
+            wheel.version,
+            store_path.display(),
+        );
+    }
+    let local_url = url::Url::from_file_path(&store_path).map_err(|_| {
+        anyhow!(
+            "closure-built wheel-store path is not representable as a file URL: {}",
+            store_path.display(),
+        )
+    })?;
+    let mut overridden = entry.clone();
+    overridden.url = Some(local_url);
+    overridden.sha256 = Some(sha256.to_string());
+    Ok((overridden, wheel.sdist_source.clone()))
+}
+
 /// One conda output's worth of wheels: a "bundle" produced by a single
 /// `[retread-wheels]` user entry. The primary wheel plus all extras-derived
 /// wheels are installed together into the same conda package, matching the
@@ -2426,6 +2477,10 @@ impl Handler {
                 ));
             }
         };
+
+        let hermetic_env = std::env::var(crate::config::HERMETIC_BUILDS_ENV).ok();
+        config.hermetic =
+            crate::config::effective_hermetic_builds(config.hermetic, hermetic_env.as_deref());
 
         if config.retread_wheels.is_empty() {
             return Err(RpcError::invalid_params(
@@ -3392,7 +3447,8 @@ impl Handler {
             RpcError::invalid_params(format!(
                 "invalid Python target `{requested_python}`: {error:#}"
             ))
-        })?;
+        })?
+        .with_hermetic_builds(config.hermetic);
         validate_advertised_non_courier_target_build(
             &config,
             &target,
@@ -4538,6 +4594,12 @@ async fn resolve_all(
     RetreadConfig,
     Vec<auto_bundle::WheelMetadataRelaxation>,
 )> {
+    // Bind the pack-level policy to the target used by every source-build
+    // branch in this resolution. Resolution/cache identity intentionally does
+    // not change: the policy controls how an exact cache miss is produced,
+    // while v7 cache markers attest whether a native artifact was hermetic.
+    let target = target.clone().with_hermetic_builds(config.hermetic);
+    let target = &target;
     let mut bundles = Vec::with_capacity(config.retread_wheels.len());
     let mut route_conflicts = Vec::new();
     let mut pending_relaxations = Vec::new();
@@ -4744,6 +4806,25 @@ async fn resolve_all(
             .map(|(n, _)| canonical_conda_name(n))
             .collect();
 
+        // Direct sdist-only roots have already been built by the closure heal
+        // above. Feed those exact store artifacts through the ordinary
+        // hash-pinned URL materializer instead of asking the index for a
+        // binary wheel a second time.
+        let wheel_store_root = crate::courier::retread_wheel_store_root();
+        let closure_entry_overrides = group_entries
+            .iter()
+            .map(|(entry_name, entry)| {
+                closure_built_entry_override(
+                    entry_name,
+                    entry,
+                    uv_closure
+                        .as_ref()
+                        .map_or(&[][..], |closure| closure.wheels.as_slice()),
+                    &wheel_store_root,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+
         // Parallel entry builds: collect all per-entry inputs FIRST (the
         // sibling sets below are pure derivations of the entry list), then
         // run the resolve_bundle futures concurrently with a bounded window.
@@ -4756,8 +4837,12 @@ async fn resolve_all(
         // per-(url,rev) lock in source_build.rs, and wheel downloads land
         // via unique-temp + atomic rename (wheel.rs).
         let mut entry_futures = Vec::with_capacity(group_entries.len());
-        for (idx, ((entry_name, entry), auto_data)) in
-            group_entries.iter().zip(auto_data_per_entry).enumerate()
+        for (idx, (((entry_name, _entry), auto_data), (materialize_entry, _sdist_source))) in
+            group_entries
+                .iter()
+                .zip(auto_data_per_entry)
+                .zip(closure_entry_overrides.iter())
+                .enumerate()
         {
             // Sibling set: every OTHER entry's canonical name in this group.
             let sibling_names: std::collections::HashSet<String> = all_entry_canonical
@@ -4777,7 +4862,7 @@ async fn resolve_all(
             entry_futures.push(async move {
                     resolve_bundle(
                         entry_name,
-                        entry,
+                        materialize_entry,
                         target,
                         download_dir,
                         source_dir,
@@ -4816,6 +4901,14 @@ async fn resolve_all(
                 .try_collect()
                 .await?
         };
+        for (sub_bundle, (_, sdist_source)) in sub_bundles.iter_mut().zip(&closure_entry_overrides)
+        {
+            if let Some(sdist_source) = sdist_source {
+                sub_bundle.primary.upstream_url = None;
+                sub_bundle.primary.sdist_source = Some(sdist_source.clone());
+                sub_bundle.primary.metadata_provenance = Provenance::SourceBuiltRelaxed;
+            }
+        }
         let mut bundle = sub_bundles.remove(0);
         bundle.conda_name = canonical_conda_name(&group_name);
         // M2: carry the uv auto-route decisions onto the bundle so
@@ -10368,7 +10461,10 @@ async fn materialize_and_rewrite_with_abi_aliases(
             cache_dir,
             &out,
             target,
-            Some(&expected),
+            crate::source_build::GitWheelBuildPolicy {
+                expected: Some(&expected),
+                static_cpp_runtime: entry.static_cpp_runtime,
+            },
         )
         .await
         .with_context(|| {
@@ -10512,6 +10608,7 @@ async fn materialize_and_rewrite_with_abi_aliases(
             Some(&expected),
             Some(download_dir),
             (!Path::new(path).is_absolute()).then_some(source_dir),
+            entry.static_cpp_runtime,
         )
         .await
         .with_context(|| {
@@ -10543,7 +10640,10 @@ async fn materialize_and_rewrite_with_abi_aliases(
             cache_dir,
             &out,
             target,
-            Some(&expected),
+            crate::source_build::GitWheelBuildPolicy {
+                expected: Some(&expected),
+                static_cpp_runtime: entry.static_cpp_runtime,
+            },
         )
         .await
         .with_context(|| {
@@ -12025,6 +12125,22 @@ pub(crate) fn check_output_abi_invariants(
     aliases: &AbiAliasGraph,
 ) -> Vec<String> {
     let mut violations = Vec::new();
+    // A source-built wheel may legitimately declare an unconstrained ABI
+    // runtime (openmesh 1.2.1 declares bare `numpy`). It is safe only when
+    // Retread's emitted conda contract supplies a concrete constraint for the
+    // same semantic anchor; uv installs bundled wheels with dependency
+    // resolution disabled, so that emitted contract is authoritative.
+    let concretely_emitted_anchors = output_run_deps
+        .iter()
+        .filter(|(name, spec)| {
+            let spec = spec.trim();
+            is_semantic_abi_anchor(name, aliases)
+                && !spec.is_empty()
+                && spec != "*"
+                && !is_bare_major_spec(spec)
+        })
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
     let mut emitted = output_run_deps
         .iter()
         .cloned()
@@ -12062,6 +12178,17 @@ pub(crate) fn check_output_abi_invariants(
         }
         let trimmed = spec.trim();
         if trimmed.is_empty() || trimmed == "*" {
+            let covered_by_emitted_contract = !allow_auto_completed_cap
+                && semantic_aliases(&name, aliases).iter().any(|alias| {
+                    concretely_emitted_anchors.iter().any(|emitted| {
+                        semantic_aliases(emitted, aliases)
+                            .iter()
+                            .any(|candidate| candidate == alias)
+                    })
+                });
+            if covered_by_emitted_contract {
+                continue;
+            }
             violations.push(format!(
                 "ABI invariant: {origin} `{name} {trimmed}` (empty/*); \
                  ABI anchors must carry a concrete spec"
@@ -12077,7 +12204,12 @@ pub(crate) fn check_output_abi_invariants(
             ));
             continue;
         }
+        // libstdcxx-ng's compatibility contract is the GCC runtime major,
+        // unlike Python/CUDA ABI anchors whose bare major is ambiguous. A
+        // hermetic wheel's final DT_NEEDED scan deliberately emits this form.
+        let gcc_runtime_major = canonical_conda_name(&name) == "libstdcxx-ng";
         if is_bare_major_spec(trimmed)
+            && !gcc_runtime_major
             && !(allow_auto_completed_cap && is_auto_completed_abi_anchor_spec(trimmed))
         {
             violations.push(format!(
@@ -12547,6 +12679,17 @@ fn produce_output_with_conflicts(
     let mut sorted_wheels: Vec<&ResolvedWheel> = bundle.all_wheels().collect();
     sorted_wheels.sort_by_key(|w| canonical_conda_name(&w.pypi_name));
     for wheel in sorted_wheels {
+        for raw in &wheel.metadata.retread_conda_run_dependencies {
+            let dependency = spec_from_str(raw).with_context(|| {
+                format!(
+                    "parsing Retread native conda run dependency `{raw}` from {}",
+                    wheel.metadata.filename
+                )
+            })?;
+            if seen_dep_names.insert(dependency.name.to_string()) {
+                run_dep_specs.push(dependency);
+            }
+        }
         for raw in &wheel.metadata.requires_dist {
             let Some(dep) = crate::relax::translate(
                 raw,
@@ -19994,6 +20137,7 @@ mod emit_wheel_upstream_url_tests {
             name: name.to_string(),
             version: version.to_string(),
             requires_dist: vec![],
+            retread_conda_run_dependencies: vec![],
             is_pure_python: true,
             sha256: "abc".to_string(),
             filename: format!("{name}-{version}-py3-none-any.whl"),

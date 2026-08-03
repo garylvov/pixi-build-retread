@@ -202,6 +202,12 @@ pub(crate) struct ResolutionTarget {
     // provenance. This flag controls operations where an envelope authorizes
     // the same environment/profile pair for co-activated sibling sources.
     exact_workspace_envelope: bool,
+    // Build-policy inputs deliberately do not participate in wheel scoring or
+    // resolution identity. They only control what Retread may do after a
+    // source artifact cache miss. The built-wheel cache has its own schema
+    // namespace for strategy changes.
+    hermetic_builds: bool,
+    hermetic_cuda: Option<String>,
 }
 
 /// What this host may do when a source artifact is missing from the validated
@@ -224,6 +230,11 @@ impl NativeSourceBuildPolicy {
     }
 }
 
+fn default_hermetic_builds() -> bool {
+    let value = std::env::var(crate::config::HERMETIC_BUILDS_ENV).ok();
+    crate::config::effective_hermetic_builds(true, value.as_deref())
+}
+
 impl ResolutionTarget {
     /// Fallible production constructor. Python is validated before any host
     /// or workspace target state is inspected, so malformed declarations can
@@ -231,6 +242,38 @@ impl ResolutionTarget {
     pub(crate) fn try_for_subdir(python_version: &str, conda_subdir: &str) -> Result<Self> {
         let python_version = normalized_python_minor(python_version)?.version();
         let declared_glibc = crate::glibc::declared_glibc_no_lock_for_target(conda_subdir);
+        Self::try_from_parts(&python_version, conda_subdir, declared_glibc)
+    }
+
+    /// Build-facing current-platform constructor for the public source APIs.
+    ///
+    /// Legacy wheel scoring deliberately widens a native `linux-64` ceiling
+    /// with the host glibc. A source build cannot do that safely: once a floor
+    /// was declared, it must retain that exact contract so a newer host either
+    /// proves the result pure or retries through the pinned sysroot. Handler
+    /// paths already carry a complete workspace contract; this minimal glibc
+    /// contract gives standalone embedding APIs the same build policy.
+    pub(crate) fn try_for_source_build_subdir(
+        python_version: &str,
+        conda_subdir: &str,
+    ) -> Result<Self> {
+        let python_version = normalized_python_minor(python_version)?.version();
+        let declared_glibc = crate::glibc::declared_glibc_no_lock_for_target(conda_subdir);
+        if conda_subdir.starts_with("linux-")
+            && let Some(floor) = declared_glibc
+        {
+            let rendered = crate::glibc::format_glibc(floor);
+            let glibc = std::collections::BTreeMap::from([("glibc".to_string(), rendered)]);
+            return Self::try_for_contract_on_subdir(
+                &python_version,
+                conda_subdir,
+                WorkspaceTargetContract {
+                    subdir: conda_subdir.to_string(),
+                    declared_virtual_packages: glibc.clone(),
+                    detected_virtual_packages: glibc,
+                },
+            );
+        }
         Self::try_from_parts(&python_version, conda_subdir, declared_glibc)
     }
 
@@ -312,6 +355,9 @@ impl ResolutionTarget {
             crate::glibc::host_glibc(),
             target_contract.is_some(),
         );
+        let hermetic_cuda = target_contract
+            .as_ref()
+            .and_then(|contract| contract.system_requirements().get("cuda").cloned());
         Ok(Self {
             wheel_target: WheelTarget {
                 python_version,
@@ -322,6 +368,8 @@ impl ResolutionTarget {
             target_contract,
             workspace_scope: None,
             exact_workspace_envelope: false,
+            hermetic_builds: default_hermetic_builds(),
+            hermetic_cuda,
         })
     }
 
@@ -374,9 +422,13 @@ impl ResolutionTarget {
         Ok(Self {
             wheel_target,
             declared_glibc,
+            hermetic_cuda: target_contract
+                .as_ref()
+                .and_then(|contract| contract.system_requirements().get("cuda").cloned()),
             target_contract,
             workspace_scope: None,
             exact_workspace_envelope: false,
+            hermetic_builds: default_hermetic_builds(),
         })
     }
 
@@ -453,6 +505,22 @@ impl ResolutionTarget {
 
     pub(crate) fn has_exact_workspace_envelope(&self) -> bool {
         self.exact_workspace_envelope
+    }
+
+    /// Apply this pack's immutable source-build policy to a resolved target.
+    /// The process-wide environment veto is folded in by the caller once at
+    /// backend initialization, so clones cannot observe a changing env var.
+    pub(crate) fn with_hermetic_builds(mut self, enabled: bool) -> Self {
+        self.hermetic_builds = enabled;
+        self
+    }
+
+    pub(crate) fn hermetic_builds(&self) -> bool {
+        self.hermetic_builds
+    }
+
+    pub(crate) fn hermetic_cuda(&self) -> Option<&str> {
+        self.hermetic_cuda.as_deref()
     }
 
     /// Source-build policy for this target on the current host.

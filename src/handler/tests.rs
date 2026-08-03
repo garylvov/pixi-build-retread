@@ -4,6 +4,55 @@ use super::auto_bundle::{
     prefer_conda_match, validated_conda_route,
 };
 use super::*;
+
+#[test]
+fn direct_sdist_only_entry_reuses_closure_built_wheel_store_source() {
+    let store = std::env::temp_dir().join(format!(
+        "retread-closure-built-entry-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    let sha256 = "a".repeat(64);
+    let filename = "evdev-1.7.1-cp311-cp311-manylinux_2_34_x86_64.whl";
+    std::fs::create_dir_all(store.join(&sha256)).unwrap();
+    std::fs::write(store.join(&sha256).join(filename), b"wheel fixture").unwrap();
+    let entry = WheelEntry {
+        version: Some("==1.7.1".to_string()),
+        ..Default::default()
+    };
+    let source = crate::lock::SdistWheelSource {
+        index: "https://pypi.org/simple/".to_string(),
+        name: "evdev".to_string(),
+        version: "1.7.1".to_string(),
+        sdist_url: "https://files.pythonhosted.org/evdev-1.7.1.tar.gz#sha256=fixture".to_string(),
+    };
+    let wheel = crate::lock::LockWheel {
+        name: "evdev".to_string(),
+        version: "1.7.1".to_string(),
+        origin: crate::lock::Origin::Built,
+        filename: filename.to_string(),
+        url: None,
+        sha256: Some(sha256.clone()),
+        requires_dist: Vec::new(),
+        must_ship: true,
+        upstream_url: None,
+        git_source: None,
+        sdist_source: Some(source.clone()),
+    };
+
+    let (overridden, captured) =
+        closure_built_entry_override("evdev", &entry, &[wheel], &store).unwrap();
+    assert_eq!(overridden.sha256.as_deref(), Some(sha256.as_str()));
+    assert_eq!(
+        overridden.url.as_ref().unwrap().to_file_path().unwrap(),
+        store.join(&sha256).join(filename),
+    );
+    assert_eq!(captured.unwrap().sdist_url, source.sdist_url);
+    let _ = std::fs::remove_dir_all(store);
+}
 use crate::config::RelaxPolicy;
 use crate::constraint::Provenance;
 use crate::index_chain::{IndexPurpose, PUBLIC_PYPI, index_chain};
@@ -653,6 +702,7 @@ fn pythons_for_rejects_bare_major_variant() {
         keep_pypi: vec![],
         force_conda: vec![],
         sdist_build: Default::default(),
+        hermetic: true,
         retread_wheels: BTreeMap::new(),
         relax: RelaxPolicy::Minor,
         overrides: BTreeMap::new(),
@@ -704,6 +754,7 @@ fn pythons_for_accepts_dotted_variant() {
         keep_pypi: vec![],
         force_conda: vec![],
         sdist_build: Default::default(),
+        hermetic: true,
         retread_wheels: BTreeMap::new(),
         relax: RelaxPolicy::Minor,
         overrides: BTreeMap::new(),
@@ -755,6 +806,7 @@ fn pythons_for_filters_bare_major_keeps_dotted() {
         keep_pypi: vec![],
         force_conda: vec![],
         sdist_build: Default::default(),
+        hermetic: true,
         retread_wheels: BTreeMap::new(),
         relax: RelaxPolicy::Minor,
         overrides: BTreeMap::new(),
@@ -818,6 +870,7 @@ fn courier_pure_python_bundle_is_platform_specific_not_noarch() {
         keep_pypi: vec![],
         force_conda: vec![],
         sdist_build: Default::default(),
+        hermetic: true,
         courier: true,
         ..cfg()
     };
@@ -2672,6 +2725,7 @@ fn cfg() -> RetreadConfig {
         keep_pypi: vec![],
         force_conda: vec![],
         sdist_build: Default::default(),
+        hermetic: true,
         retread_wheels: BTreeMap::new(),
         relax: RelaxPolicy::Minor,
         overrides: BTreeMap::new(),
@@ -2704,6 +2758,7 @@ fn meta(name: &str, version: &str, requires: Vec<&str>, platform_specific: bool)
         name: name.into(),
         version: version.into(),
         requires_dist: requires.into_iter().map(String::from).collect(),
+        retread_conda_run_dependencies: vec![],
         is_pure_python: !platform_specific,
         sha256: format!("sha-{name}"),
         filename: if platform_specific {
@@ -3639,6 +3694,7 @@ fn relaxed_pure_python_primary_pins_python_to_workspace_variant() {
         name: "isaaclab".into(),
         version: "0.51.1".into(),
         requires_dist: vec![],
+        retread_conda_run_dependencies: vec![],
         is_pure_python: is_pure,
         sha256: "sha".into(),
         filename,
@@ -4654,6 +4710,18 @@ fn output_abi_invariant_checks_embedded_wheel_metadata_and_aliases() {
         check_output_abi_invariants(&[], &hidden_alias, &workspace, &BTreeMap::new(), &aliases);
     assert_eq!(violations.len(), 1, "{violations:?}");
     assert!(violations[0].contains("array-provider >=1"));
+}
+
+#[test]
+fn emitted_concrete_anchor_covers_bare_source_wheel_requirement() {
+    let violations = check_output_abi_invariants(
+        &[("numpy".to_string(), ">=2.3,<2.4".to_string())],
+        &[("openmesh".to_string(), "numpy".to_string())],
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        &AbiAliasGraph::new(),
+    );
+    assert!(violations.is_empty(), "{violations:?}");
 }
 
 #[test]

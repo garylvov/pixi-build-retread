@@ -2,7 +2,7 @@ schema_version: 1
 
 context:
   name: pixi-build-retread
-  version: "4.10.47"
+  version: "4.10.48"
 
 package:
   name: ${{ name }}
@@ -111,19 +111,20 @@ requirements:
       - ${{ compiler('c') }}
   run:
     # The backend shells out to `rattler-build` for the actual conda build.
-    - rattler-build >=0.27
+    # `debug setup` materializes and activates the cached compiler/sysroot
+    # prefix used by hermetic native source builds (available in 0.70+).
+    - rattler-build >=0.70
     # pixi-build-api-version pins the protocol revision range this binary
     # speaks. API 4 natively (pinned pixi_build_types rev); API 5 (pixi
     # 0.72+) via the src/compat.rs normalization shim that converts the
     # structured conda/build_v1 match specs back to the API-4 string form.
     - pixi-build-api-version >=4,<6
     # uv replaces pip + setuptools + a baked-in python for source builds.
-    # `uv pip wheel --python <ver>` downloads python-build-standalone on
-    # demand and uses it for the build, so retread itself is
-    # python-agnostic: any python the workspace requests just works
-    # without rebuilding retread. (Pre-0.11 retread was variant-pinned
+    # Pure builds can download python-build-standalone on demand; hermetic
+    # native builds use the exact Python from their conda build environment.
+    # Pre-0.11 retread was variant-pinned
     # per python minor and required a retread rebuild for every new
-    # python release; uv removes that constraint entirely.)
+    # python release; uv removes that constraint entirely.
     - uv >=0.5
     # For [retread-wheels] entries with `git = ...` retread shells out to
     # `git clone`.
