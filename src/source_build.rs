@@ -5189,17 +5189,35 @@ async fn ensure_canonical_git_snapshot(
             cache_dir.display()
         )
     })? {
-        // Published canonical trees are never self-healed or replaced while a
-        // reader could be using them. Corruption is therefore a fail-closed
-        // error rather than a delete/rebuild race.
-        return validate_canonical_git_snapshot(
-            &cache_dir,
-            &repository_identity,
-            resolved_sha,
-            ref_state,
-            true,
-        )
-        .await;
+        // The marker is the last file a publish writes, so a directory
+        // without it is an incomplete publish (killed process, purged
+        // tmp), not a published tree with readers. Rebuild it under the
+        // held lock instead of failing closed.
+        if !cache_dir.join("source.json").try_exists().with_context(|| {
+            format!(
+                "checking canonical Git source marker in {}",
+                cache_dir.display()
+            )
+        })? {
+            tracing::warn!(
+                cache = %cache_dir.display(),
+                "canonical Git source cache has no marker; discarding the \
+                 incomplete tree and re-cloning"
+            );
+            remove_owned_cache_entry(&cache_dir)?;
+        } else {
+            // Published canonical trees are never self-healed or replaced
+            // while a reader could be using them. Corruption is therefore a
+            // fail-closed error rather than a delete/rebuild race.
+            return validate_canonical_git_snapshot(
+                &cache_dir,
+                &repository_identity,
+                resolved_sha,
+                ref_state,
+                true,
+            )
+            .await;
+        }
     }
 
     let staging = unique_staging_dir(&cache_dir)?;
