@@ -3044,16 +3044,22 @@ pub fn parse_pylock_closure(
             .get("url")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("pylock.toml: wheel `{filename}` missing `url`"))?;
+        // Indexes without hash fragments in their simple API (pypi.nvidia.com)
+        // export hashless pylock entries. Leave the hash empty here; the
+        // caller fetches those exact artifact bytes once and records the
+        // measured sha256, so the shipped lock is still fully hashed and the
+        // installer's Origin::Index contract (url + sha256) holds.
         let sha256 = wheel
             .get("hashes")
             .and_then(|h| h.get("sha256"))
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                anyhow!(
-                    "pylock.toml: wheel `{filename}` has no sha256 hash; refusing to \
-                     ship an unhashed index wheel"
-                )
-            })?;
+            .and_then(|v| v.as_str());
+        if sha256.is_none() {
+            tracing::warn!(
+                wheel = %filename,
+                "pylock.toml: index wheel has no sha256; will hash the fetched \
+                 artifact bytes"
+            );
+        }
 
         pins.insert(canon.clone(), version.to_string());
         wheels.push(LockWheel {
@@ -3062,7 +3068,7 @@ pub fn parse_pylock_closure(
             origin: Origin::Index,
             filename,
             url: Some(url.to_string()),
-            sha256: Some(sha256.to_string()),
+            sha256: sha256.map(str::to_string),
             requires_dist: Vec::new(),
             must_ship: false,
             upstream_url: None,
@@ -3080,6 +3086,55 @@ pub fn parse_pylock_closure(
         effective_input_requirements: None,
         dependency_graph: UvDependencyGraph::default(),
     })
+}
+
+/// Backfill sha256 for index wheels whose source index served no hash
+/// (pypi.nvidia.com's simple API). Fetches each exact artifact URL once and
+/// records the measured digest, preserving the installer's Origin::Index
+/// url+sha256 contract without refusing hashless indexes.
+pub(crate) async fn hash_unhashed_index_wheels(closure: &mut UvClosure) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    let mut client = None;
+    for wheel in &mut closure.wheels {
+        if wheel.origin != Origin::Index || wheel.sha256.is_some() {
+            continue;
+        }
+        let url = wheel.url.as_deref().ok_or_else(|| {
+            anyhow!(
+                "index wheel `{}` has neither url nor sha256 in the exported closure",
+                wheel.filename
+            )
+        })?;
+        let client = match &mut client {
+            Some(client) => client,
+            slot => slot.insert(
+                reqwest::Client::builder()
+                    .user_agent(crate::repodata::HTTP_USER_AGENT)
+                    .build()
+                    .context("building HTTP client for wheel hashing")?,
+            ),
+        };
+        let response = client
+            .get(url)
+            .send()
+            .await
+            .with_context(|| format!("fetching unhashed index wheel {url}"))?;
+        if !response.status().is_success() {
+            bail!("HTTP {} fetching unhashed index wheel {url}", response.status());
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .with_context(|| format!("reading unhashed index wheel {url}"))?;
+        let digest = Sha256::digest(&bytes);
+        let mut hex = String::with_capacity(64);
+        for byte in digest {
+            hex.push_str(&format!("{byte:02x}"));
+        }
+        tracing::info!(wheel = %wheel.filename, sha256 = %hex, "hashed index wheel bytes");
+        wheel.sha256 = Some(hex);
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -5030,6 +5085,7 @@ pub(crate) async fn compute_closure_for_target(
                                 closure.dependency_graph = dependency_graph;
                                 closure.auto_dropped.extend(owned_drops);
                                 attach_effective_input_requirements(&mut closure, req)?;
+                                hash_unhashed_index_wheels(&mut closure).await?;
                                 tracing::info!(
                                     bundle = %req.bundle,
                                     wheels = closure.wheels.len(),
@@ -5223,6 +5279,7 @@ pub(crate) async fn compute_closure_for_target(
     closure.dependency_graph = dependency_graph;
     closure.auto_dropped.extend(owned_drops);
     attach_effective_input_requirements(&mut closure, req)?;
+    hash_unhashed_index_wheels(&mut closure).await?;
 
     write_closure_meta_atomic(
         &meta_path,
@@ -6335,7 +6392,7 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
     }
 
     #[test]
-    fn parse_pylock_errors_on_missing_hash() {
+    fn parse_pylock_keeps_unhashed_index_wheel_for_backfill() {
         let text = r#"
 [[packages]]
 name = "foo"
@@ -6344,9 +6401,16 @@ version = "1.0"
 name = "foo-1.0-py3-none-any.whl"
 url = "https://example.com/foo-1.0-py3-none-any.whl"
 "#;
-        let err = parse_pylock_closure(text, &target("3.12", "linux-64"), &BTreeSet::new(), "x")
-            .unwrap_err();
-        assert!(err.to_string().contains("no sha256"), "{err}");
+        let closure = parse_pylock_closure(text, &target("3.12", "linux-64"), &BTreeSet::new(), "x")
+            .unwrap();
+        assert_eq!(closure.wheels.len(), 1);
+        // Hash absent at parse; hash_unhashed_index_wheels() backfills it from
+        // the fetched artifact bytes before the closure is used.
+        assert_eq!(closure.wheels[0].sha256, None);
+        assert_eq!(
+            closure.wheels[0].url.as_deref(),
+            Some("https://example.com/foo-1.0-py3-none-any.whl")
+        );
     }
 
     #[test]

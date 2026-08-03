@@ -33,7 +33,8 @@ use rattler_repodata_gateway::sparse::SparseRepoData;
 use sha2::{Digest, Sha256};
 
 const REPODATA_TTL: Duration = Duration::from_secs(30 * 60);
-const HTTP_USER_AGENT: &str = concat!("pixi-build-retread/", env!("CARGO_PKG_VERSION"));
+pub(crate) const HTTP_USER_AGENT: &str =
+    concat!("pixi-build-retread/", env!("CARGO_PKG_VERSION"));
 
 /// One (channel, subdir)'s lazily-built sparse handle. `None` inside
 /// the cell means the build was attempted and failed (channel
