@@ -273,14 +273,39 @@ pub(crate) async fn provision(
     cuda_version: Option<&str>,
 ) -> Result<HermeticBuildEnvironment> {
     let python_minor = crate::pypi::normalized_python_minor(python)?.version();
-    let cuda_version = normalize_cuda_version(cuda_version)?;
-    let solved = crate::conda_solve::solve_hermetic_build_environment(
+    let mut cuda_version = normalize_cuda_version(cuda_version)?;
+    let mut solve_result = crate::conda_solve::solve_hermetic_build_environment(
         target_floor,
         &python_minor,
         cuda_version.as_deref(),
     )
-    .await
-    .map_err(|reasons| anyhow!(reasons.join("; ")))?;
+    .await;
+    // A workspace `system-requirements.cuda` line older than the packaged
+    // toolchains (e.g. cuda-11: conda-forge publishes cuda-nvcc_linux-64 only
+    // for 12+) must not wall off pure-Python / non-CUDA source builds. Retry
+    // without NVCC; post-build ELF inspection still rejects any wheel that
+    // actually contains CUDA members when NVCC was not provisioned.
+    if let Err(reasons) = &solve_result
+        && cuda_version.is_some()
+        && reasons
+            .iter()
+            .any(|reason| reason.contains("cuda-nvcc_linux-64"))
+    {
+        tracing::warn!(
+            requested = cuda_version.as_deref(),
+            "no cuda-nvcc_linux-64 toolchain satisfies the workspace CUDA line; \
+             provisioning a CPU-only hermetic toolchain (CUDA-containing wheels \
+             will still be rejected by post-build validation)"
+        );
+        cuda_version = None;
+        solve_result = crate::conda_solve::solve_hermetic_build_environment(
+            target_floor,
+            &python_minor,
+            None,
+        )
+        .await;
+    }
+    let solved = solve_result.map_err(|reasons| anyhow!(reasons.join("; ")))?;
     let toolchain_digest = solved_records_digest(&solved, cuda_version.is_some())?;
     let request = ProvisionRequest {
         target_floor,
