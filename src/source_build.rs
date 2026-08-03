@@ -6043,7 +6043,29 @@ unset BUILD_DIR SRC_DIR RECIPE_DIR RATTLER_BUILD_PACKAGE_FILES
 activation_cwd=$PWD
 cd "$RETREAD_ACTIVATION_TMPDIR"
 set +o pipefail
-source "$activation" >/dev/null 2>&1
+set +u
+# Activation hooks can emit arbitrary third-party chatter. Preserve both
+# streams only when activation itself fails; successful output must not leak
+# into a later build error or the JSON-RPC channel.
+activation_stdout="$RETREAD_ACTIVATION_TMPDIR/source.stdout"
+activation_stderr="$RETREAD_ACTIVATION_TMPDIR/source.stderr"
+activation_failed() {
+  status=$?
+  trap - ERR
+  printf 'hermetic build activation failed with status %s: %s\n' "$status" "$activation" >&3
+  printf '%s\n' 'activation stdout:' >&3
+  /bin/cat "$activation_stdout" >&3
+  printf '%s\n' 'activation stderr:' >&3
+  /bin/cat "$activation_stderr" >&3
+  exit "$status"
+}
+exec 3>&2
+trap activation_failed ERR
+source "$activation" >"$activation_stdout" 2>"$activation_stderr"
+trap - ERR
+exec 3>&-
+/bin/rm -f "$activation_stdout" "$activation_stderr"
+set -u
 set -o pipefail
 cd "$activation_cwd"
 
@@ -6260,8 +6282,16 @@ exec "$uv" "${filtered[@]}" --python="$build_python" --no-build-isolation
         // actual uv error (usage / network / build failure) instead
         // of a bare "status 2".
         let snippet = stderr.trim();
-        let snippet = if snippet.len() > 2000 {
-            format!("{}...(truncated)", &snippet[..2000])
+        let snippet = if snippet.chars().count() > 2000 {
+            let tail = snippet
+                .chars()
+                .rev()
+                .take(2000)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>();
+            format!("...(truncated; showing final 2000 characters){tail}")
         } else {
             snippet.to_string()
         };

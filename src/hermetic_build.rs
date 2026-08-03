@@ -17,9 +17,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
 
-const CACHE_SCHEMA: &str = "retread-hermetic-build-environment-v7";
+const CACHE_SCHEMA: &str = "retread-hermetic-build-environment-v8";
 const CACHE_NAMESPACE: &str = "hermetic-build-envs";
-const CACHE_VERSION: &str = "v7";
+const CACHE_VERSION: &str = "v8";
 const COMPLETION_MARKER: &str = "complete.json";
 const MIN_RATTLER_BUILD_VERSION: (u64, u64, u64) = (0, 70, 0);
 
@@ -169,6 +169,12 @@ struct DebugBuild {
 struct DebugRequirements {
     build: Vec<String>,
     host: Vec<String>,
+    ignore_run_exports: DebugIgnoreRunExports,
+}
+
+#[derive(Serialize)]
+struct DebugIgnoreRunExports {
+    from_package: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1225,7 +1231,9 @@ unset PYTHON PYTHONHOME PYTHONPATH CONDA_BUILD_SYSROOT CC CXX AR CFLAGS CXXFLAGS
 activation_cwd=$PWD
 cd "$RETREAD_ACTIVATION_TMPDIR"
 set +o pipefail
-source "$1" >/dev/null 2>&1
+set +u
+source "$1" 1>&2
+set -u
 set -o pipefail
 cd "$activation_cwd"
 test "$(/usr/bin/readlink -f "${PYTHON:-/missing}")" = "$2"
@@ -1395,7 +1403,9 @@ unset PYTHON PYTHONHOME PYTHONPATH CONDA_BUILD_SYSROOT CC CXX AR CFLAGS CXXFLAGS
 activation_cwd=$PWD
 cd "$RETREAD_ACTIVATION_TMPDIR"
 set +o pipefail
-source "$1" >/dev/null 2>&1
+set +u
+source "$1" 1>&2
+set -u
 set -o pipefail
 cd "$activation_cwd"
 test "$(/usr/bin/readlink -f "${PYTHON:-/missing}")" = "$2"
@@ -1694,19 +1704,25 @@ fn activation_hook_paths(cache_dir: &Path, activation_script: &Path) -> Result<V
             .strip_prefix(". ")
             .ok_or_else(|| anyhow!("unsupported compiler activation hook statement `{line}`"))?
             .trim();
-        // Rattler writes `~`-prefixed rename artifacts (e.g.
-        // `~cuda-nvcc_activate.sh`) into activate.d during transactions;
-        // they are not real hooks and must not be sourced.
-        if candidate
-            .rsplit('/')
-            .next()
-            .is_some_and(|name| name.starts_with('~'))
-        {
-            continue;
-        }
+        // CUDA's real activation hook is named `~cuda-nvcc_activate.sh`, and
+        // rattler-build single-quotes that path to prevent tilde expansion.
+        // Strip only matching whole-value quotes so every hook the generated
+        // script sources is sanitized and attested in the completion marker.
+        let candidate = match (candidate.strip_prefix('\''), candidate.strip_suffix('\'')) {
+            (Some(without_prefix), Some(_)) => {
+                without_prefix.strip_suffix('\'').ok_or_else(|| {
+                    anyhow!("unsupported compiler activation hook statement `{line}`")
+                })?
+            }
+            (None, None) => candidate,
+            _ => {
+                bail!("unsupported compiler activation hook statement `{line}`");
+            }
+        };
         if candidate.is_empty()
             || !candidate.bytes().all(|byte| {
-                byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-' | b'+')
+                byte.is_ascii_alphanumeric()
+                    || matches!(byte, b'/' | b'.' | b'_' | b'-' | b'+' | b'~')
             })
         {
             bail!("unsupported compiler activation hook path `{candidate}`");
@@ -2240,6 +2256,10 @@ fn render_debug_recipe(
     cuda: bool,
 ) -> Result<Vec<u8>> {
     let (build, host) = solved_recipe_records(solved, cuda)?;
+    let ignored_build_run_exports = build
+        .iter()
+        .map(|record| record.name.clone())
+        .collect::<Vec<_>>();
     let recipe = DebugRecipe {
         schema_version: 1,
         package: DebugPackage {
@@ -2266,6 +2286,13 @@ fn render_debug_recipe(
                 .into_iter()
                 .map(|record| record.exact_match_spec())
                 .collect(),
+            // The build and host prefixes are already exact-pinned from one
+            // coherent solve. Suppress archive-only strong run exports from
+            // re-solving extra host records behind that digest (CUDA's
+            // `cuda-version` export exposed this with rattler-build 0.70).
+            ignore_run_exports: DebugIgnoreRunExports {
+                from_package: ignored_build_run_exports,
+            },
         },
     };
     serde_yaml::to_string(&recipe)
@@ -2712,7 +2739,37 @@ async fn discover_activated_python(
 ) -> Result<ActivatedEnvironment> {
     let script = r#"
 set -euo pipefail
-test -d "$2" || exit 85
+activation_path=$1
+validation_fail() {
+  status=$1
+  shift
+  printf 'hermetic Python validation failed (status %s): %s\n' "$status" "$*" >&2
+  exit "$status"
+}
+validation_error() {
+  status=$?
+  printf 'hermetic Python validation command failed (status %s, activation %s, line %s): %s\n' \
+    "$status" "$activation_path" "${BASH_LINENO[0]}" "$BASH_COMMAND" >&2
+  exit "$status"
+}
+require_nonempty() {
+  label=$1
+  value=$2
+  test -n "$value" || validation_fail 85 "$label is unset or empty after sourcing $3"
+}
+require_directory() {
+  label=$1
+  value=$2
+  test -d "$value" || validation_fail 85 "$label directory is missing: ${value:-<unset>}"
+}
+require_file() {
+  label=$1
+  value=$2
+  test -f "$value" || validation_fail 85 "$label file is missing: ${value:-<unset>}"
+}
+trap validation_error ERR
+test -f "$1" || validation_fail 85 "activation script is missing: $1"
+test -d "$2" || validation_fail 85 "activation temporary directory is missing: $2"
 umask 077
 export HOME=$2
 export TMPDIR=$2
@@ -2727,32 +2784,69 @@ unset PYTHON PYTHONHOME PYTHONPATH CONDA_BUILD_SYSROOT CC CXX AR CFLAGS CXXFLAGS
 activation_cwd=$PWD
 cd "$RETREAD_ACTIVATION_TMPDIR"
 set +o pipefail
-source "$1" >/dev/null 2>&1
+set +u
+# Keep activation stdout away from the structured result while retaining both
+# streams in the captured stderr if a third-party hook fails.
+source "$1" 1>&2
+set -u
 set -o pipefail
 cd "$activation_cwd"
-test -n "${PYTHON:-}"
-test -n "${CC:-}"
-test -n "${CXX:-}"
-test -n "${AR:-}"
-test -n "${CFLAGS:-}"
-test -n "${CXXFLAGS:-}"
-test -n "${LDFLAGS:-}"
-test -d "${CONDA_BUILD_SYSROOT:-}"
-test -d "${BUILD_PREFIX:-}"
-test -d "${PREFIX:-}"
+require_nonempty PYTHON "${PYTHON:-}" "$1"
+require_nonempty CC "${CC:-}" "$1"
+require_nonempty CXX "${CXX:-}" "$1"
+require_nonempty AR "${AR:-}" "$1"
+require_nonempty CFLAGS "${CFLAGS:-}" "$1"
+require_nonempty CXXFLAGS "${CXXFLAGS:-}" "$1"
+require_nonempty LDFLAGS "${LDFLAGS:-}" "$1"
+require_directory CONDA_BUILD_SYSROOT "${CONDA_BUILD_SYSROOT:-}"
+require_directory BUILD_PREFIX "${BUILD_PREFIX:-}"
+require_directory PREFIX "${PREFIX:-}"
+require_file PYTHON "$PYTHON"
+test -x "$PYTHON" || validation_fail 85 "PYTHON is not executable: $PYTHON"
 export PATH="$BUILD_PREFIX/bin:$PREFIX/bin:/usr/bin:/bin"
-c_compiler=$(command -v "$CC")
-cxx_compiler=$(command -v "$CXX")
-ar=$(command -v "$AR")
-test "$(/usr/bin/readlink -f "$("$c_compiler" -print-sysroot)")" = "$(/usr/bin/readlink -f "$CONDA_BUILD_SYSROOT")"
-test "$(/usr/bin/readlink -f "$("$cxx_compiler" -print-sysroot)")" = "$(/usr/bin/readlink -f "$CONDA_BUILD_SYSROOT")"
-case "$(/usr/bin/readlink -f "$ar")" in "$BUILD_PREFIX"/*) ;; *) exit 86 ;; esac
+c_compiler=$(command -v "$CC") || validation_fail 86 "C compiler is not on the activated PATH: $CC"
+cxx_compiler=$(command -v "$CXX") || validation_fail 86 "C++ compiler is not on the activated PATH: $CXX"
+ar=$(command -v "$AR") || validation_fail 86 "archiver is not on the activated PATH: $AR"
+c_sysroot=$("$c_compiler" -print-sysroot)
+cxx_sysroot=$("$cxx_compiler" -print-sysroot)
+c_sysroot_path=$c_sysroot
+cxx_sysroot_path=$cxx_sysroot
+expected_sysroot_path=$CONDA_BUILD_SYSROOT
+c_sysroot=$(/usr/bin/readlink -f "$c_sysroot_path") || validation_fail 86 "C compiler reported a missing sysroot path: $c_sysroot_path"
+cxx_sysroot=$(/usr/bin/readlink -f "$cxx_sysroot_path") || validation_fail 86 "C++ compiler reported a missing sysroot path: $cxx_sysroot_path"
+expected_sysroot=$(/usr/bin/readlink -f "$expected_sysroot_path") || validation_fail 86 "activated sysroot path is missing: $expected_sysroot_path"
+test "$c_sysroot" = "$expected_sysroot" || validation_fail 86 "C compiler sysroot $c_sysroot does not match activated sysroot $expected_sysroot"
+test "$cxx_sysroot" = "$expected_sysroot" || validation_fail 86 "C++ compiler sysroot $cxx_sysroot does not match activated sysroot $expected_sysroot"
+ar_path=$ar
+ar=$(/usr/bin/readlink -f "$ar_path") || validation_fail 86 "activated archiver path is missing: $ar_path"
+case "$ar" in "$BUILD_PREFIX"/*) ;; *) validation_fail 86 "activated archiver escapes BUILD_PREFIX: $ar" ;; esac
+if python_header=$("$PYTHON" -I -c '
+import pathlib
+import sysconfig
+
+include = sysconfig.get_path("include")
+if not include:
+    raise SystemExit("sysconfig did not report a Python include directory")
+header = pathlib.Path(include) / "Python.h"
+if not header.is_file():
+    raise SystemExit(f"Python.h is missing: {header}")
+print(header)
+'); then
+  :
+else
+  status=$?
+  validation_fail "$status" "hermetic Python/header check failed using $PYTHON; stdout: ${python_header:-<empty>}"
+fi
+require_file Python.h "$python_header"
 printf '%s\n' "$PYTHON"
-"$PYTHON" -I -c 'import pathlib, sysconfig; header = pathlib.Path(sysconfig.get_path("include")) / "Python.h"; assert header.is_file(), header; print(header)'
+printf '%s\n' "$python_header"
 printf '%s\n' "$CONDA_BUILD_SYSROOT"
 cuda_executable=$(command -v "${CUDACXX:-${NVCC:-nvcc}}" || true)
 printf '%s\n' "${cuda_executable:--}"
-"$c_compiler" -print-file-name=specs
+compiler_specs=$("$c_compiler" -print-file-name=specs)
+case "$compiler_specs" in /*) ;; *) validation_fail 86 "C compiler reported a non-absolute specs path: $compiler_specs" ;; esac
+require_file "C compiler specs" "$compiler_specs"
+printf '%s\n' "$compiler_specs"
 printf '%s\n' "$c_compiler"
 printf '%s\n' "$cxx_compiler"
 printf '%s\n' "$BUILD_PREFIX"
@@ -2775,8 +2869,19 @@ printf '%s\n' "$PREFIX"
         .env_remove("LD_PRELOAD");
     let output =
         run_captured_sealed(&mut command, "validating hermetic Python and headers").await?;
-    let stdout = String::from_utf8(output.stdout)
-        .context("hermetic Python validation emitted non-UTF-8 output")?;
+    let stderr = output_snippet(&output.stderr);
+    let stdout = String::from_utf8(output.stdout).map_err(|error| {
+        anyhow!(
+            "hermetic Python validation emitted non-UTF-8 output: {error}; stderr: {stderr}; stdout: {}",
+            output_snippet(error.as_bytes())
+        )
+    })?;
+    let parse_error = |message: &str| {
+        anyhow!(
+            "{message}; validator stderr: {stderr}; validator stdout: {}",
+            output_snippet(stdout.as_bytes())
+        )
+    };
     let mut lines = stdout
         .lines()
         .map(str::trim)
@@ -2784,41 +2889,46 @@ printf '%s\n' "$PREFIX"
     let python = lines
         .next()
         .map(PathBuf::from)
-        .ok_or_else(|| anyhow!("compiler activation did not define `$PYTHON`"))?;
+        .ok_or_else(|| parse_error("compiler activation did not define `$PYTHON`"))?;
     let header = lines
         .next()
         .map(PathBuf::from)
-        .ok_or_else(|| anyhow!("environment Python did not report Python.h"))?;
+        .ok_or_else(|| parse_error("environment Python did not report Python.h"))?;
     let sysroot = lines
         .next()
         .map(PathBuf::from)
-        .ok_or_else(|| anyhow!("compiler activation did not define `$CONDA_BUILD_SYSROOT`"))?;
+        .ok_or_else(|| parse_error("compiler activation did not define `$CONDA_BUILD_SYSROOT`"))?;
     let cuda = lines.next().filter(|line| *line != "-").map(PathBuf::from);
     let compiler_specs = lines
         .next()
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
-        .ok_or_else(|| anyhow!("conda compiler did not report an absolute GCC specs path"))?;
+        .ok_or_else(|| parse_error("conda compiler did not report an absolute GCC specs path"))?;
     let c_compiler = lines
         .next()
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
-        .ok_or_else(|| anyhow!("conda activation did not report an absolute C compiler"))?;
+        .ok_or_else(|| parse_error("conda activation did not report an absolute C compiler"))?;
     let cxx_compiler = lines
         .next()
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
-        .ok_or_else(|| anyhow!("conda activation did not report an absolute C++ compiler"))?;
+        .ok_or_else(|| parse_error("conda activation did not report an absolute C++ compiler"))?;
     let build_prefix = lines
         .next()
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
-        .ok_or_else(|| anyhow!("conda activation did not report an absolute build prefix"))?;
+        .ok_or_else(|| parse_error("conda activation did not report an absolute build prefix"))?;
     let host_prefix = lines
         .next()
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
-        .ok_or_else(|| anyhow!("conda activation did not report an absolute host prefix"))?;
+        .ok_or_else(|| parse_error("conda activation did not report an absolute host prefix"))?;
+    if let Some(extra) = lines.next() {
+        return Err(parse_error(&format!(
+            "hermetic Python validation reported an unexpected extra field `{extra}`"
+        )));
+    }
     Ok(ActivatedEnvironment {
         python_executable: python,
         python_header: header,
@@ -3045,7 +3155,7 @@ mod tests {
     }
 
     fn test_hermetic_solve() -> crate::conda_solve::HermeticBuildSolve {
-        let records = vec![
+        let mut records = vec![
             test_solved_record("auditwheel", "6.7.0", "pyhd8ed1ab_0", &["host-helper >=1"]),
             test_solved_record("build-helper", "1.0", "hbuild_0", &[]),
             test_solved_record("cmake", "3.31.6", "h123456_0", &[]),
@@ -3053,7 +3163,11 @@ mod tests {
                 "gcc_linux-64",
                 "13.4.0",
                 "h123456_0",
-                &["build-helper >=1", "shared-runtime >=1"],
+                &[
+                    "build-helper >=1",
+                    "run-export-only >=1",
+                    "shared-runtime >=1",
+                ],
             ),
             test_solved_record(
                 "gxx_linux-64",
@@ -3071,9 +3185,19 @@ mod tests {
                 "hpython_0",
                 &["host-helper >=1", "shared-runtime >=1"],
             ),
+            test_solved_record("run-export-only", "1.0", "hexport_0", &[]),
             test_solved_record("shared-runtime", "2.0", "hshared_0", &[]),
             test_solved_record("sysroot_linux-64", "2.28", "h123456_0", &[]),
         ];
+        records
+            .iter_mut()
+            .find(|record| record.package_record.name.as_normalized() == "gcc_linux-64")
+            .unwrap()
+            .package_record
+            .run_exports = Some(rattler_conda_types::package::RunExportsJson {
+            strong: vec!["run-export-only >=1".to_string()],
+            ..Default::default()
+        });
         crate::conda_solve::HermeticBuildSolve {
             sysroot: crate::conda_solve::SelectedSysroot {
                 conda_version: "2.28".to_string(),
@@ -3200,6 +3324,23 @@ mod tests {
             == Some("https://prefix.dev/conda-forge/linux-64::shared-runtime ==2.0 hshared_0")));
         assert!(host.iter().any(|value| value.as_str()
             == Some("https://prefix.dev/conda-forge/linux-64::shared-runtime ==2.0 hshared_0")));
+        assert!(!host.iter().any(|value| value.as_str()
+            == Some("https://prefix.dev/conda-forge/linux-64::run-export-only ==1.0 hexport_0")));
+        assert!(build.iter().any(|value| value.as_str()
+            == Some("https://prefix.dev/conda-forge/linux-64::run-export-only ==1.0 hexport_0")));
+        let ignored = yaml["requirements"]["ignore_run_exports"]["from_package"]
+            .as_sequence()
+            .unwrap();
+        assert!(
+            ignored
+                .iter()
+                .any(|value| value.as_str() == Some("gcc_linux-64"))
+        );
+        assert!(
+            ignored
+                .iter()
+                .any(|value| value.as_str() == Some("run-export-only"))
+        );
         assert!(!build.iter().any(|value| {
             value
                 .as_str()
@@ -3216,8 +3357,15 @@ mod tests {
             "cuda-nvcc_linux-64",
             "12.9.1",
             "hcuda_0",
-            &["build-helper >=1"],
+            &["build-helper >=1", "cuda-version >=12"],
         ));
+        let mut cuda_version = test_solved_record("cuda-version", "12.9", "hcuda_0", &[]);
+        cuda_version.package_record.subdir = "noarch".to_string();
+        cuda_version.url = url::Url::parse(
+            "https://prefix.dev/conda-forge/noarch/cuda-version-12.9-hcuda_0.conda",
+        )
+        .unwrap();
+        cuda_solved.records.push(cuda_version);
         let cuda_rendered =
             String::from_utf8(render_debug_recipe(&cuda_solved, true).unwrap()).unwrap();
         let cuda_yaml: serde_yaml::Value = serde_yaml::from_str(&cuda_rendered).unwrap();
@@ -3232,6 +3380,27 @@ mod tests {
                             "https://prefix.dev/conda-forge/linux-64::cuda-nvcc_linux-64 ==12.9.1 hcuda_0"
                         )
                 })
+        );
+        assert!(
+            cuda_yaml["requirements"]["build"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .any(|value| {
+                    value.as_str()
+                        == Some(
+                            "https://prefix.dev/conda-forge/noarch::cuda-version ==12.9 hcuda_0",
+                        )
+                })
+        );
+        assert!(
+            !cuda_yaml["requirements"]["host"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .any(|value| value
+                    .as_str()
+                    .is_some_and(|value| value.contains("::cuda-version ")))
         );
     }
 
@@ -3579,6 +3748,242 @@ mod tests {
         assert_eq!(parse_rattler_build_version("rattler-build unknown"), None);
     }
 
+    #[tokio::test]
+    async fn captured_command_failure_reports_both_streams_and_status() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("printf 'validator stdout'; printf 'validator stderr' >&2; exit 23");
+        let error = run_captured_sealed(&mut command, "test validator")
+            .await
+            .unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("status: 23"), "{rendered}");
+        assert!(rendered.contains("stdout: validator stdout"), "{rendered}");
+        assert!(rendered.contains("stderr: validator stderr"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn captured_command_spawn_failure_reports_errno() {
+        let missing = format!("/retread-missing-validator-{}", std::process::id());
+        let mut command = Command::new(&missing);
+        let error = run_captured_sealed(&mut command, "test validator spawn")
+            .await
+            .unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("spawning test validator spawn"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("No such file or directory"), "{rendered}");
+        assert!(rendered.contains("os error 2"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn python_validation_reports_activation_output_and_status() {
+        let root = std::env::temp_dir().join(format!(
+            "retread-hermetic-activation-error-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let activation_tmp = root.join("activation-tmp");
+        std::fs::create_dir_all(&activation_tmp).unwrap();
+        let activation = root.join("build_env.sh");
+        std::fs::write(
+            &activation,
+            "printf 'activation stdout detail\\n'\nprintf 'activation stderr detail\\n' >&2\nreturn 42\n",
+        )
+        .unwrap();
+
+        let error = discover_activated_python(&activation, &activation_tmp)
+            .await
+            .err()
+            .expect("activation failure must be reported");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("status: 42"), "{rendered}");
+        assert!(rendered.contains("activation stdout detail"), "{rendered}");
+        assert!(rendered.contains("activation stderr detail"), "{rendered}");
+        assert!(rendered.contains("source \"$1\""), "{rendered}");
+        assert!(
+            rendered.contains(&activation.display().to_string()),
+            "{rendered}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn python_validation_names_unset_values_and_missing_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "retread-hermetic-validation-paths-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let activation_tmp = root.join("activation-tmp");
+        std::fs::create_dir_all(&activation_tmp).unwrap();
+        let activation = root.join("build_env.sh");
+        // CUDA's activation hook initializes these variables by expanding
+        // their intentionally unset values. Sourcing must not impose nounset.
+        std::fs::write(
+            &activation,
+            "export NVCC_PREPEND_FLAGS=\"${NVCC_PREPEND_FLAGS} -ccbin=fake\"\n",
+        )
+        .unwrap();
+        let error = discover_activated_python(&activation, &activation_tmp)
+            .await
+            .err()
+            .expect("unset Python must be reported");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("PYTHON is unset or empty"), "{rendered}");
+        assert!(!rendered.contains("unbound variable"), "{rendered}");
+
+        let build_prefix = root.join("build");
+        let host_prefix = root.join("host");
+        std::fs::create_dir_all(&build_prefix).unwrap();
+        std::fs::create_dir_all(&host_prefix).unwrap();
+        let missing_sysroot = root.join("missing-sysroot");
+        std::fs::write(
+            &activation,
+            format!(
+                "export PYTHON=/missing/python\nexport CC=cc\nexport CXX=c++\nexport AR=ar\nexport CFLAGS=x\nexport CXXFLAGS=x\nexport LDFLAGS=x\nexport CONDA_BUILD_SYSROOT={}\nexport BUILD_PREFIX={}\nexport PREFIX={}\n",
+                missing_sysroot.display(),
+                build_prefix.display(),
+                host_prefix.display()
+            ),
+        )
+        .unwrap();
+        let error = discover_activated_python(&activation, &activation_tmp)
+            .await
+            .err()
+            .expect("missing sysroot must be reported");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains(&format!(
+                "CONDA_BUILD_SYSROOT directory is missing: {}",
+                missing_sysroot.display()
+            )),
+            "{rendered}"
+        );
+
+        std::fs::create_dir_all(&missing_sysroot).unwrap();
+        let error = discover_activated_python(&activation, &activation_tmp)
+            .await
+            .err()
+            .expect("missing Python must be reported");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("PYTHON file is missing: /missing/python"),
+            "{rendered}"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let build_bin = build_prefix.join("bin");
+            let host_bin = host_prefix.join("bin");
+            std::fs::create_dir_all(&build_bin).unwrap();
+            std::fs::create_dir_all(&host_bin).unwrap();
+            let missing_header = host_prefix.join("include/python3.12/Python.h");
+            let python = host_bin.join("python");
+            std::fs::write(
+                &python,
+                format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", missing_header.display()),
+            )
+            .unwrap();
+            let compiler_script = format!(
+                "#!/bin/sh\ncase \"$1\" in -print-sysroot) printf '%s\\n' '{}' ;; esac\n",
+                missing_sysroot.display()
+            );
+            let c_compiler = build_bin.join("cc");
+            let cxx_compiler = build_bin.join("c++");
+            let ar = build_bin.join("ar");
+            for path in [&python, &c_compiler, &cxx_compiler, &ar] {
+                let contents = if path == &python {
+                    std::fs::read(&python).unwrap()
+                } else {
+                    compiler_script.as_bytes().to_vec()
+                };
+                std::fs::write(path, contents).unwrap();
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            std::fs::write(
+                &activation,
+                format!(
+                    "export PYTHON={}\nexport CC={}\nexport CXX={}\nexport AR={}\nexport CFLAGS=x\nexport CXXFLAGS=x\nexport LDFLAGS=x\nexport CONDA_BUILD_SYSROOT={}\nexport BUILD_PREFIX={}\nexport PREFIX={}\n",
+                    python.display(),
+                    c_compiler.display(),
+                    cxx_compiler.display(),
+                    ar.display(),
+                    missing_sysroot.display(),
+                    build_prefix.display(),
+                    host_prefix.display()
+                ),
+            )
+            .unwrap();
+            let error = discover_activated_python(&activation, &activation_tmp)
+                .await
+                .err()
+                .expect("missing Python.h must be reported");
+            let rendered = format!("{error:#}");
+            assert!(
+                rendered.contains(&format!(
+                    "Python.h file is missing: {}",
+                    missing_header.display()
+                )),
+                "{rendered}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    #[ignore = "live: provisions an exact conda-forge CUDA/Python toolchain"]
+    async fn python_312_cuda_12_glibc_234_toolchain_provisions() {
+        let target_floor = (2, 34);
+        let python_minor = "3.12".to_string();
+        let cuda_version = Some("12".to_string());
+        let solved = crate::conda_solve::solve_hermetic_build_environment(
+            target_floor,
+            &python_minor,
+            cuda_version.as_deref(),
+        )
+        .await
+        .unwrap_or_else(|reasons| panic!("solve exact live tuple: {}", reasons.join("; ")));
+        let request = ProvisionRequest {
+            target_floor,
+            python_minor,
+            cuda_version,
+            toolchain_digest: solved_records_digest(&solved, true).unwrap(),
+        };
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let cache_dir = std::env::temp_dir().join(format!(
+            "retread-hermetic-exact-tuple-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&cache_dir).unwrap();
+        let marker = provision_uncached(&cache_dir, &request, &solved)
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "provision the Python 3.12, CUDA 12, glibc 2.34 toolchain; preserving {}: {error:#}",
+                    cache_dir.display()
+                )
+            });
+        let environment = validate_marker(&cache_dir, &request, &marker).unwrap_or_else(|error| {
+            panic!(
+                "validate the Python 3.12, CUDA 12, glibc 2.34 toolchain; preserving {}: {error:#}",
+                cache_dir.display()
+            )
+        });
+        assert_eq!(environment.selected_sysroot(), (2, 34));
+        assert!(environment.python_executable().is_file());
+        assert!(environment.cuda_executable().is_some_and(Path::is_file));
+        crate::source_build::remove_owned_cache_entry(&cache_dir).unwrap();
+    }
+
     #[test]
     fn cache_leaf_is_keyed_by_floor_python_and_cuda() {
         let request = |target_floor, python_minor: &str, cuda_version: Option<&str>| {
@@ -3667,6 +4072,27 @@ mod tests {
         assert!(sanitized.lines().any(|line| line.starts_with(": >")));
         validate_sanitized_activation_hook(&hook).unwrap();
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn quoted_tilde_cuda_activation_hook_is_attested() {
+        let root = std::env::temp_dir().join(format!(
+            "retread-hermetic-quoted-cuda-hook-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let hook_dir = root.join("prefix/etc/conda/activate.d");
+        std::fs::create_dir_all(&hook_dir).unwrap();
+        let hook = hook_dir.join("~cuda-nvcc_activate.sh");
+        std::fs::write(&hook, "export NVCC_PREPEND_FLAGS=active\n").unwrap();
+        let activation = root.join("build_env.sh");
+        std::fs::write(&activation, format!(". '{}'\n", hook.display())).unwrap();
+
+        let markers = sanitize_activation_hooks(&root, &activation).unwrap();
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].path, hook);
+        assert_eq!(markers[0].sha256, file_sha256(&hook).unwrap());
         let _ = std::fs::remove_dir_all(root);
     }
 

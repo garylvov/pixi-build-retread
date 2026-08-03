@@ -330,7 +330,7 @@ version = "1.0.0"
         "expected a sysroot-derived `{TARGET_PLATFORM_TAG}` evdev wheel, found {evdev_wheels:?}; \
          the test host must have glibc newer than {TARGET_GLIBC} to force the hermetic path"
     );
-    let marker_path = fs::read_dir(test_dir.path().join("retread-cache/hermetic-build-envs/v7"))
+    let marker_path = fs::read_dir(test_dir.path().join("retread-cache/hermetic-build-envs/v8"))
         .expect("read hermetic environment cache")
         .map(|entry| entry.expect("read hermetic environment entry").path())
         .find(|path| path.join("complete.json").is_file())
