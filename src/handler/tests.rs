@@ -4026,6 +4026,10 @@ fn abi_anchor_cap_completion_intersects_compatible_clauses_and_stays_source_scop
         )
         .is_empty()
     );
+    // Epoch 46: emit-pypi's anchor floor completion writes the canonical
+    // within-major band into shipped wheel METADATA, so the invariant accepts
+    // the canonical form from embedded origins too — no longer source-scoped
+    // to retread-emitted conda contracts.
     let embedded = check_output_abi_invariants(
         &[],
         &[("consumer-wheel".to_string(), "numpy>=2.0,<3".to_string())],
@@ -4033,8 +4037,17 @@ fn abi_anchor_cap_completion_intersects_compatible_clauses_and_stays_source_scop
         &BTreeMap::new(),
         &AbiAliasGraph::new(),
     );
-    assert_eq!(embedded.len(), 1, "{embedded:?}");
-    assert!(embedded[0].contains("wheel `consumer-wheel` embeds"));
+    assert!(embedded.is_empty(), "{embedded:?}");
+    // A genuinely open bare-major embedded anchor still violates.
+    let open_bare = check_output_abi_invariants(
+        &[],
+        &[("consumer-wheel".to_string(), "numpy>=2".to_string())],
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        &AbiAliasGraph::new(),
+    );
+    assert_eq!(open_bare.len(), 1, "{open_bare:?}");
+    assert!(open_bare[0].contains("wheel `consumer-wheel` embeds"));
 }
 
 #[test]
