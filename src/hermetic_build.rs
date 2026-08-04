@@ -298,12 +298,9 @@ pub(crate) async fn provision(
              will still be rejected by post-build validation)"
         );
         cuda_version = None;
-        solve_result = crate::conda_solve::solve_hermetic_build_environment(
-            target_floor,
-            &python_minor,
-            None,
-        )
-        .await;
+        solve_result =
+            crate::conda_solve::solve_hermetic_build_environment(target_floor, &python_minor, None)
+                .await;
     }
     let solved = solve_result.map_err(|reasons| anyhow!(reasons.join("; ")))?;
     let toolchain_digest = solved_records_digest(&solved, cuda_version.is_some())?;

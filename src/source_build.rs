@@ -5221,12 +5221,16 @@ async fn ensure_canonical_git_snapshot(
         // without it is an incomplete publish (killed process, purged
         // tmp), not a published tree with readers. Rebuild it under the
         // held lock instead of failing closed.
-        if !cache_dir.join("source.json").try_exists().with_context(|| {
-            format!(
-                "checking canonical Git source marker in {}",
-                cache_dir.display()
-            )
-        })? {
+        if !cache_dir
+            .join("source.json")
+            .try_exists()
+            .with_context(|| {
+                format!(
+                    "checking canonical Git source marker in {}",
+                    cache_dir.display()
+                )
+            })?
+        {
             tracing::warn!(
                 cache = %cache_dir.display(),
                 "canonical Git source cache has no marker; discarding the \

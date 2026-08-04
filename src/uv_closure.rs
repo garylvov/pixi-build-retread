@@ -3127,7 +3127,10 @@ pub(crate) async fn hash_unhashed_index_wheels(closure: &mut UvClosure) -> Resul
             .await
             .with_context(|| format!("fetching unhashed index wheel {url}"))?;
         if !response.status().is_success() {
-            bail!("HTTP {} fetching unhashed index wheel {url}", response.status());
+            bail!(
+                "HTTP {} fetching unhashed index wheel {url}",
+                response.status()
+            );
         }
         let bytes = response
             .bytes()
@@ -6408,8 +6411,8 @@ version = "1.0"
 name = "foo-1.0-py3-none-any.whl"
 url = "https://example.com/foo-1.0-py3-none-any.whl"
 "#;
-        let closure = parse_pylock_closure(text, &target("3.12", "linux-64"), &BTreeSet::new(), "x")
-            .unwrap();
+        let closure =
+            parse_pylock_closure(text, &target("3.12", "linux-64"), &BTreeSet::new(), "x").unwrap();
         assert_eq!(closure.wheels.len(), 1);
         // Hash absent at parse; hash_unhashed_index_wheels() backfills it from
         // the fetched artifact bytes before the closure is used.

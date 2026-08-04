@@ -755,7 +755,11 @@ pub const SCHEMA: u32 = 18;
 /// Epoch 44: source builds may provision a compiler environment pinned to the
 /// newest compatible conda-forge sysroot and emit exact-sysroot manylinux
 /// native wheels, expanding the set of bundleable sdist-only dependencies.
-pub const EMIT_EPOCH: u32 = 45;
+///
+/// Epoch 46: ABI anchors are excluded from the emit-pypi floor-envelope
+/// override table; their per-wheel METADATA constraints ship unchanged and
+/// are validated against the workspace's conda pins.
+pub const EMIT_EPOCH: u32 = 46;
 
 fn parse_stored_glibc(value: Option<&str>) -> Option<Option<(u32, u32)>> {
     match value {
