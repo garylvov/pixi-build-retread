@@ -4862,7 +4862,11 @@ async fn ensure_no_canonical_gitlinks(
     resolved_sha: &str,
     submodules: Option<GitSubmodules>,
 ) -> Result<()> {
-    if submodules.is_some() {
+    // Recursive initialization already populated every gitlink, so there is
+    // nothing to report. Every other policy still needs the census below:
+    // `Ignore` must say out loud what it skipped rather than quietly emit a
+    // wheel with the corresponding directories missing.
+    if submodules == Some(GitSubmodules::Recursive) {
         return Ok(());
     }
     let tree = run_output_bytes(
@@ -4889,6 +4893,21 @@ async fn ensure_no_canonical_gitlinks(
     }
     if !gitlinks.is_empty() {
         gitlinks.sort();
+        if submodules == Some(GitSubmodules::Ignore) {
+            // Building the parent tree alone is a deliberate reduction, and
+            // the consumer cannot see it from the wheel: the submodule
+            // directories are simply absent, so any import that reaches into
+            // them fails at runtime rather than at build time. Say it once,
+            // loudly, while the build output is still in front of someone.
+            tracing::warn!(
+                commit = %resolved_sha,
+                omitted_submodules = %gitlinks.join(", "),
+                "building this git source WITHOUT its submodules \
+                 (submodules = \"ignore\"); anything importing from these \
+                 paths will fail at runtime"
+            );
+            return Ok(());
+        }
         bail!(
             "git source at commit {resolved_sha} contains unsupported submodule gitlinks; retread will not silently build an uninitialized tree: {}",
             gitlinks.join(", "),
@@ -7595,6 +7614,48 @@ version = "0.1.0"
             );
         }
         make_staging_tree_removable(&repo);
+    }
+
+    #[tokio::test]
+    async fn ignore_policy_reports_the_submodules_it_skipped() {
+        let fixture = git_checkout_fixture("gitlink-policy");
+        let repo = fixture.base.join("repo");
+        let nested = fixture.base.join("nested");
+        std::fs::create_dir_all(&nested).expect("nested repo dir");
+        run_fixture_git(&["init", "-b", "main"], &nested);
+        std::fs::write(nested.join("f.txt"), "x\n").expect("write nested file");
+        run_fixture_git(&["add", "."], &nested);
+        run_fixture_git(&["commit", "-m", "nested"], &nested);
+        // Commit the nested repository as a real 160000 gitlink entry.
+        run_fixture_git(
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "--",
+                nested.to_str().expect("utf8 path"),
+                "vendored",
+            ],
+            &repo,
+        );
+        run_fixture_git(&["commit", "-m", "add gitlink"], &repo);
+        let sha = run_fixture_git(&["rev-parse", "HEAD"], &repo);
+
+        // No declared policy stays fail-closed and names the offending path.
+        let refused = ensure_no_canonical_gitlinks(&repo, &sha, None)
+            .await
+            .expect_err("an undeclared gitlink must refuse the build");
+        assert!(
+            format!("{refused:#}").contains("vendored"),
+            "the refusal must name the gitlink: {refused:#}"
+        );
+
+        // `ignore` permits the build; the omission is reported through the
+        // tracing subscriber so the build output carries it.
+        ensure_no_canonical_gitlinks(&repo, &sha, Some(GitSubmodules::Ignore))
+            .await
+            .expect("ignore must permit building the parent tree alone");
     }
 
     #[test]
