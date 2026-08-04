@@ -1695,7 +1695,11 @@ pub(crate) async fn stage_for_target_with_store_root_and_relaxations(
         .unwrap_or_else(retread_wheel_store_root);
 
     // Step 1: run plan() to get ship set + override table.
-    let emit_plan = plan(emit_wheels, conda_capable);
+    let emit_plan = plan(
+        emit_wheels,
+        conda_capable,
+        &crate::relax::abi_aliases_from_name_map(&config.name_map),
+    );
 
     // Clone overrides + conda_capable + drop_url so we can move them into
     // spawn_blocking. The mapper itself cannot cross the `'static` boundary

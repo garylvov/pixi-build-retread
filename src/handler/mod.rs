@@ -12379,7 +12379,11 @@ fn ensure_output_abi_invariants(
         .map(|decision| canonical_conda_name(&decision.pypi_name))
         .collect::<HashSet<_>>();
     conda_capable.extend(config.name_map.keys().map(|key| key.as_str().to_owned()));
-    let emit_plan = crate::emit_pypi::plan(&emit_wheels, &conda_capable);
+    let emit_plan = crate::emit_pypi::plan(
+        &emit_wheels,
+        &conda_capable,
+        &output_abi_aliases(bundle, config),
+    );
     let line_map = crate::emit_pypi::override_line_map(
         &emit_plan.overrides,
         &conda_capable,

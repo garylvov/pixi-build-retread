@@ -237,7 +237,11 @@ pub struct EmitPlan {
 /// model. Exactness is reserved for names conda definitively lacks
 /// (the isaacsim family), where it reproduces the BFS's exact-first
 /// resolution. Same gate as the step-8 auto-bundle reroute.
-pub fn plan(wheels: &[EmitWheel], conda_capable: &std::collections::HashSet<String>) -> EmitPlan {
+pub fn plan(
+    wheels: &[EmitWheel],
+    conda_capable: &std::collections::HashSet<String>,
+    abi_aliases: &crate::relax::AbiAliasGraph,
+) -> EmitPlan {
     let bundle_versions: std::collections::HashMap<&str, &EmitWheel> =
         wheels.iter().map(|w| (w.pypi_name.as_str(), w)).collect();
     // Pass 1: every direct-URL requirement's target must resolve by
@@ -318,6 +322,15 @@ pub fn plan(wheels: &[EmitWheel], conda_capable: &std::collections::HashSet<Stri
             };
             let name = req.name.to_string();
             if name == "python" || ship.contains(&name) || exact.contains_key(&name) {
+                continue;
+            }
+            // ABI anchors (numpy, python-abi, CUDA, ...) never get a
+            // collapsed floor envelope: the lowest floor across wheels is
+            // routinely a bare major (`numpy >=1`), which the emission ABI
+            // invariant rightly rejects. Anchor version discipline comes from
+            // the workspace's conda pins; the original per-wheel constraints
+            // stay in METADATA and are validated against those pins.
+            if crate::relax::is_semantic_abi_anchor(&name, abi_aliases) {
                 continue;
             }
             let Some(uv_pep508::VersionOrUrl::VersionSpecifier(specs)) = req.version_or_url else {
