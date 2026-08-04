@@ -26,6 +26,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
+use crate::config::GitSubmodules;
 use crate::pypi::{NativeSourceBuildPolicy, ResolutionTarget, normalized_python_minor};
 
 const BUILT_WHEEL_CACHE_SCHEMA: &str = "retread-built-wheel-v10";
@@ -33,7 +34,7 @@ const BUILT_WHEEL_CACHE_ROOT: &str = "built-wheels";
 const BUILT_WHEEL_CACHE_VERSION: &str = "v10";
 const CHECKOUT_CACHE_VERSION: &str = "v3";
 const LOCAL_SOURCE_SNAPSHOT_VERSION: &str = "v5";
-const CANONICAL_GIT_SOURCE_SCHEMA: &str = "retread-canonical-git-source-v2";
+const CANONICAL_GIT_SOURCE_SCHEMA: &str = "retread-canonical-git-source-v3";
 const SDIST_BUILD_CONSTRAINTS: &str = "setuptools<81\ncmake<4\n";
 static BUILD_TMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -149,6 +150,7 @@ struct CanonicalGitSourceMarker {
     repository_identity: String,
     resolved_sha: String,
     ref_state: String,
+    submodules: Option<GitSubmodules>,
 }
 
 #[derive(Debug, Clone)]
@@ -196,6 +198,7 @@ struct CanonicalGitSnapshot {
     repository_identity: String,
     resolved_sha: String,
     ref_state: String,
+    submodules: Option<GitSubmodules>,
 }
 
 #[derive(Debug)]
@@ -3187,7 +3190,7 @@ async fn external_path_git_state(source_root: &Path) -> Result<Option<ExternalPa
         bail!("external path-source Git HEAD is not an exact commit: {resolved_sha}");
     }
     let ref_state = canonical_git_ref_state(source_root).await?;
-    ensure_no_canonical_gitlinks(source_root, &resolved_sha).await?;
+    ensure_no_canonical_gitlinks(source_root, &resolved_sha, None).await?;
     Ok(Some(ExternalPathGitState {
         resolved_sha,
         ref_state,
@@ -3262,7 +3265,7 @@ async fn attach_external_path_git_metadata(
             actual_ref_state,
         );
     }
-    ensure_no_canonical_gitlinks(&repo, &state.resolved_sha).await?;
+    ensure_no_canonical_gitlinks(&repo, &state.resolved_sha, None).await?;
     let git_dir = repo.join(".git");
     sanitize_canonical_git_metadata(&repo)?;
     let snapshot_git_dir = snapshot.root().join(".git");
@@ -3868,14 +3871,32 @@ pub fn git_wheel_cache_dir(
         crate::glibc::current_pixi_platform(),
     )
     .expect("git_wheel_cache_dir requires a valid current source-build target");
-    let family_identity = git_wheel_family_identity(url, sha, subdirectory);
+    let family_identity = git_wheel_family_identity(url, sha, subdirectory, None);
     built_wheel_cache_dir("git", &family_identity, &target)
 }
 
-fn git_wheel_family_identity(url: &str, sha: &str, subdirectory: &str) -> String {
+fn git_submodules_identity(submodules: Option<GitSubmodules>) -> &'static [u8] {
+    match submodules {
+        None => b"fail-closed",
+        Some(GitSubmodules::Ignore) => b"ignore",
+        Some(GitSubmodules::Recursive) => b"recursive",
+    }
+}
+
+fn git_wheel_family_identity(
+    url: &str,
+    sha: &str,
+    subdirectory: &str,
+    submodules: Option<GitSubmodules>,
+) -> String {
     hash_fields(
-        b"retread-git-wheel-family-v4\0",
-        &[url.as_bytes(), sha.as_bytes(), subdirectory.as_bytes()],
+        b"retread-git-wheel-family-v5\0",
+        &[
+            url.as_bytes(),
+            sha.as_bytes(),
+            subdirectory.as_bytes(),
+            git_submodules_identity(submodules),
+        ],
     )
 }
 
@@ -3883,10 +3904,18 @@ fn git_wheel_source_identity(family_identity: &str, ref_state: &str) -> String {
     format!("{family_identity}/{ref_state}")
 }
 
-fn canonical_git_repository_identity(url: &str, sha: &str) -> String {
+fn canonical_git_repository_identity(
+    url: &str,
+    sha: &str,
+    submodules: Option<GitSubmodules>,
+) -> String {
     hash_fields(
-        b"retread-canonical-git-repository-v1\0",
-        &[url.as_bytes(), sha.as_bytes()],
+        b"retread-canonical-git-repository-v2\0",
+        &[
+            url.as_bytes(),
+            sha.as_bytes(),
+            git_submodules_identity(submodules),
+        ],
     )
 }
 
@@ -4828,7 +4857,14 @@ async fn delete_canonical_git_refs(repo: &Path, namespace: &str) -> Result<()> {
     Ok(())
 }
 
-async fn ensure_no_canonical_gitlinks(repo: &Path, resolved_sha: &str) -> Result<()> {
+async fn ensure_no_canonical_gitlinks(
+    repo: &Path,
+    resolved_sha: &str,
+    submodules: Option<GitSubmodules>,
+) -> Result<()> {
+    if submodules.is_some() {
+        return Ok(());
+    }
     let tree = run_output_bytes(
         Command::new("git")
             .args(["ls-tree", "-r", "-z", "--full-tree", resolved_sha])
@@ -4859,6 +4895,17 @@ async fn ensure_no_canonical_gitlinks(repo: &Path, resolved_sha: &str) -> Result
         );
     }
     Ok(())
+}
+
+async fn initialize_git_submodules_recursive(repo: &Path, label: &str) -> Result<()> {
+    run_silent(
+        Command::new("git")
+            .args(["submodule", "update", "--init", "--recursive", "--"])
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .current_dir(repo),
+        label,
+    )
+    .await
 }
 
 fn sanitize_canonical_git_metadata(repo: &Path) -> Result<()> {
@@ -5101,6 +5148,7 @@ async fn validate_canonical_git_snapshot(
     repository_identity: &str,
     resolved_sha: &str,
     ref_state: &str,
+    submodules: Option<GitSubmodules>,
     require_clean: bool,
 ) -> Result<CanonicalGitSnapshot> {
     let cache_metadata = std::fs::symlink_metadata(cache_dir)
@@ -5129,9 +5177,10 @@ async fn validate_canonical_git_snapshot(
         || marker.repository_identity != repository_identity
         || marker.resolved_sha != resolved_sha
         || marker.ref_state != ref_state
+        || marker.submodules != submodules
     {
         bail!(
-            "canonical Git source marker does not match its full repository/commit/ref identity: {}",
+            "canonical Git source marker does not match its full repository/commit/ref/submodule-policy identity: {}",
             marker_path.display(),
         );
     }
@@ -5180,7 +5229,7 @@ async fn validate_canonical_git_snapshot(
     if !noncanonical_refs.is_empty() {
         bail!("canonical Git repository regained branch or remote-tracking refs");
     }
-    ensure_no_canonical_gitlinks(&repo, resolved_sha).await?;
+    ensure_no_canonical_gitlinks(&repo, resolved_sha, submodules).await?;
     if require_clean {
         let status = validate_canonical_git_worktree(cache_dir, &repo).await?;
         if !status.is_empty() {
@@ -5195,6 +5244,7 @@ async fn validate_canonical_git_snapshot(
         repository_identity: repository_identity.to_string(),
         resolved_sha: resolved_sha.to_string(),
         ref_state: ref_state.to_string(),
+        submodules,
     })
 }
 
@@ -5203,11 +5253,13 @@ async fn ensure_canonical_git_snapshot(
     upstream_url: &str,
     resolved_sha: &str,
     ref_state: &str,
+    submodules: Option<GitSubmodules>,
 ) -> Result<CanonicalGitSnapshot> {
-    let repository_identity = canonical_git_repository_identity(upstream_url, resolved_sha);
+    let repository_identity =
+        canonical_git_repository_identity(upstream_url, resolved_sha, submodules);
     let cache_dir = crate::courier::retread_cache_root()
         .join("canonical-git-sources")
-        .join("v2")
+        .join("v3")
         .join(&repository_identity)
         .join(ref_state);
     let _lock = acquire_artifact_cache_lock(&cache_dir).await?;
@@ -5246,6 +5298,7 @@ async fn ensure_canonical_git_snapshot(
                 &repository_identity,
                 resolved_sha,
                 ref_state,
+                submodules,
                 true,
             )
             .await;
@@ -5342,6 +5395,9 @@ async fn ensure_canonical_git_snapshot(
         "git normalize canonical origin",
     )
     .await?;
+    if submodules == Some(GitSubmodules::Recursive) {
+        initialize_git_submodules_recursive(&repo, "git initialize canonical submodules").await?;
+    }
     let actual_ref_state = canonical_git_ref_state(&repo).await?;
     if actual_ref_state != ref_state {
         bail!(
@@ -5354,7 +5410,7 @@ async fn ensure_canonical_git_snapshot(
             "shared Git checkout tag/ref state changed during canonicalization: expected {ref_state}, found {final_shared_ref_state}"
         );
     }
-    ensure_no_canonical_gitlinks(&repo, resolved_sha).await?;
+    ensure_no_canonical_gitlinks(&repo, resolved_sha, submodules).await?;
     let status = run_output_bytes(
         Command::new("git")
             .args([
@@ -5394,6 +5450,7 @@ async fn ensure_canonical_git_snapshot(
         repository_identity: repository_identity.clone(),
         resolved_sha: resolved_sha.to_string(),
         ref_state: ref_state.to_string(),
+        submodules,
     };
     std::fs::write(
         staging.0.join("source.json"),
@@ -5412,6 +5469,7 @@ async fn ensure_canonical_git_snapshot(
         &repository_identity,
         resolved_sha,
         ref_state,
+        submodules,
         true,
     )
     .await
@@ -5472,6 +5530,13 @@ async fn prepare_private_git_build_tree(
         "git normalize private build origin",
     )
     .await?;
+    if canonical.submodules == Some(GitSubmodules::Recursive) {
+        initialize_git_submodules_recursive(
+            &private_repo,
+            "git initialize private build submodules",
+        )
+        .await?;
+    }
     let head = run_output(
         Command::new("git")
             .args(["rev-parse", "--verify", "HEAD^{commit}"])
@@ -5534,6 +5599,7 @@ impl GitWheelBuild {
 pub(crate) struct GitWheelBuildPolicy<'a> {
     pub(crate) expected: Option<&'a ExpectedWheel>,
     pub(crate) static_cpp_runtime: bool,
+    pub(crate) submodules: Option<GitSubmodules>,
 }
 
 pub(crate) async fn build_wheel_from_git_leased_for_target(
@@ -5576,6 +5642,7 @@ pub async fn build_wheel_from_git(
         GitWheelBuildPolicy {
             expected: None,
             static_cpp_runtime: false,
+            submodules: None,
         },
     )
     .await?;
@@ -5597,6 +5664,7 @@ async fn build_wheel_from_git_inner(
     let GitWheelBuildPolicy {
         expected,
         static_cpp_runtime,
+        submodules,
     } = policy;
     let python = normalized_python_minor(target.python_version())?;
     let subdirectory = normalize_git_subdirectory(subdirectory)?;
@@ -5617,7 +5685,8 @@ async fn build_wheel_from_git_inner(
             });
         }
         let resolved_sha = rev.to_ascii_lowercase();
-        let family_identity = git_wheel_family_identity(url, &resolved_sha, &subdirectory_identity);
+        let family_identity =
+            git_wheel_family_identity(url, &resolved_sha, &subdirectory_identity, submodules);
         let candidate_ref_states =
             probe_cached_git_family_states(&family_identity, target, expected).await?;
         if candidate_ref_states.is_empty() {
@@ -5671,9 +5740,14 @@ async fn build_wheel_from_git_inner(
                 "validated foreign git artifact disappeared before exact ref-state materialization"
             )
         })?;
-        let canonical =
-            ensure_canonical_git_snapshot(checkout.root(), url, &resolved_sha, &checkout_ref_state)
-                .await?;
+        let canonical = ensure_canonical_git_snapshot(
+            checkout.root(),
+            url,
+            &resolved_sha,
+            &checkout_ref_state,
+            submodules,
+        )
+        .await?;
         let project_root = confined_git_source_dir(&canonical.root, &subdirectory)?;
         return Ok(GitWheelBuild {
             wheel_path,
@@ -5719,10 +5793,12 @@ async fn build_wheel_from_git_inner(
     }
     let resolved_sha = resolved_sha.to_ascii_lowercase();
     let ref_state = canonical_git_ref_state(clone_dir).await?;
-    let family_identity = git_wheel_family_identity(url, &resolved_sha, &subdirectory_identity);
+    let family_identity =
+        git_wheel_family_identity(url, &resolved_sha, &subdirectory_identity, submodules);
     let base_source_identity = git_wheel_source_identity(&family_identity, &ref_state);
     let canonical =
-        ensure_canonical_git_snapshot(clone_dir, url, &resolved_sha, &ref_state).await?;
+        ensure_canonical_git_snapshot(clone_dir, url, &resolved_sha, &ref_state, submodules)
+            .await?;
     let project_root = confined_git_source_dir(&canonical.root, &subdirectory)?;
     let pyproject = pyproject_from_directory(&project_root)?;
     let build_requirements =
@@ -5802,6 +5878,7 @@ async fn build_wheel_from_git_inner(
                     &canonical_for_build.repository_identity,
                     &canonical_for_build.resolved_sha,
                     &canonical_for_build.ref_state,
+                    canonical_for_build.submodules,
                     true,
                 )
                 .await?;
@@ -7520,6 +7597,28 @@ version = "0.1.0"
         make_staging_tree_removable(&repo);
     }
 
+    #[test]
+    fn submodule_policy_participates_in_git_cache_identities() {
+        // A tree built with submodules initialized is not the same tree as one
+        // built without them. If the policy did not enter these identities, a
+        // cached Ignore build would be served for a Recursive request.
+        let url = "https://example.invalid/repo.git";
+        let sha = "0123456789012345678901234567890123456789";
+        let fail_closed = git_wheel_family_identity(url, sha, ".", None);
+        let ignore = git_wheel_family_identity(url, sha, ".", Some(GitSubmodules::Ignore));
+        let recursive = git_wheel_family_identity(url, sha, ".", Some(GitSubmodules::Recursive));
+        assert_ne!(fail_closed, ignore);
+        assert_ne!(fail_closed, recursive);
+        assert_ne!(ignore, recursive);
+
+        let repo_fail_closed = canonical_git_repository_identity(url, sha, None);
+        let repo_ignore = canonical_git_repository_identity(url, sha, Some(GitSubmodules::Ignore));
+        let repo_recursive =
+            canonical_git_repository_identity(url, sha, Some(GitSubmodules::Recursive));
+        assert_ne!(repo_fail_closed, repo_ignore);
+        assert_ne!(repo_fail_closed, repo_recursive);
+        assert_ne!(repo_ignore, repo_recursive);
+    }
     #[tokio::test]
     async fn canonical_git_source_ignores_warm_dirt_and_binds_tag_state() {
         let fixture = git_checkout_fixture("canonical-source");
@@ -7548,10 +7647,15 @@ version = "0.1.0"
         std::fs::write(warm.join(".git/index.lock"), "external warm lock\n").unwrap();
 
         let first_ref_state = canonical_git_ref_state(warm).await.unwrap();
-        let first =
-            ensure_canonical_git_snapshot(warm, &fixture.url, &fixture.rev2, &first_ref_state)
-                .await
-                .expect("prepare first canonical source");
+        let first = ensure_canonical_git_snapshot(
+            warm,
+            &fixture.url,
+            &fixture.rev2,
+            &first_ref_state,
+            None,
+        )
+        .await
+        .expect("prepare first canonical source");
         assert_eq!(
             std::fs::read_to_string(first.root.join("base.txt")).unwrap(),
             "base\n"
@@ -7589,15 +7693,20 @@ version = "0.1.0"
             canonical_git_ref_state(&origin).await.unwrap(),
             second_ref_state,
         );
-        let family = git_wheel_family_identity(&fixture.url, &fixture.rev2, ".");
+        let family = git_wheel_family_identity(&fixture.url, &fixture.rev2, ".", None);
         assert_ne!(
             git_wheel_source_identity(&family, &first_ref_state),
             git_wheel_source_identity(&family, &second_ref_state),
         );
-        let second =
-            ensure_canonical_git_snapshot(warm, &fixture.url, &fixture.rev2, &second_ref_state)
-                .await
-                .expect("prepare second canonical source");
+        let second = ensure_canonical_git_snapshot(
+            warm,
+            &fixture.url,
+            &fixture.rev2,
+            &second_ref_state,
+            None,
+        )
+        .await
+        .expect("prepare second canonical source");
         assert_ne!(first.root.parent(), second.root.parent());
         assert_eq!(
             canonical_git_ref_state(&second.root).await.unwrap(),
@@ -7711,7 +7820,7 @@ version = "0.1.0"
         let shared_packs_before = pack_files();
 
         let canonical =
-            ensure_canonical_git_snapshot(&shared, &fixture.url, &fixture.rev2, &ref_state)
+            ensure_canonical_git_snapshot(&shared, &fixture.url, &fixture.rev2, &ref_state, None)
                 .await
                 .expect("canonicalize promisor checkout from its bound upstream");
         assert_eq!(
@@ -7768,7 +7877,7 @@ version = "0.1.0"
         let parked_upstream = fixture.base.join("parked-upstream");
         std::fs::rename(&upstream, &parked_upstream).unwrap();
         let canonical =
-            ensure_canonical_git_snapshot(&shared, &fixture.url, &fixture.rev2, &ref_state)
+            ensure_canonical_git_snapshot(&shared, &fixture.url, &fixture.rev2, &ref_state, None)
                 .await
                 .expect("canonicalize full checkout without its upstream");
         assert_eq!(
@@ -7800,10 +7909,15 @@ version = "0.1.0"
             .await
             .expect("publish fixture checkout");
         let ref_state = canonical_git_ref_state(checkout.root()).await.unwrap();
-        let canonical =
-            ensure_canonical_git_snapshot(checkout.root(), &fixture.url, &fixture.rev2, &ref_state)
-                .await
-                .expect("prepare canonical fixture");
+        let canonical = ensure_canonical_git_snapshot(
+            checkout.root(),
+            &fixture.url,
+            &fixture.rev2,
+            &ref_state,
+            None,
+        )
+        .await
+        .expect("prepare canonical fixture");
         let staging_parent = fixture.base.join("private-build-staging");
         std::fs::create_dir_all(&staging_parent).unwrap();
         let cache_leaf = staging_parent.join("cache-leaf");
@@ -7846,6 +7960,7 @@ version = "0.1.0"
             &canonical.repository_identity,
             &canonical.resolved_sha,
             &canonical.ref_state,
+            canonical.submodules,
             true,
         )
         .await

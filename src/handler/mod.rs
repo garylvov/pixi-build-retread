@@ -10477,6 +10477,7 @@ async fn materialize_and_rewrite_with_abi_aliases(
             crate::source_build::GitWheelBuildPolicy {
                 expected: Some(&expected),
                 static_cpp_runtime: entry.static_cpp_runtime,
+                submodules: entry.submodules.or(src.submodules),
             },
         )
         .await
@@ -10656,6 +10657,7 @@ async fn materialize_and_rewrite_with_abi_aliases(
             crate::source_build::GitWheelBuildPolicy {
                 expected: Some(&expected),
                 static_cpp_runtime: entry.static_cpp_runtime,
+                submodules: entry.submodules,
             },
         )
         .await

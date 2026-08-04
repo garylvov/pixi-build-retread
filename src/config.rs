@@ -959,6 +959,13 @@ pub struct WheelEntry {
     #[serde(default)]
     pub from: Option<String>,
 
+    /// How to treat submodule gitlinks in a `git`/`from` source tree.
+    /// Absent means fail closed: retread refuses to build a tree whose
+    /// submodules are uninitialized rather than silently shipping a wheel
+    /// with empty directories.
+    #[serde(default)]
+    pub submodules: Option<GitSubmodules>,
+
     /// Group entries that share this string into a single conda output.
     /// The output's name is the bundle string. All wheels from grouped
     /// entries become the bundle's wheels (primary = first entry's
@@ -981,6 +988,30 @@ pub struct WheelEntry {
 pub struct NamedGitSource {
     pub url: String,
     pub rev: String,
+
+    /// Submodule policy for every wheel entry that references this source.
+    /// A referencing entry's own `submodules` value wins when both are set.
+    #[serde(default)]
+    pub submodules: Option<GitSubmodules>,
+}
+
+/// What to do with `160000` gitlink entries in a git source tree.
+///
+/// Retread's default is to refuse: a tree whose submodules were never
+/// initialized builds into a wheel with silently empty directories, and that
+/// failure surfaces at import time in the consuming environment rather than at
+/// build time. Declaring a policy is an explicit statement about which case
+/// this source is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GitSubmodules {
+    /// Recursively initialize submodules before building. Every submodule URL
+    /// must be reachable with the same credentials as the parent clone.
+    Recursive,
+    /// Build the parent tree alone. Correct when the gitlinks hold material
+    /// the Python distribution does not package (vendored C++ sources,
+    /// hardware SDKs, docs), which the build's own packaging config decides.
+    Ignore,
 }
 
 impl WheelEntry {
