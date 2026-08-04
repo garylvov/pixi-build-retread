@@ -773,7 +773,10 @@ fn hermetic_toolchain_specs(
         format!("sysroot_linux-64 =={sysroot_version}"),
         format!("python {python_minor}.*"),
         "auditwheel 6.*".to_string(),
-        "patchelf 0.18.*".to_string(),
+        // conda-forge removed its patchelf 0.18 builds as broken; the channel
+        // currently tops out at 0.17.2. Accept 0.17.2+ and allow a future
+        // fixed 0.18 without silently jumping a major.
+        "patchelf >=0.17.2,<0.19".to_string(),
         "cmake >=3.20,<4".to_string(),
         "make 4.*".to_string(),
         "ninja 1.*".to_string(),
