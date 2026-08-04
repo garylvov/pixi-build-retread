@@ -12262,9 +12262,13 @@ pub(crate) fn check_output_abi_invariants(
         // unlike Python/CUDA ABI anchors whose bare major is ambiguous. A
         // hermetic wheel's final DT_NEEDED scan deliberately emits this form.
         let gcc_runtime_major = canonical_conda_name(&name) == "libstdcxx-ng";
+        // The canonical auto-completed band (`>=M.0,<M+1`) is accepted from
+        // every origin: emit-pypi's anchor floor completion writes it into
+        // shipped wheel METADATA (epoch 46), not only into retread-emitted
+        // conda contracts (epoch 41).
         if is_bare_major_spec(trimmed)
             && !gcc_runtime_major
-            && !(allow_auto_completed_cap && is_auto_completed_abi_anchor_spec(trimmed))
+            && !is_auto_completed_abi_anchor_spec(trimmed)
         {
             violations.push(format!(
                 "ABI invariant: {origin} `{name} {trimmed}` (bare-major); \

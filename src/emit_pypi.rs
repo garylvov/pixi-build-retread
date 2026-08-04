@@ -324,15 +324,6 @@ pub fn plan(
             if name == "python" || ship.contains(&name) || exact.contains_key(&name) {
                 continue;
             }
-            // ABI anchors (numpy, python-abi, CUDA, ...) never get a
-            // collapsed floor envelope: the lowest floor across wheels is
-            // routinely a bare major (`numpy >=1`), which the emission ABI
-            // invariant rightly rejects. Anchor version discipline comes from
-            // the workspace's conda pins; the original per-wheel constraints
-            // stay in METADATA and are validated against those pins.
-            if crate::relax::is_semantic_abi_anchor(&name, abi_aliases) {
-                continue;
-            }
             let Some(uv_pep508::VersionOrUrl::VersionSpecifier(specs)) = req.version_or_url else {
                 continue;
             };
@@ -370,7 +361,29 @@ pub fn plan(
                     let bundled = Version::from_str(&w.version).ok()?;
                     (bundled == lower).then(|| format!("=={}", w.version))
                 });
+            // ABI anchors (numpy, python-abi, CUDA, ...): a collapsed floor
+            // that lost its minor (some wheel declares `numpy >=1`) would be
+            // a bare-major spec, which the emission ABI invariant rightly
+            // rejects for anchors. Complete it to the canonical within-major
+            // band instead; floors that carry a minor keep the normal
+            // envelope.
+            let anchor_band = || {
+                if !crate::relax::is_semantic_abi_anchor(&name, abi_aliases) {
+                    return None;
+                }
+                let release = lower.release();
+                if lower.epoch() != 0
+                    || lower.any_prerelease()
+                    || release.is_empty()
+                    || release.len() >= 2
+                {
+                    return None;
+                }
+                let major = release[0];
+                Some(format!(">={major}.0,<{}", major.checked_add(1)?))
+            };
             let value = bundled_exact
+                .or_else(anchor_band)
                 .or_else(|| floor_envelope(&lower))
                 .unwrap_or_else(|| "*".to_string());
             (name, value)
