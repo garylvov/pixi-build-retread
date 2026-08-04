@@ -759,7 +759,12 @@ pub const SCHEMA: u32 = 18;
 /// Epoch 46: ABI anchors are excluded from the emit-pypi floor-envelope
 /// override table; their per-wheel METADATA constraints ship unchanged and
 /// are validated against the workspace's conda pins.
-pub const EMIT_EPOCH: u32 = 46;
+///
+/// Epoch 47: git source builds accept a submodule policy, so a source tree
+/// carrying gitlinks can emit a wheel built either with its submodules
+/// initialized or from the parent tree alone. Both differ from the previous
+/// unconditional refusal, and from each other.
+pub const EMIT_EPOCH: u32 = 47;
 
 fn parse_stored_glibc(value: Option<&str>) -> Option<Option<(u32, u32)>> {
     match value {
