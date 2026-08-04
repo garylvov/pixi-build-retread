@@ -883,8 +883,26 @@ pub(crate) async fn solve_hermetic_build_environment(
         });
     }
     let parsed_roots = parse_match_specs_strict(&roots)?;
-    let (records, consulted) =
-        load_selected_records_sparse(&channels, "linux-64", &parsed_roots).await;
+    // Repodata can be transiently unavailable (index hiccup, cold cache under
+    // memory pressure). Since failures are no longer memoized, retry with
+    // backoff before declaring the toolchain unsolvable.
+    let mut records = Vec::new();
+    let mut consulted = Vec::new();
+    for (attempt, delay_s) in [0u64, 5, 15].into_iter().enumerate() {
+        if delay_s > 0 {
+            tracing::warn!(
+                attempt = attempt + 1,
+                delay_s,
+                "hermetic-build repodata unavailable; retrying after backoff"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(delay_s)).await;
+        }
+        (records, consulted) =
+            load_selected_records_sparse(&channels, "linux-64", &parsed_roots).await;
+        if !records.is_empty() {
+            break;
+        }
+    }
     if records.is_empty() {
         let detail = if consulted.is_empty() {
             "no conda-forge sparse repodata was available".to_string()

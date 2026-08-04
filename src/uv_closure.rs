@@ -3009,9 +3009,16 @@ pub fn parse_pylock_closure(
                 .and_then(|v| v.as_str())
                 .map(str::to_string)
                 .or_else(|| {
+                    // URL path segments encode `+` (PEP 440 local versions)
+                    // as `%2B`; decode so tag parsing sees the real filename.
                     w.get("url")
                         .and_then(|v| v.as_str())
-                        .and_then(|u| u.rsplit('/').next().map(str::to_string))
+                        .and_then(|u| u.rsplit('/').next())
+                        .map(|f| {
+                            percent_encoding::percent_decode_str(f)
+                                .decode_utf8_lossy()
+                                .into_owned()
+                        })
                 });
             let Some(filename) = filename else { continue };
             let score = crate::pypi::score_wheel(&filename, target);
