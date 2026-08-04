@@ -695,7 +695,11 @@ mod tests {
             &["robomimic @ git+https://github.com/ARISE-Initiative/robomimic.git@v0.4.0"],
         );
         // robomimic is NOT in the bundle.
-        let emit_plan = plan(&[mimic], &std::collections::HashSet::new());
+        let emit_plan = plan(
+            &[mimic],
+            &std::collections::HashSet::new(),
+            &crate::relax::AbiAliasGraph::new(),
+        );
         assert!(
             emit_plan.drop_url.contains("robomimic"),
             "unconditional orphan URL dep must be in drop_url; got: {:?}",
@@ -725,7 +729,11 @@ mod tests {
                 r#"robomimic @ git+https://github.com/ARISE-Initiative/robomimic.git@v0.4.0 ; extra == "robomimic""#,
             ],
         );
-        let emit_plan = plan(&[mimic], &std::collections::HashSet::new());
+        let emit_plan = plan(
+            &[mimic],
+            &std::collections::HashSet::new(),
+            &crate::relax::AbiAliasGraph::new(),
+        );
         assert!(
             emit_plan.drop_url.contains("robomimic"),
             "marked orphan URL dep must be in drop_url; got: {:?}",
@@ -745,7 +753,11 @@ mod tests {
             "1.3.2",
             &["robomimic @ git+https://github.com/ARISE-Initiative/robomimic.git@v0.4.0"],
         );
-        let emit_plan = plan(&[robomimic, mimic], &std::collections::HashSet::new());
+        let emit_plan = plan(
+            &[robomimic, mimic],
+            &std::collections::HashSet::new(),
+            &crate::relax::AbiAliasGraph::new(),
+        );
         assert!(
             !emit_plan.drop_url.contains("robomimic"),
             "active URL dep must NOT be in drop_url; overrides: {:?}",
@@ -767,7 +779,11 @@ mod tests {
     fn drop_predicate_ignores_non_url_extra_dep() {
         let w = remote_wheel("pkg", "1.0.0", &[r#"foo>=1 ; extra == "x""#]);
         // `foo` is NOT in the bundle.
-        let emit_plan = plan(&[w], &std::collections::HashSet::new());
+        let emit_plan = plan(
+            &[w],
+            &std::collections::HashSet::new(),
+            &crate::relax::AbiAliasGraph::new(),
+        );
         assert!(
             !emit_plan.drop_url.contains("foo"),
             "non-URL dep must NOT be in drop_url; drop_url: {:?}",
@@ -788,7 +804,11 @@ mod tests {
             "1.0.0",
             &["special @ git+https://github.com/example/special.git@main"],
         );
-        let emit_plan = plan(&[special, requirer], &std::collections::HashSet::new());
+        let emit_plan = plan(
+            &[special, requirer],
+            &std::collections::HashSet::new(),
+            &crate::relax::AbiAliasGraph::new(),
+        );
         assert!(
             !emit_plan.drop_url.contains("special"),
             "URL dep whose target is a bundle entry must NOT be in drop_url; \
@@ -1050,7 +1070,12 @@ mod tests {
                 Some("/w/isaaclab_rl-0.5.0-py3-none-any.injected.relaxed.whl"),
             ),
         ];
-        let table = plan(&wheels, &Default::default()).overrides;
+        let table = plan(
+            &wheels,
+            &Default::default(),
+            &crate::relax::AbiAliasGraph::new(),
+        )
+        .overrides;
         assert_eq!(table.get("pillow").unwrap(), ">=12.0.0");
         assert_eq!(table.get("kiwisolver").unwrap(), ">=1.4.9");
         // Prerelease floors become EXACT pins: pixi's uv rejects a
@@ -1076,7 +1101,12 @@ mod tests {
             wheel("old", "1", &["attrs>=17.3.0", "psutil>=5.9.0,<6"], None),
             wheel("new", "1", &["attrs==25.1.0"], None),
         ];
-        let table = plan(&wheels, &Default::default()).overrides;
+        let table = plan(
+            &wheels,
+            &Default::default(),
+            &crate::relax::AbiAliasGraph::new(),
+        )
+        .overrides;
         assert_eq!(table.get("attrs").unwrap(), ">=17.3.0");
         assert_eq!(table.get("psutil").unwrap(), ">=5.9.0");
     }
@@ -1101,7 +1131,12 @@ mod tests {
             wheel("isaacsim-core", "6.0.0.0", &[], None),
             wheel("scipy", "1.17.0", &[], None),
         ];
-        let table = plan(&wheels, &Default::default()).overrides;
+        let table = plan(
+            &wheels,
+            &Default::default(),
+            &crate::relax::AbiAliasGraph::new(),
+        )
+        .overrides;
         assert_eq!(table.get("isaacsim-core").unwrap(), "==6.0.0.0");
         assert_eq!(table.get("scipy").unwrap(), ">=1.14");
     }
@@ -1139,7 +1174,11 @@ mod tests {
                 Some("/w/somepkg-2.0-py3-none-any.whl"),
             ),
         ];
-        let p = plan(&wheels, &Default::default());
+        let p = plan(
+            &wheels,
+            &Default::default(),
+            &crate::relax::AbiAliasGraph::new(),
+        );
         assert_eq!(p.overrides.get("rl-games").unwrap(), "==1.6.1");
         assert_eq!(p.overrides.get("somepkg").unwrap(), "==2.0");
         assert!(p.ship.contains("rl-games"), "injected target ships");
@@ -1156,9 +1195,13 @@ mod tests {
             Some("/w/isaaclab_mimic-1.2.3-py3-none-any.injected.relaxed.whl"),
         )];
         assert!(
-            !plan(&wheels, &Default::default())
-                .overrides
-                .contains_key("robomimic")
+            !plan(
+                &wheels,
+                &Default::default(),
+                &crate::relax::AbiAliasGraph::new()
+            )
+            .overrides
+            .contains_key("robomimic")
         );
     }
 
@@ -1173,7 +1216,12 @@ mod tests {
             &["weird==1!2.0", "pytorch3d==0.7.9+d9839a9pt2.10.0cu128"],
             None,
         )];
-        let table = plan(&wheels, &Default::default()).overrides;
+        let table = plan(
+            &wheels,
+            &Default::default(),
+            &crate::relax::AbiAliasGraph::new(),
+        )
+        .overrides;
         assert_eq!(table.get("weird").unwrap(), "*", "epoch falls back to *");
         // Local segment stripped from the envelope's lower bound.
         assert_eq!(table.get("pytorch3d").unwrap(), ">=0.7.9");
@@ -1216,8 +1264,16 @@ mod tests {
         let mut conda_capable: HashSet<String> = HashSet::new();
         conda_capable.insert("pillow".to_string());
 
-        let plan_a = plan(&wheels_a, &conda_capable);
-        let plan_b = plan(&wheels_b, &conda_capable);
+        let plan_a = plan(
+            &wheels_a,
+            &conda_capable,
+            &crate::relax::AbiAliasGraph::new(),
+        );
+        let plan_b = plan(
+            &wheels_b,
+            &conda_capable,
+            &crate::relax::AbiAliasGraph::new(),
+        );
 
         // Overrides must be byte-identical (BTreeMap, deterministic).
         assert_eq!(
