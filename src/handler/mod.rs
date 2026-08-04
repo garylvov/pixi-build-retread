@@ -5138,6 +5138,16 @@ async fn build_sdist_wheel(
         }),
         None => match_any(),
     };
+    build_sdist_wheel_with_specifiers(name, specifiers, index_urls, target, cache_dir).await
+}
+
+async fn build_sdist_wheel_with_specifiers(
+    name: String,
+    specifiers: VersionSpecifiers,
+    index_urls: Vec<String>,
+    target: ResolutionTarget,
+    cache_dir: PathBuf,
+) -> Result<crate::uv_closure::BuiltSdistWheel> {
     let (index, version, sdist) = fetch_from_pypi_index_chain(
         &index_urls,
         |index| async {
@@ -5151,7 +5161,7 @@ async fn build_sdist_wheel(
     tracing::info!(
         pkg = %name,
         version = %version,
-        "building sdist {name}=={version} (no wheel, no conda candidate)",
+        "building sdist {name}=={version} via sdist auto-build",
     );
     let out_dir = cache_dir
         .join("sdist-auto-build-outputs")
@@ -10688,32 +10698,67 @@ async fn materialize_and_rewrite_with_abi_aliases(
         };
         let specifiers = VersionSpecifiers::from_str(&specifier_text)
             .map_err(|e| anyhow!("wheel `{entry_name}` version `{version}`: {e}"))?;
-        let resolved = pypi::resolve(&entry.index_url(), entry_name, &specifiers, target)
-            .await
-            .with_context(|| {
-                format!(
-                    "phase 1 PyPI resolve for entry `{entry_name}` \
-                     (version=`{version}`, index=`{}`)",
-                    entry.index_url(),
+        let index_url = entry.index_url();
+        match pypi::resolve(&index_url, entry_name, &specifiers, target).await {
+            Ok(resolved) => {
+                // Capture the pristine index URL BEFORE fetch_wheel_cached may
+                // localise / move it. This is the upstream_url written to the lock
+                // so Phase-1 replay can re-fetch without a full BFS re-solve.
+                upstream_url = Some(resolved.url.clone());
+                crate::wheel::fetch_wheel_cached(
+                    &resolved.url,
+                    resolved.sha256.as_deref(),
+                    download_dir,
+                    &crate::courier::retread_wheel_store_root(),
                 )
-            })?;
-        // Capture the pristine index URL BEFORE fetch_wheel_cached may
-        // localise / move it. This is the upstream_url written to the lock
-        // so Phase-1 replay can re-fetch without a full BFS re-solve.
-        upstream_url = Some(resolved.url.clone());
-        crate::wheel::fetch_wheel_cached(
-            &resolved.url,
-            resolved.sha256.as_deref(),
-            download_dir,
-            &crate::courier::retread_wheel_store_root(),
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "phase 1 PyPI fetch for entry `{entry_name}` (url=`{}`)",
-                resolved.url,
-            )
-        })?
+                .await
+                .with_context(|| {
+                    format!(
+                        "phase 1 PyPI fetch for entry `{entry_name}` (url=`{}`)",
+                        resolved.url,
+                    )
+                })?
+            }
+            Err(error) if pypi::is_pypi_index_miss(&error) => {
+                let built = build_sdist_wheel_with_specifiers(
+                    entry_name.to_string(),
+                    specifiers,
+                    vec![index_url.clone()],
+                    target.clone(),
+                    cache_dir.to_path_buf(),
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "phase 1 PyPI sdist fallback for entry `{entry_name}` \
+                         (version=`{version}`, index=`{index_url}`)"
+                    )
+                })?;
+                let sdist_url =
+                    url::Url::parse(&built.sdist_source.sdist_url).with_context(|| {
+                        format!(
+                            "phase 1 PyPI sdist fallback for entry `{entry_name}` returned invalid \
+                             sdist URL `{}`",
+                            built.sdist_source.sdist_url,
+                        )
+                    })?;
+                tracing::info!(
+                    entry = %entry_name,
+                    version = %built.version,
+                    "phase 1 PyPI wheel resolve missed; using sdist fallback",
+                );
+                upstream_url = Some(sdist_url);
+                built.wheel_path
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "phase 1 PyPI resolve for entry `{entry_name}` \
+                         (version=`{version}`, index=`{index_url}`)"
+                    )
+                });
+            }
+        }
     };
 
     // Phase 1.5: for source-built wheels, top up the wheel with any
