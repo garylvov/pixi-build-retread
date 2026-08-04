@@ -8473,6 +8473,9 @@ async fn discover_emissions(
         };
         let mut accumulated: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for trans in env_results {
+            // Propagate rather than absorb: a dropped constraint set does not
+            // fail anything here, it silently under-constrains the closure.
+            let trans = trans.map_err(|error| anyhow!("{error}"))?;
             for (dep, specs) in trans {
                 let entry = accumulated.entry(dep.into_string()).or_default();
                 for s in specs {

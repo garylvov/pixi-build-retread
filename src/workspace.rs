@@ -2875,7 +2875,7 @@ pub async fn extract_transitive_constraints(
     target_python: &str,
     conda_channels: &[rattler_conda_types::ChannelUrl],
     bundle_names: &HashSet<PypiKey>,
-) -> BTreeMap<PypiKey, Vec<String>> {
+) -> std::result::Result<BTreeMap<PypiKey, Vec<String>>, String> {
     extract_transitive_constraints_for_target(
         manifest,
         env_name,
@@ -2897,7 +2897,7 @@ pub async fn extract_transitive_constraints_for_target(
     target_subdir: &str,
     conda_channels: &[rattler_conda_types::ChannelUrl],
     bundle_names: &HashSet<PypiKey>,
-) -> BTreeMap<PypiKey, Vec<String>> {
+) -> std::result::Result<BTreeMap<PypiKey, Vec<String>>, String> {
     let deps = manifest.effective_dependencies_for_target(env_name, target_subdir);
     let system_requirements =
         manifest.effective_system_requirements_for_target(env_name, target_subdir);
@@ -2922,7 +2922,7 @@ pub async fn extract_transitive_constraints_for_contract(
     contract: &WorkspaceTargetContract,
     conda_channels: &[rattler_conda_types::ChannelUrl],
     bundle_names: &HashSet<PypiKey>,
-) -> BTreeMap<PypiKey, Vec<String>> {
+) -> std::result::Result<BTreeMap<PypiKey, Vec<String>>, String> {
     let deps = manifest.effective_dependencies_for_target(env_name, &contract.subdir);
     let system_requirements =
         manifest.effective_system_requirements_for_contract(env_name, contract);
@@ -2947,7 +2947,7 @@ pub async fn extract_transitive_constraints_for_resolved_target(
     target: &ResolvedWorkspaceTarget,
     conda_channels: &[rattler_conda_types::ChannelUrl],
     bundle_names: &HashSet<PypiKey>,
-) -> BTreeMap<PypiKey, Vec<String>> {
+) -> std::result::Result<BTreeMap<PypiKey, Vec<String>>, String> {
     let deps = manifest
         .effective_dependencies_for_resolved_env(env_name, target)
         .unwrap_or_default();
@@ -2977,7 +2977,7 @@ async fn extract_transitive_constraints_with_inputs(
     deps: BTreeMap<String, String>,
     system_requirements: BTreeMap<String, String>,
     detected_virtual_packages: Option<&BTreeMap<String, String>>,
-) -> BTreeMap<PypiKey, Vec<String>> {
+) -> std::result::Result<BTreeMap<PypiKey, Vec<String>>, String> {
     let channel_priority = match manifest.channel_priority.as_deref() {
         Some("disabled") => rattler_solve::ChannelPriority::Disabled,
         _ => rattler_solve::ChannelPriority::Strict,
@@ -2998,16 +2998,27 @@ async fn extract_transitive_constraints_with_inputs(
     {
         Ok(records) => records,
         Err(reasons) => {
-            tracing::warn!(
+            // Never silently drop the transitive constraint set. Constraints
+            // that vanish here do not fail the build: they come back as an
+            // under-constrained closure that resolves to versions nobody
+            // validated, which surfaces far downstream as a runtime error in
+            // the consuming environment. An extraction that cannot run is a
+            // defect in the request or the solver inputs, and it is reported
+            // as one.
+            let detail = reasons.join("; ");
+            tracing::error!(
                 env = %env_name,
                 reasons = ?reasons,
-                "workspace: coherent solve for transitive extraction failed; skipping transitive constraints"
+                "workspace: coherent solve for transitive extraction failed"
             );
-            return BTreeMap::new();
+            return Err(format!(
+                "transitive constraint extraction failed for environment `{env_name}` \
+                 (python {target_python}, subdir {target_subdir}): {detail}"
+            ));
         }
     };
 
-    fold_transitive_constraints(&solved_records, bundle_names)
+    Ok(fold_transitive_constraints(&solved_records, bundle_names))
 }
 
 /// P3 (grizzly #6): the depends + constrains line walk for one solved

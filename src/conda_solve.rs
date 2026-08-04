@@ -75,6 +75,7 @@ fn solve_selected_records_from_records(
             system_requirements,
             detected_virtual_packages: None,
             strategy,
+            subdir: None,
         },
         preferred,
     )
@@ -87,6 +88,7 @@ pub(crate) struct SolveTarget<'a> {
     system_requirements: &'a BTreeMap<String, String>,
     detected_virtual_packages: Option<&'a BTreeMap<String, String>>,
     strategy: SolveStrategy,
+    subdir: Option<&'a str>,
 }
 
 impl<'a> SolveTarget<'a> {
@@ -103,7 +105,17 @@ impl<'a> SolveTarget<'a> {
             system_requirements,
             detected_virtual_packages,
             strategy,
+            subdir: None,
         }
+    }
+
+    /// Declare the conda subdir this solve targets, so the platform virtual
+    /// packages every record on that subdir depends on (`__linux`/`__unix`,
+    /// `__win`, `__osx`) can be supplied without host detection. Callers that
+    /// omit it keep the previous behavior.
+    pub(crate) fn with_subdir(mut self, subdir: &'a str) -> Self {
+        self.subdir = Some(subdir);
+        self
     }
 }
 
@@ -113,10 +125,11 @@ fn solve_selected_records_from_records_for_target(
     target: &SolveTarget<'_>,
     preferred: Vec<RepoDataRecord>,
 ) -> std::result::Result<Vec<RepoDataRecord>, SharedSolveFailure> {
-    let virtual_packages = build_virtual_packages_for_target(
+    let virtual_packages = build_virtual_packages_for_subdir_target(
         target.python,
         target.system_requirements,
         target.detected_virtual_packages,
+        target.subdir,
     )
     .map_err(|error| SharedSolveFailure::Unproven(vec![error]))?;
     let task = SolverTask {
@@ -179,6 +192,7 @@ async fn solve_on_blocking_pool(
             system_requirements: &system_requirements,
             detected_virtual_packages: None,
             strategy,
+            subdir: None,
         },
         preferred,
     )
@@ -205,6 +219,7 @@ async fn solve_on_blocking_pool_for_target(
     let detected_virtual_packages = target.detected_virtual_packages.cloned();
     let channel_priority = target.channel_priority;
     let strategy = target.strategy;
+    let subdir = target.subdir.map(str::to_string);
     let result = tokio::task::spawn_blocking(move || {
         // Keep the bundle's one coordinated grant alive until this CPU task
         // actually exits, even if its async waiter is cancelled.
@@ -219,6 +234,7 @@ async fn solve_on_blocking_pool_for_target(
                 system_requirements: &system_requirements,
                 detected_virtual_packages: detected_virtual_packages.as_ref(),
                 strategy,
+                subdir: subdir.as_deref(),
             },
             preferred,
         )
@@ -457,6 +473,32 @@ pub(crate) fn build_virtual_packages_for_target(
     system_requirements: &BTreeMap<String, String>,
     detected_virtual_packages: Option<&BTreeMap<String, String>>,
 ) -> Result<Vec<GenericVirtualPackage>, String> {
+    build_virtual_packages_for_subdir_target(
+        target_python,
+        system_requirements,
+        detected_virtual_packages,
+        None,
+    )
+}
+
+/// [`build_virtual_packages_for_target`] plus the conda subdir the solve
+/// targets.
+///
+/// A contract-qualified solve whose detected set is empty previously derived
+/// its entire virtual-package set from `[system-requirements]`. Nobody writes
+/// `linux = ...` there — the platform is implied by the subdir — so the set
+/// came out with no `__linux`/`__unix`, and every record on a linux subdir
+/// depends on `__linux`. The solve was therefore unsatisfiable for a reason
+/// that had nothing to do with the request (observed as `cuda-toolkit 12.9.*
+/// would require __linux *, for which no candidates were found`). Supplying
+/// the platform packages from the subdir is target-derived, not host-derived,
+/// so it does not reintroduce host leakage into an exact contract.
+pub(crate) fn build_virtual_packages_for_subdir_target(
+    target_python: &str,
+    system_requirements: &BTreeMap<String, String>,
+    detected_virtual_packages: Option<&BTreeMap<String, String>>,
+    subdir: Option<&str>,
+) -> Result<Vec<GenericVirtualPackage>, String> {
     let host_baseline = if detected_virtual_packages.is_some() {
         Vec::new()
     } else {
@@ -473,12 +515,72 @@ pub(crate) fn build_virtual_packages_for_target(
             }
         }
     };
-    build_virtual_packages_from_baseline(
+    let mut virtual_packages = build_virtual_packages_from_baseline(
         target_python,
         system_requirements,
         detected_virtual_packages,
         host_baseline,
-    )
+    )?;
+    if let Some(subdir) = subdir {
+        add_platform_virtual_packages(&mut virtual_packages, subdir, system_requirements)?;
+    }
+    Ok(virtual_packages)
+}
+
+/// Supply the OS virtual packages implied by `subdir` when the assembled set
+/// does not already carry them. Never overrides an entry an authoritative
+/// detected set or an explicit system-requirement already provided.
+fn add_platform_virtual_packages(
+    virtual_packages: &mut Vec<GenericVirtualPackage>,
+    subdir: &str,
+    system_requirements: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    let present = |packages: &Vec<GenericVirtualPackage>, name: &str| {
+        packages.iter().any(|vp| vp.name.as_normalized() == name)
+    };
+    // Pixi's own default floor for `linux`, used when the workspace does not
+    // declare one. Conda-forge's `__linux` dependencies are overwhelmingly
+    // unversioned, so this only has to clear the rare versioned floor.
+    const DEFAULT_LINUX: &str = "4.18";
+    let (os_key, os_value): (&str, &str) = if subdir.starts_with("linux") {
+        (
+            "linux",
+            system_requirements
+                .get("linux")
+                .map_or(DEFAULT_LINUX, String::as_str),
+        )
+    } else if subdir.starts_with("osx") {
+        (
+            "macos",
+            system_requirements
+                .get("macos")
+                .map_or("11.0", String::as_str),
+        )
+    } else if subdir.starts_with("win") {
+        ("windows", "0")
+    } else {
+        // `noarch` and unknown subdirs carry no OS contract of their own.
+        return Ok(());
+    };
+    if !present(
+        virtual_packages,
+        &format!(
+            "__{}",
+            match os_key {
+                "macos" => "osx",
+                "windows" => "win",
+                other => other,
+            }
+        ),
+    ) {
+        insert_virtual_package(virtual_packages, os_key, os_value, false)?;
+    }
+    if (subdir.starts_with("linux") || subdir.starts_with("osx"))
+        && !present(virtual_packages, "__unix")
+    {
+        insert_virtual_package(virtual_packages, "unix", "", false)?;
+    }
+    Ok(())
 }
 
 /// Pure assembly boundary used by the exact-target regression. The injected
@@ -997,6 +1099,7 @@ pub async fn solve_selected_records_for_target(
             system_requirements,
             detected_virtual_packages,
             strategy,
+            subdir: Some(target_subdir),
         },
         Vec::new(),
     )
@@ -1030,6 +1133,7 @@ pub(crate) async fn solve_selected_records_for_target_shared(
             system_requirements: target.system_requirements,
             detected_virtual_packages: target.detected_virtual_packages,
             strategy: target.strategy,
+            subdir: target.subdir,
         },
         Vec::new(),
     )
@@ -1497,6 +1601,66 @@ mod tests {
         )
         .expect_err("an exact contract must not silently omit an invalid virtual package");
         assert!(error.contains("bad/name"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn contract_qualified_empty_detection_still_supplies_platform_packages() {
+        // The genesis regression: a contract-qualified target whose detected
+        // set is empty derived its whole virtual-package set from
+        // [system-requirements], which never declares `linux`. Every record on
+        // a linux subdir depends on `__linux`, so the solve failed for a
+        // reason unrelated to the request and its constraints were dropped.
+        let sysreqs = BTreeMap::from([
+            ("cuda".to_string(), "12".to_string()),
+            ("libc".to_string(), "2.35".to_string()),
+        ]);
+        let detected = BTreeMap::new();
+        let without_subdir =
+            build_virtual_packages_for_subdir_target("3.12", &sysreqs, Some(&detected), None)
+                .expect("assembly must succeed");
+        assert!(
+            vp_lookup(&without_subdir, "__linux").is_none(),
+            "no subdir means no platform contract to derive from"
+        );
+
+        let vps = build_virtual_packages_for_subdir_target(
+            "3.12",
+            &sysreqs,
+            Some(&detected),
+            Some("linux-64"),
+        )
+        .expect("assembly must succeed");
+        assert!(
+            vp_lookup(&vps, "__linux").is_some(),
+            "a linux subdir must supply __linux: {vps:?}"
+        );
+        assert!(
+            vp_lookup(&vps, "__unix").is_some(),
+            "a linux subdir must supply __unix: {vps:?}"
+        );
+        // The declared contract is untouched.
+        assert!(vp_lookup(&vps, "__cuda").is_some(), "{vps:?}");
+        assert!(vp_lookup(&vps, "__glibc").is_some(), "{vps:?}");
+    }
+
+    #[test]
+    fn declared_linux_floor_wins_over_the_default() {
+        let sysreqs = BTreeMap::from([("linux".to_string(), "5.15".to_string())]);
+        let detected = BTreeMap::new();
+        let vps = build_virtual_packages_for_subdir_target(
+            "3.12",
+            &sysreqs,
+            Some(&detected),
+            Some("linux-64"),
+        )
+        .expect("assembly must succeed");
+        assert_eq!(
+            vp_lookup(&vps, "__linux")
+                .expect("__linux must be present")
+                .version
+                .to_string(),
+            "5.15"
+        );
     }
 
     #[test]
