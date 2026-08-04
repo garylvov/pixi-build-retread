@@ -10677,7 +10677,16 @@ async fn materialize_and_rewrite_with_abi_aliases(
         let version = entry
             .normalized_version()
             .ok_or_else(|| anyhow!("wheel `{entry_name}` has no version, url, path, or git"))?;
-        let specifiers = VersionSpecifiers::from_str(&format!("=={version}"))
+        // The version field accepts both a bare exact version ("1.2.3") and a
+        // PEP 440 specifier set (">=0.65,<0.66"); only prefix `==` when the
+        // text does not already start with an operator.
+        let version_text = version.trim();
+        let specifier_text = if version_text.starts_with(['<', '>', '~', '!', '=']) {
+            version_text.to_string()
+        } else {
+            format!("=={version_text}")
+        };
+        let specifiers = VersionSpecifiers::from_str(&specifier_text)
             .map_err(|e| anyhow!("wheel `{entry_name}` version `{version}`: {e}"))?;
         let resolved = pypi::resolve(&entry.index_url(), entry_name, &specifiers, target)
             .await
