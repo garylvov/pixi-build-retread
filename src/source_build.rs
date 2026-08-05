@@ -8484,7 +8484,7 @@ version = "0.1.0"
         }
         assert!(
             a.components()
-                .any(|component| component.as_os_str() == "v10")
+                .any(|component| component.as_os_str() == BUILT_WHEEL_CACHE_VERSION)
         );
         assert_eq!(
             a.file_name().and_then(|name| name.to_str()).unwrap().len(),
@@ -8748,14 +8748,18 @@ version = "0.1.0"
     }
 
     #[test]
-    fn v10_artifact_namespaces_separate_architectures_and_use_full_hashes() {
+    fn versioned_artifact_namespaces_separate_architectures_and_use_full_hashes() {
         let x86 = ResolutionTarget::from_parts("3.11", "linux-64", Some((2, 35)));
         let arm = ResolutionTarget::from_parts("3.11", "linux-aarch64", Some((2, 35)));
         let source = "f".repeat(64);
         let x86_path = built_wheel_cache_dir("git", &source, &x86);
         let arm_path = built_wheel_cache_dir("git", &source, &arm);
         assert_ne!(x86_path, arm_path);
-        assert!(x86_path.components().any(|part| part.as_os_str() == "v10"));
+        assert!(
+            x86_path
+                .components()
+                .any(|part| part.as_os_str() == BUILT_WHEEL_CACHE_VERSION)
+        );
         assert_eq!(x86_path.file_name().unwrap().to_string_lossy().len(), 64);
         assert_eq!(
             x86_path
