@@ -29,9 +29,14 @@ use tokio::process::Command;
 use crate::config::GitSubmodules;
 use crate::pypi::{NativeSourceBuildPolicy, ResolutionTarget, normalized_python_minor};
 
-const BUILT_WHEEL_CACHE_SCHEMA: &str = "retread-built-wheel-v10";
+const BUILT_WHEEL_CACHE_SCHEMA: &str = "retread-built-wheel-v11";
 const BUILT_WHEEL_CACHE_ROOT: &str = "built-wheels";
-const BUILT_WHEEL_CACHE_VERSION: &str = "v10";
+// Bump whenever the BYTES of a source-built wheel can change for an
+// unchanged source tree -- injection rules included. Epoch 49 stopped denying
+// a nested `env` directory, and without this bump every previously cached
+// injected wheel kept its missing subpackage forever ("reusing cached injected
+// wheel" served the stale artifact straight past the fix).
+const BUILT_WHEEL_CACHE_VERSION: &str = "v11";
 const CHECKOUT_CACHE_VERSION: &str = "v3";
 const LOCAL_SOURCE_SNAPSHOT_VERSION: &str = "v5";
 const CANONICAL_GIT_SOURCE_SCHEMA: &str = "retread-canonical-git-source-v3";
