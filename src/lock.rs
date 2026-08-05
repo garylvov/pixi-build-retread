@@ -770,7 +770,11 @@ pub const SCHEMA: u32 = 18;
 /// channels rather than the per-output union. Both change which channel
 /// serves a given package under strict priority, and therefore what gets
 /// emitted.
-pub const EMIT_EPOCH: u32 = 48;
+///
+/// Epoch 49: source-root injection no longer denies a directory named `env`
+/// at arbitrary depth, so a package subdirectory called `env` ships in the
+/// wheel instead of being silently dropped.
+pub const EMIT_EPOCH: u32 = 49;
 
 fn parse_stored_glibc(value: Option<&str>) -> Option<Option<(u32, u32)>> {
     match value {

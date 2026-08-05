@@ -59,11 +59,17 @@ const DENY_COMPONENTS: &[&str] = &[
     "demo",
     "demos",
     "scripts",
-    // Local envs / IDE / lock dirs
+    // Local envs / IDE / lock dirs.
+    //
+    // `env` is NOT here: unlike `.venv`/`venv` it is an ordinary Python
+    // package name, and denying it at every level silently ate
+    // `robojudo/config/g1/env/` -- a git-tracked subpackage -- which broke
+    // `import robojudo` outright while its siblings survived. A virtualenv
+    // named `env` lives at the source root, so it is denied there only
+    // (DENY_TOP_LEVEL).
     ".pixi",
     ".venv",
     "venv",
-    "env",
     "node_modules",
     "target",
     "__pypackages__",
@@ -92,6 +98,9 @@ const DENY_SUFFIXES: &[&str] = &[".egg-info", ".dist-info", ".pyc", ".pyo", ".sw
 /// Top-level filenames to skip (project-root noise that we don't want
 /// in every package install).
 const DENY_TOP_LEVEL: &[&str] = &[
+    // A virtualenv conventionally named `env` sits at the source root; a
+    // nested `env` is a package (see DENY_COMPONENTS).
+    "env",
     "LICENSE",
     "LICENSE.txt",
     "LICENSE.md",
@@ -443,6 +452,14 @@ mod tests {
         // Top-level-only filters: README at root, allowed deeper.
         assert!(is_denied("README.md", true));
         assert!(!is_denied("README.md", false));
+        // `env` is denied only at the source root (a virtualenv lives
+        // there); nested it is an ordinary package name.
+        assert!(is_denied("env", true), "a root-level env/ is a virtualenv");
+        assert!(
+            !is_denied("env", false),
+            "a nested env/ is a package and must ship"
+        );
+
         // Legitimate data dirs pass through.
         for name in [
             "config",
