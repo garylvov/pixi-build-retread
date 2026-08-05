@@ -1727,28 +1727,37 @@ impl WorkspaceManifest {
     }
 
     /// Compute the effective channels an environment will solve
-    /// against. Workspace top-level channels first (unless
-    /// no-default-feature), then each active feature's channels
-    /// appended in declaration order. Duplicates dropped while
+    /// against, in PRIORITY order: each active feature's channels first
+    /// (declaration order), then the workspace top-level channels unless the
+    /// environment opts out with no-default-feature. Duplicates dropped while
     /// preserving first-seen order.
+    ///
+    /// Feature channels outrank inherited workspace channels because a
+    /// feature declares them to serve packages the workspace default cannot.
+    /// The reverse order silently breaks under strict channel priority: a
+    /// workspace on conda-forge plus a feature on robostack-jazzy resolved
+    /// `ros2-distro-mutex` from robostack in the real solve, while an
+    /// extraction that put conda-forge first rejected every robostack
+    /// candidate ("excluded because due to strict channel priority") and
+    /// reported the environment as unsatisfiable.
     pub fn effective_channels(&self, env_name: &str) -> Vec<String> {
         let Some(env) = self.environments.get(env_name) else {
             return Vec::new();
         };
         let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
-        if !env.no_default_feature {
-            for c in &self.channels {
-                if seen.insert(c.clone()) {
-                    out.push(c.clone());
-                }
-            }
-        }
         for feat_name in &env.features {
             let Some(feat) = self.features.get(feat_name) else {
                 continue;
             };
             for c in &feat.channels {
+                if seen.insert(c.clone()) {
+                    out.push(c.clone());
+                }
+            }
+        }
+        if !env.no_default_feature {
+            for c in &self.channels {
                 if seen.insert(c.clone()) {
                     out.push(c.clone());
                 }
@@ -6416,7 +6425,7 @@ libc = "2.36"
     }
 
     #[test]
-    fn effective_channels_appends_features_after_workspace() {
+    fn effective_channels_rank_features_above_workspace() {
         let ws = ws_toml(
             r#"
 [workspace]
@@ -6430,14 +6439,37 @@ channels = ["https://prefix.dev/robostack-humble", "https://prefix.dev/conda-for
 "#,
         );
         let chans = ws.effective_channels("ros");
-        // Top-level conda-forge first, then robostack-humble appended.
-        // Duplicate conda-forge in feature is dropped.
+        // The feature declares robostack-humble to serve packages the
+        // workspace default cannot, so it outranks the inherited
+        // conda-forge. Under strict channel priority the reverse order
+        // rejects every robostack candidate. The feature's own duplicate
+        // conda-forge entry is dropped, and the inherited one lands last.
         assert_eq!(
             chans,
             vec![
-                "https://prefix.dev/conda-forge",
                 "https://prefix.dev/robostack-humble",
+                "https://prefix.dev/conda-forge",
             ],
+        );
+    }
+
+    #[test]
+    fn effective_channels_omit_workspace_defaults_when_opted_out() {
+        let ws = ws_toml(
+            r#"
+[workspace]
+channels = ["https://prefix.dev/conda-forge"]
+
+[environments]
+ros = { features = ["ros2"], no-default-feature = true }
+
+[feature.ros2]
+channels = ["https://prefix.dev/robostack-jazzy"]
+"#,
+        );
+        assert_eq!(
+            ws.effective_channels("ros"),
+            vec!["https://prefix.dev/robostack-jazzy"],
         );
     }
 

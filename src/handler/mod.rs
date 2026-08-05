@@ -8438,6 +8438,23 @@ async fn discover_emissions(
             .envs
             .iter()
             .map(|env| async {
+                // Each env solves against ITS OWN channels, not the union
+                // above. The union is the right input for the output-level
+                // courier identity, but as a solve input it re-inverts
+                // priority for multi-distro outputs: a jazzy env sharing an
+                // output with a humble env would inherit robostack-humble
+                // ahead of robostack-jazzy and, under strict channel
+                // priority, reject its own distro's packages.
+                let per_env: Vec<ChannelUrl> = manifest
+                    .effective_channels(env)
+                    .iter()
+                    .filter_map(|s| url::Url::parse(s).ok().map(ChannelUrl::from))
+                    .collect();
+                let channels = if per_env.is_empty() {
+                    channels.clone()
+                } else {
+                    per_env
+                };
                 match resolved.as_ref() {
                     Some(resolved) => {
                         crate::workspace::extract_transitive_constraints_for_resolved_target(
