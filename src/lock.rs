@@ -764,7 +764,13 @@ pub const SCHEMA: u32 = 18;
 /// carrying gitlinks can emit a wheel built either with its submodules
 /// initialized or from the parent tree alone. Both differ from the previous
 /// unconditional refusal, and from each other.
-pub const EMIT_EPOCH: u32 = 47;
+///
+/// Epoch 48: feature-declared channels outrank inherited workspace channels,
+/// and each environment's constraint extraction solves against its own
+/// channels rather than the per-output union. Both change which channel
+/// serves a given package under strict priority, and therefore what gets
+/// emitted.
+pub const EMIT_EPOCH: u32 = 48;
 
 fn parse_stored_glibc(value: Option<&str>) -> Option<Option<(u32, u32)>> {
     match value {
