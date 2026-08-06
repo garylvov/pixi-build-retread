@@ -268,15 +268,32 @@ fn walk(root: &Path, dir: &Path, existing: &HashSet<String>, out: &mut Vec<Extra
         let is_top = rel.components().count() == 1;
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        if is_denied(&name_str, is_top) {
+        // A directory carrying `__init__.py` is an importable package, and
+        // dropping it breaks the consuming environment at import time rather
+        // than merely slimming the wheel. Real trees do ship packages named
+        // `env`, `tests`, `examples` and `scripts` (rsl_rl_g/env and
+        // protomotions/tests among them), so the clutter deny list never
+        // applies to one. Non-package directories with those names are still
+        // skipped, which is the case the list exists for.
+        if is_denied(&name_str, is_top) && !path.join("__init__.py").is_file() {
             continue;
         }
         // Skip path components anywhere up the chain too (covers
         // symlinks into a denied subtree etc.).
-        if rel
-            .components()
-            .any(|c| is_denied(&c.as_os_str().to_string_lossy(), false))
-        {
+        // Same rule for every ancestor: a denied component only disqualifies
+        // this path when that ancestor is not itself an importable package.
+        let mut denied_ancestor = root.to_path_buf();
+        let mut skip = false;
+        for component in rel.components() {
+            denied_ancestor.push(component);
+            if is_denied(&component.as_os_str().to_string_lossy(), false)
+                && !denied_ancestor.join("__init__.py").is_file()
+            {
+                skip = true;
+                break;
+            }
+        }
+        if skip {
             continue;
         }
         let file_type = entry.file_type()?;

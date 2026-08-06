@@ -774,7 +774,11 @@ pub const SCHEMA: u32 = 18;
 /// Epoch 49: source-root injection no longer denies a directory named `env`
 /// at arbitrary depth, so a package subdirectory called `env` ships in the
 /// wheel instead of being silently dropped.
-pub const EMIT_EPOCH: u32 = 49;
+///
+/// Epoch 50: source-root injection never drops a directory that carries
+/// `__init__.py`, so importable packages named `env`, `tests`, `examples` or
+/// `scripts` ship instead of being filtered as clutter.
+pub const EMIT_EPOCH: u32 = 50;
 
 fn parse_stored_glibc(value: Option<&str>) -> Option<Option<(u32, u32)>> {
     match value {
