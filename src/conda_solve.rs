@@ -904,6 +904,14 @@ fn solve_hermetic_build_environment_from_records(
     let specs = hermetic_toolchain_specs(python_minor, &sysroot.conda_version, cuda_version);
     let parsed_specs = parse_match_specs_strict(&specs)?;
     let system_requirements = BTreeMap::new();
+    // The hermetic toolchain is always solved for linux-64. Declare that
+    // subdir so the platform virtual packages (`__linux`/`__unix`) every
+    // record on it depends on come from the target rather than from host
+    // detection: with an empty system-requirements map and no detected set,
+    // a host that reports no virtual packages leaves the solve unable to
+    // satisfy `__linux`, and resolvo reports that as the toolchain roots
+    // having no viable candidates ("No candidates were found for
+    // gcc_linux-64 13.*") rather than as a missing platform package.
     let solved = solve_selected_records_from_records_for_target(
         parsed_specs,
         records,
@@ -913,7 +921,8 @@ fn solve_hermetic_build_environment_from_records(
             &system_requirements,
             None,
             SolveStrategy::Highest,
-        ),
+        )
+        .with_subdir("linux-64"),
         Vec::new(),
     )
     .map_err(|failure| {
@@ -1601,6 +1610,28 @@ mod tests {
         )
         .expect_err("an exact contract must not silently omit an invalid virtual package");
         assert!(error.contains("bad/name"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn hermetic_toolchain_solve_declares_its_linux_subdir() {
+        // The hermetic toolchain solve passes an empty system-requirements
+        // map and no detected virtual packages, so without a declared subdir
+        // it depends on host detection to supply `__linux`. Every conda-forge
+        // record on linux-64 depends on `__linux`, and when it is absent
+        // resolvo eliminates every candidate and reports the roots as
+        // unsatisfiable rather than naming the missing platform package.
+        let sysreqs = BTreeMap::new();
+        let vps =
+            build_virtual_packages_for_subdir_target("3.11", &sysreqs, None, Some("linux-64"))
+                .expect("assembly must succeed");
+        assert!(
+            vp_lookup(&vps, "__linux").is_some(),
+            "the toolchain solve must carry __linux: {vps:?}"
+        );
+        assert!(
+            vp_lookup(&vps, "__unix").is_some(),
+            "the toolchain solve must carry __unix: {vps:?}"
+        );
     }
 
     #[test]
