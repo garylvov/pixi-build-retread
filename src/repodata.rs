@@ -504,7 +504,7 @@ mod tests {
         }
         let published = std::fs::read(&dest).unwrap();
         assert!(
-            payloads.iter().any(|p| *p == published),
+            payloads.contains(&published),
             "published file matches no single writer's payload (interleaved or truncated)",
         );
         std::fs::remove_dir_all(&dir).ok();
