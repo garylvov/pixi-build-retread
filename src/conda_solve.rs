@@ -964,6 +964,18 @@ fn solve_hermetic_build_environment_from_records(
     })
 }
 
+/// The (channel, subdir) pairs the hermetic solve REQUIRES, minus the pairs
+/// actually consulted. Labels mirror `sparse_pairs`'s `"<channel>/<subdir>"`
+/// format. Nonempty means the loaded record set is a partial channel view and
+/// must not be solved against.
+fn missing_hermetic_pairs(channels: &[ChannelUrl], consulted: &[String]) -> Vec<String> {
+    crate::repodata::channel_subdir_pairs(channels, "linux-64")
+        .into_iter()
+        .map(|(channel_url, subdir)| format!("{channel_url}/{subdir}"))
+        .filter(|label| !consulted.iter().any(|seen| seen == label))
+        .collect()
+}
+
 /// Solve the compiler environment against conda-forge's sparse repodata.
 ///
 /// Stage one loads all candidate roots and selects the newest compatible
@@ -1013,7 +1025,7 @@ pub(crate) async fn solve_hermetic_build_environment(
         }
         (records, consulted) =
             load_selected_records_sparse(&channels, "linux-64", &parsed_roots).await;
-        if !records.is_empty() {
+        if !records.is_empty() && missing_hermetic_pairs(&channels, &consulted).is_empty() {
             break;
         }
     }
@@ -1025,6 +1037,22 @@ pub(crate) async fn solve_hermetic_build_environment(
         };
         return Err(vec![format!(
             "missing sysroot_linux-64: unable to load hermetic-build records ({detail})"
+        )]);
+    }
+    // A PARTIAL channel view must be a hard error, not a solver mystery.
+    // `sysroot_linux-64` lives on noarch while the compilers live on
+    // linux-64: with only the noarch pair consulted (the linux-64 fetch
+    // failed, or its disk cache was corrupt), stage one still selects a
+    // sysroot and stage two then reports "No candidates were found for
+    // gcc_linux-64 13.*" -- a misdirection that cost a full night. Name the
+    // real defect instead.
+    let missing = missing_hermetic_pairs(&channels, &consulted);
+    if !missing.is_empty() {
+        return Err(vec![format!(
+            "hermetic compiler solve aborted: conda-forge repodata incomplete; \
+             unconsulted pair(s): {} (fetch failed or corrupt disk cache); \
+             refusing to solve against a partial channel view",
+            missing.join(", "),
         )]);
     }
 
@@ -1186,6 +1214,31 @@ mod tests {
             .unwrap(),
             channel: Some("https://example.invalid".into()),
         }
+    }
+
+    /// Guard for the 4.10.77 root fix: a hermetic solve where the linux-64
+    /// pair dropped out (fetch failure / corrupt disk cache) must be named a
+    /// repodata problem, never allowed through to a "no candidates" solver
+    /// misdirection. `sysroot_linux-64` is noarch, the compilers are
+    /// linux-64, so a noarch-only view passes stage one and lies in stage two.
+    #[test]
+    fn missing_hermetic_pairs_flags_partial_channel_views() {
+        let channels = vec![ChannelUrl::from(
+            Url::parse("https://prefix.dev/conda-forge").unwrap(),
+        )];
+        let complete = vec![
+            "https://prefix.dev/conda-forge/linux-64".to_string(),
+            "https://prefix.dev/conda-forge/noarch".to_string(),
+        ];
+        assert!(missing_hermetic_pairs(&channels, &complete).is_empty());
+
+        let noarch_only = vec!["https://prefix.dev/conda-forge/noarch".to_string()];
+        assert_eq!(
+            missing_hermetic_pairs(&channels, &noarch_only),
+            vec!["https://prefix.dev/conda-forge/linux-64".to_string()],
+        );
+
+        assert_eq!(missing_hermetic_pairs(&channels, &[]).len(), 2);
     }
 
     #[test]

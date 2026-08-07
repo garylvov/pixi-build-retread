@@ -123,37 +123,7 @@ pub async fn sparse_pairs(
 }
 
 async fn build_sparse(channel_url: String, subdir: String) -> Option<Arc<SparseRepoData>> {
-    let t = std::time::Instant::now();
     let path = disk_cache_path(&channel_url, &subdir);
-    let fresh = disk_cache_is_fresh(&path).await;
-    if !fresh {
-        match fetch_repodata_bytes(&channel_url, &subdir).await {
-            Ok(bytes) => {
-                if let Err(e) = write_atomic(&path, &bytes).await {
-                    tracing::debug!(
-                        channel = %channel_url, subdir = %subdir, error = %format!("{e:#}"),
-                        "repodata: disk-cache write failed",
-                    );
-                    // Stale disk cache (if any) is still better than nothing.
-                }
-            }
-            Err(e) => {
-                if !path.exists() {
-                    tracing::warn!(
-                        channel = %channel_url, subdir = %subdir, error = %format!("{e:#}"),
-                        "repodata: unreachable and no disk cache; pair not consulted",
-                    );
-                    return None;
-                }
-                tracing::warn!(
-                    channel = %channel_url, subdir = %subdir, error = %format!("{e:#}"),
-                    "repodata: refresh failed; using stale disk cache",
-                );
-            }
-        }
-    }
-    // mmap + sparse header parse on the blocking pool (the LazyRepoData
-    // deserialize walks the whole document's key structure once).
     let cfg = ChannelConfig::default_with_root_dir(std::env::temp_dir());
     let channel = match Channel::from_str(&channel_url, &cfg) {
         Ok(channel) => channel,
@@ -165,10 +135,75 @@ async fn build_sparse(channel_url: String, subdir: String) -> Option<Arc<SparseR
             return None;
         }
     };
-    let subdir_clone = subdir.clone();
-    let path_clone = path.clone();
+    // Two attempts: attempt 0 may discover the on-disk document is CORRUPT
+    // (a truncated write published by a pre-4.10.77 release's shared `.part`
+    // rename race, or an out-of-quota filesystem short write). It evicts the
+    // corrupt file so attempt 1 refetches from the network. Without eviction
+    // a corrupt cache file poisons this pair FOREVER: every refresh failure
+    // falls back to it, every open fails, and consumers silently solve
+    // against a partial channel view ("No candidates were found for
+    // gcc_linux-64 13.*" while gcc_linux-64 plainly exists).
+    for attempt in 0..2u8 {
+        let t = std::time::Instant::now();
+        if !disk_cache_is_fresh(&path).await {
+            match refresh_disk_cache(&channel_url, &subdir, &path).await {
+                Ok(()) => {}
+                Err(e) => {
+                    if !path.exists() {
+                        tracing::warn!(
+                            channel = %channel_url, subdir = %subdir, error = %format!("{e:#}"),
+                            "repodata: unreachable and no disk cache; pair not consulted",
+                        );
+                        return None;
+                    }
+                    tracing::warn!(
+                        channel = %channel_url, subdir = %subdir, error = %format!("{e:#}"),
+                        "repodata: refresh failed; using stale disk cache",
+                    );
+                }
+            }
+        }
+        match open_sparse_file(&channel_url, &subdir, channel.clone(), path.clone()).await {
+            Some(handle) => {
+                tracing::info!(
+                    channel = %channel_url,
+                    subdir = %subdir,
+                    elapsed_ms = t.elapsed().as_millis() as u64,
+                    "bench: sparse repodata handle built",
+                );
+                return Some(handle);
+            }
+            None if attempt == 0 && path.exists() => {
+                tracing::warn!(
+                    channel = %channel_url, subdir = %subdir, path = %path.display(),
+                    "repodata: evicting corrupt disk cache and refetching",
+                );
+                if let Err(error) = tokio::fs::remove_file(&path).await {
+                    tracing::warn!(
+                        path = %path.display(), error = %error,
+                        "repodata: corrupt cache eviction failed; pair not consulted",
+                    );
+                    return None;
+                }
+            }
+            None => return None,
+        }
+    }
+    None
+}
+
+/// mmap + sparse header parse on the blocking pool (the LazyRepoData
+/// deserialize walks the whole document's key structure once). `None` means
+/// the file is unreadable or not a well-formed repodata document.
+async fn open_sparse_file(
+    channel_url: &str,
+    subdir: &str,
+    channel: Channel,
+    path: PathBuf,
+) -> Option<Arc<SparseRepoData>> {
+    let subdir_clone = subdir.to_string();
     let built = match tokio::task::spawn_blocking(move || {
-        SparseRepoData::from_file(channel, subdir_clone, path_clone, None)
+        SparseRepoData::from_file(channel, subdir_clone, path, None)
     })
     .await
     {
@@ -187,15 +222,7 @@ async fn build_sparse(channel_url: String, subdir: String) -> Option<Arc<SparseR
         }
     };
     match built {
-        Ok(s) => {
-            tracing::info!(
-                channel = %channel_url,
-                subdir = %subdir,
-                elapsed_ms = t.elapsed().as_millis() as u64,
-                "bench: sparse repodata handle built",
-            );
-            Some(Arc::new(s))
-        }
+        Ok(s) => Some(Arc::new(s)),
         Err(e) => {
             tracing::warn!(
                 channel = %channel_url, subdir = %subdir, error = %e,
@@ -204,6 +231,59 @@ async fn build_sparse(channel_url: String, subdir: String) -> Option<Arc<SparseR
             None
         }
     }
+}
+
+/// Fetch-and-cache one (channel, subdir), serialized ACROSS PROCESSES by an
+/// exclusive flock on a sibling lock file. `pixi install --all` runs one
+/// retread backend process per environment; on a cold or expired cache every
+/// one of them used to fetch the same multi-hundred-MB document concurrently.
+/// The flock elects one fetcher; waiters re-check freshness after acquiring
+/// and reuse the winner's file.
+async fn refresh_disk_cache(channel_url: &str, subdir: &str, path: &PathBuf) -> Result<()> {
+    let _lock = acquire_repodata_fetch_lock(path).await?;
+    if disk_cache_is_fresh(path).await {
+        return Ok(());
+    }
+    let bytes = fetch_repodata_bytes(channel_url, subdir).await?;
+    write_atomic(path, &bytes).await
+}
+
+struct RepodataFetchLock(std::fs::File);
+
+impl Drop for RepodataFetchLock {
+    fn drop(&mut self) {
+        if let Err(error) = fs4::fs_std::FileExt::unlock(&self.0) {
+            tracing::warn!(error = %error, "failed to unlock repodata fetch lock");
+        }
+    }
+}
+
+async fn acquire_repodata_fetch_lock(path: &std::path::Path) -> Result<RepodataFetchLock> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("repodata cache path has no parent: {}", path.display()))?;
+    tokio::fs::create_dir_all(parent)
+        .await
+        .with_context(|| format!("creating repodata cache dir {}", parent.display()))?;
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("repodata cache path has no UTF-8 filename"))?;
+    let lock_path = parent.join(format!(".{filename}.retread-fetch-v1.lock"));
+    tokio::task::spawn_blocking(move || {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("opening repodata fetch lock {}", lock_path.display()))?;
+        fs4::fs_std::FileExt::lock_exclusive(&file)
+            .with_context(|| format!("locking repodata fetch {}", lock_path.display()))?;
+        Ok(RepodataFetchLock(file))
+    })
+    .await
+    .context("repodata fetch lock task panicked")?
 }
 
 async fn disk_cache_is_fresh(path: &PathBuf) -> bool {
@@ -219,22 +299,68 @@ async fn disk_cache_is_fresh(path: &PathBuf) -> bool {
         .unwrap_or(false)
 }
 
-/// Write `bytes` to `path` atomically: write to a `.part` sibling first,
+/// Write `bytes` to `path` atomically: write to a UNIQUE temp sibling first,
 /// then rename into place. The rename is load-bearing for mmap safety:
 /// any concurrent reader that has already mmap'd the OLD file holds an
 /// open file descriptor to the old inode -- the rename creates a NEW
 /// inode at `path` without disturbing the old mapping. An in-place
 /// `write` (truncate-then-overwrite) would corrupt the active mmap by
 /// changing the bytes under it while the reader still holds a reference.
+///
+/// The temp name MUST be unique per process/call. Pre-4.10.77 this used a
+/// shared `<path>.part`, and concurrent backend processes refreshing the same
+/// pair interleaved their writes: one process renamed the shared temp into
+/// place while a sibling was still writing it, publishing a TRUNCATED
+/// document at the final path (observed: a 369MB prefix.dev/conda-forge
+/// linux-64 cache cut mid-record at a page boundary, which then made every
+/// hermetic toolchain solve report "No candidates were found for
+/// gcc_linux-64 13.*"). `sync_all` + a length check additionally surface
+/// short writes that NFS only reports at close/commit time (quota, ENOSPC)
+/// BEFORE the rename can publish them.
 async fn write_atomic(path: &PathBuf, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await.ok();
     }
-    let tmp = path.with_extension("part");
-    tokio::fs::write(&tmp, bytes)
+    let tmp = crate::wheel::unique_atomic_sibling(path, "part");
+    let result = write_verified_then_rename(&tmp, path, bytes).await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
+    result
+}
+
+async fn write_verified_then_rename(
+    tmp: &std::path::Path,
+    path: &std::path::Path,
+    bytes: &[u8],
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt as _;
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(tmp)
+        .await
+        .with_context(|| format!("creating {}", tmp.display()))?;
+    file.write_all(bytes)
         .await
         .with_context(|| format!("writing {}", tmp.display()))?;
-    tokio::fs::rename(&tmp, path)
+    file.sync_all()
+        .await
+        .with_context(|| format!("syncing {}", tmp.display()))?;
+    let len = file
+        .metadata()
+        .await
+        .with_context(|| format!("stat {}", tmp.display()))?
+        .len();
+    if len != bytes.len() as u64 {
+        return Err(anyhow!(
+            "short write to {}: {len} of {} bytes reached disk",
+            tmp.display(),
+            bytes.len(),
+        ));
+    }
+    drop(file);
+    tokio::fs::rename(tmp, path)
         .await
         .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
     Ok(())
@@ -313,5 +439,107 @@ fn dirs_cache_root() -> PathBuf {
             .join("cache")
     } else {
         std::env::temp_dir().join("retread-cache")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unique_tmp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "retread-repodata-test-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Guard for the 4.10.77 root fix: the published cache file must always
+    /// be COMPLETE, and no shared `.part` sibling may linger.
+    #[tokio::test]
+    async fn write_atomic_publishes_complete_bytes_and_no_shared_part() {
+        let dir = unique_tmp_dir("complete");
+        let dest = dir.join("repodata.json");
+        let payload = vec![b'x'; 1_048_576];
+        write_atomic(&dest, &payload).await.unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), payload);
+        // The pre-fix shared temp name must never exist: its presence would
+        // mean two writers can interleave into one file again.
+        assert!(!dest.with_extension("part").exists());
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path() != dest)
+            .collect();
+        assert!(leftovers.is_empty(), "temp siblings leaked: {leftovers:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Concurrent writers to the SAME destination must each publish a
+    /// complete document (last-writer-wins); the final file must be byte-for-
+    /// byte equal to ONE of the payloads, never an interleaving. This is the
+    /// exact race that truncated the prefix.dev/conda-forge linux-64 cache
+    /// and produced "No candidates were found for gcc_linux-64 13.*".
+    #[tokio::test]
+    async fn concurrent_write_atomic_never_publishes_interleaved_bytes() {
+        let dir = unique_tmp_dir("race");
+        let dest = dir.join("repodata.json");
+        let payloads: Vec<Vec<u8>> = (0..8u8)
+            .map(|i| vec![b'a' + i; 512 * 1024 + usize::from(i) * 4096])
+            .collect();
+        let mut tasks = Vec::new();
+        for payload in payloads.clone() {
+            let dest = dest.clone();
+            tasks.push(tokio::spawn(
+                async move { write_atomic(&dest, &payload).await },
+            ));
+        }
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+        let published = std::fs::read(&dest).unwrap();
+        assert!(
+            payloads.iter().any(|p| *p == published),
+            "published file matches no single writer's payload (interleaved or truncated)",
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A corrupt (truncated) cached document must be EVICTED, not silently
+    /// dropped from the consulted set: pre-4.10.77 a corrupt file poisoned
+    /// its (channel, subdir) pair forever because every refresh failure fell
+    /// back to it and every sparse open failed.
+    #[tokio::test]
+    async fn build_sparse_evicts_corrupt_disk_cache() {
+        let channel_url = format!(
+            "https://retread-test.invalid/corrupt-evict-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        );
+        let path = disk_cache_path(&channel_url, "linux-64");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Fresh mtime + truncated JSON: exactly the poisoned state observed.
+        std::fs::write(&path, br#"{"packages": {"gcc_linux-64-13.4.0-h"#).unwrap();
+        let handle = build_sparse(channel_url, "linux-64".to_string()).await;
+        // The channel is unreachable (.invalid), so no handle can be built --
+        // but the corrupt file must be GONE so the next run can heal.
+        assert!(handle.is_none());
+        assert!(
+            !path.exists(),
+            "corrupt cache file survived at {}",
+            path.display(),
+        );
+        if let Some(parent) = path.parent() {
+            let filename = path.file_name().unwrap().to_str().unwrap();
+            std::fs::remove_file(parent.join(format!(".{filename}.retread-fetch-v1.lock"))).ok();
+        }
     }
 }

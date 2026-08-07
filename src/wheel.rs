@@ -17,7 +17,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 static ATOMIC_FILE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn unique_atomic_sibling(dst: &Path, suffix: &str) -> PathBuf {
+pub(crate) fn unique_atomic_sibling(dst: &Path, suffix: &str) -> PathBuf {
     use std::sync::atomic::Ordering;
 
     let parent = dst.parent().unwrap_or_else(|| Path::new("."));
