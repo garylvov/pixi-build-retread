@@ -18,9 +18,10 @@
 //! impossible by construction), shared by every consumer.
 //!
 //! Disk cache: decompressed `repodata.json` under
-//! `~/.cache/rattler/cache/retread-repodata/` with a 30-minute TTL,
-//! exactly the scheme both modules used before (same paths, so
-//! existing caches stay warm across this upgrade).
+//! `<cache root>/retread-repodata/` with a 30-minute TTL, where the cache
+//! root is `$RATTLER_CACHE_DIR` when set (rattler's own semantics) and
+//! `~/.cache/rattler/cache` otherwise -- the historical path, so existing
+//! caches stay warm for default-configured hosts.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -431,8 +432,28 @@ fn disk_cache_path(channel_url: &str, subdir: &str) -> PathBuf {
     dir.join(format!("{slug}--{subdir}--{hex}.json"))
 }
 
+/// Cache root, honoring `RATTLER_CACHE_DIR` exactly like rattler itself
+/// does (the variable names the cache ROOT, i.e. the equivalent of
+/// `~/.cache/rattler/cache`). Hardcoding `$HOME` here stranded the repodata
+/// cache on a shared NFS home even when the whole pipeline had been pointed
+/// at node-local storage: an over-quota home then made the cache unwritable
+/// on EVERY node at once (the fetch lock could not even be created), and the
+/// hermetic toolchain solve degraded to "conda-forge repodata incomplete".
 fn dirs_cache_root() -> PathBuf {
-    if let Some(home) = std::env::var_os("HOME") {
+    cache_root_from(
+        std::env::var_os("RATTLER_CACHE_DIR").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+fn cache_root_from(
+    rattler_cache_dir: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> PathBuf {
+    if let Some(dir) = rattler_cache_dir.filter(|v| !v.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    if let Some(home) = home {
         PathBuf::from(home)
             .join(".cache")
             .join("rattler")
@@ -508,6 +529,28 @@ mod tests {
             "published file matches no single writer's payload (interleaved or truncated)",
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `RATTLER_CACHE_DIR` names the cache ROOT (rattler's own semantics);
+    /// empty/unset falls back to `$HOME/.cache/rattler/cache`, then temp.
+    #[test]
+    fn cache_root_honors_rattler_cache_dir_then_home() {
+        use std::ffi::OsStr;
+        assert_eq!(
+            cache_root_from(
+                Some(OsStr::new("/tmp/rcache")),
+                Some(OsStr::new("/users/x"))
+            ),
+            PathBuf::from("/tmp/rcache"),
+        );
+        assert_eq!(
+            cache_root_from(Some(OsStr::new("")), Some(OsStr::new("/users/x"))),
+            PathBuf::from("/users/x/.cache/rattler/cache"),
+        );
+        assert_eq!(
+            cache_root_from(None, Some(OsStr::new("/users/x"))),
+            PathBuf::from("/users/x/.cache/rattler/cache"),
+        );
     }
 
     /// A corrupt (truncated) cached document must be EVICTED, not silently
