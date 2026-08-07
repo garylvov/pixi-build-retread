@@ -2545,6 +2545,17 @@ fn cache_directory(request: &ProvisionRequest) -> Result<PathBuf> {
             .context("resolving relative RETREAD_CACHE_DIR")?
             .join(root)
     };
+    // ONE canonical spelling for the whole hermetic cache tree. Tools invoked
+    // inside the cache (rattler-build) report canonicalized paths; if the
+    // configured root reaches the same directory through a symlink (classic
+    // HPC home: /users/<u> -> /oscar/home/<u>), the LEXICAL containment
+    // checks (`ensure_cache_descendant`) would reject the tool's spelling of
+    // a path that is genuinely inside the cache ("rattler work directory
+    // ... escapes hermetic cache ..."). Canonicalizing here, at the single
+    // derivation point, keeps every downstream comparison in one namespace.
+    // The cache identity below hashes request facts, not the path, so the
+    // env digest is unaffected.
+    let root = canonical_cache_root(root)?;
     let mut identity = Sha256::new();
     identity.update(b"retread-hermetic-environment-cache-v1\0");
     for field in [
@@ -2564,6 +2575,15 @@ fn cache_directory(request: &ProvisionRequest) -> Result<PathBuf> {
         .join(CACHE_NAMESPACE)
         .join(CACHE_VERSION)
         .join(format!("env-{:x}", identity.finalize())))
+}
+
+/// Create (if needed) and canonicalize the hermetic cache root so symlinked
+/// spellings of the same directory cannot defeat lexical containment checks.
+fn canonical_cache_root(root: PathBuf) -> Result<PathBuf> {
+    std::fs::create_dir_all(&root)
+        .with_context(|| format!("creating hermetic cache root {}", root.display()))?;
+    std::fs::canonicalize(&root)
+        .with_context(|| format!("canonicalizing hermetic cache root {}", root.display()))
 }
 
 fn validate_shell_safe_cache_path(path: &Path) -> Result<()> {
@@ -3164,6 +3184,34 @@ async fn write_completion_marker(path: &Path, marker: &CompletionMarker) -> Resu
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    /// Guard for the 4.10.80 root fix: a cache root reached through a
+    /// symlink (HPC-style /users/<u> -> /oscar/home/<u>) must resolve to the
+    /// canonical directory, so lexical containment checks agree with the
+    /// canonicalized paths tools like rattler-build report from inside it.
+    #[test]
+    fn canonical_cache_root_resolves_symlinked_spellings() {
+        let base = std::env::temp_dir().join(format!(
+            "retread-hermetic-canon-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let real = base.join("real-home");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = base.join("users-view");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let via_link = canonical_cache_root(link.join(".cache").join("retread")).unwrap();
+        let via_real = canonical_cache_root(real.join(".cache").join("retread")).unwrap();
+        assert_eq!(via_link, via_real);
+        // A path a tool reports from inside the canonical tree passes the
+        // lexical containment check against the canonicalized root.
+        ensure_cache_descendant(&via_link, &via_real.join("bld").join("work"), "work dir").unwrap();
+        std::fs::remove_dir_all(&base).ok();
+    }
 
     fn test_solved_record(
         name: &str,
