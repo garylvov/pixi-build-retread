@@ -2300,11 +2300,52 @@ fn heal_stale_envs_symlink_with_warning(
         Err(error) => return Err(error).with_context(|| format!("checking {}", pixi.display())),
     }
 
+    // Lock-free fast path: decide whether a repair could even be needed
+    // BEFORE creating/locking the link lock file. Opening that lock is a
+    // WRITE to the workspace; on a quota-blocked (or otherwise read-only)
+    // filesystem it fails with EDQUOT even when the envs symlink is
+    // perfectly healthy, and that spurious failure took down backend
+    // startup for every environment (observed as `pixi install` runs that
+    // produced empty envs). Reads suffice to prove "nothing to do"; the
+    // repair path below re-validates everything under the lock, so this
+    // pre-pass introduces no race.
+    let link = pixi.join("envs");
+    match fs::symlink_metadata(&link) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            if let Ok(raw_target) = fs::read_link(&link)
+                && fs::metadata(&raw_target).is_ok()
+            {
+                // Live target: no repair. Preserve the live-foreign-job
+                // warning the locked path would have emitted.
+                if let Some(owned) = workspace_envs_link_target(
+                    workspace_root,
+                    configured_tmp_root,
+                    &raw_target,
+                    false,
+                )? && current_ns.is_some()
+                    && owned.job_component != current_job_component()
+                {
+                    emit_warning(&live_foreign_envs_warning(
+                        workspace_root,
+                        &link,
+                        &owned.job_component,
+                        &current_job_component(),
+                    ));
+                }
+                return Ok(());
+            }
+        }
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("checking {}", link.display()));
+        }
+    }
+
     let directory = AnchoredEnvsDirectory::open(&pixi)
         .with_context(|| format!("opening envs-link directory {}", pixi.display()))?;
     let lock_path = pixi.join(FAST_WORKSPACE_LINK_LOCK);
     let _lock = directory.lock(&lock_path)?;
-    let link = pixi.join("envs");
     let link_name = OsStr::new("envs");
     let stat = match directory.stat(link_name) {
         Ok(stat) if rustix::fs::FileType::from_raw_mode(stat.st_mode).is_symlink() => stat,
@@ -4715,6 +4756,43 @@ fi
 
         assert_eq!(fs::read_link(&link).unwrap(), ns.bld_dir());
         assert!(!dead_target.exists());
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Guard for the 4.10.82 fix: a LIVE envs symlink must be verifiable
+    /// with reads alone. Opening the link lock is a workspace WRITE, and on
+    /// a quota-blocked filesystem it failed with EDQUOT even when there was
+    /// nothing to heal -- taking down backend startup for every environment
+    /// while `pixi install` still exited 0 with an empty env.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn backend_heal_needs_no_workspace_write_when_envs_symlink_is_live() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let guard = EnvGuard::new(&fasttmp_env_keys());
+        let root = tmp_dir("readonly-live-envs");
+        let ws = root.join("workspace");
+        write_workspace(&ws);
+        let pixi = ws.join(".pixi");
+        fs::create_dir_all(&pixi).unwrap();
+        let tmp_root = root.join("tmp");
+        let target = retread_envs_target(&tmp_root, &ws, "job-4305035");
+        fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, pixi.join("envs")).unwrap();
+        guard.set("SLURM_JOB_ID", "4305035");
+        guard.set("RETREAD_FAST_TMP", "on");
+        guard.set("RETREAD_FAST_TMP_ROOT", tmp_root.to_str().unwrap());
+
+        // Read-only .pixi: any attempt to create the lock file would EACCES.
+        fs::set_permissions(&pixi, fs::Permissions::from_mode(0o555)).unwrap();
+        let result = heal_stale_envs_symlink_at_backend_startup(&ws);
+        fs::set_permissions(&pixi, fs::Permissions::from_mode(0o755)).unwrap();
+        result.expect("live envs symlink must not require workspace writes");
+        assert!(
+            !pixi.join(FAST_WORKSPACE_LINK_LOCK).exists(),
+            "no lock file may be created on the no-repair path",
+        );
         fs::remove_dir_all(root).ok();
     }
 
