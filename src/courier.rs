@@ -2676,7 +2676,10 @@ mod tests {
     #[test]
     fn validate_emit_wheels_tolerates_legacy_sdist_upstream_url() {
         let target = ResolutionTarget::for_subdir("3.11", Platform::current().as_str());
-        let sdist_url = "https://files.pythonhosted.org/packages/aa/bb/compress_json-1.1.1.tar.gz";
+        let sdist_url = concat!(
+            "https://files.pythonhosted.org/packages/aa/bb/compress_json-1.1.1.tar.gz",
+            "#sha256=1111111111111111111111111111111111111111111111111111111111111111",
+        );
         let mut wheel = make_emit_wheel("compress-json", "1.1.1", &[], None, None);
         wheel.sdist_source = Some(crate::lock::SdistWheelSource {
             index: "https://pypi.org/simple".to_string(),
