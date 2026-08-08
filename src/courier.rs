@@ -1428,6 +1428,23 @@ fn validate_emit_wheels(emit_wheels: &[EmitWheel], target: &WheelTarget) -> anyh
             ("upstream URL", wheel.upstream_url.as_ref()),
         ] {
             let Some(url) = url else { continue };
+            // Legacy-lock tolerance: releases <=4.10.80 recorded the SDIST
+            // URL as upstream_url for version-entry sdist fallbacks (writer
+            // fixed in 4.10.81 -- sdist provenance lives in sdist_source).
+            // Such a URL names a .tar.gz, not a wheel; its provenance was
+            // already validated via `sdist_source` above, so skip the wheel
+            // filename extraction instead of failing the whole stage.
+            if let Some(source) = &wheel.sdist_source
+                && url.as_str() == source.sdist_url
+            {
+                tracing::warn!(
+                    wheel = %wheel.pypi_name,
+                    url = %url,
+                    "courier: legacy lock records the sdist URL as {provenance}; \
+                     ignoring it in favor of sdist_source provenance",
+                );
+                continue;
+            }
             let filename = crate::wheel::wheel_filename_from_url(url).with_context(|| {
                 format!(
                     "courier: extracting {provenance} wheel filename for `{}` from {url}",
@@ -2649,6 +2666,40 @@ mod tests {
             git_source: None,
             sdist_source: None,
         }
+    }
+
+    /// Guard for the 4.10.81 sdist provenance fix: locks written by <=4.10.80
+    /// recorded the SDIST URL as `upstream_url` for version-entry sdist
+    /// fallbacks. With `sdist_source` present and matching, the courier must
+    /// tolerate that legacy spelling instead of failing "extracting upstream
+    /// URL wheel filename ... from ...tar.gz".
+    #[test]
+    fn validate_emit_wheels_tolerates_legacy_sdist_upstream_url() {
+        let target = ResolutionTarget::for_subdir("3.11", Platform::current().as_str());
+        let sdist_url = "https://files.pythonhosted.org/packages/aa/bb/compress_json-1.1.1.tar.gz";
+        let mut wheel = make_emit_wheel("compress-json", "1.1.1", &[], None, None);
+        wheel.sdist_source = Some(crate::lock::SdistWheelSource {
+            index: "https://pypi.org/simple".to_string(),
+            name: "compress-json".to_string(),
+            version: "1.1.1".to_string(),
+            sdist_url: sdist_url.to_string(),
+        });
+        wheel.upstream_url = Some(sdist_url.parse().unwrap());
+        wheel.sha256 = Some("0".repeat(64));
+        validate_emit_wheels(&[wheel], &target.wheel_target())
+            .expect("legacy sdist upstream_url must be tolerated when sdist_source matches");
+
+        // A NON-matching non-wheel upstream URL must still fail loudly.
+        let mut poisoned = make_emit_wheel("compress-json", "1.1.1", &[], None, None);
+        poisoned.upstream_url = Some(
+            "https://example.invalid/other/artifact-1.0.tar.gz"
+                .parse()
+                .unwrap(),
+        );
+        poisoned.sha256 = Some("0".repeat(64));
+        let err = validate_emit_wheels(&[poisoned], &target.wheel_target())
+            .expect_err("a stray sdist upstream URL without provenance must fail");
+        assert!(format!("{err:#}").contains("upstream URL"));
     }
 
     #[tokio::test]

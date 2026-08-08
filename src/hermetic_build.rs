@@ -323,12 +323,32 @@ pub(crate) async fn provision(
                     marker_path.display()
                 );
             }
-            let marker: CompletionMarker = serde_json::from_slice(
-                &std::fs::read(&marker_path)
-                    .with_context(|| format!("reading {}", marker_path.display()))?,
-            )
-            .with_context(|| format!("parsing {}", marker_path.display()))?;
-            return validate_marker(&cache_dir, &request, &marker);
+            let cached = std::fs::read(&marker_path)
+                .with_context(|| format!("reading {}", marker_path.display()))
+                .and_then(|bytes| {
+                    serde_json::from_slice::<CompletionMarker>(&bytes)
+                        .with_context(|| format!("parsing {}", marker_path.display()))
+                })
+                .and_then(|marker| validate_marker(&cache_dir, &request, &marker));
+            match cached {
+                Ok(environment) => return Ok(environment),
+                Err(error) => {
+                    // A cached tuple that no longer validates is a STALE CACHE,
+                    // not a fatal condition: markers record absolute paths, and
+                    // an entry copied from (or reached through) a cache root
+                    // that has since been deleted dead-ends every consumer
+                    // forever ("canonicalizing rattler work directory ...: No
+                    // such file or directory"). We hold the exclusive tuple
+                    // lock, so evict and re-provision below exactly like a
+                    // markerless interrupted setup.
+                    tracing::warn!(
+                        cache = %cache_dir.display(),
+                        error = %format!("{error:#}"),
+                        "hermetic build environment cache failed validation; \
+                         evicting and re-provisioning",
+                    );
+                }
+            }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {

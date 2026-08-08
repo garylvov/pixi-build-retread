@@ -608,6 +608,7 @@ async fn materialize_index_wheel(
     Ok(fetched)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn materialize_locked_wheels(
     lock: &RetreadLock,
     prefix: &Path,
@@ -616,6 +617,7 @@ async fn materialize_locked_wheels(
     conda_owned: &BTreeSet<(String, String)>,
     editable_owned: &BTreeSet<String>,
     drop_cuda_shadows: bool,
+    conda_dist_names: &BTreeSet<String>,
 ) -> Result<Vec<PathBuf>> {
     let fetch_dir = prefix
         .join("share")
@@ -665,15 +667,35 @@ async fn materialize_locked_wheels(
         // globs `site-packages/nvidia/*/lib` and preloads the stale wheel),
         // breaking `import torch` with `undefined symbol: ncclAlltoAll`. Drop
         // it so conda's CUDA stack stays authoritative. See
-        // `conda_owns_cuda_runtime` / `is_pypi_cuda_shadow_wheel`.
-        if drop_cuda_shadows && is_pypi_cuda_shadow_wheel(&wheel.name) {
-            eprintln!(
-                "retread install: {}=={} is a PyPI CUDA lib-shim wheel shadowed by \
-                 the conda CUDA stack in the prefix (conda-meta has cuda-version); \
-                 skipping wheel replay so conda's CUDA libraries stay authoritative",
-                wheel.name, wheel.version
+        // `conda_owns_cuda_runtime` / `pypi_cuda_shadow_component`.
+        if drop_cuda_shadows && let Some(component) = pypi_cuda_shadow_component(&wheel.name) {
+            // Per-component gate: drop only when the conda prefix actually
+            // PROVIDES this component. `cuda-version` proves conda owns the
+            // runtime, but a PyPI `torch` in such a prefix still needs any
+            // family member conda does NOT ship (observed: torch's
+            // `nvidia-cusparselt-cu12` dropped while conda had no
+            // `libcusparselt` -> "libcusparseLt.so.0: cannot open shared
+            // object file" at import).
+            let providers = conda_cuda_shadow_providers(&component);
+            if providers
+                .iter()
+                .any(|provider| conda_dist_names.contains(*provider))
+            {
+                eprintln!(
+                    "retread install: {}=={} is a PyPI CUDA lib-shim wheel shadowed by \
+                     the conda CUDA stack in the prefix (conda-meta has cuda-version); \
+                     skipping wheel replay so conda's CUDA libraries stay authoritative",
+                    wheel.name, wheel.version
+                );
+                continue;
+            }
+            tracing::warn!(
+                bundle = %lock.bundle,
+                dist = %wheel.name,
+                component = %component,
+                "retread install: conda owns the CUDA runtime but provides no \
+                 conda package for this component; keeping the PyPI wheel",
             );
-            continue;
         }
         let shipped = shipped_wheels_dir.join(&wheel.filename);
         if shipped.is_file() {
@@ -908,22 +930,74 @@ fn conda_owned_at_version(
 /// The name is anchored on a trailing `-cu<digits>` tag so genuine CUDA-adjacent
 /// PyPI packages that are NOT lib-shim wheels are never matched:
 /// `nvidia-ml-py`, `nvidia-cudnn-frontend`, etc. fall through.
-fn is_pypi_cuda_shadow_wheel(name: &str) -> bool {
+/// The `<component>` of a `nvidia-<component>-cu<digits>` lib-shim wheel
+/// name, or `None` when the name is not one.
+fn pypi_cuda_shadow_component(name: &str) -> Option<String> {
     let normalized = normalize_dist_name(name);
-    let Some(rest) = normalized.strip_prefix("nvidia-") else {
-        return false;
-    };
+    let rest = normalized.strip_prefix("nvidia-")?;
     // rest = "<component>-cu<digits>", component itself may contain '-'
     // (e.g. "cuda-runtime"). Split on the LAST '-' to isolate the cuNN tag.
-    match rest.rsplit_once('-') {
-        Some((component, tag)) => {
-            !component.is_empty()
-                && tag
-                    .strip_prefix("cu")
-                    .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
-        }
-        None => false,
+    let (component, tag) = rest.rsplit_once('-')?;
+    let is_shim = !component.is_empty()
+        && tag
+            .strip_prefix("cu")
+            .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()));
+    is_shim.then(|| component.to_string())
+}
+
+/// The conda distribution name(s) that provide a given PyPI CUDA lib-shim
+/// component. Dropping a shim wheel is only sound when one of these is
+/// actually installed in the prefix -- `cuda-version` being present proves
+/// conda owns the CUDA RUNTIME, not that it ships EVERY component. A PyPI
+/// `torch` in a conda-CUDA prefix imports `nvidia.cusparselt` from its wheel
+/// family; dropping `nvidia-cusparselt-cu12` while conda has no
+/// `libcusparselt` broke `import torch` with "libcusparseLt.so.0: cannot open
+/// shared object file".
+fn conda_cuda_shadow_providers(component: &str) -> &'static [&'static str] {
+    match component {
+        "nccl" => &["nccl"],
+        "cublas" => &["libcublas"],
+        "cuda-runtime" => &["cuda-cudart"],
+        "cuda-nvrtc" => &["cuda-nvrtc"],
+        "cuda-cupti" => &["cuda-cupti"],
+        "cudnn" => &["cudnn"],
+        "cufft" => &["libcufft"],
+        "cufile" => &["libcufile"],
+        "curand" => &["libcurand"],
+        "cusolver" => &["libcusolver"],
+        "cusparse" => &["libcusparse"],
+        "cusparselt" => &["libcusparselt"],
+        "nvjitlink" => &["libnvjitlink"],
+        "nvshmem" => &["nvshmem", "libnvshmem"],
+        "nvtx" => &["cuda-nvtx"],
+        _ => &[],
     }
+}
+
+/// Conda distribution names installed in the prefix, parsed from
+/// `conda-meta/<name>-<version>-<build>.json` filenames.
+fn installed_conda_dist_names(prefix: &Path) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    let Ok(entries) = std::fs::read_dir(prefix.join("conda-meta")) else {
+        return names;
+    };
+    for entry in entries.flatten() {
+        let Some(file) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let Some(stem) = file.strip_suffix(".json") else {
+            continue;
+        };
+        // <name>-<version>-<build>: name may contain '-', version/build may
+        // not (conda forbids '-' in both), so strip the last two segments.
+        let mut parts = stem.rsplitn(3, '-');
+        let (Some(_build), Some(_version), Some(name)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        names.insert(name.to_string());
+    }
+    names
 }
 
 /// True if conda owns the CUDA runtime in this prefix, signalled by the
@@ -933,7 +1007,7 @@ fn is_pypi_cuda_shadow_wheel(name: &str) -> bool {
 /// (`$PREFIX/lib/libnccl.so`, `libcublas.so`, ...) are the authoritative stack.
 ///
 /// When true, the PyPI `nvidia-*-cu<major>` shadow wheels
-/// (`is_pypi_cuda_shadow_wheel`) must be kept out of the env: conda pytorch's
+/// (`pypi_cuda_shadow_component`) must be kept out of the env: conda pytorch's
 /// `_preload_cuda_deps` globs `site-packages/nvidia/*/lib/lib*.so*` and, if a
 /// stale PyPI wheel is present (e.g. `nvidia-nccl-cu12==2.27.5` alongside conda
 /// `nccl==2.30.7`), preloads the OLDER lib with `RTLD_GLOBAL` -- shadowing
@@ -1478,6 +1552,10 @@ pub async fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
     // break `import torch` if installed alongside conda's CUDA libs -- drop them
     // from the replay. See `conda_owns_cuda_runtime`.
     let drop_cuda_shadows = conda_owns_cuda_runtime(prefix);
+    // Conda dist names installed in the prefix: the per-component gate on the
+    // shadow-wheel drop (a shim wheel is only dropped when conda actually
+    // provides its component).
+    let conda_dist_names = installed_conda_dist_names(prefix);
     let wheel_files = materialize_locked_wheels(
         &lock,
         prefix,
@@ -1486,6 +1564,7 @@ pub async fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
         &conda_owned,
         &editable_owned,
         drop_cuda_shadows,
+        &conda_dist_names,
     )
     .await?;
 
@@ -1645,7 +1724,7 @@ mod tests {
             "nvidia_nccl_cu13",
         ] {
             assert!(
-                is_pypi_cuda_shadow_wheel(name),
+                pypi_cuda_shadow_component(name).is_some(),
                 "expected {name} to be treated as a conda-shadowed CUDA lib-shim wheel"
             );
         }
@@ -1659,10 +1738,61 @@ mod tests {
             "nvidia",
         ] {
             assert!(
-                !is_pypi_cuda_shadow_wheel(name),
+                !pypi_cuda_shadow_component(name).is_some(),
                 "expected {name} to be left installed"
             );
         }
+    }
+
+    /// Guard for the cusparselt defect: a shadow wheel may be dropped ONLY
+    /// when the conda prefix provides its component; `cuda-version` alone
+    /// proves runtime ownership, not component coverage.
+    #[test]
+    fn cuda_shadow_drop_is_gated_on_a_conda_provider() {
+        assert_eq!(
+            pypi_cuda_shadow_component("nvidia-cusparselt-cu12").as_deref(),
+            Some("cusparselt"),
+        );
+        assert_eq!(
+            pypi_cuda_shadow_component("nvidia-cuda-runtime-cu12").as_deref(),
+            Some("cuda-runtime"),
+        );
+        assert_eq!(pypi_cuda_shadow_component("nvidia-ml-py"), None);
+
+        assert_eq!(
+            conda_cuda_shadow_providers("cusparselt"),
+            &["libcusparselt"]
+        );
+        assert_eq!(conda_cuda_shadow_providers("nccl"), &["nccl"]);
+        // Unknown component: no provider names, so the wheel is KEPT.
+        assert!(conda_cuda_shadow_providers("hypothetical-new-lib").is_empty());
+    }
+
+    #[test]
+    fn installed_conda_dist_names_parses_dashed_names() {
+        let dir = std::env::temp_dir().join(format!(
+            "retread-conda-meta-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(dir.join("conda-meta")).unwrap();
+        for file in [
+            "libcusparse-12.5.10.65-hecca717_2.json",
+            "cuda-nvtx-12.8.90-0.json",
+            "cuda-version-12.8-h5d125a7_3.json",
+            "history", // non-json entries are ignored
+        ] {
+            std::fs::write(dir.join("conda-meta").join(file), b"{}").unwrap();
+        }
+        let names = installed_conda_dist_names(&dir);
+        assert!(names.contains("libcusparse"));
+        assert!(names.contains("cuda-nvtx"));
+        assert!(names.contains("cuda-version"));
+        assert!(!names.contains("libcusparselt"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     fn lock_wheel(name: &str, version: &str) -> LockWheel {
@@ -2293,6 +2423,7 @@ mod tests {
             &BTreeSet::new(),
             &BTreeSet::new(),
             false,
+            &BTreeSet::new(),
         )
         .await
         .unwrap();
@@ -2348,6 +2479,7 @@ mod tests {
             &BTreeSet::new(),
             &BTreeSet::new(),
             false,
+            &BTreeSet::new(),
         )
         .await
         .unwrap();
@@ -2372,6 +2504,7 @@ mod tests {
             &BTreeSet::new(),
             &BTreeSet::new(),
             false,
+            &BTreeSet::new(),
         )
         .await
         .unwrap_err();
@@ -2407,6 +2540,7 @@ mod tests {
                 &BTreeSet::new(),
                 &BTreeSet::new(),
                 false,
+                &BTreeSet::new(),
             )
             .await
             .is_err()
@@ -2565,6 +2699,7 @@ mod tests {
             &conda_owned,
             &BTreeSet::new(),
             false,
+            &BTreeSet::new(),
         )
         .await
         .unwrap();
@@ -2668,6 +2803,7 @@ mod tests {
             &BTreeSet::new(),
             &editable_owned,
             false,
+            &BTreeSet::new(),
         )
         .await
         .unwrap();
@@ -2756,6 +2892,7 @@ mod tests {
             &BTreeSet::new(),
             &BTreeSet::new(),
             false,
+            &BTreeSet::new(),
         )
         .await
         .unwrap_err();
@@ -2885,6 +3022,7 @@ mod tests {
             &BTreeSet::new(),
             &BTreeSet::new(),
             false,
+            &BTreeSet::new(),
         )
         .await
         .unwrap();

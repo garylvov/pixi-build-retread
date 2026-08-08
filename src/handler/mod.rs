@@ -10468,6 +10468,10 @@ async fn materialize_and_rewrite_with_abi_aliases(
     // Git provenance (schema 8+): populated for named-git and inline-git
     // entry forms. None for all other origins.
     let mut git_source_captured: Option<crate::lock::GitWheelSource> = None;
+    // Sdist provenance (schema 9+): populated when a PyPI version entry has
+    // no wheel and falls back to the sdist auto-build. Mutually exclusive
+    // with `upstream_url` (which is strictly a wheel URL).
+    let mut sdist_source_captured: Option<crate::lock::SdistWheelSource> = None;
     let raw_path: PathBuf = if let Some(from_name) = &entry.from {
         // Named git-source reference: look up url + rev from the
         // [retread-git-sources] table, treat subdirectory just like
@@ -10756,20 +10760,28 @@ async fn materialize_and_rewrite_with_abi_aliases(
                          (version=`{version}`, index=`{index_url}`)"
                     )
                 })?;
-                let sdist_url =
-                    url::Url::parse(&built.sdist_source.sdist_url).with_context(|| {
-                        format!(
-                            "phase 1 PyPI sdist fallback for entry `{entry_name}` returned invalid \
-                             sdist URL `{}`",
-                            built.sdist_source.sdist_url,
-                        )
-                    })?;
+                url::Url::parse(&built.sdist_source.sdist_url).with_context(|| {
+                    format!(
+                        "phase 1 PyPI sdist fallback for entry `{entry_name}` returned invalid \
+                         sdist URL `{}`",
+                        built.sdist_source.sdist_url,
+                    )
+                })?;
                 tracing::info!(
                     entry = %entry_name,
                     version = %built.version,
                     "phase 1 PyPI wheel resolve missed; using sdist fallback",
                 );
-                upstream_url = Some(sdist_url);
+                // Sdist provenance goes in `sdist_source`, NEVER `upstream_url`:
+                // upstream_url is defined as a WHEEL URL (the courier extracts
+                // and validates a PEP 427 filename from it), while the artifact
+                // behind an sdist build is a .tar.gz. Recording the sdist URL
+                // as upstream_url made courier staging fail with "extracting
+                // upstream URL wheel filename ... from ...tar.gz" for every
+                // [retread-wheels] version entry whose distribution publishes
+                // no wheel (e.g. compress-json). Same contract as
+                // bfs_fetch_provenance for BFS transitives.
+                sdist_source_captured = Some(built.sdist_source.clone());
                 built.wheel_path
             }
             Err(error) => {
@@ -11011,10 +11023,9 @@ async fn materialize_and_rewrite_with_abi_aliases(
             url: final_url,
             upstream_url,
             git_source: git_source_captured,
-            // sdist_source is only populated for BFS-transitive sdist-built wheels
-            // (set in the BFS phase-3 loop). materialize_and_rewrite handles git/path/
-            // url/version entries — none of those are sdist BFS transitives.
-            sdist_source: None,
+            // Populated only by the version-entry sdist fallback above; BFS
+            // transitives get theirs in the BFS phase-3 loop.
+            sdist_source: sdist_source_captured,
             metadata_provenance: wheel_entry_metadata_provenance(entry),
             extras_requested: audit_info.extras_requested,
             auto_data: auto_data_report,
