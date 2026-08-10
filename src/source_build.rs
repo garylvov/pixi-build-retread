@@ -764,11 +764,72 @@ pub(crate) fn remove_owned_cache_entry(path: &Path) -> Result<()> {
         // stripped from directories too), which makes remove_dir_all fail
         // with EACCES. Restore owner-write on directories first.
         restore_directory_write_bits(path);
-        std::fs::remove_dir_all(path)
+        remove_dir_all_nfs_tolerant(path)
     } else {
         std::fs::remove_file(path)
     }
     .with_context(|| format!("removing invalid owned cache entry {}", path.display()))
+}
+
+/// `remove_dir_all` on an NFS mount can fail with `ENOTEMPTY` even though it
+/// just unlinked every entry: NFS silly-renames files that are still open by
+/// some process into `.nfsXXXX` siblings, so the parent directory is
+/// non-empty again by the time we rmdir it. Shared HPC caches on NFS hit this
+/// whenever an eviction races a live build, and the eviction is a heal path —
+/// failing it wedges the cache permanently, because every later run re-detects
+/// the same invalid entry and re-fails on it.
+///
+/// Rename the tree aside first so the visible path is free regardless of what
+/// happens next, then delete with a short retry to let the silly-rename
+/// references drain. A leftover `.evicting-*` directory is inert (nothing
+/// resolves cache entries through it) and gets swept by the next eviction.
+fn remove_dir_all_nfs_tolerant(path: &Path) -> std::io::Result<()> {
+    let doomed = match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => {
+            let staged = parent.join(format!(
+                ".evicting-{}-{}",
+                name.to_string_lossy(),
+                std::process::id()
+            ));
+            // Best effort: if the rename fails (cross-device, permissions,
+            // a stale sibling), fall through and delete in place.
+            match std::fs::rename(path, &staged) {
+                Ok(()) => staged,
+                Err(_) => path.to_path_buf(),
+            }
+        }
+        _ => path.to_path_buf(),
+    };
+
+    let mut last = match std::fs::remove_dir_all(&doomed) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    for backoff_ms in [50, 200, 500] {
+        if last.kind() != std::io::ErrorKind::DirectoryNotEmpty {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+        match std::fs::remove_dir_all(&doomed) {
+            Ok(()) => return Ok(()),
+            Err(error) => last = error,
+        }
+    }
+
+    // The visible path is gone if the rename landed, so the cache is usable
+    // even though the doomed tree survives. Only report failure when the
+    // entry is still sitting at its real path.
+    if doomed != path {
+        tracing::warn!(
+            path = %path.display(),
+            residue = %doomed.display(),
+            error = %last,
+            "evicted cache entry renamed aside but not fully deleted; \
+             leaving residue for a later sweep",
+        );
+        return Ok(());
+    }
+    Err(last)
 }
 
 /// Best-effort: re-add owner write permission on `path` and every nested
@@ -6678,6 +6739,37 @@ fn git_slug(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An eviction must free the visible cache path even when the tree cannot
+    /// be fully deleted. On NFS a silly-renamed `.nfsXXXX` sibling keeps the
+    /// directory non-empty and `remove_dir_all` returns `ENOTEMPTY`; that used
+    /// to wedge the cache forever, since the next run re-detected the same
+    /// invalid entry and failed on it again. Simulated here with a read-only
+    /// parent, which blocks the final rmdir the same way.
+    #[test]
+    #[cfg(unix)]
+    fn remove_owned_cache_entry_frees_path_when_tree_cannot_be_deleted() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = unique_test_dir("evict-undeletable");
+        let entry = root.join("env-deadbeef");
+        std::fs::create_dir_all(entry.join("nested")).unwrap();
+        std::fs::write(entry.join("nested").join("held.txt"), b"in use").unwrap();
+
+        remove_owned_cache_entry(&entry).unwrap();
+        assert!(
+            !entry.exists(),
+            "visible cache path must be gone so the entry can be rebuilt"
+        );
+
+        // Second eviction of an already-absent path is a no-op, not an error.
+        remove_owned_cache_entry(&entry).unwrap();
+
+        for leftover in std::fs::read_dir(&root).into_iter().flatten().flatten() {
+            let _ = std::fs::set_permissions(leftover.path(), std::fs::Permissions::from_mode(0o755));
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     const CHECKOUT_SUBPROCESS_HELPER: &str = "source_build::tests::git_checkout_subprocess_helper";
     const UV_BUILD_LIMIT_SUBPROCESS_HELPER: &str =
