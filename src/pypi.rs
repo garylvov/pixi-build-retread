@@ -1371,6 +1371,21 @@ fn parse_index_json(body: &str, base: &url::Url) -> Result<Vec<ResolvedWheel>> {
         let Some(filename) = f.get("filename").and_then(|v| v.as_str()) else {
             continue;
         };
+        // Decode exactly like both PEP 503 HTML parsers above. PEP 691 says
+        // `filename` is the real filename, but indexes that generate the JSON
+        // view from their HTML view carry the percent-encoded href through, so
+        // a PEP 440 local version arrives as `torch-2.5.1%2Bcu124-...whl`.
+        // Everything downstream treats this field as a literal filename, and
+        // `%2B` is not a valid PEP 427 version character, so the encoded form
+        // fails the courier's filename validation late in a build:
+        //   "courier recorded wheel filename has an invalid PEP 427 version
+        //    field: `2.5.1%2Bcu124`"
+        // Decoding is a no-op for correctly-served indexes.
+        let filename = percent_encoding::percent_decode_str(filename)
+            .decode_utf8()
+            .map(std::borrow::Cow::into_owned)
+            .unwrap_or_else(|_| filename.to_string());
+        let filename = filename.as_str();
         // PEP 691 permits `url` to be relative to the index page.
         let Some(url) = f
             .get("url")
@@ -1737,6 +1752,50 @@ mod tests {
     }
 
     #[test]
+    /// A PEP 440 local version (`+cu124`) is percent-encoded in index hrefs.
+    /// Indexes that derive their PEP 691 JSON from the HTML view carry that
+    /// encoding into the `filename` field; both HTML parsers already decode,
+    /// so the JSON parser must too, or `%2B` reaches the courier as a literal
+    /// filename and fails PEP 427 version parsing at the end of a long build.
+    #[test]
+    fn json_listing_decodes_percent_encoded_local_version_filenames() {
+        let base: url::Url = "https://download.pytorch.org/whl/cu124/".parse().unwrap();
+        let json = r#"{
+            "meta": {"api-version": "1.1"},
+            "files": [{
+                "filename": "torch-2.5.1%2Bcu124-cp311-cp311-linux_x86_64.whl",
+                "url": "torch-2.5.1%2Bcu124-cp311-cp311-linux_x86_64.whl",
+                "hashes": {}
+            }]
+        }"#;
+        let candidates = parse_index_json(json, &base).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].filename,
+            "torch-2.5.1+cu124-cp311-cp311-linux_x86_64.whl",
+            "filename must be decoded to a literal PEP 427 name"
+        );
+        // The URL keeps its encoding: that is what has to be fetched.
+        assert!(candidates[0].url.as_str().contains("%2B"));
+    }
+
+    /// Correctly-served indexes must be untouched by that decode.
+    #[test]
+    fn json_listing_leaves_plain_filenames_alone() {
+        let base: url::Url = "https://example.com/simple/demo/".parse().unwrap();
+        let json = r#"{
+            "meta": {"api-version": "1.1"},
+            "files": [{
+                "filename": "demo-1.0.0-py3-none-any.whl",
+                "url": "demo-1.0.0-py3-none-any.whl",
+                "hashes": {}
+            }]
+        }"#;
+        let candidates = parse_index_json(json, &base).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].filename, "demo-1.0.0-py3-none-any.whl");
+    }
+
     fn sdist_only_and_empty_json_are_valid_simple_listings() {
         let base: url::Url = "https://example.com/simple/source-only/".parse().unwrap();
         let json = r#"{
