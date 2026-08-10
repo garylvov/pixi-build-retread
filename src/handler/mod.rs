@@ -4070,9 +4070,12 @@ impl Handler {
                     candidate.metadata.build,
                     candidate.metadata.subdir,
                     if identity_matches {
-                        "identity matches, run dependencies differ"
+                        format!(
+                            "identity matches, run dependencies differ — {}",
+                            run_dependency_delta(&candidate, run_override.as_deref())
+                        )
                     } else {
-                        "identity differs"
+                        "identity differs".to_string()
                     },
                 ));
             }
@@ -13319,6 +13322,72 @@ fn output_run_dependencies_match(
     advertised: Option<&[String]>,
 ) -> Result<bool> {
     run_dependencies_match(&output.run_dependencies.depends, advertised)
+}
+
+/// Describe *which* run dependencies differ, for the "0 exact matches" error.
+/// Knowing only that they differ is not actionable: the record can be stale in
+/// one spec out of two hundred, and the operator has no way to see which.
+fn run_dependency_delta(output: &CondaOutput, advertised: Option<&[String]>) -> String {
+    let Some(advertised) = advertised else {
+        return "no advertised run dependencies to compare".to_string();
+    };
+    let actual: BTreeSet<String> = output
+        .run_dependencies
+        .depends
+        .iter()
+        .map(|dependency| format!("{dependency:?}"))
+        .collect();
+    let advertised_names: BTreeSet<String> = advertised
+        .iter()
+        .filter_map(|raw| {
+            rattler_conda_types::MatchSpec::from_str(
+                raw,
+                rattler_conda_types::ParseStrictness::Lenient,
+            )
+            .ok()
+            .and_then(|spec| spec.name.as_ref().map(|name| name.to_string()))
+        })
+        .collect();
+    let actual_names: BTreeSet<String> = output
+        .run_dependencies
+        .depends
+        .iter()
+        .map(|dependency| canonical_conda_name(&dependency.name).to_string())
+        .collect();
+
+    let only_built: Vec<&String> = actual_names.difference(&advertised_names).collect();
+    let only_advertised: Vec<&String> = advertised_names.difference(&actual_names).collect();
+
+    let mut parts = Vec::new();
+    if !only_built.is_empty() {
+        parts.push(format!(
+            "present in the rebuilt output but not advertised: {}",
+            only_built
+                .iter()
+                .map(|name| name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if !only_advertised.is_empty() {
+        parts.push(format!(
+            "advertised but absent from the rebuilt output: {}",
+            only_advertised
+                .iter()
+                .map(|name| name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if parts.is_empty() {
+        parts.push(format!(
+            "same {} dependency names on both sides, so one or more version/build \
+             constraints were relaxed or tightened",
+            actual_names.len()
+        ));
+        let _ = &actual;
+    }
+    parts.join("; ")
 }
 
 fn run_dependencies_match(
