@@ -4009,6 +4009,7 @@ impl Handler {
             })
             .unwrap_or_default();
         let mut matching_bundles = Vec::new();
+        let mut rejected_candidates: Vec<String> = Vec::new();
         for (bundle_index, base_bundle) in materialized.iter().enumerate() {
             let (bundle, effective) = apply_emission(base_bundle, &base_config, picked_emission);
             let courier_hash = config.courier.then(|| {
@@ -4045,26 +4046,67 @@ impl Handler {
                     bundle.conda_name
                 ))
             })?;
-            if output_matches_build_request(&candidate, &params.output)
-                && output_run_dependencies_match(&candidate, run_override.as_deref()).map_err(
-                    |error| {
-                        RpcError::internal(format!(
-                            "validating cached output parity for {}: {error:#}",
-                            bundle.conda_name
-                        ))
-                    },
-                )?
-            {
+            let identity_matches = output_matches_build_request(&candidate, &params.output);
+            let dependencies_match = output_run_dependencies_match(&candidate, run_override.as_deref())
+                .map_err(|error| {
+                    RpcError::internal(format!(
+                        "validating cached output parity for {}: {error:#}",
+                        bundle.conda_name
+                    ))
+                })?;
+            if identity_matches && dependencies_match {
                 matching_bundles.push((bundle_index, bundle, effective, emission_relaxations));
+            } else {
+                // Record why each candidate was rejected. Without this the
+                // caller only ever sees "0 exact matches", which names no
+                // delta and leaves no way to tell a genuinely stale record
+                // apart from a one-field drift (a rebuilt version, a changed
+                // build string) that the operator could fix in seconds.
+                rejected_candidates.push(format!(
+                    "`{}` {}={} build=`{}` subdir={} ({})",
+                    bundle.conda_name,
+                    candidate.metadata.name.as_normalized(),
+                    candidate.metadata.version,
+                    candidate.metadata.build,
+                    candidate.metadata.subdir,
+                    if identity_matches {
+                        "identity matches, run dependencies differ"
+                    } else {
+                        "identity differs"
+                    },
+                ));
             }
         }
         let [(bundle_index, bundle, effective, emission_relaxations)] = matching_bundles.as_slice()
         else {
+            let requested = format!(
+                "{}{}{} subdir={}",
+                params.output.name.as_normalized(),
+                params
+                    .output
+                    .version
+                    .as_ref()
+                    .map(|version| format!(" version={version}"))
+                    .unwrap_or_default(),
+                params
+                    .output
+                    .build
+                    .as_ref()
+                    .map(|build| format!(" build=`{build}`"))
+                    .unwrap_or_default(),
+                params.output.subdir,
+            );
             return Err(RpcError::invalid_params(format!(
                 "the current source plan has {} exact matches for advertised output \
-                 `{}`; refusing to build with a stale or ambiguous relaxation record",
+                 `{}`; refusing to build with a stale or ambiguous relaxation record. \
+                 Requested: {requested}. Candidates considered: {}",
                 matching_bundles.len(),
                 params.output.name.as_normalized(),
+                if rejected_candidates.is_empty() {
+                    "none — the source plan produced no outputs at all".to_string()
+                } else {
+                    rejected_candidates.join("; ")
+                },
             )));
         };
         let base_bundle = &materialized[*bundle_index];
