@@ -1381,7 +1381,22 @@ fn validate_emit_wheels(emit_wheels: &[EmitWheel], target: &WheelTarget) -> anyh
                 wheel.version,
             );
         }
-        let recorded = validate_wheel_filename(wheel, "recorded", &wheel.wheel_filename, target)?;
+        let recorded = validate_wheel_filename(wheel, "recorded", &wheel.wheel_filename, target)
+            .with_context(|| {
+                // The rejected name alone does not say who produced it. Carry
+                // the wheel's provenance so a bad filename points at its
+                // source instead of requiring a bisect of every writer.
+                format!(
+                    "staging `{}`=={} (origin: local_path={:?}, upstream_url={:?}, \
+                     sdist_source={:?}, git_source={:?})",
+                    wheel.pypi_name,
+                    wheel.version,
+                    wheel.local_path.as_ref().map(|p| p.display().to_string()),
+                    wheel.upstream_url,
+                    wheel.sdist_source.as_ref().map(|s| s.sdist_url.clone()),
+                    wheel.git_source.as_ref().map(|g| g.url.clone()),
+                )
+            })?;
         if let Some(prior) =
             seen_filenames.insert(recorded.to_ascii_lowercase(), wheel.wheel_filename.clone())
         {
@@ -1676,6 +1691,40 @@ pub(crate) async fn stage_for_target_with_store_root_and_relaxations(
     let python = crate::lock::normalized_target_python(target.python_version())
         .context("courier: malformed resolution target")?;
     validate_native_stage_target(target, Platform::current())?;
+    // `wheel_filename` is contractually a literal PEP 427 basename, but a
+    // producer that derives it from a URL path segment leaves it
+    // percent-encoded: a PEP 440 local version then arrives as
+    // `torch-2.5.1%2Bcu124-...whl` and fails validation at the very end of a
+    // long build. Seen on wheels whose upstream_url is a redirect target
+    // (download-r2.pytorch.org). Normalize before the guards run, and name the
+    // offending wheel so its producer can be repaired at the source.
+    let normalized_wheels: Vec<EmitWheel> = emit_wheels
+        .iter()
+        .map(|wheel| {
+            if !wheel.wheel_filename.contains('%') {
+                return wheel.clone();
+            }
+            let decoded = percent_encoding::percent_decode_str(&wheel.wheel_filename)
+                .decode_utf8_lossy()
+                .into_owned();
+            if decoded == wheel.wheel_filename {
+                return wheel.clone();
+            }
+            tracing::warn!(
+                pypi_name = %wheel.pypi_name,
+                version = %wheel.version,
+                recorded = %wheel.wheel_filename,
+                normalized = %decoded,
+                upstream_url = ?wheel.upstream_url,
+                "courier: recorded wheel filename was percent-encoded; normalizing \
+                 (its producer should record a literal basename)",
+            );
+            let mut fixed = wheel.clone();
+            fixed.wheel_filename = decoded;
+            fixed
+        })
+        .collect();
+    let emit_wheels: &[EmitWheel] = &normalized_wheels;
     validate_reserved_meta_wheel_collisions(emit_wheels, bundle_name, version)?;
     validate_emit_wheels(emit_wheels, target.wheel_target())?;
     if let Some(relaxations) = relaxations {
