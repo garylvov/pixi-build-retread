@@ -3004,21 +3004,29 @@ pub fn parse_pylock_closure(
         // Select ONE wheel by tag priority for (python, platform).
         let mut best: Option<(i64, &toml::Value, String)> = None;
         for w in wheel_entries {
+            // `+` in a PEP 440 local version is percent-encoded as `%2B`
+            // wherever the name is carried through a URL. The `url` fallback
+            // below always decoded; `name` did not, and uv populates `name`
+            // from the artifact URL for index entries served that way. The
+            // encoded form then travels as a literal filename all the way to
+            // courier staging, which rejects it minutes into a build:
+            //   "courier recorded wheel filename has an invalid PEP 427
+            //    version field: `2.5.1%2Bcu124`"
+            // Decode both sources. It is a no-op for already-literal names.
+            let decode = |raw: &str| {
+                percent_encoding::percent_decode_str(raw)
+                    .decode_utf8_lossy()
+                    .into_owned()
+            };
             let filename = w
                 .get("name")
                 .and_then(|v| v.as_str())
-                .map(str::to_string)
+                .map(decode)
                 .or_else(|| {
-                    // URL path segments encode `+` (PEP 440 local versions)
-                    // as `%2B`; decode so tag parsing sees the real filename.
                     w.get("url")
                         .and_then(|v| v.as_str())
                         .and_then(|u| u.rsplit('/').next())
-                        .map(|f| {
-                            percent_encoding::percent_decode_str(f)
-                                .decode_utf8_lossy()
-                                .into_owned()
-                        })
+                        .map(decode)
                 });
             let Some(filename) = filename else { continue };
             let score = crate::pypi::score_wheel(&filename, target);
