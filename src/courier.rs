@@ -3445,14 +3445,17 @@ mod tests {
         let mut wheel = make_emit_wheel("demo", "1.0.0", &[], None, None);
         wheel.wheel_filename = "demo-1.0.0-cp311-cp311-manylinux_2_35_x86_64.whl".into();
         let err = validate_emit_wheels(&[wheel], &target).unwrap_err();
-        assert!(err.to_string().contains("incompatible"));
+        // Inspect the whole chain: filename failures now carry the wheel's
+        // provenance as outer context, so the reason is no longer the
+        // outermost message.
+        assert!(format!("{err:#}").contains("incompatible"));
 
         let mut mismatch = make_emit_wheel("demo", "1.0.0", &[], None, None);
         mismatch.wheel_filename = "demo-1.0.0-cp311-cp311-manylinux_2_35_aarch64.whl".into();
         mismatch.local_path =
             Some("/unused/other-1.0.0-cp311-cp311-manylinux_2_35_aarch64.whl".into());
         let err = validate_emit_wheels(&[mismatch], &target).unwrap_err();
-        assert!(err.to_string().contains("records distribution"));
+        assert!(format!("{err:#}").contains("records distribution"));
     }
 
     #[test]
