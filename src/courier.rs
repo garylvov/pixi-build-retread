@@ -1328,6 +1328,54 @@ fn validate_wheel_filename(
     Ok(standard_wheel_filename(filename))
 }
 
+/// `wheel_filename` is contractually a literal PEP 427 basename, but a producer
+/// that derives it from a URL path segment leaves it percent-encoded: a PEP 440
+/// local version then arrives as `torch-2.5.1%2Bcu124-...whl`. `%2B` is not a
+/// valid PEP 427 version character, so the encoded name survives resolution,
+/// download and staging and only fails at the very end of a long build:
+///
+/// ```text
+/// courier recorded wheel filename has an invalid PEP 427 version field:
+/// `2.5.1%2Bcu124`
+/// ```
+///
+/// Observed on wheels whose `upstream_url` is a CDN redirect target
+/// (`download-r2.pytorch.org`), where the filename is taken from the
+/// post-redirect path instead of via [`crate::wheel::wheel_filename_from_url`],
+/// which decodes.
+///
+/// This is a boundary guard, not the cure: it warns with the offending wheel's
+/// identity so the producer can be repaired at the source. Decoding is a no-op
+/// for names that are already literal.
+fn normalize_recorded_wheel_filenames(emit_wheels: &[EmitWheel]) -> Vec<EmitWheel> {
+    emit_wheels
+        .iter()
+        .map(|wheel| {
+            if !wheel.wheel_filename.contains('%') {
+                return wheel.clone();
+            }
+            let decoded = percent_encoding::percent_decode_str(&wheel.wheel_filename)
+                .decode_utf8_lossy()
+                .into_owned();
+            if decoded == wheel.wheel_filename {
+                return wheel.clone();
+            }
+            tracing::warn!(
+                pypi_name = %wheel.pypi_name,
+                version = %wheel.version,
+                recorded = %wheel.wheel_filename,
+                normalized = %decoded,
+                upstream_url = ?wheel.upstream_url,
+                "courier: recorded wheel filename was percent-encoded; normalizing \
+                 (its producer should record a literal basename)",
+            );
+            let mut fixed = wheel.clone();
+            fixed.wheel_filename = decoded;
+            fixed
+        })
+        .collect()
+}
+
 /// Validate every cold/replay provenance before staging mutates files or
 /// caches. All representations must both score for the exact target and name
 /// the same wheel after removing only transformations owned by retread.
@@ -1691,39 +1739,7 @@ pub(crate) async fn stage_for_target_with_store_root_and_relaxations(
     let python = crate::lock::normalized_target_python(target.python_version())
         .context("courier: malformed resolution target")?;
     validate_native_stage_target(target, Platform::current())?;
-    // `wheel_filename` is contractually a literal PEP 427 basename, but a
-    // producer that derives it from a URL path segment leaves it
-    // percent-encoded: a PEP 440 local version then arrives as
-    // `torch-2.5.1%2Bcu124-...whl` and fails validation at the very end of a
-    // long build. Seen on wheels whose upstream_url is a redirect target
-    // (download-r2.pytorch.org). Normalize before the guards run, and name the
-    // offending wheel so its producer can be repaired at the source.
-    let normalized_wheels: Vec<EmitWheel> = emit_wheels
-        .iter()
-        .map(|wheel| {
-            if !wheel.wheel_filename.contains('%') {
-                return wheel.clone();
-            }
-            let decoded = percent_encoding::percent_decode_str(&wheel.wheel_filename)
-                .decode_utf8_lossy()
-                .into_owned();
-            if decoded == wheel.wheel_filename {
-                return wheel.clone();
-            }
-            tracing::warn!(
-                pypi_name = %wheel.pypi_name,
-                version = %wheel.version,
-                recorded = %wheel.wheel_filename,
-                normalized = %decoded,
-                upstream_url = ?wheel.upstream_url,
-                "courier: recorded wheel filename was percent-encoded; normalizing \
-                 (its producer should record a literal basename)",
-            );
-            let mut fixed = wheel.clone();
-            fixed.wheel_filename = decoded;
-            fixed
-        })
-        .collect();
+    let normalized_wheels = normalize_recorded_wheel_filenames(emit_wheels);
     let emit_wheels: &[EmitWheel] = &normalized_wheels;
     validate_reserved_meta_wheel_collisions(emit_wheels, bundle_name, version)?;
     validate_emit_wheels(emit_wheels, target.wheel_target())?;
@@ -2752,6 +2768,56 @@ mod tests {
         let err = validate_emit_wheels(&[poisoned], &target.wheel_target())
             .expect_err("a stray sdist upstream URL without provenance must fail");
         assert!(format!("{err:#}").contains("upstream URL"));
+    }
+
+    /// A PEP 440 local version percent-encoded by a producer that read it off a
+    /// URL must be normalized before validation, not rejected after a full
+    /// build. Regression: `torch-2.5.1%2Bcu124-...whl` reached courier staging
+    /// from a `download-r2.pytorch.org` redirect and failed PEP 427 parsing
+    /// ~700s into a sage-isaac-pack build.
+    #[test]
+    fn percent_encoded_recorded_wheel_filename_is_normalized_before_validation() {
+        let mut encoded = make_emit_wheel("torch", "2.5.1+cu124", &[], None, None);
+        encoded.wheel_filename = "torch-2.5.1%2Bcu124-cp310-cp310-linux_x86_64.whl".to_string();
+        encoded.upstream_url = Some(
+            "https://download-r2.pytorch.org/whl/cu124/\
+             torch-2.5.1%2Bcu124-cp310-cp310-linux_x86_64.whl"
+                .parse()
+                .unwrap(),
+        );
+
+        let normalized = normalize_recorded_wheel_filenames(&[encoded]);
+        assert_eq!(
+            normalized[0].wheel_filename,
+            "torch-2.5.1+cu124-cp310-cp310-linux_x86_64.whl",
+            "the recorded basename must be decoded to a literal PEP 427 name"
+        );
+        assert!(
+            normalized[0]
+                .upstream_url
+                .as_ref()
+                .is_some_and(|url| url.as_str().contains("%2B")),
+            "the URL keeps its encoding: that is what gets fetched"
+        );
+    }
+
+    /// Literal names must pass through byte-for-byte, including the `+` that a
+    /// correctly-recorded local version already carries.
+    #[test]
+    fn literal_wheel_filenames_are_untouched_by_normalization() {
+        let plain = make_emit_wheel("demo", "1.0.0", &[], None, None);
+        let plain_name = plain.wheel_filename.clone();
+
+        let mut local_version = make_emit_wheel("torch", "2.5.1+cu124", &[], None, None);
+        local_version.wheel_filename =
+            "torch-2.5.1+cu124-cp310-cp310-linux_x86_64.whl".to_string();
+
+        let normalized = normalize_recorded_wheel_filenames(&[plain, local_version]);
+        assert_eq!(normalized[0].wheel_filename, plain_name);
+        assert_eq!(
+            normalized[1].wheel_filename,
+            "torch-2.5.1+cu124-cp310-cp310-linux_x86_64.whl"
+        );
     }
 
     #[tokio::test]
