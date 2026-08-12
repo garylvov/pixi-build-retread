@@ -518,11 +518,29 @@ pub(crate) fn resolve_workspace_declared_glibc_for_target(
     None
 }
 
+/// Collect manifest candidates from `start` upwards, stopping at the workspace
+/// that owns `start`.
+///
+/// The walk used to continue to the filesystem root. Because the caller skips
+/// manifests that declare no glibc and keeps climbing, a project whose own
+/// manifest is silent on glibc would silently adopt the declaration of ANY
+/// ancestor directory -- including an unrelated workspace that merely happens
+/// to sit above it on disk. A nested checkout under a parent workspace (a
+/// scratch/work directory with its own pixi.toml, say) would build against the
+/// parent's libc floor with nothing in the logs to say so.
+///
+/// A workspace is a boundary: stop after the first directory that owns one, so
+/// resolution can reach the project's own root and no further. `pixi.lock` is
+/// the marker -- it exists exactly at a workspace root, whereas `pixi.toml`
+/// alone also appears in nested packages.
 fn append_manifest_walk(out: &mut Vec<PathBuf>, start: &Path) {
     let mut cur = Some(start);
     while let Some(dir) = cur {
         out.push(dir.join("pixi.toml"));
         out.push(dir.join("pyproject.toml"));
+        if dir.join("pixi.lock").is_file() {
+            return;
+        }
         cur = dir.parent();
     }
 }
@@ -1788,6 +1806,51 @@ mod tests {
     }
 
     #[test]
+    /// A project must not inherit a glibc floor from an unrelated workspace
+    /// that merely sits above it on disk. The candidate walk skips manifests
+    /// that declare nothing and keeps climbing, so without a boundary a nested
+    /// checkout silently builds against a parent's libc.
+    #[test]
+    fn manifest_walk_stops_at_the_owning_workspace() {
+        let root = tempdir("walk-boundary");
+        let parent = root.join("outer");
+        let child = parent.join("inner");
+        std::fs::create_dir_all(&child).unwrap();
+
+        // An unrelated ancestor workspace with a libc floor.
+        std::fs::write(
+            parent.join("pixi.toml"),
+            "[workspace]\nplatforms = [{ platform = \"linux-64\", glibc = \"2.35\" }]\n",
+        )
+        .unwrap();
+        std::fs::write(parent.join("pixi.lock"), "version: 6\n").unwrap();
+
+        // The nested project: its own workspace, silent on glibc.
+        std::fs::write(child.join("pixi.toml"), "[workspace]\nplatforms = [\"linux-64\"]\n").unwrap();
+        std::fs::write(child.join("pixi.lock"), "version: 6\n").unwrap();
+
+        let mut candidates = Vec::new();
+        append_manifest_walk(&mut candidates, &child);
+        assert!(
+            candidates.contains(&child.join("pixi.toml")),
+            "the project's own manifest must be considered"
+        );
+        assert!(
+            !candidates.contains(&parent.join("pixi.toml")),
+            "the walk must stop at the owning workspace, not reach an unrelated ancestor"
+        );
+
+        // Without a lock marking the boundary the walk still climbs, so a
+        // plain nested directory keeps the previous behaviour.
+        let loose = parent.join("loose");
+        std::fs::create_dir_all(&loose).unwrap();
+        let mut from_loose = Vec::new();
+        append_manifest_walk(&mut from_loose, &loose);
+        assert!(from_loose.contains(&parent.join("pixi.toml")));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     fn declared_glibc_precedence_env_manifest_lock() {
         let root = tempdir("declared-precedence");
         let manifest = root.join("pixi.toml");
