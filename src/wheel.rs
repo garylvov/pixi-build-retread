@@ -1070,6 +1070,30 @@ pub(crate) async fn store_wheel_in_cache(src: &Path, store_root: &Path) -> Resul
 
     let store_dir = store_root.join(&sha256);
     let store_final = store_dir.join(&filename);
+
+    // Serialize the inspect/evict/publish sequence on this store entry.
+    //
+    // `atomic_owned_copy` makes the publish itself safe, but eviction is
+    // destructive and was unsynchronized: a second writer that observed a
+    // half-written entry classified it Corrupt and DELETED it, while a reader
+    // was resolving that exact path. With pixi's `solves = 1` there is no
+    // concurrency and it never fires; at `--concurrent-solves 8` a full
+    // imprint lock died with
+    //   canonicalizing built-wheel source `pyperclip` at
+    //   .../wheels/<sha>/pyperclip-1.8.0-py3-none-any.whl:
+    //   No such file or directory (os error 2)
+    // The lock is keyed on the sha directory, so entries for different wheels
+    // still stage concurrently.
+    let _entry_lock = crate::source_build::acquire_artifact_cache_lock(&store_dir)
+        .await
+        .with_context(|| {
+            format!(
+                "wheel store: locking entry {} for {}",
+                store_dir.display(),
+                filename
+            )
+        })?;
+
     match inspect_store_entry(&store_final, &sha256).await? {
         StoreEntryState::Valid(_) => {
             tracing::debug!(
