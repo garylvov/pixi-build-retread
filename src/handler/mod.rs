@@ -6474,6 +6474,28 @@ async fn solve_workspace_conda_facts(
     )
 }
 
+/// Seed the sdist-heal route ledger from the persisted heal-facts file.
+///
+/// Filtering (a route whose PyPI name the current run is force-keeping on the
+/// wheel side is dropped) is unchanged pre-existing behavior. The origin stamp
+/// is DIAGNOSTICS ONLY: nothing downstream reads it to decide anything, but a
+/// route seeded here was NOT derived by this resolution -- it was replayed off
+/// disk -- and that is the single fact the run-dependency-mismatch failures
+/// have never been able to state about the extra packages they report.
+fn seed_persisted_routes(
+    persisted: Vec<crate::uv_closure::AutoRoutedPackage>,
+    keep_pypi_names: &BTreeSet<String>,
+) -> Vec<crate::uv_closure::AutoRoutedPackage> {
+    persisted
+        .into_iter()
+        .filter(|route| !keep_pypi_names.contains(&canonical_conda_name(&route.pypi_name)))
+        .map(|route| crate::uv_closure::AutoRoutedPackage {
+            origin: crate::uv_closure::RouteOrigin::PersistedFacts,
+            ..route
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn uv_group_closure(
     group_name: &str,
@@ -7254,11 +7276,7 @@ async fn uv_group_closure(
         );
     }
     let workspace_overrides = Arc::new(std::sync::Mutex::new(persisted_facts.workspace_overrides));
-    let persisted_routes = persisted_facts
-        .routed
-        .into_iter()
-        .filter(|route| !uv_retry_keep_names.contains(&canonical_conda_name(&route.pypi_name)))
-        .collect();
+    let persisted_routes = seed_persisted_routes(persisted_facts.routed, &uv_retry_keep_names);
     let sdist_routed = Arc::new(std::sync::Mutex::new(persisted_routes));
     let sdist_built = Arc::new(std::sync::Mutex::new(persisted_facts.built));
     // Transitive-prerelease repairs surface naturally in the closure's
@@ -13361,6 +13379,56 @@ fn output_run_dependencies_match(
 /// sdist auto-builds. Either the bundle carries different wheels at build
 /// time than at metadata time, or a build-isolation package is reaching the
 /// run closure. This says which, without another round of guessing.
+/// Attribute one run dependency that NO bundle wheel declares in its
+/// `Requires-Dist`, to the non-wheel producer that put it in the emitted set.
+///
+/// Two producers exist, and neither is visible to `Requires-Dist` scanning:
+///
+///   * `bundle.auto_routed` -- the uv auto-route set. A routed package is by
+///     construction absent from the wheel closure, so scanning wheels for it
+///     can never succeed. The reported tag carries the route's
+///     [`crate::uv_closure::RouteOrigin`], which distinguishes a route this
+///     resolution actually derived (`Fixpoint`/`SdistHeal`) from one spliced
+///     in off the persisted heal-facts ledger (`PersistedFacts`) -- the
+///     difference between "the world moved" and "we replayed stale state",
+///     which is precisely what the run-dependency-mismatch failures have been
+///     unable to tell apart.
+///   * a wheel's `Retread-Conda-Run-Dependency` metadata -- a conda-only
+///     dependency the wheel names directly, which is not a `Requires-Dist`
+///     line and so is invisible to the wheel scan too.
+///
+/// Pure and infallible: diagnostics must never fail the way the thing they
+/// describe failed. Returns `None` when nothing in the bundle explains the
+/// name; the caller then reports `UNATTRIBUTED`, which after this function
+/// exists is a real finding rather than a default.
+fn unadvertised_non_wheel_source(name: &str, bundle: &Bundle) -> Option<String> {
+    for route in &bundle.auto_routed {
+        let matches = canonical_conda_name(&route.route.conda_name) == name
+            || canonical_conda_name(&route.route.pypi_name) == name
+            || route.workspace_provider.as_ref().is_some_and(|provider| {
+                canonical_conda_name(provider.conda_name.as_spec()) == name
+            });
+        if matches {
+            return Some(format!("auto-routed({})", route.route.origin));
+        }
+    }
+    for wheel in std::iter::once(&bundle.primary).chain(bundle.extras.iter()) {
+        let declares = wheel
+            .metadata
+            .retread_conda_run_dependencies
+            .iter()
+            .any(|raw| {
+                raw.split([' ', '=', '<', '>', '!', '~'])
+                    .next()
+                    .is_some_and(|dep| canonical_conda_name(dep) == name)
+            });
+        if declares {
+            return Some(format!("native-conda-dep({})", wheel.pypi_name));
+        }
+    }
+    None
+}
+
 fn describe_unadvertised_sources(
     output: &CondaOutput,
     advertised: Option<&[String]>,
@@ -13400,9 +13468,18 @@ fn describe_unadvertised_sources(
             }
         }
         if owners.is_empty() {
-            // Declared by nothing in the bundle: it entered the run closure
-            // from outside the package's own requirements.
-            notes.push(format!("{name}<-UNATTRIBUTED"));
+            // Declared by no wheel's `Requires-Dist`. That does NOT mean the
+            // source is unknown: the two other producers of run dependencies
+            // are the uv auto-route set (`bundle.auto_routed`, which never
+            // appears in any wheel's requirements by construction -- the
+            // package was MOVED off the wheel side) and a wheel's own
+            // `Retread-Conda-Run-Dependency` metadata. Both are checked here
+            // so `UNATTRIBUTED` is reserved for a genuinely unexplained name
+            // -- which is then itself a finding, not a shrug.
+            notes.push(match unadvertised_non_wheel_source(&name, bundle) {
+                Some(source) => format!("{name}<-{source}"),
+                None => format!("{name}<-UNATTRIBUTED"),
+            });
         } else {
             notes.push(format!("{name}<-{}", owners.join("+")));
         }

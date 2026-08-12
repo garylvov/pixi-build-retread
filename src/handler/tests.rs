@@ -224,6 +224,7 @@ fn bundle_auto_route(name: &str, version: &str, provenance: Provenance) -> Bundl
             conda_version: version.to_string(),
             channel: "https://conda.example.invalid/linux-64".to_string(),
             input_requirements: Vec::new(),
+            origin: crate::uv_closure::RouteOrigin::Fixpoint,
         },
         provenance,
         workspace_provider: None,
@@ -1616,6 +1617,7 @@ fn workspace_fact_ownership_respects_pypi_intent_and_mapping_direction() {
             conda_version: "2.7.0".to_string(),
             channel: "https://conda.example.invalid/linux-64".to_string(),
             input_requirements: Vec::new(),
+            origin: crate::uv_closure::RouteOrigin::Fixpoint,
         },
         provenance: Provenance::PriorSelection,
         workspace_provider: None,
@@ -2818,6 +2820,7 @@ fn auto_routed_underscored_conda_name_emits_raw() {
             conda_version: "12.9.1".to_string(),
             channel: "https://conda.example.invalid/linux-64".to_string(),
             input_requirements: Vec::new(),
+            origin: crate::uv_closure::RouteOrigin::Fixpoint,
         },
         provenance: Provenance::PriorSelection,
         workspace_provider: None,
@@ -2848,6 +2851,207 @@ fn auto_routed_underscored_conda_name_emits_raw() {
     assert_eq!(
         route.match_spec().as_str(),
         "cuda-nvcc_linux-64 >=12.9,<12.10"
+    );
+}
+
+// -----------------------------------------------------------------
+// Auto-route origin attribution (RETREAD_NONDETERMINISM_AUDIT.md).
+//
+// The "identity matches, run dependencies differ" failure reports every
+// unadvertised name it can attribute to a bundle wheel's Requires-Dist and
+// gives up on the rest. An auto-routed package can NEVER be attributed that
+// way -- routing MOVES it off the wheel side -- so the exact packages the
+// failure is about (zipp, virtualenv) printed as UNATTRIBUTED, and four
+// rounds of diagnosis had to guess at the vector. These tests pin the
+// attribution AND the origin tag that says whether the route came from this
+// resolution or was replayed off the persisted heal-facts ledger.
+// -----------------------------------------------------------------
+
+fn origin_route(
+    pypi: &str,
+    conda: &str,
+    origin: crate::uv_closure::RouteOrigin,
+) -> BundleAutoRoute {
+    BundleAutoRoute {
+        route: crate::uv_closure::AutoRoutedPackage {
+            pypi_name: pypi.to_string(),
+            conda_name: conda.to_string(),
+            pypi_version: "3.19.2".to_string(),
+            conda_version: "3.19.2".to_string(),
+            channel: "https://conda.example.invalid/linux-64".to_string(),
+            input_requirements: Vec::new(),
+            origin,
+        },
+        provenance: Provenance::PriorSelection,
+        workspace_provider: None,
+    }
+}
+
+/// The advertised list every test below compares against: the pack's own
+/// baseline run deps, with the auto-routed name deliberately absent. This is
+/// the observed robogen-pack shape (rebuilt set = advertised set + a routed
+/// package the advertisement never carried).
+fn advertised_without(output: &CondaOutput, missing: &str) -> Vec<String> {
+    output
+        .run_dependencies
+        .depends
+        .iter()
+        .filter(|dependency| canonical_conda_name(&dependency.name) != missing)
+        .map(|dependency| dependency.name.as_str().to_string())
+        .collect()
+}
+
+#[test]
+fn unadvertised_delta_names_persisted_facts_route_origin() {
+    let mut bundle = solo_bundle("origin-pack", vec![]);
+    bundle.auto_routed.push(origin_route(
+        "zipp",
+        "zipp",
+        crate::uv_closure::RouteOrigin::PersistedFacts,
+    ));
+    let output =
+        produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
+    let advertised = advertised_without(&output, "zipp");
+    assert!(
+        !advertised.iter().any(|dep| dep.starts_with("zipp")),
+        "fixture must advertise everything EXCEPT the routed package: {advertised:?}"
+    );
+
+    let described = describe_unadvertised_sources(&output, Some(&advertised), &bundle);
+    assert!(
+        described.contains("zipp<-auto-routed(PersistedFacts)"),
+        "a route replayed from the heal-facts ledger must name the ledger as \
+         its vector, not print UNATTRIBUTED: {described}"
+    );
+    assert!(
+        !described.contains("UNATTRIBUTED"),
+        "the routed name is fully explained; nothing may remain unattributed: {described}"
+    );
+}
+
+#[test]
+fn unadvertised_delta_distinguishes_live_route_origins() {
+    for (origin, tag) in [
+        (crate::uv_closure::RouteOrigin::Fixpoint, "Fixpoint"),
+        (crate::uv_closure::RouteOrigin::SdistHeal, "SdistHeal"),
+        (crate::uv_closure::RouteOrigin::Unknown, "Unknown"),
+    ] {
+        let mut bundle = solo_bundle("origin-pack", vec![]);
+        bundle
+            .auto_routed
+            .push(origin_route("virtualenv", "virtualenv", origin));
+        let output =
+            produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
+        let advertised = advertised_without(&output, "virtualenv");
+        let described = describe_unadvertised_sources(&output, Some(&advertised), &bundle);
+        assert!(
+            described.contains(&format!("virtualenv<-auto-routed({tag})")),
+            "origin {origin:?} must be distinguishable in the failure text: {described}"
+        );
+    }
+}
+
+#[test]
+fn unadvertised_delta_matches_route_by_conda_name_not_only_pypi_name() {
+    // Routes are emitted under their CONDA name; the emitted dependency the
+    // attribution walks is therefore never the PyPI name for a name-mapped
+    // route. Matching only on `pypi_name` would silently re-UNATTRIBUTE every
+    // mapped route (torch->pytorch is the common shape).
+    let mut bundle = solo_bundle("origin-pack", vec![]);
+    bundle.auto_routed.push(origin_route(
+        "torch",
+        "pytorch",
+        crate::uv_closure::RouteOrigin::Fixpoint,
+    ));
+    let output =
+        produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
+    let advertised = advertised_without(&output, "pytorch");
+    let described = describe_unadvertised_sources(&output, Some(&advertised), &bundle);
+    assert!(
+        described.contains("pytorch<-auto-routed(Fixpoint)"),
+        "a name-mapped route must attribute under its emitted conda name: {described}"
+    );
+}
+
+#[test]
+fn unadvertised_delta_keeps_wheel_attribution_and_real_unattributed() {
+    // Guards the two behaviors the origin tags must NOT disturb: a name a
+    // bundle wheel declares still attributes to that wheel, and a name no
+    // producer in the bundle explains still reports UNATTRIBUTED (which is
+    // now a genuine finding rather than the default answer).
+    let bundle = solo_bundle("origin-pack", vec!["requests==2.31.0"]);
+    let mut output =
+        produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
+    output
+        .run_dependencies
+        .depends
+        .push(spec_from_str("mystery-dep 1.0").unwrap());
+    let advertised: Vec<String> = vec!["python 3.11.*".to_string()];
+
+    let described = describe_unadvertised_sources(&output, Some(&advertised), &bundle);
+    assert!(
+        described.contains("requests<-origin-pack"),
+        "wheel attribution must be unchanged: {described}"
+    );
+    assert!(
+        described.contains("mystery-dep<-UNATTRIBUTED"),
+        "a name no wheel and no route explains must still be reported as \
+         unattributed: {described}"
+    );
+}
+
+#[test]
+fn seed_persisted_routes_stamps_persisted_facts_origin() {
+    let ledger = vec![
+        crate::uv_closure::AutoRoutedPackage {
+            pypi_name: "zipp".to_string(),
+            conda_name: "zipp".to_string(),
+            pypi_version: "3.19.2".to_string(),
+            conda_version: "3.19.2".to_string(),
+            channel: "https://conda.example.invalid/linux-64".to_string(),
+            input_requirements: Vec::new(),
+            // A v3-era ledger record (no origin recorded) and a record whose
+            // stored origin says where it was FIRST discovered must both come
+            // back as PersistedFacts: what matters to the diagnosis is that
+            // this resolution did not derive them, it replayed them.
+            origin: crate::uv_closure::RouteOrigin::Unknown,
+        },
+        crate::uv_closure::AutoRoutedPackage {
+            pypi_name: "virtualenv".to_string(),
+            conda_name: "virtualenv".to_string(),
+            pypi_version: "20.26.3".to_string(),
+            conda_version: "20.26.3".to_string(),
+            channel: "https://conda.example.invalid/linux-64".to_string(),
+            input_requirements: Vec::new(),
+            origin: crate::uv_closure::RouteOrigin::Fixpoint,
+        },
+        crate::uv_closure::AutoRoutedPackage {
+            pypi_name: "kept-on-pypi".to_string(),
+            conda_name: "kept-on-pypi".to_string(),
+            pypi_version: "1.0".to_string(),
+            conda_version: "1.0".to_string(),
+            channel: "https://conda.example.invalid/linux-64".to_string(),
+            input_requirements: Vec::new(),
+            origin: crate::uv_closure::RouteOrigin::Fixpoint,
+        },
+    ];
+    let keep: BTreeSet<String> = ["kept-on-pypi".to_string()].into_iter().collect();
+
+    let seeded = seed_persisted_routes(ledger, &keep);
+
+    assert_eq!(
+        seeded
+            .iter()
+            .map(|route| route.pypi_name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["zipp", "virtualenv"],
+        "the keep-pypi filter must keep behaving exactly as before"
+    );
+    assert!(
+        seeded
+            .iter()
+            .all(|route| route.origin == crate::uv_closure::RouteOrigin::PersistedFacts),
+        "every route seeded from the ledger is a replayed route: {seeded:?}"
     );
 }
 
