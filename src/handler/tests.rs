@@ -7171,6 +7171,12 @@ fn advertised_and_drifted_bundles() -> (Bundle, Bundle) {
             conda_version: "3.19.2".to_string(),
             channel: "https://conda.example.invalid/noarch".to_string(),
             input_requirements: Vec::new(),
+            // PersistedFacts models the suspected real mechanism: a route
+            // replayed from the heal-facts ledger rather than re-derived by
+            // this resolution. That is the leading (still UNVERIFIED)
+            // explanation for `zipp` appearing in the rebuilt run set while
+            // no bundle wheel declares it.
+            origin: crate::uv_closure::RouteOrigin::PersistedFacts,
         },
         provenance: Provenance::PriorSelection,
         workspace_provider: None,
