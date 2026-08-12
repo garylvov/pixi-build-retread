@@ -394,7 +394,19 @@ fn workspace_manifest_mtime(
 /// the symlink stays unchanged, and only its missing target directory is
 /// created.
 fn ensure_pixi_bld_symlink_target(workspace_dir: Option<&std::path::Path>) -> Result<(), RpcError> {
-    if crate::fasttmp::in_slurm_job() {
+    ensure_pixi_bld_symlink_target_inner(workspace_dir, crate::fasttmp::in_slurm_job())
+}
+
+/// The Slurm check is a parameter so the repair logic can be tested for what
+/// it does, not for what the ambient environment happens to be. Reading
+/// `SLURM_JOB_ID` directly made the test pass in CI and fail inside any Slurm
+/// allocation, where the guard short-circuits before doing the work the test
+/// asserts on.
+fn ensure_pixi_bld_symlink_target_inner(
+    workspace_dir: Option<&std::path::Path>,
+    in_slurm_job: bool,
+) -> Result<(), RpcError> {
+    if in_slurm_job {
         tracing::info!(
             "retread fast-tmp: SLURM job context; not repairing shared workspace .pixi/bld symlink"
         );
@@ -4070,9 +4082,23 @@ impl Handler {
                     candidate.metadata.build,
                     candidate.metadata.subdir,
                     if identity_matches {
+                        // Name the wheel that contributed each unadvertised
+                        // dependency. The delta alone says a name appeared but
+                        // not where from, and the set has been observed to
+                        // VARY between runs of the same bundle
+                        // (aiohappyeyeballs+virtualenv one run, virtualenv+zipp
+                        // the next), which points at the bundle's composition
+                        // differing between the metadata and build phases
+                        // rather than at a stale record. Attribution turns that
+                        // guess into a fact on the next failure.
                         format!(
-                            "identity matches, run dependencies differ — {}",
-                            run_dependency_delta(&candidate, run_override.as_deref())
+                            "identity matches, run dependencies differ — {} [{}]",
+                            run_dependency_delta(&candidate, run_override.as_deref()),
+                            describe_unadvertised_sources(
+                                &candidate,
+                                run_override.as_deref(),
+                                &bundle
+                            )
                         )
                     } else {
                         "identity differs".to_string()
@@ -13327,6 +13353,70 @@ fn output_run_dependencies_match(
 /// Describe *which* run dependencies differ, for the "0 exact matches" error.
 /// Knowing only that they differ is not actionable: the record can be stale in
 /// one spec out of two hundred, and the operator has no way to see which.
+/// Attribute each unadvertised run dependency to the bundle wheel that
+/// declares it, and flag wheels that were built from an sdist.
+///
+/// The unadvertised set varies run to run for the same bundle, and the
+/// failure only reproduces from a cold cache -- the one run that performs
+/// sdist auto-builds. Either the bundle carries different wheels at build
+/// time than at metadata time, or a build-isolation package is reaching the
+/// run closure. This says which, without another round of guessing.
+fn describe_unadvertised_sources(
+    output: &CondaOutput,
+    advertised: Option<&[String]>,
+    bundle: &Bundle,
+) -> String {
+    let Some(advertised) = advertised else {
+        return "no advertised list to attribute against".to_string();
+    };
+    let advertised_names: BTreeSet<String> = advertised
+        .iter()
+        .filter_map(|raw| {
+            rattler_conda_types::MatchSpec::from_str(
+                raw,
+                rattler_conda_types::ParseStrictness::Lenient,
+            )
+            .ok()
+            .and_then(|spec| spec.name.as_ref().map(|name| name.to_string()))
+        })
+        .collect();
+
+    let mut notes = Vec::new();
+    for dependency in &output.run_dependencies.depends {
+        let name = canonical_conda_name(&dependency.name).to_string();
+        if advertised_names.contains(&name) {
+            continue;
+        }
+        let mut owners: Vec<String> = Vec::new();
+        for wheel in std::iter::once(&bundle.primary).chain(bundle.extras.iter()) {
+            let declares = wheel
+                .metadata
+                .requires_dist
+                .iter()
+                .any(|raw| raw.split([';', ' ', '=', '<', '>', '!', '~', '[']).next()
+                    .is_some_and(|dep| canonical_conda_name(dep) == name));
+            if declares {
+                owners.push(wheel.pypi_name.clone());
+            }
+        }
+        if owners.is_empty() {
+            // Declared by nothing in the bundle: it entered the run closure
+            // from outside the package's own requirements.
+            notes.push(format!("{name}<-UNATTRIBUTED"));
+        } else {
+            notes.push(format!("{name}<-{}", owners.join("+")));
+        }
+    }
+    if notes.is_empty() {
+        return "no unadvertised dependencies to attribute".to_string();
+    }
+    format!(
+        "attribution: {} (bundle wheels: {})",
+        notes.join(", "),
+        bundle.extras.len() + 1
+    )
+}
+
 fn run_dependency_delta(output: &CondaOutput, advertised: Option<&[String]>) -> String {
     let Some(advertised) = advertised else {
         return "no advertised run dependencies to compare".to_string();

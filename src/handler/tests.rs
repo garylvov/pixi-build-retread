@@ -166,7 +166,10 @@ fn initialize_preflight_repairs_dangling_pixi_bld_symlink_target() {
         !target.exists(),
         "test setup must start with a dangling symlink"
     );
-    ensure_pixi_bld_symlink_target(Some(&workspace)).unwrap();
+    // Pass in_slurm_job=false explicitly: this test is about the repair
+    // logic, and reading the ambient SLURM_JOB_ID made it fail for everyone
+    // running inside an allocation.
+    ensure_pixi_bld_symlink_target_inner(Some(&workspace), false).unwrap();
 
     assert!(
         target.is_dir(),
