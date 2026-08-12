@@ -7048,3 +7048,581 @@ fn is_fresh_accepts_valid_cached_wheel() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ── Option D: cold-path lock-parity recovery ─────────────────────────────────
+//
+// docs/RETREAD_DETERMINISM_FIX_DESIGN.md. `conda/outputs` advertises a
+// run-dependency set computed at lock time; `conda_build_v1`'s cold path
+// re-derives it from live repodata plus a read-modify-write heal-facts ledger
+// and can get a DIFFERENT set, which the gate then refuses. The drift is
+// nondeterministic, so these tests CONSTRUCT the failing state (a bundle with
+// one injected extra auto-route) instead of racing for it.
+
+/// Render an emitted output's run deps back into the `"<name> <spec>"` strings
+/// pixi records in pixi.lock and forwards as `params.run_dependencies`.
+fn advertised_run_dependency_strings(output: &CondaOutput) -> Vec<String> {
+    output
+        .run_dependencies
+        .depends
+        .iter()
+        .map(|dependency| {
+            let spec = format_packagespec(&dependency.spec);
+            if spec.is_empty() {
+                dependency.name.clone()
+            } else {
+                format!("{} {}", dependency.name, spec)
+            }
+        })
+        .collect()
+}
+
+fn recovery_target() -> crate::pypi::ResolutionTarget {
+    crate::pypi::ResolutionTarget::from_wheel_target(
+        crate::pypi::WheelTarget {
+            python_version: "3.11".into(),
+            conda_subdir: "linux-64".into(),
+            max_glibc: None,
+        },
+        None,
+    )
+}
+
+/// A committed pack lock whose `conda_run_deps` are exactly `run_deps`, split
+/// the way `courier::parse_conda_deps` splits forwarded run-dep strings.
+fn recovery_lock(
+    bundle: &str,
+    version: &str,
+    inputs_hash: &str,
+    run_deps: &[String],
+) -> crate::lock::RetreadLock {
+    let filename = format!(
+        "{}-{version}-cp311-cp311-manylinux_2_17_x86_64.whl",
+        bundle.replace('-', "_"),
+    );
+    let sha256 = "11".repeat(32);
+    crate::lock::RetreadLock {
+        schema: crate::lock::SCHEMA,
+        retread_version: "0.0.1".into(),
+        bundle: bundle.into(),
+        version: version.into(),
+        python: "3.11".into(),
+        target_subdir: "linux-64".into(),
+        target_contract: None,
+        target_identity: None,
+        target_scope: None,
+        exact_workspace_envelope: false,
+        resolution_glibc: None,
+        inputs_hash: inputs_hash.into(),
+        root_requirements: Vec::new(),
+        wheels: vec![crate::lock::LockWheel {
+            name: bundle.into(),
+            version: version.into(),
+            origin: crate::lock::Origin::Index,
+            filename: filename.clone(),
+            url: Some(format!("https://example.com/{filename}")),
+            sha256: Some(sha256.clone()),
+            requires_dist: vec![],
+            must_ship: false,
+            upstream_url: None,
+            git_source: None,
+            sdist_source: None,
+        }],
+        conda_run_deps: run_deps
+            .iter()
+            .map(|raw| {
+                let mut parts = raw.splitn(2, ' ');
+                crate::lock::CondaDep {
+                    name: parts.next().unwrap_or_default().to_string(),
+                    spec: parts.next().unwrap_or_default().to_string(),
+                }
+            })
+            .collect(),
+        index_urls: vec!["https://pypi.org/simple/".into()],
+        prerelease: BTreeMap::new(),
+        shadow_libs: BTreeMap::new(),
+        declared_glibc: None,
+        conda_capable: vec![],
+        entry_specs: vec![],
+        wheel_store: None,
+        abi_context: Some(crate::lock::LockAbiContext {
+            wheels: vec![crate::lock::LockWheelAbiMetadata {
+                name: bundle.into(),
+                sha256,
+                requires_dist: vec![],
+            }],
+        }),
+        relaxations: vec![],
+    }
+}
+
+/// The advertised (lock-time) bundle and the drifted (cold re-derivation)
+/// bundle: identical except for ONE extra auto-routed conda dep, which is the
+/// exact shape the observed failures take ("present in the rebuilt output but
+/// not advertised: virtualenv, zipp"). Deterministic — no timing, no network,
+/// no cache state.
+fn advertised_and_drifted_bundles() -> (Bundle, Bundle) {
+    let advertised = solo_bundle("robogen-pack", vec!["packaging>=23", "certifi"]);
+    let mut drifted = advertised.clone();
+    drifted.auto_routed.push(BundleAutoRoute {
+        route: crate::uv_closure::AutoRoutedPackage {
+            pypi_name: "zipp".to_string(),
+            conda_name: "zipp".to_string(),
+            pypi_version: "3.19.2".to_string(),
+            conda_version: "3.19.2".to_string(),
+            channel: "https://conda.example.invalid/noarch".to_string(),
+            input_requirements: Vec::new(),
+        },
+        provenance: Provenance::PriorSelection,
+        workspace_provider: None,
+    });
+    (advertised, drifted)
+}
+
+fn emit_for_recovery(bundle: &Bundle) -> CondaOutput {
+    produce_output(bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None)
+        .expect("emission must succeed")
+}
+
+fn courier_cfg() -> RetreadConfig {
+    RetreadConfig {
+        courier: true,
+        ..cfg()
+    }
+}
+
+/// The cold-path candidate the failure arm retains: identity matched, run
+/// dependencies drifted.
+fn recovery_candidate(bundle: &Bundle, inputs_hash: Option<&str>) -> ColdMismatchedCandidate {
+    ColdMismatchedCandidate {
+        bundle: bundle.clone(),
+        effective: courier_cfg(),
+        courier_hash: inputs_hash.map(ToString::to_string),
+    }
+}
+
+/// Write a committed pack lock where `plan_cold_mismatch_recovery` looks for
+/// it, and return its directory.
+fn commit_recovery_lock(
+    label: &str,
+    version: &str,
+    inputs_hash: &str,
+    run_deps: &[String],
+) -> std::path::PathBuf {
+    let dir = unique_test_dir(label);
+    std::fs::create_dir_all(&dir).unwrap();
+    let lock = recovery_lock("robogen-pack", version, inputs_hash, run_deps);
+    let path = dir.join(crate::lock::RetreadLock::file_name_for_target(
+        "robogen-pack",
+        &recovery_target(),
+    ));
+    std::fs::write(&path, lock.to_pretty_json().unwrap()).unwrap();
+    dir
+}
+
+/// T1 (fails before / passes after): the constructed drift state is exactly
+/// the one the gate refuses today, and the committed lock — which still
+/// reproduces the advertisement — recovers it.
+#[test]
+fn cold_mismatch_recovery_replays_when_lock_matches_advertised() {
+    let _env_guard = super::TEST_ENV_MUTEX.lock().unwrap();
+    let (advertised_bundle, drifted_bundle) = advertised_and_drifted_bundles();
+    let advertised = advertised_run_dependency_strings(&emit_for_recovery(&advertised_bundle));
+
+    // Sanity: the advertised strings faithfully round-trip, so a failure below
+    // is real drift and not a rendering artefact of the test.
+    assert!(
+        run_dependencies_match(
+            &emit_for_recovery(&advertised_bundle)
+                .run_dependencies
+                .depends,
+            Some(&advertised),
+        )
+        .unwrap(),
+        "the advertised rendering must match the emission it came from",
+    );
+
+    // The failing state the gate produces today.
+    let candidate = emit_for_recovery(&drifted_bundle);
+    assert!(
+        !output_run_dependencies_match(&candidate, Some(&advertised)).unwrap(),
+        "the injected auto-route must make the gate reject this candidate",
+    );
+    let delta = run_dependency_delta(&candidate, Some(&advertised));
+    assert!(
+        delta.contains("present in the rebuilt output but not advertised: zipp"),
+        "gate delta must name the drifted dep, got: {delta}",
+    );
+
+    // The committed lock still reproduces the advertisement. Drive the whole
+    // failure-arm decision (candidate retention → ABI context → lock location →
+    // lock load → parity), not just its innermost comparison; everything after
+    // this point is the shared `materialize_from_lock_for_target` replay the
+    // top replay gate already uses.
+    let dir = commit_recovery_lock("cold-recovery-match", "1.0.0", "inputs-hash-a", &advertised);
+    let target = recovery_target();
+    match plan_cold_mismatch_recovery(
+        Some(recovery_candidate(&drifted_bundle, Some("inputs-hash-a"))),
+        false,
+        &courier_cfg(),
+        &target,
+        &dir,
+        Some(&advertised),
+        Some("1.0.0"),
+    ) {
+        ColdRecoveryPlan::Replay { bundle_name, lock } => {
+            assert_eq!(bundle_name, "robogen-pack");
+            let replayed: Vec<String> = lock
+                .conda_run_deps
+                .iter()
+                .map(lock_run_dep_string)
+                .collect();
+            assert_eq!(
+                replayed, advertised,
+                "the replayed build must carry the advertised run deps exactly",
+            );
+        }
+        ColdRecoveryPlan::Refuse { reason } => panic!(
+            "a committed lock that reproduces the advertisement must recover the build, \
+             got refusal: {reason}",
+        ),
+        ColdRecoveryPlan::NotAttempted => {
+            panic!("recovery must be attempted for a courier pack with a drifted candidate")
+        }
+    }
+
+    // RETREAD_NO_REPLAY=1 must disable this recovery too, not only the other
+    // replay paths.
+    // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
+    unsafe {
+        std::env::set_var("RETREAD_NO_REPLAY", "1");
+    }
+    let outcome = plan_cold_mismatch_recovery(
+        Some(recovery_candidate(&drifted_bundle, Some("inputs-hash-a"))),
+        false,
+        &courier_cfg(),
+        &target,
+        &dir,
+        Some(&advertised),
+        Some("1.0.0"),
+    );
+    // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
+    unsafe {
+        std::env::remove_var("RETREAD_NO_REPLAY");
+    }
+    match outcome {
+        ColdRecoveryPlan::Refuse { reason } => assert!(
+            reason.contains("RETREAD_NO_REPLAY"),
+            "the escape hatch must be named in the refusal, got: {reason}",
+        ),
+        other => panic!(
+            "RETREAD_NO_REPLAY=1 must disable lock-parity recovery, got {}",
+            recovery_plan_label(&other),
+        ),
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn recovery_plan_label(plan: &ColdRecoveryPlan) -> &'static str {
+    match plan {
+        ColdRecoveryPlan::NotAttempted => "NotAttempted",
+        ColdRecoveryPlan::Replay { .. } => "Replay",
+        ColdRecoveryPlan::Refuse { .. } => "Refuse",
+    }
+}
+
+/// T2: a lock that disagrees with the advertisement must never build. This is
+/// the hand-re-locked-pack state; the refusal has to name which record
+/// disagrees, because "0 exact matches" alone is undiagnosable.
+#[test]
+fn cold_mismatch_recovery_refuses_when_lock_also_differs() {
+    let _env_guard = super::TEST_ENV_MUTEX.lock().unwrap();
+    let (advertised_bundle, drifted_bundle) = advertised_and_drifted_bundles();
+    let advertised = advertised_run_dependency_strings(&emit_for_recovery(&advertised_bundle));
+    // The lock records its own third set: it dropped `certifi` and gained
+    // `virtualenv`.
+    let mut lock_deps: Vec<String> = advertised
+        .iter()
+        .filter(|dep| !dep.starts_with("certifi"))
+        .cloned()
+        .collect();
+    lock_deps.push("virtualenv >=20".to_string());
+
+    let dir = commit_recovery_lock(
+        "cold-recovery-lock-differs",
+        "1.0.0",
+        "inputs-hash-a",
+        &lock_deps,
+    );
+    match plan_cold_mismatch_recovery(
+        Some(recovery_candidate(&drifted_bundle, Some("inputs-hash-a"))),
+        false,
+        &courier_cfg(),
+        &recovery_target(),
+        &dir,
+        Some(&advertised),
+        Some("1.0.0"),
+    ) {
+        ColdRecoveryPlan::Refuse { reason } => {
+            assert!(
+                reason.contains("committed lock also differs"),
+                "refusal must say the LOCK is the disagreeing record, got: {reason}",
+            );
+            assert!(
+                reason.contains("present in the committed lock but not advertised: virtualenv"),
+                "refusal must name what the lock has and the advertisement does not, \
+                 got: {reason}",
+            );
+            assert!(
+                reason.contains("advertised but absent from the committed lock: certifi"),
+                "refusal must name what the advertisement has and the lock does not, \
+                 got: {reason}",
+            );
+        }
+        other => panic!(
+            "a lock that does not vouch for the advertisement must never be replayed, got {}",
+            recovery_plan_label(&other),
+        ),
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// T3: no lock, an unusable lock, and a version-drifted lock all fail closed,
+/// with distinguishable reasons.
+#[test]
+fn cold_mismatch_recovery_refuses_without_lock_or_on_hash_mismatch() {
+    let advertised = vec!["python 3.11.*".to_string(), "certifi".to_string()];
+
+    match recover_cold_mismatch_from_lock(Ok(None), Some(&advertised), Some("1.0.0")) {
+        ColdMismatchRecovery::Refuse { reason } => assert!(
+            reason.contains("no committed lock vouches"),
+            "missing/hash-mismatched lock must say so, got: {reason}",
+        ),
+        ColdMismatchRecovery::ReplayFromLock(_) => panic!("no lock must never recover"),
+    }
+
+    let broken = recover_cold_mismatch_from_lock(
+        Err(anyhow!("courier replay rejected by ABI invariant: numpy")),
+        Some(&advertised),
+        Some("1.0.0"),
+    );
+    match broken {
+        ColdMismatchRecovery::Refuse { reason } => {
+            assert!(
+                reason.contains("committed lock unusable"),
+                "an unusable lock must be reported as such, got: {reason}",
+            );
+            assert!(
+                reason.contains("ABI invariant"),
+                "the loader's own diagnosis must survive into the refusal, got: {reason}",
+            );
+        }
+        ColdMismatchRecovery::ReplayFromLock(_) => panic!("an unusable lock must never recover"),
+    }
+
+    // Identity matched on version, so a lock recording a different version is
+    // a different package: refuse rather than build it.
+    let lock = recovery_lock("robogen-pack", "2.0.0", "inputs-hash-a", &advertised);
+    match recover_cold_mismatch_from_lock(Ok(Some(lock)), Some(&advertised), Some("1.0.0")) {
+        ColdMismatchRecovery::Refuse { reason } => assert!(
+            reason.contains("records version `2.0.0`")
+                && reason.contains("advertised version `1.0.0`"),
+            "a version-drifted lock must name both versions, got: {reason}",
+        ),
+        ColdMismatchRecovery::ReplayFromLock(_) => {
+            panic!("a lock for another version must never recover")
+        }
+    }
+
+    // A missing lock file on disk reaches the same refusal through the wiring.
+    let dir = unique_test_dir("cold-recovery-no-lock");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (_, drifted_bundle) = advertised_and_drifted_bundles();
+    match plan_cold_mismatch_recovery(
+        Some(recovery_candidate(&drifted_bundle, Some("inputs-hash-a"))),
+        false,
+        &courier_cfg(),
+        &recovery_target(),
+        &dir,
+        Some(&advertised),
+        Some("1.0.0"),
+    ) {
+        ColdRecoveryPlan::Refuse { reason } => assert!(
+            reason.contains("no committed lock vouches"),
+            "an absent lock file must refuse, got: {reason}",
+        ),
+        other => panic!(
+            "an absent lock file must refuse, got {}",
+            recovery_plan_label(&other),
+        ),
+    }
+
+    // Non-courier packs have no lock at all: the existing error must stand
+    // completely unchanged (no appended reason).
+    assert!(
+        matches!(
+            plan_cold_mismatch_recovery(
+                Some(recovery_candidate(&drifted_bundle, None)),
+                false,
+                &cfg(),
+                &recovery_target(),
+                &dir,
+                Some(&advertised),
+                Some("1.0.0"),
+            ),
+            ColdRecoveryPlan::NotAttempted,
+        ),
+        "non-courier packs must not grow a lock-parity note on their error",
+    );
+
+    // Identity never matched (e.g. a rebuilt version): nothing to recover.
+    assert!(
+        matches!(
+            plan_cold_mismatch_recovery(
+                None,
+                false,
+                &courier_cfg(),
+                &recovery_target(),
+                &dir,
+                Some(&advertised),
+                Some("1.0.0"),
+            ),
+            ColdRecoveryPlan::NotAttempted,
+        ),
+        "no identity-matched candidate means no recovery attempt",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// T4: the parity check is the SAME matcher the gate uses, so pixi's
+/// post-`conda/outputs` `python_abi` run-export is tolerated identically on
+/// both comparisons. A second, subtly different comparison would fail here.
+#[test]
+fn cold_mismatch_recovery_applies_python_abi_allowance_symmetrically() {
+    let lock_deps = vec![
+        "python 3.11.*".to_string(),
+        "certifi".to_string(),
+        "packaging >=23".to_string(),
+    ];
+    let mut advertised = lock_deps.clone();
+    advertised.push("python_abi 3.11.* *_cp311".to_string());
+
+    let lock = recovery_lock("robogen-pack", "1.0.0", "inputs-hash-a", &lock_deps);
+    assert!(
+        matches!(
+            recover_cold_mismatch_from_lock(Ok(Some(lock)), Some(&advertised), Some("1.0.0")),
+            ColdMismatchRecovery::ReplayFromLock(_),
+        ),
+        "pixi's injected python_abi must not defeat lock parity",
+    );
+
+    // The allowance is one-directional by design: a lock carrying a dep the
+    // advertisement never mentioned is still a real disagreement.
+    let mut extra = lock_deps.clone();
+    extra.push("zipp ==3.19.2".to_string());
+    let lock = recovery_lock("robogen-pack", "1.0.0", "inputs-hash-a", &extra);
+    assert!(
+        matches!(
+            recover_cold_mismatch_from_lock(Ok(Some(lock)), Some(&lock_deps), Some("1.0.0")),
+            ColdMismatchRecovery::Refuse { .. },
+        ),
+        "a lock with an unadvertised dep must not pass parity",
+    );
+}
+
+/// T5 (the "don't break the 13 working environments" guard): when the gate
+/// passes, none of the recovery code may run — no lock load, no extra I/O.
+///
+/// Two halves. The behavioural half proves an undrifted candidate passes the
+/// gate, so the failure arm (the only place recovery lives) is never entered.
+/// The structural half pins the recovery INSIDE that arm: it fails if anyone
+/// hoists the lock load above the gate, or drops the wiring altogether.
+#[test]
+fn cold_mismatch_recovery_never_consulted_when_candidate_matches() {
+    let (advertised_bundle, _) = advertised_and_drifted_bundles();
+    let advertised = advertised_run_dependency_strings(&emit_for_recovery(&advertised_bundle));
+    assert!(
+        output_run_dependencies_match(&emit_for_recovery(&advertised_bundle), Some(&advertised))
+            .unwrap(),
+        "an undrifted candidate must pass the gate, which is what keeps the \
+         recovery branch unreachable for the environments that build today",
+    );
+
+    let src = include_str!("mod.rs");
+    let loop_start = src
+        .find("let mut matching_bundles = Vec::new();")
+        .expect("cold-path candidate loop must be findable");
+    let gate = src
+        .find("] = matching_bundles.as_slice()")
+        .expect("cold-path gate must be findable");
+    assert!(loop_start < gate, "the loop precedes the gate");
+    let before_gate = &src[loop_start..gate];
+    for forbidden in [
+        "load_replayable_lock",
+        "materialize_from_lock_for_target",
+        "plan_cold_mismatch_recovery",
+        "recover_cold_mismatch_from_lock",
+        "replay_abi_context_for_bundle",
+    ] {
+        assert!(
+            !before_gate.contains(forbidden),
+            "`{forbidden}` must not run before the cold-path gate decides: every \
+             environment that builds today passes the gate and must pay no extra I/O",
+        );
+    }
+    let failure_arm = &src[gate..];
+    assert!(
+        failure_arm.contains("plan_cold_mismatch_recovery("),
+        "lock-parity recovery must be wired into the cold-path failure arm",
+    );
+
+    // `plan_cold_mismatch_recovery` performs the only cold-path lock read, so
+    // one call site is the whole story: the gate-passing path cannot reach it.
+    assert_eq!(
+        src.matches("plan_cold_mismatch_recovery(").count(),
+        2,
+        "exactly one definition and one call site; a second caller would need \
+         its own proof that the gate-passing path cannot reach it",
+    );
+}
+
+/// T6: two identity-matching mismatched candidates cannot happen today
+/// (identity includes the package name), but if they ever do, no lock may be
+/// attributed to either — the existing ambiguity error must stand.
+#[test]
+fn cold_mismatch_recovery_disabled_for_ambiguous_identity() {
+    let _env_guard = super::TEST_ENV_MUTEX.lock().unwrap();
+    let (advertised_bundle, drifted_bundle) = advertised_and_drifted_bundles();
+    let advertised = advertised_run_dependency_strings(&emit_for_recovery(&advertised_bundle));
+    // A lock that WOULD have vouched for the advertisement, so the refusal can
+    // only come from the ambiguity guard.
+    let dir = commit_recovery_lock(
+        "cold-recovery-ambiguous",
+        "1.0.0",
+        "inputs-hash-a",
+        &advertised,
+    );
+
+    match plan_cold_mismatch_recovery(
+        Some(recovery_candidate(&drifted_bundle, Some("inputs-hash-a"))),
+        true,
+        &courier_cfg(),
+        &recovery_target(),
+        &dir,
+        Some(&advertised),
+        Some("1.0.0"),
+    ) {
+        ColdRecoveryPlan::Refuse { reason } => assert!(
+            reason.contains("refusing lock-parity recovery") && reason.contains("unambiguously"),
+            "the ambiguity refusal must say why, got: {reason}",
+        ),
+        other => panic!(
+            "an ambiguous identity match must never pick a lock, got {}",
+            recovery_plan_label(&other),
+        ),
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

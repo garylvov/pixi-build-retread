@@ -4022,6 +4022,15 @@ impl Handler {
             .unwrap_or_default();
         let mut matching_bundles = Vec::new();
         let mut rejected_candidates: Vec<String> = Vec::new();
+        // Option D lock-parity recovery (docs/RETREAD_DETERMINISM_FIX_DESIGN.md):
+        // retain the identity-matched-but-deps-drifted candidate so the failure
+        // arm below can ask the committed lock whether it vouches for the
+        // advertisement. Populated ONLY when a candidate fails the gate, and
+        // every state that populates it reaches the failure arm (identity
+        // includes the package name, so at most one candidate can match and it
+        // is by construction absent from `matching_bundles`).
+        let mut identity_mismatch: Option<ColdMismatchedCandidate> = None;
+        let mut identity_mismatch_ambiguous = false;
         for (bundle_index, base_bundle) in materialized.iter().enumerate() {
             let (bundle, effective) = apply_emission(base_bundle, &base_config, picked_emission);
             let courier_hash = config.courier.then(|| {
@@ -4104,6 +4113,19 @@ impl Handler {
                         "identity differs".to_string()
                     },
                 ));
+                if identity_matches {
+                    if identity_mismatch.is_some() {
+                        // Cannot happen today (identity includes the package
+                        // name), but ambiguity must never pick a lock.
+                        identity_mismatch_ambiguous = true;
+                    } else {
+                        identity_mismatch = Some(ColdMismatchedCandidate {
+                            bundle,
+                            effective,
+                            courier_hash,
+                        });
+                    }
+                }
             }
         }
         let [(bundle_index, bundle, effective, emission_relaxations)] = matching_bundles.as_slice()
@@ -4125,10 +4147,122 @@ impl Handler {
                     .unwrap_or_default(),
                 params.output.subdir,
             );
+            // ── Option D: lock-parity recovery ───────────────────────────────
+            // docs/RETREAD_DETERMINISM_FIX_DESIGN.md. The cold re-derivation is
+            // a fresh sample of a resolution function whose inputs move under
+            // it (repodata TTL, probe outages, the read-modify-write heal-facts
+            // ledger, live uv re-locks). When the identity still matches and
+            // ONLY the run dependencies drifted, ask the committed pack lock —
+            // the recorded resolution that the advertisement's inputs hash pins
+            // — whether it reproduces what pixi advertised. If it does, replay
+            // it; the produced package then agrees with the advertisement by
+            // construction. If it does not, the error below stands and now says
+            // WHICH record disagrees and how.
+            //
+            // This is the only lock read on the cold path and it is
+            // unreachable whenever the gate passes: `identity_mismatch` is
+            // populated only by a candidate that failed the gate, and this arm
+            // runs only when `matching_bundles` is not exactly one. Guarded by
+            // `cold_mismatch_recovery_never_consulted_when_candidate_matches`.
+            let mut recovery_refusal: Option<String> = None;
+            match plan_cold_mismatch_recovery(
+                identity_mismatch,
+                identity_mismatch_ambiguous,
+                &config,
+                &target,
+                &source_dir,
+                run_override.as_deref(),
+                advertised_output_version.as_deref(),
+            ) {
+                ColdRecoveryPlan::NotAttempted => {}
+                ColdRecoveryPlan::Refuse { reason } => recovery_refusal = Some(reason),
+                ColdRecoveryPlan::Replay { bundle_name, lock } => {
+                    // Same convention as the top replay path:
+                    // lock.conda_run_deps is authoritative, and it has just
+                    // been proven equivalent to what pixi advertised.
+                    let run_deps: Vec<String> = lock
+                        .conda_run_deps
+                        .iter()
+                        .map(lock_run_dep_string)
+                        .collect();
+                    let workspace_fp = cold_workspace_manifest
+                        .as_ref()
+                        .map(|manifest| {
+                            workspace_solve_fingerprint(
+                                manifest,
+                                workspace_dir.as_deref().unwrap_or(source_dir.as_path()),
+                                &source_dir,
+                                &target,
+                            )
+                        })
+                        .unwrap_or_default();
+                    let config_fp = crate::courier::config_fingerprint(
+                        &config,
+                        &courier_channels,
+                        &workspace_fp,
+                    );
+                    // Always warn: a recovered build must stay distinguishable
+                    // from one whose fresh derivation actually reproduced the
+                    // advertisement.
+                    tracing::warn!(
+                        bundle = %bundle_name,
+                        "cold re-derivation drifted from the advertised run dependencies; \
+                         recovered by replaying the committed lock, which matches the \
+                         advertisement. This build did NOT reproduce from a fresh \
+                         resolution. See docs/RETREAD_NONDETERMINISM_AUDIT.md.",
+                    );
+                    crate::status::tty(&format!(
+                        "building '{bundle_name}': cold re-derivation drifted from the \
+                         advertised run dependencies -- recovered by replaying the \
+                         committed lock (not a fresh reproduction).",
+                    ));
+                    match materialize_from_lock_for_target(
+                        *lock,
+                        &bundle_name,
+                        &config,
+                        &params.work_directory,
+                        &build_output_dir,
+                        &target,
+                        &source_dir,
+                        &cache_dir,
+                        params.output.build.as_deref(),
+                        run_deps,
+                        &config_fp,
+                    )
+                    .await
+                    {
+                        Ok(Some(result)) => {
+                            let result = finalize_fasttmp_build_output(
+                                result,
+                                stage_output_dir.as_deref(),
+                                &output_dir,
+                            )
+                            .await?;
+                            return Ok(result);
+                        }
+                        Ok(None) => {
+                            // Provenance gap: same convention as the top replay
+                            // gate, except there is nothing left to fall through
+                            // to, so the error below stands.
+                            recovery_refusal = Some(
+                                "committed lock matches the advertised run dependencies \
+                                 but its wheel provenance is incomplete, so it cannot be \
+                                 replayed"
+                                    .to_string(),
+                            );
+                        }
+                        Err(error) => {
+                            return Err(RpcError::internal(format!(
+                                "cold-path lock-parity recovery for {bundle_name}: {error:#}",
+                            )));
+                        }
+                    }
+                }
+            }
             return Err(RpcError::invalid_params(format!(
                 "the current source plan has {} exact matches for advertised output \
                  `{}`; refusing to build with a stale or ambiguous relaxation record. \
-                 Requested: {requested}. Candidates considered: {}",
+                 Requested: {requested}. Candidates considered: {}{}",
                 matching_bundles.len(),
                 params.output.name.as_normalized(),
                 if rejected_candidates.is_empty() {
@@ -4136,6 +4270,9 @@ impl Handler {
                 } else {
                     rejected_candidates.join("; ")
                 },
+                recovery_refusal
+                    .map(|reason| format!(". Lock-parity recovery declined: {reason}"))
+                    .unwrap_or_default(),
             )));
         };
         let base_bundle = &materialized[*bundle_index];
@@ -13495,15 +13632,28 @@ fn describe_unadvertised_sources(
 }
 
 fn run_dependency_delta(output: &CondaOutput, advertised: Option<&[String]>) -> String {
+    named_spec_run_dependency_delta(
+        &output.run_dependencies.depends,
+        advertised,
+        "the rebuilt output",
+    )
+}
+
+/// Shared delta rendering for "which run dependencies differ".
+///
+/// Extracted from [`run_dependency_delta`] so the cold-path gate error and the
+/// lock-parity refusal (see [`recover_cold_mismatch_from_lock`]) describe their
+/// disagreement in exactly the same terms. `actual_label` names the left-hand
+/// record ("the rebuilt output" / "the committed lock"); passing
+/// `"the rebuilt output"` reproduces the historical wording byte-for-byte.
+fn named_spec_run_dependency_delta(
+    actual: &[NamedSpec<PackageSpec>],
+    advertised: Option<&[String]>,
+    actual_label: &str,
+) -> String {
     let Some(advertised) = advertised else {
         return "no advertised run dependencies to compare".to_string();
     };
-    let actual: BTreeSet<String> = output
-        .run_dependencies
-        .depends
-        .iter()
-        .map(|dependency| format!("{dependency:?}"))
-        .collect();
     let advertised_names: BTreeSet<String> = advertised
         .iter()
         .filter_map(|raw| {
@@ -13515,9 +13665,7 @@ fn run_dependency_delta(output: &CondaOutput, advertised: Option<&[String]>) -> 
             .and_then(|spec| spec.name.as_ref().map(|name| name.to_string()))
         })
         .collect();
-    let actual_names: BTreeSet<String> = output
-        .run_dependencies
-        .depends
+    let actual_names: BTreeSet<String> = actual
         .iter()
         .map(|dependency| canonical_conda_name(&dependency.name).to_string())
         .collect();
@@ -13528,7 +13676,7 @@ fn run_dependency_delta(output: &CondaOutput, advertised: Option<&[String]>) -> 
     let mut parts = Vec::new();
     if !only_built.is_empty() {
         parts.push(format!(
-            "present in the rebuilt output but not advertised: {}",
+            "present in {actual_label} but not advertised: {}",
             only_built
                 .iter()
                 .map(|name| name.as_str())
@@ -13538,7 +13686,7 @@ fn run_dependency_delta(output: &CondaOutput, advertised: Option<&[String]>) -> 
     }
     if !only_advertised.is_empty() {
         parts.push(format!(
-            "advertised but absent from the rebuilt output: {}",
+            "advertised but absent from {actual_label}: {}",
             only_advertised
                 .iter()
                 .map(|name| name.as_str())
@@ -13552,7 +13700,6 @@ fn run_dependency_delta(output: &CondaOutput, advertised: Option<&[String]>) -> 
              constraints were relaxed or tightened",
             actual_names.len()
         ));
-        let _ = &actual;
     }
     parts.join("; ")
 }
@@ -13604,6 +13751,206 @@ fn run_dependencies_match(
             !actual_names.contains(&canonical_conda_name(&dependency.name))
                 || actual.contains(dependency)
         }))
+}
+
+/// Render one committed-lock run dependency back to the `"<name> <spec>"` form
+/// pixi forwarded when the lock was written.
+///
+/// `courier::parse_conda_deps` produced `CondaDep` by splitting the forwarded
+/// string at the first space, so this is its exact inverse.
+fn lock_run_dep_string(dep: &crate::lock::CondaDep) -> String {
+    if dep.spec.is_empty() {
+        dep.name.clone()
+    } else {
+        format!("{} {}", dep.name, dep.spec)
+    }
+}
+
+/// Outcome of attempting to recover a cold-path advertised/rebuilt
+/// run-dependency mismatch from the committed pack lock.
+///
+/// See `docs/RETREAD_DETERMINISM_FIX_DESIGN.md` (Option D). The cold path
+/// re-executes `resolve_all`, which is a *fresh sample* of a resolution
+/// function whose inputs (repodata TTL, probe outages, the heal-facts ledger,
+/// live uv re-locks) move between the advertise-time evaluation and the build.
+/// When the identity still matches and only the run dependencies drifted, the
+/// committed pack lock is the recorded resolution that the advertisement's
+/// inputs hash pins; if it agrees with what pixi advertised, replaying it is
+/// strictly more faithful than either building the drifted set or refusing.
+#[derive(Debug)]
+enum ColdMismatchRecovery {
+    /// The committed lock reproduces the advertised run deps; replay it.
+    ReplayFromLock(Box<crate::lock::RetreadLock>),
+    /// No committed lock can vouch for the advertisement; fail closed with
+    /// `reason` appended to the existing "0 exact matches" error.
+    Refuse { reason: String },
+}
+
+/// Decide recovery for ONE identity-matched, deps-mismatched candidate.
+///
+/// Pure with respect to handler state: the caller performs the lock load (so
+/// that this decision is trivially testable, and so the load itself stays
+/// inside the branch that would otherwise error) and passes its result in.
+///
+/// Fail-closed by construction: every path that cannot *prove* the committed
+/// lock vouches for the advertisement returns [`ColdMismatchRecovery::Refuse`]
+/// with a reason naming which record disagrees and how.
+fn recover_cold_mismatch_from_lock(
+    lock: anyhow::Result<Option<crate::lock::RetreadLock>>,
+    run_override: Option<&[String]>,
+    advertised_version: Option<&str>,
+) -> ColdMismatchRecovery {
+    let refuse = |reason: String| ColdMismatchRecovery::Refuse { reason };
+    let lock = match lock {
+        Err(error) => {
+            return refuse(format!("committed lock unusable: {error:#}"));
+        }
+        Ok(None) => {
+            return refuse(
+                "no committed lock vouches for this advertisement (missing lock file, \
+                 different schema, different resolution target, inputs-hash mismatch, \
+                 or RETREAD_NO_REPLAY=1)"
+                    .to_string(),
+            );
+        }
+        Ok(Some(lock)) => lock,
+    };
+    // Identity already matched, so the advertised version is authoritative; a
+    // lock recording a different version would silently build the wrong
+    // package. The top replay gate applies the same check.
+    if !advertised_version_matches(advertised_version, &lock.version) {
+        return refuse(format!(
+            "committed lock records version `{}` but pixi advertised version `{}`",
+            lock.version,
+            advertised_version.unwrap_or("<unset>"),
+        ));
+    }
+    // `run_override` (pixi's echo of the advertised metadata) is compared with
+    // THE SAME matcher the gate used on the rebuilt candidate, so the
+    // python_abi host/build run-export allowance applies identically to both
+    // comparisons. A second, subtly different comparison here would be able to
+    // accept a lock the gate would have rejected.
+    let lock_deps = match lock
+        .conda_run_deps
+        .iter()
+        .map(|dep| spec_from_str(&lock_run_dep_string(dep)))
+        .collect::<Result<Vec<_>>>()
+    {
+        Ok(deps) => deps,
+        Err(error) => {
+            return refuse(format!(
+                "committed lock records an unparseable run dependency: {error:#}"
+            ));
+        }
+    };
+    match run_dependencies_match(&lock_deps, run_override) {
+        Ok(true) => ColdMismatchRecovery::ReplayFromLock(Box::new(lock)),
+        Ok(false) => refuse(format!(
+            "committed lock also differs from the advertised run dependencies: {}",
+            named_spec_run_dependency_delta(&lock_deps, run_override, "the committed lock"),
+        )),
+        // Unreachable in practice: the gate already parsed the same advertised
+        // strings. Refusing (rather than propagating) keeps the failure mode
+        // fail-closed and diagnosable.
+        Err(error) => refuse(format!(
+            "comparing the committed lock against the advertised run dependencies: {error:#}"
+        )),
+    }
+}
+
+/// The one cold-path candidate whose identity matched the advertisement but
+/// whose freshly re-derived run dependencies did not.
+///
+/// Retained only on the branch that today ends in `RpcError::invalid_params`;
+/// nothing here is constructed when the gate passes.
+struct ColdMismatchedCandidate {
+    bundle: Bundle,
+    effective: RetreadConfig,
+    courier_hash: Option<String>,
+}
+
+/// What the cold-path failure arm should do, decided before any build work.
+enum ColdRecoveryPlan {
+    /// Recovery does not apply (non-courier pack, or no candidate matched the
+    /// advertised identity). The existing error stands byte-unchanged.
+    NotAttempted,
+    /// The committed lock vouches for the advertisement: replay it.
+    Replay {
+        bundle_name: String,
+        lock: Box<crate::lock::RetreadLock>,
+    },
+    /// Fail closed; `reason` is appended to the existing error.
+    Refuse { reason: String },
+}
+
+/// Everything the cold-path failure arm decides before it materializes
+/// anything: candidate eligibility, ABI context, lock location, lock load, and
+/// the parity decision.
+///
+/// Split out from `conda_build_v1` so the whole recovery decision — not just
+/// its innermost comparison — is exercisable without running a real build.
+/// The caller does nothing but act on the returned plan.
+///
+/// PERFORMANCE / BLAST-RADIUS CONTRACT: this performs the only lock read on
+/// the cold path, and it is called from exactly one place — inside the arm
+/// that today terminates in `RpcError::invalid_params`. It must never be
+/// hoisted above the gate; `cold_mismatch_recovery_never_consulted_when_candidate_matches`
+/// fails if it is.
+fn plan_cold_mismatch_recovery(
+    candidate: Option<ColdMismatchedCandidate>,
+    ambiguous: bool,
+    config: &RetreadConfig,
+    target: &ResolutionTarget,
+    source_dir: &Path,
+    run_override: Option<&[String]>,
+    advertised_version: Option<&str>,
+) -> ColdRecoveryPlan {
+    if !config.courier {
+        // Non-courier packs commit no lock; today's error stands.
+        return ColdRecoveryPlan::NotAttempted;
+    }
+    if ambiguous {
+        return ColdRecoveryPlan::Refuse {
+            reason: "two candidates matched the advertised identity, so no committed lock \
+                     can be attributed unambiguously; refusing lock-parity recovery"
+                .to_string(),
+        };
+    }
+    let Some(candidate) = candidate else {
+        return ColdRecoveryPlan::NotAttempted;
+    };
+    // ABI context comes from the FRESH bundle: producer-time lock facts cannot
+    // stand in for the versions the current request solved (same rule the top
+    // replay gate documents).
+    let abi_context = replay_abi_context_for_bundle(
+        &candidate.bundle,
+        &candidate.effective,
+        target.python_version(),
+    );
+    let lock_path = lock_path_for_target(source_dir, &candidate.bundle.conda_name, target);
+    let relax_is_default = config.relax == crate::config::RelaxPolicy::default();
+    // `load_replayable_lock_for_target` re-uses every existing gate: schema,
+    // resolution target, bundle name, full replay provenance, inputs hash,
+    // relax poisoning, ABI invariants — and honors RETREAD_NO_REPLAY=1, which
+    // therefore disables this recovery along with every other replay.
+    let loaded = match candidate.courier_hash.as_deref() {
+        Some(current_hash) => load_replayable_lock_for_target(
+            &lock_path,
+            current_hash,
+            relax_is_default,
+            target,
+            &candidate.bundle.conda_name,
+            &abi_context,
+        ),
+        None => Ok(None),
+    };
+    match recover_cold_mismatch_from_lock(loaded, run_override, advertised_version) {
+        ColdMismatchRecovery::ReplayFromLock(lock) => ColdRecoveryPlan::Replay {
+            bundle_name: candidate.bundle.conda_name,
+            lock,
+        },
+        ColdMismatchRecovery::Refuse { reason } => ColdRecoveryPlan::Refuse { reason },
+    }
 }
 
 #[cfg(test)]
