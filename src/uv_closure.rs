@@ -324,6 +324,52 @@ impl AutoRouteInputRequirement {
     }
 }
 
+/// Which mechanism emitted an auto-route. DIAGNOSTICS ONLY: nothing in the
+/// resolution path may read this field to decide anything. It exists because
+/// a run dependency that entered the emitted set through `bundle.auto_routed`
+/// is structurally invisible to wheel-`Requires-Dist` attribution, so an
+/// advertised-vs-rebuilt run-dependency mismatch could only ever report the
+/// offending name as `UNATTRIBUTED` -- which is exactly the state that forced
+/// four rounds of guessing about `zipp`/`virtualenv` (see
+/// `RETREAD_NONDETERMINISM_AUDIT.md`). Tagging every route at its single
+/// construction site makes the NEXT occurrence name its own vector.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RouteOrigin {
+    /// Origin not recorded: a route deserialized from a heal-facts ledger
+    /// written before this field existed. Never produced by live code.
+    #[default]
+    Unknown,
+    /// Discovered by the normal auto-route fixpoint sweep
+    /// ([`plan_auto_route_round`]).
+    Fixpoint,
+    /// Discovered by the sdist-only self-heal's rung-1 conda probe
+    /// ([`with_sdist_heal`]).
+    SdistHeal,
+    /// Replayed from the persisted heal-facts ledger, i.e. this route was NOT
+    /// re-derived by the current resolution -- it was spliced in from disk.
+    PersistedFacts,
+}
+
+impl RouteOrigin {
+    /// Stable short label for error text and logs. Matches the Rust variant
+    /// name so a tag seen in a build failure greps straight to its source.
+    pub fn label(self) -> &'static str {
+        match self {
+            RouteOrigin::Unknown => "Unknown",
+            RouteOrigin::Fixpoint => "Fixpoint",
+            RouteOrigin::SdistHeal => "SdistHeal",
+            RouteOrigin::PersistedFacts => "PersistedFacts",
+        }
+    }
+}
+
+impl std::fmt::Display for RouteOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AutoRoutedPackage {
     /// PEP 503-canonical PyPI name (closure-side identity).
@@ -341,6 +387,11 @@ pub struct AutoRoutedPackage {
     /// only solver output and may be used as a soft restoration preference.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub input_requirements: Vec<AutoRouteInputRequirement>,
+    /// Which mechanism emitted this route. Diagnostics only -- see
+    /// [`RouteOrigin`]. Serde-defaulted so heal-facts ledgers written before
+    /// the field existed still deserialize (as [`RouteOrigin::Unknown`]).
+    #[serde(default)]
+    pub origin: RouteOrigin,
 }
 
 /// Configuration for the auto-route loop.
@@ -758,6 +809,7 @@ pub fn plan_auto_route_round(
                 conda_version: hit.conda_version.clone(),
                 channel: hit.channel.clone(),
                 input_requirements: effective_inputs.get(name).cloned().unwrap_or_default(),
+                origin: RouteOrigin::Fixpoint,
             });
         }
     }
@@ -2302,6 +2354,7 @@ where
                                         conda_version: hit.conda_version.clone(),
                                         channel: hit.channel.clone(),
                                         input_requirements: Vec::new(),
+                                        origin: RouteOrigin::SdistHeal,
                                     });
                                 }
                                 // Rung 2: build from the sdist at the exact
@@ -9972,6 +10025,12 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
         assert_eq!(closure.auto_routed[0].pypi_name, "pyperclip");
         assert_eq!(closure.auto_routed[0].pypi_version, "1.8.2");
         assert_eq!(closure.auto_routed[0].conda_version, "1.8.3");
+        assert_eq!(
+            closure.auto_routed[0].origin,
+            RouteOrigin::SdistHeal,
+            "rung 1 of the sdist self-heal is a distinct route vector from the \
+             fixpoint sweep and must say so in the record"
+        );
         let built = closure
             .wheels
             .iter()
@@ -10732,6 +10791,7 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
                     provenance: Provenance::UvConstraint,
                     role: AutoRouteInputRole::Constraint,
                 }],
+                origin: RouteOrigin::PersistedFacts,
             }],
             built: vec![
                 BuiltSdistWheel {
@@ -10785,6 +10845,114 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
         assert!(!facts_file.exists());
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The origin tag is diagnostics carried on a PERSISTED record, so it has
+    /// to survive the ledger both ways: a tagged route must round-trip, and a
+    /// ledger written before the field existed must still load (as
+    /// `Unknown`) instead of being discarded as unreadable -- discarding it
+    /// would silently force a full re-heal on every workspace that upgrades.
+    #[test]
+    fn route_origin_survives_ledger_roundtrip() {
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-route-origin-roundtrip-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let facts_file = heal_facts_path(&tmp, "isaac-pack", "3.12", "linux-64");
+        let facts = HealFacts {
+            stamp: "origin-stamp".to_string(),
+            workspace_overrides: vec![],
+            routed: vec![
+                AutoRoutedPackage {
+                    pypi_name: "zipp".into(),
+                    conda_name: "zipp".into(),
+                    pypi_version: "3.19.2".into(),
+                    conda_version: "3.19.2".into(),
+                    channel: "conda-forge".into(),
+                    input_requirements: vec![],
+                    origin: RouteOrigin::PersistedFacts,
+                },
+                AutoRoutedPackage {
+                    pypi_name: "pyperclip".into(),
+                    conda_name: "pyperclip".into(),
+                    pypi_version: "1.8.2".into(),
+                    conda_version: "1.8.2".into(),
+                    channel: "conda-forge".into(),
+                    input_requirements: vec![],
+                    origin: RouteOrigin::SdistHeal,
+                },
+            ],
+            built: vec![],
+            prereleased: vec![],
+        };
+        save_heal_facts(&facts_file, &facts);
+        let loaded = load_heal_facts(&facts_file, "origin-stamp");
+        assert_eq!(
+            loaded
+                .routed
+                .iter()
+                .map(|route| route.origin)
+                .collect::<Vec<_>>(),
+            vec![RouteOrigin::PersistedFacts, RouteOrigin::SdistHeal],
+            "route origins must survive the ledger"
+        );
+
+        // A v3-era ledger: same schema, no `origin` key anywhere.
+        let legacy = serde_json::json!({
+            "stamp": "origin-stamp",
+            "workspace_overrides": [],
+            "routed": [{
+                "pypi_name": "zipp",
+                "conda_name": "zipp",
+                "pypi_version": "3.19.2",
+                "conda_version": "3.19.2",
+                "channel": "conda-forge"
+            }],
+            "built": [],
+            "prereleased": []
+        });
+        std::fs::write(&facts_file, serde_json::to_string(&legacy).unwrap()).unwrap();
+        let legacy_loaded = load_heal_facts(&facts_file, "origin-stamp");
+        assert_eq!(legacy_loaded.routed.len(), 1, "v3 ledgers must still load");
+        assert_eq!(
+            legacy_loaded.routed[0].origin,
+            RouteOrigin::Unknown,
+            "a pre-origin record must default rather than fail the load"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Every route the ordinary sweep emits is stamped `Fixpoint`, so a
+    /// `PersistedFacts` tag in a failure report can only mean the ledger.
+    #[test]
+    fn plan_auto_route_round_tags_fixpoint_origin() {
+        let req = auto_route_req();
+        let closure = parse_pylock_closure(
+            PYLOCK_FIXTURE,
+            &target("3.12", "linux-64"),
+            &BTreeSet::new(),
+            "x",
+        )
+        .unwrap();
+        let mut hits = BTreeMap::new();
+        hits.insert(
+            "typing-extensions".to_string(),
+            RouteProbeHit {
+                conda_version: "1".into(),
+                channel: "c/linux-64".into(),
+                depends: Vec::new(),
+            },
+        );
+
+        let routes = plan_auto_route_round(&closure, &req, &auto_route_opts(), &[], &hits).unwrap();
+
+        assert!(!routes.is_empty(), "the fixture must produce a route");
+        assert!(
+            routes.iter().all(|r| r.origin == RouteOrigin::Fixpoint),
+            "the fixpoint sweep is the origin of the routes it discovers: {routes:?}"
+        );
     }
 
     #[test]
