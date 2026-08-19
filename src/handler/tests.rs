@@ -1113,6 +1113,122 @@ fn workspace_provided_wheel_bound_is_carried_as_conda_constrains() {
     );
 }
 
+/// Shared fixture for the origin-of-the-conflicting-fact guards: the same
+/// live-measured shape as
+/// `workspace_provided_wheel_bound_is_carried_as_conda_constrains`, plus the
+/// workspace conda fact `huggingface_hub==1.28.0` that the v10 viral-gpu lock
+/// showed conflicting with the bundled wheel's `<1.0`
+/// (`verify_fixes/artifacts/v10-viral-gpu.backend.log`).
+fn hub_cap_bundle_with_conflicting_workspace_fact(
+    declared_specs: BTreeSet<String>,
+) -> super::Bundle {
+    let mut bundle = solo_bundle("hub-cap-pack", vec!["huggingface-hub>=0.34.0"]);
+    bundle.primary.original_requires_dist = vec!["huggingface-hub<1.0,>=0.34.0".to_string()];
+    let key = canonical_conda_name("huggingface-hub");
+    bundle.auto_dropped.insert(key.clone());
+    bundle.uv_closure_names.insert("huggingface-hub".into());
+    bundle.uv_closure_names.insert("huggingface_hub".into());
+    bundle
+        .workspace_conda_versions
+        .insert(key.clone(), "1.28.0".to_string());
+    bundle.workspace_conda_provider_facts.insert(
+        key,
+        super::WorkspaceCondaProviderFact {
+            selected_versions: BTreeSet::from(["1.28.0".to_string()]),
+            declared_specs,
+            present_in_all_consumers: true,
+        },
+    );
+    bundle
+}
+
+fn hub_constrains_entry(output: &super::CondaOutput) -> Option<String> {
+    output
+        .run_dependencies
+        .constraints
+        .iter()
+        .map(format_constraint_spec)
+        .find(|line| {
+            line.split(' ').next().unwrap_or_default().replace('-', "_") == "huggingface_hub"
+        })
+}
+
+#[test]
+fn a_learned_workspace_conda_fact_cannot_veto_a_bundled_wheels_cap() {
+    // D1 turn 13. MEASURED on the v10 viral-gpu backend log: the carry fires
+    // and is then thrown away, VERBATIM --
+    //   WARN handler: conda constrains entry for a workspace-provided name
+    //        could not be decided; omitting the bound ... dep=huggingface_hub
+    //        bundle=isaaclab-viral-pack conflict=... `>=0.34.0, <1.0` required
+    //        by wheel `transformers==4.57.6`; `==1.28.0` required by workspace
+    //        conda fact
+    // The `==1.28.0` is NOT in pixi.toml. It is what the sibling envs' last
+    // solve resolved to -- a LEARNED float. Omitting on that conflict is
+    // circular: the float vetoes the bound that would correct the float, so
+    // 1.28.0 is re-picked every lock and `transformers`' runtime `<1.0` check
+    // raises on import. A learned fact must yield to the wheel's own cap.
+    let bundle = hub_cap_bundle_with_conflicting_workspace_fact(BTreeSet::new());
+
+    let output =
+        produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
+
+    let hub = hub_constrains_entry(&output).unwrap_or_else(|| {
+        panic!(
+            "a LEARNED workspace conda fact must not suppress the bundled wheel's bound; \
+             the constrains entry must still be emitted: {:?}",
+            output.run_dependencies.constraints
+        )
+    });
+    assert!(
+        hub.contains(">=0.34.0") && hub.contains("<1.0"),
+        "the emitted bound must be the wheel's own cap, unweakened by the learned \
+         float: {hub}"
+    );
+    assert!(
+        output
+            .run_dependencies
+            .depends
+            .iter()
+            .all(|d| d.name.replace('-', "_") != "huggingface_hub"),
+        "the pack still must not claim a name the workspace provider owns"
+    );
+}
+
+#[test]
+fn a_declared_workspace_pin_still_decides_the_constrains_carry() {
+    // The other half of the origin split: when the conflicting version IS
+    // operator intent -- a precise consumer declaring `huggingface_hub
+    // ==1.28.0` in its manifest -- the wheel cap does NOT get to overrule it.
+    // Policy decides, and today's policy omits the undecidable bound with a
+    // WARN rather than turning a pack that built before into a hard failure.
+    let bundle = hub_cap_bundle_with_conflicting_workspace_fact(BTreeSet::from([
+        "==1.28.0".to_string()
+    ]));
+
+    let output =
+        produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
+
+    assert_eq!(
+        hub_constrains_entry(&output),
+        None,
+        "a DECLARED workspace pin is operator intent; the carry must keep its \
+         policy-decided behaviour (omitted, recorded) instead of overruling the \
+         manifest: {:?}",
+        output.run_dependencies.constraints
+    );
+}
+
+#[test]
+fn a_bare_workspace_declaration_is_not_a_version_pin() {
+    // The origin test keys on whether the declaration bounds the VERSION. A
+    // consumer that merely lists the package (`*`) has declared presence, not
+    // a version, so the version is still just what the solve resolved to.
+    assert!(!super::declared_spec_bounds_version("*"));
+    assert!(!super::declared_spec_bounds_version(""));
+    assert!(super::declared_spec_bounds_version("==1.28.0"));
+    assert!(super::declared_spec_bounds_version(">=5.9,<8"));
+}
+
 #[test]
 fn emitted_conda_constrains_survive_the_lock_round_trip_on_replay() {
     // `assemble_conda_output` is documented as the single source of truth for
