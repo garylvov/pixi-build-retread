@@ -27,6 +27,7 @@
 //! knob and the historical cascade/resolvo mirror-solver are both gone).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -43,6 +44,53 @@ use crate::relax::{
 
 /// Env var overriding the uv binary path (spec §2.5).
 pub const UV_BIN_ENV: &str = "RETREAD_UV";
+
+/// Env var uv reads for its cache lock-wait budget, in seconds.
+pub const UV_LOCK_TIMEOUT_ENV: &str = "UV_LOCK_TIMEOUT";
+
+/// Lock-wait budget retread hands a uv child when the caller declared none.
+///
+/// One `pixi lock` fans several `pixi-build-retread` backends at a single
+/// shared uv cache. A cold sdist build holds
+/// `<uv-cache>/sdists-v9/pypi/<name>/<version>/.lock` for as long as the
+/// build takes, and uv's built-in 300 s default expires under a sibling's
+/// wait (`Timeout (300s) when waiting for lock`), aborting the whole lock.
+/// A cold multi-env lock legitimately holds an sdist lock for many minutes,
+/// and retread — not its caller — spawns those uv processes, so retread owns
+/// the budget.
+pub const DEFAULT_UV_LOCK_TIMEOUT_SECS: &str = "3600";
+
+/// A child-process builder retread can stamp uv environment onto. Implemented
+/// for both the blocking and the tokio `Command`, since retread spawns uv
+/// through both.
+pub trait UvCommandEnv {
+    fn set_uv_env(&mut self, key: &str, value: &OsStr);
+}
+
+impl UvCommandEnv for std::process::Command {
+    fn set_uv_env(&mut self, key: &str, value: &OsStr) {
+        self.env(key, value);
+    }
+}
+
+impl UvCommandEnv for tokio::process::Command {
+    fn set_uv_env(&mut self, key: &str, value: &OsStr) {
+        self.env(key, value);
+    }
+}
+
+/// Give a uv child its lock-wait budget: the caller's `UV_LOCK_TIMEOUT` when
+/// they set one, otherwise [`DEFAULT_UV_LOCK_TIMEOUT_SECS`].
+pub fn apply_uv_lock_budget<C: UvCommandEnv>(command: &mut C) {
+    apply_uv_lock_budget_with(command, std::env::var_os(UV_LOCK_TIMEOUT_ENV));
+}
+
+fn apply_uv_lock_budget_with<C: UvCommandEnv>(command: &mut C, inherited: Option<OsString>) {
+    let value = inherited
+        .filter(|declared| !declared.is_empty())
+        .unwrap_or_else(|| OsString::from(DEFAULT_UV_LOCK_TIMEOUT_SECS));
+    command.set_uv_env(UV_LOCK_TIMEOUT_ENV, &value);
+}
 
 /// Marker appended to `retread-drop-deps` override entries so uv removes
 /// the name from the resolution graph entirely (spec AMENDMENT A3: the
@@ -3724,12 +3772,12 @@ impl Drop for ClosureUvProcessGroupGuard {
     }
 }
 
-async fn run_uv_closure_command(
+fn build_uv_closure_command(
     uv_bin: &Path,
     args: &[String],
     project_dir: &Path,
     uv_cache_dir: &Path,
-) -> Result<std::process::Output> {
+) -> tokio::process::Command {
     let mut command = tokio::process::Command::new(uv_bin);
     command
         .args(args)
@@ -3740,8 +3788,21 @@ async fn run_uv_closure_command(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    // Siblings share `uv_cache_dir`; without a budget of our own, uv's 300 s
+    // default aborts the lock whenever a cold sdist build outlasts it.
+    apply_uv_lock_budget(&mut command);
     #[cfg(unix)]
     command.process_group(0);
+    command
+}
+
+async fn run_uv_closure_command(
+    uv_bin: &Path,
+    args: &[String],
+    project_dir: &Path,
+    uv_cache_dir: &Path,
+) -> Result<std::process::Output> {
+    let mut command = build_uv_closure_command(uv_bin, args, project_dir, uv_cache_dir);
     let child = command
         .spawn()
         .with_context(|| format!("spawning `{} {}`", uv_bin.display(), args.join(" ")))?;
@@ -5378,6 +5439,63 @@ pub(crate) async fn compute_closure_for_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn uv_env_value(command: &std::process::Command, key: &str) -> Option<OsString> {
+        command
+            .get_envs()
+            .find(|(name, _)| *name == OsStr::new(key))
+            .map(|(_, value)| value.expect("uv lock budget was removed, not set").to_os_string())
+    }
+
+    #[test]
+    fn uv_lock_budget_defaults_when_the_caller_declared_none() {
+        let mut command = std::process::Command::new("uv");
+        apply_uv_lock_budget_with(&mut command, None);
+        assert_eq!(
+            uv_env_value(&command, UV_LOCK_TIMEOUT_ENV).as_deref(),
+            Some(OsStr::new(DEFAULT_UV_LOCK_TIMEOUT_SECS)),
+            "a uv child spawned without a declared budget must not inherit uv's 300 s default",
+        );
+    }
+
+    #[test]
+    fn uv_lock_budget_respects_a_caller_declared_value() {
+        let mut command = std::process::Command::new("uv");
+        apply_uv_lock_budget_with(&mut command, Some(OsString::from("120")));
+        assert_eq!(
+            uv_env_value(&command, UV_LOCK_TIMEOUT_ENV).as_deref(),
+            Some(OsStr::new("120")),
+            "an explicit UV_LOCK_TIMEOUT from the caller is authoritative",
+        );
+    }
+
+    #[test]
+    fn uv_lock_budget_ignores_an_empty_caller_value() {
+        let mut command = std::process::Command::new("uv");
+        apply_uv_lock_budget_with(&mut command, Some(OsString::new()));
+        assert_eq!(
+            uv_env_value(&command, UV_LOCK_TIMEOUT_ENV).as_deref(),
+            Some(OsStr::new(DEFAULT_UV_LOCK_TIMEOUT_SECS)),
+        );
+    }
+
+    #[test]
+    fn closure_uv_command_carries_a_lock_budget() {
+        let command = build_uv_closure_command(
+            Path::new("uv"),
+            &["lock".to_string()],
+            Path::new("/tmp"),
+            Path::new("/tmp/uv-cache"),
+        );
+        let expected = std::env::var_os(UV_LOCK_TIMEOUT_ENV)
+            .filter(|declared| !declared.is_empty())
+            .unwrap_or_else(|| OsString::from(DEFAULT_UV_LOCK_TIMEOUT_SECS));
+        assert_eq!(
+            uv_env_value(command.as_std(), UV_LOCK_TIMEOUT_ENV),
+            Some(expected),
+            "the closure resolver spawns uv against a shared cache and must own the lock wait",
+        );
+    }
 
     fn target(py: &str, subdir: &str) -> WheelTarget {
         WheelTarget {
