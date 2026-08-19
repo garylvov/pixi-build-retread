@@ -13067,7 +13067,13 @@ type ProducedOutput = (
 ///   from the pack that exists to ship it;
 /// * `retread-keep-pypi` entries -- the user said "this stays a bundled wheel".
 fn declared_pypi_owned_dists(bundle: &Bundle, config: &RetreadConfig) -> BTreeSet<String> {
-    let reachable = declared_pypi_reachable(bundle, config);
+    // Union, not just the closure: a name the consuming env's own `pixi.lock`
+    // installs is env-provided whether or not the pack's uv graph can reach it
+    // (F11 turn 3 -- see `env_pypi_owned`). Recording it here is what puts it in
+    // the committed lock's `declared_pypi_owned`, i.e. the courier's install
+    // record of what it deliberately did NOT install.
+    let mut reachable = declared_pypi_reachable(bundle, config);
+    reachable.extend(env_pypi_owned(bundle, config));
     bundle
         .all_wheels()
         .map(|wheel| canonical_conda_name(&wheel.pypi_name))
@@ -13118,6 +13124,48 @@ fn declared_pypi_reachable(bundle: &Bundle, config: &RetreadConfig) -> BTreeSet<
     protected.insert(canonical_conda_name(&bundle.primary.pypi_name));
     reachable.retain(|name| !protected.contains(name));
     reachable
+}
+
+/// The PyPI names the consuming ENV's committed `pixi.lock` already installs in
+/// its own pypi phase -- the authoritative version of the fact
+/// `declared_pypi_reachable` can only approximate.
+///
+/// The closure heuristic walks the PACK's uv adjacency from the declared roots,
+/// and it is blind exactly where F11 bites. `isaaclab-viral-pack` maps
+/// `torch = "pytorch"` (a conda name-map), so `torch` is not a NODE in the
+/// pack's uv graph at all: the BFS from root `torch` reaches nothing, no
+/// `declared-pypi ownership:` line is emitted, and the pack claims
+/// `ownership: name=networkx owner=pack` / `name=sympy owner=pack` (observed on
+/// v16 `viral-gpu`, binary `9740d429...`). Meanwhile pixi's env-level pypi
+/// `torch` installs `networkx 3.6.1` / `sympy 1.14.0` into the SAME
+/// site-packages the pack ships its own copies to -- two owners, the F11
+/// ping-pong. The pack cannot reach the fact through its own graph because the
+/// graph does not contain the root.
+///
+/// `pixi.lock` is not an approximation: it is the literal list of what pixi's
+/// pypi phase installs for the env. Every name in it is env-provided, so the
+/// pack cedes it -- no `depends`, bounds carried as `constrains` only.
+///
+/// Same two exclusions as the closure view, both explicit pack intent that a
+/// lock row must not overrule: the pack's own primary wheel and
+/// `retread-keep-pypi` entries. Empty when there is no lock (or the lock has
+/// never solved a consuming env) -- "cannot know" is never "unconstrained".
+fn env_pypi_owned(bundle: &Bundle, config: &RetreadConfig) -> BTreeSet<String> {
+    if bundle.workspace_locked_pypi.is_empty() {
+        return BTreeSet::new();
+    }
+    let mut protected: BTreeSet<String> = config
+        .keep_pypi
+        .iter()
+        .map(|name| canonical_conda_name(name))
+        .collect();
+    protected.insert(canonical_conda_name(&bundle.primary.pypi_name));
+    bundle
+        .workspace_locked_pypi
+        .keys()
+        .map(|name| canonical_conda_name(name))
+        .filter(|name| !protected.contains(name))
+        .collect()
 }
 
 /// Refuse a build whose bundled wheels contradict the version the consuming
@@ -13315,7 +13363,15 @@ fn produce_output_with_conflicts(
     // `[pypi-dependencies]`, and everything that name pulls in, belongs to
     // pixi's own pypi phase. The pack must not claim any of them as a conda
     // `depends` edge -- see `declared_pypi_reachable`.
-    let declared_pypi_owned = declared_pypi_reachable(bundle, config);
+    //
+    // AMENDMENT (F11 turn 3): the closure above is a heuristic over the pack's
+    // OWN uv graph and misses every name pixi's pypi phase installs through a
+    // root the pack name-maps to conda (`torch` -> `pytorch`). The env's
+    // `pixi.lock` states that set literally, so it takes precedence: lock-listed
+    // pypi (env-provided) > declared-closure > pack.
+    let env_pypi_owned = env_pypi_owned(bundle, config);
+    let mut declared_pypi_owned = declared_pypi_reachable(bundle, config);
+    declared_pypi_owned.extend(env_pypi_owned.iter().cloned());
     check_declared_pypi_bounds(bundle, &declared_pypi_owned, &env)?;
     // One greppable ownership verdict per name the bundle carries, at the one
     // point where all three owners are decidable. `pack` means this build
@@ -13324,7 +13380,12 @@ fn produce_output_with_conflicts(
     // reach it and pixi's own pypi phase installs it.
     for wheel in bundle.all_wheels() {
         let name = canonical_conda_name(&wheel.pypi_name);
-        let (owner, reason) = if declared_pypi_owned.contains(&name) {
+        let (owner, reason) = if env_pypi_owned.contains(&name) {
+            (
+                "env-pypi",
+                "the consuming env's pixi.lock installs this name in its pypi phase",
+            )
+        } else if declared_pypi_owned.contains(&name) {
             (
                 "pypi-declared",
                 "reachable from workspace [pypi-dependencies]",

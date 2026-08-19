@@ -628,6 +628,135 @@ pub(crate) fn declared_pypi_owned_names(lock: &RetreadLock) -> BTreeSet<String> 
         .collect()
 }
 
+/// Split a pixi env prefix into `(workspace root, env name)`.
+///
+/// Pixi lays every env out as `<workspace>/.pixi/envs/<env>`, so the prefix the
+/// post-link script is handed already names both halves of the fact we need:
+/// WHICH lock to read and WHICH environment inside it. Anything else (a
+/// detached prefix, a relocated env) yields `None`, which every caller reads as
+/// "cannot know" -- never as "nothing is env-owned".
+fn pixi_env_identity(prefix: &Path) -> Option<(PathBuf, String)> {
+    let env = prefix.file_name()?.to_str()?.to_owned();
+    let envs = prefix.parent()?;
+    if envs.file_name()? != "envs" {
+        return None;
+    }
+    let dot_pixi = envs.parent()?;
+    if dot_pixi.file_name()? != ".pixi" {
+        return None;
+    }
+    Some((dot_pixi.parent()?.to_path_buf(), env))
+}
+
+/// The PyPI distributions the CONSUMING ENV's own `pixi.lock` installs, mapped
+/// to the version it locked.
+///
+/// This is the INSTALL-time half of the F11 root fix, and it is the half that
+/// can be exact. At build time the pack can only guess which names pixi's pypi
+/// phase will own (`declared_pypi_reachable` walks the pack's uv adjacency, and
+/// misses everything behind a conda name-map such as `torch = "pytorch"` --
+/// v16 `viral-gpu` logged `ownership: name=networkx owner=pack` while pixi's
+/// env-level pypi torch was installing `networkx 3.6.1` into the same
+/// site-packages). By INSTALL time the lock exists and states the answer
+/// literally, so the courier reads it directly instead of trusting the guess it
+/// recorded at build time.
+///
+/// Anything in here is env-provided: not materialized, not demanded by verify,
+/// not audited. Empty means "cannot know" (no lock, unparseable lock, a prefix
+/// that is not a pixi env, an env the lock has never solved) and cedes nothing.
+///
+/// Memoized per prefix: `run()` reaches this through materialize + verify +
+/// audit, and the live workspace lock is a 56k-line YAML document.
+fn env_pypi_owned_versions(lock: &RetreadLock, prefix: &Path) -> BTreeMap<String, String> {
+    use std::sync::{Mutex, OnceLock};
+    static MEMO: OnceLock<Mutex<BTreeMap<(PathBuf, String), BTreeMap<String, String>>>> =
+        OnceLock::new();
+    let key = (prefix.to_path_buf(), lock.target_subdir.clone());
+    let memo = MEMO.get_or_init(|| Mutex::new(BTreeMap::new()));
+    if let Ok(guard) = memo.lock()
+        && let Some(hit) = guard.get(&key)
+    {
+        return hit.clone();
+    }
+    let computed = match pixi_env_identity(prefix) {
+        Some((workspace_root, env)) => crate::workspace::locked_pypi_versions_for_envs(
+            &workspace_root,
+            &BTreeSet::from([env]),
+            &lock.target_subdir,
+        )
+        .into_iter()
+        .map(|(name, version)| (normalize_dist_name(&name), version))
+        .collect(),
+        None => BTreeMap::new(),
+    };
+    if let Ok(mut guard) = memo.lock() {
+        guard.insert(key, computed.clone());
+    }
+    computed
+}
+
+/// Every distribution this install must cede to another owner in the prefix:
+/// the producer's build-time record (`declared_pypi_owned`) UNION the env's own
+/// `pixi.lock` (`env_pypi_owned_versions`). The lock read wins where the two
+/// disagree, because it is a fact and the record is an approximation.
+fn not_courier_owned_pypi(lock: &RetreadLock, prefix: &Path) -> BTreeSet<String> {
+    let mut owned = declared_pypi_owned_names(lock);
+    owned.extend(env_pypi_owned_versions(lock, prefix).into_keys());
+    owned
+}
+
+/// Refuse an install whose bundled wheels contradict the version the env's own
+/// `pixi.lock` installs for a name this install is ceding.
+///
+/// Ceding hands the version choice to pixi. If a wheel this pack ships requires
+/// `networkx<3.4` and the env's lock already carries `networkx 3.6.1`, the pack
+/// and the env are unsatisfiable together, and every later symptom (an
+/// ImportError at activation, a repair round that replays 142 wheels) is a
+/// downstream echo of a fact that is knowable HERE, before a single byte is
+/// materialized. Bail with the wheel, the name, the bound and the locked
+/// version in one line.
+///
+/// Requirements carrying an environment marker are skipped: the courier has no
+/// marker environment at install time, and a guess would refuse real installs.
+fn check_env_pypi_bounds(lock: &RetreadLock, owned: &BTreeMap<String, String>) -> Result<()> {
+    if owned.is_empty() {
+        return Ok(());
+    }
+    for wheel in &lock.wheels {
+        for raw in &wheel.requires_dist {
+            let Ok(requirement) = uv_pep508::Requirement::<uv_pep508::VerbatimUrl>::from_str(raw)
+            else {
+                continue;
+            };
+            if !requirement.marker.is_true() {
+                continue;
+            }
+            let name = normalize_dist_name(requirement.name.as_ref());
+            let Some(locked) = owned.get(&name) else {
+                continue;
+            };
+            let Some(uv_pep508::VersionOrUrl::VersionSpecifier(specifiers)) =
+                requirement.version_or_url.as_ref()
+            else {
+                continue;
+            };
+            let Ok(locked_version) = uv_pep508::uv_pep440::Version::from_str(locked) else {
+                continue;
+            };
+            if specifiers.contains(&locked_version) {
+                continue;
+            }
+            bail!(
+                "retread install: env-pypi owner {name}=={locked} (from the workspace \
+                 pixi.lock) violates bundled wheel {wheel_file} requirement {raw}; \
+                 fix the manifest/pack, not the repair",
+                wheel_file = wheel.filename,
+            );
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn materialize_locked_wheels(
     lock: &RetreadLock,
@@ -639,7 +768,10 @@ async fn materialize_locked_wheels(
     drop_cuda_shadows: bool,
     conda_dist_names: &BTreeSet<String>,
 ) -> Result<Vec<PathBuf>> {
-    let declared_owned = declared_pypi_owned_names(lock);
+    // Producer's build-time record UNION the env's own pixi.lock. See
+    // `not_courier_owned_pypi`: the lock read is what catches the names the
+    // build-time closure could not reach (F11 turn 3).
+    let declared_owned = not_courier_owned_pypi(lock, prefix);
     let fetch_dir = prefix
         .join("share")
         .join("retread")
@@ -659,8 +791,9 @@ async fn materialize_locked_wheels(
         // ping-pong. See `declared_pypi_owned_names`.
         if declared_owned.contains(&normalized_name) {
             eprintln!(
-                "retread install: {}=={} is provided by the workspace's declared \
-                 pypi-dependencies; skipping wheel replay (declared-owned)",
+                "retread install: {}=={} is provided by the consuming env's own pypi \
+                 phase (workspace [pypi-dependencies] / pixi.lock); skipping wheel \
+                 replay (env-pypi-owned)",
                 wheel.name, wheel.version
             );
             continue;
@@ -1340,7 +1473,7 @@ fn missing_locked_wheels_in_prefix(lock: &RetreadLock, prefix: &Path) -> Vec<Str
         return Vec::new();
     };
     let mut not_courier_owned = conda_shadowed_locked_dists(lock, prefix);
-    not_courier_owned.extend(declared_pypi_owned_names(lock));
+    not_courier_owned.extend(not_courier_owned_pypi(lock, prefix));
     missing_after_exemptions(
         lock,
         &installed,
@@ -1390,13 +1523,14 @@ fn verify_payload_installed(lock: &RetreadLock, prefix: &Path) -> Result<()> {
     // the post-install gate on a healthy prefix, marked it `.broken` and drove
     // the activation repair loop. Same decision, same set, one reader.
     //
-    // The producer's install record adds the second non-courier owner: dists
-    // the consuming workspace's own `[pypi-dependencies]` closure provides,
-    // which the courier never laid down either. Without this exemption the
+    // The second non-courier owner: dists the consuming ENV provides through
+    // its own pypi phase -- the producer's build-time record UNION the env's
+    // committed `pixi.lock` (F11 turn 3, `not_courier_owned_pypi`). The courier
+    // never laid these down either, so without this exemption the install
     // record would be written and then immediately contradicted by verify --
     // the reader half of the writer/reader pair.
     let mut not_courier_owned = conda_shadowed_locked_dists(lock, prefix);
-    not_courier_owned.extend(declared_pypi_owned_names(lock));
+    not_courier_owned.extend(not_courier_owned_pypi(lock, prefix));
     let missing = missing_after_exemptions(lock, &installed, &editable_owned, &not_courier_owned);
     if !missing.is_empty() {
         bail!(
@@ -1464,10 +1598,11 @@ fn installed_payload_libraries(
     // `conda_provides_cuda_component`); the libraries they would have shipped
     // are conda's, and are audited as part of the conda prefix, not the wheel
     // payload. Declared-owned dists (the workspace's own `[pypi-dependencies]`
-    // closure) were never laid down either. Without this the audit bails
+    // closure, plus everything the env's own pixi.lock installs) were never
+    // laid down either. Without this the audit bails
     // "is not installed" on exactly the wheels the installer meant to omit.
     let mut not_courier_owned = conda_shadowed_locked_dists(lock, prefix);
-    not_courier_owned.extend(declared_pypi_owned_names(lock));
+    not_courier_owned.extend(not_courier_owned_pypi(lock, prefix));
     let mut out: BTreeMap<String, crate::glibc::PayloadLib> = BTreeMap::new();
     for wheel in &lock.wheels {
         let name = normalize_dist_name(&wheel.name);
@@ -1544,6 +1679,7 @@ pub fn verify(lock_path: &Path, prefix: &Path, full: bool) -> Result<()> {
             lock_path.display()
         );
     }
+    check_env_pypi_bounds(&lock, &env_pypi_owned_versions(&lock, prefix))?;
     verify_payload_installed(&lock, prefix)?;
     let audit = crate::glibc::verify_marker_state(&lock, prefix, &have)?;
     if full {
@@ -1929,6 +2065,9 @@ pub async fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
     // shadow-wheel drop (a shim wheel is only dropped when conda actually
     // provides its component).
     let conda_dist_names = installed_conda_dist_names(prefix);
+    // A ceded name the env's own lock already contradicts makes the pack and
+    // the env unsatisfiable together; refuse before materializing anything.
+    check_env_pypi_bounds(&lock, &env_pypi_owned_versions(&lock, prefix))?;
     // Record the shadow decision BEFORE the replay: the post-install gate and
     // every later `retread verify` (activate.d guard) read it back so they
     // never demand a wheel this install intentionally omitted.
@@ -3190,6 +3329,202 @@ mod tests {
             "only the dist nobody else owns may be replayed",
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The env's own `pixi.lock` is the authority on what pixi's pypi phase
+    /// installs, and the courier reads it at install time.
+    ///
+    /// This is the F11 case the build-time closure CANNOT reach: the pack maps
+    /// `torch = "pytorch"`, so `torch` is not a node in its uv graph, the BFS
+    /// from that root reaches nothing, and `declared_pypi_owned` comes back
+    /// EMPTY (`lock.declared_pypi_owned = vec![]` below -- exactly what v16
+    /// `viral-gpu` recorded). The env's lock still lists `networkx` / `sympy`
+    /// as pypi packages, because pixi's env-level pypi torch pulls them, so
+    /// both are ceded: not materialized, not demanded by verify. A dist the
+    /// lock does NOT list is still bundled and still verified.
+    #[tokio::test]
+    async fn env_locked_pypi_dists_are_ceded_at_install_and_others_are_not() {
+        let root = tempdir("env-pypi-owned");
+        let prefix = root.join(".pixi").join("envs").join("viral-gpu");
+        let wheels_dir = root.join("wheels");
+        std::fs::create_dir_all(&wheels_dir).unwrap();
+        std::fs::write(
+            root.join("pixi.lock"),
+            r#"
+version: 7
+platforms:
+- name: p4
+  subdir: linux-64
+environments:
+  viral-gpu:
+    packages:
+      p4:
+      - conda: https://example.com/linux-64/python-3.11.conda
+      - pypi: https://example.com/networkx-3.6.1.whl
+      - pypi: https://example.com/sympy-1.14.0.whl
+packages:
+- conda: https://example.com/linux-64/python-3.11.conda
+- pypi: https://example.com/networkx-3.6.1.whl
+  name: networkx
+  version: 3.6.1
+- pypi: https://example.com/sympy-1.14.0.whl
+  name: sympy
+  version: 1.14.0
+"#,
+        )
+        .unwrap();
+
+        let mut shipped: Vec<PathBuf> = Vec::new();
+        for (name, version) in [
+            ("networkx", "3.3"),
+            ("sympy", "1.13.3"),
+            ("packonly", "0.1.0"),
+        ] {
+            let bytes = test_wheel_bytes(name, version);
+            let file = wheels_dir.join(format!("{name}-{version}-py3-none-any.whl"));
+            std::fs::write(&file, &bytes).unwrap();
+            shipped.push(file);
+        }
+
+        let mut lock = make_lock(vec![], vec![], BTreeMap::new());
+        lock.wheels = vec![
+            lock_wheel("networkx", "3.3"),
+            lock_wheel("sympy", "1.13.3"),
+            lock_wheel("packonly", "0.1.0"),
+        ];
+        // The build-time closure reached NOTHING -- the whole point.
+        lock.declared_pypi_owned = Vec::new();
+
+        let files = materialize_locked_wheels(
+            &lock,
+            &prefix,
+            &wheels_dir,
+            &root.join("cache"),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            false,
+            &BTreeSet::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            files,
+            vec![shipped[2].clone()],
+            "only the dist the env's pixi.lock does NOT own may be replayed",
+        );
+
+        // The install record the courier keeps for this prefix lists both
+        // ceded names (union of the producer's record and the live lock read).
+        assert_eq!(
+            not_courier_owned_pypi(&lock, &prefix),
+            BTreeSet::from(["networkx".to_string(), "sympy".to_string()]),
+            "the ceded set must name exactly the env-locked pypi dists",
+        );
+
+        // Verify passes with ONLY the non-ceded dist installed.
+        let sp = site_packages_dir(&prefix, &lock.python);
+        std::fs::create_dir_all(&sp).unwrap();
+        let di = write_dist_info(&sp, "packonly", "0.1.0", None);
+        std::fs::write(di.join("RECORD"), "packonly-0.1.0.dist-info/RECORD,,\n").unwrap();
+        verify_payload_installed(&lock, &prefix).expect(
+            "the env's own pypi phase owns networkx/sympy; the courier must not demand them",
+        );
+
+        // Baseline, in a prefix that is NOT a pixi env (no lock to read): the
+        // same lock and the same site-packages DO report both as missing --
+        // proof the pass above came from the lock read, not from the fixture.
+        let bare_root = tempdir("env-pypi-owned-bare");
+        let bare_prefix = bare_root.join("prefix");
+        let bare_sp = site_packages_dir(&bare_prefix, &lock.python);
+        std::fs::create_dir_all(&bare_sp).unwrap();
+        let bare_di = write_dist_info(&bare_sp, "packonly", "0.1.0", None);
+        std::fs::write(
+            bare_di.join("RECORD"),
+            "packonly-0.1.0.dist-info/RECORD,,\n",
+        )
+        .unwrap();
+        let err = verify_payload_installed(&lock, &bare_prefix)
+            .expect_err("without the env lock nothing is ceded");
+        let err = format!("{err:#}");
+        assert!(err.contains("networkx==3.3"), "{err}");
+        assert!(err.contains("sympy==1.13.3"), "{err}");
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(bare_root);
+    }
+
+    /// A version the env's lock already installs that no bundled wheel can
+    /// accept makes the pack and the env unsatisfiable together. Refuse loudly
+    /// -- naming the wheel, the name, the bound and the locked version -- before
+    /// anything is materialized. Silent when the lock has no entry for the name
+    /// and when the bound is satisfied.
+    #[test]
+    fn an_env_locked_version_outside_a_bundled_wheels_bound_refuses_at_install() {
+        let root = tempdir("env-pypi-bound");
+        let prefix = root.join(".pixi").join("envs").join("viral-gpu");
+        std::fs::write(
+            root.join("pixi.lock"),
+            r#"
+version: 7
+platforms:
+- name: p4
+  subdir: linux-64
+environments:
+  viral-gpu:
+    packages:
+      p4:
+      - pypi: https://example.com/networkx-3.6.1.whl
+packages:
+- pypi: https://example.com/networkx-3.6.1.whl
+  name: networkx
+  version: 3.6.1
+"#,
+        )
+        .unwrap();
+
+        let mut lock = make_lock(vec![], vec![], BTreeMap::new());
+        let mut pack = lock_wheel("viral-pack", "1.0.0");
+        pack.requires_dist = vec![
+            "networkx<3.4".into(),
+            // Not in the env lock: never bound-checked.
+            "sympy>=99".into(),
+            // Marker-carrying line: skipped (no marker environment here).
+            "networkx<1 ; extra == 'test'".into(),
+        ];
+        lock.wheels = vec![pack.clone()];
+
+        let owned = env_pypi_owned_versions(&lock, &prefix);
+        assert_eq!(
+            owned.get("networkx").map(String::as_str),
+            Some("3.6.1"),
+            "the reader must see the env's locked networkx",
+        );
+        let err = format!(
+            "{:#}",
+            check_env_pypi_bounds(&lock, &owned).expect_err("3.6.1 cannot satisfy <3.4")
+        );
+        for needle in [
+            "env-pypi owner",
+            "networkx==3.6.1",
+            "viral_pack-1.0.0-py3-none-any.whl",
+            "networkx<3.4",
+            "fix the manifest/pack, not the repair",
+        ] {
+            assert!(err.contains(needle), "message must name {needle}: {err}");
+        }
+
+        // Satisfied bound -> builds.
+        let mut ok_lock = lock.clone();
+        ok_lock.wheels[0].requires_dist = vec!["networkx>=3.0".into()];
+        check_env_pypi_bounds(&ok_lock, &owned).expect("3.6.1 satisfies >=3.0");
+
+        // No lock at all -> nothing known, nothing checked.
+        let bare = tempdir("env-pypi-bound-bare");
+        assert!(env_pypi_owned_versions(&lock, &bare.join("prefix")).is_empty());
+        check_env_pypi_bounds(&lock, &BTreeMap::new()).expect("no locked facts, no check");
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(bare);
     }
 
     #[test]
