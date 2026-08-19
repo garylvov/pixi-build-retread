@@ -6625,6 +6625,9 @@ fn facts_from_solved_records(
 fn workspace_fact_constraints(
     facts: &WorkspaceCondaFacts,
     manual_overrides: &BTreeSet<String>,
+    learned_excluded: &BTreeSet<String>,
+    fact_name_map: &NameMap,
+    global_name_map: &PypiToCondaMap,
 ) -> crate::uv_closure::ConstraintSet {
     let mut constraints = crate::uv_closure::ConstraintSet::default();
     for (pypi_name, fact) in &facts.common_pypi {
@@ -6647,6 +6650,23 @@ fn workspace_fact_constraints(
             },
         );
     }
+    // F13: the DECLARED facts above are only half the workspace's authority.
+    // Every conda record the consuming envs' solves agreed on -- transitives
+    // nothing declared, such as `huggingface_hub 0.36.0` pulled by conda
+    // `transformers 4.57.6` -- must reach `uv lock` too, or the pack's closure
+    // resolves that name's dependents blind and only collides afterwards, at
+    // conda run-dependency emission, where the carry is silently omitted.
+    // Declared lines already assembled win; learned facts only fill the gaps.
+    let learned = crate::uv_closure::learned_fact_constraints(
+        &facts.common_selected_versions,
+        fact_name_map,
+        global_name_map,
+        &constraints,
+        learned_excluded,
+        "precise-consuming-envs",
+    );
+    constraints.constraints.extend(learned.constraints);
+    constraints.provenance.extend(learned.provenance);
     constraints
 }
 
@@ -7211,7 +7231,28 @@ async fn uv_group_closure(
         .collect();
     let mut constraints = match effective.route_policy {
         crate::config::RoutePolicy::PreferCondaValidated | crate::config::RoutePolicy::Minimal => {
-            workspace_fact_constraints(&workspace_facts, &manual)
+            // A name the pack overrides, explicitly keeps on the PyPI side,
+            // or ships itself must never receive a learned conda `==` pin.
+            let mut learned_excluded = manual.clone();
+            learned_excluded.extend(
+                effective
+                    .keep_pypi
+                    .iter()
+                    .map(|name| canonical_conda_name(name)),
+            );
+            learned_excluded.extend(uv_retry_keep_names.iter().cloned());
+            learned_excluded.extend(
+                group_entries
+                    .iter()
+                    .map(|(name, _)| canonical_conda_name(name)),
+            );
+            workspace_fact_constraints(
+                &workspace_facts,
+                &manual,
+                &learned_excluded,
+                fact_name_map,
+                load_pypi_to_conda_map().await.as_ref(),
+            )
         }
         crate::config::RoutePolicy::Aggressive => match (manifest_opt.as_ref(), workspace_dir) {
             (Some(manifest), Some(ws_dir)) => {
@@ -8002,10 +8043,10 @@ mod facts_cleanup_tests {
 #[cfg(test)]
 mod workspace_conda_facts_tests {
     use super::{
-        CondaCoSolveContext, SolvedPypiFact, WorkspaceCondaFacts, WorkspaceRouteOwnership,
-        dependency_name_intersection, effective_name_map, facts_from_solved_records,
-        precise_consumer_inputs_for_target, workspace_conda_provider_candidates,
-        workspace_fact_constraints,
+        CondaCoSolveContext, PypiToCondaMap, SolvedPypiFact, WorkspaceCondaFacts,
+        WorkspaceRouteOwnership, dependency_name_intersection, effective_name_map,
+        facts_from_solved_records, precise_consumer_inputs_for_target,
+        workspace_conda_provider_candidates, workspace_fact_constraints,
     };
     use crate::constraint::Provenance;
     use crate::pypi::{ResolutionTarget, WheelTarget};
@@ -8365,12 +8406,87 @@ gpu = { features = ["gpu"], no-default-feature = true }
             &name_map(&[("torch", "pytorch")]),
             "sage-isaac-pack",
         );
-        let constraints = workspace_fact_constraints(&facts, &BTreeSet::new());
+        let constraints = workspace_fact_constraints(
+            &facts,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &name_map(&[("torch", "pytorch")]),
+            &PypiToCondaMap::new(),
+        );
         assert_eq!(constraints.constraints, vec!["torch==2.5.1"]);
         assert_eq!(constraints.provenance["torch"].source, "workspace-solved");
         assert_eq!(constraints.provenance["torch"].conda_name, "pytorch");
 
         let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// F13. The workspace's SOLVED transitives -- not just what a manifest
+    /// declares -- must reach `uv lock` as constraints.
+    ///
+    /// MEASURED (v13/v16 backend logs): the consuming envs declare conda
+    /// `transformers 4.57.6`, which drags `huggingface_hub 0.36.0` in as a
+    /// transitive nothing declares. Before this guard, only the DECLARED
+    /// `transformers` fact became a uv constraint, so `protomotions-deps-pack`
+    /// resolved `transformers==5.15.1` (`huggingface-hub>=1.5.0,<2.0`) blind
+    /// and the hub carry was then dropped at emission with
+    /// `conflict: ... ==0.36.0 required by workspace conda fact`.
+    #[test]
+    fn a_solved_transitive_conda_fact_becomes_a_uv_constraint() {
+        let env = "pace".to_string();
+        let facts = facts_from_solved_records(
+            BTreeMap::from([(
+                env.clone(),
+                vec![
+                    repo_record("transformers", "4.57.6", &["huggingface_hub >=0.34,<1.0"]),
+                    repo_record("huggingface_hub", "0.36.0", &[]),
+                ],
+            )]),
+            BTreeMap::from([(
+                env,
+                BTreeMap::from([("transformers".to_string(), "==4.57.6".to_string())]),
+            )]),
+            BTreeSet::new(),
+            &name_map(&[("transformers", "transformers")]),
+            "protomotions-deps-pack",
+        );
+        // The declared/learned split the fix rests on.
+        assert!(
+            facts.common_conda_versions.contains_key("transformers")
+                && !facts.common_conda_versions.contains_key("huggingface-hub"),
+            "hub is a solved transitive, never a declared fact: {:?}",
+            facts.common_conda_versions,
+        );
+        assert_eq!(
+            facts.common_selected_versions.get("huggingface-hub"),
+            Some(&"0.36.0".to_string()),
+            "{:?}",
+            facts.common_selected_versions,
+        );
+
+        let constraints = workspace_fact_constraints(
+            &facts,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &name_map(&[("transformers", "transformers")]),
+            &PypiToCondaMap::new(),
+        );
+        assert!(
+            constraints
+                .constraints
+                .contains(&"huggingface-hub==0.36.0".to_string()),
+            "the solved transitive must reach uv, or the closure resolves \
+             transformers blind: {:?}",
+            constraints.constraints,
+        );
+        assert_eq!(
+            constraints.provenance["huggingface-hub"].source,
+            crate::uv_closure::LEARNED_WORKSPACE_FACT_SOURCE,
+        );
+        // The declared fact keeps its own provenance; learned never overwrites.
+        assert_eq!(
+            constraints.provenance["transformers"].source,
+            "workspace-solved",
+        );
     }
 
     #[test]
@@ -8405,10 +8521,22 @@ gpu = { features = ["gpu"], no-default-feature = true }
             "the agreed transitive stays available as validation input without becoming ownership"
         );
         assert!(!facts.common_pypi.contains_key("torch"));
+        // A learned transitive must not be pinned under a conda spelling that a
+        // DIFFERENT PyPI distribution claims: conda `pytorch`/`pytorch-gpu`
+        // belong to pypi `torch`, so neither may become a constraint here.
         assert!(
-            workspace_fact_constraints(&facts, &BTreeSet::new())
-                .constraints
-                .is_empty()
+            workspace_fact_constraints(
+                &facts,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                &NameMap::new(),
+                &PypiToCondaMap::from([(
+                    "torch".to_string(),
+                    vec!["pytorch".to_string(), "pytorch-gpu".to_string()],
+                )]),
+            )
+            .constraints
+            .is_empty()
         );
     }
 
@@ -8453,9 +8581,15 @@ gpu = { features = ["gpu"], no-default-feature = true }
             "provider presence is independent of exact cross-env version agreement"
         );
         assert!(
-            workspace_fact_constraints(&facts, &BTreeSet::new())
-                .constraints
-                .is_empty()
+            workspace_fact_constraints(
+                &facts,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                &NameMap::new(),
+                &PypiToCondaMap::new(),
+            )
+            .constraints
+            .is_empty()
         );
     }
 

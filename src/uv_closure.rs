@@ -2693,6 +2693,128 @@ pub fn build_constraints(
     set
 }
 
+/// Source string recorded on every LEARNED workspace conda fact constraint.
+///
+/// Rendered verbatim into the conflict prose (`constraint::conflict_from_active`
+/// formats "`<spec>` required by <source>"), so it must read as an actionable
+/// sentence on its own.
+pub const LEARNED_WORKSPACE_FACT_SOURCE: &str =
+    "workspace conda fact (learned: selected by every consuming env's conda solve)";
+
+/// Turn the workspace's SOLVED conda versions -- transitives included -- into
+/// uv `constraint-dependencies`.
+///
+/// F13. `workspace_fact_constraints` only ever fed uv the DECLARED conda facts
+/// (`common_conda_versions`, filtered to names every consumer declares). A
+/// conda record that no manifest names but every consuming env's solve
+/// selected was therefore invisible to `uv lock`: the pack's closure resolved
+/// that name's dependents blind (newest-wins) and only collided with the conda
+/// side afterwards, at conda run-dependency emission, where the carry is
+/// silently omitted. Measured shape (v13/v16 backend logs):
+/// `protomotions-deps-pack` locked `transformers==5.15.1` (needs
+/// `huggingface-hub>=1.5.0,<2.0`) against a workspace whose envs had already
+/// solved `huggingface_hub 0.36.0` -- a transitive of the envs' conda
+/// `transformers 4.57.6`, hence never a declared fact.
+///
+/// These are LEARNED facts, not operator intent, so they are tagged
+/// [`Provenance::UvConstraint`] rather than
+/// [`Provenance::WorkspaceCondaFact`]: authoritative for solving and for
+/// conflict attribution, but they must not arm the Rule-3 conda-routing
+/// repairs reserved for precise declared facts. Their `source` says "learned"
+/// so a conflict message can name which side is which.
+///
+/// * `solved_versions`: canonical conda name -> exact selected version, agreed
+///   by every precise consuming environment (`common_selected_versions`).
+/// * `name_map`: the pack's own PyPI->conda map, inverted to recover the PyPI
+///   spelling. A declared edge is identity proof and always wins.
+/// * `global_name_map`: the parselmouth-backed pypi->conda table, used ONLY as
+///   a veto. A learned fact is never renamed through a guessed alias -- but a
+///   conda name that some OTHER PyPI distribution demonstrably claims (conda
+///   `pytorch` is claimed by pypi `torch`) must not be pinned under its own
+///   spelling either, or a transitive `pytorch 2.10.0` record would manufacture
+///   a hard pin on the unrelated PyPI `pytorch` shim. Identity is used when the
+///   table claims the name for itself (`huggingface-hub` -> `huggingface_hub`)
+///   or does not know it at all.
+/// * `already`: constraints already assembled (declared facts). A name they
+///   cover keeps the declared line; a learned float never overwrites intent.
+/// * `excluded`: canonical PyPI names the pack overrides by hand.
+pub fn learned_fact_constraints(
+    solved_versions: &BTreeMap<String, String>,
+    name_map: &NameMap,
+    global_name_map: &crate::handler::PypiToCondaMap,
+    already: &ConstraintSet,
+    excluded: &BTreeSet<String>,
+    env: &str,
+) -> ConstraintSet {
+    // Invert pypi->conda from the pack's declared map only. BTreeMap order
+    // makes the alphabetically-first PyPI name win a conda-name collision.
+    let mut conda_to_pypi: BTreeMap<PypiKey, PypiKey> = BTreeMap::new();
+    for (pypi, target) in name_map {
+        let Some(conda) = target.mapped_name() else {
+            continue;
+        };
+        conda_to_pypi
+            .entry(conda.key())
+            .or_insert_with(|| pypi.clone());
+    }
+    // Deterministic claimant per conda name: sort the HashMap's pypi keys.
+    let mut global_sorted: Vec<(&String, &Vec<String>)> = global_name_map.iter().collect();
+    global_sorted.sort_by_key(|(pypi, _)| (*pypi).clone());
+    let mut conda_claimants: BTreeMap<PypiKey, PypiKey> = BTreeMap::new();
+    for (pypi, condas) in global_sorted {
+        for conda in condas {
+            conda_claimants
+                .entry(CondaName::new(conda.clone()).key())
+                .or_insert_with(|| PypiKey::from_pypi(pypi));
+        }
+    }
+
+    let mut set = ConstraintSet::default();
+    for (conda_name, version) in solved_versions {
+        if is_conda_only_name(conda_name) {
+            continue;
+        }
+        // A solved version is always exact; anything unparseable as PEP 440
+        // (conda-only epoch/build spellings) is not a pin uv can honor.
+        if uv_pep508::uv_pep440::Version::from_str(version).is_err() {
+            continue;
+        }
+        let conda_key = CondaName::new(conda_name.clone()).key();
+        let pypi_name = match conda_to_pypi.get(&conda_key) {
+            // A declared edge is identity proof.
+            Some(mapped) => mapped.clone(),
+            None => match conda_claimants.get(&conda_key) {
+                // Claimed by a DIFFERENT PyPI distribution: neither spelling is
+                // a fact this pass may assert. Fail closed.
+                Some(claimant) if claimant != &conda_key => continue,
+                _ => conda_key.clone(),
+            },
+        };
+        let pypi_name = pypi_name.into_string();
+        if excluded.contains(&pypi_name)
+            || already.provenance.contains_key(&pypi_name)
+            || set.provenance.contains_key(&pypi_name)
+        {
+            continue;
+        }
+        let line = format!("{pypi_name}=={version}");
+        set.constraints.push(line.clone());
+        set.provenance.insert(
+            pypi_name,
+            ConstraintProvenance {
+                constraint: line,
+                conda_name: conda_name.clone(),
+                conda_version: format!("=={version}"),
+                source: LEARNED_WORKSPACE_FACT_SOURCE.to_string(),
+                env: env.to_string(),
+                provenance: Provenance::UvConstraint,
+            },
+        );
+    }
+    set.constraints.sort();
+    set
+}
+
 /// PyPI families whose published release line tracks the CUDA toolkit
 /// MAJOR version 1:1, the same way conda-forge's `cuda-version`
 /// metapackage anchors the conda side (`cuda-bindings` releases 12.x
@@ -6665,6 +6787,143 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
         assert!(msg.contains("No solution found"));
         assert!(msg.contains("retread solve"));
         assert!(msg.contains("conda package `mujoco`"));
+    }
+
+    /// F13(a). MEASURED (v13/v16 backend logs): `protomotions-deps-pack`
+    /// locked `transformers==5.15.1`, whose `Requires-Dist` is
+    /// `huggingface-hub>=1.5.0,<2.0`, into envs whose conda side had already
+    /// solved `huggingface_hub 0.36.0` (a transitive of conda
+    /// `transformers 4.57.6`, so NEVER a declared fact). The omission fired at
+    /// emission time -- `conflict: ... required by wheel transformers==5.15.1;
+    /// ==0.36.0 required by workspace conda fact` -- because the fact never
+    /// reached `uv lock`. It must now be a constraint, so uv picks a
+    /// transformers whose hub requirement admits 0.36.
+    #[test]
+    fn a_learned_transitive_conda_fact_reaches_uv_as_a_constraint() {
+        let solved = BTreeMap::from([
+            ("huggingface_hub".to_string(), "0.36.0".to_string()),
+            ("transformers".to_string(), "4.57.6".to_string()),
+            // Conda-only surface and unparseable versions are not uv pins.
+            ("python".to_string(), "3.11.9".to_string()),
+            ("libgcc-ng".to_string(), "13.2.0.h807b86a_5".to_string()),
+        ]);
+        // A DECLARED fact for transformers is already assembled; the learned
+        // pass must not restate or overwrite operator intent.
+        let mut declared = ConstraintSet::default();
+        declared
+            .constraints
+            .push("transformers==4.57.6".to_string());
+        declared.provenance.insert(
+            "transformers".to_string(),
+            ConstraintProvenance {
+                constraint: "transformers==4.57.6".to_string(),
+                conda_name: "transformers".to_string(),
+                conda_version: "==4.57.6".to_string(),
+                source: "workspace-solved".to_string(),
+                env: "precise-consuming-envs".to_string(),
+                provenance: Provenance::WorkspaceCondaFact("precise-consuming-envs".to_string()),
+            },
+        );
+
+        let learned = learned_fact_constraints(
+            &solved,
+            &BTreeMap::new(),
+            &Default::default(),
+            &declared,
+            &BTreeSet::new(),
+            "precise-consuming-envs",
+        );
+
+        assert_eq!(
+            learned.constraints,
+            vec!["huggingface-hub==0.36.0".to_string()],
+            "the transitive conda fact -- and only it -- must reach uv",
+        );
+        let prov = &learned.provenance["huggingface-hub"];
+        assert_eq!(prov.conda_name, "huggingface_hub");
+        assert_eq!(prov.source, LEARNED_WORKSPACE_FACT_SOURCE);
+        assert!(
+            prov.source.contains("learned"),
+            "a learned float must be distinguishable from declared intent: {}",
+            prov.source,
+        );
+        assert_eq!(
+            prov.provenance,
+            Provenance::UvConstraint,
+            "a learned float must not wear the provenance that arms Rule-3 routing",
+        );
+        assert_eq!(
+            authority(&prov.provenance),
+            Authority::Authoritative,
+            "but it must still solve and attribute",
+        );
+    }
+
+    /// F13(b). No workspace fact for a name means uv stays free to pick the
+    /// newest release -- the learned pass must never invent a pin.
+    #[test]
+    fn a_name_absent_from_the_workspace_solve_gets_no_learned_pin() {
+        let solved = BTreeMap::from([("numpy".to_string(), "2.1.0".to_string())]);
+        let learned = learned_fact_constraints(
+            &solved,
+            &BTreeMap::new(),
+            &Default::default(),
+            &ConstraintSet::default(),
+            &BTreeSet::new(),
+            "precise-consuming-envs",
+        );
+        assert!(
+            !learned.provenance.contains_key("transformers")
+                && !learned.provenance.contains_key("huggingface-hub"),
+            "{:?}",
+            learned.constraints,
+        );
+        // And an explicitly excluded name (override / keep-pypi / the pack's
+        // own entry) is never pinned to the workspace float either.
+        let excluded = learned_fact_constraints(
+            &solved,
+            &BTreeMap::new(),
+            &Default::default(),
+            &ConstraintSet::default(),
+            &BTreeSet::from(["numpy".to_string()]),
+            "precise-consuming-envs",
+        );
+        assert!(excluded.constraints.is_empty(), "{excluded:?}");
+    }
+
+    /// F13(c). When the learned fact and the wheel requirement genuinely
+    /// cannot both hold, the failure must be loud and name BOTH sides.
+    #[test]
+    fn an_unsatisfiable_learned_fact_names_both_sides() {
+        let solved = BTreeMap::from([("huggingface_hub".to_string(), "0.36.0".to_string())]);
+        let learned = learned_fact_constraints(
+            &solved,
+            &BTreeMap::new(),
+            &Default::default(),
+            &ConstraintSet::default(),
+            &BTreeSet::new(),
+            "precise-consuming-envs",
+        );
+
+        let stderr = "  x No solution found when resolving dependencies:\n  \
+             `-> Because transformers==5.15.1 depends on huggingface-hub>=1.5.0 and you \
+                 require huggingface-hub==0.36.0, we can conclude that your requirements \
+                 are unsatisfiable.";
+        let attributions = attribute_conflict(stderr, &learned.provenance);
+        assert_eq!(attributions.len(), 1, "{attributions:?}");
+        assert_eq!(attributions[0].required.as_deref(), Some(">=1.5.0"));
+
+        let msg = format_lock_failure(&sample_request(), stderr, &attributions);
+        assert!(
+            msg.contains("huggingface-hub>=1.5.0"),
+            "the wheel side must be named: {msg}",
+        );
+        assert!(
+            msg.contains("huggingface-hub==0.36.0")
+                && msg.contains("conda package `huggingface_hub` ==0.36.0")
+                && msg.contains(LEARNED_WORKSPACE_FACT_SOURCE),
+            "the conda side, and that it is a learned float, must be named: {msg}",
+        );
     }
 
     #[test]
