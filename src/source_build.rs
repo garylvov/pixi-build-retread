@@ -785,12 +785,30 @@ pub(crate) fn remove_owned_cache_entry(path: &Path) -> Result<()> {
 /// references drain. A leftover `.evicting-*` directory is inert (nothing
 /// resolves cache entries through it) and gets swept by the next eviction.
 fn remove_dir_all_nfs_tolerant(path: &Path) -> std::io::Result<()> {
-    let doomed = match (path.parent(), path.file_name()) {
+    remove_dir_all_nfs_tolerant_beside(path, path.parent())
+}
+
+/// [`remove_dir_all_nfs_tolerant`], but the caller names the directory that
+/// receives the renamed-aside tree. The default (the doomed path's own parent)
+/// is wrong when the parent is itself about to be published: a private build
+/// directory lives inside a staging tree that gets renamed into the cache, so
+/// a leftover `.evicting-*` sibling would be published as part of the cache
+/// entry. Renaming aside into the cache *family* directory keeps the leftover
+/// outside every published tree; family scanners filter to 64-hex leaf names
+/// (see `probe_cached_git_family_states`), so a dotted leftover is inert.
+///
+/// The aside name carries both the pid and a process-unique sequence: two
+/// concurrent builds in one process retire directories with the same file
+/// name (`build`) under the same parent, and a pid-only name would make the
+/// second rename land on the first's tree and fail with `ENOTEMPTY`.
+fn remove_dir_all_nfs_tolerant_beside(path: &Path, aside: Option<&Path>) -> std::io::Result<()> {
+    let doomed = match (aside, path.file_name()) {
         (Some(parent), Some(name)) => {
             let staged = parent.join(format!(
-                ".evicting-{}-{}",
+                ".evicting-{}-{}-{}",
                 name.to_string_lossy(),
-                std::process::id()
+                std::process::id(),
+                BUILD_TMP_SEQUENCE.fetch_add(1, Ordering::Relaxed),
             ));
             // Best effort: if the rename fails (cross-device, permissions,
             // a stale sibling), fall through and delete in place.
@@ -1415,6 +1433,55 @@ async fn materialize_validated_wheel(wheel: &ValidatedWheel, out_dir: &Path) -> 
     Ok(destination)
 }
 
+/// Retire the private build directory out of the staging tree that is about
+/// to be published.
+///
+/// The build has already succeeded and its wheel has already been renamed into
+/// the staging root by the time this runs, so this is a cleanup step -- but it
+/// used to be able to fail the whole build. On NFS the just-finished PEP 517
+/// build's children can still hold descriptors under the build directory, so
+/// unlinking silly-renames those files into `.nfsXXXX` siblings and the final
+/// rmdir returns `ENOTEMPTY` (os error 39). A plain `remove_dir_all` therefore
+/// turned a good build into `cleaning private build dir ...: Directory not
+/// empty`, which surfaces to uv as a missing wheel and kills the entire lock.
+///
+/// The load-bearing step is the *rename*: once the tree is out of staging, the
+/// staging tree is publishable regardless of what happens next. Deleting the
+/// renamed-aside tree is best effort; a leftover `.evicting-*` entry is inert
+/// and gets swept by the next eviction. Only a build directory that is still
+/// visible at its original path is a real error.
+///
+/// This never touches a path it did not create: it renames exactly the
+/// caller's own build directory, into a name stamped with this process's pid
+/// and a process-unique sequence. Sibling staging and eviction directories
+/// owned by other processes are left alone.
+fn retire_private_build_dir(build_dir: &Path, aside: Option<&Path>) -> Result<()> {
+    match remove_dir_all_nfs_tolerant_beside(build_dir, aside) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if build_dir.exists() {
+                return Err(error).with_context(|| {
+                    format!("cleaning private build dir {}", build_dir.display())
+                });
+            }
+            tracing::warn!(
+                build_dir = %build_dir.display(),
+                error = %error,
+                "private build dir was retired out of the staging tree but could not be \
+                 fully deleted; the leftover is inert and is swept by the next eviction",
+            );
+            Ok(())
+        }
+    }
+}
+
+/// The aside directory for a hermetic retry's build-dir reset: the build dir
+/// lives at `<family>/<staging>.tmp/build`, so its grandparent is the cache
+/// family directory -- outside the staging tree that later gets published.
+fn hermetic_retry_aside_dir(build_dir: &Path) -> Option<PathBuf> {
+    build_dir.parent()?.parent().map(Path::to_path_buf)
+}
+
 fn unique_staging_dir(cache_dir: &Path) -> Result<StagingDir> {
     let parent = cache_dir
         .parent()
@@ -1492,7 +1559,8 @@ where
     // backend scratch in the private output. The callback owns no state here;
     // reset the Retread-owned directory so the hermetic attempt is a clean
     // PEP 517 build and `find_built_wheel` can admit exactly one result.
-    remove_owned_cache_entry(build_dir)?;
+    restore_directory_write_bits(build_dir);
+    retire_private_build_dir(build_dir, hermetic_retry_aside_dir(build_dir).as_deref())?;
     std::fs::create_dir(build_dir)
         .with_context(|| format!("recreating hermetic build output {}", build_dir.display()))?;
     build(
@@ -1892,9 +1960,13 @@ where
     tokio::fs::rename(&built, &cached_wheel)
         .await
         .with_context(|| format!("staging built wheel {}", cached_wheel.display()))?;
-    tokio::fs::remove_dir_all(&build_dir)
-        .await
-        .with_context(|| format!("cleaning private build dir {}", build_dir.display()))?;
+    let retire_aside = cache_dir.parent().map(Path::to_path_buf);
+    tokio::task::spawn_blocking({
+        let build_dir = build_dir.clone();
+        move || retire_private_build_dir(&build_dir, retire_aside.as_deref())
+    })
+    .await
+    .context("private build dir retirement task panicked")??;
     std::fs::write(
         staging.0.join("artifact.json"),
         serde_json::to_vec_pretty(&marker).context("serializing built-wheel marker")?,
@@ -6773,6 +6845,208 @@ mod tests {
             let _ = std::fs::set_permissions(leftover.path(), std::fs::Permissions::from_mode(0o755));
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// F12. Two backend children under one cache root building the same sdist
+    /// concurrently used to kill the whole lock: the private build dir was
+    /// cleaned with a plain `remove_dir_all`, and on NFS the finished build's
+    /// silly-renamed `.nfsXXXX` leftovers make that return `ENOTEMPTY`
+    /// ("cleaning private build dir ...: Directory not empty (os error 39)"),
+    /// which uv sees as a missing wheel. An undeletable subdirectory blocks
+    /// the removal here exactly the way a silly-renamed sibling does.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn concurrent_builds_of_one_sdist_survive_an_undeletable_build_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let target = ResolutionTarget::from_parts("3.11", "linux-64", Some((2, 35)))
+            .with_hermetic_builds(false);
+        let source_identity = hash_fields(
+            b"f12-concurrent-sdist-test\0",
+            &[unique_test_dir("f12-concurrent").to_string_lossy().as_bytes()],
+        );
+        let cache = built_wheel_cache_dir("sdist", &source_identity, &target);
+        remove_owned_cache_entry(&cache).unwrap();
+        let family = cache.parent().expect("cache leaf has a family dir").to_path_buf();
+        let policy = crate::pypi::native_source_build_policy(
+            "linux-64",
+            "linux-64",
+            Some((2, 35)),
+            Some((2, 39)),
+            true,
+        );
+
+        let build_once = |output: PathBuf| {
+            let target = target.clone();
+            let source_identity = source_identity.clone();
+            let policy = policy.clone();
+            async move {
+                cached_build_with_acceptance(
+                    "sdist",
+                    &source_identity,
+                    &target,
+                    &output,
+                    Some(&ExpectedWheel::exact("pkg", "1.0.0")),
+                    policy,
+                    BuiltWheelRequirement::TargetCompatible,
+                    false,
+                    move |private_out, _environment| async move {
+                        write_test_wheel(
+                            &private_out.join("pkg-1.0.0-py3-none-any.whl"),
+                            "pkg",
+                            "1.0.0",
+                        );
+                        // Stand in for an NFS silly-rename: an entry under the
+                        // private build dir that `remove_dir_all` cannot unlink.
+                        let held = private_out.join("held");
+                        std::fs::create_dir_all(&held).unwrap();
+                        std::fs::write(held.join(".nfs0000deadbeef"), b"open elsewhere").unwrap();
+                        std::fs::set_permissions(&held, std::fs::Permissions::from_mode(0o555))
+                            .unwrap();
+                        Ok(())
+                    },
+                )
+                .await
+            }
+        };
+
+        let first_out = unique_test_dir("f12-concurrent-out-a");
+        let second_out = unique_test_dir("f12-concurrent-out-b");
+        let (first, second) = tokio::join!(
+            build_once(first_out.clone()),
+            build_once(second_out.clone()),
+        );
+
+        for (label, result) in [("first", &first), ("second", &second)] {
+            let error = match result {
+                Ok(_) => continue,
+                Err(error) => format!("{error:#}"),
+            };
+            panic!("{label} concurrent builder failed: {error}");
+        }
+        assert!(first.unwrap().is_file());
+        assert!(second.unwrap().is_file());
+
+        // Exactly one published wheel, and the private build dir never rode
+        // into the published cache entry.
+        let published: Vec<_> = std::fs::read_dir(&cache)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        let wheels: Vec<_> = published
+            .iter()
+            .filter(|name| name.ends_with(".whl"))
+            .collect();
+        assert_eq!(wheels.len(), 1, "published cache entry: {published:?}");
+        assert!(
+            !published.iter().any(|name| name == "build"
+                || name.starts_with(".evicting-")
+                || name.starts_with(".nfs")),
+            "published cache entry must not carry build scratch: {published:?}",
+        );
+
+        cleanup_family_dir(&family);
+        let _ = std::fs::remove_dir_all(&first_out);
+        let _ = std::fs::remove_dir_all(&second_out);
+    }
+
+    /// The retirement of a private build dir must only ever touch the tree the
+    /// caller created. A sibling staging directory and a sibling eviction
+    /// directory owned by another process must both survive a build untouched,
+    /// and the leftover this process creates must be stamped with its own pid.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn build_dir_retirement_never_touches_another_process_tree() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let target = ResolutionTarget::from_parts("3.11", "linux-64", Some((2, 35)))
+            .with_hermetic_builds(false);
+        let source_identity = hash_fields(
+            b"f12-ownership-test\0",
+            &[unique_test_dir("f12-ownership").to_string_lossy().as_bytes()],
+        );
+        let cache = built_wheel_cache_dir("sdist", &source_identity, &target);
+        remove_owned_cache_entry(&cache).unwrap();
+        let family = cache.parent().expect("cache leaf has a family dir").to_path_buf();
+        std::fs::create_dir_all(&family).unwrap();
+
+        // Two directories owned by a different (fabricated) pid.
+        let foreign_pid = u32::MAX;
+        let foreign_staging = family.join(format!(".{source_identity}.{foreign_pid}.0.tmp"));
+        let foreign_evicting = family.join(format!(".evicting-build-{foreign_pid}-0"));
+        for foreign in [&foreign_staging, &foreign_evicting] {
+            std::fs::create_dir_all(foreign).unwrap();
+            std::fs::write(foreign.join("sentinel"), b"owned by another process").unwrap();
+        }
+
+        let output = unique_test_dir("f12-ownership-out");
+        let policy = crate::pypi::native_source_build_policy(
+            "linux-64",
+            "linux-64",
+            Some((2, 35)),
+            Some((2, 39)),
+            true,
+        );
+        cached_build_with_acceptance(
+            "sdist",
+            &source_identity,
+            &target,
+            &output,
+            Some(&ExpectedWheel::exact("pkg", "1.0.0")),
+            policy,
+            BuiltWheelRequirement::TargetCompatible,
+            false,
+            move |private_out, _environment| async move {
+                write_test_wheel(&private_out.join("pkg-1.0.0-py3-none-any.whl"), "pkg", "1.0.0");
+                let held = private_out.join("held");
+                std::fs::create_dir_all(&held).unwrap();
+                std::fs::write(held.join(".nfs0000deadbeef"), b"open elsewhere").unwrap();
+                std::fs::set_permissions(&held, std::fs::Permissions::from_mode(0o555)).unwrap();
+                Ok(())
+            },
+        )
+        .await
+        .expect("a build must publish even when its private build dir cannot be deleted");
+
+        for foreign in [&foreign_staging, &foreign_evicting] {
+            assert_eq!(
+                std::fs::read(foreign.join("sentinel")).unwrap(),
+                b"owned by another process",
+                "another process's tree was disturbed: {}",
+                foreign.display(),
+            );
+        }
+
+        let own_pid = std::process::id();
+        for entry in std::fs::read_dir(&family).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            let Some(rest) = name.strip_prefix(".evicting-build-") else {
+                continue;
+            };
+            let pid = rest.split('-').next().unwrap_or_default();
+            assert!(
+                pid == own_pid.to_string() || pid == foreign_pid.to_string(),
+                "unexpected eviction leftover owner in {name}",
+            );
+        }
+
+        cleanup_family_dir(&family);
+        let _ = std::fs::remove_dir_all(&output);
+    }
+
+    #[cfg(unix)]
+    fn cleanup_family_dir(family: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fn chmod_tree(path: &Path) {
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755));
+            if let Ok(entries) = std::fs::read_dir(path) {
+                for entry in entries.flatten() {
+                    chmod_tree(&entry.path());
+                }
+            }
+        }
+        chmod_tree(family);
+        let _ = std::fs::remove_dir_all(family);
     }
 
     const CHECKOUT_SUBPROCESS_HELPER: &str = "source_build::tests::git_checkout_subprocess_helper";
