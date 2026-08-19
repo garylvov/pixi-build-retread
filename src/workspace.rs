@@ -3883,6 +3883,108 @@ mod tests {
     use std::str::FromStr;
     use url::Url;
 
+    /// The v7 lock's `platforms:` indirection, the url -> (name, version)
+    /// join through the top-level `packages:` list, and the fail-closed
+    /// intersection across consuming envs.
+    #[test]
+    fn locked_pypi_versions_join_urls_and_intersect_across_consuming_envs() {
+        let root = temp_workspace("lockread");
+        std::fs::write(
+            root.join("pixi.lock"),
+            r#"
+version: 7
+platforms:
+- name: p1
+  subdir: linux-64
+- name: p9
+  subdir: osx-arm64
+environments:
+  viral-gpu:
+    packages:
+      p1:
+      - conda: https://example.com/linux-64/python-3.11.conda
+      - pypi: https://example.com/torch-2.7.0.whl
+      - pypi: https://example.com/networkx-3.3.whl
+      p9:
+      - pypi: https://example.com/torch-2.5.0.whl
+  hover-gpu:
+    packages:
+      p1:
+      - pypi: https://example.com/torch-2.7.0.whl
+      - pypi: https://example.com/networkx-3.5.whl
+packages:
+- conda: https://example.com/linux-64/python-3.11.conda
+- pypi: https://example.com/torch-2.7.0.whl
+  name: torch
+  version: 2.7.0+cu128
+- pypi: https://example.com/torch-2.5.0.whl
+  name: torch
+  version: 2.5.0
+- pypi: https://example.com/networkx-3.3.whl
+  name: NetworkX
+  version: '3.3'
+- pypi: https://example.com/networkx-3.5.whl
+  name: networkx
+  version: '3.5'
+"#,
+        )
+        .unwrap();
+
+        // One consumer: every locked pypi dist on the matching subdir, keyed
+        // canonically, with the local segment preserved. The osx-arm64 rows
+        // must not leak in through the platform indirection.
+        let one = locked_pypi_versions_for_envs(
+            &root,
+            &BTreeSet::from(["viral-gpu".to_string()]),
+            "linux-64",
+        );
+        assert_eq!(
+            one,
+            BTreeMap::from([
+                ("torch".to_string(), "2.7.0+cu128".to_string()),
+                ("networkx".to_string(), "3.3".to_string()),
+            ]),
+            "one consumer yields its own linux-64 pypi selections",
+        );
+
+        // Two consumers: only a name locked at the SAME version in both
+        // survives. networkx disagrees (3.3 vs 3.5) and is dropped, exactly
+        // like the declaration-side intersection.
+        let both = locked_pypi_versions_for_envs(
+            &root,
+            &BTreeSet::from(["viral-gpu".to_string(), "hover-gpu".to_string()]),
+            "linux-64",
+        );
+        assert_eq!(
+            both,
+            BTreeMap::from([("torch".to_string(), "2.7.0+cu128".to_string())]),
+            "a name locked at two versions across consumers is not a fact",
+        );
+
+        // A consumer the lock has never solved: refuse to guess anything.
+        assert!(
+            locked_pypi_versions_for_envs(
+                &root,
+                &BTreeSet::from(["viral-gpu".to_string(), "never-locked".to_string()]),
+                "linux-64",
+            )
+            .is_empty(),
+            "an unsolved consumer means cannot-know, not unconstrained",
+        );
+
+        // No lock at all.
+        let empty = temp_workspace("lockread-none");
+        assert!(
+            locked_pypi_versions_for_envs(
+                &empty,
+                &BTreeSet::from(["viral-gpu".to_string()]),
+                "linux-64",
+            )
+            .is_empty(),
+            "a missing lock is cannot-know",
+        );
+    }
+
     fn ws_toml(text: &str) -> WorkspaceManifest {
         WorkspaceManifest::from_toml_source(text).unwrap()
     }
@@ -7632,4 +7734,131 @@ channels = ["conda-forge", "robostack-humble"]
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Workspace `pixi.lock` -- locked PyPI selections (F11 build-time bound check)
+// ---------------------------------------------------------------------------
+
+/// One entry under `environments.<env>.packages.<platform>` in `pixi.lock`.
+/// Conda rows deserialize with `pypi: None` and are ignored.
+#[derive(Debug, Deserialize)]
+struct PixiLockEnvEntry {
+    #[serde(default)]
+    pypi: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PixiLockEnv {
+    #[serde(default)]
+    packages: BTreeMap<String, Vec<PixiLockEnvEntry>>,
+}
+
+/// A `platforms:` row (lock v7). v6 keys `environments.<env>.packages` by the
+/// subdir directly and has no such table.
+#[derive(Debug, Deserialize)]
+struct PixiLockPlatform {
+    name: String,
+    subdir: String,
+}
+
+/// One top-level `packages:` row. Only PyPI rows carry the `name`/`version`
+/// pair this read needs; conda rows deserialize with `pypi: None`.
+#[derive(Debug, Deserialize)]
+struct PixiLockPackage {
+    #[serde(default)]
+    pypi: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    version: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PixiLockFile {
+    #[serde(default)]
+    platforms: Vec<PixiLockPlatform>,
+    #[serde(default)]
+    environments: BTreeMap<String, PixiLockEnv>,
+    #[serde(default)]
+    packages: Vec<PixiLockPackage>,
+}
+
+/// The PyPI versions the workspace's committed `pixi.lock` already selected for
+/// `envs` on `subdir`, INTERSECTED over those envs (a name locked at two
+/// different versions across consumers is dropped, exactly like
+/// `dependency_name_intersection` on the declaration side).
+///
+/// Returns an empty map -- "cannot know, do not act" -- when the lock is
+/// missing, unparseable, or does not yet contain one of `envs` (the cold first
+/// pass, before pixi has ever solved this workspace). The caller must treat an
+/// absent entry as "no check", never as "unconstrained".
+///
+/// Keys are PEP 503-canonical PyPI names; values are the literal locked version
+/// strings (local segments preserved: `2.7.0+cu128`).
+pub fn locked_pypi_versions_for_envs(
+    workspace_root: &Path,
+    envs: &BTreeSet<String>,
+    subdir: &str,
+) -> BTreeMap<String, String> {
+    if envs.is_empty() {
+        return BTreeMap::new();
+    }
+    let path = workspace_root.join("pixi.lock");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return BTreeMap::new();
+    };
+    let lock: PixiLockFile = match serde_yaml::from_str(&text) {
+        Ok(lock) => lock,
+        Err(err) => {
+            tracing::debug!(path = %path.display(), error = %err, "pixi.lock unparseable; no locked pypi facts");
+            return BTreeMap::new();
+        }
+    };
+    // url -> (canonical name, version). Rows without both are unusable.
+    let mut by_url: BTreeMap<&str, (String, &str)> = BTreeMap::new();
+    for package in &lock.packages {
+        let (Some(url), Some(name), Some(version)) =
+            (&package.pypi, &package.name, &package.version)
+        else {
+            continue;
+        };
+        by_url.insert(
+            url.as_str(),
+            (PypiKey::from_pypi(name).into_string(), version.as_str()),
+        );
+    }
+    // Platform keys that mean `subdir`: the v7 indirection plus the v6 literal.
+    let platform_keys: BTreeSet<&str> = lock
+        .platforms
+        .iter()
+        .filter(|platform| platform.subdir == subdir)
+        .map(|platform| platform.name.as_str())
+        .chain(std::iter::once(subdir))
+        .collect();
+
+    let mut intersected: Option<BTreeMap<String, String>> = None;
+    for env in envs {
+        let Some(locked_env) = lock.environments.get(env) else {
+            // A consumer the lock has never solved: refuse to guess.
+            return BTreeMap::new();
+        };
+        let mut versions: BTreeMap<String, String> = BTreeMap::new();
+        for (key, entries) in &locked_env.packages {
+            if !platform_keys.contains(key.as_str()) {
+                continue;
+            }
+            for entry in entries {
+                let Some(url) = &entry.pypi else { continue };
+                if let Some((name, version)) = by_url.get(url.as_str()) {
+                    versions.insert(name.clone(), (*version).to_owned());
+                }
+            }
+        }
+        match &mut intersected {
+            None => intersected = Some(versions),
+            Some(common) => common.retain(|name, version| versions.get(name) == Some(version)),
+        }
+    }
+    intersected.unwrap_or_default()
 }
