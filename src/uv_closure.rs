@@ -2615,6 +2615,15 @@ pub fn conda_spec_to_pep440(spec: &str) -> Option<String> {
     None
 }
 
+/// `(major, minor)` of a python version string (`"3.11.14"`, `"3.8"`, `"3.8.*"`).
+/// `None` when the leading two components are not both plain integers.
+fn python_minor(version: &str) -> Option<(u64, u64)> {
+    let mut parts = version.trim().split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
 /// Conda names never emitted as PyPI constraints (conda-only surface).
 fn is_conda_only_name(name: &str) -> bool {
     name.is_empty() || name == "python" || name == "python_abi" || name.starts_with("__")
@@ -2738,6 +2747,15 @@ pub const LEARNED_WORKSPACE_FACT_SOURCE: &str =
 /// * `already`: constraints already assembled (declared facts). A name they
 ///   cover keeps the declared line; a learned float never overwrites intent.
 /// * `excluded`: canonical PyPI names the pack overrides by hand.
+/// * `target_python`: the python minor THIS bundle resolves for. Learned facts
+///   are ADVISORY, and a fact learned under a different interpreter is not a
+///   fact about this closure at all: the consuming envs' solve for python 3.11
+///   selected `zipp 3.21.0`, whose PyPI distribution declares
+///   `Requires-Python >=3.9`, so injecting it into a python-3.8 bundle makes
+///   every dependent (`etils[epath]`) unsatisfiable (F13 turn 5, cert4 backend
+///   log 20:04:08). `solved_versions` carries the envs' own `python` record, so
+///   the comparison needs no extra plumbing; when it is absent or unparseable
+///   the facts are injected as before and the classifier is the safety net.
 pub fn learned_fact_constraints(
     solved_versions: &BTreeMap<String, String>,
     name_map: &NameMap,
@@ -2745,7 +2763,27 @@ pub fn learned_fact_constraints(
     already: &ConstraintSet,
     excluded: &BTreeSet<String>,
     env: &str,
+    target_python: &str,
 ) -> ConstraintSet {
+    // Provenance check FIRST: nothing learned under another interpreter is
+    // carried in, so the classifier never has to unwind a whole workspace's
+    // worth of facts one re-lock at a time.
+    if let (Some(learned_python), Some(target)) = (
+        solved_versions.get("python").and_then(|v| python_minor(v)),
+        python_minor(target_python),
+    ) && learned_python != target
+    {
+        tracing::debug!(
+            env = %env,
+            learned_python = %format!("{}.{}", learned_python.0, learned_python.1),
+            target_python = %format!("{}.{}", target.0, target.1),
+            facts = solved_versions.len(),
+            "learned conda facts skipped wholesale: they were selected by a \
+             conda solve for a different python minor than this bundle targets, \
+             so they are not facts about this closure",
+        );
+        return ConstraintSet::default();
+    }
     // Invert pypi->conda from the pack's declared map only. BTreeMap order
     // makes the alphabetically-first PyPI name win a conda-name collision.
     let mut conda_to_pypi: BTreeMap<PypiKey, PypiKey> = BTreeMap::new();
@@ -3754,10 +3792,20 @@ struct LearnedFactYieldNeeded {
     learned_version: String,
     /// Why the learned fact has to go.
     reason: LearnedFactYieldReason,
+    /// uv's own reason sentence for this package, verbatim (box-drawing and
+    /// hard wraps flattened). Empty when no sentence names the package.
+    uv_reason: String,
     original_error: String,
 }
 
 /// Why a LEARNED workspace conda fact must be dropped.
+///
+/// F13 turn 5 stopped enumerating reasons. Learned facts are ADVISORY, so the
+/// yield is triggered by the fact being NAMED in uv's conflict at all -- the
+/// variants below only choose the `reason=` label and the extra detail the
+/// warning can add. A reason nobody has seen yet (requires-python, an
+/// environment marker, a yanked release) lands in [`Self::NamedInConflict`]
+/// and yields exactly the same way instead of failing the pack.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LearnedFactYieldReason {
     /// A hard requirement stated inside the closure EXCLUDES the learned
@@ -3769,6 +3817,22 @@ enum LearnedFactYieldReason {
     /// tzdata==2026rc0" and every dependent becomes unsatisfiable. Carries
     /// conda's own spelling so the warning can name both sides.
     NoSuchVersion { conda_pin: String },
+    /// uv named the fact in the conflict for some other reason -- the shape
+    /// cert4 hit was `Requires-Python` (`zipp==3.21.0 depends on Python>=3.9`
+    /// under a `==3.8.*` request). No detail beyond uv's own sentence, which
+    /// [`LearnedFactYieldNeeded::uv_reason`] carries verbatim.
+    NamedInConflict,
+}
+
+impl LearnedFactYieldReason {
+    /// Stable `reason=` label for the yield warning.
+    fn label(&self) -> &'static str {
+        match self {
+            Self::ContradictedBy { .. } => "contradicted-by",
+            Self::NoSuchVersion { .. } => "no-such-version",
+            Self::NamedInConflict => "named-in-conflict",
+        }
+    }
 }
 
 /// Flatten uv's box-drawn, hard-wrapped conflict prose into one line so a
@@ -3829,6 +3893,46 @@ fn conflict_says_no_such_version(
     false
 }
 
+/// uv's own reason sentence for `name`, verbatim from the conflict prose.
+///
+/// The prose is box-drawn and hard-wrapped, so it is flattened first
+/// ([`flatten_conflict_prose`]) and then split on sentence boundaries -- a
+/// period followed by whitespace, which no PEP 440 version or specifier
+/// contains. The FIRST sentence that names the package is returned, because
+/// uv states the root cause before it propagates it ("Because the requested
+/// Python version (==3.8.*) does not satisfy Python>=3.9 and zipp==3.21.0
+/// depends on Python>=3.9, we can conclude that zipp==3.21.0 cannot be
+/// used."). `None` when no sentence names it.
+fn uv_reason_sentence(stderr: &str, name: &str) -> Option<String> {
+    // uv's own block markers are sentence boundaries the prose does not
+    // otherwise punctuate: `x` opens the summary line and `|->` opens the
+    // conflict body, neither preceded by a period, so without this the
+    // interpreter banner and the marker line would be glued onto the first
+    // real sentence. `|` continuation markers are NOT boundaries.
+    let marked = stderr.replace('\u{d7}', ". ").replace('\u{25b6}', ". ");
+    let prose = flatten_conflict_prose(&marked);
+    let re = regex::Regex::new(&format!(
+        r"(?i)(?:^|[^A-Za-z0-9._-]){}(?:[^A-Za-z0-9._-]|$)",
+        regex::escape(name)
+    ))
+    .expect("static package-name regex");
+    let mut start = 0usize;
+    let bytes = prose.as_bytes();
+    for (idx, _) in prose.match_indices(". ") {
+        let end = idx + 1;
+        let sentence = prose[start..end].trim();
+        if !sentence.is_empty() && re.is_match(sentence) {
+            return Some(sentence.to_string());
+        }
+        start = end;
+        while start < bytes.len() && bytes[start] == b' ' {
+            start += 1;
+        }
+    }
+    let tail = prose[start.min(prose.len())..].trim();
+    (!tail.is_empty() && re.is_match(tail)).then(|| tail.to_string())
+}
+
 impl std::fmt::Display for LearnedFactYieldNeeded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.original_error)
@@ -3868,38 +3972,36 @@ fn learned_fact_yield_needed(
         // requirement comparison because the requirement uv names in that
         // shape is the echo of our own constraint, which trivially "contains"
         // the learned version and would leave the fact in place forever.
-        if conflict_says_no_such_version(original_error, &attribution.package, &learned_version) {
-            return Some(LearnedFactYieldNeeded {
-                pypi_name: constraint_name,
-                learned_version: learned_version.to_string(),
-                reason: LearnedFactYieldReason::NoSuchVersion {
-                    conda_pin: format!(
-                        "{}{}",
-                        attribution.conda_source.conda_name, attribution.conda_source.conda_version
-                    ),
-                },
-                original_error: original_error.to_string(),
-            });
-        }
-        let Some(required) = attribution.required.as_deref() else {
-            continue;
+        let reason = if conflict_says_no_such_version(
+            original_error,
+            &attribution.package,
+            &learned_version,
+        ) {
+            LearnedFactYieldReason::NoSuchVersion {
+                conda_pin: format!(
+                    "{}{}",
+                    attribution.conda_source.conda_name, attribution.conda_source.conda_version
+                ),
+            }
+        } else if let Some(required) = attribution.required.as_deref()
+            && let Ok(upstream) = uv_pep508::uv_pep440::VersionSpecifiers::from_str(required.trim())
+            && !upstream.contains(&learned_version)
+        {
+            // A requirement that EXCLUDES the learned version: name it.
+            LearnedFactYieldReason::ContradictedBy {
+                upstream_requirement: format!("{}{}", attribution.package, required),
+            }
+        } else {
+            // Anything else uv blamed this learned fact for. It is still only
+            // ADVISORY, so it yields under uv's own sentence rather than
+            // failing the pack for a reason class nobody enumerated yet.
+            LearnedFactYieldReason::NamedInConflict
         };
-        let Ok(upstream) = uv_pep508::uv_pep440::VersionSpecifiers::from_str(required.trim())
-        else {
-            continue;
-        };
-        // Only a requirement that EXCLUDES the learned version is a
-        // contradiction. A learned fact the closure's requirements accept is
-        // left exactly where F13 put it.
-        if upstream.contains(&learned_version) {
-            continue;
-        }
         return Some(LearnedFactYieldNeeded {
             pypi_name: constraint_name,
             learned_version: learned_version.to_string(),
-            reason: LearnedFactYieldReason::ContradictedBy {
-                upstream_requirement: format!("{}{}", attribution.package, required),
-            },
+            reason,
+            uv_reason: uv_reason_sentence(original_error, &attribution.package).unwrap_or_default(),
             original_error: original_error.to_string(),
         });
     }
@@ -4001,33 +4103,37 @@ where
                         if !inserted {
                             return Err(anyhow!(original_error));
                         }
-                        match &needed.reason {
+                        // One warning for every yield class: the label says
+                        // WHICH class matched, `uv_reason` carries uv's own
+                        // sentence verbatim so an unenumerated class is still
+                        // fully diagnosable from the log alone.
+                        let detail = match &needed.reason {
                             LearnedFactYieldReason::ContradictedBy {
                                 upstream_requirement,
-                            } => tracing::warn!(
-                                bundle = %req.bundle,
-                                package = %needed.pypi_name,
-                                learned = %format!("{}=={}", needed.pypi_name, needed.learned_version),
-                                required = %upstream_requirement,
-                                "learned conda fact {}=={} yields to the closure's hard requirement {}; \
-                                 dropping the learned constraint and re-locking",
-                                needed.pypi_name,
-                                needed.learned_version,
-                                upstream_requirement,
+                            } => format!(
+                                " (the closure's hard requirement {upstream_requirement} excludes it)"
                             ),
-                            LearnedFactYieldReason::NoSuchVersion { conda_pin } => tracing::warn!(
-                                bundle = %req.bundle,
-                                package = %needed.pypi_name,
-                                learned = %conda_pin,
-                                translated = %format!("{}=={}", needed.pypi_name, needed.learned_version),
-                                "learned conda fact {} has no PyPI version matching its translation \
-                                 {}=={} (version-scheme mismatch); dropping the learned constraint \
-                                 and re-locking",
-                                conda_pin,
-                                needed.pypi_name,
-                                needed.learned_version,
+                            LearnedFactYieldReason::NoSuchVersion { conda_pin } => format!(
+                                " (conda spells it {conda_pin}; no PyPI version matches that \
+                                 translation)"
                             ),
-                        }
+                            LearnedFactYieldReason::NamedInConflict => String::new(),
+                        };
+                        tracing::warn!(
+                            bundle = %req.bundle,
+                            package = %needed.pypi_name,
+                            learned = %format!("{}=={}", needed.pypi_name, needed.learned_version),
+                            reason = %needed.reason.label(),
+                            uv_reason = %needed.uv_reason,
+                            "learned conda fact {}=={} is named in uv's conflict \
+                             (reason={}){}; dropping the learned constraint and re-locking. \
+                             uv's reason: {}",
+                            needed.pypi_name,
+                            needed.learned_version,
+                            needed.reason.label(),
+                            detail,
+                            needed.uv_reason,
+                        );
                         let mut names = BTreeSet::new();
                         names.insert(needed.pypi_name.clone());
                         apply_learned_fact_yields(&mut req, &names);
@@ -7233,6 +7339,7 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
             &declared,
             &BTreeSet::new(),
             "precise-consuming-envs",
+            "3.11",
         );
 
         assert_eq!(
@@ -7272,6 +7379,7 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
             &ConstraintSet::default(),
             &BTreeSet::new(),
             "precise-consuming-envs",
+            "3.11",
         );
         assert!(
             !learned.provenance.contains_key("transformers")
@@ -7288,6 +7396,7 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
             &ConstraintSet::default(),
             &BTreeSet::from(["numpy".to_string()]),
             "precise-consuming-envs",
+            "3.11",
         );
         assert!(excluded.constraints.is_empty(), "{excluded:?}");
     }
@@ -7304,6 +7413,7 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
             &ConstraintSet::default(),
             &BTreeSet::new(),
             "precise-consuming-envs",
+            "3.11",
         );
 
         let stderr = "  x No solution found when resolving dependencies:\n  \
@@ -7841,6 +7951,7 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
             &ConstraintSet::default(),
             &BTreeSet::new(),
             "precise-consuming-envs",
+            "3.11",
         )
     }
 
@@ -8009,6 +8120,195 @@ Using CPython 3.10.20 interpreter at: /users/glvov/.local/bin/python3.10
         );
     }
 
+    /// F13 turn 5, cert4 backend log 20:04:08 (`unitree-rl-gym-pack`, target
+    /// python 3.8): uv blames the learned `zipp==3.21.0` for a REQUIRES-PYTHON
+    /// reason -- neither a version contradiction nor a missing version, so the
+    /// two enumerated classes both miss it and the pack died. Verbatim, box
+    /// drawing included.
+    const CERT4_ZIPP_PASS_B_STDERR: &str = "\
+Using CPython 3.8.20
+  \u{d7} No solution found when resolving dependencies for split (markers:
+  \u{2502} python_full_version == '3.8.*' and platform_machine == 'x86_64' and
+  \u{2502} sys_platform == 'linux'):
+  \u{2570}\u{2500}\u{25b6} Because the requested Python version (==3.8.*) does not satisfy
+      Python>=3.9 and zipp==3.21.0 depends on Python>=3.9, we can conclude
+      that zipp==3.21.0 cannot be used.
+      And because etils[epath]>=0.2.0,<=1.3.0 depends on zipp==3.21.0 and the
+      requested Python version (==3.8.*) does not satisfy Python>=3.9, we can
+      conclude that etils[epath]<=0.2.0 cannot be used. (1)";
+
+    /// The learned `zipp==3.21.0` float F13 injected for that pack, tagged
+    /// exactly as `learned_fact_constraints` tags it.
+    fn cert4_zipp_provenance(provenance: Provenance, source: &str) -> ConstraintSet {
+        let mut set = ConstraintSet::default();
+        set.constraints.push("zipp==3.21.0".to_string());
+        set.provenance.insert(
+            "zipp".to_string(),
+            ConstraintProvenance {
+                constraint: "zipp==3.21.0".to_string(),
+                conda_name: "zipp".to_string(),
+                conda_version: "==3.21.0".to_string(),
+                source: source.to_string(),
+                env: "precise-consuming-envs".to_string(),
+                provenance,
+            },
+        );
+        set
+    }
+
+    /// (a) ANY learned fact uv names in the conflict yields, whatever the
+    /// reason class -- here `Requires-Python`, which no enumerated class
+    /// matches -- and the warning carries uv's own sentence verbatim.
+    #[tokio::test]
+    async fn a_learned_fact_named_in_a_requires_python_conflict_yields_and_relocks() {
+        let learned =
+            cert4_zipp_provenance(Provenance::UvConstraint, LEARNED_WORKSPACE_FACT_SOURCE);
+        let attributions = attribute_conflict(CERT4_ZIPP_PASS_B_STDERR, &learned.provenance);
+        let needed = learned_fact_yield_needed(&attributions, CERT4_ZIPP_PASS_B_STDERR).expect(
+            "a learned fact NAMED in the conflict must yield even when the reason is \
+             requires-python",
+        );
+        assert_eq!(needed.pypi_name, "zipp");
+        assert_eq!(needed.learned_version, "3.21.0");
+        assert_eq!(needed.reason, LearnedFactYieldReason::NamedInConflict);
+        assert_eq!(needed.reason.label(), "named-in-conflict");
+        assert_eq!(
+            needed.uv_reason,
+            "Because the requested Python version (==3.8.*) does not satisfy Python>=3.9 \
+             and zipp==3.21.0 depends on Python>=3.9, we can conclude that zipp==3.21.0 \
+             cannot be used.",
+            "the warning quotes uv's reason sentence for zipp verbatim",
+        );
+
+        // ... and the yield actually re-locks, zipp-free.
+        let mut req = sample_request();
+        req.constraints = learned;
+        let seen: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let raw = {
+            let seen = Arc::clone(&seen);
+            move |req: UvClosureRequest| {
+                seen.lock()
+                    .unwrap()
+                    .push(req.constraints.constraints.clone());
+                let attempt = seen.lock().unwrap().len();
+                Box::pin(async move {
+                    if attempt == 1 {
+                        let learned = cert4_zipp_provenance(
+                            Provenance::UvConstraint,
+                            LEARNED_WORKSPACE_FACT_SOURCE,
+                        );
+                        let attributions =
+                            attribute_conflict(CERT4_ZIPP_PASS_B_STDERR, &learned.provenance);
+                        return Err(anyhow::Error::new(
+                            learned_fact_yield_needed(&attributions, CERT4_ZIPP_PASS_B_STDERR)
+                                .expect("pass B blames the learned zipp fact"),
+                        ));
+                    }
+                    Ok(UvClosure {
+                        wheels: vec![],
+                        pins: BTreeMap::from([("etils".to_string(), "0.9.0".to_string())]),
+                        uv_version: "test".to_string(),
+                        auto_routed: vec![],
+                        auto_dropped: BTreeSet::new(),
+                        effective_input_requirements: None,
+                        dependency_graph: UvDependencyGraph::default(),
+                    })
+                }) as futures::future::BoxFuture<'static, Result<UvClosure>>
+            }
+        };
+        let yielded = Arc::new(Mutex::new(BTreeSet::new()));
+        let mut solve = with_learned_fact_yields(raw, Arc::clone(&yielded));
+        let closure = solve(req)
+            .await
+            .expect("dropping the requires-python-incompatible learned pin must let it resolve");
+        assert_eq!(closure.pins["etils"], "0.9.0");
+        assert_eq!(
+            *yielded.lock().unwrap(),
+            BTreeSet::from(["zipp".to_string()])
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "one retry, zipp-free: {seen:?}");
+        assert!(
+            !seen[1].iter().any(|line| line.starts_with("zipp")),
+            "the retry carries no zipp line: {:?}",
+            seen[1],
+        );
+    }
+
+    /// (b) The SAME prose against a DECLARED pin: operator intent never
+    /// yields, so the error stays loud.
+    #[test]
+    fn a_declared_pin_named_in_a_requires_python_conflict_never_yields() {
+        let declared = cert4_zipp_provenance(
+            Provenance::WorkspaceCondaFact("precise-consuming-envs".to_string()),
+            "workspace-solved",
+        );
+        let attributions = attribute_conflict(CERT4_ZIPP_PASS_B_STDERR, &declared.provenance);
+        assert!(
+            !attributions.is_empty(),
+            "the declared pin is still attributed in the same prose",
+        );
+        assert!(
+            learned_fact_yield_needed(&attributions, CERT4_ZIPP_PASS_B_STDERR).is_none(),
+            "operator intent is never silently dropped: the error stays loud",
+        );
+    }
+
+    /// (c) Injection side: the envs' own `python` record IS the provenance, so
+    /// a fact learned under python 3.11 never reaches a python-3.8 bundle.
+    #[test]
+    fn learned_facts_from_another_python_minor_are_never_injected() {
+        let solved = BTreeMap::from([
+            ("python".to_string(), "3.11.14".to_string()),
+            ("zipp".to_string(), "3.21.0".to_string()),
+            ("numpy".to_string(), "2.4.6".to_string()),
+        ]);
+        assert!(
+            learned_fact_constraints(
+                &solved,
+                &BTreeMap::new(),
+                &Default::default(),
+                &ConstraintSet::default(),
+                &BTreeSet::new(),
+                "precise-consuming-envs",
+                "3.8",
+            )
+            .constraints
+            .is_empty(),
+            "facts selected by a python-3.11 solve are not facts about a 3.8 closure",
+        );
+        // Same python: every fact is injected exactly as before.
+        assert_eq!(
+            learned_fact_constraints(
+                &solved,
+                &BTreeMap::new(),
+                &Default::default(),
+                &ConstraintSet::default(),
+                &BTreeSet::new(),
+                "precise-consuming-envs",
+                "3.11",
+            )
+            .constraints,
+            vec!["numpy==2.4.6".to_string(), "zipp==3.21.0".to_string()],
+        );
+        // Provenance absent (no `python` record): inject, and let the
+        // classifier be the safety net.
+        let no_python = BTreeMap::from([("zipp".to_string(), "3.21.0".to_string())]);
+        assert_eq!(
+            learned_fact_constraints(
+                &no_python,
+                &BTreeMap::new(),
+                &Default::default(),
+                &ConstraintSet::default(),
+                &BTreeSet::new(),
+                "precise-consuming-envs",
+                "3.8",
+            )
+            .constraints,
+            vec!["zipp==3.21.0".to_string()],
+        );
+    }
+
     #[test]
     fn a_conda_only_version_spelling_is_never_injected_as_a_pypi_fact() {
         let learned = learned_fact_constraints(
@@ -8021,6 +8321,7 @@ Using CPython 3.10.20 interpreter at: /users/glvov/.local/bin/python3.10
             &ConstraintSet::default(),
             &BTreeSet::new(),
             "precise-consuming-envs",
+            "3.11",
         );
         assert_eq!(
             learned.constraints,
@@ -8120,6 +8421,7 @@ Using CPython 3.10.20 interpreter at: /users/glvov/.local/bin/python3.10
             &ConstraintSet::default(),
             &BTreeSet::new(),
             "precise-consuming-envs",
+            "3.11",
         )
     }
 
@@ -8216,16 +8518,26 @@ Using CPython 3.10.20 interpreter at: /users/glvov/.local/bin/python3.10
         );
     }
 
+    /// F13 turn 5 SUPERSEDES this test's original assertion. It used to require
+    /// that a learned fact whose named requirement ACCEPTS it stays injected.
+    /// Learned facts are advisory, and cert4 showed uv blames them for reasons
+    /// that have nothing to do with the requirement it echoes (requires-python,
+    /// markers), so being NAMED in the conflict is now the whole trigger and
+    /// the accepting-requirement case yields under `named-in-conflict`.
     #[test]
-    fn a_learned_fact_no_requirement_contradicts_is_still_injected() {
+    fn a_learned_fact_an_accepting_requirement_names_still_yields() {
         let learned = sage_learned_sympy_constraints();
         // Same shape, but the closure's requirement ACCEPTS the learned float.
         let compatible = "Because torch==2.5.1+cu124 depends on sympy>=1.13 and sympy==1.14.0, \
                           we can conclude that torch==2.5.1+cu124 cannot be used.";
         let attributions = attribute_conflict(compatible, &learned.provenance);
-        assert!(
-            learned_fact_yield_needed(&attributions, "original").is_none(),
-            "a learned fact the closure's requirements accept keeps F13's behaviour",
+        let needed = learned_fact_yield_needed(&attributions, compatible)
+            .expect("a learned fact uv names in the conflict yields whatever the reason");
+        assert_eq!(needed.pypi_name, "sympy");
+        assert_eq!(needed.reason, LearnedFactYieldReason::NamedInConflict);
+        assert_eq!(
+            needed.uv_reason,
+            compatible.split_whitespace().collect::<Vec<_>>().join(" ")
         );
 
         // A DECLARED fact is operator intent and never yields: it keeps its own

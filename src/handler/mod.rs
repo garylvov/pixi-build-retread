@@ -6628,6 +6628,10 @@ fn workspace_fact_constraints(
     learned_excluded: &BTreeSet<String>,
     fact_name_map: &NameMap,
     global_name_map: &PypiToCondaMap,
+    // F13 turn 5: the python minor THIS bundle resolves for. Learned facts
+    // selected by a conda solve for a different interpreter are not facts
+    // about this closure and are dropped at injection.
+    target_python: &str,
 ) -> crate::uv_closure::ConstraintSet {
     let mut constraints = crate::uv_closure::ConstraintSet::default();
     for (pypi_name, fact) in &facts.common_pypi {
@@ -6664,6 +6668,7 @@ fn workspace_fact_constraints(
         &constraints,
         learned_excluded,
         "precise-consuming-envs",
+        target_python,
     );
     constraints.constraints.extend(learned.constraints);
     constraints.provenance.extend(learned.provenance);
@@ -7252,6 +7257,7 @@ async fn uv_group_closure(
                 &learned_excluded,
                 fact_name_map,
                 load_pypi_to_conda_map().await.as_ref(),
+                target.python_version(),
             )
         }
         crate::config::RoutePolicy::Aggressive => match (manifest_opt.as_ref(), workspace_dir) {
@@ -8419,6 +8425,7 @@ gpu = { features = ["gpu"], no-default-feature = true }
             &BTreeSet::new(),
             &name_map(&[("torch", "pytorch")]),
             &PypiToCondaMap::new(),
+            "3.11",
         );
         assert_eq!(constraints.constraints, vec!["torch==2.5.1"]);
         assert_eq!(constraints.provenance["torch"].source, "workspace-solved");
@@ -8476,6 +8483,7 @@ gpu = { features = ["gpu"], no-default-feature = true }
             &BTreeSet::new(),
             &name_map(&[("transformers", "transformers")]),
             &PypiToCondaMap::new(),
+            "3.11",
         );
         assert!(
             constraints
@@ -8541,6 +8549,7 @@ gpu = { features = ["gpu"], no-default-feature = true }
                     "torch".to_string(),
                     vec!["pytorch".to_string(), "pytorch-gpu".to_string()],
                 )]),
+                "3.11",
             )
             .constraints
             .is_empty()
@@ -8594,6 +8603,7 @@ gpu = { features = ["gpu"], no-default-feature = true }
                 &BTreeSet::new(),
                 &NameMap::new(),
                 &PypiToCondaMap::new(),
+                "3.11",
             )
             .constraints
             .is_empty()
