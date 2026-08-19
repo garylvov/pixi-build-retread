@@ -8805,3 +8805,146 @@ fn patchelf_is_not_a_pack_run_requirement() {
         "patchelf is a hermetic-build tool, never a pack run dep: {names:?}",
     );
 }
+
+// ---- F20 guards: a native provider that is an ABI ANCHOR is never bare ----
+
+fn emitted_dep_specs(output: &super::CondaOutput) -> Vec<(String, String)> {
+    output
+        .run_dependencies
+        .depends
+        .iter()
+        .map(|dependency| {
+            (
+                dependency.name.as_str().to_string(),
+                super::audit_report::format_packagespec(&dependency.spec),
+            )
+        })
+        .collect()
+}
+
+/// Guard (F20a). `cuda-cudart` is an ABI anchor (`solve::is_abi_anchor`), so
+/// `check_output_abi_invariants` rejects it emitted name-only -- that is what
+/// killed the whole `conda/outputs` request for `flashsac-pack` in cert5
+/// (2026-08-19). A pack shipping `nvidia-cuda-runtime-cu12` that does NOT
+/// already carry the anchor must emit it PINNED to the workspace's solved
+/// version, and `produce_output` (which runs the invariant) must succeed.
+#[test]
+fn an_anchor_native_provider_absent_from_run_deps_is_emitted_pinned() {
+    let mut bundle = solo_bundle("flashsac-pack", vec![]);
+    bundle.extras.push(rw(
+        "nvidia-cuda-runtime-cu12",
+        meta("nvidia-cuda-runtime-cu12", "12.9.79", vec![], true),
+    ));
+    bundle
+        .workspace_conda_versions
+        .insert("cuda-cudart".to_string(), "12.9.79".to_string());
+    let output = super::produce_output(
+        &bundle,
+        &cfg(),
+        rattler_conda_types::Platform::Linux64,
+        "3.11",
+        &[],
+        None,
+        None,
+    )
+    .expect("the ABI invariant must accept a pinned anchor provider");
+    let specs = emitted_dep_specs(&output);
+    let anchor = specs
+        .iter()
+        .find(|(name, _)| name == "cuda-cudart")
+        .unwrap_or_else(|| panic!("the pack must emit the conda owner of the shim: {specs:?}"));
+    assert_eq!(
+        anchor.1.trim(),
+        "==12.9.79",
+        "an ABI anchor provider must carry the workspace's solved spec, never `*`: {specs:?}",
+    );
+}
+
+/// Guard (F20b). Same shim wheel, but the anchor is ALREADY a run-dep (an
+/// auto-route to `cuda-cudart`). The native-provider emission must not restate
+/// it: a second, name-only `cuda-cudart` is both a duplicate and an anchor
+/// widening.
+#[test]
+fn an_anchor_native_provider_already_in_run_deps_is_not_restated() {
+    let mut bundle = solo_bundle(
+        "flashsac-pack",
+        vec!["nvidia-cuda-runtime-cu12==12.9.79"],
+    );
+    bundle.extras.push(rw(
+        "nvidia-cuda-runtime-cu12",
+        meta("nvidia-cuda-runtime-cu12", "12.9.79", vec![], true),
+    ));
+    bundle.auto_routed.push(BundleAutoRoute {
+        route: crate::uv_closure::AutoRoutedPackage {
+            pypi_name: "nvidia-cuda-runtime-cu12".to_string(),
+            conda_name: "cuda-cudart".to_string(),
+            pypi_version: "12.9.79".to_string(),
+            conda_version: "12.9.79".to_string(),
+            channel: "https://conda.example.invalid/linux-64".to_string(),
+            input_requirements: Vec::new(),
+            origin: crate::uv_closure::RouteOrigin::Fixpoint,
+        },
+        provenance: Provenance::PriorSelection,
+        workspace_provider: None,
+    });
+    let output = super::produce_output(
+        &bundle,
+        &cfg(),
+        rattler_conda_types::Platform::Linux64,
+        "3.11",
+        &[],
+        None,
+        None,
+    )
+    .expect("the ABI invariant must accept the routed anchor");
+    let specs = emitted_dep_specs(&output);
+    let anchors = specs
+        .iter()
+        .filter(|(name, _)| name == "cuda-cudart")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        anchors.len(),
+        1,
+        "the native-provider emission must not duplicate a carried anchor: {specs:?}",
+    );
+    let spec = anchors[0].1.trim();
+    assert!(
+        !spec.is_empty() && spec != "*",
+        "the carried anchor must keep its concrete spec: {specs:?}",
+    );
+}
+
+/// Guard (F20c). A NON-anchor provider (`cusparselt`) is unaffected: it is
+/// still emitted name-only, because nothing pins its ABI and the workspace has
+/// no selection to carry.
+#[test]
+fn a_non_anchor_native_provider_is_still_emitted_name_only() {
+    let mut bundle = solo_bundle("flashsac-pack", vec![]);
+    bundle.extras.push(rw(
+        "nvidia-cusparselt-cu12",
+        meta("nvidia-cusparselt-cu12", "0.8.1.1", vec![], true),
+    ));
+    let output = super::produce_output(
+        &bundle,
+        &cfg(),
+        rattler_conda_types::Platform::Linux64,
+        "3.11",
+        &[],
+        None,
+        None,
+    )
+    .unwrap();
+    let specs = emitted_dep_specs(&output);
+    let provider = specs
+        .iter()
+        .find(|(name, _)| name == "cusparselt")
+        .unwrap_or_else(|| panic!("the non-anchor provider must still be emitted: {specs:?}"));
+    assert!(
+        provider.1.trim().is_empty() || provider.1.trim() == "*",
+        "a non-anchor provider stays name-only: {specs:?}",
+    );
+    assert!(
+        !crate::solve::is_abi_anchor("cusparselt"),
+        "fixture premise: cusparselt is not an ABI anchor",
+    );
+}
