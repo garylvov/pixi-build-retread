@@ -1058,11 +1058,20 @@ fn workspace_provided_wheel_bound_is_carried_as_conda_constrains() {
     // it). It must state the bound its own wheels were built against, which is
     // exactly what conda `constrains` is for: inert unless something else
     // pulls the name in, binding when it does.
+    //
+    // Turn 10 correction, MEASURED on the v8 cold relock
+    // (`verify_fixes/artifacts/v8-viral-gpu.backend.log`, 09:27:02.526701 then
+    // 09:27:02.526708): a name a workspace conda provider owns is ALSO a
+    // uv-closure member, so the carry was recomputed and then thrown away by
+    // the uv-closure gate. The fixture must therefore put the name in BOTH
+    // sets, or it cannot see the defect the live pack has.
     let mut bundle = solo_bundle("hub-cap-pack", vec!["huggingface-hub>=0.34.0"]);
     bundle.primary.original_requires_dist = vec!["huggingface-hub<1.0,>=0.34.0".to_string()];
     bundle
         .auto_dropped
         .insert(canonical_conda_name("huggingface-hub"));
+    bundle.uv_closure_names.insert("huggingface-hub".into());
+    bundle.uv_closure_names.insert("huggingface_hub".into());
 
     let output =
         produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
@@ -1118,6 +1127,10 @@ fn emitted_conda_constrains_survive_the_lock_round_trip_on_replay() {
     bundle
         .auto_dropped
         .insert(canonical_conda_name("huggingface-hub"));
+    // Same live shape as the guard above: owned by a workspace conda provider
+    // AND a uv-closure member.
+    bundle.uv_closure_names.insert("huggingface-hub".into());
+    bundle.uv_closure_names.insert("huggingface_hub".into());
 
     let fresh = produce_output(
         &bundle,
