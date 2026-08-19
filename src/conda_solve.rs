@@ -502,8 +502,13 @@ pub(crate) fn build_virtual_packages_for_subdir_target(
     let host_baseline = if detected_virtual_packages.is_some() {
         Vec::new()
     } else {
+        // F14: detect with the workspace's declared floors substituted for
+        // anything this host cannot satisfy, and warn once with the exports
+        // pixi itself needs. `VirtualPackageOverrides::default()` is `None`
+        // for every field, so the pre-F14 call also ignored an explicit
+        // `CONDA_OVERRIDE_*`; `solve_overrides` honours it.
         match rattler_virtual_packages::VirtualPackage::detect(
-            &rattler_virtual_packages::VirtualPackageOverrides::default(),
+            &crate::virtual_override::solve_overrides(system_requirements),
         ) {
             Ok(vps) => vps.into_iter().map(GenericVirtualPackage::from).collect(),
             Err(e) => {

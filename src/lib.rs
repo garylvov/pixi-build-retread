@@ -35,6 +35,7 @@ pub mod source_build;
 pub mod status;
 pub(crate) mod thread_budget;
 pub mod uv_closure;
+pub(crate) mod virtual_override;
 pub mod wheel;
 pub mod wheel_inject;
 pub mod wheel_inject_data;
