@@ -7734,3 +7734,154 @@ fn cold_mismatch_recovery_disabled_for_ambiguous_identity() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// -----------------------------------------------------------------
+// fix/obs-rpc-errors: the JSON-RPC boundary must be LOUD.
+//
+// Regression under guard: retread returned a JSON-RPC error for
+// `protomotions-deps-pack` and logged NOTHING at error level. Pixi's
+// frontend (`build_dispatch.rs:477`) `.expect()`s the response and prints
+// only "failed to build", so the operator saw no cause whatsoever.
+// CLAUDE.md §1.9: every failure must be loud and reach an actor.
+// -----------------------------------------------------------------
+
+fn capture_error_logs<T>(body: impl FnOnce() -> T) -> (T, String) {
+    let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::ERROR)
+        .with_writer({
+            let logs = std::sync::Arc::clone(&logs);
+            move || SharedLogWriter(std::sync::Arc::clone(&logs))
+        })
+        .finish();
+    let value = tracing::subscriber::with_default(subscriber, body);
+    let text = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    (value, text)
+}
+
+#[test]
+fn dispatch_logs_every_rpc_error_with_method_subject_and_full_message() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("the guard test needs a current-thread runtime so the \
+                 thread-local tracing subscriber stays in scope");
+
+    // A conda/build_v1 request naming a pack, which cannot succeed: the
+    // handler was never initialized, and the params are not a valid
+    // CondaBuildV1Params. Either way it must leave the boundary as an error.
+    let params = serde_json::json!({
+        "output": { "name": "protomotions-deps-pack", "version": "0.1.0" },
+    });
+    let (result, logs) = capture_error_logs(|| {
+        runtime.block_on(async {
+            Handler::new()
+                .dispatch("conda/build_v1".to_string(), params)
+                .await
+        })
+    });
+
+    let error = result.expect_err("an uninitialized conda/build_v1 must fail");
+    assert!(
+        logs.contains("retread rpc error:"),
+        "the boundary must emit the greppable prefix; got: {logs}"
+    );
+    assert!(
+        logs.contains("conda/build_v1"),
+        "the log must name the method; got: {logs}"
+    );
+    assert!(
+        logs.contains("protomotions-deps-pack=0.1.0"),
+        "the log must name the pack/output the request was about; got: {logs}"
+    );
+    assert!(
+        logs.contains(error.message.trim()),
+        "the log must carry the FULL message that goes on the wire \
+         ({}); got: {logs}",
+        error.message
+    );
+    assert!(
+        logs.contains("ERROR"),
+        "the event must be at error level; got: {logs}"
+    );
+}
+
+#[test]
+fn dispatch_logs_errors_from_methods_without_an_output_name() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("the guard test needs a current-thread runtime");
+
+    // `initialize` with no [build.config] table: the documented refusal.
+    // No output name exists in these params, so the subject degrades to the
+    // (uninitialized) source-dir fallback rather than vanishing.
+    let (result, logs) = capture_error_logs(|| {
+        runtime.block_on(async {
+            Handler::new()
+                .dispatch("initialize".to_string(), serde_json::json!({}))
+                .await
+        })
+    });
+
+    let error = result.expect_err("initialize without a config must fail");
+    assert!(
+        logs.contains("retread rpc error:"),
+        "every method's errors must be logged, not just conda/build_v1; got: {logs}"
+    );
+    assert!(
+        logs.contains("initialize"),
+        "the log must name the method; got: {logs}"
+    );
+    assert!(
+        logs.contains(error.message.trim()),
+        "the log must carry the wire message ({}); got: {logs}",
+        error.message
+    );
+}
+
+#[test]
+fn dispatch_does_not_log_successful_requests() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("the guard test needs a current-thread runtime");
+
+    let (result, logs) = capture_error_logs(|| {
+        runtime.block_on(async {
+            Handler::new()
+                .dispatch(
+                    "negotiateCapabilities".to_string(),
+                    serde_json::json!({ "capabilities": {} }),
+                )
+                .await
+        })
+    });
+
+    result.expect("negotiateCapabilities must succeed");
+    assert!(
+        !logs.contains("retread rpc error:"),
+        "a successful request must not emit an error line; got: {logs}"
+    );
+}
+
+#[test]
+fn rpc_subject_prefers_the_output_name_over_the_source_dir_fallback() {
+    assert_eq!(
+        rpc_subject_from_params(&serde_json::json!({
+            "output": { "name": "protomotions-deps-pack", "version": "0.1.0" }
+        }))
+        .as_deref(),
+        Some("protomotions-deps-pack=0.1.0")
+    );
+    assert_eq!(
+        rpc_subject_from_params(&serde_json::json!({ "output": { "name": "pack" } })).as_deref(),
+        Some("pack")
+    );
+    assert_eq!(
+        rpc_subject_from_params(&serde_json::json!({ "hostPlatform": "linux-64" })),
+        None
+    );
+}

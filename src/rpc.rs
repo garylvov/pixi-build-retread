@@ -46,8 +46,15 @@ impl RpcError {
 }
 
 impl<E: std::fmt::Display> From<E> for RpcError {
+    /// Formats with `{:#}`, NOT `{}`. For `anyhow::Error` the alternate flag
+    /// renders the whole cause chain (`outer: middle: root`); plain `{}`
+    /// prints only the outermost context and silently discards every
+    /// `.context()` and the underlying I/O/parse error. Pixi's frontend
+    /// surfaces this string verbatim (and `build_dispatch.rs` `.expect()`s
+    /// it), so anything dropped here is unrecoverable for the operator.
+    /// Types whose `Display` ignores `#` are unaffected.
     fn from(e: E) -> Self {
-        Self::internal(e.to_string())
+        Self::internal(format!("{e:#}"))
     }
 }
 
@@ -156,4 +163,43 @@ pub fn parse_params<T: DeserializeOwned>(params: Value) -> Result<T, RpcError> {
 /// Helper: serialize a typed result into JSON-RPC `result`.
 pub fn ok<T: Serialize>(value: T) -> Result<Value, RpcError> {
     serde_json::to_value(value).map_err(RpcError::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Guard for fix/obs-rpc-errors: `?` on an `anyhow::Error` must carry the
+    /// whole cause chain onto the wire. With the old `e.to_string()` this
+    /// asserted string is just "outer", and every `.context()` plus the root
+    /// cause is destroyed before pixi ever sees it.
+    #[test]
+    fn anyhow_errors_keep_their_full_cause_chain_on_the_wire() {
+        let error: anyhow::Error = anyhow::anyhow!("root cause: no such file")
+            .context("while reading the pack manifest")
+            .context("conda/build_v1 failed");
+        let rpc = RpcError::from(error);
+        assert_eq!(rpc.code, INTERNAL_ERROR);
+        assert!(
+            rpc.message.contains("conda/build_v1 failed"),
+            "{}",
+            rpc.message
+        );
+        assert!(
+            rpc.message.contains("while reading the pack manifest"),
+            "the intermediate context must survive; got: {}",
+            rpc.message
+        );
+        assert!(
+            rpc.message.contains("root cause: no such file"),
+            "the ROOT cause must survive; got: {}",
+            rpc.message
+        );
+    }
+
+    #[test]
+    fn plain_display_errors_are_unchanged() {
+        let rpc = RpcError::from(std::io::Error::other("boom"));
+        assert_eq!(rpc.message, "boom");
+    }
 }

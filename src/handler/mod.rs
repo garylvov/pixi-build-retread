@@ -2453,12 +2453,77 @@ fn workspace_conda_provider_route(
     })
 }
 
+/// Pull a pack/output label out of raw JSON-RPC params.
+///
+/// Reads the wire JSON rather than the typed structs because the error being
+/// reported may BE a params-deserialization failure. `conda/build_v1` carries
+/// `output.name` (see `params.output.name` use at the build site);
+/// `conda/outputs` carries none, so callers fall back to the source dir.
+fn rpc_subject_from_params(params: &Value) -> Option<String> {
+    let name = params
+        .get("output")
+        .and_then(|o| o.get("name"))
+        .or_else(|| params.get("name"))
+        .and_then(Value::as_str)?;
+    let version = params
+        .get("output")
+        .and_then(|o| o.get("version"))
+        .and_then(Value::as_str);
+    Some(match version {
+        Some(version) => format!("{name}={version}"),
+        None => name.to_string(),
+    })
+}
+
 impl Handler {
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// JSON-RPC boundary. Every error leaving this function becomes a wire
+    /// error response and nothing else: pixi's frontend
+    /// (`build_dispatch.rs` `.expect()`) collapses it to "failed to build",
+    /// so if we do not log here the operator gets no cause at all.
+    /// CLAUDE.md §1.9 -- failure is loud and reaches an actor.
+    ///
+    /// The log line carries the greppable prefix `retread rpc error:`, the
+    /// method, the pack/output subject, the JSON-RPC code, and the FULL
+    /// message (which, thanks to `impl From<E> for RpcError` formatting with
+    /// `{:#}`, is the whole anyhow cause chain).
     pub async fn dispatch(&self, method: String, params: Value) -> Result<Value, RpcError> {
+        let subject = self.rpc_subject(&params).await;
+        let result = self.dispatch_inner(method.clone(), params).await;
+        if let Err(error) = &result {
+            tracing::error!(
+                rpc_method = %method,
+                rpc_subject = %subject,
+                rpc_code = error.code,
+                "retread rpc error: method={method} subject={subject} code={code}: {message}",
+                code = error.code,
+                message = error.message,
+            );
+        }
+        result
+    }
+
+    /// Best-effort human label for the thing the request is about, so the
+    /// error line names the pack instead of just the method. Reads the raw
+    /// params (typed parsing may itself be what failed) and falls back to the
+    /// initialized source directory's name.
+    async fn rpc_subject(&self, params: &Value) -> String {
+        if let Some(name) = rpc_subject_from_params(params) {
+            return name;
+        }
+        match self.state.read().await.source_dir.as_deref() {
+            Some(dir) => dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| dir.display().to_string()),
+            None => "<unknown>".to_string(),
+        }
+    }
+
+    async fn dispatch_inner(&self, method: String, params: Value) -> Result<Value, RpcError> {
         match method.as_str() {
             NEGOTIATE => self.negotiate(parse_params(params)?).await.and_then(ok),
             INITIALIZE => self.initialize(parse_params(params)?).await.and_then(ok),
