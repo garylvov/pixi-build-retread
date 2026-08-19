@@ -27,6 +27,7 @@ pub mod recipe;
 pub mod relax;
 pub(crate) mod relax_decision;
 pub mod relaxation_record;
+pub mod repair;
 pub mod repodata;
 pub mod rpc;
 pub mod solve;

@@ -1110,7 +1110,7 @@ pub(crate) fn missing_locked_wheels_from_installed(
     missing
 }
 
-fn record_path_token(line: &str) -> Option<String> {
+pub(crate) fn record_path_token(line: &str) -> Option<String> {
     let trimmed = line.trim_start();
     if trimmed.is_empty() {
         return None;
@@ -1568,6 +1568,27 @@ pub async fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
     )
     .await?;
 
+    // ── D2: make the destructive replay survivable ──────────────────────
+    // uv runs the replay as uninstall-then-install and its uninstall is NOT
+    // transactional. Snapshot what the transaction will uninstall BEFORE it
+    // runs (once uv has deleted a RECORD, ownership can no longer be
+    // reconstructed) and delete the unowned bytecode that makes uv's
+    // post-uninstall `rmdir` abort with `Directory not empty (os error 39)`,
+    // stranding the prefix with a half-removed, still-importable package.
+    // See `crate::repair`.
+    let replay_names = crate::repair::replay_dist_names(&wheel_files);
+    let (transaction, pruned_pycache) = crate::repair::prepare_transaction(
+        &site_packages_dir(prefix, &lock.python),
+        &replay_names,
+    )?;
+    if pruned_pycache > 0 {
+        eprintln!(
+            "retread install: {} pre-cleaned {pruned_pycache} unowned __pycache__ \
+             dir(s) before the replay",
+            lock.bundle
+        );
+    }
+
     let mut relaxed_platform: Option<String> = None;
     let mut declaration_source: Option<String> = None;
 
@@ -1620,6 +1641,15 @@ pub async fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
             })
             .ok();
 
+        // The prefix is about to be mutated destructively; record it so a
+        // crashed or killed repair is distinguishable from a completed one.
+        crate::repair::mark_state(
+            &share,
+            &lock.bundle,
+            crate::repair::RepairState::Repairing,
+            &install_msg,
+        );
+
         let status = Command::new(&uv)
             .args(&args)
             .status()
@@ -1642,21 +1672,34 @@ pub async fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
                         .status()
                         .with_context(|| format!("spawning uv ({uv:?}) with relaxed platform"))?;
                     if !status.success() {
-                        bail!(
-                            "uv pip install failed for bundle {} even after relaxing the \
-                             manylinux platform tag to {} (status {status})",
-                            lock.bundle,
-                            outcome.platform
-                        );
+                        return Err(crate::repair::fail_repair(
+                            &share,
+                            &lock.bundle,
+                            &transaction,
+                            anyhow::anyhow!(
+                                "uv pip install failed for bundle {} even after relaxing \
+                                 the manylinux platform tag to {} (status {status})",
+                                lock.bundle,
+                                outcome.platform
+                            ),
+                        ));
                     }
                     relaxed_platform = Some(outcome.platform);
                     declaration_source = Some(outcome.declaration_source.to_string());
                 }
                 None => {
-                    bail!(
-                        "uv pip install failed for bundle {} (status {status})",
-                        lock.bundle
-                    );
+                    // A failed replay must leave the previous complete state
+                    // or a clean ABSENCE -- never a half-removed tree that
+                    // still imports as a PEP 420 namespace package.
+                    return Err(crate::repair::fail_repair(
+                        &share,
+                        &lock.bundle,
+                        &transaction,
+                        anyhow::anyhow!(
+                            "uv pip install failed for bundle {} (status {status})",
+                            lock.bundle
+                        ),
+                    ));
                 }
             }
         }
@@ -1682,6 +1725,7 @@ pub async fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
     std::fs::create_dir_all(&share).ok();
     write_marker_atomic(&marker, &crate::glibc::marker_body(&want, &audit)?)?;
     let _ = std::fs::remove_file(share.join(format!("{}.broken", lock.bundle)));
+    crate::repair::mark_state(&share, &lock.bundle, crate::repair::RepairState::Installed, "");
     let done_msg = format!("retread install: {} installed", lock.bundle);
     eprintln!("{done_msg}");
     crate::status::phase(
