@@ -171,6 +171,61 @@ pub(crate) async fn load_record(
     Some(record)
 }
 
+/// The live workspace solve fingerprint, read from whatever sibling locks are
+/// on disk RIGHT NOW.
+///
+/// PRIVATE ON PURPOSE. This is the function whose result drifts between the
+/// metadata pass and the build pass, and every identity refusal this module
+/// exists to fix was a gate calling it directly. It is unreachable from
+/// `handler::mod` (and from every other module), so the only fingerprint a
+/// gate can obtain is [`EffectiveWorkspaceFp`], which has folded the record in.
+fn live_workspace_fp(
+    workspace_manifest: Option<&crate::workspace::WorkspaceManifest>,
+    workspace_dir: &Path,
+    source_dir: &Path,
+    target: &crate::pypi::ResolutionTarget,
+) -> String {
+    workspace_manifest
+        .map(|m| super::workspace_solve_fingerprint(m, workspace_dir, source_dir, target))
+        .unwrap_or_default()
+}
+
+/// The ONE workspace solve fingerprint a build request derives identity from.
+///
+/// Structural enforcement of "identity is a function of the inputs the
+/// ADVERTISING pass saw, never of which pass is running": [`live_workspace_fp`]
+/// is private to this module, so [`resolve`](Self::resolve) is the only
+/// constructor in the crate. Every identity gate in `conda/build_v1` -- the
+/// WS-B replay hash, the cold candidate hash, the lock-parity recovery
+/// fingerprint, `validate_advertised_courier_build`, and `build_one`'s packing
+/// fingerprint -- takes this type by value or reference, so a gate added later
+/// physically cannot bypass the record: there is no other way to make one, and
+/// the compiler, not a code-review convention, is what keeps stragglers out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EffectiveWorkspaceFp(String);
+
+impl EffectiveWorkspaceFp {
+    /// Resolve the fingerprint for this build request: the recorded one when
+    /// the advertising pass left a record for the requested identity, the live
+    /// one (and today's drift gate) when it did not.
+    pub(crate) fn resolve(
+        record: Option<&AdvertisedIdentityRecord>,
+        workspace_manifest: Option<&crate::workspace::WorkspaceManifest>,
+        workspace_dir: &Path,
+        source_dir: &Path,
+        target: &crate::pypi::ResolutionTarget,
+    ) -> Self {
+        Self(workspace_fp_for_build(
+            record,
+            live_workspace_fp(workspace_manifest, workspace_dir, source_dir, target),
+        ))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// The workspace solve fingerprint the build pass must resolve under.
 ///
 /// With a record: the fingerprint the advertised identity was computed from,

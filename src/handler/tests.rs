@@ -6769,6 +6769,112 @@ fn unrelated_existing_route_keeps_incremental_fast_path_version_safe() {
     );
 }
 
+/// Guard for the LAST identity gate in `conda/build_v1` (`v10`, job 5080874):
+/// the advertised-identity record was written, loaded and applied, `0 exact
+/// matches` was gone -- and the build still died one gate lower with
+/// `courier inputs changed between conda/outputs and conda/build_v1: pixi
+/// requested build py312_h0b0e3ca4ee_loose_0, but current inputs ... require
+/// py312_hf6f1825ac6_loose_0`, because
+/// `validate_advertised_courier_build` recomputed the workspace solve
+/// fingerprint from the sibling locks that existed at THAT moment.
+///
+/// The two arms are the whole contract:
+///   * with a record for the requested build, the gate resolves under the
+///     fingerprint the identity was advertised from and passes even though the
+///     live sibling view has moved;
+///   * with no record, the live view stands and the drift is still refused --
+///     the fix must not blind the gate, only stop it from asking the wrong
+///     question.
+#[test]
+fn the_advertised_courier_build_gate_resolves_under_the_recorded_fingerprint() {
+    let mut config = cfg();
+    config.courier = true;
+    config
+        .retread_wheels
+        .insert("protomotions-deps-pack".to_string(), WheelEntry::default());
+    let target = ResolutionTarget::for_subdir("3.12", "linux-64");
+    let source = Path::new("/source");
+    let ws = Path::new("/ws");
+
+    // The metadata pass advertised its identity under the sibling-lock view it
+    // saw, and recorded that exact fingerprint beside the build string.
+    let record = AdvertisedIdentityRecord {
+        schema: advertised_identity::SCHEMA,
+        name: "protomotions-deps-pack".to_string(),
+        version: "3.1".to_string(),
+        build: String::new(),
+        subdir: "linux-64".to_string(),
+        target_identity: target.resolution_identity(),
+        python_version: target.python_version().to_string(),
+        workspace_fp: "sibling-locks-as-of-the-metadata-pass".to_string(),
+    };
+    let advertising_fp = EffectiveWorkspaceFp::resolve(Some(&record), None, ws, source, &target);
+    assert_eq!(
+        advertising_fp.as_str(),
+        "sibling-locks-as-of-the-metadata-pass"
+    );
+    // Derived here from the recorded fingerprint DIRECTLY, not through the
+    // gate's own helper: otherwise a helper that ignores the resolved
+    // fingerprint would compute both sides the same way and the fixture could
+    // never see the drift it exists to catch.
+    let advertised_build = courier_build_string_for_target(
+        &target,
+        &courier_inputs_hash_with_workspace_fp(
+            &config,
+            "protomotions-deps-pack",
+            &target,
+            &[],
+            None,
+            advertising_fp.as_str(),
+        ),
+        config.build_number,
+        config.bundle_mode == crate::config::BundleMode::Loose,
+    );
+
+    // The build pass runs later; siblings have written locks since, so the
+    // LIVE fingerprint is a different string.
+    let drifted_live_fp = EffectiveWorkspaceFp::resolve(None, None, ws, source, &target);
+    assert_ne!(
+        drifted_live_fp.as_str(),
+        advertising_fp.as_str(),
+        "fixture must actually model sibling drift"
+    );
+
+    // Arm 1 -- the record exists: the gate must pass.
+    validate_advertised_courier_build(
+        &config,
+        "protomotions-deps-pack",
+        &target,
+        None,
+        None,
+        source,
+        &EffectiveWorkspaceFp::resolve(Some(&record), None, ws, source, &target),
+        Some(&advertised_build),
+    )
+    .expect(
+        "a build request whose identity was advertised under a recorded workspace fingerprint \
+         must be validated under that same fingerprint, never under whatever sibling locks \
+         exist when the build pass happens to run",
+    );
+
+    // Arm 2 -- no record: today's refusal, unchanged.
+    let error = validate_advertised_courier_build(
+        &config,
+        "protomotions-deps-pack",
+        &target,
+        None,
+        None,
+        source,
+        &drifted_live_fp,
+        Some(&advertised_build),
+    )
+    .expect_err("without a record the live fingerprint stands and real drift is still refused");
+    assert!(
+        format!("{error:?}").contains("courier inputs changed"),
+        "{error:?}"
+    );
+}
+
 /// conda/outputs may detect an incremental add and advertise `lock.version`,
 /// while build_v1 later fails that detection gate because the lock, config,
 /// environment, or cache changed between RPCs. Without a persisted marker,
@@ -6801,6 +6907,8 @@ fn disappeared_build_incremental_detection_rejects_primary_version_drift() {
     .unwrap();
     let advertised = metadata.metadata.version.to_string();
     let target = ResolutionTarget::for_subdir("3.11", "linux-64");
+    let live_fp =
+        EffectiveWorkspaceFp::resolve(None, None, Path::new("/ws"), Path::new("/source"), &target);
     let unchanged_manifest_build = current_courier_build_for_input_bundle(
         &config,
         "a-new-primary",
@@ -6808,6 +6916,7 @@ fn disappeared_build_incremental_detection_rejects_primary_version_drift() {
         None,
         None,
         Path::new("/source"),
+        &live_fp,
     );
     assert!(
         validate_advertised_courier_build(
@@ -6817,6 +6926,7 @@ fn disappeared_build_incremental_detection_rejects_primary_version_drift() {
             None,
             None,
             Path::new("/source"),
+            &live_fp,
             Some(&unchanged_manifest_build),
         )
         .is_ok(),

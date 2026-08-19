@@ -4,7 +4,7 @@ mod audit_report;
 use audit_report::{build_bundle_audit, write_probe_trace};
 
 mod advertised_identity;
-use advertised_identity::{AdvertisedIdentityRecord, workspace_fp_for_build};
+use advertised_identity::{AdvertisedIdentityRecord, EffectiveWorkspaceFp};
 
 mod auto_bundle;
 use auto_bundle::{
@@ -599,42 +599,15 @@ fn validate_advertised_non_courier_target_build(
 ///
 /// IMPORTANT: the arguments must be constructed identically at every call
 /// site — see the inline notes in each caller.
-fn courier_inputs_hash(
-    config: &crate::config::RetreadConfig,
-    bundle_name: &str,
-    target: &ResolutionTarget,
-    channels: &[String],
-    workspace_manifest: Option<&crate::workspace::WorkspaceManifest>,
-    workspace_dir: &std::path::Path,
-    source_dir: &std::path::Path,
-) -> String {
-    let workspace_fp = courier_workspace_fp(workspace_manifest, workspace_dir, source_dir, target);
-    courier_inputs_hash_with_workspace_fp(
-        config,
-        bundle_name,
-        target,
-        channels,
-        workspace_manifest,
-        &workspace_fp,
-    )
-}
-
-/// The workspace solve fingerprint `courier_inputs_hash` folds in by default.
-///
-/// Exposed separately because the metadata pass must RECORD the exact string
-/// it resolved under (`advertised_identity`) and the build pass must be able to
-/// resolve under that recorded string instead of re-reading sibling locks that
-/// have appeared since.
-fn courier_workspace_fp(
-    workspace_manifest: Option<&crate::workspace::WorkspaceManifest>,
-    workspace_dir: &std::path::Path,
-    source_dir: &std::path::Path,
-    target: &ResolutionTarget,
-) -> String {
-    workspace_manifest
-        .map(|m| workspace_solve_fingerprint(m, workspace_dir, source_dir, target))
-        .unwrap_or_default()
-}
+// `courier_inputs_hash` (which computed the workspace fingerprint itself) and
+// `courier_workspace_fp` (the live-fingerprint entry point) were DELETED here.
+// Both let a gate derive an identity from whatever sibling locks exist at the
+// moment it runs, which is exactly the drift the advertised-identity record
+// exists to defeat, and every remaining gate below reached one of them. The
+// live fingerprint now has a single private producer inside
+// `advertised_identity`, and the only obtainable fingerprint is
+// `EffectiveWorkspaceFp`, which has already folded the record in. See
+// `advertised_identity::EffectiveWorkspaceFp`.
 
 /// [`courier_inputs_hash`] resolved under an explicitly supplied workspace
 /// fingerprint. Identity must be a function of the inputs the advertising pass
@@ -677,19 +650,19 @@ fn current_courier_build_for_input_bundle(
     workspace_manifest: Option<&crate::workspace::WorkspaceManifest>,
     workspace_dir: Option<&Path>,
     source_dir: &Path,
+    workspace_fp: &EffectiveWorkspaceFp,
 ) -> String {
     let workspace_root = workspace_dir.unwrap_or(source_dir);
     let channels = workspace_manifest
         .map(|manifest| workspace_courier_channels(manifest, workspace_root, source_dir, target))
         .unwrap_or_default();
-    let inputs_hash = courier_inputs_hash(
+    let inputs_hash = courier_inputs_hash_with_workspace_fp(
         config,
         input_bundle_name,
         target,
         &channels,
         workspace_manifest,
-        workspace_root,
-        source_dir,
+        workspace_fp.as_str(),
     );
     courier_build_string_for_target(
         target,
@@ -706,6 +679,7 @@ fn validate_advertised_courier_build(
     workspace_manifest: Option<&crate::workspace::WorkspaceManifest>,
     workspace_dir: Option<&Path>,
     source_dir: &Path,
+    workspace_fp: &EffectiveWorkspaceFp,
     advertised_build: Option<&str>,
 ) -> Result<(), RpcError> {
     let current_build = current_courier_build_for_input_bundle(
@@ -715,6 +689,7 @@ fn validate_advertised_courier_build(
         workspace_manifest,
         workspace_dir,
         source_dir,
+        workspace_fp,
     );
     if advertised_build_matches(advertised_build, &current_build) {
         return Ok(());
@@ -3171,7 +3146,11 @@ impl Handler {
                     // Compute the courier inputs hash once here: it feeds both
                     // the replay gate (hash-check) and produce_output (embedded
                     // in the content-addressed build string). None for non-courier.
-                    let courier_workspace_fp_for_outputs = courier_workspace_fp(
+                    // The ADVERTISING pass: no record exists yet by
+                    // definition, so this resolves to the live fingerprint and
+                    // is then recorded below as the identity's inputs.
+                    let courier_workspace_fp_for_outputs = EffectiveWorkspaceFp::resolve(
+                        None,
                         workspace_manifest.as_ref(),
                         workspace_dir.as_deref().unwrap_or(source_dir.as_path()),
                         &source_dir,
@@ -3201,7 +3180,7 @@ impl Handler {
                             &target,
                             &courier_channels,
                             workspace_manifest.as_ref(),
-                            &courier_workspace_fp_for_outputs,
+                            courier_workspace_fp_for_outputs.as_str(),
                         ))
                     } else {
                         None
@@ -3403,7 +3382,7 @@ impl Handler {
                                 subdir: output.metadata.subdir.to_string(),
                                 target_identity: target.resolution_identity(),
                                 python_version: target.python_version().to_string(),
-                                workspace_fp: courier_workspace_fp_for_outputs.clone(),
+                                workspace_fp: courier_workspace_fp_for_outputs.as_str().to_string(),
                             },
                         )
                         .await;
@@ -3681,6 +3660,25 @@ impl Handler {
             }
             None => None,
         };
+        // THE single workspace-fingerprint resolution for this build request.
+        // Every identity derivation below -- the WS-B replay hash, the cold
+        // candidate hash, the lock-parity recovery fingerprint, both
+        // `validate_advertised_courier_build` gates and `build_one`'s packing
+        // fingerprint -- takes this value. None of them can compute their own:
+        // the live-fingerprint function is private to `advertised_identity`
+        // and `EffectiveWorkspaceFp::resolve` is its only constructor, so a
+        // gate added later cannot silently drift back to reading whatever
+        // sibling locks exist at the moment it happens to run.
+        let build_workspace_manifest = workspace_dir
+            .as_deref()
+            .and_then(crate::workspace::WorkspaceManifest::load);
+        let effective_workspace_fp = EffectiveWorkspaceFp::resolve(
+            advertised_identity_record.as_ref(),
+            build_workspace_manifest.as_ref(),
+            workspace_dir.as_deref().unwrap_or(&source_dir),
+            &source_dir,
+            &target,
+        );
         let mut prepared_build_selection = self
             .lookup_prepared_build_for_target(
                 generation,
@@ -3717,17 +3715,11 @@ impl Handler {
             // the fingerprint the advertised identity was actually computed
             // from whenever the metadata pass recorded it; with no record this
             // falls back to the freshly computed one and to today's gate.
-            let workspace_fp = workspace_fp_for_build(
-                advertised_identity_record.as_ref(),
-                courier_workspace_fp(
-                    ws_manifest_for_replay.as_ref(),
-                    workspace_dir.as_deref().unwrap_or(&source_dir),
-                    &source_dir,
-                    &target,
-                ),
+            let config_fp = crate::courier::config_fingerprint(
+                &config,
+                &courier_channels,
+                effective_workspace_fp.as_str(),
             );
-            let config_fp =
-                crate::courier::config_fingerprint(&config, &courier_channels, &workspace_fp);
             // The bundle_name for the hash is the requested output name
             // (params.output.name.as_normalized()), which equals bundle.conda_name
             // and is what courier::stage uses as the lock key.
@@ -3742,7 +3734,7 @@ impl Handler {
                 &target,
                 &courier_channels,
                 ws_manifest_for_replay.as_ref(),
-                &workspace_fp,
+                effective_workspace_fp.as_str(),
             );
             let current_build = courier_build_string_for_target(
                 &target,
@@ -4077,17 +4069,16 @@ impl Handler {
                     bundle.conda_name
                 )));
             }
-            let prepared_workspace_manifest = workspace_dir
-                .as_deref()
-                .and_then(crate::workspace::WorkspaceManifest::load);
+            let prepared_workspace_manifest = build_workspace_manifest.as_ref();
             if prepared.plan.declared_config.courier {
                 validate_advertised_courier_build(
                     &prepared.plan.declared_config,
                     input_bundle_name,
                     &prepared.plan.target,
-                    prepared_workspace_manifest.as_ref(),
+                    prepared_workspace_manifest,
                     workspace_dir.as_deref(),
                     &source_dir,
+                    &effective_workspace_fp,
                     Some(expected_build),
                 )?;
                 validate_advertised_courier_version(
@@ -4107,6 +4098,7 @@ impl Handler {
                 &source_dir,
                 workspace_dir.as_deref(),
                 input_bundle_name,
+                &effective_workspace_fp,
                 Some(expected_build),
                 prepared.incremental_version_override.as_deref(),
                 run_override.as_deref(),
@@ -4188,11 +4180,8 @@ impl Handler {
                 )
             })
             .collect();
-        let cold_workspace_manifest = workspace_dir
-            .as_deref()
-            .and_then(crate::workspace::WorkspaceManifest::load);
+        let cold_workspace_manifest = build_workspace_manifest.as_ref();
         let courier_channels = cold_workspace_manifest
-            .as_ref()
             .map(|manifest| {
                 workspace_courier_channels(
                     manifest,
@@ -4210,15 +4199,7 @@ impl Handler {
         // requested `py311_h3c24f86882_loose_0` and refusing with "identity
         // differs". The candidate identity must be a function of the inputs the
         // ADVERTISING pass saw, so it resolves under the recorded fingerprint.
-        let cold_workspace_fp = workspace_fp_for_build(
-            advertised_identity_record.as_ref(),
-            courier_workspace_fp(
-                cold_workspace_manifest.as_ref(),
-                workspace_dir.as_deref().unwrap_or(source_dir.as_path()),
-                &source_dir,
-                &target,
-            ),
-        );
+        let cold_workspace_fp = &effective_workspace_fp;
         let mut matching_bundles = Vec::new();
         let mut rejected_candidates: Vec<String> = Vec::new();
         // Option D lock-parity recovery (docs/RETREAD_DETERMINISM_FIX_DESIGN.md):
@@ -4238,8 +4219,8 @@ impl Handler {
                     &base_bundle.conda_name,
                     &target,
                     &courier_channels,
-                    cold_workspace_manifest.as_ref(),
-                    &cold_workspace_fp,
+                    cold_workspace_manifest,
+                    cold_workspace_fp.as_str(),
                 )
             });
             let rich_target_hash = (!config.courier)
@@ -4389,7 +4370,7 @@ impl Handler {
                     let config_fp = crate::courier::config_fingerprint(
                         &config,
                         &courier_channels,
-                        &cold_workspace_fp,
+                        cold_workspace_fp.as_str(),
                     );
                     // Always warn: a recovered build must stay distinguishable
                     // from one whose fresh derivation actually reproduced the
@@ -4480,9 +4461,10 @@ impl Handler {
                 &config,
                 &input_bundle_name,
                 &target,
-                cold_workspace_manifest.as_ref(),
+                cold_workspace_manifest,
                 workspace_dir.as_deref(),
                 &source_dir,
+                cold_workspace_fp,
                 params.output.build.as_deref(),
             )?;
             validate_advertised_courier_version(
@@ -4503,6 +4485,7 @@ impl Handler {
             &source_dir,
             workspace_dir.as_deref(),
             &input_bundle_name,
+            cold_workspace_fp,
             params.output.build.as_deref(),
             None,
             run_override.as_deref(),
@@ -16182,6 +16165,7 @@ async fn build_one(
     source_dir: &Path,
     workspace_dir: Option<&Path>,
     input_bundle_name: &str,
+    workspace_fp: &EffectiveWorkspaceFp,
     expected_build: Option<&str>,
     courier_version_override: Option<&str>,
     run_override: Option<&[String]>,
@@ -16312,19 +16296,12 @@ async fn build_one(
             .as_ref()
             .map(|m| m.resolution_pypi_index_urls())
             .unwrap_or_else(|| vec![crate::index_chain::PUBLIC_PYPI.to_string()]);
-        // grizzly H1: fold the workspace solve environment into the hash.
-        // Pack-scoped: only envs that reference source_dir are hashed.
-        let workspace_fp = ws_manifest
-            .as_ref()
-            .map(|m| {
-                workspace_solve_fingerprint(
-                    m,
-                    workspace_dir.unwrap_or(source_dir),
-                    source_dir,
-                    target,
-                )
-            })
-            .unwrap_or_default();
+        // grizzly H1: the workspace solve environment is folded into the
+        // hash, Pack-scoped. It is NOT recomputed here: this fingerprint
+        // decides the build string the artifact is packed under, so it must be
+        // the same one the identity was advertised from. It arrives as an
+        // `EffectiveWorkspaceFp` from `conda/build_v1`, which is the only
+        // constructor in the crate.
         let entry_indexes: Vec<String> = config
             .retread_wheels
             .values()
@@ -16365,8 +16342,11 @@ async fn build_one(
                 )
             })
             .unwrap_or_default();
-        let config_fp =
-            crate::courier::config_fingerprint(declared_config, &courier_channels, &workspace_fp);
+        let config_fp = crate::courier::config_fingerprint(
+            declared_config,
+            &courier_channels,
+            workspace_fp.as_str(),
+        );
         // Constrains are OUR emission, not pixi's solve: pixi forwards
         // `run_dependencies` (depends) only, so unlike `run_deps` there is no
         // authoritative forwarded list. Re-derive from the same emission
