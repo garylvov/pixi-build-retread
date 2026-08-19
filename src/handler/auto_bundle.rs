@@ -2625,6 +2625,35 @@ fn should_eagerly_prewarm_probe_routes(
     probe_parallelism > 1 && has_mutable_candidates
 }
 
+/// Bounded concurrency for the post-rejection PyPI restore fetches (fix
+/// f17). Matches the 8-way bound already used for the per-round fetch.
+pub(crate) const RESTORE_FETCH_CONCURRENCY: usize = 8;
+
+/// Run `make` over `items` with bounded concurrency, preserving INPUT
+/// order in the output.
+///
+/// `buffered` (not `buffer_unordered`) is deliberate: the results become
+/// bundle extras, and extras order decides the next round's
+/// `Requires-Dist` scan order, so the output must stay deterministic even
+/// though the requests overlap on the wire. The first `Err` short-circuits,
+/// preserving the old `await?` failure semantics.
+pub(crate) async fn fetch_bounded_concurrent<I, T, F, Fut, R>(
+    items: I,
+    concurrency: usize,
+    make: F,
+) -> Result<Vec<R>>
+where
+    I: IntoIterator<Item = T>,
+    F: Fn(T) -> Fut,
+    Fut: std::future::Future<Output = Result<R>>,
+{
+    use futures::stream::{self, StreamExt, TryStreamExt};
+    stream::iter(items.into_iter().map(make))
+        .buffered(concurrency.max(1))
+        .try_collect()
+        .await
+}
+
 async fn jointly_unroute_unsolvable_with_route_precheck<C, CF, W, WF, V, VF, X, XF>(
     bundle: &mut Bundle,
     metadata_routes: &mut ProvisionalMetadataRoutes,
@@ -3094,7 +3123,15 @@ where
 
     // Fetch every wheel before changing routing. A missing index candidate
     // therefore fails without leaving the bundle partially un-routed.
-    let mut restored_wheels = Vec::with_capacity(finalized_restore_requests.len());
+    //
+    // fix f17: the fetches are issued with bounded concurrency. They used to
+    // be a serial `for request { ... fetch_pypi(..).await? }`, so a bundle
+    // with 100 rejected routes paid 100 index round-trips end to end --
+    // inside pixi's single conda-solve permit and with no log output
+    // (`isaac-pack-latest`: ~30 minutes of total silence). The wheel-store
+    // lock discipline is unchanged: `fetch_pypi` is the same entry point the
+    // already-concurrent round-fetch above uses.
+    let mut to_fetch = Vec::with_capacity(finalized_restore_requests.len());
     for request in finalized_restore_requests {
         let request_key = PypiKey::from_pypi(&request.pypi_name);
         let already_bundled = bundle
@@ -3139,8 +3176,14 @@ where
                 request.pypi_name
             ))
             .to_string();
-        restored_wheels.push(fetch_pypi(request, indexes.to_vec(), failure_context).await?);
+        to_fetch.push((request, failure_context));
     }
+    let restored_wheels = fetch_bounded_concurrent(
+        to_fetch,
+        RESTORE_FETCH_CONCURRENCY,
+        |(request, failure_context)| fetch_pypi(request, indexes.to_vec(), failure_context),
+    )
+    .await?;
 
     let mut trial = bundle.clone();
     trial

@@ -5926,8 +5926,18 @@ fn workspace_conda_provider_candidates(
 struct BundleProbeMetrics {
     bundle: String,
     probes: std::sync::atomic::AtomicUsize,
+    /// Route-probe verdict cache outcomes (fix f17). Counted here so the
+    /// end-of-bundle summary can state `hit/miss N/M` and silence about a
+    /// probe storm becomes impossible.
+    cache_hits: std::sync::atomic::AtomicUsize,
+    cache_misses: std::sync::atomic::AtomicUsize,
     timing: std::sync::Mutex<BundleProbeTiming>,
 }
+
+/// Emit a progress line every this many EXECUTED probes so a long probe
+/// batch can never run silently (fix f17: 100 probes ran for ~30 minutes
+/// with zero backend output).
+const PROBE_PROGRESS_INTERVAL: usize = 10;
 
 #[derive(Debug, Default)]
 struct BundleProbeTiming {
@@ -5942,6 +5952,8 @@ impl BundleProbeMetrics {
         Self {
             bundle: bundle.to_string(),
             probes: std::sync::atomic::AtomicUsize::new(0),
+            cache_hits: std::sync::atomic::AtomicUsize::new(0),
+            cache_misses: std::sync::atomic::AtomicUsize::new(0),
             timing: std::sync::Mutex::new(BundleProbeTiming::default()),
         }
     }
@@ -5949,17 +5961,40 @@ impl BundleProbeMetrics {
     fn enter(self: &Arc<Self>) -> BundleProbeGuard {
         use std::sync::atomic::Ordering;
 
-        self.probes.fetch_add(1, Ordering::Relaxed);
+        let probes = self.probes.fetch_add(1, Ordering::Relaxed) + 1;
         let mut timing = self.timing.lock().unwrap();
         timing.started.get_or_insert_with(std::time::Instant::now);
         if timing.active == 0 {
             timing.rounds += 1;
         }
         timing.active += 1;
+        let elapsed_ms = timing
+            .started
+            .map_or(0, |started| started.elapsed().as_millis() as u64);
+        let rounds = timing.rounds;
         drop(timing);
+        if probes % PROBE_PROGRESS_INTERVAL == 0 {
+            tracing::info!(
+                bundle = %self.bundle,
+                probes,
+                rounds,
+                elapsed_ms,
+                "bench: bundle route probes in progress",
+            );
+        }
         BundleProbeGuard {
             metrics: Arc::clone(self),
         }
+    }
+
+    fn record_cache_hit(&self) {
+        use std::sync::atomic::Ordering;
+        self.cache_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_cache_miss(&self) {
+        use std::sync::atomic::Ordering;
+        self.cache_misses.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -5975,12 +6010,21 @@ impl Drop for BundleProbeMetrics {
             .map_or(0, |(started, finished)| {
                 finished.duration_since(started).as_millis() as u64
             });
+        let hits = self.cache_hits.load(Ordering::Relaxed);
+        let misses = self.cache_misses.load(Ordering::Relaxed);
         tracing::info!(
             bundle = %self.bundle,
             probes,
             rounds = timing.rounds,
             wall_ms,
             "bench: bundle route probes finished",
+        );
+        tracing::info!(
+            bundle = %self.bundle,
+            hits,
+            misses,
+            total = hits + misses,
+            "route probe cache: hit/miss",
         );
     }
 }
@@ -6020,6 +6064,9 @@ pub(crate) struct CondaCoSolveContext {
     /// explicit PyPI `torch==2.7.0`).
     workspace_pypi_providers: BTreeMap<CondaName, PypiKey>,
     probe_metrics: Arc<BundleProbeMetrics>,
+    /// On-disk memo of decisive co-solve verdicts (fix f17). `None`
+    /// disables memoization entirely (unit tests, no cache dir).
+    verdict_cache: Option<Arc<crate::route_probe_cache::RouteProbeCache>>,
 }
 
 struct CondaCoSolveInputs<'a> {
@@ -6153,7 +6200,119 @@ impl CondaCoSolveContext {
             workspace_deps,
             workspace_pypi_providers,
             probe_metrics,
+            verdict_cache: None,
         }
+    }
+
+    /// Attach the on-disk route-probe verdict memo for this bundle.
+    ///
+    /// The validity key covers the candidate universe (channels +
+    /// repodata identity), the target (python + subdir) and the policy
+    /// inputs that can change a verdict. Changing any of them discards
+    /// every memoized verdict rather than replaying it.
+    fn with_verdict_cache(mut self, cache_dir: &Path, subdir: &str) -> Self {
+        let channels: Vec<String> = self.channels.iter().map(|c| c.to_string()).collect();
+        let repodata_identity = crate::repodata::repodata_identity(&self.channels, subdir);
+        let policy_fields: Vec<(&str, Vec<String>)> = vec![
+            (
+                "channel-priority",
+                vec![format!("{:?}", self.channel_priority)],
+            ),
+            (
+                "system-requirements",
+                self.system_requirements
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect(),
+            ),
+            (
+                "virtual-packages",
+                self.detected_virtual_packages.as_ref().map_or_else(
+                    || vec!["host-detected".to_string()],
+                    |packages| {
+                        packages
+                            .iter()
+                            .map(|(k, v)| format!("{k}={v}"))
+                            .collect::<Vec<_>>()
+                    },
+                ),
+            ),
+            (
+                "workspace-deps",
+                self.workspace_deps
+                    .iter()
+                    .map(|(name, specs)| format!("{}={}", name.as_spec(), specs.join(",")))
+                    .collect(),
+            ),
+            (
+                "workspace-pypi-providers",
+                self.workspace_pypi_providers
+                    .iter()
+                    .map(|(conda, pypi)| format!("{}={}", conda.as_spec(), pypi.as_str()))
+                    .collect(),
+            ),
+        ];
+        let key = crate::route_probe_cache::validity_key(
+            &channels,
+            &repodata_identity,
+            &self.python,
+            subdir,
+            &policy_fields,
+        );
+        let path = crate::route_probe_cache::cache_path(
+            cache_dir,
+            self.bundle.as_str(),
+            &self.python,
+            subdir,
+        );
+        tracing::debug!(
+            path = %path.display(), key = %key,
+            "route probe cache: opened",
+        );
+        self.verdict_cache = Some(Arc::new(crate::route_probe_cache::RouteProbeCache::open(
+            path, key,
+        )));
+        self
+    }
+
+    /// Memoized wrapper around one co-solve probe. A hit returns the
+    /// stored verdict WITHOUT executing the probe (and without entering
+    /// the probe metrics guard, so `probes=` counts real work only).
+    async fn memoized_probe<F, Fut>(
+        &self,
+        stage: &str,
+        specs: &[crate::relax::CondaMatchSpec],
+        run: F,
+    ) -> crate::uv_closure::CoInstallVerdict
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = crate::uv_closure::CoInstallVerdict>,
+    {
+        let Some(cache) = self.verdict_cache.as_ref() else {
+            let _probe = self.probe_metrics.enter();
+            return run().await;
+        };
+        let digest = crate::route_probe_cache::probe_digest(
+            stage,
+            specs.iter().map(|spec| spec.to_string()),
+        );
+        if let Some(cached) = cache.lookup(&digest) {
+            self.probe_metrics.record_cache_hit();
+            tracing::debug!(
+                bundle = %self.bundle.as_str(), stage, digest = %digest,
+                "route probe cache: hit (probe skipped)",
+            );
+            return cached.into();
+        }
+        self.probe_metrics.record_cache_miss();
+        let verdict = {
+            let _probe = self.probe_metrics.enter();
+            run().await
+        };
+        if let Some(cacheable) = crate::route_probe_cache::CachedVerdict::from_verdict(&verdict) {
+            cache.record(&digest, cacheable);
+        }
+        verdict
     }
 
     fn with_probe_pool(mut self, probe_pool: crate::thread_budget::ProbePoolGrant) -> Self {
@@ -6195,12 +6354,24 @@ impl CondaCoSolveContext {
             .await;
     }
 
+    /// Memoizing entry point: an unchanged question under an unchanged
+    /// candidate universe replays the stored verdict without probing.
     pub(crate) async fn solve(
         &self,
         routed: Vec<crate::uv_closure::CondaRouteSpec>,
     ) -> crate::uv_closure::CoInstallVerdict {
         let specs = self.specs_for_routes(&routed);
-        let _probe = self.probe_metrics.enter();
+        self.memoized_probe("auto_route_joint_solve", &specs, || {
+            self.solve_uncached(routed)
+        })
+        .await
+    }
+
+    async fn solve_uncached(
+        &self,
+        routed: Vec<crate::uv_closure::CondaRouteSpec>,
+    ) -> crate::uv_closure::CoInstallVerdict {
+        let specs = self.specs_for_routes(&routed);
         match crate::conda_solve::solve_selected_records_for_target_shared(
             &self.shared_solve,
             &specs,
@@ -6273,7 +6444,20 @@ impl CondaCoSolveContext {
             route.match_spec(),
             CondaName::new("python").match_spec(&format!("{}.*", self.python)),
         ];
-        let _probe = self.probe_metrics.enter();
+        self.memoized_probe("standalone_provider_route", &specs, || {
+            self.validate_standalone_provider_route_uncached(route)
+        })
+        .await
+    }
+
+    async fn validate_standalone_provider_route_uncached(
+        &self,
+        route: crate::uv_closure::CondaRouteSpec,
+    ) -> crate::uv_closure::CoInstallVerdict {
+        let specs = vec![
+            route.match_spec(),
+            CondaName::new("python").match_spec(&format!("{}.*", self.python)),
+        ];
         match crate::conda_solve::solve_selected_records_for_target_shared(
             &self.shared_solve,
             &specs,
@@ -7209,7 +7393,8 @@ async fn uv_group_closure(
         &workspace_facts.owned_pypi,
         &effective.name_map,
     )
-    .with_probe_metrics(probe_metrics);
+    .with_probe_metrics(probe_metrics)
+    .with_verdict_cache(cache_dir, target.conda_subdir());
     let conda_co_solve = if crate::thread_budget::parallel_probes_enabled() {
         const PROBE_POOL_CAP: usize = 4;
         let requested_probe_threads = std::num::NonZeroUsize::new(
