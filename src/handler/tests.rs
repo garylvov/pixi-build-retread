@@ -1186,25 +1186,76 @@ fn a_declared_owned_name_locked_outside_a_bundled_wheels_bound_refuses_at_build(
     produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None)
         .expect("a locked version inside the bundled wheel\'s bound must build");
 
-    // Arm 1: the locked version violates it -> loud build-time refusal.
+    // Arm 1 (AMENDMENT, operator ruling 2026-08-19): `networkx 3.5` violates
+    // the bundled `<3.4` but stays INSIDE major 3. The declared pypi provider
+    // WINS: no refusal, the bound the pack advertises is relaxed to the major
+    // band, and the relaxation is recorded. Guard (1).
     let mut bundle = ceding_bundle();
     bundle
         .workspace_locked_pypi
         .insert("networkx".to_string(), "3.5".to_string());
+    let output = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None)
+        .expect("a within-major violation is ACCEPTED, not refused");
+    let depends: Vec<String> = output
+        .run_dependencies
+        .depends
+        .iter()
+        .map(|d| d.name.clone())
+        .collect();
+    assert!(
+        !depends.iter().any(|name| name == "networkx"),
+        "a within-major relaxation must NOT hand the name to conda: {depends:?}",
+    );
+    let constrains: Vec<String> = output
+        .run_dependencies
+        .constraints
+        .iter()
+        .map(format_constraint_spec)
+        .collect();
+    let line = constrains
+        .iter()
+        .find(|line| line.split(' ').next() == Some("networkx"))
+        .unwrap_or_else(|| panic!("the relaxed bound must still be advertised: {constrains:?}"));
+    assert!(
+        line.contains("<4") && !line.contains("<3.4"),
+        "the advertised bound must be the MAJOR band, not the original cap: {line}",
+    );
+
+    // Arm 1b: the violation crosses a MAJOR boundary -> still a loud refusal,
+    // and the message names all three sides. Guard (2).
+    let mut bundle = solo_bundle("viral-pack", vec!["huggingface_hub<1.0"]);
+    bundle.primary.original_requires_dist = vec!["huggingface_hub<1.0".to_string()];
+    bundle.primary.metadata.requires_dist = vec!["huggingface_hub<1.0".to_string()];
+    bundle
+        .workspace_declared_pypi
+        .insert(canonical_conda_name("torch"));
+    bundle
+        .uv_dependency_graph
+        .edges
+        .insert(crate::uv_closure::UvDependencyEdge {
+            parent: "torch".to_string(),
+            child: "huggingface-hub".to_string(),
+        });
+    bundle
+        .workspace_locked_pypi
+        .insert("huggingface-hub".to_string(), "1.28.0".to_string());
     let err = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None)
-        .expect_err("a locked version outside a bundled wheel\'s bound must refuse at build");
+        .expect_err("a MAJOR-boundary violation must refuse at build");
     let message = format!("{err:#}");
     for needle in [
         "declared-pypi owner",
-        "networkx==3.5",
+        "huggingface-hub==1.28.0",
         "viral_pack-1.0.0-cp311-none-manylinux_2_35_x86_64.whl",
-        "networkx<3.4",
+        "huggingface_hub<1.0",
+        "MAJOR boundary",
+        "torch",
+        "conda cannot be made the single owner",
         "fix the manifest/pack, not the repair",
     ] {
         assert!(
             message.contains(needle),
-            "the refusal must name the owner, the locked version, the wheel and \
-             the violated spec; missing {needle:?} in {message:?}",
+            "the refusal must name the declared root, the bundled wheel and conda; \
+             missing {needle:?} in {message:?}",
         );
     }
 

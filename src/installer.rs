@@ -746,10 +746,25 @@ fn check_env_pypi_bounds(lock: &RetreadLock, owned: &BTreeMap<String, String>) -
             if specifiers.contains(&locked_version) {
                 continue;
             }
+            // SAME POLICY AS BUILD (operator ruling 2026-08-19). A violation
+            // that stays inside the major the bundled bound admits is accepted:
+            // the declared pypi provider wins, the producer already relaxed the
+            // bound it advertises, and refusing here would refuse exactly what
+            // the build deliberately accepted. Only a MAJOR-boundary crossing
+            // is a hard stop.
+            if crate::handler::ceded_bound_is_within_major(specifiers, &locked_version) {
+                eprintln!(
+                    "retread install: accepting env-pypi owner {name}=={locked} over bundled \
+                     wheel {wheel_file} requirement {raw} (within-major relaxation; declared \
+                     pypi provider wins)",
+                    wheel_file = wheel.filename,
+                );
+                continue;
+            }
             bail!(
                 "retread install: env-pypi owner {name}=={locked} (from the workspace \
-                 pixi.lock) violates bundled wheel {wheel_file} requirement {raw}; \
-                 fix the manifest/pack, not the repair",
+                 pixi.lock) violates bundled wheel {wheel_file} requirement {raw} across a \
+                 MAJOR boundary; fix the manifest/pack, not the repair",
                 wheel_file = wheel.filename,
             );
         }
@@ -3562,15 +3577,47 @@ packages:
             Some("3.6.1"),
             "the reader must see the env's locked networkx",
         );
+        // AMENDMENT (operator ruling 2026-08-19): 3.6.1 violates `<3.4` but
+        // stays inside major 3, so install must ACCEPT it -- exactly what the
+        // build accepted. Refusing here would refuse the build's own decision.
+        check_env_pypi_bounds(&lock, &owned)
+            .expect("a within-major violation is accepted at install, as at build");
+
+        // A MAJOR-boundary crossing is still a hard stop, and the message says
+        // so. `huggingface_hub 1.28.0` against a bundled `<1.0`.
+        std::fs::write(
+            root.join("pixi.lock"),
+            r#"
+version: 7
+platforms:
+- name: p4
+  subdir: linux-64
+environments:
+  viral-gpu:
+    packages:
+      p4:
+      - pypi: https://example.com/huggingface_hub-1.28.0.whl
+packages:
+- pypi: https://example.com/huggingface_hub-1.28.0.whl
+  name: huggingface_hub
+  version: 1.28.0
+"#,
+        )
+        .unwrap();
+        let mut major_lock = lock.clone();
+        major_lock.wheels[0].requires_dist = vec!["huggingface_hub<1.0".into()];
+        let major_owned = BTreeMap::from([("huggingface-hub".to_string(), "1.28.0".to_string())]);
         let err = format!(
             "{:#}",
-            check_env_pypi_bounds(&lock, &owned).expect_err("3.6.1 cannot satisfy <3.4")
+            check_env_pypi_bounds(&major_lock, &major_owned)
+                .expect_err("1.28.0 crosses the major boundary of <1.0")
         );
         for needle in [
             "env-pypi owner",
-            "networkx==3.6.1",
+            "huggingface-hub==1.28.0",
             "viral_pack-1.0.0-py3-none-any.whl",
-            "networkx<3.4",
+            "huggingface_hub<1.0",
+            "MAJOR boundary",
             "fix the manifest/pack, not the repair",
         ] {
             assert!(err.contains(needle), "message must name {needle}: {err}");
