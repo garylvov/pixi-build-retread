@@ -405,8 +405,11 @@ pub fn plan(
 /// - Name in `drop_url` (Phase 2.8): return `Drop` — strip the orphan
 ///   direct-URL line. Checked FIRST so a dropped name is never also pinned.
 /// - Name in `overrides`: rebuild the line with the override spec
-///   (`"*"` means drop the specifier entirely). Returns `Keep` when the
-///   rebuilt line equals the original (exact family pins stay
+///   (`"*"` means drop the specifier entirely), with THIS line's own
+///   upper bounds / exclusions (`<`, `<=`, `!=`) re-attached — the
+///   table is name-keyed and floor-only, so applying it verbatim would
+///   delete a cap the requirer actually needs (D1). Returns `Keep` when
+///   the rebuilt line equals the original (exact family pins stay
 ///   byte-identical -- no rewrite, no shadow wheel needed).
 /// - Direct-URL lines whose name has an exact override: rebuilt as a
 ///   version pin (uv rejects transitive URL requirements; find-links
@@ -416,6 +419,53 @@ pub fn plan(
 ///   need a floor), but a cap can exclude whatever the consumer's
 ///   conda side pinned just like an exact pin can. Strip `<`/`<=`
 ///   bounds, keep `!=` exclusions.
+/// The upper bounds / exclusions of a requirement line: `<`, `<=`, `!=`.
+///
+/// These are the half of a specifier set that encodes INCOMPATIBILITY. A
+/// floor can be widened without lying (an older release may still work);
+/// a cap cannot be dropped without asserting compatibility retread has no
+/// evidence for.
+fn upper_bound_specifiers(req: &uv_pep508::Requirement) -> Vec<String> {
+    let Some(uv_pep508::VersionOrUrl::VersionSpecifier(specs)) = req.version_or_url.as_ref() else {
+        return Vec::new();
+    };
+    specs
+        .iter()
+        .filter(|s| {
+            matches!(
+                s.operator(),
+                Operator::LessThan
+                    | Operator::LessThanEqual
+                    | Operator::NotEqual
+                    | Operator::NotEqualStar
+            )
+        })
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Re-attach a requirement line's own upper bounds to the spec an override
+/// table entry would replace it with.
+///
+/// Skipped when the override is itself exact (`==`/`===`) or already carries
+/// a cap: an exact reroute is a deliberate bundle-membership pin (a wheel
+/// retread SHIPS), and re-attaching a foreign cap there could only produce an
+/// empty version set.
+fn merge_preserved_upper_bounds(base: &str, req: &uv_pep508::Requirement) -> String {
+    if base.contains("==") || base.contains('<') {
+        return base.to_string();
+    }
+    let caps = upper_bound_specifiers(req);
+    if caps.is_empty() {
+        return base.to_string();
+    }
+    if base.is_empty() {
+        caps.join(",")
+    } else {
+        format!("{base},{}", caps.join(","))
+    }
+}
+
 pub fn override_line_map<'a>(
     overrides: &'a BTreeMap<String, String>,
     conda_capable: &'a std::collections::HashSet<String>,
@@ -435,11 +485,23 @@ pub fn override_line_map<'a>(
             return LineAction::Drop;
         }
         if let Some(value) = overrides.get(&name) {
-            let spec = if value == "*" {
+            let base = if value == "*" {
                 String::new()
             } else {
                 value.clone()
             };
+            // METADATA TRUTH (D1). The override table is keyed by NAME and
+            // collapses every requirer of that name to ONE spec: the LOWEST
+            // floor seen anywhere in the bundle (see `plan`, pass 2). Applying
+            // it verbatim also DELETES this requirer's own upper bounds --
+            // which is how transformers 4.57.6's
+            // `huggingface-hub<1.0,>=0.34.0` shipped as
+            // `huggingface-hub>=0.16.4` (tokenizers' older floor), a wheel
+            // that lies about what it can run against. Widening a floor is
+            // deliberate (the consumer's conda side may pin an older
+            // version); deleting a cap or an exclusion is not -- those encode
+            // incompatibility, so they are re-attached here.
+            let spec = merge_preserved_upper_bounds(&base, &req);
             let rebuilt = crate::wheel_rewrite::rebuild_requirement(&req, &spec);
             if rebuilt != line {
                 return LineAction::Replace(rebuilt);
@@ -675,6 +737,65 @@ mod tests {
         assert_eq!(map("notconda<2"), LineAction::Keep);
         // python is never touched.
         assert_eq!(map("python>=3.10"), LineAction::Keep);
+    }
+
+    /// D1 guard: a name-keyed floor override must not delete the requirer's
+    /// own upper bound.
+    ///
+    /// Live defect this reproduces: the bundle contained both
+    /// `tokenizers` (`huggingface-hub>=0.16.4,<1.0`) and `transformers`
+    /// 4.57.6 (`huggingface-hub<1.0,>=0.34.0`). `plan` pass 2 keeps the
+    /// LOWEST floor, so the table entry was `huggingface-hub -> >=0.16.4`,
+    /// and applying it verbatim rewrote transformers' line to a
+    /// cap-less `huggingface-hub>=0.16.4`. The shipped shadow wheel then
+    /// declared compatibility with `huggingface_hub` 1.28.0, which
+    /// transformers refuses at import time.
+    ///
+    /// Without the fix this asserts `huggingface-hub>=0.16.4` and fails.
+    #[test]
+    fn override_line_map_preserves_requirer_upper_bounds() {
+        use crate::wheel_rewrite::LineAction;
+        let mut overrides = BTreeMap::new();
+        overrides.insert("huggingface-hub".into(), ">=0.16.4".into());
+        overrides.insert("dropped".into(), "*".into());
+        overrides.insert("pinned".into(), "==6.0.0.0".into());
+        let capable: std::collections::HashSet<String> = ["huggingface-hub".to_string()].into();
+        let drop: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let map = override_line_map(&overrides, &capable, &drop);
+
+        // The floor widens (conda may hold an older hub); the cap survives.
+        assert_eq!(
+            map("huggingface-hub<1.0,>=0.34.0"),
+            LineAction::Replace("huggingface-hub>=0.16.4,<1.0".to_string())
+        );
+        // Exclusions are upper-bound-class too.
+        assert_eq!(
+            map("huggingface-hub>=0.34.0,!=0.99.0"),
+            LineAction::Replace("huggingface-hub>=0.16.4,!=0.99.0".to_string())
+        );
+        // Markers and extras still survive the rebuild.
+        assert_eq!(
+            map("huggingface-hub<1.0,>=0.34.0 ; extra == \"torchhub\""),
+            LineAction::Replace("huggingface-hub>=0.16.4,<1.0 ; extra == 'torchhub'".to_string())
+        );
+
+        // NEGATIVE ARMS -- nothing else changes shape.
+        // No cap on the requirer: pure floor widening, as before.
+        assert_eq!(
+            map("huggingface-hub>=0.34.0"),
+            LineAction::Replace("huggingface-hub>=0.16.4".to_string())
+        );
+        // "*" with no cap still drops the specifier entirely.
+        assert_eq!(
+            map("dropped==1.0"),
+            LineAction::Replace("dropped".to_string())
+        );
+        // An exact reroute is a bundle-membership pin: no foreign cap is
+        // merged in (that could only make the set empty).
+        assert_eq!(
+            map("pinned<7,>=5"),
+            LineAction::Replace("pinned==6.0.0.0".to_string())
+        );
     }
 
     /// Helper: build a minimal EmitWheel with requires_dist and no local path.
