@@ -676,11 +676,7 @@ async fn materialize_locked_wheels(
             // `nvidia-cusparselt-cu12` dropped while conda had no
             // `libcusparselt` -> "libcusparseLt.so.0: cannot open shared
             // object file" at import).
-            let providers = conda_cuda_shadow_providers(&component);
-            if providers
-                .iter()
-                .any(|provider| conda_dist_names.contains(*provider))
-            {
+            if conda_provides_cuda_component(&component, conda_dist_names) {
                 eprintln!(
                     "retread install: {}=={} is a PyPI CUDA lib-shim wheel shadowed by \
                      the conda CUDA stack in the prefix (conda-meta has cuda-version); \
@@ -974,6 +970,101 @@ fn conda_cuda_shadow_providers(component: &str) -> &'static [&'static str] {
     }
 }
 
+/// True when the conda prefix actually PROVIDES the CUDA component that a
+/// PyPI `nvidia-<component>-cu<major>` lib-shim wheel would ship.
+///
+/// THE shadow decision, with exactly one implementation and three readers:
+/// `materialize_locked_wheels` (which declines to lay the wheel down),
+/// `verify_payload_installed` and `installed_payload_libraries` (which must
+/// therefore not demand it back). A wheel the installer intentionally omits
+/// being reported "missing" by the post-install gate is what marked a healthy
+/// prefix `.broken` and drove the activation repair loop.
+fn conda_provides_cuda_component(component: &str, conda_dist_names: &BTreeSet<String>) -> bool {
+    conda_cuda_shadow_providers(component)
+        .iter()
+        .any(|provider| conda_dist_names.contains(*provider))
+}
+
+/// The locked distributions (PEP 503 names) that are conda-shadowed CUDA
+/// lib-shim wheels in this prefix, given an already-taken env view.
+fn conda_shadowed_from_env(
+    lock: &RetreadLock,
+    drop_cuda_shadows: bool,
+    conda_dist_names: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    if !drop_cuda_shadows {
+        return out;
+    }
+    for wheel in &lock.wheels {
+        if let Some(component) = pypi_cuda_shadow_component(&wheel.name)
+            && conda_provides_cuda_component(&component, conda_dist_names)
+        {
+            out.insert(normalize_dist_name(&wheel.name));
+        }
+    }
+    out
+}
+
+/// The locked distributions this prefix is expected NOT to contain because
+/// conda's CUDA stack provides the library instead.
+///
+/// Union of what the env says NOW (`conda-meta`) and what the last install
+/// RECORDED it skipped (`conda_shadowed_record_path`). The recorded half is
+/// the point: `retread verify` runs much later from the activate.d guard, in a
+/// different process with a possibly different view of the prefix, and it must
+/// reach the same verdict the installer did rather than re-deriving one.
+fn conda_shadowed_locked_dists(lock: &RetreadLock, prefix: &Path) -> BTreeSet<String> {
+    let mut out = conda_shadowed_from_env(
+        lock,
+        conda_owns_cuda_runtime(prefix),
+        &installed_conda_dist_names(prefix),
+    );
+    out.extend(read_conda_shadowed_record(prefix, &lock.bundle));
+    out
+}
+
+/// Where an install records the shadow decision for later readers.
+fn conda_shadowed_record_path(prefix: &Path, bundle: &str) -> PathBuf {
+    prefix
+        .join("share")
+        .join("retread")
+        .join(bundle)
+        .join("conda-shadowed.json")
+}
+
+fn read_conda_shadowed_record(prefix: &Path, bundle: &str) -> BTreeSet<String> {
+    let Ok(body) = std::fs::read_to_string(conda_shadowed_record_path(prefix, bundle)) else {
+        return BTreeSet::new();
+    };
+    serde_json::from_str::<BTreeSet<String>>(&body).unwrap_or_default()
+}
+
+/// Record the shadow decision so a later `retread verify` reads it back
+/// instead of re-deriving it. Rewritten on every install (an empty array is
+/// written too: it retracts a previous install's skips once conda no longer
+/// provides the component). Best-effort -- a prefix that cannot be written is
+/// already failing louder elsewhere, and readers degrade to fresh derivation.
+fn write_conda_shadowed_record(lock: &RetreadLock, prefix: &Path, skipped: &BTreeSet<String>) {
+    let path = conda_shadowed_record_path(prefix, &lock.bundle);
+    if let Some(parent) = path.parent()
+        && let Err(err) = std::fs::create_dir_all(parent)
+    {
+        tracing::warn!(bundle = %lock.bundle, error = %err, "retread install: cannot create the conda-shadow record dir");
+        return;
+    }
+    match serde_json::to_string(skipped) {
+        Ok(body) => {
+            if let Err(err) = std::fs::write(&path, body) {
+                tracing::warn!(bundle = %lock.bundle, error = %err, "retread install: cannot write the conda-shadow record");
+            }
+        }
+        Err(err) => {
+            tracing::warn!(bundle = %lock.bundle, error = %err, "retread install: cannot serialize the conda-shadow record");
+        }
+    }
+}
+
 /// Conda distribution names installed in the prefix, parsed from
 /// `conda-meta/<name>-<version>-<build>.json` filenames.
 fn installed_conda_dist_names(prefix: &Path) -> BTreeSet<String> {
@@ -1200,11 +1291,17 @@ fn verify_payload_installed(lock: &RetreadLock, prefix: &Path) -> Result<()> {
     // editable are therefore counted present and skipped from the missing /
     // RECORD checks entirely.
     let editable_owned = editable_owned_distributions(&site_packages);
+    // The installer deliberately does NOT lay down a PyPI CUDA lib-shim wheel
+    // whose component conda provides in this prefix (see
+    // `conda_provides_cuda_component`). Demanding it back here is what failed
+    // the post-install gate on a healthy prefix, marked it `.broken` and drove
+    // the activation repair loop. Same decision, same set, one reader.
+    let conda_shadowed = conda_shadowed_locked_dists(lock, prefix);
     let missing: Vec<String> = missing_locked_wheels_from_installed(lock, &installed)
         .into_iter()
         .filter(|item| {
             let name = item.split("==").next().map(normalize_dist_name);
-            name.is_none_or(|n| !editable_owned.contains(&n))
+            name.is_none_or(|n| !editable_owned.contains(&n) && !conda_shadowed.contains(&n))
         })
         .collect();
     if !missing.is_empty() {
@@ -1219,7 +1316,7 @@ fn verify_payload_installed(lock: &RetreadLock, prefix: &Path) -> Result<()> {
 
     for wheel in &lock.wheels {
         let name = normalize_dist_name(&wheel.name);
-        if editable_owned.contains(&name) {
+        if editable_owned.contains(&name) || conda_shadowed.contains(&name) {
             continue;
         }
         let dist_root = installed
@@ -1269,10 +1366,16 @@ fn installed_payload_libraries(
     // (name, version) lookup below does not error on the overlaid version.
     let editable_owned = editable_owned_distributions(&site_packages);
     let conda_owned = conda_owned_distributions(&site_packages);
+    // Conda-shadowed CUDA lib-shim wheels are never laid down (see
+    // `conda_provides_cuda_component`); the libraries they would have shipped
+    // are conda's, and are audited as part of the conda prefix, not the wheel
+    // payload. Without this the audit bails "is not installed" on exactly the
+    // wheels the installer meant to omit.
+    let conda_shadowed = conda_shadowed_locked_dists(lock, prefix);
     let mut out: BTreeMap<String, crate::glibc::PayloadLib> = BTreeMap::new();
     for wheel in &lock.wheels {
         let name = normalize_dist_name(&wheel.name);
-        if editable_owned.contains(&name) {
+        if editable_owned.contains(&name) || conda_shadowed.contains(&name) {
             continue;
         }
         let dist_root = installed
@@ -1679,6 +1782,14 @@ pub async fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
     // shadow-wheel drop (a shim wheel is only dropped when conda actually
     // provides its component).
     let conda_dist_names = installed_conda_dist_names(prefix);
+    // Record the shadow decision BEFORE the replay: the post-install gate and
+    // every later `retread verify` (activate.d guard) read it back so they
+    // never demand a wheel this install intentionally omitted.
+    write_conda_shadowed_record(
+        &lock,
+        prefix,
+        &conda_shadowed_from_env(&lock, drop_cuda_shadows, &conda_dist_names),
+    );
     let wheel_files = materialize_locked_wheels(
         &lock,
         prefix,
@@ -3021,6 +3132,128 @@ mod tests {
         );
         verify_payload_installed(&lock, &prefix)
             .expect("PEP 440-equivalent installed version satisfies verify");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Fixture: a prefix whose `conda-meta` declares the CUDA runtime
+    /// (`cuda-version`) plus the named conda provider packages, with the
+    /// ordinary locked wheel installed (RECORD and all) and NO PyPI CUDA
+    /// lib-shim wheel in site-packages.
+    fn conda_cuda_shadow_prefix(root: &Path, conda_providers: &[&str]) -> PathBuf {
+        let prefix = root.join("prefix");
+        let sp = site_packages_dir(&prefix, "3.11");
+        std::fs::create_dir_all(&sp).unwrap();
+        let meta = prefix.join("conda-meta");
+        std::fs::create_dir_all(&meta).unwrap();
+        std::fs::write(meta.join("cuda-version-12.4-h1234567_0.json"), "{}").unwrap();
+        for name in conda_providers {
+            std::fs::write(meta.join(format!("{name}-12.4.5.8-h0_0.json")), "{}").unwrap();
+        }
+        let dist_info = write_dist_info(&sp, "mypackage", "1.0.0", None);
+        std::fs::write(sp.join("mypackage.py"), "value = 1\n").unwrap();
+        std::fs::write(
+            dist_info.join("RECORD"),
+            "mypackage.py,,\nmypackage-1.0.0.dist-info/RECORD,,\n",
+        )
+        .unwrap();
+        prefix
+    }
+
+    /// F10: the installer declines to lay down a PyPI CUDA lib-shim wheel that
+    /// the conda CUDA stack shadows -- and the post-install gate must reach the
+    /// SAME verdict. Before the shared decision set, `verify_payload_installed`
+    /// re-derived nothing at all and reported every skipped wheel as "missing",
+    /// failing the gate on a healthy prefix, marking it `.broken` and driving
+    /// the activation repair loop (observed on `isaaclab-hover-pack`, 8 wheels).
+    #[tokio::test]
+    async fn conda_shadowed_cuda_wheel_is_skipped_by_install_and_not_demanded_by_verify() {
+        let root = tempdir("conda-shadow-verify");
+        let prefix = conda_cuda_shadow_prefix(&root, &["libcublas"]);
+        let wheels_dir = root.join("wheels");
+        std::fs::create_dir_all(&wheels_dir).unwrap();
+        let mypackage_shipped = wheels_dir.join("mypackage-1.0.0-py3-none-any.whl");
+        std::fs::write(&mypackage_shipped, test_wheel_bytes("mypackage", "1.0.0")).unwrap();
+        std::fs::write(
+            wheels_dir.join("nvidia_cublas_cu12-12.4.5.8-py3-none-any.whl"),
+            test_wheel_bytes("nvidia-cublas-cu12", "12.4.5.8"),
+        )
+        .unwrap();
+
+        let mut lock = make_lock(vec![], vec![], BTreeMap::new());
+        lock.wheels = vec![
+            lock_wheel("mypackage", "1.0.0"),
+            lock_wheel("nvidia-cublas-cu12", "12.4.5.8"),
+        ];
+
+        assert!(conda_owns_cuda_runtime(&prefix));
+        let conda_dist_names = installed_conda_dist_names(&prefix);
+        let files = materialize_locked_wheels(
+            &lock,
+            &prefix,
+            &wheels_dir,
+            &root.join("cache"),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            true,
+            &conda_dist_names,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            files,
+            vec![mypackage_shipped],
+            "the conda-shadowed lib-shim wheel must not be laid down"
+        );
+
+        // The install records the decision it just took.
+        write_conda_shadowed_record(
+            &lock,
+            &prefix,
+            &conda_shadowed_from_env(&lock, true, &conda_dist_names),
+        );
+        verify_payload_installed(&lock, &prefix)
+            .expect("a wheel the installer intentionally skipped is not missing");
+        installed_payload_libraries(&lock, &prefix)
+            .expect("the shadowed wheel is outside the payload library audit");
+
+        // The recorded decision alone carries the verdict for a later
+        // `retread verify` whose view of the env has drifted.
+        std::fs::remove_dir_all(prefix.join("conda-meta")).unwrap();
+        assert!(!conda_owns_cuda_runtime(&prefix));
+        verify_payload_installed(&lock, &prefix)
+            .expect("the recorded skip decision survives a drifted env view");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The skip is per-component, and verify honours the same gate: conda owns
+    /// the CUDA runtime but ships no `libcusparselt`, so the installer KEEPS
+    /// `nvidia-cusparselt-cu12` -- and its genuine absence must still fail
+    /// verify, naming it.
+    #[test]
+    fn unshadowed_missing_wheel_still_fails_verify_in_a_conda_cuda_prefix() {
+        let root = tempdir("conda-shadow-verify-negative");
+        let prefix = conda_cuda_shadow_prefix(&root, &["libcublas"]);
+
+        let mut lock = make_lock(vec![], vec![], BTreeMap::new());
+        lock.wheels = vec![
+            lock_wheel("mypackage", "1.0.0"),
+            lock_wheel("nvidia-cusparselt-cu12", "0.6.3"),
+        ];
+        // Even a stale record must not launder an unshadowed wheel: the record
+        // written by an install of this prefix names only cublas.
+        write_conda_shadowed_record(
+            &lock,
+            &prefix,
+            &conda_shadowed_from_env(&lock, true, &installed_conda_dist_names(&prefix)),
+        );
+
+        let err = verify_payload_installed(&lock, &prefix)
+            .expect_err("a genuinely missing, unshadowed wheel must still fail verify");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("missing 1 locked wheel") && msg.contains("nvidia-cusparselt-cu12==0.6.3"),
+            "{msg}"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
