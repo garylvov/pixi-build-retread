@@ -2187,6 +2187,12 @@ struct Bundle {
     /// neither bundle nor verify any dist reachable from them -- see
     /// `declared_pypi_owned_dists`.
     workspace_declared_pypi: BTreeSet<String>,
+    /// Canonical PyPI name -> the version the consuming workspace's committed
+    /// `pixi.lock` already selected for this target, intersected over the
+    /// precise consumers. Empty on a cold first pass (no lock yet), which
+    /// means "cannot know" -- never "unconstrained". Read ONLY by
+    /// `check_declared_pypi_bounds`.
+    workspace_locked_pypi: BTreeMap<String, String>,
 }
 
 /// One mutable uv auto-route retained on a bundle until the final emitted
@@ -5399,6 +5405,23 @@ async fn resolve_all(
         bundle.workspace_conda_versions = workspace_facts.common_selected_versions.clone();
         bundle.workspace_conda_provider_facts = workspace_facts.provider_facts.clone();
         bundle.workspace_declared_pypi = workspace_facts.declared_pypi.clone();
+        // The locked PyPI selections of the very envs whose conda solves
+        // produced these facts. Used only to REFUSE a build whose bundled
+        // wheels contradict what pixi has already locked (F11 amendment):
+        // that contradiction is discoverable here, and discovering it at
+        // activation instead is the failure mode this closes.
+        bundle.workspace_locked_pypi = match workspace_dir {
+            Some(root) => crate::workspace::locked_pypi_versions_for_envs(
+                root,
+                &workspace_facts
+                    .env_exact_specs
+                    .keys()
+                    .cloned()
+                    .collect::<BTreeSet<_>>(),
+                &target.conda_subdir,
+            ),
+            None => BTreeMap::new(),
+        };
         bundle.auto_dropped.extend(prelock_owned_drops);
         for sub in sub_bundles {
             bundle.extras.push(sub.primary);
@@ -9832,6 +9855,7 @@ async fn resolve_bundle(
             workspace_conda_versions: Default::default(),
             workspace_conda_provider_facts: Default::default(),
             workspace_declared_pypi: Default::default(),
+            workspace_locked_pypi: Default::default(),
         });
     }
 
@@ -10444,6 +10468,7 @@ async fn resolve_bundle(
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
         workspace_declared_pypi: Default::default(),
+        workspace_locked_pypi: Default::default(),
     };
 
     Ok(bfs_bundle)
@@ -13095,6 +13120,78 @@ fn declared_pypi_reachable(bundle: &Bundle, config: &RetreadConfig) -> BTreeSet<
     reachable
 }
 
+/// Refuse a build whose bundled wheels contradict the version the consuming
+/// workspace has ALREADY locked for a name the pack is ceding to pixi's pypi
+/// phase.
+///
+/// Ceding a name (`declared_pypi_reachable`) hands the version choice to pixi.
+/// If a wheel this pack ships requires `transformers <5` and the workspace's
+/// `pixi.lock` already carries `transformers 5.1.0`, the pack and the env are
+/// unsatisfiable together -- and every later symptom (an ImportError at
+/// activation, a repair round that loosens the wrong bound) is a downstream
+/// echo of a fact that is knowable HERE. Bail, and let it surface as a
+/// `retread rpc error` with the wheel, the name, the bound and the locked
+/// version in one line.
+///
+/// Silent when the workspace lock has no entry for the name: the cold first
+/// pass has no lock yet, and "cannot know" is not "unconstrained".
+fn check_declared_pypi_bounds(
+    bundle: &Bundle,
+    declared_pypi_owned: &BTreeSet<String>,
+    marker_env: &uv_pep508::MarkerEnvironment,
+) -> Result<()> {
+    if declared_pypi_owned.is_empty() || bundle.workspace_locked_pypi.is_empty() {
+        tracing::debug!(
+            bundle = %bundle.conda_name,
+            declared = declared_pypi_owned.len(),
+            locked = bundle.workspace_locked_pypi.len(),
+            "declared-pypi bound check: no locked workspace pypi facts; skipping",
+        );
+        return Ok(());
+    }
+    for wheel in bundle.all_wheels() {
+        for raw in &wheel.metadata.requires_dist {
+            let Ok(requirement): Result<uv_pep508::Requirement, _> =
+                uv_pep508::Requirement::from_str(raw)
+            else {
+                continue;
+            };
+            if !requirement.marker.evaluate(marker_env, &[]) {
+                continue;
+            }
+            let name = canonical_conda_name(requirement.name.as_ref());
+            if !declared_pypi_owned.contains(&name) {
+                continue;
+            }
+            let Some(locked) = bundle.workspace_locked_pypi.get(&name) else {
+                tracing::debug!(
+                    dep = %name,
+                    bundle = %bundle.conda_name,
+                    "declared-pypi bound check: no locked version for this name; cannot know",
+                );
+                continue;
+            };
+            let Some(uv_pep508::VersionOrUrl::VersionSpecifier(specifiers)) =
+                requirement.version_or_url.as_ref()
+            else {
+                continue;
+            };
+            let Ok(locked_version) = uv_pep508::uv_pep440::Version::from_str(locked) else {
+                continue;
+            };
+            if specifiers.contains(&locked_version) {
+                continue;
+            }
+            bail!(
+                "declared-pypi owner {name}=={locked} violates bundled wheel \
+                 {wheel_file} requirement {raw}; fix the manifest/pack, not the repair",
+                wheel_file = wheel.metadata.filename,
+            );
+        }
+    }
+    Ok(())
+}
+
 fn produce_output_with_conflicts(
     bundle: &Bundle,
     config: &RetreadConfig,
@@ -13219,6 +13316,32 @@ fn produce_output_with_conflicts(
     // pixi's own pypi phase. The pack must not claim any of them as a conda
     // `depends` edge -- see `declared_pypi_reachable`.
     let declared_pypi_owned = declared_pypi_reachable(bundle, config);
+    check_declared_pypi_bounds(bundle, &declared_pypi_owned, &env)?;
+    // One greppable ownership verdict per name the bundle carries, at the one
+    // point where all three owners are decidable. `pack` means this build
+    // ships the dist; `conda` means a workspace conda provider supplies it;
+    // `pypi-declared` means the consuming workspace's `[pypi-dependencies]`
+    // reach it and pixi's own pypi phase installs it.
+    for wheel in bundle.all_wheels() {
+        let name = canonical_conda_name(&wheel.pypi_name);
+        let (owner, reason) = if declared_pypi_owned.contains(&name) {
+            (
+                "pypi-declared",
+                "reachable from workspace [pypi-dependencies]",
+            )
+        } else if bundle.auto_dropped.contains(&name) {
+            ("conda", "workspace conda provider owns the name")
+        } else {
+            ("pack", "bundled wheel shipped by this pack")
+        };
+        tracing::info!(
+            bundle = %bundle.conda_name,
+            "ownership: name={} owner={} reason={}",
+            name,
+            owner,
+            reason,
+        );
+    }
     for auto_route in &bundle.auto_routed {
         let pypi_name = PypiKey::from_pypi(&auto_route.route.pypi_name);
         // The pack maps this PyPI name onto a conda package (e.g.
@@ -21781,6 +21904,7 @@ mod emit_wheel_upstream_url_tests {
             workspace_conda_versions: Default::default(),
             workspace_conda_provider_facts: Default::default(),
             workspace_declared_pypi: Default::default(),
+            workspace_locked_pypi: Default::default(),
         };
 
         // Reproduce the exact mapping from build_one that populates EmitWheel.
@@ -21905,6 +22029,7 @@ mod emit_wheel_upstream_url_tests {
             workspace_conda_versions: Default::default(),
             workspace_conda_provider_facts: Default::default(),
             workspace_declared_pypi: Default::default(),
+            workspace_locked_pypi: Default::default(),
         };
 
         let emit_wheels: Vec<crate::emit_pypi::EmitWheel> = bundle

@@ -4012,6 +4012,7 @@ mod tests {
             workspace_conda_versions: BTreeMap::new(),
             workspace_conda_provider_facts: BTreeMap::new(),
             workspace_declared_pypi: BTreeSet::new(),
+            workspace_locked_pypi: BTreeMap::new(),
         }
     }
 

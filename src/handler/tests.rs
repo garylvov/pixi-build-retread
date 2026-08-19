@@ -864,6 +864,7 @@ fn courier_pure_python_bundle_is_platform_specific_not_noarch() {
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
         workspace_declared_pypi: Default::default(),
+        workspace_locked_pypi: Default::default(),
     };
 
     let courier_cfg = RetreadConfig {
@@ -945,6 +946,7 @@ fn produce_output_emits_auto_routed_conda_run_deps() {
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
         workspace_declared_pypi: Default::default(),
+        workspace_locked_pypi: Default::default(),
     };
     let out = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
     let deps: Vec<(String, String)> = out
@@ -1128,6 +1130,98 @@ fn workspace_provided_wheel_bound_is_carried_as_conda_constrains() {
 /// The declared owner wins, so a dist reachable from a declared pypi root is
 /// (i) marked declared-owned, (ii) kept out of the emitted conda `depends`,
 /// and (iii) has its bound carried as `constrains` instead. A bundled dist
+/// F11 amendment (operator ruling 2026-08-19): ceding a name hands its version
+/// choice to pixi, so a bundled wheel whose `Requires-Dist` bound EXCLUDES the
+/// version the workspace lock already selected is an unsatisfiable pack. That
+/// is knowable at build time; discovering it at activation is the failure this
+/// refuses. Three arms in one guard: violated -> `bail!` naming wheel/name/
+/// spec/version; satisfied -> builds; no lock entry -> builds.
+#[test]
+fn a_declared_owned_name_locked_outside_a_bundled_wheels_bound_refuses_at_build() {
+    // `networkx <3.4` is required by the pack's own primary wheel, and the
+    // workspace declares `torch`, whose uv closure reaches networkx.
+    let ceding_bundle = || {
+        let mut bundle = solo_bundle("viral-pack", vec!["networkx<3.4"]);
+        bundle.primary.original_requires_dist = vec!["networkx<3.4".to_string()];
+        bundle
+            .extras
+            .push(rw("networkx", meta("networkx", "3.3", vec![], true)));
+        bundle.uv_closure_names.insert("networkx".to_string());
+        bundle
+            .workspace_declared_pypi
+            .insert(canonical_conda_name("torch"));
+        bundle
+            .uv_dependency_graph
+            .edges
+            .insert(crate::uv_closure::UvDependencyEdge {
+                parent: "torch".to_string(),
+                child: "networkx".to_string(),
+            });
+        bundle
+    };
+
+    // Arm 3 FIRST (it is the baseline the other two move off): the cold pass
+    // has no locked pypi facts at all -> no check, the build proceeds.
+    let bundle = ceding_bundle();
+    assert!(
+        bundle.workspace_locked_pypi.is_empty(),
+        "baseline arm must carry no locked facts",
+    );
+    produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None)
+        .expect("without a locked version the build must proceed -- cannot know is not violated");
+
+    // Arm 3b: the lock exists but has no entry for the ceded name.
+    let mut bundle = ceding_bundle();
+    bundle
+        .workspace_locked_pypi
+        .insert("sympy".to_string(), "1.13.3".to_string());
+    produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None)
+        .expect("a lock without an entry for the ceded name must not refuse the build");
+
+    // Arm 2: the locked version satisfies the bundled wheel's bound.
+    let mut bundle = ceding_bundle();
+    bundle
+        .workspace_locked_pypi
+        .insert("networkx".to_string(), "3.3".to_string());
+    produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None)
+        .expect("a locked version inside the bundled wheel\'s bound must build");
+
+    // Arm 1: the locked version violates it -> loud build-time refusal.
+    let mut bundle = ceding_bundle();
+    bundle
+        .workspace_locked_pypi
+        .insert("networkx".to_string(), "3.5".to_string());
+    let err = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None)
+        .expect_err("a locked version outside a bundled wheel\'s bound must refuse at build");
+    let message = format!("{err:#}");
+    for needle in [
+        "declared-pypi owner",
+        "networkx==3.5",
+        "viral_pack-1.0.0-cp311-none-manylinux_2_35_x86_64.whl",
+        "networkx<3.4",
+        "fix the manifest/pack, not the repair",
+    ] {
+        assert!(
+            message.contains(needle),
+            "the refusal must name the owner, the locked version, the wheel and \
+             the violated spec; missing {needle:?} in {message:?}",
+        );
+    }
+
+    // A name the workspace does NOT own is not bound-checked at all: the pack
+    // ships it, so its own resolution already agreed with the bound.
+    let mut bundle = solo_bundle("viral-pack", vec!["networkx<3.4"]);
+    bundle.primary.original_requires_dist = vec!["networkx<3.4".to_string()];
+    bundle
+        .extras
+        .push(rw("networkx", meta("networkx", "3.3", vec![], true)));
+    bundle
+        .workspace_locked_pypi
+        .insert("networkx".to_string(), "3.5".to_string());
+    produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None)
+        .expect("a name outside the declared-pypi closure is never bound-checked");
+}
+
 /// NOT reachable from any declared root is untouched.
 #[test]
 fn a_dist_in_the_declared_pypi_closure_is_ceded_to_the_workspace() {
@@ -2685,6 +2779,7 @@ fn produce_output_softens_deps_from_floor_pin_to_floor_spec() {
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
         workspace_declared_pypi: Default::default(),
+        workspace_locked_pypi: Default::default(),
     };
     let out = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
     let deps: Vec<(String, String)> = out
@@ -2743,6 +2838,7 @@ fn produce_output_preserves_deps_from_bare_and_range_specs() {
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
         workspace_declared_pypi: Default::default(),
+        workspace_locked_pypi: Default::default(),
     };
 
     let out = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
@@ -3288,6 +3384,7 @@ fn solo_bundle(name: &str, requires: Vec<&str>) -> Bundle {
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
         workspace_declared_pypi: Default::default(),
+        workspace_locked_pypi: Default::default(),
     }
 }
 
@@ -4165,6 +4262,7 @@ fn vendored_sub_packages_dropped_from_run_deps() {
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
         workspace_declared_pypi: Default::default(),
+        workspace_locked_pypi: Default::default(),
     };
 
     let output =
@@ -4321,6 +4419,7 @@ fn bundle_field_groups_entries_into_one_output() {
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
         workspace_declared_pypi: Default::default(),
+        workspace_locked_pypi: Default::default(),
     };
 
     let output =
@@ -4421,6 +4520,7 @@ fn relaxed_pure_python_primary_pins_python_to_workspace_variant() {
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
         workspace_declared_pypi: Default::default(),
+        workspace_locked_pypi: Default::default(),
     };
 
     let output =
