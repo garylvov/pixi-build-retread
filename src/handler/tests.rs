@@ -9219,3 +9219,120 @@ fn the_candidate_gate_does_not_change_the_anchor_path() {
         "an unpinnable anchor is skipped, never emitted bare: {names:?}",
     );
 }
+
+/// F22 fixture: one pack whose bundled wheel needs `packaging<27.0,>=23.0`,
+/// with a workspace conda fact for `packaging` at 26.3. `declared` supplies
+/// the workspace-side declared conda spec, which is what separates operator
+/// intent from a prior solve's float.
+fn f22_packaging_bundle(declared: Option<&str>) -> Bundle {
+    f22_packaging_bundle_requiring("packaging<27.0,>=23.0", declared)
+}
+
+fn f22_packaging_bundle_requiring(requires: &str, declared: Option<&str>) -> Bundle {
+    let mut bundle = solo_bundle("f22-pack", vec![requires]);
+    bundle
+        .workspace_conda_versions
+        .insert("packaging".to_string(), "26.3".to_string());
+    bundle.workspace_conda_provider_facts.insert(
+        "packaging".to_string(),
+        WorkspaceCondaProviderFact {
+            selected_versions: BTreeSet::from(["26.3".to_string()]),
+            declared_specs: declared
+                .map(|spec| BTreeSet::from([spec.to_string()]))
+                .unwrap_or_default(),
+            present_in_all_consumers: true,
+        },
+    );
+    bundle
+}
+
+fn f22_packaging_spec(output: &CondaOutput) -> String {
+    output
+        .run_dependencies
+        .depends
+        .iter()
+        .find(|dep| dep.name.as_str() == "packaging")
+        .map(|dep| format_packagespec(&dep.spec))
+        .expect("the emitted pack must still carry a `packaging` run dependency")
+}
+
+#[test]
+fn learned_workspace_fact_yields_to_a_declared_pack_override() {
+    let bundle = f22_packaging_bundle(None);
+    let mut config = cfg();
+    config
+        .overrides
+        .insert("packaging".to_string(), "==23.0".to_string());
+
+    let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer({
+            let logs = std::sync::Arc::clone(&logs);
+            move || SharedLogWriter(std::sync::Arc::clone(&logs))
+        })
+        .finish();
+    let output = tracing::subscriber::with_default(subscriber, || {
+        produce_output(&bundle, &config, Platform::Linux64, "3.11", &[], None, None).expect(
+            "a LEARNED workspace conda fact must yield to the pack's DECLARED override \
+             instead of failing the solve",
+        )
+    });
+
+    assert_eq!(f22_packaging_spec(&output), "==23.0");
+    let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    assert!(
+        logs.contains("learned workspace conda fact yields to the pack's DECLARED override"),
+        "the yield must reach an actor as a WARN:\n{logs}"
+    );
+}
+
+#[test]
+fn a_declared_workspace_pin_against_a_declared_override_stays_a_conflict() {
+    let bundle = f22_packaging_bundle(Some("==26.3"));
+    let mut config = cfg();
+    config
+        .overrides
+        .insert("packaging".to_string(), "==23.0".to_string());
+
+    let error = produce_output(&bundle, &config, Platform::Linux64, "3.11", &[], None, None)
+        .expect_err("declared-versus-declared must keep failing closed");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("`packaging` requirements are mutually unsatisfiable"),
+        "{message}"
+    );
+    assert!(
+        message.contains("workspace conda fact `packaging==26.3`"),
+        "{message}"
+    );
+    assert!(message.contains("Suggested fix in"), "{message}");
+}
+
+#[test]
+fn a_learned_workspace_fact_without_an_override_keeps_its_prior_treatment() {
+    // Compatible: the fact never enters the conflict set, and the emitted
+    // bound is exactly the wheel's own envelope, as before this fix.
+    let bundle = f22_packaging_bundle(None);
+    let output = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None)
+        .expect("a compatible learned fact must not become a conflict");
+    assert_eq!(f22_packaging_spec(&output), ">=23.0,<27.0");
+
+    // Incompatible, but with nothing DECLARED on the other side: the yield
+    // must NOT fire. Only written-down operator intent outranks a learned
+    // float; two learned inputs still fail closed.
+    let capped = f22_packaging_bundle_requiring("packaging<26", None);
+    let error = produce_output(&capped, &cfg(), Platform::Linux64, "3.11", &[], None, None)
+        .expect_err("no declared override means the learned fact keeps its veto");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("`packaging` requirements are mutually unsatisfiable"),
+        "{message}"
+    );
+    assert!(
+        message.contains("workspace conda fact `packaging==26.3`"),
+        "{message}"
+    );
+}

@@ -5868,6 +5868,40 @@ fn declared_spec_bounds_version(spec: &str) -> bool {
     !spec.is_empty() && spec != "*" && spec.chars().any(|c| c.is_ascii_digit())
 }
 
+/// Whether a DECLARED uv override in one emission group excludes the version
+/// a workspace conda fact carries.
+///
+/// The override side counts as declared only once the caller has confirmed a
+/// manual (non-ledger) override for the group: a ledger-seeded override is
+/// itself learned, and two learned inputs have no precedence over each other.
+/// The fact side is read from its own `==` clause, so an override that happens
+/// to admit the learned version is not mistaken for a conflict.
+fn declared_override_excludes_learned_fact(constraints: &[Constraint]) -> bool {
+    let fact_versions: Vec<uv_pep508::uv_pep440::Version> = constraints
+        .iter()
+        .filter(|constraint| matches!(constraint.provenance, Provenance::WorkspaceCondaFact(_)))
+        .flat_map(|constraint| constraint.specifiers.iter())
+        .filter(|specifier| {
+            matches!(
+                specifier.operator(),
+                uv_pep508::uv_pep440::Operator::Equal | uv_pep508::uv_pep440::Operator::ExactEqual
+            )
+        })
+        .map(|specifier| specifier.version().clone())
+        .collect();
+    if fact_versions.is_empty() {
+        return false;
+    }
+    constraints
+        .iter()
+        .filter(|constraint| matches!(constraint.provenance, Provenance::UvOverride))
+        .any(|constraint| {
+            fact_versions
+                .iter()
+                .any(|version| !constraint.specifiers.contains(version))
+        })
+}
+
 /// Effective Rule-1 ownership authority shared with Rule 2. Direct conda
 /// names remain distinct from explicitly mapped PyPI names, and PyPI-side
 /// exclusions are carried separately so same-name fallback cannot bypass a
@@ -14579,6 +14613,88 @@ fn produce_output_with_conflicts(
                     &platform,
                     workspace_python_version,
                 );
+                // DECLARED BEATS LEARNED -- third site. d1 t13 applied this
+                // ruling to the `constrains` arm below and F13 to the uv-side
+                // conflicts; this emitted `depends` edge predates both. A
+                // pack's `retread-overrides` entry is written-down operator
+                // intent. A workspace conda fact is only what some sibling
+                // environment's LAST solve happened to select. Letting that
+                // float veto the declared override is circular in exactly the
+                // way d1 t13 describes: the override never reaches the emitted
+                // spec, the sibling floats to the same version again, and the
+                // pack never converges. So the learned fact yields with a WARN
+                // and the declared value is emitted; the conda solve may then
+                // re-pick the declared version for the consuming environments,
+                // which is the intent. Declared-vs-declared -- an operator pin
+                // on both sides -- keeps today's loud error and suggested fix.
+                let fact_origins: BTreeSet<ConstraintOriginId> = constraints
+                    .iter()
+                    .filter(|constraint| {
+                        matches!(constraint.provenance, Provenance::WorkspaceCondaFact(_))
+                    })
+                    .map(|constraint| constraint.origin_id.clone())
+                    .collect();
+                let fact_is_declared = workspace_conda_fact_is_declared(
+                    &bundle.workspace_conda_provider_facts,
+                    conda_name.key().as_str(),
+                );
+                if !constrains_only
+                    && !fact_origins.is_empty()
+                    && !fact_is_declared
+                    && has_manual_override
+                    && declared_override_excludes_learned_fact(&constraints)
+                {
+                    let without_fact: Vec<Constraint> = constraints
+                        .iter()
+                        .filter(|constraint| !fact_origins.contains(&constraint.origin_id))
+                        .cloned()
+                        .collect();
+                    let mut validation_without_fact = validation_only_origins.clone();
+                    validation_without_fact.retain(|id| !fact_origins.contains(id));
+                    match decide_for_emission(
+                        &pypi_name,
+                        &without_fact,
+                        &validation_without_fact,
+                        config.relax,
+                        &SafetyContext::new(Some(conda_name.as_spec()))
+                            .with_abi_anchor_alias(has_anchor_alias),
+                    ) {
+                        RelaxDecision::Strict {
+                            specifiers,
+                            diagnostics,
+                        }
+                        | RelaxDecision::Relaxed {
+                            specifiers,
+                            decisions: diagnostics,
+                        } => {
+                            pending_relaxations.extend(auto_bundle::wheel_metadata_relaxations(
+                                &pypi_name,
+                                &without_fact,
+                                diagnostics,
+                                &bundle.conda_name,
+                                format!(" for bundle '{}'", bundle.conda_name),
+                            ));
+                            let rendered = native_conda_override
+                                .clone()
+                                .unwrap_or_else(|| specifiers.to_string().replace(", ", ","));
+                            tracing::warn!(
+                                dep = %conda_name,
+                                bundle = %bundle.conda_name,
+                                bound = %rendered,
+                                conflict = %conflict,
+                                "learned workspace conda fact yields to the pack's DECLARED \
+                                 override (a prior solve's selection is not operator intent); \
+                                 emitting the declared bound so the conda solve re-picks under \
+                                 it -- an infeasible re-pick must fail the solve loudly rather \
+                                 than ship an environment that ignores the override.",
+                            );
+                            let spec = conda_name.match_spec(&rendered);
+                            run_dep_specs.push(spec_from_str(spec.as_str())?);
+                            continue;
+                        }
+                        RelaxDecision::Conflict(_) | RelaxDecision::SearchExhausted(_) => {}
+                    }
+                }
                 if constrains_only {
                     // ORIGIN DECIDES. A "workspace conda fact" is one of two
                     // very different things: an operator pin declared in the
