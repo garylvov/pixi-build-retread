@@ -1009,6 +1009,41 @@ fn auto_route_envelope_does_not_override_index_metadata_cap() {
 }
 
 #[test]
+fn phase_d_stripped_wheel_cap_still_reaches_the_conda_emission() {
+    // Live defect (viral-gpu): transformers states
+    // `huggingface-hub<1.0,>=0.34.0`, but phase D rewrites the SHIPPED
+    // wheel's METADATA and `relax::strip_upper_bounds` deletes every `<`
+    // clause, so the bundle's post-D view is `huggingface-hub>=0.34.0`.
+    // Emission used to read that post-D view, so the cap was already gone
+    // when `relax_decision::decide` -- documented as the sole policy-aware
+    // relaxation boundary -- ran: the bound was dropped silently, by
+    // nobody's decision, and conda-forge's huggingface_hub 1.28 satisfied
+    // the residue. Emission must read the PRE-D lines so the policy sees the
+    // real bound and either keeps it or records relaxing it.
+    let mut bundle = solo_bundle("hub-cap-pack", vec!["huggingface-hub>=0.34.0"]);
+    bundle.primary.original_requires_dist = vec!["huggingface-hub<1.0,>=0.34.0".to_string()];
+
+    let output =
+        produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
+    let deps: Vec<(String, String)> = output
+        .run_dependencies
+        .depends
+        .iter()
+        .map(|d| (d.name.clone(), format_packagespec(&d.spec)))
+        .collect();
+    let (_, spec) = deps
+        .iter()
+        .find(|(n, _)| n.replace('-', "_") == "huggingface_hub")
+        .unwrap_or_else(|| panic!("huggingface hub must be emitted as a conda run-dep: {deps:?}"));
+    assert!(
+        spec.contains("<1.0"),
+        "the requirer\'s own cap must survive into the conda run-dep (or be \
+         explicitly relaxed by relax_decision, never silently dropped): {deps:?}"
+    );
+    assert!(spec.contains(">=0.34.0"), "{deps:?}");
+}
+
+#[test]
 fn final_emission_opts_into_minimal_stale_cap_relaxation() {
     let mut bundle = solo_bundle("relax-pack", vec!["demo>=1,<2", "demo<99"]);
     bundle.extras.push(rw(
@@ -2786,6 +2821,9 @@ fn rw(pypi: &str, m: WheelMetadata) -> ResolvedWheel {
         sdist_source: None,
         metadata_provenance: Provenance::IndexWheelMetadata,
         url,
+        // Fixtures are already-final metadata: pre-D == post-D unless a test
+        // deliberately makes them differ (see the phase-D cap-strip guard).
+        original_requires_dist: m.requires_dist.clone(),
         metadata: m,
         extras_requested: vec![],
         auto_data: None,
@@ -3921,6 +3959,7 @@ fn relaxed_pure_python_primary_pins_python_to_workspace_variant() {
             git_source: None,
             sdist_source: None,
             metadata_provenance: Provenance::SourceBuiltRelaxed,
+            original_requires_dist: primary.requires_dist.clone(),
             metadata: primary,
             extras_requested: vec![],
             auto_data: None,
