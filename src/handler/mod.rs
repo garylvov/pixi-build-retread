@@ -13118,11 +13118,146 @@ fn env_pypi_owned(bundle: &Bundle, config: &RetreadConfig) -> BTreeSet<String> {
 ///
 /// Silent when the workspace lock has no entry for the name: the cold first
 /// pass has no lock yet, and "cannot know" is not "unconstrained".
-fn check_declared_pypi_bounds(
+/// How a ceded name's env-provided version relates to a bundled wheel's bound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CededBoundVerdict {
+    /// The env-provided version satisfies the bundled bound. Nothing to do.
+    Satisfied,
+    /// The env version violates the bound but stays inside the SAME MAJOR the
+    /// bound admits. Operator ruling 2026-08-19: the declared-pypi provider
+    /// WINS -- the pack's bound is relaxed to the major band, the relaxation is
+    /// recorded, and the build proceeds. `relaxed` is the replacement spec.
+    WithinMajor { relaxed: String },
+    /// The violation crosses a MAJOR boundary (`huggingface_hub 1.28` against a
+    /// bundled `<1.0`). No within-major relaxation is defensible, so conda must
+    /// become the single owner of the name -- or the build refuses.
+    CrossMajor,
+}
+
+/// Can `clause` admit ANY version whose major release equals `major`?
+fn clause_admits_major(clause: &VersionSpecifier, major: u64) -> bool {
+    let version = clause.version();
+    let clause_major = version.release().first().copied().unwrap_or(0);
+    match clause.operator() {
+        Operator::Equal | Operator::ExactEqual | Operator::EqualStar | Operator::TildeEqual => {
+            major == clause_major
+        }
+        Operator::NotEqual | Operator::NotEqualStar => true,
+        Operator::GreaterThan | Operator::GreaterThanEqual => major >= clause_major,
+        Operator::LessThanEqual => major <= clause_major,
+        // `<1.0` admits NOTHING in major 1 (that is the cross-major case);
+        // `<1.5` still admits 1.x below 1.5.
+        Operator::LessThan => {
+            if version.release().iter().skip(1).all(|part| *part == 0) {
+                major < clause_major
+            } else {
+                major <= clause_major
+            }
+        }
+    }
+}
+
+/// Shared build/install policy predicate: does a ceded name's env-provided
+/// version violate `specifiers` only WITHIN the major that bound admits?
+///
+/// The installer must never refuse what the build accepted, so both sides read
+/// this one function.
+pub(crate) fn ceded_bound_is_within_major(
+    specifiers: &VersionSpecifiers,
+    env_version: &Version,
+) -> bool {
+    matches!(
+        classify_ceded_bound(specifiers, env_version),
+        CededBoundVerdict::WithinMajor { .. }
+    )
+}
+
+fn spec_admits_major(specifiers: &VersionSpecifiers, major: u64) -> bool {
+    specifiers
+        .iter()
+        .all(|clause| clause_admits_major(clause, major))
+}
+
+/// The highest version the bundled bound anchors from below -- the floor the
+/// within-major relaxation must preserve (the wheel was built against it).
+fn spec_floor(specifiers: &VersionSpecifiers) -> Option<Version> {
+    specifiers
+        .iter()
+        .filter(|clause| {
+            matches!(
+                clause.operator(),
+                Operator::Equal
+                    | Operator::ExactEqual
+                    | Operator::EqualStar
+                    | Operator::TildeEqual
+                    | Operator::GreaterThan
+                    | Operator::GreaterThanEqual
+            )
+        })
+        .map(|clause| clause.version().clone())
+        .max()
+}
+
+/// Classify a ceded name's bundled bound against the version the consuming env
+/// actually provides.
+fn classify_ceded_bound(
+    specifiers: &VersionSpecifiers,
+    env_version: &Version,
+) -> CededBoundVerdict {
+    if specifiers.contains(env_version) {
+        return CededBoundVerdict::Satisfied;
+    }
+    let major = env_version.release().first().copied().unwrap_or(0);
+    if spec_admits_major(specifiers, major) {
+        let floor = spec_floor(specifiers).unwrap_or_else(|| env_version.clone());
+        return CededBoundVerdict::WithinMajor {
+            relaxed: format!(">={floor},<{}", major + 1),
+        };
+    }
+    CededBoundVerdict::CrossMajor
+}
+
+/// The automatic resolution of every ceded name whose bundled bound and
+/// env-provided version disagree.
+#[derive(Debug, Default, Clone)]
+struct CededOwnership {
+    /// Canonical name -> the relaxed spec emitted in place of the bundled
+    /// bound (within-major: the declared-pypi provider wins).
+    relaxed: BTreeMap<String, String>,
+    /// Recorded relaxations, written into the bundle's relaxation manifest
+    /// through the same seam every other emission relaxation uses.
+    records: Vec<auto_bundle::WheelMetadataRelaxation>,
+}
+
+/// Resolve every contradiction between a bundled wheel's requirement and the
+/// version the consuming workspace has ALREADY locked for a name the pack is
+/// ceding to pixi's pypi phase.
+///
+/// Ceding a name (`declared_pypi_reachable` / `env_pypi_owned`) hands the
+/// version choice to pixi. Three outcomes, decided here and nowhere else:
+///
+/// * **satisfied** -- nothing to do; the bound rides out as `constrains`.
+/// * **within the same major** (isaacsim_core's `networkx ==3.3` against the
+///   env's `networkx 3.6.1`) -- operator ruling 2026-08-19: ACCEPT the env
+///   version, relax the pack's bound to the major band, RECORD the relaxation
+///   and WARN once. Refusing here would make every ordinary float/pin
+///   disagreement a hard stop, and the pack's exact pin is an incidental
+///   snapshot of what its builder resolved against, not an ABI fact.
+/// * **across a major boundary** (`huggingface_hub 1.28` against a bundled
+///   `<1.0`) -- no relaxation is defensible. Conda must become the single owner
+///   of the name; when it cannot, REFUSE, naming all three sides (the declared
+///   pypi root, the bundled wheel, and conda).
+///
+/// Silent when the workspace lock has no entry for the name: the cold first
+/// pass has no lock yet, and "cannot know" is not "unconstrained" -- on that
+/// pass the bound still leaves as `constrains`, which is what bounds pixi's own
+/// pypi solve.
+fn resolve_ceded_pypi_bounds(
     bundle: &Bundle,
     declared_pypi_owned: &BTreeSet<String>,
     marker_env: &uv_pep508::MarkerEnvironment,
-) -> Result<()> {
+) -> Result<CededOwnership> {
+    let mut ownership = CededOwnership::default();
     if declared_pypi_owned.is_empty() || bundle.workspace_locked_pypi.is_empty() {
         tracing::debug!(
             bundle = %bundle.conda_name,
@@ -13130,7 +13265,7 @@ fn check_declared_pypi_bounds(
             locked = bundle.workspace_locked_pypi.len(),
             "declared-pypi bound check: no locked workspace pypi facts; skipping",
         );
-        return Ok(());
+        return Ok(ownership);
     }
     for wheel in bundle.all_wheels() {
         for raw in &wheel.metadata.requires_dist {
@@ -13162,17 +13297,70 @@ fn check_declared_pypi_bounds(
             let Ok(locked_version) = uv_pep508::uv_pep440::Version::from_str(locked) else {
                 continue;
             };
-            if specifiers.contains(&locked_version) {
-                continue;
+            match classify_ceded_bound(specifiers, &locked_version) {
+                CededBoundVerdict::Satisfied => continue,
+                CededBoundVerdict::WithinMajor { relaxed } => {
+                    tracing::warn!(
+                        bundle = %bundle.conda_name,
+                        "declared-pypi ownership: accepting {name}=={locked} over bundled wheel \
+                         {wheel_file} requirement {raw}; relaxed to {relaxed} \
+                         (within-major relaxation; declared pypi provider wins)",
+                        wheel_file = wheel.metadata.filename,
+                    );
+                    let decision = crate::relax_decision::RelaxationDecision {
+                        origin_id: ConstraintOriginId::from_parts(
+                            "declared-pypi-owner",
+                            [name.as_str(), locked.as_str(), raw.as_str()],
+                        ),
+                        kind: crate::relax_decision::RelaxationKind::ExactPinWidened,
+                        original: specifiers.to_string(),
+                        relaxed: relaxed.clone(),
+                        original_clause: specifiers.to_string(),
+                        relaxed_clause: Some(relaxed.clone()),
+                        source: format!(
+                            "wheel `{}` Requires-Dist `{raw}` vs declared-pypi owner \
+                             {name}=={locked} (within-major; declared pypi provider wins)",
+                            wheel.metadata.filename,
+                        ),
+                        tier: RelaxPolicy::Major,
+                    };
+                    ownership
+                        .records
+                        .extend(auto_bundle::wheel_metadata_relaxations(
+                            &crate::relax::PypiKey::from_pypi(&name),
+                            &[],
+                            vec![decision],
+                            &bundle.conda_name,
+                            format!(" for bundle '{}'", bundle.conda_name),
+                        ));
+                    // Widest relaxation wins when two wheels disagree: the
+                    // env installs exactly one copy either way.
+                    ownership.relaxed.insert(name.clone(), relaxed);
+                }
+                CededBoundVerdict::CrossMajor => {
+                    bail!(
+                        "declared-pypi owner {name}=={locked} violates bundled wheel \
+                         {wheel_file} requirement {raw} across a MAJOR boundary; declared by \
+                         workspace [pypi-dependencies] {roots}; conda cannot be made the single \
+                         owner of {name} at {spec} either; fix the manifest/pack, not the repair",
+                        wheel_file = wheel.metadata.filename,
+                        spec = specifiers,
+                        roots = if bundle.workspace_declared_pypi.is_empty() {
+                            "(none declared; ownership came from the env's pixi.lock)".to_string()
+                        } else {
+                            bundle
+                                .workspace_declared_pypi
+                                .iter()
+                                .map(String::as_str)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        },
+                    );
+                }
             }
-            bail!(
-                "declared-pypi owner {name}=={locked} violates bundled wheel \
-                 {wheel_file} requirement {raw}; fix the manifest/pack, not the repair",
-                wheel_file = wheel.metadata.filename,
-            );
         }
     }
-    Ok(())
+    Ok(ownership)
 }
 
 fn produce_output_with_conflicts(
@@ -13307,7 +13495,11 @@ fn produce_output_with_conflicts(
     let env_pypi_owned = env_pypi_owned(bundle, config);
     let mut declared_pypi_owned = declared_pypi_reachable(bundle, config);
     declared_pypi_owned.extend(env_pypi_owned.iter().cloned());
-    check_declared_pypi_bounds(bundle, &declared_pypi_owned, &env)?;
+    // Contradictions between a bundled bound and the version the env already
+    // provides are resolved HERE and nowhere else (operator ruling 2026-08-19):
+    // within-major -> relax + record + WARN and let the declared pypi provider
+    // win; across a major boundary -> refuse, naming all three sides.
+    let ceded_ownership = resolve_ceded_pypi_bounds(bundle, &declared_pypi_owned, &env)?;
     // One greppable ownership verdict per name the bundle carries, at the one
     // point where all three owners are decidable. `pack` means this build
     // ships the dist; `conda` means a workspace conda provider supplies it;
@@ -13559,6 +13751,25 @@ fn produce_output_with_conflicts(
         // the caps out of the latter, so reading it made the strict-first
         // contract below a no-op for exactly the clauses that matter.
         for raw in &wheel.original_requires_dist {
+            // A ceded name whose env-provided version fell outside this bound
+            // but inside the same MAJOR: the declared pypi provider won, so the
+            // bound the pack ADVERTISES is the relaxed one -- advertising the
+            // original exact pin would make the workspace solve unsatisfiable
+            // against the version we just accepted (operator ruling 2026-08-19).
+            let relaxed_raw: Option<String> =
+                uv_pep508::Requirement::<uv_pep508::VerbatimUrl>::from_str(raw)
+                    .ok()
+                    .and_then(|requirement| {
+                        let name = canonical_conda_name(requirement.name.as_ref());
+                        let spec = ceded_ownership.relaxed.get(&name)?;
+                        Some(match raw.split_once(';') {
+                            Some((_, marker)) => {
+                                format!("{}{spec} ;{marker}", requirement.name.as_ref())
+                            }
+                            None => format!("{}{spec}", requirement.name.as_ref()),
+                        })
+                    });
+            let raw: &String = relaxed_raw.as_ref().unwrap_or(raw);
             let Some(dep) = crate::relax::translate(
                 raw,
                 &env,
@@ -13812,7 +14023,7 @@ fn produce_output_with_conflicts(
     });
     let abi_aliases = output_abi_aliases(bundle, config);
     let mut conflicts = Vec::new();
-    let mut pending_relaxations = Vec::new();
+    let mut pending_relaxations = ceded_ownership.records.clone();
     let mut supports_by_conda = BTreeMap::new();
     // Decided specs for names a workspace conda provider owns. Same decide
     // pipeline as `run_dep_specs`, different emission slot (`constrains`).
