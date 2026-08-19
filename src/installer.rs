@@ -1110,7 +1110,7 @@ pub(crate) fn missing_locked_wheels_from_installed(
     missing
 }
 
-fn record_path_token(line: &str) -> Option<String> {
+pub(crate) fn record_path_token(line: &str) -> Option<String> {
     let trimmed = line.trim_start();
     if trimmed.is_empty() {
         return None;
@@ -1320,6 +1320,20 @@ pub fn verify(lock_path: &Path, prefix: &Path, full: bool) -> Result<()> {
     let (raw, lock) = read_validated_lock(lock_path)?;
 
     let share = prefix.join("share").join("retread");
+    // Reader for `<bundle>.state` (written by crate::repair). A prefix left
+    // `broken` or `repairing` is not verified: the marker and the payload can
+    // both look intact while a half-uninstalled distribution survives only as
+    // an importable PEP 420 namespace directory. Report the state and fail, so
+    // the activate.d guard's `retread verify || retread install` re-attempts
+    // the repair instead of trusting the wreckage.
+    if let Some(state) = crate::repair::read_state(&share, &lock.bundle)
+        .filter(|state| crate::repair::state_is_distrusted(*state))
+    {
+        bail!(
+            "{}",
+            crate::repair::distrust_reason(&share, &lock.bundle, state)
+        );
+    }
     let marker = share.join(lock.marker_name());
     let want = lock_digest(&raw);
     let have = std::fs::read_to_string(&marker)
@@ -1398,6 +1412,37 @@ pub async fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
     let share = prefix.join("share").join("retread");
     std::fs::create_dir_all(&share).ok();
 
+    // Reader for `<bundle>.state`: `broken` (repair finished and failed) or
+    // `repairing` (repair killed mid-transaction) both mean the prefix may be
+    // half-uninstalled, which is precisely the shape the fast path below
+    // cannot detect -- the marker still matches and RECORD verification passes
+    // for every distribution uv did not get to. Say why on one loud line
+    // naming the repair log, then force the full replay.
+    let recorded_state = crate::repair::read_state(&share, &lock.bundle)
+        .filter(|state| crate::repair::state_is_distrusted(*state));
+    // The activate.d guard writes only the legacy `.broken` sentinel (it is a
+    // shell script and knows nothing about `.state`), so an older or
+    // shell-marked prefix must be distrusted on that file alone. Without this
+    // a `.broken` prefix reached the "marker exists but GLIBC audit
+    // verification failed" branch below, which REMOVES the sentinel and
+    // returns Ok after only refreshing the audit -- i.e. it silently declared
+    // a failed repair healthy without replaying a single wheel.
+    let legacy_broken = crate::repair::broken_path(&share, &lock.bundle).exists();
+    let distrusted = recorded_state.is_some() || legacy_broken;
+    match recorded_state {
+        Some(state) => eprintln!(
+            "{}; re-attempting the repair",
+            crate::repair::distrust_reason(&share, &lock.bundle, state)
+        ),
+        None if legacy_broken => eprintln!(
+            "retread: bundle {} is marked broken by {}; failure text in {}; re-attempting the repair",
+            lock.bundle,
+            crate::repair::broken_path(&share, &lock.bundle).display(),
+            crate::repair::repair_log_path(&share, &lock.bundle).display()
+        ),
+        None => {}
+    }
+
     let marker = share.join(lock.marker_name());
     let want = lock_digest(&raw);
 
@@ -1410,7 +1455,10 @@ pub async fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
     // lock-free reader sees either the old or the new marker, never a
     // torn one. Any mismatch (including a race with an in-flight writer)
     // just falls through to the locked slow path, which re-evaluates.
-    if marker_matches(&marker, &want) && verify_payload_installed(&lock, prefix).is_ok() {
+    if !distrusted
+        && marker_matches(&marker, &want)
+        && verify_payload_installed(&lock, prefix).is_ok()
+    {
         let marker_text = std::fs::read_to_string(&marker).unwrap_or_default();
         if crate::glibc::verify_marker_state(&lock, prefix, &marker_text).is_ok() {
             let msg = format!("retread install: {} already current; skipping", lock.bundle);
@@ -1443,7 +1491,7 @@ pub async fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
             let _ = fs4::fs_std::FileExt::lock_exclusive(f);
         })
         .ok();
-    let marker_current = marker_matches(&marker, &want);
+    let marker_current = !distrusted && marker_matches(&marker, &want);
     let mut force_reinstall = !marker_current;
     if marker_current {
         match verify_payload_installed(&lock, prefix) {
@@ -1568,6 +1616,27 @@ pub async fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
     )
     .await?;
 
+    // ── D2: make the destructive replay survivable ──────────────────────
+    // uv runs the replay as uninstall-then-install and its uninstall is NOT
+    // transactional. Snapshot what the transaction will uninstall BEFORE it
+    // runs (once uv has deleted a RECORD, ownership can no longer be
+    // reconstructed) and delete the unowned bytecode that makes uv's
+    // post-uninstall `rmdir` abort with `Directory not empty (os error 39)`,
+    // stranding the prefix with a half-removed, still-importable package.
+    // See `crate::repair`.
+    let replay_names = crate::repair::replay_dist_names(&wheel_files);
+    let (transaction, pruned_pycache) = crate::repair::prepare_transaction(
+        &site_packages_dir(prefix, &lock.python),
+        &replay_names,
+    )?;
+    if pruned_pycache > 0 {
+        eprintln!(
+            "retread install: {} pre-cleaned {pruned_pycache} unowned __pycache__ \
+             dir(s) before the replay",
+            lock.bundle
+        );
+    }
+
     let mut relaxed_platform: Option<String> = None;
     let mut declaration_source: Option<String> = None;
 
@@ -1620,6 +1689,15 @@ pub async fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
             })
             .ok();
 
+        // The prefix is about to be mutated destructively; record it so a
+        // crashed or killed repair is distinguishable from a completed one.
+        crate::repair::mark_state(
+            &share,
+            &lock.bundle,
+            crate::repair::RepairState::Repairing,
+            &install_msg,
+        );
+
         let status = Command::new(&uv)
             .args(&args)
             .status()
@@ -1642,21 +1720,34 @@ pub async fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
                         .status()
                         .with_context(|| format!("spawning uv ({uv:?}) with relaxed platform"))?;
                     if !status.success() {
-                        bail!(
-                            "uv pip install failed for bundle {} even after relaxing the \
-                             manylinux platform tag to {} (status {status})",
-                            lock.bundle,
-                            outcome.platform
-                        );
+                        return Err(crate::repair::fail_repair(
+                            &share,
+                            &lock.bundle,
+                            &transaction,
+                            anyhow::anyhow!(
+                                "uv pip install failed for bundle {} even after relaxing \
+                                 the manylinux platform tag to {} (status {status})",
+                                lock.bundle,
+                                outcome.platform
+                            ),
+                        ));
                     }
                     relaxed_platform = Some(outcome.platform);
                     declaration_source = Some(outcome.declaration_source.to_string());
                 }
                 None => {
-                    bail!(
-                        "uv pip install failed for bundle {} (status {status})",
-                        lock.bundle
-                    );
+                    // A failed replay must leave the previous complete state
+                    // or a clean ABSENCE -- never a half-removed tree that
+                    // still imports as a PEP 420 namespace package.
+                    return Err(crate::repair::fail_repair(
+                        &share,
+                        &lock.bundle,
+                        &transaction,
+                        anyhow::anyhow!(
+                            "uv pip install failed for bundle {} (status {status})",
+                            lock.bundle
+                        ),
+                    ));
                 }
             }
         }
@@ -1682,6 +1773,12 @@ pub async fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
     std::fs::create_dir_all(&share).ok();
     write_marker_atomic(&marker, &crate::glibc::marker_body(&want, &audit)?)?;
     let _ = std::fs::remove_file(share.join(format!("{}.broken", lock.bundle)));
+    crate::repair::mark_state(
+        &share,
+        &lock.bundle,
+        crate::repair::RepairState::Installed,
+        "",
+    );
     let done_msg = format!("retread install: {} installed", lock.bundle);
     eprintln!("{done_msg}");
     crate::status::phase(
@@ -3253,6 +3350,143 @@ mod tests {
         .unwrap();
 
         verify(&lock_path, &prefix, false).expect("matching marker plus metadata should verify");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // Build a prefix that verifies cleanly: matching marker + one installed
+    // distribution with METADATA and a RECORD whose payload is present.
+    // Returns (root, prefix, lock_path).
+    fn healthy_verifying_prefix(label: &str) -> (PathBuf, PathBuf, PathBuf, RetreadLock) {
+        let root = tempdir(label);
+        let prefix = root.join("prefix");
+        let share = prefix.join("share").join("retread");
+        std::fs::create_dir_all(&share).unwrap();
+
+        let lock = make_native_lock(
+            vec![],
+            vec!["https://pypi.org/simple/".into()],
+            BTreeMap::new(),
+        );
+        let raw = serde_json::to_vec(&lock).unwrap();
+        let target = lock.resolution_target().unwrap();
+        let lock_path = share.join(RetreadLock::file_name_for_target(&lock.bundle, &target));
+        std::fs::write(&lock_path, &raw).unwrap();
+        std::fs::write(
+            share.join(lock.marker_name()),
+            marker_with_audit(&lock_digest(&raw)),
+        )
+        .unwrap();
+
+        let site_packages = site_packages_dir(&prefix, &lock.python);
+        let dist_info = site_packages.join("mypackage-1.0.0.dist-info");
+        std::fs::create_dir_all(&dist_info).unwrap();
+        std::fs::write(
+            dist_info.join("METADATA"),
+            "Metadata-Version: 2.1\nName: MyPackage\nVersion: 1.0.0\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(site_packages.join("mypackage")).unwrap();
+        std::fs::write(site_packages.join("mypackage/__init__.py"), "").unwrap();
+        std::fs::write(
+            dist_info.join("RECORD"),
+            "mypackage/__init__.py,,\nmypackage-1.0.0.dist-info/METADATA,,\nmypackage-1.0.0.dist-info/RECORD,,\n",
+        )
+        .unwrap();
+
+        verify(&lock_path, &prefix, false).expect("fixture must verify before the state is set");
+        (root, prefix, lock_path, lock)
+    }
+
+    // Reader half of the `<bundle>.state` writer: `retread verify` must refuse
+    // a prefix whose last repair failed (`broken`) or was killed mid
+    // transaction (`repairing`), even though marker + RECORD payload still
+    // check out -- that combination is exactly the hover-gpu wreckage (uv
+    // uninstalled torch, nothing reinstalled, every OTHER dist still verifies).
+    #[test]
+    fn verify_fails_on_a_broken_or_repairing_state_file() {
+        let (root, prefix, lock_path, lock) = healthy_verifying_prefix("verify-state");
+        let share = prefix.join("share").join("retread");
+
+        for state in [
+            crate::repair::RepairState::Broken,
+            crate::repair::RepairState::Repairing,
+        ] {
+            crate::repair::mark_state(&share, &lock.bundle, state, "uv died after uninstall");
+            let err = verify(&lock_path, &prefix, false)
+                .expect_err("a distrusted state file must fail verification");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("not trustworthy")
+                    && msg.contains(state.as_str())
+                    && msg.contains(&format!("{}.repair.log", lock.bundle)),
+                "state {:?} must be reported and the repair log named, got: {msg}",
+                state
+            );
+        }
+
+        // Clearing the state (a completed install) restores a passing verify.
+        crate::repair::mark_state(
+            &share,
+            &lock.bundle,
+            crate::repair::RepairState::Installed,
+            "",
+        );
+        verify(&lock_path, &prefix, false).expect("installed state must verify again");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // The same reader in `installer::run`: a distrusted state must defeat the
+    // marker fast path so the repair is RE-ATTEMPTED rather than skipped. The
+    // fixture has no `bin/python`, so "re-attempted" is observable as the
+    // replay's own python-not-found error instead of "already current".
+    #[tokio::test]
+    async fn install_re_attempts_the_repair_on_a_broken_or_repairing_state_file() {
+        let (root, prefix, lock_path, lock) = healthy_verifying_prefix("install-state");
+        let share = prefix.join("share").join("retread");
+
+        run(&lock_path, &prefix)
+            .await
+            .expect("without a state file the marker fast path must skip");
+
+        for state in [
+            crate::repair::RepairState::Broken,
+            crate::repair::RepairState::Repairing,
+        ] {
+            crate::repair::mark_state(&share, &lock.bundle, state, "uv died after uninstall");
+            let err = run(&lock_path, &prefix)
+                .await
+                .expect_err("a distrusted state file must defeat the fast path");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("python not found"),
+                "state {:?} must reach the replay (repair re-attempted), got: {msg}",
+                state
+            );
+        }
+
+        // Legacy prefixes carry only the shell-written `.broken` sentinel.
+        crate::repair::mark_state(
+            &share,
+            &lock.bundle,
+            crate::repair::RepairState::Installed,
+            "",
+        );
+        std::fs::write(
+            crate::repair::broken_path(&share, &lock.bundle),
+            "uv died after uninstall\n",
+        )
+        .unwrap();
+        let err = run(&lock_path, &prefix)
+            .await
+            .expect_err("a legacy .broken sentinel must defeat the fast path too");
+        assert!(
+            format!("{err:#}").contains("python not found"),
+            "legacy sentinel must reach the replay, got: {err:#}"
+        );
+        assert!(
+            crate::repair::broken_path(&share, &lock.bundle).exists(),
+            "a failed re-attempt must not clear the broken sentinel"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
