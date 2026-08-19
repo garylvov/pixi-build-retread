@@ -6,6 +6,7 @@
 pub mod audit;
 pub mod compat;
 pub mod concurrency;
+pub mod conda_constraint_carry;
 pub mod conda_solve;
 pub mod config;
 pub mod constraint;
