@@ -29,7 +29,7 @@ use pixi_build_types::procedures::{
     negotiate_capabilities::{NegotiateCapabilitiesParams, NegotiateCapabilitiesResult},
 };
 use pixi_build_types::{
-    BackendCapabilities, BinaryPackageSpec, NamedSpec, PackageSpec, VariantValue,
+    BackendCapabilities, BinaryPackageSpec, ConstraintSpec, NamedSpec, PackageSpec, VariantValue,
 };
 use rattler_conda_types::{
     ChannelUrl, NoArchType, PackageName, Platform, StringMatcher, VersionSpec, VersionWithSource,
@@ -1264,6 +1264,7 @@ composed = { features = ["composed"], no-default-feature = true }
                     sdist_source: None,
                 },
             ],
+            conda_run_constraints: Vec::new(),
             conda_run_deps: vec![CondaDep {
                 name: "numba".to_string(),
                 spec: ">=0.59.1,<0.60".to_string(),
@@ -1539,6 +1540,7 @@ alias = { features = ["sibling", "alias"], no-default-feature = true }
                 git_source: None,
                 sdist_source: None,
             }],
+            conda_run_constraints: Vec::new(),
             conda_run_deps: Vec::new(),
             index_urls: vec!["https://pypi.org/simple/".to_string()],
             prerelease: BTreeMap::new(),
@@ -11303,6 +11305,10 @@ fn assemble_conda_output(
     courier: bool,
     any_platform_specific: bool,
     mut run_dep_specs: Vec<NamedSpec<PackageSpec>>,
+    // Conda `constrains`: bounds the pack states without claiming the
+    // dependency. Canonically ordered here alongside `run_dep_specs` so the
+    // cold and replay paths emit byte-identical metadata.
+    mut constrains_specs: Vec<NamedSpec<ConstraintSpec>>,
     mut seen_dep_names: HashSet<String>,
     host_platform: Platform,
     build_number: u64,
@@ -11363,6 +11369,14 @@ fn assemble_conda_output(
             })
         });
     }
+    // Constrains are order-insensitive but land in the same advertised
+    // metadata, so canonicalize unconditionally: the lock stores them sorted
+    // (`RetreadLock::canonicalize`) and replay must reproduce that order.
+    constrains_specs.sort_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then_with(|| format_constraint_spec(a).cmp(&format_constraint_spec(b)))
+    });
 
     // Courier is never noarch: it ships the native `retread` installer binary
     // + a python-specific lock, and the courier recipe is `noarch: None`.
@@ -11419,7 +11433,7 @@ fn assemble_conda_output(
         }),
         run_dependencies: CondaOutputDependencies {
             depends: run_dep_specs,
-            constraints: Vec::new(),
+            constraints: constrains_specs,
         },
         ignore_run_exports: CondaOutputIgnoreRunExports::default(),
         run_exports: CondaOutputRunExports::default(),
@@ -11474,6 +11488,13 @@ struct PypiEmissionGroup {
     validation_only_origins: BTreeSet<ConstraintOriginId>,
     native_conda_overrides: BTreeSet<String>,
     supports: BTreeSet<EmissionSupport>,
+    /// True while EVERY constraint in this group came from a requirement the
+    /// pack must not claim as its own run-dep (today: a name a workspace
+    /// conda provider already owns). Such a group still goes through
+    /// `relax_decision::decide` -- the sole policy boundary -- but its decided
+    /// spec is emitted as a conda `constrains` entry instead of a `depends`
+    /// one. One real depend edge flips it false for the whole group.
+    constrains_only: bool,
 }
 
 #[derive(Debug)]
@@ -11568,6 +11589,9 @@ struct EmissionConstraintInput {
     constraint: Constraint,
     native_conda_override: Option<String>,
     support: EmissionSupport,
+    /// See [`PypiEmissionGroup::constrains_only`]. `false` for every ordinary
+    /// emission edge.
+    constrains_only: bool,
 }
 
 fn add_emission_constraint(
@@ -11582,6 +11606,7 @@ fn add_emission_constraint(
         constraint,
         native_conda_override,
         support,
+        constrains_only,
     } = input;
     let conda_key = conda_name.key();
     let index = match indexes.get(&conda_key) {
@@ -11597,6 +11622,9 @@ fn add_emission_constraint(
                 validation_only_origins: BTreeSet::new(),
                 native_conda_overrides: BTreeSet::new(),
                 supports: BTreeSet::new(),
+                // Start permissive; the AND below narrows it only if every
+                // contributing edge is constrains-only.
+                constrains_only: true,
             });
             index
         }
@@ -11643,6 +11671,10 @@ fn add_emission_constraint(
         }
     }
     group.supports.insert(support);
+    // Any real depend edge outranks a constrains-only one: if the pack must
+    // depend on this name for some other reason, the carried bound belongs in
+    // `depends`, not `constrains`.
+    group.constrains_only = group.constrains_only && constrains_only;
     Ok(())
 }
 
@@ -12859,6 +12891,7 @@ fn produce_output_with_conflicts(
                     constraint: workspace_provider.constraint.clone(),
                     native_conda_override: None,
                     support: route_support,
+                    constrains_only: false,
                 },
             )?;
             continue;
@@ -12928,6 +12961,7 @@ fn produce_output_with_conflicts(
                     },
                     native_conda_override: None,
                     support: route_support.clone(),
+                    constrains_only: false,
                 },
             )?;
         }
@@ -12967,6 +13001,7 @@ fn produce_output_with_conflicts(
                 },
                 native_conda_override: None,
                 support: route_support.clone(),
+                constrains_only: false,
             },
         )?;
         for input in &auto_route.route.input_requirements {
@@ -13011,6 +13046,7 @@ fn produce_output_with_conflicts(
                     },
                     native_conda_override: None,
                     support: route_support.clone(),
+                    constrains_only: false,
                 },
             )?;
         }
@@ -13075,16 +13111,24 @@ fn produce_output_with_conflicts(
             // translated conda name here would let an inferred name-map edge
             // turn an unrelated PyPI owner into ownership of this raw wheel
             // requirement.
-            if bundle
+            // A workspace conda provider owns this name, so the pack must not
+            // claim it as a run-dep -- but silently DISCARDING the requirement
+            // also discarded its BOUND, and the bundled wheel was built against
+            // that bound. Carry it through the same group/decide machinery as
+            // every other edge (so a workspace fact still relaxes or refuses it
+            // at `relax_decision::decide`, the sole policy boundary) and emit
+            // the decided spec as a conda `constrains` entry: inert unless the
+            // provider is pulled in, binding when it is.
+            let constrains_only = bundle
                 .auto_dropped
-                .contains(&canonical_conda_name(raw_pypi_name))
-            {
+                .contains(&canonical_conda_name(raw_pypi_name));
+            if constrains_only {
                 tracing::debug!(
                     dep = %dep_name,
                     bundle = %bundle.conda_name,
-                    "dropping wheel dependency owned by a workspace conda provider",
+                    "wheel dependency owned by a workspace conda provider; \
+                     carrying its bound as a conda constrains entry",
                 );
-                continue;
             }
             if in_set(&built_in_auto_dropped) {
                 // Surface this prominently so the user has a chance to
@@ -13151,6 +13195,7 @@ fn produce_output_with_conflicts(
                         translated_conda_name: dep_name,
                         raw_pypi_name: raw_pypi_name.to_string(),
                     },
+                    constrains_only,
                 },
             )?;
         }
@@ -13238,6 +13283,9 @@ fn produce_output_with_conflicts(
     let mut conflicts = Vec::new();
     let mut pending_relaxations = Vec::new();
     let mut supports_by_conda = BTreeMap::new();
+    // Decided specs for names a workspace conda provider owns. Same decide
+    // pipeline as `run_dep_specs`, different emission slot (`constrains`).
+    let mut constrains_specs: Vec<NamedSpec<ConstraintSpec>> = Vec::new();
     for group in emission_groups {
         let PypiEmissionGroup {
             pypi_names,
@@ -13247,6 +13295,7 @@ fn produce_output_with_conflicts(
             validation_only_origins,
             native_conda_overrides,
             supports,
+            constrains_only,
         } = group;
         let pypi_name = pypi_names
             .iter()
@@ -13267,7 +13316,13 @@ fn produce_output_with_conflicts(
             });
         let native_conda_override = native_conda_overrides.into_iter().next();
         let conda_key = conda_name.key().into_string();
-        supports_by_conda.insert(conda_key.clone(), supports);
+        if !constrains_only {
+            // Rule 2's route oracle indexes EMITTED routes. A constrains-only
+            // group is not a route (it never appears in `depends`), so adding
+            // it would advertise structural support for an edge the pack does
+            // not actually carry.
+            supports_by_conda.insert(conda_key.clone(), supports);
+        }
         if !seen_dep_names.insert(conda_key) {
             bail!(
                 "duplicate conda dependency target `{conda_name}` reached final emission; \
@@ -13309,7 +13364,11 @@ fn produce_output_with_conflicts(
                     rendered
                 };
                 let spec = conda_name.match_spec(&rendered);
-                run_dep_specs.push(spec_from_str(spec.as_str())?);
+                if constrains_only {
+                    constrains_specs.push(constraint_spec_from_str(spec.as_str())?);
+                } else {
+                    run_dep_specs.push(spec_from_str(spec.as_str())?);
+                }
             }
             RelaxDecision::Relaxed {
                 specifiers,
@@ -13339,7 +13398,11 @@ fn produce_output_with_conflicts(
                     rendered
                 };
                 let spec = conda_name.match_spec(&rendered);
-                run_dep_specs.push(spec_from_str(spec.as_str())?);
+                if constrains_only {
+                    constrains_specs.push(constraint_spec_from_str(spec.as_str())?);
+                } else {
+                    run_dep_specs.push(spec_from_str(spec.as_str())?);
+                }
             }
             RelaxDecision::Conflict(conflict) => {
                 let platform = host_platform.to_string();
@@ -13350,6 +13413,22 @@ fn produce_output_with_conflicts(
                     &platform,
                     workspace_python_version,
                 );
+                if constrains_only {
+                    // A constrains entry states a bound; it does not claim the
+                    // dependency. An undecidable one must NOT turn a pack that
+                    // built before into a hard failure -- that would be a
+                    // regression introduced by the carry itself. Drop it, but
+                    // loudly (doctrine: failure reaches an actor).
+                    tracing::warn!(
+                        dep = %conda_name,
+                        bundle = %bundle.conda_name,
+                        conflict = %conflict,
+                        "conda constrains entry for a workspace-provided name could not be \
+                         decided; omitting the bound. The workspace conda provider is \
+                         unbounded for this name.",
+                    );
+                    continue;
+                }
                 // Keep a name-only placeholder in the tolerant assembly so
                 // Rule 2 can identify and reject a wholly mutable route. The
                 // strict `produce_output` wrapper below always returns the
@@ -13388,6 +13467,7 @@ fn produce_output_with_conflicts(
         config.courier,
         any_platform_specific,
         run_dep_specs,
+        constrains_specs,
         seen_dep_names,
         host_platform,
         config.build_number,
@@ -13998,6 +14078,37 @@ fn produce_output(
         relaxation.emit();
     }
     Ok(output)
+}
+
+/// The conda `constrains` lines (`"name spec"`) this bundle advertises.
+///
+/// Derived from `produce_output_with_conflicts` -- the single emission
+/// authority -- so the lock records exactly what `conda/outputs` advertised
+/// and a replay can reproduce it. Emission conflicts are irrelevant here:
+/// a constrains-only group that cannot be decided is already dropped with a
+/// WARN inside the emission loop, and a `depends`-side conflict is reported by
+/// the caller's own strict path.
+fn bundle_emitted_constrains(
+    bundle: &Bundle,
+    config: &RetreadConfig,
+    host_platform: Platform,
+    workspace_python_version: &str,
+) -> Result<Vec<String>> {
+    let (output, _conflicts, _pending_relaxations, _supports) = produce_output_with_conflicts(
+        bundle,
+        config,
+        host_platform,
+        workspace_python_version,
+        &[],
+        None,
+        None,
+    )?;
+    Ok(output
+        .run_dependencies
+        .constraints
+        .iter()
+        .map(format_constraint_spec)
+        .collect())
 }
 
 /// Render the bundle's actual emitted run-dependency set into the generic
@@ -15058,6 +15169,14 @@ async fn materialize_from_lock_for_target(
     );
     let replay_relaxations = RelaxationManifest::new(bundle_name.clone(), lock.relaxations.clone());
 
+    // Same convention as `run_deps` above: on a replay the COMMITTED lock is
+    // authoritative for the advertised metadata, so the constrains come from
+    // the lock, never from a fresh re-derivation.
+    let constrains: Vec<String> = lock
+        .conda_run_constraints
+        .iter()
+        .map(lock_run_dep_string)
+        .collect();
     let result = materialize_and_pack(
         None, // bundle=None: replay path, audit skipped
         config,
@@ -15069,6 +15188,7 @@ async fn materialize_from_lock_for_target(
         emit_wheels,
         conda_capable,
         run_deps,
+        constrains,
         index_urls,
         config_fp,
         work_dir,
@@ -15103,6 +15223,10 @@ async fn materialize_and_pack(
     emit_wheels: Vec<crate::emit_pypi::EmitWheel>,
     conda_capable: std::collections::HashSet<String>,
     run_deps: Vec<String>,
+    // Conda `constrains` lines to record in the lock and advertise. Cold
+    // path: derived from the emission. Replay/incremental: read back from the
+    // authoritative lock.
+    constrains: Vec<String>,
     index_urls: Vec<String>,
     config_fp: &str,
     work_dir: &Path,
@@ -15130,6 +15254,7 @@ async fn materialize_and_pack(
         &emit_wheels,
         &conda_capable,
         &run_deps,
+        &constrains,
         &index_urls,
         config_fp,
         source_dir,
@@ -15607,6 +15732,13 @@ async fn resolve_incremental_add(
     let replay_relaxations = RelaxationManifest::new(bundle_name.clone(), lock.relaxations.clone());
 
     // ── A6: write lock only after ALL checks pass ─────────────────────────
+    // Incremental-add keeps the locked constrains: the unchanged closure is
+    // authoritative and a pure-PyPI addition carries no conda-provided bound.
+    let constrains: Vec<String> = lock
+        .conda_run_constraints
+        .iter()
+        .map(lock_run_dep_string)
+        .collect();
     let result = materialize_and_pack(
         None, // bundle=None: incremental path, no full Bundle available
         config,
@@ -15618,6 +15750,7 @@ async fn resolve_incremental_add(
         merged,
         conda_capable,
         run_deps,
+        constrains,
         index_urls,
         config_fp,
         work_dir,
@@ -16046,6 +16179,13 @@ async fn build_one(
             .unwrap_or_default();
         let config_fp =
             crate::courier::config_fingerprint(declared_config, &courier_channels, &workspace_fp);
+        // Constrains are OUR emission, not pixi's solve: pixi forwards
+        // `run_dependencies` (depends) only, so unlike `run_deps` there is no
+        // authoritative forwarded list. Re-derive from the same emission
+        // authority that produced the conda/outputs advertisement.
+        let constrains =
+            bundle_emitted_constrains(bundle, config, target_subdir, workspace_python_version)
+                .context("deriving emitted conda constrains for the courier lock")?;
         return materialize_and_pack(
             Some(bundle),
             config,
@@ -16057,6 +16197,7 @@ async fn build_one(
             emit_wheels,
             conda_capable,
             run_deps,
+            constrains,
             index_urls,
             &config_fp,
             work_dir,
@@ -16229,6 +16370,33 @@ fn bounded_range_ceiling(version: &str) -> Option<String> {
     } else {
         crate::relax::checked_version_ceiling(&[major])
     }
+}
+
+/// `constrains` counterpart of [`spec_from_str`]. Conda constraints admit
+/// binary specs only (`ConstraintSpec` has a single variant), so a source spec
+/// is unrepresentable by construction rather than by a runtime check.
+fn constraint_spec_from_str(s: &str) -> Result<NamedSpec<ConstraintSpec>> {
+    let named = spec_from_str(s)?;
+    let PackageSpec::Binary(binary) = named.spec else {
+        bail!("conda constrains entry `{s}` is not a binary spec");
+    };
+    Ok(NamedSpec {
+        name: named.name,
+        spec: ConstraintSpec::Binary(binary),
+    })
+}
+
+/// Render a `ConstraintSpec` back to its `name spec` line, reusing the single
+/// package-spec formatter so a lock round-trip is byte-stable.
+fn format_constraint_spec(named: &NamedSpec<ConstraintSpec>) -> String {
+    let ConstraintSpec::Binary(binary) = &named.spec;
+    format!(
+        "{} {}",
+        named.name,
+        audit_report::format_packagespec(&PackageSpec::Binary(binary.clone()))
+    )
+    .trim()
+    .to_string()
 }
 
 fn spec_from_str(s: &str) -> Result<NamedSpec<PackageSpec>> {
@@ -16913,6 +17081,24 @@ fn replay_loaded_lock(
         }
     }
 
+    // Rebuild the advertised conda `constrains` from the lock. Without this
+    // a replayed output would silently drop the bounds a cold build states,
+    // and `fresh.run_dependencies == replayed.run_dependencies` (the prepared-
+    // fallback gate) would go false for every affected pack.
+    let mut constrains_specs: Vec<NamedSpec<ConstraintSpec>> = Vec::new();
+    let mut seen_constrains: HashSet<String> = HashSet::new();
+    for dep in &lock.conda_run_constraints {
+        let spec_str = if dep.spec.is_empty() {
+            dep.name.clone()
+        } else {
+            format!("{} {}", dep.name, dep.spec)
+        };
+        let ns = constraint_spec_from_str(&spec_str)?;
+        if seen_constrains.insert(ns.name.clone()) {
+            constrains_specs.push(ns);
+        }
+    }
+
     // Courier (replay is courier-only) is ALWAYS platform-specific: the
     // package ships the native `retread` installer binary + a python-specific
     // lock. any_platform_specific=false here because courier=true already
@@ -16924,6 +17110,7 @@ fn replay_loaded_lock(
         true,  // courier=true: replay is always courier mode
         false, // any_platform_specific: courier=true already forces platform-specific
         run_dep_specs,
+        constrains_specs,
         seen_dep_names,
         host_platform,
         build_number,
@@ -17069,6 +17256,7 @@ mod replay_tests {
                 git_source: None,
                 sdist_source: None,
             }],
+            conda_run_constraints: Vec::new(),
             conda_run_deps: vec![CondaDep {
                 name: "numpy".into(),
                 spec: ">=1.21".into(),
@@ -17664,6 +17852,7 @@ mod replay_tests {
                 super::spec_from_str("zlib >=1.3").unwrap(),
                 super::spec_from_str("numpy >=1.21").unwrap(),
             ],
+            Vec::new(),
             HashSet::from([
                 "python".to_string(),
                 "zlib".to_string(),
@@ -17960,6 +18149,7 @@ mod replay_tests {
                 git_source: None,
                 sdist_source: None,
             }],
+            conda_run_constraints: Vec::new(),
             conda_run_deps: vec![],
             index_urls: vec!["https://pypi.org/simple/".into()],
             prerelease: BTreeMap::new(),
@@ -18038,6 +18228,7 @@ mod replay_tests {
                 git_source: None,
                 sdist_source: None,
             }],
+            conda_run_constraints: Vec::new(),
             conda_run_deps: vec![],
             index_urls: vec!["https://pypi.org/simple/".into()],
             prerelease: BTreeMap::new(),
@@ -18153,6 +18344,7 @@ mod replay_tests {
                 git_source: None,
                 sdist_source: Some(sdist_src),
             }],
+            conda_run_constraints: Vec::new(),
             conda_run_deps: vec![],
             index_urls: vec!["https://pypi.org/simple/".into()],
             prerelease: BTreeMap::new(),
@@ -18362,6 +18554,7 @@ mod replay_tests {
                 git_source: None,
                 sdist_source: Some(sdist_src.clone()),
             }],
+            conda_run_constraints: Vec::new(),
             conda_run_deps: vec![],
             index_urls: vec!["https://pypi.org/simple/".into()],
             prerelease: BTreeMap::new(),
@@ -18748,6 +18941,7 @@ mod replay_tests {
             inputs_hash: "test-hash".into(),
             root_requirements: vec![],
             wheels: cold_staged.lock.wheels.clone(),
+            conda_run_constraints: Vec::new(),
             conda_run_deps: vec![],
             index_urls: index_urls.to_vec(),
             prerelease: BTreeMap::new(),
@@ -18947,6 +19141,7 @@ mod replay_tests {
                 git_source: None,
                 sdist_source: None,
             }],
+            conda_run_constraints: Vec::new(),
             conda_run_deps: vec![],
             index_urls: vec!["https://pypi.org/simple/".into()],
             prerelease: BTreeMap::new(),
@@ -20082,6 +20277,7 @@ include = ["retread_bfs_git_leaf*"]
                     sdist_source: None,
                 },
             ],
+            conda_run_constraints: Vec::new(),
             conda_run_deps: vec![],
             index_urls: vec!["https://pypi.org/simple/".into()],
             prerelease: std::collections::BTreeMap::new(),
@@ -20791,6 +20987,7 @@ mod courier_build_string_tests {
             true,
             false,
             Vec::new(),
+            Vec::new(),
             std::collections::HashSet::new(),
             Platform::Linux64,
             build_number,
@@ -21149,6 +21346,7 @@ mod load_favored_versions_tests {
             inputs_hash: "testhash".into(),
             root_requirements: vec![],
             wheels,
+            conda_run_constraints: Vec::new(),
             conda_run_deps: vec![CondaDep {
                 name: "numpy".into(),
                 spec: ">=1.0".into(),
@@ -23086,6 +23284,7 @@ mod incremental_add_tests {
             inputs_hash: inputs_hash.into(),
             root_requirements: vec![],
             wheels: vec![valid_payload_wheel()],
+            conda_run_constraints: Vec::new(),
             conda_run_deps: vec![],
             index_urls: vec!["https://pypi.org/simple".into()],
             prerelease: BTreeMap::new(),
@@ -23188,6 +23387,7 @@ mod incremental_add_tests {
             inputs_hash: "dummy".into(),
             root_requirements: vec![],
             wheels: vec![valid_payload_wheel()],
+            conda_run_constraints: Vec::new(),
             conda_run_deps: vec![],
             index_urls: vec![],
             prerelease: BTreeMap::new(),
@@ -23276,6 +23476,7 @@ mod incremental_add_tests {
             inputs_hash: inputs_hash.into(),
             root_requirements: vec![],
             wheels: vec![valid_payload_wheel()],
+            conda_run_constraints: Vec::new(),
             conda_run_deps: vec![],
             index_urls,
             prerelease: BTreeMap::new(),
@@ -23829,6 +24030,7 @@ mod incremental_add_tests {
             inputs_hash: "dummy".into(),
             root_requirements: vec![],
             wheels: lock_wheels,
+            conda_run_constraints: Vec::new(),
             conda_run_deps: vec![],
             index_urls: vec!["https://pypi.org/simple".into()],
             prerelease: BTreeMap::new(),

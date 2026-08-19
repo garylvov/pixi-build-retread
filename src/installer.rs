@@ -1830,6 +1830,7 @@ mod tests {
             inputs_hash: "abc".into(),
             root_requirements: vec!["mypackage==1.0.0".into()],
             wheels: vec![lock_wheel("mypackage", "1.0.0")],
+            conda_run_constraints: Vec::new(),
             conda_run_deps,
             index_urls,
             prerelease,

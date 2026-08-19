@@ -1705,6 +1705,7 @@ pub(crate) async fn stage_for_target_with_store_root(
         emit_wheels,
         conda_capable,
         run_deps,
+        &[],
         index_urls,
         config_fp,
         source_dir,
@@ -1727,6 +1728,10 @@ pub(crate) async fn stage_for_target_with_store_root_and_relaxations(
     emit_wheels: &[EmitWheel],
     conda_capable: &HashSet<String>,
     run_deps: &[String],
+    // Conda `constrains` lines (`"name spec"`), emitted for wheel
+    // requirements a workspace conda provider owns. Recorded in the lock so
+    // replay reproduces the same advertised metadata; NOT run-deps.
+    constrains: &[String],
     index_urls: &[String],
     config_fp: &str,
     source_dir: &Path,
@@ -2595,6 +2600,7 @@ pub(crate) async fn stage_for_target_with_store_root_and_relaxations(
         root_requirements: vec![format!("{bundle_name}-pypi=={version}")],
         wheels: lock_wheels,
         conda_run_deps: parse_conda_deps(run_deps),
+        conda_run_constraints: parse_conda_deps(constrains),
         index_urls: index_urls.to_vec(),
         prerelease,
         shadow_libs,
@@ -5487,6 +5493,7 @@ version = "1.0.0"
             &target,
             &emit_wheels,
             &conda_capable,
+            &[],
             &[],
             &["https://pypi.org/simple/".to_string()],
             "",
