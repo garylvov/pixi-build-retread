@@ -3,6 +3,9 @@
 mod audit_report;
 use audit_report::{build_bundle_audit, write_probe_trace};
 
+mod advertised_identity;
+use advertised_identity::{AdvertisedIdentityRecord, workspace_fp_for_build};
+
 mod auto_bundle;
 use auto_bundle::{
     AutoBundleOutcome, BfsFetched, Pending, PendingSource, UvReresolveContext, UvReresolveMode,
@@ -605,6 +608,45 @@ fn courier_inputs_hash(
     workspace_dir: &std::path::Path,
     source_dir: &std::path::Path,
 ) -> String {
+    let workspace_fp = courier_workspace_fp(workspace_manifest, workspace_dir, source_dir, target);
+    courier_inputs_hash_with_workspace_fp(
+        config,
+        bundle_name,
+        target,
+        channels,
+        workspace_manifest,
+        &workspace_fp,
+    )
+}
+
+/// The workspace solve fingerprint `courier_inputs_hash` folds in by default.
+///
+/// Exposed separately because the metadata pass must RECORD the exact string
+/// it resolved under (`advertised_identity`) and the build pass must be able to
+/// resolve under that recorded string instead of re-reading sibling locks that
+/// have appeared since.
+fn courier_workspace_fp(
+    workspace_manifest: Option<&crate::workspace::WorkspaceManifest>,
+    workspace_dir: &std::path::Path,
+    source_dir: &std::path::Path,
+    target: &ResolutionTarget,
+) -> String {
+    workspace_manifest
+        .map(|m| workspace_solve_fingerprint(m, workspace_dir, source_dir, target))
+        .unwrap_or_default()
+}
+
+/// [`courier_inputs_hash`] resolved under an explicitly supplied workspace
+/// fingerprint. Identity must be a function of the inputs the advertising pass
+/// saw, never of which pass is running.
+fn courier_inputs_hash_with_workspace_fp(
+    config: &crate::config::RetreadConfig,
+    bundle_name: &str,
+    target: &ResolutionTarget,
+    channels: &[String],
+    workspace_manifest: Option<&crate::workspace::WorkspaceManifest>,
+    workspace_fp: &str,
+) -> String {
     let entry_specs = crate::courier::courier_input_specs(config, bundle_name);
     let ws_indexes: Vec<String> = workspace_manifest
         .map(|m| m.resolution_pypi_index_urls())
@@ -616,10 +658,7 @@ fn courier_inputs_hash(
         .filter_map(|entry| entry.index.clone())
         .collect();
     let index_urls = index_chain(entry_indexes, &ws_indexes, IndexPurpose::RootResolve);
-    let workspace_fp = workspace_manifest
-        .map(|m| workspace_solve_fingerprint(m, workspace_dir, source_dir, target))
-        .unwrap_or_default();
-    let config_fp = crate::courier::config_fingerprint(config, channels, &workspace_fp);
+    let config_fp = crate::courier::config_fingerprint(config, channels, workspace_fp);
     crate::lock::RetreadLock::compute_inputs_hash_for_target(
         &entry_specs,
         &index_urls,
@@ -3132,6 +3171,12 @@ impl Handler {
                     // Compute the courier inputs hash once here: it feeds both
                     // the replay gate (hash-check) and produce_output (embedded
                     // in the content-addressed build string). None for non-courier.
+                    let courier_workspace_fp_for_outputs = courier_workspace_fp(
+                        workspace_manifest.as_ref(),
+                        workspace_dir.as_deref().unwrap_or(source_dir.as_path()),
+                        &source_dir,
+                        &target,
+                    );
                     let courier_build_hash: Option<String> = if config.courier {
                         // Derive channels from the manifest (NOT from
                         // params.channels, which pixi forwards differently
@@ -3150,14 +3195,13 @@ impl Handler {
                                 )
                             })
                             .unwrap_or_default();
-                        Some(courier_inputs_hash(
+                        Some(courier_inputs_hash_with_workspace_fp(
                             &config,
                             &base_bundle.conda_name,
                             &target,
                             &courier_channels,
                             workspace_manifest.as_ref(),
-                            workspace_dir.as_deref().unwrap_or(source_dir.as_path()),
-                            &source_dir,
+                            &courier_workspace_fp_for_outputs,
                         ))
                     } else {
                         None
@@ -3341,6 +3385,29 @@ impl Handler {
                         &relaxations,
                     );
                     pending_output_relaxations.extend(relaxations.iter().cloned());
+                    // Persist the exact resolution inputs behind the identity
+                    // just advertised. conda/build_v1 must reproduce THIS
+                    // identity even when a co-activated sibling pack writes its
+                    // lock between the two passes -- without the record it
+                    // recomputes a different workspace fingerprint, gets a
+                    // different build string, and refuses to build.
+                    if courier_build_hash.is_some() {
+                        advertised_identity::write_record(
+                            &cache_dir,
+                            &source_dir,
+                            &AdvertisedIdentityRecord {
+                                schema: advertised_identity::SCHEMA,
+                                name: output.metadata.name.as_normalized().to_string(),
+                                version: output.metadata.version.to_string(),
+                                build: output.metadata.build.clone(),
+                                subdir: output.metadata.subdir.to_string(),
+                                target_identity: target.resolution_identity(),
+                                python_version: target.python_version().to_string(),
+                                workspace_fp: courier_workspace_fp_for_outputs.clone(),
+                            },
+                        )
+                        .await;
+                    }
                     // v4.2.0: the in-backend per-env solve check +
                     // iterative widening cascade were removed with the
                     // legacy mirror-solver. Emitted run-deps go to pixi
@@ -3613,17 +3680,43 @@ impl Handler {
                     )
                 })
                 .unwrap_or_default();
-            let workspace_fp = ws_manifest_for_replay
-                .as_ref()
-                .map(|m| {
-                    workspace_solve_fingerprint(
-                        m,
-                        workspace_dir.as_deref().unwrap_or(&source_dir),
+            // The workspace fingerprint folds in the ON-DISK locks of
+            // co-activated sibling packs. In a cold multi-pack relock a sibling
+            // writes its lock between this pack's metadata pass and this build
+            // request, which would silently move our identity. Resolve under
+            // the fingerprint the advertised identity was actually computed
+            // from whenever the metadata pass recorded it; with no record this
+            // falls back to the freshly computed one and to today's gate.
+            let advertised_identity_record = match params.output.build.as_deref() {
+                Some(build) => {
+                    advertised_identity::load_record(
+                        &cache_dir,
                         &source_dir,
-                        &target,
+                        params.output.name.as_normalized(),
+                        params
+                            .output
+                            .version
+                            .as_ref()
+                            .map(ToString::to_string)
+                            .as_deref(),
+                        &params.output.subdir.to_string(),
+                        build,
+                        &target.resolution_identity(),
+                        target.python_version(),
                     )
-                })
-                .unwrap_or_default();
+                    .await
+                }
+                None => None,
+            };
+            let workspace_fp = workspace_fp_for_build(
+                advertised_identity_record.as_ref(),
+                courier_workspace_fp(
+                    ws_manifest_for_replay.as_ref(),
+                    workspace_dir.as_deref().unwrap_or(&source_dir),
+                    &source_dir,
+                    &target,
+                ),
+            );
             let config_fp =
                 crate::courier::config_fingerprint(&config, &courier_channels, &workspace_fp);
             // The bundle_name for the hash is the requested output name
@@ -3632,7 +3725,7 @@ impl Handler {
             let bundle_name_for_hash = params.output.name.as_normalized().to_string();
             let declared_input_bundle =
                 declared_input_bundle_for_output(&config, &bundle_name_for_hash);
-            let current_hash = courier_inputs_hash(
+            let current_hash = courier_inputs_hash_with_workspace_fp(
                 &config,
                 declared_input_bundle
                     .as_deref()
@@ -3640,8 +3733,7 @@ impl Handler {
                 &target,
                 &courier_channels,
                 ws_manifest_for_replay.as_ref(),
-                workspace_dir.as_deref().unwrap_or(&source_dir),
-                &source_dir,
+                &workspace_fp,
             );
             let current_build = courier_build_string_for_target(
                 &target,
@@ -20994,10 +21086,11 @@ version = "1.0.0"
 // -----------------------------------------------------------------
 #[cfg(test)]
 mod courier_build_string_tests {
+    use super::advertised_identity::{self, AdvertisedIdentityRecord, workspace_fp_for_build};
     use super::{
         advertised_build_matches, assemble_conda_output,
         build_courier_recipe_with_mode_and_lock_filename, courier_build_string,
-        courier_build_string_for_target,
+        courier_build_string_for_target, courier_inputs_hash_with_workspace_fp,
     };
     use crate::pypi::ResolutionTarget;
     use rattler_conda_types::Platform;
@@ -21104,6 +21197,71 @@ mod courier_build_string_tests {
         let loose = courier_build_string("312", "1234567890abcdef", 2, true);
         assert_ne!(fat, loose);
         assert_eq!(loose, "py312_h1234567890_loose_2");
+    }
+
+    /// Guard: the identity a pack advertises must survive a sibling pack
+    /// writing its lock between the metadata pass and the build pass.
+    ///
+    /// The workspace solve fingerprint folds co-activated siblings' ON-DISK
+    /// locks, so the build pass computes a different fingerprint than the
+    /// metadata pass did. Resolving under the RECORDED fingerprint reproduces
+    /// the advertised build string; recomputing does not, and that mismatch is
+    /// exactly the "0 exact matches for advertised output ... identity differs"
+    /// refusal seen in a cold multi-pack relock.
+    #[test]
+    fn recorded_workspace_fingerprint_reproduces_the_advertised_identity() {
+        let target = ResolutionTarget::for_subdir("3.11", "linux-64");
+        let config: crate::config::RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-wheels": { "mypack": { "version": "==1.0.0" } }
+        }))
+        .unwrap();
+        let metadata_pass_fp = "co-activated-sibling-conda:numpy===1.26.4";
+        let build_pass_fp =
+            "co-activated-sibling-conda:numpy===1.26.4\nco-activated-sibling:torch ==2.5.1";
+        let build_for = |fp: &str| {
+            courier_build_string_for_target(
+                &target,
+                &courier_inputs_hash_with_workspace_fp(
+                    &config,
+                    "mypack",
+                    &target,
+                    &["conda-forge".to_string()],
+                    None,
+                    fp,
+                ),
+                config.build_number,
+                false,
+            )
+        };
+        let advertised = build_for(metadata_pass_fp);
+        let recomputed = build_for(build_pass_fp);
+        assert_ne!(
+            advertised, recomputed,
+            "a sibling lock appearing between the passes must move the recomputed identity, \
+             otherwise this guard proves nothing"
+        );
+        assert!(!advertised_build_matches(Some(&advertised), &recomputed));
+
+        let record = AdvertisedIdentityRecord {
+            schema: advertised_identity::SCHEMA,
+            name: "mypack".to_string(),
+            version: "1.0.0".to_string(),
+            build: advertised.clone(),
+            subdir: "linux-64".to_string(),
+            target_identity: target.resolution_identity(),
+            python_version: target.python_version().to_string(),
+            workspace_fp: metadata_pass_fp.to_string(),
+        };
+        let from_record = build_for(&workspace_fp_for_build(
+            Some(&record),
+            build_pass_fp.to_string(),
+        ));
+        assert_eq!(from_record, advertised);
+        assert!(advertised_build_matches(Some(&advertised), &from_record));
+
+        // No record: today's behaviour, i.e. the drift gate still refuses.
+        let without_record = build_for(&workspace_fp_for_build(None, build_pass_fp.to_string()));
+        assert_eq!(without_record, recomputed);
     }
 
     #[test]
