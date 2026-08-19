@@ -3641,8 +3641,18 @@ pub fn attribute_conflict(
             continue;
         }
         // Word-boundary match on the normalized name.
+        //
+        // The specifier capture is a whole PEP 440 specifier SET, not one
+        // clause: uv writes ranges comma-joined and unspaced
+        // (`mpmath>=1.1.0,<1.4`), while the commas of its surrounding PROSE
+        // always carry a following space or newline. Stopping at the first
+        // comma turned `>=1.1.0,<1.4` into `>=1.1.0`, i.e. turned a
+        // requirement that EXCLUDES the learned `mpmath==1.4.1` into one that
+        // accepts it -- so `learned_fact_yield_needed` found no contradiction
+        // and the second round of the `sage-isaac-pack` chain died as a plain
+        // Pass-B failure (F13 turn 3, cert2 backend log 19:12:17).
         let re = regex::Regex::new(&format!(
-            r"(?i)\b{}(?:\[[^\]]*\])?((?:===|==|>=|<=|~=|!=|>|<)[0-9][^\s,)`']*)?",
+            r"(?i)\b{}(?:\[[^\]]*\])?((?:===|==|>=|<=|~=|!=|>|<)[0-9][^\s,)`']*(?:,(?:===|==|>=|<=|~=|!=|>|<)[0-9][^\s,)`']*)*)?",
             regex::escape(pypi_name)
         ))
         .expect("static conflict regex");
@@ -7771,6 +7781,129 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
             seen[1],
         );
         assert_eq!(*yielded.lock().unwrap(), BTreeSet::from(["sympy".to_string()]));
+    }
+
+    /// Verbatim Pass-B prose measured on the SECOND relock of `sage-isaac-pack`
+    /// after `sympy` yielded
+    /// (`tasks/retread-cold-solve/certify_4_10_90/artifacts/cert2.backend.log`,
+    /// ANSI stripped, the 19:12:17 `uv closure pass B failed` record). Dropping
+    /// the learned `sympy==1.14.0` uncovers the NEXT learned float in the same
+    /// chain: `sympy==1.13.1`'s own `Requires-Dist: mpmath>=1.1.0,<1.4` excludes
+    /// the learned `mpmath==1.4.1`.
+    const SAGE_PASS_B_STDERR_ROUND_2: &str = "\
+  x No solution found when resolving dependencies:
+  |-> Because sympy==1.13.1 depends on mpmath>=1.1.0,<1.4 and mpmath==1.4.1,
+      we can conclude that sympy==1.13.1 cannot be used.
+      And because torch==2.5.1+cu124 depends on sympy==1.13.1, we can conclude
+      that torch==2.5.1+cu124 cannot be used.";
+
+    /// Both learned floats F13 injects for that pack, in one set.
+    fn sage_learned_sympy_and_mpmath_constraints() -> ConstraintSet {
+        learned_fact_constraints(
+            &BTreeMap::from([
+                ("sympy".to_string(), "1.14.0".to_string()),
+                ("mpmath".to_string(), "1.4.1".to_string()),
+            ]),
+            &BTreeMap::new(),
+            &Default::default(),
+            &ConstraintSet::default(),
+            &BTreeSet::new(),
+            "precise-consuming-envs",
+        )
+    }
+
+    /// F13 turn 3. A RANGE requirement (`mpmath>=1.1.0,<1.4`) must be read
+    /// whole. `attribute_conflict`'s specifier capture stopped at the first
+    /// comma, so the range arrived as `>=1.1.0` -- which ACCEPTS the learned
+    /// `1.4.1`, so the yield never fired and the second round died as a plain
+    /// Pass-B failure (cert2 backend log, 19:12:17).
+    #[test]
+    fn a_range_requirement_is_attributed_whole_not_truncated_at_the_comma() {
+        let learned = sage_learned_sympy_and_mpmath_constraints();
+        let attributions = attribute_conflict(SAGE_PASS_B_STDERR_ROUND_2, &learned.provenance);
+        let mpmath = attributions
+            .iter()
+            .find(|a| a.package == "mpmath")
+            .expect("mpmath is named in the conflict");
+        assert_eq!(
+            mpmath.required.as_deref(),
+            Some(">=1.1.0,<1.4"),
+            "the whole specifier SET is the requirement; truncating at the comma \
+             turns an exclusion into an acceptance: {mpmath:?}",
+        );
+    }
+
+    /// F13 turn 3. The yield must ITERATE: `sage-isaac-pack` has a CHAIN of
+    /// learned floats (sympy, then mpmath) and yielding only the first left the
+    /// second to kill the lock.
+    #[tokio::test]
+    async fn learned_facts_yield_in_sequence_until_the_closure_resolves() {
+        let mut req = sample_request();
+        req.constraints = sage_learned_sympy_and_mpmath_constraints();
+
+        let seen = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+        let raw = {
+            let seen = Arc::clone(&seen);
+            move |req: UvClosureRequest| {
+                let seen = Arc::clone(&seen);
+                Box::pin(async move {
+                    let lines = req.constraints.constraints.clone();
+                    seen.lock().unwrap().push(lines.clone());
+                    // Round 1: sympy's learned float contradicts torch's pin.
+                    // Round 2: with sympy gone, uv reaches sympy==1.13.1 and
+                    // its mpmath range contradicts mpmath's learned float.
+                    let stderr = if lines.iter().any(|line| line == "sympy==1.14.0") {
+                        Some(SAGE_PASS_B_STDERR)
+                    } else if lines.iter().any(|line| line == "mpmath==1.4.1") {
+                        Some(SAGE_PASS_B_STDERR_ROUND_2)
+                    } else {
+                        None
+                    };
+                    if let Some(stderr) = stderr {
+                        let attributions =
+                            attribute_conflict(stderr, &req.constraints.provenance);
+                        let needed = learned_fact_yield_needed(&attributions, "pass A: evdev")
+                            .expect("fixture must arm the yield");
+                        return Err(anyhow::Error::new(needed));
+                    }
+                    Ok(UvClosure {
+                        wheels: vec![],
+                        pins: BTreeMap::from([
+                            ("sympy".to_string(), "1.13.1".to_string()),
+                            ("mpmath".to_string(), "1.3.0".to_string()),
+                        ]),
+                        uv_version: "test".to_string(),
+                        auto_routed: vec![],
+                        auto_dropped: BTreeSet::new(),
+                        effective_input_requirements: None,
+                        dependency_graph: UvDependencyGraph::default(),
+                    })
+                }) as futures::future::BoxFuture<'static, Result<UvClosure>>
+            }
+        };
+
+        let yielded = Arc::new(Mutex::new(BTreeSet::new()));
+        let mut solve = with_learned_fact_yields(raw, Arc::clone(&yielded));
+        let closure = solve(req)
+            .await
+            .expect("a CHAIN of contradicting learned floats must all yield");
+
+        assert_eq!(closure.pins["mpmath"], "1.3.0");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3, "two retries, one per yielded fact: {seen:?}");
+        assert!(
+            !seen[2]
+                .iter()
+                .any(|line| line.starts_with("sympy") || line.starts_with("mpmath")),
+            "the final constraint set carries neither yielded float: {:?}",
+            seen[2],
+        );
+        // One WARN line per insert (uv_closure.rs, the `warn!` immediately
+        // after the `inserted` check), so two yields == two WARN lines.
+        assert_eq!(
+            *yielded.lock().unwrap(),
+            BTreeSet::from(["sympy".to_string(), "mpmath".to_string()]),
+        );
     }
 
     #[test]
