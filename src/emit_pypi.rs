@@ -612,9 +612,13 @@ pub fn build_meta_wheel(
         } else {
             format!("[{}]", entry.extras.join(","))
         };
+        // F15: emit the entry's specifier set VERBATIM -- `==27.1.0` for a
+        // pin, `>=26,<28` for a range. The old `format!("=={v}")` over the
+        // raw entry produced `Requires-Dist: pyzmq==>=26,<28` for any
+        // ranged entry. The `==` below is over a RESOLVED concrete version
+        // (not a config entry), which is a genuine pin.
         let pin = entry
-            .normalized_version()
-            .map(|v| format!("=={v}"))
+            .version_specifier_text()
             .or_else(|| resolved.as_ref().map(|v| format!("=={v}")))
             .unwrap_or_default();
         metadata.push_str(&format!("Requires-Dist: {entry_name}{extras}{pin}\n"));
@@ -688,13 +692,16 @@ pub fn collect_prerelease_pins(
         }
     }
     for (key, entry, resolved) in entries {
-        // Match build_meta_wheel's pin precedence EXACTLY (normalized
-        // entry version first, then resolved). If these diverge, a
+        // Match build_meta_wheel's pin precedence EXACTLY (entry's exact
+        // pin first, then resolved). If these diverge, a
         // prerelease-pinned entry whose wheel lookup missed (resolved ==
         // None) or resolved to a different version would get a meta-wheel
         // `==<prerelease>` Requires-Dist line with no prerelease opt-in,
         // failing `pixi lock` -- the exact case source 3 exists to cover.
-        if let Some(ver) = entry.normalized_version().or_else(|| resolved.clone())
+        // F15: a RANGED entry has no exact pin, so it falls through to the
+        // resolved version -- which is what the meta-wheel would need an
+        // opt-in for anyway.
+        if let Some(ver) = entry.exact_pin().or_else(|| resolved.clone())
             && is_prerelease(&ver)
         {
             pins.insert(crate::relax::canonical_conda_name(key), format!("=={ver}"));
@@ -1032,6 +1039,52 @@ mod tests {
         assert!(insert_build_tag("not-a-wheel.tar.gz", "x").is_err());
     }
 
+    /// F15: a RANGED `[retread-wheels]` entry must reach METADATA as its
+    /// specifier set, not wrapped in a second `==`. Before the fix this
+    /// emitted the invalid `Requires-Dist: pyzmq==>=26,<28`.
+    #[test]
+    fn f15_meta_wheel_emits_range_entries_verbatim() {
+        let mut ranged = WheelEntry {
+            version: Some(">=26,<28".into()),
+            ..Default::default()
+        };
+        ranged.normalize("pyzmq").expect("range normalizes");
+        let mut pinned = WheelEntry {
+            version: Some("27.1.0".into()),
+            extras: vec!["draft".into()],
+            ..Default::default()
+        };
+        pinned.normalize("pinlib").expect("bare version normalizes");
+        let entries = vec![
+            ("pyzmq".to_string(), ranged, Some("27.1.0".to_string())),
+            ("pinlib".to_string(), pinned, None),
+        ];
+
+        let (_, bytes) = build_meta_wheel("range-pack", "1.0.0", &entries);
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("zip");
+        let mut metadata = String::new();
+        {
+            use std::io::Read as _;
+            zip.by_name("range_pack_pypi-1.0.0.dist-info/METADATA")
+                .expect("METADATA")
+                .read_to_string(&mut metadata)
+                .expect("read");
+        }
+
+        assert!(
+            metadata.contains("Requires-Dist: pyzmq>=26,<28\n"),
+            "ranged entry must emit its specifier set verbatim; got:\n{metadata}"
+        );
+        assert!(
+            !metadata.contains("pyzmq==>="),
+            "the F15 bug (`==` prefixed onto a specifier set) must be gone:\n{metadata}"
+        );
+        assert!(
+            metadata.contains("Requires-Dist: pinlib[draft]==27.1.0\n"),
+            "bare version must still emit an exact pin; got:\n{metadata}"
+        );
+    }
+
     #[test]
     fn meta_wheel_is_valid_and_carries_entry_pins() {
         let entries = vec![
@@ -1113,7 +1166,7 @@ mod tests {
                 Some("2.0.0rc13".to_string()),
             ),
             // 3b: prerelease PIN but resolved is a stable/different version.
-            // The meta-wheel pins ==1.0.0rc1 from normalized_version, so the
+            // The meta-wheel pins ==1.0.0rc1 from the entry specifier, so the
             // override row MUST too -- reading `resolved` alone (stable)
             // would emit no row and break `pixi lock`.
             (

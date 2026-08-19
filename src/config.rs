@@ -7,6 +7,7 @@ use std::num::NonZeroUsize;
 
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
+use uv_pep508::uv_pep440::VersionSpecifiers;
 
 use crate::relax::{CondaName, CondaTarget, NameMap, PypiKey};
 
@@ -891,9 +892,18 @@ pub struct WheelEntry {
     pub sha256: Option<String>,
 
     // ---- Spec form ----
-    /// PEP 440 version. Accepts both `5.1.0` and `==5.1.0` (the leading
-    /// `==` is stripped). Only exact pins are supported by the resolver
-    /// today; range syntax (`>=5.1,<6`) is planned.
+    /// PEP 440 version **or specifier set**.
+    ///
+    /// Three accepted shapes, all normalized once by
+    /// [`WheelEntry::version_specifier_text`] (F15):
+    /// - bare `5.1.0`     -- lifted to `==5.1.0` (exact pin, historic form)
+    /// - `==5.1.0`        -- exact pin, kept verbatim
+    /// - `>=5.1,<6`, `~=1.4`, `!=2.0` -- a range; the resolver picks the
+    ///   newest wheel on the index that satisfies every clause, and the
+    ///   meta-wheel emits the range verbatim as its `Requires-Dist` tail.
+    ///
+    /// Anything that is not a parseable PEP 440 specifier set is a loud
+    /// config error naming this entry (see [`WheelEntry::validate`]).
     #[serde(default)]
     pub version: Option<String>,
 
@@ -1047,6 +1057,21 @@ impl WheelEntry {
     /// disagree, that is a contradiction and we error (a wrong hash would
     /// either poison the cache or wedge verification).
     pub fn normalize(&mut self, name: &str) -> Result<()> {
+        // F15: parse the `version` field ONCE, here, and write the
+        // canonical specifier text back. After this every consumer sees an
+        // already-normalized `>=26,<28` / `==27.1.0` and nobody re-derives
+        // the `==` lift. Comma-joined WITHOUT spaces so the text drops
+        // straight into a `Requires-Dist:` tail and into the inputs-hash
+        // spec string (uv's own Display would insert `, `).
+        if let Some(specifiers) = self.version_specifiers(name)? {
+            self.version = Some(
+                specifiers
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+        }
         let Some(url) = self.url.as_mut() else {
             return Ok(());
         };
@@ -1094,6 +1119,10 @@ impl WheelEntry {
 
     /// Validate that the entry has exactly one form.
     pub fn validate(&self, name: &str) -> Result<()> {
+        // F15: a `version` that is not a PEP 440 specifier set is a config
+        // error naming this entry, raised at load time rather than as a
+        // mangled `Requires-Dist` line much later.
+        self.version_specifiers(name)?;
         let form_count = [
             self.url.is_some(),
             self.version.is_some(),
@@ -1135,12 +1164,85 @@ impl WheelEntry {
         Ok(())
     }
 
-    /// Normalized version string (leading `==` stripped). Only meaningful
-    /// for spec-form entries.
-    pub fn normalized_version(&self) -> Option<String> {
-        self.version
-            .as_ref()
-            .map(|v| v.trim().trim_start_matches("==").trim().to_string())
+    /// **THE** normalizer for the `version` field (F15). Every consumer --
+    /// resolver, meta-wheel emitter, spec/inputs-hash encoder, meta-wheel
+    /// cache marker, closure-adoption audit -- reads the version through
+    /// this function or one of its two derivatives below. No site anywhere
+    /// formats `==` around a config entry itself; that is what produced
+    /// `Requires-Dist: pyzmq==>=26,<28` before this fix.
+    ///
+    /// The lift is purely textual so it stays infallible: a leading PEP 440
+    /// operator means "already a specifier set, keep verbatim", anything
+    /// else is a bare version and gets `==` prepended. The *parse* (and its
+    /// loud error) lives in [`Self::version_specifiers`], which
+    /// [`Self::validate`] runs at config load; [`Self::normalize`] writes
+    /// the canonical parsed text back into `self.version`, so after load
+    /// this function is just a clone.
+    ///
+    /// `None` when the entry is not in spec form (url/path/git).
+    pub fn version_specifier_text(&self) -> Option<String> {
+        let text = self.version.as_deref()?.trim();
+        if text.is_empty() {
+            return None;
+        }
+        Some(if text.starts_with(['<', '>', '~', '!', '=']) {
+            text.to_string()
+        } else {
+            format!("=={text}")
+        })
+    }
+
+    /// [`Self::version_specifier_text`] parsed into a PEP 440 specifier
+    /// set. `Err` names the entry and the offending text -- this is the
+    /// only place a bad `version` is reported, and `validate` runs it for
+    /// every entry at config load so the failure is loud and early.
+    pub fn version_specifiers(&self, name: &str) -> Result<Option<VersionSpecifiers>> {
+        let Some(text) = self.version_specifier_text() else {
+            // Distinguish "no version field" from "version = \"\"".
+            if self.version.is_some() {
+                return Err(anyhow!("wheel `{name}`: `version` is empty"));
+            }
+            return Ok(None);
+        };
+        let specifiers = <VersionSpecifiers as std::str::FromStr>::from_str(&text).map_err(|e| {
+            anyhow!(
+                "wheel `{name}`: `version = \"{}\"` is not a PEP 440 version or specifier \
+                 set (accepted: `5.1.0`, `==5.1.0`, `>=5.1,<6`): {e}",
+                self.version.as_deref().unwrap_or("")
+            )
+        })?;
+        Ok(Some(specifiers))
+    }
+
+    /// The one concrete version this entry pins, and `None` for every
+    /// other shape (a range, `===`, a multi-clause set, or no version).
+    ///
+    /// Callers that need a concrete version out of a *ranged* entry must
+    /// use the RESOLVED version instead -- a range names no single version
+    /// by construction.
+    pub fn exact_pin(&self) -> Option<String> {
+        let text = self.version_specifier_text()?;
+        let rest = text.strip_prefix("==")?;
+        // `===1.0` (arbitrary-equality) and `==1.0,!=1.0.1` are not pins.
+        if rest.starts_with('=') || rest.contains(',') {
+            return None;
+        }
+        Some(rest.trim().to_string())
+    }
+
+    /// Does `version` (a concrete PEP 440 version) satisfy this entry's
+    /// specifier set? `false` for non-spec entries and unparseable
+    /// versions. Range-aware, so a closure-built wheel is adopted when it
+    /// lands inside `>=26,<28`, not only when it equals a pin.
+    pub fn version_matches(&self, name: &str, version: &str) -> Result<bool> {
+        let Some(specifiers) = self.version_specifiers(name)? else {
+            return Ok(false);
+        };
+        let Ok(parsed) = <uv_pep508::uv_pep440::Version as std::str::FromStr>::from_str(version)
+        else {
+            return Ok(false);
+        };
+        Ok(specifiers.contains(&parsed))
     }
 
     /// Default index when in spec form.
@@ -1253,9 +1355,82 @@ mod tests {
         assert_eq!(cfg.relax, RelaxPolicy::Minor);
         assert!(cfg.retread_wheels.contains_key("isaacsim"));
         let isaac = &cfg.retread_wheels["isaacsim"];
-        assert_eq!(isaac.normalized_version().unwrap(), "5.1.0");
+        assert_eq!(isaac.exact_pin().unwrap(), "5.1.0");
         assert!(isaac.is_spec());
         assert_eq!(isaac.extras, vec!["all", "extscache"]);
+    }
+
+    // ---- F15: `[retread-wheels]` version accepts a specifier SET ----
+    //
+    // Before F15 the resolver accepted ranges but `build_meta_wheel`
+    // formatted every entry as `format!("=={v}")` over the RAW config text,
+    // so `version = ">=26,<28"` emitted the invalid line
+    // `Requires-Dist: pyzmq==>=26,<28`. These four guards pin the one
+    // normalizer all consumers now share.
+
+    fn spec_entry(version: &str) -> WheelEntry {
+        WheelEntry {
+            version: Some(version.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn f15_range_version_is_kept_verbatim_and_matches_by_range() {
+        let mut entry = spec_entry(">=26,<28");
+        entry.normalize("pyzmq").expect("range must normalize");
+        entry.validate("pyzmq").expect("range must validate");
+        // Canonical text: comma-joined, NO spaces, no `==` prefix.
+        assert_eq!(entry.version.as_deref(), Some(">=26,<28"));
+        assert_eq!(entry.version_specifier_text().as_deref(), Some(">=26,<28"));
+        // A range names no single version.
+        assert_eq!(entry.exact_pin(), None);
+        // ...and matching is by the specifier set, not by string equality.
+        assert!(entry.version_matches("pyzmq", "27.1.0").unwrap());
+        assert!(entry.version_matches("pyzmq", "26.0").unwrap());
+        assert!(!entry.version_matches("pyzmq", "28.0").unwrap());
+        assert!(!entry.version_matches("pyzmq", "25.1.2").unwrap());
+    }
+
+    #[test]
+    fn f15_bare_version_still_lifts_to_exact_pin() {
+        let mut entry = spec_entry("27.1.0");
+        entry.normalize("pyzmq").expect("bare version must normalize");
+        entry.validate("pyzmq").expect("bare version must validate");
+        assert_eq!(entry.version.as_deref(), Some("==27.1.0"));
+        assert_eq!(entry.version_specifier_text().as_deref(), Some("==27.1.0"));
+        assert_eq!(entry.exact_pin().as_deref(), Some("27.1.0"));
+        assert!(entry.version_matches("pyzmq", "27.1.0").unwrap());
+        assert!(!entry.version_matches("pyzmq", "27.1.1").unwrap());
+    }
+
+    #[test]
+    fn f15_explicit_equals_version_is_unchanged() {
+        let mut entry = spec_entry("==27.1.0");
+        entry.normalize("pyzmq").expect("== pin must normalize");
+        entry.validate("pyzmq").expect("== pin must validate");
+        assert_eq!(entry.version.as_deref(), Some("==27.1.0"));
+        assert_eq!(entry.exact_pin().as_deref(), Some("27.1.0"));
+        // Multi-clause sets and `===` are NOT exact pins.
+        assert_eq!(spec_entry("==1.0,!=1.0.1").exact_pin(), None);
+        assert_eq!(spec_entry("===1.0").exact_pin(), None);
+    }
+
+    #[test]
+    fn f15_unparseable_version_is_a_config_error_naming_the_entry() {
+        for bad in [">=26,<<28", "not-a-version!", "=>1.0", ""] {
+            let entry = spec_entry(bad);
+            let err = entry
+                .validate("pyzmq")
+                .expect_err("garbage version must be refused")
+                .to_string();
+            assert!(
+                err.contains("pyzmq"),
+                "config error must name the entry key, got: {err}"
+            );
+            // normalize() refuses too, so the failure is loud at load time.
+            assert!(entry.clone().normalize("pyzmq").is_err(), "bad={bad}");
+        }
     }
 
     #[test]
