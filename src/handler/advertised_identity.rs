@@ -155,9 +155,20 @@ pub(crate) async fn load_record(
     let path = record_path(cache_dir, source_dir, name, subdir, build);
     let bytes = tokio::fs::read(&path).await.ok()?;
     let record: AdvertisedIdentityRecord = serde_json::from_slice(&bytes).ok()?;
-    record
+    let record = record
         .describes(name, version, subdir, target_identity, python_version)
-        .then_some(record)
+        .then_some(record)?;
+    // INFO, not DEBUG: whether a build request reproduced its advertised
+    // identity from the record or fell back to recompute-and-refuse is the one
+    // fact a post-hoc audit of a cold relock needs, and a DEBUG-only line is
+    // absent from every default-level backend log.
+    tracing::info!(
+        path = %path.display(),
+        output = %record.name,
+        build = %record.build,
+        "advertised identity: loaded the recorded resolution inputs for this build request",
+    );
+    Some(record)
 }
 
 /// The workspace solve fingerprint the build pass must resolve under.
@@ -213,6 +224,72 @@ mod tests {
             python_version: "3.11".to_string(),
             workspace_fp: "metadata-pass-fp".to_string(),
         }
+    }
+
+    /// Guard: the record survives pixi moving `work_directory` between the
+    /// metadata pass and the build pass, and survives the two passes running
+    /// from different current directories. `record_path` is keyed by
+    /// (cache_dir, source_dir, name, subdir, build) ONLY -- if a work dir, a
+    /// CWD, or any per-phase path is ever folded in, the build pass looks in a
+    /// place the metadata pass never wrote and this test fails.
+    #[tokio::test]
+    async fn a_record_written_from_one_work_dir_view_is_found_from_another() {
+        let dir = tempdir("work-dir-view").canonicalize().unwrap();
+        let cache = dir.join("cache");
+        let source = dir.join("pack");
+        let metadata_work_dir = dir.join(".pixi/bld/pack/metadata-phase");
+        let build_work_dir = dir.join(".pixi/bld/pack/AbC123-build-phase");
+        std::fs::create_dir_all(&metadata_work_dir).unwrap();
+        std::fs::create_dir_all(&build_work_dir).unwrap();
+        let record = record();
+
+        // The path must live under the cache root and carry no trace of
+        // either phase's work directory...
+        let path = record_path(&cache, &source, &record.name, &record.subdir, &record.build);
+        assert!(
+            path.starts_with(cache.join("retread-advertised-identity")),
+            "{path:?}"
+        );
+        let rendered = path.to_string_lossy().to_string();
+        assert!(!rendered.contains("metadata-phase"), "{rendered}");
+        assert!(!rendered.contains("AbC123-build-phase"), "{rendered}");
+        assert!(metadata_work_dir.exists() && build_work_dir.exists());
+
+        // ...and a record the metadata phase wrote must load for the build
+        // phase, which passes a different `work_directory` for the same
+        // (source_dir, name, subdir, build).
+        write_record(&cache, &source, &record).await;
+        let loaded = load_record(
+            &cache,
+            &source,
+            &record.name,
+            Some(&record.version),
+            &record.subdir,
+            &record.build,
+            &record.target_identity,
+            &record.python_version,
+        )
+        .await;
+        assert_eq!(loaded.as_ref(), Some(&record));
+
+        // Non-vacuous: a DIFFERENT source dir (another pack) must miss, so the
+        // assertion above is not merely "any record loads".
+        let other_source = dir.join("other-pack");
+        assert!(
+            load_record(
+                &cache,
+                &other_source,
+                &record.name,
+                Some(&record.version),
+                &record.subdir,
+                &record.build,
+                &record.target_identity,
+                &record.python_version,
+            )
+            .await
+            .is_none()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Guard (a): the metadata pass's record is retrievable by the exact

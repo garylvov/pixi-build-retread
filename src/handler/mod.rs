@@ -3586,6 +3586,36 @@ impl Handler {
         // cannot substitute producer-time selections: a ranged workspace
         // dependency can solve to a newer ABI version without changing the
         // manifest-derived inputs hash.
+        // The advertised-identity record of the metadata pass that produced
+        // `params.output.build`. It is loaded ONCE here because BOTH identity
+        // computations in this request must resolve under the fingerprint the
+        // identity was advertised from: the WS-B replay hash below, and -- the
+        // one that actually refused in v9 -- the cold candidate hash that the
+        // identity gate compares against `params.output`. Keyed by
+        // (source_dir, name, subdir, build) only, so pixi moving
+        // `work_directory` between the metadata and build phases cannot move
+        // the record.
+        let advertised_identity_record = match params.output.build.as_deref() {
+            Some(build) => {
+                advertised_identity::load_record(
+                    &cache_dir,
+                    &source_dir,
+                    params.output.name.as_normalized(),
+                    params
+                        .output
+                        .version
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .as_deref(),
+                    &params.output.subdir.to_string(),
+                    build,
+                    &target.resolution_identity(),
+                    target.python_version(),
+                )
+                .await
+            }
+            None => None,
+        };
         let mut prepared_build_selection = self
             .lookup_prepared_build_for_target(
                 generation,
@@ -3622,27 +3652,6 @@ impl Handler {
             // the fingerprint the advertised identity was actually computed
             // from whenever the metadata pass recorded it; with no record this
             // falls back to the freshly computed one and to today's gate.
-            let advertised_identity_record = match params.output.build.as_deref() {
-                Some(build) => {
-                    advertised_identity::load_record(
-                        &cache_dir,
-                        &source_dir,
-                        params.output.name.as_normalized(),
-                        params
-                            .output
-                            .version
-                            .as_ref()
-                            .map(ToString::to_string)
-                            .as_deref(),
-                        &params.output.subdir.to_string(),
-                        build,
-                        &target.resolution_identity(),
-                        target.python_version(),
-                    )
-                    .await
-                }
-                None => None,
-            };
             let workspace_fp = workspace_fp_for_build(
                 advertised_identity_record.as_ref(),
                 courier_workspace_fp(
@@ -4128,6 +4137,23 @@ impl Handler {
                 )
             })
             .unwrap_or_default();
+        // v9 (job 5080585) proved the record alone is not enough: the record
+        // WAS loaded (`advertised identity: loaded ...`) but only fed the WS-B
+        // replay hash, that replay missed, and the full cold resolve below then
+        // recomputed the workspace fingerprint from whatever sibling locks had
+        // appeared since -- producing `py311_h0a4ba3c452_loose_0` against a
+        // requested `py311_h3c24f86882_loose_0` and refusing with "identity
+        // differs". The candidate identity must be a function of the inputs the
+        // ADVERTISING pass saw, so it resolves under the recorded fingerprint.
+        let cold_workspace_fp = workspace_fp_for_build(
+            advertised_identity_record.as_ref(),
+            courier_workspace_fp(
+                cold_workspace_manifest.as_ref(),
+                workspace_dir.as_deref().unwrap_or(source_dir.as_path()),
+                &source_dir,
+                &target,
+            ),
+        );
         let mut matching_bundles = Vec::new();
         let mut rejected_candidates: Vec<String> = Vec::new();
         // Option D lock-parity recovery (docs/RETREAD_DETERMINISM_FIX_DESIGN.md):
@@ -4142,14 +4168,13 @@ impl Handler {
         for (bundle_index, base_bundle) in materialized.iter().enumerate() {
             let (bundle, effective) = apply_emission(base_bundle, &base_config, picked_emission);
             let courier_hash = config.courier.then(|| {
-                courier_inputs_hash(
+                courier_inputs_hash_with_workspace_fp(
                     &config,
                     &base_bundle.conda_name,
                     &target,
                     &courier_channels,
                     cold_workspace_manifest.as_ref(),
-                    workspace_dir.as_deref().unwrap_or(source_dir.as_path()),
-                    &source_dir,
+                    &cold_workspace_fp,
                 )
             });
             let rich_target_hash = (!config.courier)
@@ -4293,21 +4318,13 @@ impl Handler {
                         .iter()
                         .map(lock_run_dep_string)
                         .collect();
-                    let workspace_fp = cold_workspace_manifest
-                        .as_ref()
-                        .map(|manifest| {
-                            workspace_solve_fingerprint(
-                                manifest,
-                                workspace_dir.as_deref().unwrap_or(source_dir.as_path()),
-                                &source_dir,
-                                &target,
-                            )
-                        })
-                        .unwrap_or_default();
+                    // Same rule as the candidate hash above: the recovered
+                    // build carries the identity that was advertised, so its
+                    // config fingerprint must come from the advertising pass.
                     let config_fp = crate::courier::config_fingerprint(
                         &config,
                         &courier_channels,
-                        &workspace_fp,
+                        &cold_workspace_fp,
                     );
                     // Always warn: a recovered build must stay distinguishable
                     // from one whose fresh derivation actually reproduced the
