@@ -13312,7 +13312,21 @@ fn produce_output_with_conflicts(
             // workspace solve unsatisfiable. Bundle base-deps (the
             // `<entry>-*` prefix family) are closure members too, so this
             // also stops their duplication as conda deps.
-            if in_set(&bundle.uv_closure_names) {
+            //
+            // MEASURED (v8 cold relock,
+            // `verify_fixes/artifacts/v8-viral-gpu.backend.log`, 09:27:02.526701
+            // then 09:27:02.526708 -- 7 microseconds apart, same dep, same
+            // bundle): `huggingface_hub` reached the constrains carry and was
+            // then discarded HERE, because a name a workspace conda provider
+            // owns can ALSO be a uv-closure member. The carry emitted nothing
+            // and the workspace solve took `huggingface_hub 1.28.0` while the
+            // bundled `transformers 4.57.6-999retread` requires `<1.0`.
+            // A `constrains` entry is not a run-dep: it adds no package to the
+            // solve and is inert unless something else pulls the name in, so
+            // every failure this gate exists to prevent (a pypi-only name or an
+            // unsatisfiable spec becoming a REQUIRED conda edge) is out of
+            // reach for it. The gate therefore only drops non-carry edges.
+            if !constrains_only && in_set(&bundle.uv_closure_names) {
                 tracing::debug!(
                     dep = %dep_name,
                     bundle = %bundle.conda_name,
