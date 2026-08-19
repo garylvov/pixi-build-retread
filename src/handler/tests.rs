@@ -6923,6 +6923,8 @@ fn the_advertised_courier_build_gate_resolves_under_the_recorded_fingerprint() {
         target_identity: target.resolution_identity(),
         python_version: target.python_version().to_string(),
         workspace_fp: "sibling-locks-as-of-the-metadata-pass".to_string(),
+        run_depends: vec!["python 3.11.*".to_string()],
+        run_constrains: Vec::new(),
     };
     let advertising_fp = EffectiveWorkspaceFp::resolve(Some(&record), None, ws, source, &target);
     assert_eq!(
@@ -8125,4 +8127,124 @@ fn cold_mismatch_recovery_disabled_for_ambiguous_identity() {
     }
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// -----------------------------------------------------------------
+// The advertised OUTPUT, not just the advertised identity (turn 14,
+// v14-viral-gpu.backend.log:118653). Identity reproduced from the record, and
+// the build STILL died: `identity matches, run dependencies differ —
+// advertised but absent from the rebuilt output: python_abi`. The metadata
+// pass and the build pass read different `auto_dropped` / auto-route /
+// uv.lock-selection inputs, so the re-derived run-dep set differs from the one
+// pixi ALREADY solved the consuming environment against. The record now
+// carries that emitted set, and the gate emits it back.
+// -----------------------------------------------------------------
+
+/// The v14 shape: what `conda/outputs` advertised (and pixi solved the
+/// consuming environment against) differs from what the build pass re-derives
+/// in BOTH directions -- an advertised `python_abi` the rebuild no longer
+/// emits, and a shared name whose spec moved. `run_dependencies_match`
+/// tolerates the first on its own, so the fixture carries the second too;
+/// together they are the log's "identity matches, run dependencies differ".
+fn drifted_advertisement(candidate: &CondaOutput) -> Vec<String> {
+    let mut advertised: Vec<String> = candidate
+        .run_dependencies
+        .depends
+        .iter()
+        .map(format_package_spec_line)
+        .collect();
+    let moved = candidate.run_dependencies.depends[0].name.clone();
+    advertised[0] = format!("{moved} >=0.0.1,<9999");
+    advertised.push("python_abi 3.11.* *_cp311".to_string());
+    advertised
+}
+
+fn advertised_output_record(depends: Vec<String>, constrains: Vec<String>) -> AdvertisedIdentityRecord {
+    AdvertisedIdentityRecord {
+        schema: advertised_identity::SCHEMA,
+        name: "protomotions-deps-pack".to_string(),
+        version: "3.1".to_string(),
+        build: "py311_h3c24f86882_loose_0".to_string(),
+        subdir: "linux-64".to_string(),
+        target_identity: "linux-64".to_string(),
+        python_version: "3.11".to_string(),
+        workspace_fp: "metadata-pass-fp".to_string(),
+        run_depends: depends,
+        run_constrains: constrains,
+    }
+}
+
+/// Guard (a): with a record, the build emits the ADVERTISED run dependencies
+/// even though this pass's own re-derivation lost one of them, and does not
+/// refuse. Delete the record branch and the gate refuses again, exactly as the
+/// v14 log did.
+#[test]
+fn a_recorded_advertisement_outranks_a_build_pass_that_dropped_a_run_dep() {
+    let bundle = solo_bundle("protomotions-deps-pack", vec![]);
+    let candidate =
+        produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
+    // What pixi was advertised and solved against: this pass's emission PLUS
+    // the `python_abi` the build pass no longer derives.
+    let advertised = drifted_advertisement(&candidate);
+    assert!(
+        !output_run_dependencies_match(&candidate, Some(&advertised)).unwrap(),
+        "fixture must model the observed drift: the rebuilt output no longer emits \
+         what conda/outputs advertised"
+    );
+
+    let record = advertised_output_record(advertised.clone(), vec!["numpy >=1.26".to_string()]);
+    let authority = cold_emission_authority(Some(&record));
+    assert!(
+        cold_dependencies_gate(authority, &candidate, Some(&advertised)).unwrap(),
+        "a recorded advertisement must not be refused over the build pass's own drift"
+    );
+    let (run_deps, constrains) = cold_emission_overrides(authority, Some(&advertised));
+    assert_eq!(
+        run_deps.as_deref(),
+        Some(advertised.as_slice()),
+        "the build must emit the advertised depends, not the re-derived set"
+    );
+    assert_eq!(
+        constrains.as_deref(),
+        Some(["numpy >=1.26".to_string()].as_slice()),
+        "constrains are re-derived on the build pass too, so the record must \
+         supply them as well"
+    );
+}
+
+/// Guard (b): with no record there is nothing that vouches for the
+/// advertisement, so today's comparison -- and today's refusal -- stand. The
+/// fix must not blind the gate, only stop it from asking a question the record
+/// has already answered.
+#[test]
+fn without_a_record_a_dropped_run_dep_is_still_refused() {
+    let bundle = solo_bundle("protomotions-deps-pack", vec![]);
+    let candidate =
+        produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
+    let advertised = drifted_advertisement(&candidate);
+
+    assert!(cold_emission_authority(None).is_none());
+    assert!(
+        !cold_dependencies_gate(None, &candidate, Some(&advertised)).unwrap(),
+        "without a record the drifted candidate must still fail the gate"
+    );
+    assert!(
+        run_dependency_delta(&candidate, Some(&advertised))
+            .contains("advertised but absent from the rebuilt output: python_abi"),
+        "the refusal must keep naming the missing dependency: {}",
+        run_dependency_delta(&candidate, Some(&advertised))
+    );
+    // And the emission falls back to pixi's forwarded echo, with constrains
+    // still re-derived (None).
+    let (run_deps, constrains) = cold_emission_overrides(None, Some(&advertised));
+    assert_eq!(run_deps.as_deref(), Some(advertised.as_slice()));
+    assert!(constrains.is_none());
+}
+
+/// Guard: a record that carries no advertised depends is not an authority. It
+/// must fall back to today's comparison rather than emit an empty dep list.
+#[test]
+fn a_record_without_advertised_depends_is_not_an_emission_authority() {
+    let record = advertised_output_record(Vec::new(), Vec::new());
+    assert!(cold_emission_authority(Some(&record)).is_none());
 }

@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped whenever the recorded field set changes meaning. A record with a
 /// different schema is ignored, which degrades to today's recompute.
-pub(crate) const SCHEMA: u32 = 1;
+pub(crate) const SCHEMA: u32 = 2;
 
 /// The resolution inputs one advertised output identity was computed from.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,6 +43,20 @@ pub(crate) struct AdvertisedIdentityRecord {
     /// The exact `workspace_solve_fingerprint` string folded into the
     /// `config_fingerprint` that produced `build`.
     pub workspace_fp: String,
+    /// The exact `run_dependencies.depends` this pass sent to pixi in
+    /// `conda/outputs`, rendered as `name spec` lines.
+    ///
+    /// Pixi solved the consuming environment against THIS list; the build pass
+    /// re-deriving a different one (a missing `python_abi`, an extra
+    /// auto-routed name) is drift, not a correction, so the record -- not the
+    /// re-derivation -- decides what the package emits.
+    #[serde(default)]
+    pub run_depends: Vec<String>,
+    /// The exact `run_dependencies.constraints` (conda `constrains`) advertised
+    /// alongside `run_depends`. Re-derived on the build pass today
+    /// (`bundle_emitted_constrains`), so it drifts for the same reasons.
+    #[serde(default)]
+    pub run_constrains: Vec<String>,
 }
 
 impl AdvertisedIdentityRecord {
@@ -278,7 +292,42 @@ mod tests {
             target_identity: "linux-64-cuda-12-glibc-2-35".to_string(),
             python_version: "3.11".to_string(),
             workspace_fp: "metadata-pass-fp".to_string(),
+            run_depends: vec![
+                "python 3.11.*".to_string(),
+                "python_abi 3.11.* *_cp311".to_string(),
+            ],
+            run_constrains: vec!["numpy >=1.26".to_string()],
         }
+    }
+
+    /// Guard (turn 14): the advertised OUTPUT round-trips through the store --
+    /// both halves of it. `conda/build_v1` emits the recorded `depends` AND the
+    /// recorded `constrains`; dropping either from the record silently returns
+    /// that half to the build pass's re-derivation, which is the drift this
+    /// record exists to eliminate.
+    #[tokio::test]
+    async fn a_record_round_trips_the_advertised_depends_and_constrains() {
+        let dir = tempdir("advertised-output").canonicalize().unwrap();
+        let cache = dir.join("cache");
+        let source = dir.join("pack");
+        let record = record();
+        write_record(&cache, &source, &record).await;
+        let loaded = load_record(
+            &cache,
+            &source,
+            &record.name,
+            Some(&record.version),
+            &record.subdir,
+            &record.build,
+            &record.target_identity,
+            &record.python_version,
+        )
+        .await
+        .expect("record must load");
+        assert_eq!(loaded.run_depends, record.run_depends);
+        assert_eq!(loaded.run_constrains, record.run_constrains);
+        assert_eq!(loaded, record);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Guard: the record survives pixi moving `work_directory` between the
