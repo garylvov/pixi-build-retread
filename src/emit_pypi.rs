@@ -451,8 +451,40 @@ fn upper_bound_specifiers(req: &uv_pep508::Requirement) -> Vec<String> {
 /// a cap: an exact reroute is a deliberate bundle-membership pin (a wheel
 /// retread SHIPS), and re-attaching a foreign cap there could only produce an
 /// empty version set.
-fn merge_preserved_upper_bounds(base: &str, req: &uv_pep508::Requirement) -> String {
+///
+/// ALSO skipped for a semantic ABI ANCHOR (`numpy`, `python`, CUDA, the
+/// compiler runtimes). D1 regression, 2026-08-19: an anchor is the one class
+/// of name the WORKSPACE pins, and a requirer's raw anchor cap already
+/// reaches `relax_decision::decide` as an emission constraint alongside that
+/// pin (`handler/mod.rs`, the `original_requires_dist` emission loop). That
+/// call is the sole policy boundary: it intersects the cap when it can and
+/// RELAXES it with a recorded relaxation when it conflicts with the pin, and
+/// its output is the authoritative emitted contract that
+/// `check_output_abi_invariants` enforces. Re-attaching the raw cap here
+/// would re-assert, in shipped METADATA, a bound the policy boundary had
+/// already ruled on -- which is exactly how `cmeel-boost`'s `numpy <1.25`
+/// came back as a hard `does not cover workspace pin numpy==2.4.6` emission
+/// rejection for every bundle containing `isaaclab-sonic-pack`. Non-anchor
+/// names (`huggingface-hub <1.0`) carry no workspace pin and keep their cap.
+fn merge_preserved_upper_bounds(name: &str, base: &str, req: &uv_pep508::Requirement) -> String {
     if base.contains("==") || base.contains('<') {
+        return base.to_string();
+    }
+    if crate::solve::is_abi_anchor(name) {
+        let caps = upper_bound_specifiers(req);
+        if !caps.is_empty() {
+            // Loud, not silent: the cap is deliberately left to the policy
+            // boundary, and an operator reading the build log must be able to
+            // see which bound stopped being asserted in shipped METADATA.
+            tracing::warn!(
+                anchor = %name,
+                suppressed_cap = %caps.join(","),
+                emitted = %base,
+                "emit-pypi: not re-attaching an ABI anchor cap to the \
+                 name-keyed override line; `relax_decision::decide` owns this \
+                 bound against the workspace pin",
+            );
+        }
         return base.to_string();
     }
     let caps = upper_bound_specifiers(req);
@@ -501,7 +533,7 @@ pub fn override_line_map<'a>(
             // deliberate (the consumer's conda side may pin an older
             // version); deleting a cap or an exclusion is not -- those encode
             // incompatibility, so they are re-attached here.
-            let spec = merge_preserved_upper_bounds(&base, &req);
+            let spec = merge_preserved_upper_bounds(&name, &base, &req);
             let rebuilt = crate::wheel_rewrite::rebuild_requirement(&req, &spec);
             if rebuilt != line {
                 return LineAction::Replace(rebuilt);
