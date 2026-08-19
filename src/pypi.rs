@@ -3187,6 +3187,44 @@ platforms = [{ platform = "linux-64", glibc = "2.35" }]
     /// `resolve` (no preferred version) still picks the highest matching version.
     /// This guards the default code path against regressions from the
     /// `resolve_inner` refactor.
+    /// F15: a `[retread-wheels]` entry written as a RANGE resolves through
+    /// the shared normalizer and picks the newest wheel INSIDE the range --
+    /// not the newest on the index.
+    #[tokio::test]
+    async fn f15_ranged_wheel_entry_resolves_to_newest_in_range() {
+        let entries = vec![
+            ("pyzmq-25.1.2-py3-none-any.whl".to_string(), b"v25".to_vec()),
+            ("pyzmq-27.1.0-py3-none-any.whl".to_string(), b"v27".to_vec()),
+            ("pyzmq-28.0.0-py3-none-any.whl".to_string(), b"v28".to_vec()),
+        ];
+        let port = spawn_fixture_server(entries, 4).await;
+        let index = format!("http://127.0.0.1:{port}/simple/");
+        let target = WheelTarget {
+            python_version: "3.11".into(),
+            conda_subdir: "linux-64".into(),
+            max_glibc: None,
+        };
+
+        let mut entry = crate::config::WheelEntry {
+            version: Some(">=26,<28".into()),
+            ..Default::default()
+        };
+        entry.normalize("pyzmq").expect("range normalizes");
+        let specs = entry
+            .version_specifiers("pyzmq")
+            .expect("range parses")
+            .expect("spec form");
+
+        let picked = resolve(&index, "pyzmq", &specs, &target)
+            .await
+            .expect("resolve must succeed");
+
+        assert_eq!(
+            picked.filename, "pyzmq-27.1.0-py3-none-any.whl",
+            "must pick the newest wheel satisfying >=26,<28 (27.1.0), not 28.0.0"
+        );
+    }
+
     #[tokio::test]
     async fn resolve_without_preference_picks_highest() {
         let entries = vec![

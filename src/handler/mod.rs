@@ -2076,7 +2076,13 @@ fn closure_built_entry_override(
         matches!(wheel.origin, crate::lock::Origin::Built)
             && wheel.sdist_source.is_some()
             && canonical_conda_name(&wheel.name) == canonical_name
-            && entry.normalized_version().as_deref() == Some(wheel.version.as_str())
+            // F15: range-aware -- a closure-built wheel is adopted when it
+            // SATISFIES the entry's specifier set, not only when it equals
+            // an exact pin. `validate` already parsed this at config load,
+            // so the Err arm here is unreachable in practice.
+            && entry
+                .version_matches(entry_name, &wheel.version)
+                .unwrap_or(false)
     }) else {
         return Ok((entry.clone(), None));
     };
@@ -11379,20 +11385,16 @@ async fn materialize_and_rewrite_with_abi_aliases(
         wheel
     } else {
         // PyPI version spec form.
-        let version = entry
-            .normalized_version()
+        // F15: the `==`-lift and the PEP 440 parse both live in
+        // `WheelEntry::version_specifiers` -- the single normalizer -- so the
+        // resolver, the meta-wheel emitter and the inputs-hash encoder can
+        // never disagree about what a `[retread-wheels]` version means.
+        let specifiers = entry
+            .version_specifiers(entry_name)?
             .ok_or_else(|| anyhow!("wheel `{entry_name}` has no version, url, path, or git"))?;
-        // The version field accepts both a bare exact version ("1.2.3") and a
-        // PEP 440 specifier set (">=0.65,<0.66"); only prefix `==` when the
-        // text does not already start with an operator.
-        let version_text = version.trim();
-        let specifier_text = if version_text.starts_with(['<', '>', '~', '!', '=']) {
-            version_text.to_string()
-        } else {
-            format!("=={version_text}")
-        };
-        let specifiers = VersionSpecifiers::from_str(&specifier_text)
-            .map_err(|e| anyhow!("wheel `{entry_name}` version `{version}`: {e}"))?;
+        // Canonical text of the same specifier set, for error context (the
+        // parsed value is moved into the sdist fallback below).
+        let version = entry.version_specifier_text().unwrap_or_default();
         let index_url = entry.index_url();
         match pypi::resolve(&index_url, entry_name, &specifiers, target).await {
             Ok(resolved) => {

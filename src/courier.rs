@@ -122,7 +122,8 @@ pub struct CourierStaged {
 /// Canonical spec string for a single `[retread-wheels]` entry.
 ///
 /// Format: `<key>[<extras>]<ver_proxy>` where `ver_proxy` is one of:
-/// - `==<version>` for an explicit pin
+/// - `==<version>` for an explicit pin, or the verbatim specifier set
+///   (`>=26,<28`) for a ranged entry (F15)
 /// - `@git:<rev>` for an inline or named git source
 /// - `@url:<url>[#sha256=<digest>]` for a direct URL
 /// - `""` (empty) for a bare/range entry
@@ -144,8 +145,7 @@ pub fn spec_for_entry(
     // version proxy, pure-input precedence: explicit pin, then inline
     // git rev, then named-git-source rev, then direct url, else bare.
     let ver = entry
-        .normalized_version()
-        .map(|v| format!("=={v}"))
+        .version_specifier_text()
         .or_else(|| entry.rev.clone().map(|r| format!("@git:{r}")))
         .or_else(|| {
             entry
@@ -2408,7 +2408,7 @@ pub(crate) async fn stage_for_target_with_store_root_and_relaxations(
             h.update(b":");
             h.update(
                 entry
-                    .normalized_version()
+                    .version_specifier_text()
                     .as_deref()
                     .unwrap_or("")
                     .as_bytes(),
