@@ -2386,6 +2386,34 @@ mod tests {
         assert!(conda_cuda_shadow_providers("hypothetical-new-lib").is_empty());
     }
 
+    /// Guard (F21d). The SHADOW half of the F21 fix. Emission refuses to
+    /// require a provider the workspace channels cannot supply; this is the
+    /// other half of that agreement -- a provider that is not in the prefix
+    /// (because no channel could supply it) means the shim wheel is NOT
+    /// shadowed, so it stays installed and `libnvshmem` is present at runtime.
+    /// If these two ever disagree, torch loads against a library nothing
+    /// shipped.
+    #[test]
+    fn an_absent_provider_leaves_the_shim_wheel_installed() {
+        // A realistic conda CUDA prefix that has cusparselt but no nvshmem --
+        // conda-forge carries the former and not the latter (cert6,
+        // 2026-08-19).
+        let prefix_names: BTreeSet<String> = ["cuda-cudart", "cuda-version", "cusparselt"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert!(
+            conda_provides_cuda_component("cusparselt", &prefix_names),
+            "cusparselt is in the prefix, so its shim wheel IS shadowed",
+        );
+        for absent in ["nvshmem", "cudnn", "nccl"] {
+            assert!(
+                !conda_provides_cuda_component(absent, &prefix_names),
+                "`{absent}` is not in the prefix, so its shim wheel must stay installed",
+            );
+        }
+    }
+
     /// Guard (F16c): a linked SONAME retread knows maps to exactly one conda
     /// provider; an unmapped one returns `None` so the caller must WARN with
     /// the name rather than drop it silently.

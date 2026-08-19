@@ -8799,6 +8799,11 @@ fn shadowed_cuda_shim_wheel_emits_its_conda_native_provider() {
         "nvidia-cusparselt-cu12",
         meta("nvidia-cusparselt-cu12", "0.8.1.1", vec![], true),
     ));
+    // F21 premise: the provider is only emittable because the workspace's
+    // solved conda facts prove the channels carry a record for it.
+    bundle
+        .workspace_conda_versions
+        .insert("cusparselt".to_string(), "0.8.1.1".to_string());
     let output = super::produce_output(
         &bundle,
         &cfg(),
@@ -9048,6 +9053,10 @@ fn a_non_anchor_native_provider_is_still_emitted_name_only() {
         "nvidia-cusparselt-cu12",
         meta("nvidia-cusparselt-cu12", "0.8.1.1", vec![], true),
     ));
+    // F21 premise: the workspace solved this provider, so the channels have it.
+    bundle
+        .workspace_conda_versions
+        .insert("cusparselt".to_string(), "0.8.1.1".to_string());
     let output = super::produce_output(
         &bundle,
         &cfg(),
@@ -9070,5 +9079,143 @@ fn a_non_anchor_native_provider_is_still_emitted_name_only() {
     assert!(
         !crate::solve::is_abi_anchor("cusparselt"),
         "fixture premise: cusparselt is not an ABI anchor",
+    );
+}
+
+// ---- F21 guards: a native provider with NO candidates is never emitted ----
+
+/// Guard (F21a). `nvidia-nvshmem-cu12` maps to `nvshmem`, which is real on
+/// NVIDIA's own channel but ABSENT from this workspace's channels (conda-forge
+/// + garylvov). Emitting it name-only failed the ENTIRE conda solve --
+/// "flashsac-pack 0.1.0 would require nvshmem *, for which no candidates were
+/// found" (cert6.lock.log:78-86, 2026-08-19). With no workspace-solved fact for
+/// the provider there is no evidence the channels can supply it, so no depend
+/// may be emitted.
+#[test]
+fn a_native_provider_with_no_channel_candidates_is_not_emitted() {
+    let mut bundle = solo_bundle("flashsac-pack", vec![]);
+    bundle.extras.push(rw(
+        "nvidia-nvshmem-cu12",
+        meta("nvidia-nvshmem-cu12", "3.3.20", vec![], true),
+    ));
+    // No `workspace_conda_versions` entry: nothing proves `nvshmem` exists.
+    let output = super::produce_output(
+        &bundle,
+        &cfg(),
+        rattler_conda_types::Platform::Linux64,
+        "3.11",
+        &[],
+        None,
+        None,
+    )
+    .expect("an unavailable provider must be skipped, not fail emission");
+    let names = emitted_dep_names(&output);
+    for provider in ["nvshmem", "libnvshmem"] {
+        assert!(
+            !names.iter().any(|name| name == provider),
+            "`{provider}` has no candidates on the workspace channels and must not be \
+             emitted -- the whole consumer solve fails on it: {names:?}",
+        );
+    }
+    // And the wheel itself is still shipped by the pack, so the native library
+    // is present at runtime.
+    assert!(
+        bundle
+            .all_wheels()
+            .any(|wheel| wheel.pypi_name == "nvidia-nvshmem-cu12"),
+        "the shim wheel must stay in the materialized set when its provider is unavailable",
+    );
+}
+
+/// Guard (F21b). Both halves in one pack: the provider WITH channel evidence
+/// (`cusparselt`) is still emitted, the one WITHOUT (`nvshmem`) is not. One
+/// missing provider must never suppress an available sibling.
+#[test]
+fn an_available_native_provider_survives_an_unavailable_sibling() {
+    let mut bundle = solo_bundle("flashsac-pack", vec![]);
+    bundle.extras.push(rw(
+        "nvidia-cusparselt-cu12",
+        meta("nvidia-cusparselt-cu12", "0.8.1.1", vec![], true),
+    ));
+    bundle.extras.push(rw(
+        "nvidia-nvshmem-cu12",
+        meta("nvidia-nvshmem-cu12", "3.3.20", vec![], true),
+    ));
+    bundle
+        .workspace_conda_versions
+        .insert("cusparselt".to_string(), "0.8.1.1".to_string());
+    let output = super::produce_output(
+        &bundle,
+        &cfg(),
+        rattler_conda_types::Platform::Linux64,
+        "3.11",
+        &[],
+        None,
+        None,
+    )
+    .unwrap();
+    let names = emitted_dep_names(&output);
+    assert!(
+        names.iter().any(|name| name == "cusparselt"),
+        "the evidenced provider must still be emitted: {names:?}",
+    );
+    assert!(
+        !names.iter().any(|name| name == "nvshmem"),
+        "the unevidenced provider must be dropped: {names:?}",
+    );
+}
+
+/// Guard (F21c). The ANCHOR path is untouched by the candidate gate: it keeps
+/// its own evidence rule (a single workspace-solved version, emitted `==`),
+/// which is the F20 behaviour and is already an availability proof.
+#[test]
+fn the_candidate_gate_does_not_change_the_anchor_path() {
+    let mut bundle = solo_bundle("flashsac-pack", vec![]);
+    bundle.extras.push(rw(
+        "nvidia-cuda-runtime-cu12",
+        meta("nvidia-cuda-runtime-cu12", "12.9.79", vec![], true),
+    ));
+    bundle
+        .workspace_conda_versions
+        .insert("cuda-cudart".to_string(), "12.9.79".to_string());
+    let output = super::produce_output(
+        &bundle,
+        &cfg(),
+        rattler_conda_types::Platform::Linux64,
+        "3.11",
+        &[],
+        None,
+        None,
+    )
+    .unwrap();
+    let specs = emitted_dep_specs(&output);
+    let anchor = specs
+        .iter()
+        .find(|(name, _)| name == "cuda-cudart")
+        .unwrap_or_else(|| panic!("the anchor provider must still be emitted: {specs:?}"));
+    assert_eq!(anchor.1.trim(), "==12.9.79", "{specs:?}");
+
+    // An anchor with NO workspace selection still takes the F20 refusal path
+    // (skip, WARN), not a candidate-gate path -- either way nothing bare is
+    // emitted and emission succeeds.
+    let mut bare = solo_bundle("flashsac-pack", vec![]);
+    bare.extras.push(rw(
+        "nvidia-cuda-runtime-cu12",
+        meta("nvidia-cuda-runtime-cu12", "12.9.79", vec![], true),
+    ));
+    let output = super::produce_output(
+        &bare,
+        &cfg(),
+        rattler_conda_types::Platform::Linux64,
+        "3.11",
+        &[],
+        None,
+        None,
+    )
+    .unwrap();
+    let names = emitted_dep_names(&output);
+    assert!(
+        !names.iter().any(|name| name == "cuda-cudart"),
+        "an unpinnable anchor is skipped, never emitted bare: {names:?}",
     );
 }

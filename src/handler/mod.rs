@@ -13081,6 +13081,27 @@ fn output_workspace_abi_versions(
     workspace_versions
 }
 
+/// Whether the workspace's solved conda facts prove a record EXISTS for
+/// `provider` (or any of its transitive semantic ABI aliases) on the channels
+/// this workspace solves against.
+///
+/// The emission-time twin of `installer::conda_provides_cuda_component`, which
+/// asks the same question of an installed prefix. Both must answer alike: a
+/// provider no consumer can install must not become a depend, and the shim
+/// wheel it would have shadowed must stay in the pack. "No facts at all"
+/// answers NO on purpose -- an unprovable provider is not an available one,
+/// and the pre-F16 status quo (no depend, wheel shipped) is always installable
+/// whereas a depend with no candidates fails the consumer's whole solve.
+fn native_provider_has_candidates(
+    provider: &str,
+    workspace_abi: &WorkspaceAbiVersions,
+    abi_aliases: &AbiAliasGraph,
+) -> bool {
+    semantic_aliases(provider, abi_aliases)
+        .iter()
+        .any(|alias| workspace_abi.get(alias).is_some_and(|v| !v.is_empty()))
+}
+
 /// Current, solved ABI facts attached to one advertised output.
 ///
 /// This is process-local on purpose: producer-time lock facts cannot stand in
@@ -14751,6 +14772,40 @@ fn produce_output_with_conflicts(
                 continue;
             }
             if !is_anchor {
+                // F21. The table names the conda package that OWNS the
+                // component; it does NOT prove the workspace channels carry a
+                // record for that name. `nvshmem` is mapped and real on
+                // NVIDIA's own channel, but the workspace here (conda-forge +
+                // garylvov) has no record for it, so emitting the depend took
+                // the entire conda solve down with "flashsac-pack 0.1.0 would
+                // require nvshmem *, for which no candidates were found"
+                // (cert6, 2026-08-19).
+                //
+                // The availability check must read the SAME evidence the
+                // SHADOW decision reads, or the two halves disagree and torch
+                // ends up without the native library at runtime.
+                // `installer::conda_provides_cuda_component` asks whether the
+                // provider is IN THE PREFIX; the emission-time twin of that
+                // question is the workspace's SOLVED conda facts
+                // (`workspace_abi`), which are channel-derived by construction
+                // and already in hand -- no per-name network call here. A name
+                // absent from every precise consumer's solve is a name no
+                // consumer can install, so the shim wheel is NOT shadowed at
+                // install time and must stay in the pack. Emitting the depend
+                // anyway is the only way the two halves can disagree, because
+                // the install side derives its set from the real prefix
+                // (`conda_shadowed_from_env`), never from this list.
+                if !native_provider_has_candidates(provider, &workspace_abi, &abi_aliases) {
+                    tracing::warn!(
+                        wheel = %wheel_name,
+                        provider = %provider,
+                        bundle = %bundle.conda_name,
+                        "native provider {provider} for shadowed wheel {wheel_name} has no \
+                         candidates on the workspace channels; keeping the wheel instead of \
+                         shadowing",
+                    );
+                    continue;
+                }
                 tracing::info!(
                     wheel = %wheel_name,
                     provider = %provider,
