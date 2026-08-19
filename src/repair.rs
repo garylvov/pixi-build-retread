@@ -67,6 +67,40 @@ pub fn broken_path(share: &Path, bundle: &str) -> PathBuf {
     share.join(format!("{bundle}.broken"))
 }
 
+/// Path of the repair log the activate.d guard redirects the self-heal into.
+/// Named in every distrust notice so the operator has the failure text one
+/// `cat` away.
+pub fn repair_log_path(share: &Path, bundle: &str) -> PathBuf {
+    share.join(format!("{bundle}.repair.log"))
+}
+
+/// True when a recorded state means the prefix must NOT be trusted: `broken`
+/// (the repair ran and failed) and `repairing` (the repair was killed
+/// mid-transaction) both describe a possibly half-uninstalled site-packages.
+pub fn state_is_distrusted(state: RepairState) -> bool {
+    matches!(state, RepairState::Repairing | RepairState::Broken)
+}
+
+/// The single loud line every reader of the state file emits, naming the
+/// repair log and the state file itself.
+pub fn distrust_reason(share: &Path, bundle: &str, state: RepairState) -> String {
+    let why = match state {
+        RepairState::Repairing => {
+            "a previous repair was interrupted mid-transaction (state 'repairing'), so \
+             site-packages may be half-uninstalled"
+        }
+        RepairState::Broken => {
+            "the previous repair FAILED (state 'broken'), so the payload cannot be trusted"
+        }
+        RepairState::Installed => "state 'installed'",
+    };
+    format!(
+        "retread: bundle {bundle} is not trustworthy: {why}; failure text in {}; state file {}",
+        repair_log_path(share, bundle).display(),
+        state_path(share, bundle).display()
+    )
+}
+
 /// Record `state` for `bundle`. Best-effort: a repair must never fail because
 /// its own bookkeeping file could not be written.
 ///
