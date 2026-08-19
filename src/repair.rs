@@ -538,6 +538,160 @@ pub fn fail_post_verify(
     err.context(detail)
 }
 
+
+// ── F11: repair budget + divergence detector ─────────────────────────────
+//
+// A repair is only worth running if it can CONVERGE. On `viral-gpu`
+// (2026-08-19) it could not: the bundle `isaaclab-viral-pack` locks
+// `networkx==3.3` / `sympy==1.13.3`, while the environment's own pypi phase
+// installs `networkx 3.6.1` / `sympy 1.14.0` over them on every `pixi
+// install`/`pixi run`. Each activation therefore saw the same two wheels
+// "missing", replayed all 142 locked wheels (~9.5 min: uninstall 5m46s +
+// install 2m48s) to put 3.3/1.13.3 back, and was undone again by the next
+// activation. `<bundle>.repair.log` recorded four identical attempts with no
+// cap and no notice that the SAME names kept flipping; the run only ended
+// because a 900 s probe timeout cut attempt #4 in half (`rc=124`).
+//
+// Two independent stops, both terminal and both loud:
+//   * the same missing-set twice in a row => the payload has an external
+//     owner; replaying cannot win, so name the owner and stop.
+//   * a hard ceiling of [`MAX_REPAIR_ATTEMPTS`] attempts regardless.
+// The refusal is recorded in `<bundle>.state` so LATER activations honour it
+// without replaying (the existing `.broken` backoff only slowed the loop
+// down; it never stopped it, because a *successful* replay clears the state).
+
+/// Hard ceiling on repair attempts recorded in `<bundle>.repair.log`. Each
+/// attempt is a full uninstall+reinstall of the locked wheel set, so an
+/// unbounded retry is an unbounded burn.
+pub const MAX_REPAIR_ATTEMPTS: usize = 3;
+
+/// Marks the machine-readable "what was missing when this repair was
+/// triggered" line inside the repair log.
+const TRIGGER_PREFIX: &str = "trigger missing: ";
+
+/// Marks a refusal inside `<bundle>.state`: `broken` on line 1, then
+/// `retread-refused: <lock-digest> <reason>` on line 2.
+const REFUSAL_PREFIX: &str = "retread-refused: ";
+
+/// What the budget/divergence check decided about one repair trigger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepairVerdict {
+    /// No evidence of divergence and budget left: replay.
+    Proceed,
+    /// Stop: replaying cannot converge, or the budget is spent.
+    Refuse(String),
+}
+
+/// Record the missing-set that triggered a repair so the NEXT trigger can be
+/// compared against it. It lives in the repair log (which already APPENDS one
+/// section per attempt and is the file every distrust notice names), so the
+/// evidence for a divergence verdict is readable with `cat`.
+pub fn record_trigger(share: &Path, bundle: &str, missing: &[String]) {
+    append_repair_log(
+        share,
+        bundle,
+        &format!("{TRIGGER_PREFIX}{}", missing.join(", ")),
+    );
+}
+
+/// The last missing-set recorded by [`record_trigger`], if any.
+pub fn last_trigger(share: &Path, bundle: &str) -> Option<Vec<String>> {
+    let body = std::fs::read_to_string(repair_log_path(share, bundle)).ok()?;
+    let line = body
+        .lines()
+        .rev()
+        .find_map(|l| l.trim().strip_prefix(TRIGGER_PREFIX))?;
+    Some(
+        line.split(", ")
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+/// Repair attempts already recorded for `bundle` (one `=== attempt N … ===`
+/// header per destructive replay).
+pub fn attempts_recorded(share: &Path, bundle: &str) -> usize {
+    recorded_attempts(&repair_log_path(share, bundle))
+}
+
+/// The refusal text for a payload with an owner outside the bundle. Names the
+/// dists and BOTH versions -- what the env put there and what the bundle
+/// locks -- because the fix is in the manifest/pack ownership, not here.
+pub fn divergence_reason(missing: &[String], env_versions: &[String]) -> String {
+    let who = if env_versions.is_empty() {
+        "another owner".to_string()
+    } else {
+        env_versions.join(", ")
+    };
+    format!(
+        "repair diverges: env-level pypi installs {who} over the bundle's locked {}; the previous \
+         replay COMPLETED and the same wheels went missing again, so an external owner keeps \
+         overwriting the payload -- fix the manifest/pack ownership (the environment must not \
+         resolve these names itself), not the repair",
+        missing.join(", ")
+    )
+}
+
+/// Decide whether a repair triggered by `missing` may replay. `env_versions`
+/// carries what the prefix currently holds for those names (for the message).
+pub fn decide_repair(
+    share: &Path,
+    bundle: &str,
+    missing: &[String],
+    env_versions: &[String],
+) -> RepairVerdict {
+    let attempts = attempts_recorded(share, bundle);
+    if attempts >= MAX_REPAIR_ATTEMPTS {
+        return RepairVerdict::Refuse(format!(
+            "repair budget spent: {attempts} attempt(s) already recorded in {} (cap \
+             {MAX_REPAIR_ATTEMPTS}) and the payload still fails verification (missing {}); a \
+             further replay would only repeat them",
+            repair_log_path(share, bundle).display(),
+            missing.join(", ")
+        ));
+    }
+    if !missing.is_empty() && last_trigger(share, bundle).as_deref() == Some(missing) {
+        return RepairVerdict::Refuse(divergence_reason(missing, env_versions));
+    }
+    RepairVerdict::Proceed
+}
+
+/// Terminal handler for a REFUSED repair: record `broken` with the refusal
+/// tagged and keyed to the lock digest, so later activations read it back and
+/// skip the replay entirely instead of re-entering the loop.
+pub fn refuse_repair(share: &Path, bundle: &str, lock_digest: &str, reason: &str) -> anyhow::Error {
+    mark_state(
+        share,
+        bundle,
+        RepairState::Broken,
+        &format!("{REFUSAL_PREFIX}{lock_digest} {reason}"),
+    );
+    let line = format!("retread install: {bundle} repair REFUSED; {reason}");
+    append_repair_log(share, bundle, &line);
+    eprintln!("{line}");
+    anyhow::anyhow!("{line}")
+}
+
+/// The recorded refusal for `bundle`, as `(lock digest, reason)`.
+pub fn read_refusal(share: &Path, bundle: &str) -> Option<(String, String)> {
+    let body = std::fs::read_to_string(state_path(share, bundle)).ok()?;
+    let mut lines = body.lines();
+    if lines.next()?.trim() != RepairState::Broken.as_str() {
+        return None;
+    }
+    let detail = lines.next()?.trim().strip_prefix(REFUSAL_PREFIX)?;
+    let (digest, reason) = detail.split_once(' ')?;
+    Some((digest.to_string(), reason.to_string()))
+}
+
+/// Drop a recorded refusal (and its legacy sentinel). Used when the LOCK the
+/// refusal was keyed to has changed: a new payload deserves a fresh attempt.
+pub fn clear_refusal(share: &Path, bundle: &str) {
+    let _ = std::fs::remove_file(state_path(share, bundle));
+    let _ = std::fs::remove_file(broken_path(share, bundle));
+}
+
 #[cfg(test)]
 mod tests {
 

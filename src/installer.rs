@@ -1278,6 +1278,64 @@ fn verify_record_payload(site_packages: &Path, dist_root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The locked wheels a prefix does not hold, as `name==version`, after the
+/// editable-overlay and conda-shadow exemptions. Single producer: the verify
+/// failure text and the F11 divergence detector must never disagree about
+/// what "missing" means, or the detector would compare two different sets and
+/// never fire.
+fn missing_after_exemptions(
+    lock: &RetreadLock,
+    installed: &BTreeMap<String, BTreeMap<String, PathBuf>>,
+    editable_owned: &BTreeSet<String>,
+    conda_shadowed: &BTreeSet<String>,
+) -> Vec<String> {
+    missing_locked_wheels_from_installed(lock, installed)
+        .into_iter()
+        .filter(|item| {
+            let name = item.split("==").next().map(normalize_dist_name);
+            name.is_none_or(|n| !editable_owned.contains(&n) && !conda_shadowed.contains(&n))
+        })
+        .collect()
+}
+
+/// The same set computed straight from a live prefix, for callers that hold
+/// only the prefix (the divergence detector, which runs after
+/// `verify_payload_installed` has already returned its error text).
+fn missing_locked_wheels_in_prefix(lock: &RetreadLock, prefix: &Path) -> Vec<String> {
+    let site_packages = site_packages_dir(prefix, &lock.python);
+    let Ok(installed) = installed_distributions(&site_packages) else {
+        return Vec::new();
+    };
+    missing_after_exemptions(
+        lock,
+        &installed,
+        &editable_owned_distributions(&site_packages),
+        &conda_shadowed_locked_dists(lock, prefix),
+    )
+}
+
+/// For each `name==version` the bundle is missing, the version(s) the prefix
+/// actually holds under that name -- i.e. what an owner OUTSIDE the bundle
+/// put there. This is the other half of the divergence message: naming only
+/// the locked version would not tell the operator who is overwriting it.
+fn env_installed_versions_for(lock: &RetreadLock, prefix: &Path, missing: &[String]) -> Vec<String> {
+    let installed =
+        installed_distributions(&site_packages_dir(prefix, &lock.python)).unwrap_or_default();
+    missing
+        .iter()
+        .filter_map(|item| {
+            let (name, _locked) = item.split_once("==")?;
+            let versions = installed.get(&normalize_dist_name(name))?;
+            (!versions.is_empty()).then(|| {
+                format!(
+                    "{name} {}",
+                    versions.keys().cloned().collect::<Vec<_>>().join("/")
+                )
+            })
+        })
+        .collect()
+}
+
 fn verify_payload_installed(lock: &RetreadLock, prefix: &Path) -> Result<()> {
     let site_packages = site_packages_dir(prefix, &lock.python);
     let installed = installed_distributions(&site_packages)?;
@@ -1297,13 +1355,7 @@ fn verify_payload_installed(lock: &RetreadLock, prefix: &Path) -> Result<()> {
     // the post-install gate on a healthy prefix, marked it `.broken` and drove
     // the activation repair loop. Same decision, same set, one reader.
     let conda_shadowed = conda_shadowed_locked_dists(lock, prefix);
-    let missing: Vec<String> = missing_locked_wheels_from_installed(lock, &installed)
-        .into_iter()
-        .filter(|item| {
-            let name = item.split("==").next().map(normalize_dist_name);
-            name.is_none_or(|n| !editable_owned.contains(&n) && !conda_shadowed.contains(&n))
-        })
-        .collect();
+    let missing = missing_after_exemptions(lock, &installed, &editable_owned, &conda_shadowed);
     if !missing.is_empty() {
         bail!(
             "retread verify: bundle {} is missing {} locked wheel(s) in {}: {}",
@@ -1589,6 +1641,34 @@ pub async fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
 
     let share = prefix.join("share").join("retread");
     std::fs::create_dir_all(&share).ok();
+    let want = lock_digest(&raw);
+
+    // F11 reader: a repair REFUSED as divergent (or over its attempt budget)
+    // must not be replayed by later activations. The `.broken` backoff alone
+    // never stopped the loop -- a *successful* replay clears the state, and
+    // the next activation's env-level pypi phase re-broke it, so the ~9.5 min
+    // 142-wheel transaction ran again and again. The refusal is keyed to the
+    // lock digest: a CHANGED lock is a new payload and earns a fresh attempt,
+    // so this cannot wedge a bundle that was genuinely rebuilt.
+    match crate::repair::read_refusal(&share, &lock.bundle) {
+        Some((digest, reason)) if digest == want => {
+            bail!(
+                "retread install: bundle {} repair is REFUSED and will not be replayed again \
+                 until {} is removed: {reason}",
+                lock.bundle,
+                crate::repair::state_path(&share, &lock.bundle).display()
+            );
+        }
+        Some((_, reason)) => {
+            eprintln!(
+                "retread install: bundle {} was refused under a different lock ({reason}); the \
+                 lock has changed, clearing the refusal and re-attempting",
+                lock.bundle
+            );
+            crate::repair::clear_refusal(&share, &lock.bundle);
+        }
+        None => {}
+    }
 
     // Reader for `<bundle>.state`: `broken` (repair finished and failed) or
     // `repairing` (repair killed mid-transaction) both mean the prefix may be
@@ -1622,7 +1702,6 @@ pub async fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
     }
 
     let marker = share.join(lock.marker_name());
-    let want = lock_digest(&raw);
 
     // ── Lock-free fast path ──────────────────────────────────────────────
     // The self-heal activate.d guard runs `retread install` on EVERY
@@ -1722,6 +1801,30 @@ pub async fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
                 }
             }
             Err(err) => {
+                // F11: before replaying, check the repair can converge. If the
+                // SAME wheels went missing again after the previous replay
+                // completed, an owner outside the bundle is putting its own
+                // versions back after every attempt, and each attempt is a
+                // full uninstall+reinstall of the locked set. Refuse loudly --
+                // naming the dists and both versions -- instead of ping-ponging
+                // forever; and refuse unconditionally once the attempt budget
+                // is spent.
+                let missing = missing_locked_wheels_in_prefix(&lock, prefix);
+                let env_versions = env_installed_versions_for(&lock, prefix, &missing);
+                match crate::repair::decide_repair(&share, &lock.bundle, &missing, &env_versions) {
+                    crate::repair::RepairVerdict::Refuse(reason) => {
+                        return Err(crate::repair::refuse_repair(
+                            &share,
+                            &lock.bundle,
+                            &want,
+                            &reason,
+                        )
+                        .context(format!("{err:#}")));
+                    }
+                    crate::repair::RepairVerdict::Proceed => {
+                        crate::repair::record_trigger(&share, &lock.bundle, &missing);
+                    }
+                }
                 // The digest marker is only trusted together with installed
                 // wheel metadata. A payload miss invalidates it for replay, so
                 // uv must replace the locked wheel set rather than skip
@@ -3870,6 +3973,162 @@ mod tests {
         assert!(
             crate::repair::broken_path(&share, &lock.bundle).exists(),
             "a failed re-attempt must not clear the broken sentinel"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // The F11 shape: an owner OUTSIDE the bundle (the environment's own pypi
+    // phase) has replaced the locked distribution with its own version, so
+    // every activation sees the same locked wheel "missing". The version is
+    // read from METADATA, so rewriting it is exactly what pixi's pypi phase
+    // does to the prefix.
+    fn env_overwrites_the_locked_dist(prefix: &Path, lock: &RetreadLock) {
+        let site_packages = site_packages_dir(prefix, &lock.python);
+        std::fs::write(
+            site_packages.join("mypackage-1.0.0.dist-info/METADATA"),
+            "Metadata-Version: 2.1\nName: MyPackage\nVersion: 2.0.0\n",
+        )
+        .unwrap();
+    }
+
+    // GUARD (F11): the SAME missing-set twice in a row means the replay
+    // cannot converge -- viral-gpu ran four identical ~9.5 min 142-wheel
+    // replays because nothing noticed that networkx/sympy flipped back after
+    // every completed attempt. The second identical trigger must refuse, name
+    // the dists and BOTH versions, and the refusal must survive into LATER
+    // activations without replaying.
+    #[tokio::test]
+    async fn an_identical_missing_set_refuses_the_replay_as_divergence() {
+        let (root, prefix, lock_path, lock) = healthy_verifying_prefix("repair-divergence");
+        let share = prefix.join("share").join("retread");
+        env_overwrites_the_locked_dist(&prefix, &lock);
+
+        // Attempt 1: nothing recorded yet, so the replay is legitimate --
+        // observable as the fixture's missing bin/python.
+        let err = run(&lock_path, &prefix)
+            .await
+            .expect_err("the first trigger must reach the replay");
+        assert!(
+            format!("{err:#}").contains("python not found"),
+            "the first repair must not be refused, got: {err:#}"
+        );
+
+        // Attempt 2: the same wheel is missing again -> divergence.
+        let err = run(&lock_path, &prefix)
+            .await
+            .expect_err("an identical missing-set must refuse the replay");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("repair diverges")
+                && msg.contains("mypackage 2.0.0")
+                && msg.contains("mypackage==1.0.0"),
+            "the refusal must name the dist and BOTH versions, got: {msg}"
+        );
+        assert!(
+            !msg.contains("python not found"),
+            "a divergent repair must NOT reach the replay, got: {msg}"
+        );
+        assert_eq!(
+            crate::repair::read_state(&share, &lock.bundle),
+            Some(crate::repair::RepairState::Broken),
+            "a refused repair must be recorded broken"
+        );
+
+        // A later activation: the refusal is honoured, still no third replay.
+        let err = run(&lock_path, &prefix)
+            .await
+            .expect_err("a refused repair must stay refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("REFUSED") && msg.contains("repair diverges"),
+            "the later activation must repeat the refusal reason, got: {msg}"
+        );
+        assert!(
+            !msg.contains("python not found"),
+            "a refused repair must not replay on later activations, got: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // GUARD (F11): the detector must fire on DIVERGENCE, not on repair. A
+    // different missing-set is evidence the previous repair changed
+    // something, so the replay still runs.
+    #[tokio::test]
+    async fn a_different_missing_set_still_proceeds_to_the_replay() {
+        let (root, prefix, lock_path, lock) = healthy_verifying_prefix("repair-progress");
+        let share = prefix.join("share").join("retread");
+        env_overwrites_the_locked_dist(&prefix, &lock);
+        crate::repair::record_trigger(&share, &lock.bundle, &["othersuch==9.9.9".to_string()]);
+
+        let err = run(&lock_path, &prefix)
+            .await
+            .expect_err("a changed missing-set must reach the replay");
+        assert!(
+            format!("{err:#}").contains("python not found"),
+            "a non-identical trigger must not be refused, got: {err:#}"
+        );
+        assert_eq!(
+            crate::repair::read_state(&share, &lock.bundle),
+            None,
+            "a proceeding repair must not be marked broken by the budget check"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // GUARD (F11): the attempt cap is unconditional -- a repair whose
+    // missing-set keeps CHANGING still cannot replay forever.
+    #[tokio::test]
+    async fn the_attempt_budget_caps_the_replay_even_when_the_missing_set_changes() {
+        let (root, prefix, lock_path, lock) = healthy_verifying_prefix("repair-budget");
+        let share = prefix.join("share").join("retread");
+        env_overwrites_the_locked_dist(&prefix, &lock);
+
+        for _ in 0..crate::repair::MAX_REPAIR_ATTEMPTS {
+            crate::repair::begin_attempt_log(&share, &lock.bundle);
+        }
+        // A DIFFERENT trigger, so the divergence arm cannot be what refuses.
+        crate::repair::record_trigger(&share, &lock.bundle, &["othersuch==9.9.9".to_string()]);
+
+        let err = run(&lock_path, &prefix)
+            .await
+            .expect_err("the attempt cap must refuse the replay");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("repair budget spent")
+                && msg.contains(&format!("cap {}", crate::repair::MAX_REPAIR_ATTEMPTS)),
+            "the refusal must name the spent budget and the cap, got: {msg}"
+        );
+        assert!(
+            !msg.contains("python not found"),
+            "the capped repair must not reach the replay, got: {msg}"
+        );
+        assert_eq!(
+            crate::repair::read_state(&share, &lock.bundle),
+            Some(crate::repair::RepairState::Broken),
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // GUARD (F11): a refusal is keyed to the lock digest, so a bundle that is
+    // genuinely REBUILT is not wedged by a stale refusal.
+    #[tokio::test]
+    async fn a_refusal_does_not_survive_a_changed_lock() {
+        let (root, prefix, lock_path, lock) = healthy_verifying_prefix("repair-refusal-lock");
+        let share = prefix.join("share").join("retread");
+        env_overwrites_the_locked_dist(&prefix, &lock);
+        crate::repair::refuse_repair(
+            &share,
+            &lock.bundle,
+            "a-digest-from-an-older-lock",
+            "repair diverges: …",
+        );
+
+        let err = run(&lock_path, &prefix)
+            .await
+            .expect_err("a refusal under a different lock must not block the replay");
+        assert!(
+            format!("{err:#}").contains("python not found"),
+            "a changed lock must earn a fresh attempt, got: {err:#}"
         );
         let _ = std::fs::remove_dir_all(root);
     }
