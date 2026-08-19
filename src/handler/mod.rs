@@ -3383,6 +3383,23 @@ impl Handler {
                                 target_identity: target.resolution_identity(),
                                 python_version: target.python_version().to_string(),
                                 workspace_fp: courier_workspace_fp_for_outputs.as_str().to_string(),
+                                // The advertised OUTPUT, not just the inputs
+                                // that named it: pixi solves the consuming
+                                // environment against exactly these lines, so
+                                // conda/build_v1 must emit them back rather
+                                // than re-derive a pass-dependent set.
+                                run_depends: output
+                                    .run_dependencies
+                                    .depends
+                                    .iter()
+                                    .map(format_package_spec_line)
+                                    .collect(),
+                                run_constrains: output
+                                    .run_dependencies
+                                    .constraints
+                                    .iter()
+                                    .map(format_constraint_spec)
+                                    .collect(),
                             },
                         )
                         .await;
@@ -4102,6 +4119,10 @@ impl Handler {
                 Some(expected_build),
                 prepared.incremental_version_override.as_deref(),
                 run_override.as_deref(),
+                // Prepared handoff: the in-memory plan is the advertising
+                // pass's own, so its constrains derivation is the advertised
+                // one already; no record override is needed here.
+                None,
                 prepared.relaxations.as_ref(),
             )
             .await
@@ -4200,6 +4221,17 @@ impl Handler {
         // differs". The candidate identity must be a function of the inputs the
         // ADVERTISING pass saw, so it resolves under the recorded fingerprint.
         let cold_workspace_fp = &effective_workspace_fp;
+        // The advertised-identity record carries the OUTPUT pixi was given, not
+        // merely the inputs that named it. When one exists for the requested
+        // build string it -- not this pass's re-derivation -- is authoritative
+        // for what the package emits: the metadata pass and the build pass read
+        // different `auto_dropped` / auto-route / uv.lock-selection inputs, so
+        // the re-derived run-dep set legitimately differs (v14: `python_abi`
+        // advertised, absent from the rebuild) while the environment pixi has
+        // ALREADY solved still depends on the advertised one. Rebuilding the
+        // advertised list is therefore the correct output; refusing on the
+        // delta only strands a build whose identity already reproduced.
+        let advertised_output = cold_emission_authority(advertised_identity_record.as_ref());
         let mut matching_bundles = Vec::new();
         let mut rejected_candidates: Vec<String> = Vec::new();
         // Option D lock-parity recovery (docs/RETREAD_DETERMINISM_FIX_DESIGN.md):
@@ -4247,13 +4279,14 @@ impl Handler {
                 ))
             })?;
             let identity_matches = output_matches_build_request(&candidate, &params.output);
-            let dependencies_match = output_run_dependencies_match(&candidate, run_override.as_deref())
-                .map_err(|error| {
-                    RpcError::internal(format!(
-                        "validating cached output parity for {}: {error:#}",
-                        bundle.conda_name
-                    ))
-                })?;
+            let dependencies_match =
+                cold_dependencies_gate(advertised_output, &candidate, run_override.as_deref())
+                    .map_err(|error| {
+                        RpcError::internal(format!(
+                            "validating cached output parity for {}: {error:#}",
+                            bundle.conda_name
+                        ))
+                    })?;
             if identity_matches && dependencies_match {
                 matching_bundles.push((bundle_index, bundle, effective, emission_relaxations));
             } else {
@@ -4474,6 +4507,24 @@ impl Handler {
             )?;
         }
 
+        // Emit the advertisement, not the re-derivation. `run_override` is
+        // pixi's echo of the same advertised list, but only the record also
+        // carries the `constrains` half -- pixi forwards `depends` alone, so
+        // without the record `build_one` re-derives constrains on the build
+        // pass and drifts there exactly as the depends did.
+        if let Some(record) = advertised_output {
+            tracing::info!(
+                bundle = %bundle.conda_name,
+                build = %record.build,
+                "advertised identity: emitting the advertised run dependencies \
+                 ({} depends, {} constrains)",
+                record.run_depends.len(),
+                record.run_constrains.len(),
+            );
+        }
+        let (cold_run_override, cold_constrains_override) =
+            cold_emission_overrides(advertised_output, run_override.as_deref());
+
         let result = build_one(
             bundle,
             effective,
@@ -4488,7 +4539,8 @@ impl Handler {
             cold_workspace_fp,
             params.output.build.as_deref(),
             None,
-            run_override.as_deref(),
+            cold_run_override.as_deref(),
+            cold_constrains_override.as_deref(),
             bundled_relaxations.as_ref(),
         )
         .await
@@ -13884,6 +13936,56 @@ fn output_run_dependencies_match(
     run_dependencies_match(&output.run_dependencies.depends, advertised)
 }
 
+/// The record that is authoritative for what a cold `conda/build_v1` emits, if
+/// there is one.
+///
+/// A record whose `run_depends` is empty (a pre-schema-2 shape, or a write that
+/// captured nothing) carries no advertisement to emit, so it must not silence
+/// the gate: authority requires an actual advertised list.
+fn cold_emission_authority(
+    record: Option<&AdvertisedIdentityRecord>,
+) -> Option<&AdvertisedIdentityRecord> {
+    record.filter(|record| !record.run_depends.is_empty())
+}
+
+/// Does the re-derived cold candidate agree with the advertisement?
+///
+/// With an authoritative record the question does not arise: pixi solved the
+/// consuming environment against the RECORDED run dependencies, and this pass
+/// re-derives them from different `auto_dropped` / auto-route /
+/// uv.lock-selection inputs, so a delta is drift to be overridden (see
+/// [`cold_emission_overrides`]) and never grounds to refuse. Without a record
+/// the comparison -- and the refusal it feeds -- stands unchanged.
+fn cold_dependencies_gate(
+    authority: Option<&AdvertisedIdentityRecord>,
+    candidate: &CondaOutput,
+    run_override: Option<&[String]>,
+) -> Result<bool> {
+    match authority {
+        Some(_) => Ok(true),
+        None => output_run_dependencies_match(candidate, run_override),
+    }
+}
+
+/// The `(run_deps, constrains)` a cold build must emit.
+///
+/// `run_override` is pixi's echo of the advertised `depends` and stays the
+/// fallback, but only the record also carries the `constrains` half: pixi
+/// forwards `depends` alone, so without a record `build_one` re-derives
+/// constrains on the build pass and drifts there exactly as the depends did.
+fn cold_emission_overrides(
+    authority: Option<&AdvertisedIdentityRecord>,
+    run_override: Option<&[String]>,
+) -> (Option<Vec<String>>, Option<Vec<String>>) {
+    match authority {
+        Some(record) => (
+            Some(record.run_depends.clone()),
+            Some(record.run_constrains.clone()),
+        ),
+        None => (run_override.map(<[String]>::to_vec), None),
+    }
+}
+
 /// Describe *which* run dependencies differ, for the "0 exact matches" error.
 /// Knowing only that they differ is not actionable: the record can be stale in
 /// one spec out of two hundred, and the operator has no way to see which.
@@ -16275,6 +16377,10 @@ async fn build_one(
     expected_build: Option<&str>,
     courier_version_override: Option<&str>,
     run_override: Option<&[String]>,
+    // The advertised `constrains`, when a record for this identity supplies
+    // them. `None` re-derives, which is correct only when this pass is the
+    // advertising pass (see the cold-path caller).
+    constrains_override: Option<&[String]>,
     relaxations: Option<&RelaxationManifest>,
 ) -> Result<CondaBuildV1Result> {
     validate_resolution_artifact_subdir(target, target_subdir)?;
@@ -16457,9 +16563,11 @@ async fn build_one(
         // `run_dependencies` (depends) only, so unlike `run_deps` there is no
         // authoritative forwarded list. Re-derive from the same emission
         // authority that produced the conda/outputs advertisement.
-        let constrains =
-            bundle_emitted_constrains(bundle, config, target_subdir, workspace_python_version)
-                .context("deriving emitted conda constrains for the courier lock")?;
+        let constrains = match constrains_override {
+            Some(advertised) => advertised.to_vec(),
+            None => bundle_emitted_constrains(bundle, config, target_subdir, workspace_python_version)
+                .context("deriving emitted conda constrains for the courier lock")?,
+        };
         return materialize_and_pack(
             Some(bundle),
             config,
@@ -16668,6 +16776,20 @@ fn format_constraint_spec(named: &NamedSpec<ConstraintSpec>) -> String {
         "{} {}",
         named.name,
         audit_report::format_packagespec(&PackageSpec::Binary(binary.clone()))
+    )
+    .trim()
+    .to_string()
+}
+
+/// Render a run-dependency spec back to the `name spec` line it was parsed
+/// from. Exact inverse of [`spec_from_str`] for the specs this crate emits, so
+/// the advertised run dependencies survive a trip through the
+/// advertised-identity record byte-stably.
+fn format_package_spec_line(named: &NamedSpec<PackageSpec>) -> String {
+    format!(
+        "{} {}",
+        named.name,
+        audit_report::format_packagespec(&named.spec)
     )
     .trim()
     .to_string()
@@ -21368,6 +21490,8 @@ mod courier_build_string_tests {
             target_identity: target.resolution_identity(),
             python_version: target.python_version().to_string(),
             workspace_fp: metadata_pass_fp.to_string(),
+            run_depends: vec!["python 3.11.*".to_string()],
+            run_constrains: Vec::new(),
         };
         let from_record = build_for(&workspace_fp_for_build(
             Some(&record),
