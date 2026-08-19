@@ -5737,6 +5737,35 @@ struct WorkspaceCondaProviderFact {
     present_in_all_consumers: bool,
 }
 
+/// Whether the workspace conda fact for `conda_key` is DECLARED operator
+/// intent rather than a LEARNED float.
+///
+/// `workspace_conda_versions` holds what every precise consumer's solve
+/// *selected*, transitives included. That is two different things wearing one
+/// name: a version some consumer's manifest actually asks for, and a version
+/// nothing asked for that simply fell out of the last solve. Only the first is
+/// authority. The provider fact keeps the direct workspace specs, so the
+/// distinction is already in the data: a declared spec carrying a version
+/// clause (`>=5.9,<8`, `==1.28.0`) is intent; a bare presence declaration
+/// (`*`) and a purely transitive provider (no declared spec at all) are not.
+fn workspace_conda_fact_is_declared(
+    provider_facts: &BTreeMap<String, WorkspaceCondaProviderFact>,
+    conda_key: &str,
+) -> bool {
+    provider_facts.get(conda_key).is_some_and(|fact| {
+        fact.declared_specs
+            .iter()
+            .any(|spec| declared_spec_bounds_version(spec))
+    })
+}
+
+/// A declared conda spec bounds the version when it says anything beyond
+/// "this package is present".
+fn declared_spec_bounds_version(spec: &str) -> bool {
+    let spec = spec.trim();
+    !spec.is_empty() && spec != "*" && spec.chars().any(|c| c.is_ascii_digit())
+}
+
 /// Effective Rule-1 ownership authority shared with Rule 2. Direct conda
 /// names remain distinct from explicitly mapped PyPI names, and PyPI-side
 /// exclusions are carried separately so same-name fallback cannot bypass a
@@ -13585,6 +13614,83 @@ fn produce_output_with_conflicts(
                     workspace_python_version,
                 );
                 if constrains_only {
+                    // ORIGIN DECIDES. A "workspace conda fact" is one of two
+                    // very different things: an operator pin declared in the
+                    // manifest by a precise consumer, or a LEARNED float --
+                    // merely the version the previous solve happened to
+                    // select. Letting a learned float veto the bundled wheel's
+                    // cap is CIRCULAR: the sibling env floats to 1.28, the
+                    // float vetoes the `<1.0` bound that would correct it, the
+                    // pack ships with no bound, the next solve floats to 1.28
+                    // again, and the built env cannot import. So a learned
+                    // fact yields: emit the wheel's cap and let the conda
+                    // solver re-pick under it, or fail loudly if it cannot. A
+                    // DECLARED pin is operator intent and keeps today's
+                    // policy-decided behaviour below.
+                    let fact_origins: BTreeSet<ConstraintOriginId> = constraints
+                        .iter()
+                        .filter(|constraint| {
+                            matches!(constraint.provenance, Provenance::WorkspaceCondaFact(_))
+                        })
+                        .map(|constraint| constraint.origin_id.clone())
+                        .collect();
+                    let declared = workspace_conda_fact_is_declared(
+                        &bundle.workspace_conda_provider_facts,
+                        conda_name.key().as_str(),
+                    );
+                    if !fact_origins.is_empty() && !declared {
+                        let without_fact: Vec<Constraint> = constraints
+                            .iter()
+                            .filter(|constraint| !fact_origins.contains(&constraint.origin_id))
+                            .cloned()
+                            .collect();
+                        let mut validation_without_fact = validation_only_origins.clone();
+                        validation_without_fact.retain(|id| !fact_origins.contains(id));
+                        match decide_for_emission(
+                            &pypi_name,
+                            &without_fact,
+                            &validation_without_fact,
+                            config.relax,
+                            &SafetyContext::new(Some(conda_name.as_spec()))
+                                .with_abi_anchor_alias(has_anchor_alias),
+                        ) {
+                            RelaxDecision::Strict {
+                                specifiers,
+                                diagnostics,
+                            }
+                            | RelaxDecision::Relaxed {
+                                specifiers,
+                                decisions: diagnostics,
+                            } => {
+                                pending_relaxations.extend(auto_bundle::wheel_metadata_relaxations(
+                                    &pypi_name,
+                                    &without_fact,
+                                    diagnostics,
+                                    &bundle.conda_name,
+                                    format!(" for bundle '{}'", bundle.conda_name),
+                                ));
+                                let rendered = native_conda_override
+                                    .clone()
+                                    .unwrap_or_else(|| specifiers.to_string().replace(", ", ","));
+                                tracing::warn!(
+                                    dep = %conda_name,
+                                    bundle = %bundle.conda_name,
+                                    bound = %rendered,
+                                    conflict = %conflict,
+                                    "conda constrains entry conflicts with a LEARNED workspace \
+                                     conda fact (a prior solve's selection, not a declared \
+                                     manifest pin); the bundled wheel's cap wins. Emitting the \
+                                     bound so the conda solver re-picks under it -- an \
+                                     infeasible re-pick must fail the solve loudly rather than \
+                                     ship an environment that cannot import.",
+                                );
+                                let spec = conda_name.match_spec(&rendered);
+                                constrains_specs.push(constraint_spec_from_str(spec.as_str())?);
+                                continue;
+                            }
+                            RelaxDecision::Conflict(_) | RelaxDecision::SearchExhausted(_) => {}
+                        }
+                    }
                     // A constrains entry states a bound; it does not claim the
                     // dependency. An undecidable one must NOT turn a pack that
                     // built before into a hard failure -- that would be a
