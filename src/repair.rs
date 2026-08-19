@@ -381,7 +381,7 @@ pub fn fail_repair(
 ) -> anyhow::Error {
     let removed = rollback_half_removed(dists);
     let detail = if removed.is_empty() {
-        format!("{err:#}")
+        format!("transaction failed mid-way (nothing to roll back): {err:#}")
     } else {
         let names: Vec<String> = removed
             .iter()
@@ -393,11 +393,16 @@ pub fn fail_repair(
             })
             .collect();
         format!(
-            "{err:#}; removed half-uninstalled package dirs: {}",
+            "transaction failed mid-way (rolled back orphans: {}): {err:#}",
             names.join(", ")
         )
     };
     mark_state(share, bundle, RepairState::Broken, &detail);
+    append_repair_log(
+        share,
+        bundle,
+        &format!("retread install: {bundle} repair failed; {detail}"),
+    );
     if !removed.is_empty() {
         eprintln!(
             "retread install: {bundle} repair failed; removed {} half-uninstalled package \
@@ -426,8 +431,166 @@ pub fn prepare_transaction(
     Ok((dists, pruned))
 }
 
+/// Maximum size of `<bundle>.repair.log` before it is rotated to
+/// `<bundle>.repair.log.1`. The log is APPENDED to (one `=== attempt N … ===`
+/// header per attempt) so a failure's text survives the next attempt; the cap
+/// is what keeps an env that re-heals every activation from filling the disk.
+pub const REPAIR_LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
+
+/// `YYYY-MM-DDTHH:MM:SSZ` for a Unix timestamp, without pulling in a date
+/// crate (Howard Hinnant's civil-from-days).
+fn utc_stamp(epoch_secs: i64) -> String {
+    let days = epoch_secs.div_euclid(86_400);
+    let secs = epoch_secs.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        secs / 3_600,
+        (secs % 3_600) / 60,
+        secs % 60
+    )
+}
+
+fn now_epoch_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Append one line to `<bundle>.repair.log`. Best-effort: bookkeeping must
+/// never be the reason a repair fails.
+pub fn append_repair_log(share: &Path, bundle: &str, line: &str) {
+    use std::io::Write as _;
+    let _ = std::fs::create_dir_all(share);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(repair_log_path(share, bundle))
+    {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+/// Number of attempts already recorded in a repair log.
+fn recorded_attempts(path: &Path) -> usize {
+    std::fs::read_to_string(path)
+        .map(|body| {
+            body.lines()
+                .filter(|l| l.starts_with("=== attempt "))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// Open a new attempt in the repair log: rotate it if it has grown past
+/// [`REPAIR_LOG_MAX_BYTES`], then append an `=== attempt N <UTC> ===` header.
+///
+/// The log used to be TRUNCATED by the activate.d guard's `>` redirect on
+/// every activation, so attempt #1's failure text — the only record of why a
+/// repair failed — was destroyed by attempt #2. Returns the attempt number.
+pub fn begin_attempt_log(share: &Path, bundle: &str) -> usize {
+    let _ = std::fs::create_dir_all(share);
+    let path = repair_log_path(share, bundle);
+    if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) >= REPAIR_LOG_MAX_BYTES {
+        let _ = std::fs::rename(&path, share.join(format!("{bundle}.repair.log.1")));
+    }
+    let attempt = recorded_attempts(&path) + 1;
+    append_repair_log(
+        share,
+        bundle,
+        &format!("=== attempt {attempt} {} ===", utc_stamp(now_epoch_secs())),
+    );
+    attempt
+}
+
+/// Terminal handler for a replay that COMPLETED but whose post-transaction
+/// bookkeeping failed (payload verification, library scan, GLIBC audit, or the
+/// marker write).
+///
+/// Deliberately does NOT roll anything back: uv finished, so site-packages
+/// holds a freshly installed tree, not a half-removed one — deleting it would
+/// destroy a good install and guarantee the next attempt starts from scratch.
+/// It records `broken` with the failing check named, so the activate.d
+/// backoff/retry is honest and loud instead of the prefix being left in
+/// `repairing` forever (which made every later activation claim, falsely, that
+/// "a previous repair was interrupted mid-transaction").
+pub fn fail_post_verify(
+    share: &Path,
+    bundle: &str,
+    check: &str,
+    err: anyhow::Error,
+) -> anyhow::Error {
+    let detail = format!("transaction completed but post-verify failed: {check}: {err:#}");
+    mark_state(share, bundle, RepairState::Broken, &detail);
+    let line = format!("retread install: {bundle} repair failed; {detail}");
+    append_repair_log(share, bundle, &line);
+    eprintln!("{line}");
+    err.context(detail)
+}
+
 #[cfg(test)]
 mod tests {
+
+    // GUARD (d2 turn 3): the repair log must APPEND. The activate.d guard used
+    // to redirect with `>`, so attempt #2 truncated attempt #1's failure text
+    // -- the only record of why the first repair failed -- before anyone read
+    // it (hover-gpu 2026-08-19).
+    #[test]
+    fn repair_log_appends_across_attempts_and_rotates_at_the_cap() {
+        let root = std::env::temp_dir().join(format!("retread-repair-log-{}", std::process::id()));
+        let share = root.join("share/retread");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&share).unwrap();
+        let log = repair_log_path(&share, "b");
+
+        assert_eq!(begin_attempt_log(&share, "b"), 1);
+        append_repair_log(&share, "b", "uv died: os error 39");
+        assert_eq!(begin_attempt_log(&share, "b"), 2);
+        append_repair_log(&share, "b", "second failure");
+
+        let body = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            body.contains("uv died: os error 39"),
+            "attempt #1's failure text must survive attempt #2, got: {body}"
+        );
+        assert!(
+            body.contains("=== attempt 1 ") && body.contains("=== attempt 2 "),
+            "each attempt must be headed, got: {body}"
+        );
+        assert!(
+            body.contains("Z ===") && body.contains("20"),
+            "the header must carry a timestamp, got: {body}"
+        );
+
+        // Cap: an oversized log rotates instead of growing without bound, and
+        // the new log starts its attempt numbering over.
+        std::fs::write(&log, vec![b'x'; REPAIR_LOG_MAX_BYTES as usize + 1]).unwrap();
+        assert_eq!(begin_attempt_log(&share, "b"), 1);
+        assert!(
+            share.join("b.repair.log.1").exists(),
+            "log must rotate at the cap"
+        );
+        assert!(std::fs::metadata(&log).unwrap().len() < 200);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn utc_stamp_formats_a_known_instant() {
+        assert_eq!(utc_stamp(1_787_128_402), "2026-08-19T08:33:22Z");
+        assert_eq!(utc_stamp(0), "1970-01-01T00:00:00Z");
+    }
+
     use super::*;
 
     fn tempdir(label: &str) -> PathBuf {
@@ -620,8 +783,9 @@ mod tests {
             "the activate.d backoff sentinel must exist"
         );
         assert!(
-            format!("{err:#}").contains("removed half-uninstalled package dirs: torch"),
-            "the error must name what was rolled back: {err:#}"
+            format!("{err:#}").contains("transaction failed mid-way (rolled back orphans: torch)"),
+            "the error must name what was rolled back AND distinguish a mid-way abort \
+             from a completed-but-unverified transaction: {err:#}"
         );
 
         std::fs::remove_dir_all(&root).ok();
