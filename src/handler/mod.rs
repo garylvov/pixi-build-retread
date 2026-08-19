@@ -14691,7 +14691,9 @@ fn produce_output_with_conflicts(
             .iter()
             .map(|spec| spec.name.as_str().to_string())
             .collect();
-        let mut native: BTreeSet<&'static str> = BTreeSet::new();
+        // provider -> the shim wheel that demanded it (first one wins; the log
+        // only needs one witness).
+        let mut native: BTreeMap<&'static str, String> = BTreeMap::new();
         for wheel in bundle.all_wheels() {
             let Some(component) = crate::installer::pypi_cuda_shadow_component(&wheel.pypi_name)
             else {
@@ -14710,22 +14712,94 @@ fn produce_output_with_conflicts(
                 );
                 continue;
             };
-            if already.contains(*provider) || !native.insert(*provider) {
+            native
+                .entry(*provider)
+                .or_insert_with(|| wheel.pypi_name.clone());
+        }
+        // F20. Half of these providers are ABI ANCHORS (`cuda-cudart`,
+        // `cuda-cupti`, `cuda-nvrtc`, `cuda-nvtx` -- `solve::is_abi_anchor`),
+        // and `check_output_abi_invariants` rejects an anchor emitted
+        // name-only: a floating `cuda-cudart *` lets the consumer's solve pick
+        // a CUDA runtime the pack's wheels were never built against. Emitting
+        // one is not a near-miss, it fails the whole `conda/outputs` request
+        // (cert5 flashsac-pack, 2026-08-19). So an anchor provider is either
+        // already carried by the anchor pipeline (skip) or emitted PINNED to
+        // the workspace's own solved version -- never bare.
+        let workspace_abi = output_workspace_abi_versions(bundle, workspace_python_version);
+        for (provider, wheel_name) in native {
+            let is_anchor = is_semantic_abi_anchor(provider, &abi_aliases);
+            if already.contains(provider) || seen_dep_names.contains(provider) {
+                // Already a run-dep (or a constrains target) with whatever spec
+                // the decide pipeline chose. Restating it name-only would be a
+                // duplicate at best and an anchor-widening at worst.
+                if is_anchor {
+                    tracing::debug!(
+                        wheel = %wheel_name,
+                        provider = %provider,
+                        bundle = %bundle.conda_name,
+                        "native provider {provider} is an ABI anchor; already carried by \
+                         the anchor pipeline",
+                    );
+                } else {
+                    tracing::debug!(
+                        wheel = %wheel_name,
+                        provider = %provider,
+                        bundle = %bundle.conda_name,
+                        "native provider {provider} is already a run-dep; not restating it",
+                    );
+                }
                 continue;
             }
-            tracing::info!(
-                wheel = %wheel.pypi_name,
-                provider = %provider,
-                bundle = %bundle.conda_name,
-                "native provider: {} shadowed by conda -> emitting {}",
-                wheel.pypi_name,
-                provider,
-            );
-        }
-        for provider in native {
-            if seen_dep_names.insert(provider.to_string()) {
+            if !is_anchor {
+                tracing::info!(
+                    wheel = %wheel_name,
+                    provider = %provider,
+                    bundle = %bundle.conda_name,
+                    "native provider: {wheel_name} shadowed by conda -> emitting {provider}",
+                );
+                seen_dep_names.insert(provider.to_string());
                 run_dep_specs.push(spec_from_str(provider)?);
+                continue;
             }
+            // The anchor's concrete spec is the workspace's SOLVED selection --
+            // the same fact `check_output_abi_invariants` validates against, so
+            // an emitted `==<selected>` is coverage-exact by construction. The
+            // whole semantic-alias component is consulted; more than one
+            // distinct version across it means there is no single selection to
+            // pin, and inventing one would be a guess.
+            let alias_component = semantic_aliases(provider, &abi_aliases);
+            let mut selected = alias_component
+                .iter()
+                .filter_map(|alias| workspace_abi.get(alias))
+                .flat_map(|versions| versions.iter().map(String::as_str))
+                .collect::<BTreeSet<_>>()
+                .into_iter();
+            let (Some(version), None) = (selected.next(), selected.next()) else {
+                // Doctrine 9: loud, and it reaches the party that must fix it.
+                // Emitting `*` here would fail the ABI invariant and take the
+                // whole build down; the pack ships without this provider, which
+                // is the pre-F16 status quo, not a regression.
+                tracing::warn!(
+                    wheel = %wheel_name,
+                    provider = %provider,
+                    bundle = %bundle.conda_name,
+                    "native provider {provider} is an ABI anchor but the workspace has no \
+                     single solved version for it; refusing to emit a name-only anchor \
+                     depend -- pin the provider in the workspace so the pack can carry it",
+                );
+                continue;
+            };
+            let spec = format!("{provider} =={version}");
+            tracing::info!(
+                wheel = %wheel_name,
+                provider = %provider,
+                spec = %spec,
+                bundle = %bundle.conda_name,
+                "native provider: {wheel_name} shadowed by conda -> emitting ABI anchor \
+                 {spec} (workspace-selected)",
+            );
+            seen_dep_names.insert(provider.to_string());
+            run_dep_specs.push(spec_from_str(&spec)?);
         }
     }
     // ---- F16 END ----
