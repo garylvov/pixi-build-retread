@@ -1758,6 +1758,7 @@ mod tests {
             inputs_hash: "abc".to_string(),
             root_requirements: vec!["test-bundle-pypi==1.0.0".to_string()],
             wheels: Vec::new(),
+            conda_run_constraints: Vec::new(),
             conda_run_deps: Vec::new(),
             index_urls: Vec::new(),
             prerelease: BTreeMap::new(),

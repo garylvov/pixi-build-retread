@@ -411,6 +411,24 @@ pub struct RetreadLock {
     pub relaxations: Vec<RelaxationRecord>,
     /// Shared transitives routed to conda (the courier package's run-deps).
     pub conda_run_deps: Vec<CondaDep>,
+    /// Conda `constrains` this courier package advertises (schema 19+).
+    ///
+    /// These are bounds carried from a bundled wheel's Requires-Dist for a
+    /// dependency name a workspace conda provider already owns: the pack must
+    /// NOT pull the package in (that is the provider's job), but it must still
+    /// state the bound its own wheels were built against. `constrains` is
+    /// exactly that conda concept -- inert unless something else pulls the
+    /// name in, binding when it does.
+    ///
+    /// Replay rebuilds `run_dependencies.constraints` from this field so the
+    /// cold and replayed `conda/outputs` metadata stay byte-identical (see
+    /// `assemble_conda_output`, the single assembly authority). Pre-schema-19
+    /// locks deserialize this as empty AND are refused by the `schema !=
+    /// SCHEMA` replay gates (`src/handler/mod.rs:16388`, `:16706`), so an old
+    /// lock cold-derives once instead of silently replaying without its
+    /// constrains.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conda_run_constraints: Vec<CondaDep>,
     /// Producer-side index chain used during pack build/solve. Install replay
     /// uses per-wheel direct artifact URLs and never consults this chain.
     pub index_urls: Vec<String>,
@@ -553,12 +571,20 @@ pub struct RetreadLock {
 /// for the Part-2 incremental delta-detector. `#[serde(default)]` so old locks
 /// parse (delta-detector falls back to full cold resolve on empty `entry_specs`).
 ///
+/// Schema 19: `conda_run_constraints` -- the conda `constrains` list the pack
+/// advertises. Wheel requirements on a name owned by a workspace conda
+/// provider used to be DROPPED outright; they are now carried as `constrains`
+/// so the bound survives without the pack claiming the dependency. The field
+/// is `serde(default)` so older locks parse, but both producer replay gates
+/// refuse `schema != SCHEMA`, so a schema-18 lock cold-derives once rather
+/// than replaying an output missing its constrains.
+///
 /// On the producer-side `conda/outputs` replay path, old schema-9 and earlier
 /// locks are rejected by the != gate and the pack build performs a fresh solve.
 /// On the consumer-side install path, old schemas are hard errors: install
 /// replay must not fall back to resolver-backed uv. SCHEMA is NOT an epoch bump
 /// (output SEMANTICS for identical inputs are unchanged; [emit-epoch-ok]).
-pub const SCHEMA: u32 = 18;
+pub const SCHEMA: u32 = 19;
 
 /// Bump EMIT_EPOCH in the SAME commit as ANY change that can alter the bytes
 /// retread emits for identical manifest inputs (relax/version-selection
@@ -778,7 +804,13 @@ pub const SCHEMA: u32 = 18;
 /// Epoch 50: source-root injection never drops a directory that carries
 /// `__init__.py`, so importable packages named `env`, `tests`, `examples` or
 /// `scripts` ship instead of being filtered as clutter.
-pub const EMIT_EPOCH: u32 = 50;
+///
+/// Epoch 51: a wheel requirement on a name owned by a workspace conda provider
+/// is carried as a conda `constrains` entry instead of being dropped. Identical
+/// manifests now emit `conda/outputs` metadata with a non-empty `constraints`
+/// list and a lock carrying `conda_run_constraints`, so every affected pack
+/// must cold-derive once.
+pub const EMIT_EPOCH: u32 = 51;
 
 fn parse_stored_glibc(value: Option<&str>) -> Option<Option<(u32, u32)>> {
     match value {
@@ -1415,6 +1447,13 @@ impl RetreadLock {
         self.conda_run_deps
             .sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.spec.cmp(&b.spec)));
 
+        // Top-level: conda_run_constraints sorted by (name, spec), exactly
+        // like conda_run_deps -- the emitted constrains list is order-
+        // insensitive, so canonical order keeps lock diffs meaningful and
+        // keeps a replayed output byte-identical to the cold one.
+        self.conda_run_constraints
+            .sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.spec.cmp(&b.spec)));
+
         // Top-level: root_requirements lexicographic.
         self.root_requirements.sort();
 
@@ -1570,6 +1609,7 @@ mod tests {
                     sdist_source: None,
                 },
             ],
+            conda_run_constraints: Vec::new(),
             conda_run_deps: vec![CondaDep {
                 name: "torchaudio".into(),
                 spec: ">=2.7,<3".into(),
@@ -2328,6 +2368,7 @@ mod tests {
                     sdist_url: "https://example.com/gym-0.26.2.tar.gz".into(),
                 }),
             }],
+            conda_run_constraints: Vec::new(),
             conda_run_deps: vec![],
             index_urls: vec![],
             prerelease: BTreeMap::new(),
@@ -2521,6 +2562,7 @@ mod tests {
                     sdist_source: None,
                 },
             ],
+            conda_run_constraints: Vec::new(),
             conda_run_deps: vec![
                 CondaDep {
                     name: "zlib".into(),

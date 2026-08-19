@@ -1044,6 +1044,152 @@ fn phase_d_stripped_wheel_cap_still_reaches_the_conda_emission() {
 }
 
 #[test]
+fn workspace_provided_wheel_bound_is_carried_as_conda_constrains() {
+    // D1, MEASURED on the live hover-gpu build
+    // (`verify_fixes/artifacts/v5-hover-gpu.backend.log:12099`):
+    //   `dropping wheel dependency owned by a workspace conda provider
+    //    dep=huggingface_hub bundle=isaaclab-viral-pack`
+    // The `auto_dropped` gate discarded the requirement one step BEFORE
+    // `add_emission_constraint`, so the bundled wheel's `<1.0` never reached
+    // `relax_decision::decide` and nothing on the conda side held the bound --
+    // conda-forge's huggingface_hub 1.28 satisfied the resulting silence.
+    //
+    // The pack still must NOT depend on the name (the workspace provider owns
+    // it). It must state the bound its own wheels were built against, which is
+    // exactly what conda `constrains` is for: inert unless something else
+    // pulls the name in, binding when it does.
+    let mut bundle = solo_bundle("hub-cap-pack", vec!["huggingface-hub>=0.34.0"]);
+    bundle.primary.original_requires_dist = vec!["huggingface-hub<1.0,>=0.34.0".to_string()];
+    bundle
+        .auto_dropped
+        .insert(canonical_conda_name("huggingface-hub"));
+
+    let output =
+        produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
+
+    let depends: Vec<(String, String)> = output
+        .run_dependencies
+        .depends
+        .iter()
+        .map(|d| (d.name.clone(), format_packagespec(&d.spec)))
+        .collect();
+    assert!(
+        depends
+            .iter()
+            .all(|(name, _)| name.replace('-', "_") != "huggingface_hub"),
+        "a name a workspace conda provider owns must never become a run-dep \
+         of the pack: {depends:?}"
+    );
+
+    let constrains: Vec<String> = output
+        .run_dependencies
+        .constraints
+        .iter()
+        .map(format_constraint_spec)
+        .collect();
+    let hub = constrains
+        .iter()
+        .find(|line| {
+            line.split(' ').next().unwrap_or_default().replace('-', "_") == "huggingface_hub"
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "the bound the auto_dropped gate discarded must be carried as a conda \
+                 constrains entry, never silently dropped: {constrains:?}"
+            )
+        });
+    assert!(
+        hub.contains(">=0.34.0") && hub.contains("<1.0"),
+        "both halves of the wheel's own bound must survive the decide loop: {constrains:?}"
+    );
+}
+
+#[test]
+fn emitted_conda_constrains_survive_the_lock_round_trip_on_replay() {
+    // `assemble_conda_output` is documented as the single source of truth for
+    // BOTH the cold path and the courier replay path, and
+    // `fresh.run_dependencies == replayed.run_dependencies` gates the prepared
+    // fallback (src/handler/mod.rs). Emitting constrains on the cold path
+    // ALONE would make that comparison false for every affected pack and
+    // silently disable the fallback, so the lock has to carry them
+    // (`conda_run_constraints`, schema 19) and replay has to rebuild them.
+    let mut bundle = solo_bundle("hub-cap-pack", vec!["huggingface-hub>=0.34.0"]);
+    bundle.primary.original_requires_dist = vec!["huggingface-hub<1.0,>=0.34.0".to_string()];
+    bundle
+        .auto_dropped
+        .insert(canonical_conda_name("huggingface-hub"));
+
+    let fresh = produce_output(
+        &bundle,
+        &courier_cfg(),
+        Platform::Linux64,
+        "3.11",
+        &[],
+        Some("inputs-hash-constrains"),
+        None,
+    )
+    .unwrap();
+    assert!(
+        !fresh.run_dependencies.constraints.is_empty(),
+        "fixture must actually emit a constrains entry"
+    );
+
+    // Build the committed lock exactly the way the courier writes it:
+    // `conda_run_deps` / `conda_run_constraints` are the emitted lines.
+    let run_deps: Vec<String> = fresh
+        .run_dependencies
+        .depends
+        .iter()
+        .map(|d| {
+            format!("{} {}", d.name, format_packagespec(&d.spec))
+                .trim()
+                .to_string()
+        })
+        .collect();
+    let mut lock = recovery_lock("hub-cap-pack", "1.0.0", "inputs-hash-constrains", &run_deps);
+    lock.conda_run_constraints = fresh
+        .run_dependencies
+        .constraints
+        .iter()
+        .map(|c| {
+            let line = format_constraint_spec(c);
+            let mut parts = line.splitn(2, ' ');
+            crate::lock::CondaDep {
+                name: parts.next().unwrap_or_default().to_string(),
+                spec: parts.next().unwrap_or_default().to_string(),
+            }
+        })
+        .collect();
+    lock.canonicalize();
+    assert_eq!(
+        lock.conda_run_constraints.len(),
+        1,
+        "the lock must persist the emitted constrains: {:?}",
+        lock.conda_run_constraints
+    );
+
+    let replayed = replay_loaded_lock(
+        lock,
+        "inputs-hash-constrains",
+        Platform::Linux64,
+        0,
+        false,
+        &[],
+    )
+    .unwrap();
+
+    assert_eq!(
+        fresh.run_dependencies, replayed.run_dependencies,
+        "a replayed courier output must advertise the SAME depends AND constrains \
+         as the cold one, or the prepared-fallback parity gate goes false silently"
+    );
+    assert_eq!(
+        fresh.run_dependencies.constraints, replayed.run_dependencies.constraints,
+        "constrains specifically must round-trip through the lock"
+    );
+}
+
+#[test]
 fn wheel_anchor_cap_conflicting_with_a_workspace_pin_is_relaxed_not_rejected() {
     // Live regression, cold relock 2026-08-19 (`isaaclab-sonic-pack`, every
     // one of the 26 envs): `cmeel-boost` declares `numpy >=1.7,<1.25` while
@@ -4464,6 +4610,7 @@ fn abi_anchor_cap_completion_sha_bound_lock_replay_round_trips() {
             }],
         }),
         relaxations: manifest.records().to_vec(),
+        conda_run_constraints: Vec::new(),
         conda_run_deps: vec![crate::lock::CondaDep {
             name: "numpy".to_string(),
             spec: NORMALIZED.to_string(),
@@ -4487,7 +4634,8 @@ fn abi_anchor_cap_completion_sha_bound_lock_replay_round_trips() {
 
     let reloaded = crate::lock::RetreadLock::load(&lock_path).unwrap();
     assert_eq!(reloaded.schema, crate::lock::SCHEMA);
-    assert_eq!(crate::lock::SCHEMA, 18);
+    // Pinned so a schema bump forces a look at this replay round-trip.
+    assert_eq!(crate::lock::SCHEMA, 19);
     assert_eq!(reloaded.relaxations, manifest.records());
     assert_eq!(
         reloaded.relaxations[0].kind,
@@ -4628,6 +4776,7 @@ fn abi_anchor_exact_pin_widening_sha_bound_lock_replay_round_trips() {
             }],
         }),
         relaxations: manifest.records().to_vec(),
+        conda_run_constraints: Vec::new(),
         conda_run_deps: vec![crate::lock::CondaDep {
             name: "numpy".to_string(),
             spec: NORMALIZED.to_string(),
@@ -4651,7 +4800,8 @@ fn abi_anchor_exact_pin_widening_sha_bound_lock_replay_round_trips() {
 
     let reloaded = crate::lock::RetreadLock::load(&lock_path).unwrap();
     assert_eq!(reloaded.schema, crate::lock::SCHEMA);
-    assert_eq!(crate::lock::SCHEMA, 18);
+    // Pinned so a schema bump forces a look at this replay round-trip.
+    assert_eq!(crate::lock::SCHEMA, 19);
     assert_eq!(reloaded.relaxations, manifest.records());
     assert_eq!(
         reloaded.relaxations[0].kind,
@@ -5666,6 +5816,7 @@ fn cache_key_partitions_same_subdir_rich_target_contracts() {
             false,
             true,
             Vec::new(),
+            Vec::new(),
             std::collections::HashSet::new(),
             Platform::Linux64,
             0,
@@ -5746,6 +5897,7 @@ fn cache_key_partitions_exact_workspace_consumer_scope() {
             "3.11",
             false,
             true,
+            Vec::new(),
             Vec::new(),
             std::collections::HashSet::new(),
             Platform::Linux64,
@@ -7229,6 +7381,7 @@ fn recovery_lock(
             git_source: None,
             sdist_source: None,
         }],
+        conda_run_constraints: Vec::new(),
         conda_run_deps: run_deps
             .iter()
             .map(|raw| {
