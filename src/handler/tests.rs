@@ -1208,8 +1208,14 @@ fn a_declared_owned_name_locked_outside_a_bundled_wheels_bound_refuses_at_build(
         );
     }
 
-    // A name the workspace does NOT own is not bound-checked at all: the pack
-    // ships it, so its own resolution already agreed with the bound.
+    // A name the workspace does NOT own by EITHER route is not bound-checked at
+    // all: the pack ships it, so its own resolution already agreed with the
+    // bound. F11 turn 3 CORRECTION -- "outside the declared closure" is no
+    // longer sufficient, because a lock-listed pypi name is env-owned even when
+    // the closure cannot reach it (`env_pypi_owned`). The unowned arm therefore
+    // has to keep networkx out of the lock too; a lock that DID list
+    // `networkx 3.5` against a bundled `networkx<3.4` is genuinely
+    // unsatisfiable and must refuse, which is arm 1 above.
     let mut bundle = solo_bundle("viral-pack", vec!["networkx<3.4"]);
     bundle.primary.original_requires_dist = vec!["networkx<3.4".to_string()];
     bundle
@@ -1217,9 +1223,9 @@ fn a_declared_owned_name_locked_outside_a_bundled_wheels_bound_refuses_at_build(
         .push(rw("networkx", meta("networkx", "3.3", vec![], true)));
     bundle
         .workspace_locked_pypi
-        .insert("networkx".to_string(), "3.5".to_string());
+        .insert("unrelated".to_string(), "1.0".to_string());
     produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None)
-        .expect("a name outside the declared-pypi closure is never bound-checked");
+        .expect("a name neither declared-reachable nor lock-listed is never bound-checked");
 }
 
 /// NOT reachable from any declared root is untouched.
@@ -1307,6 +1313,103 @@ fn a_dist_in_the_declared_pypi_closure_is_ceded_to_the_workspace() {
             .all(|line| line.split(' ').next() != Some("packonly")),
         "a dist outside the declared closure is the pack\'s own; it must not be \
          demoted to constrains: {constrains:?}",
+    );
+}
+
+/// F11 turn 3: the env's `pixi.lock` cedes a name the uv closure CANNOT reach.
+///
+/// The v16 evidence (`verify_fixes/artifacts/v16-viral-gpu.backend.log`,
+/// binary `9740d429...`): `isaaclab-viral-pack` maps `torch = "pytorch"`, so
+/// `torch` is not a NODE in the pack's uv graph -- the BFS from that root
+/// reaches nothing, no `declared-pypi ownership:` line is emitted, and the pack
+/// logs `ownership: name=networkx owner=pack` / `name=sympy owner=pack` while
+/// pixi's env-level pypi torch installs networkx 3.6.1 / sympy 1.14.0 into the
+/// same site-packages. This fixture reproduces that exactly: NO declared root,
+/// NO uv edges, an empty closure -- and the lock still cedes both.
+#[test]
+fn a_dist_the_env_lock_installs_is_ceded_even_when_the_uv_closure_cannot_reach_it() {
+    let mut bundle = solo_bundle("viral-pack", vec!["networkx", "sympy>=1.13.3"]);
+    bundle.primary.original_requires_dist = vec![
+        "networkx<4".to_string(),
+        "sympy>=1.13".to_string(),
+        "packonly>=2.0".to_string(),
+    ];
+    for (name, version) in [
+        ("networkx", "3.3"),
+        ("sympy", "1.13.3"),
+        ("packonly", "2.1.0"),
+    ] {
+        bundle
+            .extras
+            .push(rw(name, meta(name, version, vec![], true)));
+        bundle.uv_closure_names.insert(name.to_string());
+    }
+    // The closure half is INERT here: nothing declared, no adjacency.
+    assert!(bundle.workspace_declared_pypi.is_empty());
+    assert!(bundle.uv_dependency_graph.edges.is_empty());
+    assert!(
+        super::declared_pypi_reachable(&bundle, &cfg()).is_empty(),
+        "the heuristic must reach nothing -- that is the defect being fixed",
+    );
+    // The env's committed lock says pixi's pypi phase installs both.
+    for (name, version) in [("networkx", "3.6.1"), ("sympy", "1.14.0")] {
+        bundle
+            .workspace_locked_pypi
+            .insert(name.to_string(), version.to_string());
+    }
+
+    let owned = super::declared_pypi_owned_dists(&bundle, &cfg());
+    assert_eq!(
+        owned,
+        BTreeSet::from(["networkx".to_string(), "sympy".to_string()]),
+        "the lock-listed pypi names are ceded and recorded in the install record",
+    );
+
+    let output =
+        produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
+    let depends: Vec<String> = output
+        .run_dependencies
+        .depends
+        .iter()
+        .map(|d| d.name.clone())
+        .collect();
+    for ceded in ["networkx", "sympy"] {
+        assert!(
+            !depends.iter().any(|name| name == ceded),
+            "a name the env's own pixi.lock installs must never become a conda \
+             run-dep of the pack: {depends:?}",
+        );
+    }
+    let constrains: Vec<String> = output
+        .run_dependencies
+        .constraints
+        .iter()
+        .map(format_constraint_spec)
+        .collect();
+    for (ceded, bound) in [("networkx", "<4"), ("sympy", ">=1.13")] {
+        let line = constrains
+            .iter()
+            .find(|line| line.split(' ').next() == Some(ceded))
+            .unwrap_or_else(|| {
+                panic!("the ceded dist\'s bound must be carried as constrains: {constrains:?}")
+            });
+        assert!(line.contains(bound), "{constrains:?}");
+    }
+    assert!(
+        constrains
+            .iter()
+            .all(|line| line.split(' ').next() != Some("packonly")),
+        "a name the lock does not list is the pack\'s own: {constrains:?}",
+    );
+
+    // The pack's OWN primary wheel is never ceded, even if the lock lists it.
+    let mut protected = bundle.clone();
+    protected
+        .workspace_locked_pypi
+        .insert("viral-pack".to_string(), "1.0.0".to_string());
+    assert!(
+        !super::declared_pypi_owned_dists(&protected, &cfg()).contains("viral-pack"),
+        "a first-party artifact is never dropped from the pack that ships it",
     );
 }
 
