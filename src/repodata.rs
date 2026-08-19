@@ -432,6 +432,38 @@ fn disk_cache_path(channel_url: &str, subdir: &str) -> PathBuf {
     dir.join(format!("{slug}--{subdir}--{hex}.json"))
 }
 
+/// Identity of the repodata the probes will actually see: for every
+/// `(channel, subdir)` pair the on-disk cache file's length and mtime, or
+/// `absent` when nothing is cached yet. Used as a route-probe verdict cache
+/// key input (fix f17) so a refreshed repodata invalidates memoized
+/// verdicts instead of replaying them against a changed candidate universe.
+pub(crate) fn repodata_identity(channels: &[ChannelUrl], target_subdir: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"retread-repodata-identity-v1\0");
+    for (channel_url, subdir) in channel_subdir_pairs(channels, target_subdir) {
+        h.update(channel_url.as_bytes());
+        h.update([0u8]);
+        h.update(subdir.as_bytes());
+        h.update([0u8]);
+        let path = disk_cache_path(&channel_url, &subdir);
+        match std::fs::metadata(&path) {
+            Ok(meta) => {
+                h.update(meta.len().to_be_bytes());
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_secs());
+                h.update(mtime.to_be_bytes());
+            }
+            Err(_) => h.update(b"absent"),
+        }
+        h.update([0xffu8]);
+    }
+    format!("{:x}", h.finalize())
+}
+
 /// Cache root, honoring `RATTLER_CACHE_DIR` exactly like rattler itself
 /// does (the variable names the cache ROOT, i.e. the equivalent of
 /// `~/.cache/rattler/cache`). Hardcoding `$HOME` here stranded the repodata

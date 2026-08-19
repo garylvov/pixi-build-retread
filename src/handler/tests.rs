@@ -2836,8 +2836,18 @@ fn bundle_probe_metrics_aggregate_retries_and_zero_probe_bundles() {
         2,
         "{logs}",
     );
-    assert_eq!(logs.matches("bundle=retried-pack").count(), 1, "{logs}");
-    assert_eq!(logs.matches("bundle=zero-probe-pack").count(), 1, "{logs}");
+    // fix f17: each bundle summary is now TWO lines -- the bench timing
+    // line and the route-probe verdict cache hit/miss line -- so silence
+    // about a probe storm is impossible even when the cache is cold.
+    assert_eq!(logs.matches("bundle=retried-pack").count(), 2, "{logs}");
+    assert_eq!(logs.matches("bundle=zero-probe-pack").count(), 2, "{logs}");
+    assert_eq!(
+        logs.matches("route probe cache: hit/miss").count(),
+        2,
+        "every bundle must report its verdict cache hit/miss: {logs}",
+    );
+    assert!(logs.contains("hits=0"), "{logs}");
+    assert!(logs.contains("misses=0"), "{logs}");
     assert!(logs.contains("probes=3"), "{logs}");
     assert!(logs.contains("rounds=2"), "{logs}");
     assert!(logs.contains("probes=0"), "{logs}");
@@ -8803,5 +8813,68 @@ fn patchelf_is_not_a_pack_run_requirement() {
     assert!(
         !names.iter().any(|name| name == "patchelf"),
         "patchelf is a hermetic-build tool, never a pack run dep: {names:?}",
+    );
+}
+
+/// Guard (c) for fix f17: the post-rejection restore fetches must be
+/// ISSUED CONCURRENTLY, not one after another.
+///
+/// The fixture stands in N fake fetches for `fetch_pypi`, each sleeping the
+/// same amount. Serial (`for request { .. .await? }`) costs N sleeps; the
+/// bounded-concurrent helper costs about ONE. The assertion is on wall
+/// time against a threshold well below the serial cost, so a regression to
+/// a serial loop fails this test.
+#[tokio::test]
+async fn restore_fetches_are_issued_concurrently() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const N: usize = 16;
+    const SLEEP_MS: u64 = 150;
+
+    let peak = Arc::new(AtomicUsize::new(0));
+    let active = Arc::new(AtomicUsize::new(0));
+    let started = std::time::Instant::now();
+    let peak_for_fetch = Arc::clone(&peak);
+    let active_for_fetch = Arc::clone(&active);
+    let fetched = super::auto_bundle::fetch_bounded_concurrent(
+        0..N,
+        super::auto_bundle::RESTORE_FETCH_CONCURRENCY,
+        move |index: usize| {
+            let peak = Arc::clone(&peak_for_fetch);
+            let active = Arc::clone(&active_for_fetch);
+            async move {
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(SLEEP_MS)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                Ok::<usize, anyhow::Error>(index)
+            }
+        },
+    )
+    .await
+    .expect("every fake fetch succeeds");
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        fetched,
+        (0..N).collect::<Vec<_>>(),
+        "`buffered` must preserve input order so extras order stays deterministic",
+    );
+    assert!(
+        peak.load(Ordering::SeqCst) > 1,
+        "fetches must overlap; peak in-flight was {}",
+        peak.load(Ordering::SeqCst),
+    );
+    assert!(
+        peak.load(Ordering::SeqCst) <= super::auto_bundle::RESTORE_FETCH_CONCURRENCY,
+        "concurrency must stay bounded; peak in-flight was {}",
+        peak.load(Ordering::SeqCst),
+    );
+    // Serial would be N * SLEEP_MS = 2400 ms; 8-way is ~2 * SLEEP_MS.
+    let serial_ms = N as u64 * SLEEP_MS;
+    assert!(
+        elapsed.as_millis() < (serial_ms / 2) as u128,
+        "restore fetches ran serially: {elapsed:?} for {N} x {SLEEP_MS}ms (serial = {serial_ms}ms)",
     );
 }
