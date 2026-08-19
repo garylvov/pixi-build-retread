@@ -1044,6 +1044,69 @@ fn phase_d_stripped_wheel_cap_still_reaches_the_conda_emission() {
 }
 
 #[test]
+fn wheel_anchor_cap_conflicting_with_a_workspace_pin_is_relaxed_not_rejected() {
+    // Live regression, cold relock 2026-08-19 (`isaaclab-sonic-pack`, every
+    // one of the 26 envs): `cmeel-boost` declares `numpy >=1.7,<1.25` while
+    // the workspace pins `numpy==2.4.6`. The bundle emitted fine through
+    // v4.10.89 and then died with
+    //   `bundle emission rejected by ABI invariant: wheel `cmeel-boost`
+    //    embeds `numpy >=1.7,<1.25` does not cover workspace pin
+    //    `numpy==2.4.6``
+    //
+    // Cause: `emit_pypi::plan` collapses every requirer of `numpy` to the
+    // LOWEST floor (`>=1.7`), and `merge_preserved_upper_bounds` re-attached
+    // this requirer's own `<1.25` to that rewritten METADATA line. For an ABI
+    // ANCHOR that re-assertion bypasses the policy boundary: the same cap is
+    // already handed to `relax_decision::decide` alongside the workspace pin
+    // (the `original_requires_dist` emission loop), and `decide` is the ONLY
+    // place allowed to rule on the conflict -- which it does, by relaxing the
+    // cap and RECORDING the relaxation. The shipped METADATA must carry the
+    // surviving post-decision bound, never the raw pre-decision cap.
+    //
+    // Fails without the fix with exactly the live message.
+    let mut bundle = solo_bundle("isaaclab-sonic-pack", vec!["numpy>=1.7,<1.25"]);
+    bundle.primary.pypi_name = "cmeel-boost".to_string();
+    bundle.primary.metadata.name = "cmeel-boost".to_string();
+    bundle.primary.original_requires_dist = vec!["numpy>=1.7,<1.25".to_string()];
+    bundle
+        .workspace_conda_versions
+        .insert("numpy".to_string(), "2.4.6".to_string());
+    // The workspace conda provider OWNS numpy, so the requirement is dropped
+    // from the conda run-deps (the live `isaaclab-sonic-pack` shape). Nothing
+    // else is left to police the cap except the shipped METADATA -- which is
+    // precisely where the raw cap must not be re-asserted.
+    bundle.auto_dropped.insert(canonical_conda_name("numpy"));
+
+    let (output, relaxations) = produce_output_pending_relaxations(
+        &bundle,
+        &cfg(),
+        Platform::Linux64,
+        "3.11",
+        &[],
+        None,
+        None,
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "a wheel cap that conflicts with a workspace anchor pin must be \
+             RELAXED by relax_decision, never rejected by the ABI invariant: {error:#}"
+        )
+    });
+
+    let deps: Vec<(String, String)> = output
+        .run_dependencies
+        .depends
+        .iter()
+        .map(|d| (d.name.clone(), format_packagespec(&d.spec)))
+        .collect();
+    assert!(
+        !deps.iter().any(|(_, spec)| spec.contains("1.25")),
+        "no emitted contract may carry the raw pre-decision cap: {deps:?}"
+    );
+    let _ = &relaxations;
+}
+
+#[test]
 fn final_emission_opts_into_minimal_stale_cap_relaxation() {
     let mut bundle = solo_bundle("relax-pack", vec!["demo>=1,<2", "demo<99"]);
     bundle.extras.push(rw(

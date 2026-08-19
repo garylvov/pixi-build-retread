@@ -5521,11 +5521,13 @@ version = "1.0.0"
         assert_eq!(final_metadata.sha256, sha);
         assert_eq!(
             final_metadata.requires_dist,
-            ["numpy>=1.26,<2"],
-            "persisted ABI metadata must come from the final courier-mapped wheel bytes, \
-             and the courier map must not delete the requirer's own cap (D1): the \
-             name-keyed override table widens the floor to `>=1.26` but `<2` survives, \
-             so the line is byte-identical to the input and no rewrite is needed"
+            ["numpy>=1.26"],
+            "persisted ABI metadata must come from the final courier-mapped wheel bytes. \
+             `numpy` is an ABI ANCHOR: the requirer's `<2` is NOT re-attached to the \
+             name-keyed floor override, because `relax_decision::decide` is the sole \
+             boundary allowed to rule on an anchor cap against the workspace pin (D1 \
+             regression 2026-08-19). Non-anchor caps are still preserved -- see \
+             `emit_pypi::tests::override_line_map_preserves_requirer_upper_bounds`"
         );
         let stored = store.join(sha).join(&lw.filename);
         assert!(
