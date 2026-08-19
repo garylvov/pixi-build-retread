@@ -2776,7 +2776,28 @@ pub fn learned_fact_constraints(
         }
         // A solved version is always exact; anything unparseable as PEP 440
         // (conda-only epoch/build spellings) is not a pin uv can honor.
-        if uv_pep508::uv_pep440::Version::from_str(version).is_err() {
+        let Ok(parsed) = uv_pep508::uv_pep440::Version::from_str(version) else {
+            continue;
+        };
+        // ... and neither is one that PARSES but under a DIFFERENT scheme.
+        // conda and PyPI do not share a version grammar: conda's tzdata
+        // `2026c` is a plain release in conda's calendar scheme, but PEP 440
+        // reads the trailing `c` as a release-candidate marker and normalizes
+        // it to `2026rc0` -- a version tzdata never published on PyPI, so the
+        // injected `tzdata==2026rc0` made every dependent (`pandas==2.3.3`)
+        // unsatisfiable (F13 turn 4, cert3 backend log 19:37:26). Only a
+        // spelling that survives PEP 440 normalization UNCHANGED is a fact
+        // about the PyPI side; a workspace that really pinned a pre-release
+        // spells it the PyPI way (`2.1.0rc1`) and is kept.
+        if parsed.to_string() != *version {
+            tracing::debug!(
+                conda_package = %conda_name,
+                conda_version = %version,
+                pep440 = %parsed,
+                "learned conda fact skipped: its PEP 440 translation is a \
+                 different version than conda's spelling (version-scheme \
+                 mismatch), so it cannot be asserted about PyPI",
+            );
             continue;
         }
         let conda_key = CondaName::new(conda_name.clone()).key();
@@ -3731,9 +3752,81 @@ struct LearnedFactYieldNeeded {
     pypi_name: String,
     /// The learned version that lost.
     learned_version: String,
-    /// The hard requirement, verbatim from uv, that it lost to.
-    upstream_requirement: String,
+    /// Why the learned fact has to go.
+    reason: LearnedFactYieldReason,
     original_error: String,
+}
+
+/// Why a LEARNED workspace conda fact must be dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LearnedFactYieldReason {
+    /// A hard requirement stated inside the closure EXCLUDES the learned
+    /// version (F13 turn 2). Carries the requirement verbatim from uv.
+    ContradictedBy { upstream_requirement: String },
+    /// No index version satisfies the learned fact's PEP 440 translation at
+    /// all (F13 turn 4): conda's `tzdata 2026c` translates to `2026rc0`,
+    /// which tzdata never published, so uv reports "there is no version of
+    /// tzdata==2026rc0" and every dependent becomes unsatisfiable. Carries
+    /// conda's own spelling so the warning can name both sides.
+    NoSuchVersion { conda_pin: String },
+}
+
+/// Flatten uv's box-drawn, hard-wrapped conflict prose into one line so a
+/// sentence uv split across `│ ` continuations can be matched as written.
+fn flatten_conflict_prose(stderr: &str) -> String {
+    stderr
+        .chars()
+        .map(|c| {
+            if c.is_ascii_graphic() || c == ' ' {
+                c
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// True when uv's conflict says the index holds NO version matching `name`'s
+/// pin -- "there is no version of tzdata==2026rc0", "there are no versions of
+/// tzdata", "no versions of tzdata satisfy ==2026rc0". When uv names a
+/// specifier, `version` must be inside it, so an unrelated name's
+/// no-such-version line never condemns this fact.
+fn conflict_says_no_such_version(
+    stderr: &str,
+    name: &str,
+    version: &uv_pep508::uv_pep440::Version,
+) -> bool {
+    let prose = flatten_conflict_prose(stderr);
+    let re = regex::Regex::new(&format!(
+        r"(?i)\bno versions? of\s+{}(?:\[[^\]]*\])?(?:\s+satisfy)?\s*((?:===|==|>=|<=|~=|!=|>|<)[0-9][^\s,)`']*(?:,(?:===|==|>=|<=|~=|!=|>|<)[0-9][^\s,)`']*)*)?",
+        regex::escape(name)
+    ))
+    .expect("static no-such-version regex");
+    for cap in re.captures_iter(&prose) {
+        let whole = cap.get(0).expect("a regex capture always has group 0");
+        if prose[whole.end()..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        {
+            // Name end boundary: `tzdata` must not read `tzdata-extra`'s line.
+            continue;
+        }
+        let Some(spec) = cap.get(1) else {
+            // uv named no specifier: the name itself has no versions.
+            return true;
+        };
+        let spec = spec.as_str().trim_end_matches(['.', ',']);
+        if uv_pep508::uv_pep440::VersionSpecifiers::from_str(spec)
+            .is_ok_and(|specs| specs.contains(version))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 impl std::fmt::Display for LearnedFactYieldNeeded {
@@ -3753,14 +3846,13 @@ fn learned_fact_yield_needed(
     original_error: &str,
 ) -> Option<LearnedFactYieldNeeded> {
     for attribution in attributions {
-        if !matches!(attribution.conda_source.provenance, Provenance::UvConstraint)
-            || attribution.conda_source.source != LEARNED_WORKSPACE_FACT_SOURCE
+        if !matches!(
+            attribution.conda_source.provenance,
+            Provenance::UvConstraint
+        ) || attribution.conda_source.source != LEARNED_WORKSPACE_FACT_SOURCE
         {
             continue;
         }
-        let Some(required) = attribution.required.as_deref() else {
-            continue;
-        };
         let Some((constraint_name, _, learned_version)) =
             exact_requirement_pin(&attribution.conda_source.constraint)
         else {
@@ -3769,6 +3861,29 @@ fn learned_fact_yield_needed(
         if constraint_name != canonical_conda_name(&attribution.package) {
             continue;
         }
+        // No index version satisfies the fact's own translation: the learned
+        // pin is not a contradiction with some other requirement, it is
+        // unsatisfiable on its own, and uv reports it as the reason its
+        // DEPENDENTS cannot be used (F13 turn 4). Checked before the
+        // requirement comparison because the requirement uv names in that
+        // shape is the echo of our own constraint, which trivially "contains"
+        // the learned version and would leave the fact in place forever.
+        if conflict_says_no_such_version(original_error, &attribution.package, &learned_version) {
+            return Some(LearnedFactYieldNeeded {
+                pypi_name: constraint_name,
+                learned_version: learned_version.to_string(),
+                reason: LearnedFactYieldReason::NoSuchVersion {
+                    conda_pin: format!(
+                        "{}{}",
+                        attribution.conda_source.conda_name, attribution.conda_source.conda_version
+                    ),
+                },
+                original_error: original_error.to_string(),
+            });
+        }
+        let Some(required) = attribution.required.as_deref() else {
+            continue;
+        };
         let Ok(upstream) = uv_pep508::uv_pep440::VersionSpecifiers::from_str(required.trim())
         else {
             continue;
@@ -3782,7 +3897,9 @@ fn learned_fact_yield_needed(
         return Some(LearnedFactYieldNeeded {
             pypi_name: constraint_name,
             learned_version: learned_version.to_string(),
-            upstream_requirement: format!("{}{}", attribution.package, required),
+            reason: LearnedFactYieldReason::ContradictedBy {
+                upstream_requirement: format!("{}{}", attribution.package, required),
+            },
             original_error: original_error.to_string(),
         });
     }
@@ -3821,7 +3938,11 @@ fn apply_learned_fact_yields(req: &mut UvClosureRequest, yielded: &BTreeSet<Stri
         if name.is_some_and(|name| droppable.contains(&name)) {
             continue;
         }
-        if req.constraints.auto_route_constraint_indices.contains(&index) {
+        if req
+            .constraints
+            .auto_route_constraint_indices
+            .contains(&index)
+        {
             remapped.insert(kept.len());
         }
         kept.push(line.clone());
@@ -3880,17 +4001,33 @@ where
                         if !inserted {
                             return Err(anyhow!(original_error));
                         }
-                        tracing::warn!(
-                            bundle = %req.bundle,
-                            package = %needed.pypi_name,
-                            learned = %format!("{}=={}", needed.pypi_name, needed.learned_version),
-                            required = %needed.upstream_requirement,
-                            "learned conda fact {}=={} yields to the closure's hard requirement {}; \
-                             dropping the learned constraint and re-locking",
-                            needed.pypi_name,
-                            needed.learned_version,
-                            needed.upstream_requirement,
-                        );
+                        match &needed.reason {
+                            LearnedFactYieldReason::ContradictedBy {
+                                upstream_requirement,
+                            } => tracing::warn!(
+                                bundle = %req.bundle,
+                                package = %needed.pypi_name,
+                                learned = %format!("{}=={}", needed.pypi_name, needed.learned_version),
+                                required = %upstream_requirement,
+                                "learned conda fact {}=={} yields to the closure's hard requirement {}; \
+                                 dropping the learned constraint and re-locking",
+                                needed.pypi_name,
+                                needed.learned_version,
+                                upstream_requirement,
+                            ),
+                            LearnedFactYieldReason::NoSuchVersion { conda_pin } => tracing::warn!(
+                                bundle = %req.bundle,
+                                package = %needed.pypi_name,
+                                learned = %conda_pin,
+                                translated = %format!("{}=={}", needed.pypi_name, needed.learned_version),
+                                "learned conda fact {} has no PyPI version matching its translation \
+                                 {}=={} (version-scheme mismatch); dropping the learned constraint \
+                                 and re-locking",
+                                conda_pin,
+                                needed.pypi_name,
+                                needed.learned_version,
+                            ),
+                        }
                         let mut names = BTreeSet::new();
                         names.insert(needed.pypi_name.clone());
                         apply_learned_fact_yields(&mut req, &names);
@@ -5721,8 +5858,7 @@ pub(crate) async fn compute_closure_for_target(
                 {
                     return Err(anyhow::Error::new(needed));
                 }
-                if let Some(needed) =
-                    learned_fact_yield_needed(&pass_b_attributions, &pass_b_error)
+                if let Some(needed) = learned_fact_yield_needed(&pass_b_attributions, &pass_b_error)
                 {
                     return Err(anyhow::Error::new(needed));
                 }
@@ -5827,7 +5963,11 @@ mod tests {
         command
             .get_envs()
             .find(|(name, _)| *name == OsStr::new(key))
-            .map(|(_, value)| value.expect("uv lock budget was removed, not set").to_os_string())
+            .map(|(_, value)| {
+                value
+                    .expect("uv lock budget was removed, not set")
+                    .to_os_string()
+            })
     }
 
     #[test]
@@ -7717,11 +7857,179 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
             );
         assert_eq!(needed.pypi_name, "sympy");
         assert_eq!(needed.learned_version, "1.14.0");
+        let LearnedFactYieldReason::ContradictedBy {
+            upstream_requirement,
+        } = &needed.reason
+        else {
+            panic!(
+                "a requirement-driven yield keeps its reason: {:?}",
+                needed.reason
+            );
+        };
         assert!(
-            needed.upstream_requirement.contains("1.13.1"),
-            "the yield must name the requirement it lost to: {}",
-            needed.upstream_requirement,
+            upstream_requirement.contains("1.13.1"),
+            "the yield must name the requirement it lost to: {upstream_requirement}",
         );
+    }
+
+    // ---- a learned fact whose PEP 440 TRANSLATION has no version (F13 t4) --
+
+    /// Verbatim Pass-B prose from the 4.10.90 cert relock
+    /// (`tasks/retread-cold-solve/certify_4_10_90/artifacts/cert3.backend.log`,
+    /// ANSI stripped, 2026-08-19T19:37:26Z). conda's `tzdata 2026c` is a plain
+    /// release in conda's calendar scheme; PEP 440 reads the `c` as an rc
+    /// marker and normalizes it to `2026rc0`, which tzdata never published.
+    const CERT3_TZDATA_PASS_B_STDERR: &str = "\
+Using CPython 3.10.20 interpreter at: /users/glvov/.local/bin/python3.10
+  \u{d7} No solution found when resolving dependencies for split (markers:
+  \u{2502} python_full_version == '3.10.*' and platform_machine == 'x86_64' and
+  \u{2502} sys_platform == 'linux'):
+  \u{2570}\u{2500}\u{25b6} Because there is no version of tzdata==2026rc0 and pandas==2.3.3 depends
+      on tzdata==2026rc0, we can conclude that pandas==2.3.3 cannot be used.
+      And because open3d>=0.19.0 depends on pandas==2.3.3 and your project
+      depends on open3d==0.19.0, we can conclude that your project's
+      requirements are unsatisfiable.";
+
+    /// The learned tzdata float F13 injected for `sage-isaac-pack`: the
+    /// constraint LINE carries conda's spelling (`==2026c`), which uv
+    /// normalizes to `==2026rc0` in its prose.
+    fn cert3_learned_tzdata_constraints() -> ConstraintSet {
+        let mut set = ConstraintSet::default();
+        set.constraints.push("tzdata==2026c".to_string());
+        set.provenance.insert(
+            "tzdata".to_string(),
+            ConstraintProvenance {
+                constraint: "tzdata==2026c".to_string(),
+                conda_name: "tzdata".to_string(),
+                conda_version: "==2026c".to_string(),
+                source: LEARNED_WORKSPACE_FACT_SOURCE.to_string(),
+                env: "precise-consuming-envs".to_string(),
+                provenance: Provenance::UvConstraint,
+            },
+        );
+        set
+    }
+
+    #[tokio::test]
+    async fn a_learned_fact_with_no_matching_pypi_version_yields_and_relocks() {
+        let learned = cert3_learned_tzdata_constraints();
+        let attributions = attribute_conflict(CERT3_TZDATA_PASS_B_STDERR, &learned.provenance);
+        let needed = learned_fact_yield_needed(&attributions, CERT3_TZDATA_PASS_B_STDERR).expect(
+            "`there is no version of tzdata==2026rc0` must yield the learned fact that \
+             asked for it",
+        );
+        assert_eq!(needed.pypi_name, "tzdata");
+        assert_eq!(
+            needed.learned_version, "2026rc0",
+            "the yield reports the PEP 440 translation uv actually saw",
+        );
+        assert_eq!(
+            needed.reason,
+            LearnedFactYieldReason::NoSuchVersion {
+                conda_pin: "tzdata==2026c".to_string(),
+            },
+            "the WARN must be able to name BOTH spellings",
+        );
+
+        // ... and the wrapper must drop it and re-lock.
+        let mut req = sample_request();
+        req.constraints = cert3_learned_tzdata_constraints();
+        let seen = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+        let raw = {
+            let seen = Arc::clone(&seen);
+            move |req: UvClosureRequest| {
+                let seen = Arc::clone(&seen);
+                Box::pin(async move {
+                    let lines = req.constraints.constraints.clone();
+                    seen.lock().unwrap().push(lines.clone());
+                    if lines.iter().any(|line| line == "tzdata==2026c") {
+                        let attributions = attribute_conflict(
+                            CERT3_TZDATA_PASS_B_STDERR,
+                            &req.constraints.provenance,
+                        );
+                        let needed =
+                            learned_fact_yield_needed(&attributions, CERT3_TZDATA_PASS_B_STDERR)
+                                .expect("fixture must arm the yield");
+                        return Err(anyhow::Error::new(needed));
+                    }
+                    Ok(UvClosure {
+                        wheels: vec![],
+                        pins: BTreeMap::from([("pandas".to_string(), "2.3.3".to_string())]),
+                        uv_version: "test".to_string(),
+                        auto_routed: vec![],
+                        auto_dropped: BTreeSet::new(),
+                        effective_input_requirements: None,
+                        dependency_graph: UvDependencyGraph::default(),
+                    })
+                }) as futures::future::BoxFuture<'static, Result<UvClosure>>
+            }
+        };
+        let yielded = Arc::new(Mutex::new(BTreeSet::new()));
+        let mut solve = with_learned_fact_yields(raw, Arc::clone(&yielded));
+        let closure = solve(req)
+            .await
+            .expect("dropping the unsatisfiable learned pin must let the closure resolve");
+        assert_eq!(closure.pins["pandas"], "2.3.3");
+        assert_eq!(
+            *yielded.lock().unwrap(),
+            BTreeSet::from(["tzdata".to_string()])
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "one retry, tzdata-free: {seen:?}");
+        assert!(
+            !seen[1].iter().any(|line| line.starts_with("tzdata")),
+            "the retry carries no tzdata line: {:?}",
+            seen[1],
+        );
+    }
+
+    #[test]
+    fn a_declared_fact_with_no_matching_pypi_version_never_yields() {
+        let mut declared = ConstraintSet::default();
+        declared.constraints.push("tzdata==2026c".to_string());
+        declared.provenance.insert(
+            "tzdata".to_string(),
+            ConstraintProvenance {
+                constraint: "tzdata==2026c".to_string(),
+                conda_name: "tzdata".to_string(),
+                conda_version: "==2026c".to_string(),
+                source: "workspace conda fact".to_string(),
+                env: "precise-consuming-envs".to_string(),
+                provenance: Provenance::WorkspaceCondaFact("precise-consuming-envs".to_string()),
+            },
+        );
+        let attributions = attribute_conflict(CERT3_TZDATA_PASS_B_STDERR, &declared.provenance);
+        assert!(
+            !attributions.is_empty(),
+            "the declared pin is still attributed in the conflict prose",
+        );
+        assert!(
+            learned_fact_yield_needed(&attributions, CERT3_TZDATA_PASS_B_STDERR).is_none(),
+            "operator intent is never silently dropped: the error stays loud",
+        );
+    }
+
+    #[test]
+    fn a_conda_only_version_spelling_is_never_injected_as_a_pypi_fact() {
+        let learned = learned_fact_constraints(
+            &BTreeMap::from([
+                ("tzdata".to_string(), "2026c".to_string()),
+                ("numpy".to_string(), "2.4.6".to_string()),
+            ]),
+            &BTreeMap::new(),
+            &Default::default(),
+            &ConstraintSet::default(),
+            &BTreeSet::new(),
+            "precise-consuming-envs",
+        );
+        assert_eq!(
+            learned.constraints,
+            vec!["numpy==2.4.6".to_string()],
+            "conda `2026c` translates to PEP 440 `2026rc0` (a version tzdata \
+             never published), so it is not a fact about PyPI; a spelling that \
+             survives normalization unchanged still is",
+        );
+        assert!(!learned.provenance.contains_key("tzdata"));
     }
 
     #[tokio::test]
@@ -7780,7 +8088,10 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
             "the retry's constraint set must carry no sympy pin at all: {:?}",
             seen[1],
         );
-        assert_eq!(*yielded.lock().unwrap(), BTreeSet::from(["sympy".to_string()]));
+        assert_eq!(
+            *yielded.lock().unwrap(),
+            BTreeSet::from(["sympy".to_string()])
+        );
     }
 
     /// Verbatim Pass-B prose measured on the SECOND relock of `sage-isaac-pack`
@@ -7860,8 +8171,7 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
                         None
                     };
                     if let Some(stderr) = stderr {
-                        let attributions =
-                            attribute_conflict(stderr, &req.constraints.provenance);
+                        let attributions = attribute_conflict(stderr, &req.constraints.provenance);
                         let needed = learned_fact_yield_needed(&attributions, "pass A: evdev")
                             .expect("fixture must arm the yield");
                         return Err(anyhow::Error::new(needed));
