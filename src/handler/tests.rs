@@ -863,6 +863,7 @@ fn courier_pure_python_bundle_is_platform_specific_not_noarch() {
         uv_dependency_graph: Default::default(),
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
+        workspace_declared_pypi: Default::default(),
     };
 
     let courier_cfg = RetreadConfig {
@@ -943,6 +944,7 @@ fn produce_output_emits_auto_routed_conda_run_deps() {
         uv_dependency_graph: Default::default(),
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
+        workspace_declared_pypi: Default::default(),
     };
     let out = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
     let deps: Vec<(String, String)> = out
@@ -1110,6 +1112,107 @@ fn workspace_provided_wheel_bound_is_carried_as_conda_constrains() {
     assert!(
         hub.contains(">=0.34.0") && hub.contains("<1.0"),
         "both halves of the wheel's own bound must survive the decide loop: {constrains:?}"
+    );
+}
+
+/// F11 guard. The consuming workspace declares `torch` in
+/// `[pypi-dependencies]` (measured: `imprint-data/pixi.toml:462-464`
+/// `[feature.isaaclab-viral.pypi-dependencies] torch = "==2.7.0"`), so pixi's
+/// OWN pypi phase resolves torch AND its whole transitive closure -- which
+/// includes `networkx` and `sympy`. The pack bundled those two at its own
+/// (conda-torch-derived) versions, and the two owners then overwrote each
+/// other's site-packages forever: four identical 142-wheel replays on
+/// viral-gpu (`fix_d2_atomic_repair_out.md` turn 5).
+///
+/// Operator ruling 2026-08-19: "prefer whatever is declared in the pixi.toml".
+/// The declared owner wins, so a dist reachable from a declared pypi root is
+/// (i) marked declared-owned, (ii) kept out of the emitted conda `depends`,
+/// and (iii) has its bound carried as `constrains` instead. A bundled dist
+/// NOT reachable from any declared root is untouched.
+#[test]
+fn a_dist_in_the_declared_pypi_closure_is_ceded_to_the_workspace() {
+    let mut bundle = solo_bundle("viral-pack", vec!["networkx", "sympy>=1.13.3"]);
+    bundle.primary.original_requires_dist = vec![
+        "networkx<3.4".to_string(),
+        "sympy>=1.13.3,<1.14".to_string(),
+        "packonly>=2.0".to_string(),
+    ];
+    // Bundled dists.
+    for (name, version) in [
+        ("networkx", "3.3"),
+        ("sympy", "1.13.3"),
+        ("packonly", "2.1.0"),
+    ] {
+        bundle
+            .extras
+            .push(rw(name, meta(name, version, vec![], true)));
+    }
+    // Every bundled name is a uv-closure member (they are wheels in the
+    // closure); the uv-closure gate must not swallow the carry -- same
+    // correction as the hub guard above.
+    for name in ["networkx", "sympy", "packonly"] {
+        bundle.uv_closure_names.insert(name.to_string());
+    }
+    // The workspace declares torch as a PyPI dependency, and uv's adjacency
+    // says torch pulls networkx + sympy. `packonly` is reachable from nothing
+    // the workspace declared.
+    bundle
+        .workspace_declared_pypi
+        .insert(canonical_conda_name("torch"));
+    for child in ["networkx", "sympy"] {
+        bundle
+            .uv_dependency_graph
+            .edges
+            .insert(crate::uv_closure::UvDependencyEdge {
+                parent: "torch".to_string(),
+                child: child.to_string(),
+            });
+    }
+
+    let owned = super::declared_pypi_owned_dists(&bundle, &cfg());
+    assert_eq!(
+        owned,
+        BTreeSet::from(["networkx".to_string(), "sympy".to_string()]),
+        "exactly the bundled dists reachable from a declared pypi root are ceded",
+    );
+
+    let output =
+        produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
+    let depends: Vec<String> = output
+        .run_dependencies
+        .depends
+        .iter()
+        .map(|d| d.name.clone())
+        .collect();
+    for ceded in ["networkx", "sympy"] {
+        assert!(
+            !depends.iter().any(|name| name == ceded),
+            "a dist the workspace's declared pypi-dependencies own must never \
+             become a conda run-dep of the pack: {depends:?}",
+        );
+    }
+
+    let constrains: Vec<String> = output
+        .run_dependencies
+        .constraints
+        .iter()
+        .map(format_constraint_spec)
+        .collect();
+    for (ceded, bound) in [("networkx", "<3.4"), ("sympy", ">=1.13.3")] {
+        let line = constrains
+            .iter()
+            .find(|line| line.split(' ').next() == Some(ceded))
+            .unwrap_or_else(|| {
+                panic!("the ceded dist\'s bound must be carried as constrains: {constrains:?}")
+            });
+        assert!(line.contains(bound), "{constrains:?}");
+    }
+    assert!(
+        constrains
+            .iter()
+            .all(|line| line.split(' ').next() != Some("packonly")),
+        "a dist outside the declared closure is the pack\'s own; it must not be \
+         demoted to constrains: {constrains:?}",
     );
 }
 
@@ -2581,6 +2684,7 @@ fn produce_output_softens_deps_from_floor_pin_to_floor_spec() {
         uv_dependency_graph: Default::default(),
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
+        workspace_declared_pypi: Default::default(),
     };
     let out = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
     let deps: Vec<(String, String)> = out
@@ -2638,6 +2742,7 @@ fn produce_output_preserves_deps_from_bare_and_range_specs() {
         uv_dependency_graph: Default::default(),
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
+        workspace_declared_pypi: Default::default(),
     };
 
     let out = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
@@ -3182,6 +3287,7 @@ fn solo_bundle(name: &str, requires: Vec<&str>) -> Bundle {
         uv_dependency_graph: Default::default(),
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
+        workspace_declared_pypi: Default::default(),
     }
 }
 
@@ -4058,6 +4164,7 @@ fn vendored_sub_packages_dropped_from_run_deps() {
         uv_dependency_graph: Default::default(),
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
+        workspace_declared_pypi: Default::default(),
     };
 
     let output =
@@ -4213,6 +4320,7 @@ fn bundle_field_groups_entries_into_one_output() {
         uv_dependency_graph: Default::default(),
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
+        workspace_declared_pypi: Default::default(),
     };
 
     let output =
@@ -4312,6 +4420,7 @@ fn relaxed_pure_python_primary_pins_python_to_workspace_variant() {
         uv_dependency_graph: Default::default(),
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
+        workspace_declared_pypi: Default::default(),
     };
 
     let output =
@@ -4740,6 +4849,7 @@ fn abi_anchor_cap_completion_sha_bound_lock_replay_round_trips() {
         }),
         relaxations: manifest.records().to_vec(),
         conda_run_constraints: Vec::new(),
+        declared_pypi_owned: Vec::new(),
         conda_run_deps: vec![crate::lock::CondaDep {
             name: "numpy".to_string(),
             spec: NORMALIZED.to_string(),
@@ -4764,7 +4874,7 @@ fn abi_anchor_cap_completion_sha_bound_lock_replay_round_trips() {
     let reloaded = crate::lock::RetreadLock::load(&lock_path).unwrap();
     assert_eq!(reloaded.schema, crate::lock::SCHEMA);
     // Pinned so a schema bump forces a look at this replay round-trip.
-    assert_eq!(crate::lock::SCHEMA, 19);
+    assert_eq!(crate::lock::SCHEMA, 20);
     assert_eq!(reloaded.relaxations, manifest.records());
     assert_eq!(
         reloaded.relaxations[0].kind,
@@ -4906,6 +5016,7 @@ fn abi_anchor_exact_pin_widening_sha_bound_lock_replay_round_trips() {
         }),
         relaxations: manifest.records().to_vec(),
         conda_run_constraints: Vec::new(),
+        declared_pypi_owned: Vec::new(),
         conda_run_deps: vec![crate::lock::CondaDep {
             name: "numpy".to_string(),
             spec: NORMALIZED.to_string(),
@@ -4930,7 +5041,7 @@ fn abi_anchor_exact_pin_widening_sha_bound_lock_replay_round_trips() {
     let reloaded = crate::lock::RetreadLock::load(&lock_path).unwrap();
     assert_eq!(reloaded.schema, crate::lock::SCHEMA);
     // Pinned so a schema bump forces a look at this replay round-trip.
-    assert_eq!(crate::lock::SCHEMA, 19);
+    assert_eq!(crate::lock::SCHEMA, 20);
     assert_eq!(reloaded.relaxations, manifest.records());
     assert_eq!(
         reloaded.relaxations[0].kind,
@@ -7623,6 +7734,7 @@ fn recovery_lock(
             sdist_source: None,
         }],
         conda_run_constraints: Vec::new(),
+        declared_pypi_owned: Vec::new(),
         conda_run_deps: run_deps
             .iter()
             .map(|raw| {
