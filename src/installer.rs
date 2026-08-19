@@ -608,6 +608,26 @@ async fn materialize_index_wheel(
     Ok(fetched)
 }
 
+/// Locked distributions the CONSUMING WORKSPACE owns because its own
+/// `[pypi-dependencies]` closure provides them (lock schema 20+).
+///
+/// Pixi's pypi phase resolves and installs these names itself. If the courier
+/// also replays its bundled wheel for one, the two owners overwrite each
+/// other's dist-info forever: the replay completes, pixi's phase re-installs
+/// its version, payload verification finds the locked version "missing", and
+/// the repair replays again (F11 -- `viral-gpu` ran four identical 142-wheel
+/// replays over `networkx` / `sympy`). The declared owner wins, so these dists
+/// are neither materialized nor demanded by verify. Same shape as the
+/// conda-shadowed CUDA lib-shim drop, but the evidence is recorded IN THE LOCK
+/// by the producer rather than sniffed from the prefix, because the producer is
+/// the only party that can see the workspace manifest.
+pub(crate) fn declared_pypi_owned_names(lock: &RetreadLock) -> BTreeSet<String> {
+    lock.declared_pypi_owned
+        .iter()
+        .map(|name| normalize_dist_name(name))
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn materialize_locked_wheels(
     lock: &RetreadLock,
@@ -619,6 +639,7 @@ async fn materialize_locked_wheels(
     drop_cuda_shadows: bool,
     conda_dist_names: &BTreeSet<String>,
 ) -> Result<Vec<PathBuf>> {
+    let declared_owned = declared_pypi_owned_names(lock);
     let fetch_dir = prefix
         .join("share")
         .join("retread")
@@ -632,6 +653,18 @@ async fn materialize_locked_wheels(
         // even materialized), so uv never uninstalls the conda payload. See
         // `conda_owned_distributions` for why that uninstall is destructive.
         let normalized_name = normalize_dist_name(&wheel.name);
+        // The consuming workspace declares this distribution -- or an ancestor
+        // of it -- in `[pypi-dependencies]`, so pixi's own pypi phase installs
+        // it. Replaying the bundled wheel would start the F11 ownership
+        // ping-pong. See `declared_pypi_owned_names`.
+        if declared_owned.contains(&normalized_name) {
+            eprintln!(
+                "retread install: {}=={} is provided by the workspace's declared \
+                 pypi-dependencies; skipping wheel replay (declared-owned)",
+                wheel.name, wheel.version
+            );
+            continue;
+        }
         if conda_owned_at_version(conda_owned, &normalized_name, &wheel.version) {
             eprintln!(
                 "retread install: {}=={} is conda-provided in the prefix; \
@@ -1306,11 +1339,13 @@ fn missing_locked_wheels_in_prefix(lock: &RetreadLock, prefix: &Path) -> Vec<Str
     let Ok(installed) = installed_distributions(&site_packages) else {
         return Vec::new();
     };
+    let mut not_courier_owned = conda_shadowed_locked_dists(lock, prefix);
+    not_courier_owned.extend(declared_pypi_owned_names(lock));
     missing_after_exemptions(
         lock,
         &installed,
         &editable_owned_distributions(&site_packages),
-        &conda_shadowed_locked_dists(lock, prefix),
+        &not_courier_owned,
     )
 }
 
@@ -1354,8 +1389,15 @@ fn verify_payload_installed(lock: &RetreadLock, prefix: &Path) -> Result<()> {
     // `conda_provides_cuda_component`). Demanding it back here is what failed
     // the post-install gate on a healthy prefix, marked it `.broken` and drove
     // the activation repair loop. Same decision, same set, one reader.
-    let conda_shadowed = conda_shadowed_locked_dists(lock, prefix);
-    let missing = missing_after_exemptions(lock, &installed, &editable_owned, &conda_shadowed);
+    //
+    // The producer's install record adds the second non-courier owner: dists
+    // the consuming workspace's own `[pypi-dependencies]` closure provides,
+    // which the courier never laid down either. Without this exemption the
+    // record would be written and then immediately contradicted by verify --
+    // the reader half of the writer/reader pair.
+    let mut not_courier_owned = conda_shadowed_locked_dists(lock, prefix);
+    not_courier_owned.extend(declared_pypi_owned_names(lock));
+    let missing = missing_after_exemptions(lock, &installed, &editable_owned, &not_courier_owned);
     if !missing.is_empty() {
         bail!(
             "retread verify: bundle {} is missing {} locked wheel(s) in {}: {}",
@@ -1368,7 +1410,7 @@ fn verify_payload_installed(lock: &RetreadLock, prefix: &Path) -> Result<()> {
 
     for wheel in &lock.wheels {
         let name = normalize_dist_name(&wheel.name);
-        if editable_owned.contains(&name) || conda_shadowed.contains(&name) {
+        if editable_owned.contains(&name) || not_courier_owned.contains(&name) {
             continue;
         }
         let dist_root = installed
@@ -1421,13 +1463,15 @@ fn installed_payload_libraries(
     // Conda-shadowed CUDA lib-shim wheels are never laid down (see
     // `conda_provides_cuda_component`); the libraries they would have shipped
     // are conda's, and are audited as part of the conda prefix, not the wheel
-    // payload. Without this the audit bails "is not installed" on exactly the
-    // wheels the installer meant to omit.
-    let conda_shadowed = conda_shadowed_locked_dists(lock, prefix);
+    // payload. Declared-owned dists (the workspace's own `[pypi-dependencies]`
+    // closure) were never laid down either. Without this the audit bails
+    // "is not installed" on exactly the wheels the installer meant to omit.
+    let mut not_courier_owned = conda_shadowed_locked_dists(lock, prefix);
+    not_courier_owned.extend(declared_pypi_owned_names(lock));
     let mut out: BTreeMap<String, crate::glibc::PayloadLib> = BTreeMap::new();
     for wheel in &lock.wheels {
         let name = normalize_dist_name(&wheel.name);
-        if editable_owned.contains(&name) || conda_shadowed.contains(&name) {
+        if editable_owned.contains(&name) || not_courier_owned.contains(&name) {
             continue;
         }
         let dist_root = installed
@@ -2208,6 +2252,7 @@ mod tests {
             root_requirements: vec!["mypackage==1.0.0".into()],
             wheels: vec![lock_wheel("mypackage", "1.0.0")],
             conda_run_constraints: Vec::new(),
+            declared_pypi_owned: Vec::new(),
             conda_run_deps,
             index_urls,
             prerelease,
@@ -3013,6 +3058,137 @@ mod tests {
         let err = verify_payload_installed(&lock, &prefix)
             .expect_err("conda ownership only satisfies the exact locked version");
         assert!(format!("{err:#}").contains("mypackage==1.0.0"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// F11 guard (a). The consuming workspace declares `torch` in
+    /// `[pypi-dependencies]`; `networkx` and `sympy` are reachable from it, so
+    /// the producer recorded them in the lock's `declared_pypi_owned` install
+    /// record. Pixi's own pypi phase installs them -- the courier must neither
+    /// replay nor DEMAND them, or the replay/reinstall ping-pong restarts.
+    #[test]
+    fn declared_pypi_owned_wheels_are_not_demanded_by_verify() {
+        let root = tempdir("verify-declared-owned");
+        let prefix = root.join("prefix");
+        let sp = site_packages_dir(&prefix, "3.11");
+        std::fs::create_dir_all(&sp).unwrap();
+        // Only the pack's own dist is installed by the courier.
+        let dist_info = write_dist_info(&sp, "mypackage", "1.0.0", None);
+        std::fs::write(sp.join("mypackage.py"), "x = 1\n").unwrap();
+        std::fs::write(
+            dist_info.join("RECORD"),
+            "mypackage.py,,\nmypackage-1.0.0.dist-info/RECORD,,\n",
+        )
+        .unwrap();
+
+        let mut lock = make_lock(vec![], vec![], BTreeMap::new());
+        lock.wheels.push(lock_wheel("networkx", "3.3"));
+        lock.wheels.push(lock_wheel("sympy", "1.13.3"));
+        // Nothing installed them; without the record verify bails on both.
+        let err = verify_payload_installed(&lock, &prefix)
+            .expect_err("an unrecorded locked wheel must still be demanded");
+        assert!(
+            format!("{err:#}").contains("networkx==3.3")
+                && format!("{err:#}").contains("sympy==1.13.3"),
+            "baseline must fail on both dists, got: {err:#}"
+        );
+
+        lock.declared_pypi_owned = vec!["networkx".into(), "sympy".into()];
+        verify_payload_installed(&lock, &prefix).expect(
+            "a dist the workspace's declared pypi-dependencies own must not be demanded \
+             by the courier's payload verification",
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// F11 guard (b). Declared ownership is per-DIST, not a blanket amnesty: a
+    /// locked wheel outside the declared closure is still the courier's to
+    /// install and still demanded by verify.
+    #[test]
+    fn a_dist_outside_the_declared_pypi_closure_is_still_demanded() {
+        let root = tempdir("verify-declared-owned-partial");
+        let prefix = root.join("prefix");
+        let sp = site_packages_dir(&prefix, "3.11");
+        std::fs::create_dir_all(&sp).unwrap();
+        let dist_info = write_dist_info(&sp, "mypackage", "1.0.0", None);
+        std::fs::write(sp.join("mypackage.py"), "x = 1\n").unwrap();
+        std::fs::write(
+            dist_info.join("RECORD"),
+            "mypackage.py,,\nmypackage-1.0.0.dist-info/RECORD,,\n",
+        )
+        .unwrap();
+
+        let mut lock = make_lock(vec![], vec![], BTreeMap::new());
+        lock.wheels.push(lock_wheel("networkx", "3.3"));
+        lock.wheels.push(lock_wheel("pack-only-dep", "0.1.0"));
+        lock.declared_pypi_owned = vec!["networkx".into()];
+
+        let err = verify_payload_installed(&lock, &prefix)
+            .expect_err("a dist nothing declared must still be verified");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("pack-only-dep==0.1.0"),
+            "the non-declared dist must still be reported missing, got: {text}"
+        );
+        assert!(
+            !text.contains("networkx"),
+            "the declared-owned dist must not be reported missing, got: {text}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// F11 guard (a), install half: a declared-owned dist is never even
+    /// materialized, so uv is never handed a wheel that would overwrite what
+    /// pixi's pypi phase installed. Guard (c): the conda-shadow drop (F10)
+    /// still works in the same call.
+    #[tokio::test]
+    async fn materialize_locked_wheels_skips_declared_pypi_owned_wheel() {
+        let root = tempdir("skip-declared-owned");
+        let prefix = root.join("prefix");
+        let wheels_dir = root.join("wheels");
+        std::fs::create_dir_all(&wheels_dir).unwrap();
+        let mut shipped: Vec<PathBuf> = Vec::new();
+        for (name, version) in [
+            ("networkx", "3.3"),
+            ("packonly", "0.1.0"),
+            ("nvidia-nccl-cu12", "2.26.2"),
+        ] {
+            let bytes = test_wheel_bytes(name, version);
+            let file = wheels_dir.join(format!(
+                "{}-{version}-py3-none-any.whl",
+                name.replace('-', "_")
+            ));
+            std::fs::write(&file, &bytes).unwrap();
+            shipped.push(file);
+        }
+
+        let mut lock = make_lock(vec![], vec![], BTreeMap::new());
+        lock.wheels = vec![
+            lock_wheel("networkx", "3.3"),
+            lock_wheel("packonly", "0.1.0"),
+            lock_wheel("nvidia-nccl-cu12", "2.26.2"),
+        ];
+        lock.declared_pypi_owned = vec!["networkx".into()];
+
+        let files = materialize_locked_wheels(
+            &lock,
+            &prefix,
+            &wheels_dir,
+            &root.join("cache"),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            // F10 still live alongside: conda owns the CUDA runtime and
+            // provides nccl, so the lib-shim wheel is dropped too.
+            true,
+            &BTreeSet::from(["nccl".to_string()]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            files,
+            vec![shipped[1].clone()],
+            "only the dist nobody else owns may be replayed",
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

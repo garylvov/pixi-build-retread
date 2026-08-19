@@ -429,6 +429,20 @@ pub struct RetreadLock {
     /// constrains.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conda_run_constraints: Vec<CondaDep>,
+    /// Distribution names in `wheels` that the CONSUMING WORKSPACE owns
+    /// because it declares them -- or an ancestor of them -- in
+    /// `[pypi-dependencies]` (schema 20+). PEP 503-normalized.
+    ///
+    /// This is the courier's INSTALL RECORD of declared ownership: pixi's own
+    /// pypi phase resolves and installs these names, so the replay must
+    /// neither materialize nor verify them. Without the record, both owners
+    /// write the same site-packages path, each write invalidates the other's,
+    /// and payload verification reinstalls forever (F11). They stay in
+    /// `wheels` deliberately: the pack still needs their Requires-Dist to
+    /// derive the `constrains` bounds it advertises, and an auditor needs to
+    /// see WHICH dists were ceded and to whom.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub declared_pypi_owned: Vec<String>,
     /// Producer-side index chain used during pack build/solve. Install replay
     /// uses per-wheel direct artifact URLs and never consults this chain.
     pub index_urls: Vec<String>,
@@ -571,6 +585,13 @@ pub struct RetreadLock {
 /// for the Part-2 incremental delta-detector. `#[serde(default)]` so old locks
 /// parse (delta-detector falls back to full cold resolve on empty `entry_specs`).
 ///
+/// Schema 20: `declared_pypi_owned` -- the install record naming which locked
+/// wheels the consuming workspace's own `[pypi-dependencies]` declaration
+/// owns. Replay must not materialize or verify them (F11 ownership ping-pong).
+/// `serde(default)` so older locks parse; both producer replay gates refuse
+/// `schema != SCHEMA`, so a schema-19 lock cold-derives once rather than
+/// replaying a payload set that still fights pixi's pypi phase.
+///
 /// Schema 19: `conda_run_constraints` -- the conda `constrains` list the pack
 /// advertises. Wheel requirements on a name owned by a workspace conda
 /// provider used to be DROPPED outright; they are now carried as `constrains`
@@ -584,7 +605,7 @@ pub struct RetreadLock {
 /// On the consumer-side install path, old schemas are hard errors: install
 /// replay must not fall back to resolver-backed uv. SCHEMA is NOT an epoch bump
 /// (output SEMANTICS for identical inputs are unchanged; [emit-epoch-ok]).
-pub const SCHEMA: u32 = 19;
+pub const SCHEMA: u32 = 20;
 
 /// Bump EMIT_EPOCH in the SAME commit as ANY change that can alter the bytes
 /// retread emits for identical manifest inputs (relax/version-selection
@@ -805,12 +826,19 @@ pub const SCHEMA: u32 = 19;
 /// `__init__.py`, so importable packages named `env`, `tests`, `examples` or
 /// `scripts` ship instead of being filtered as clutter.
 ///
+/// Epoch 52: a dist provided by the workspace's declared `[pypi-dependencies]`
+/// closure is no longer replayed by the courier, and a wheel requirement (or
+/// auto-route) naming one is emitted as `constrains` rather than `depends`.
+/// Identical manifests therefore emit a different `conda/outputs` dependency
+/// set and a lock carrying `declared_pypi_owned`, so every affected pack must
+/// cold-derive once.
+///
 /// Epoch 51: a wheel requirement on a name owned by a workspace conda provider
 /// is carried as a conda `constrains` entry instead of being dropped. Identical
 /// manifests now emit `conda/outputs` metadata with a non-empty `constraints`
 /// list and a lock carrying `conda_run_constraints`, so every affected pack
 /// must cold-derive once.
-pub const EMIT_EPOCH: u32 = 51;
+pub const EMIT_EPOCH: u32 = 52;
 
 fn parse_stored_glibc(value: Option<&str>) -> Option<Option<(u32, u32)>> {
     match value {
@@ -1454,6 +1482,10 @@ impl RetreadLock {
         self.conda_run_constraints
             .sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.spec.cmp(&b.spec)));
 
+        // Top-level: declared_pypi_owned lexicographic + deduped.
+        self.declared_pypi_owned.sort();
+        self.declared_pypi_owned.dedup();
+
         // Top-level: root_requirements lexicographic.
         self.root_requirements.sort();
 
@@ -1610,6 +1642,7 @@ mod tests {
                 },
             ],
             conda_run_constraints: Vec::new(),
+            declared_pypi_owned: Vec::new(),
             conda_run_deps: vec![CondaDep {
                 name: "torchaudio".into(),
                 spec: ">=2.7,<3".into(),
@@ -2369,6 +2402,7 @@ mod tests {
                 }),
             }],
             conda_run_constraints: Vec::new(),
+            declared_pypi_owned: Vec::new(),
             conda_run_deps: vec![],
             index_urls: vec![],
             prerelease: BTreeMap::new(),
@@ -2563,6 +2597,7 @@ mod tests {
                 },
             ],
             conda_run_constraints: Vec::new(),
+            declared_pypi_owned: Vec::new(),
             conda_run_deps: vec![
                 CondaDep {
                     name: "zlib".into(),

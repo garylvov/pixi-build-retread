@@ -1279,6 +1279,7 @@ composed = { features = ["composed"], no-default-feature = true }
                 },
             ],
             conda_run_constraints: Vec::new(),
+            declared_pypi_owned: Vec::new(),
             conda_run_deps: vec![CondaDep {
                 name: "numba".to_string(),
                 spec: ">=0.59.1,<0.60".to_string(),
@@ -1555,6 +1556,7 @@ alias = { features = ["sibling", "alias"], no-default-feature = true }
                 sdist_source: None,
             }],
             conda_run_constraints: Vec::new(),
+            declared_pypi_owned: Vec::new(),
             conda_run_deps: Vec::new(),
             index_urls: vec!["https://pypi.org/simple/".to_string()],
             prerelease: BTreeMap::new(),
@@ -2178,6 +2180,13 @@ struct Bundle {
     /// differ across consumers, together with the direct workspace specs that
     /// constrain them.
     workspace_conda_provider_facts: BTreeMap<String, WorkspaceCondaProviderFact>,
+    /// Canonical names the consuming workspace declares in
+    /// `[pypi-dependencies]` / `[feature.*.pypi-dependencies]` (intersected
+    /// over every precise consumer). Pixi's OWN pypi phase resolves and
+    /// installs these names and everything they pull in, so the pack must
+    /// neither bundle nor verify any dist reachable from them -- see
+    /// `declared_pypi_owned_dists`.
+    workspace_declared_pypi: BTreeSet<String>,
 }
 
 /// One mutable uv auto-route retained on a bundle until the final emitted
@@ -5389,6 +5398,7 @@ async fn resolve_all(
         }
         bundle.workspace_conda_versions = workspace_facts.common_selected_versions.clone();
         bundle.workspace_conda_provider_facts = workspace_facts.provider_facts.clone();
+        bundle.workspace_declared_pypi = workspace_facts.declared_pypi.clone();
         bundle.auto_dropped.extend(prelock_owned_drops);
         for sub in sub_bundles {
             bundle.extras.push(sub.primary);
@@ -5756,6 +5766,17 @@ struct WorkspaceCondaFacts {
     /// Canonical names directly declared in `[pypi-dependencies]` by every
     /// consuming environment. Pixi supplies these on the wheel side already.
     owned_pypi: BTreeSet<String>,
+    /// The SAME intersection as `owned_pypi`, kept UNFILTERED.
+    ///
+    /// `owned_pypi` is a routing input and is retained/cleared by route
+    /// policy, manual overrides, keep-pypi and protected roots
+    /// (`workspace_facts.owned_pypi.retain(...)` below). Declared-ownership is
+    /// not a routing question: a name the workspace itself declares in
+    /// `[pypi-dependencies]` is owned by pixi's pypi phase no matter what the
+    /// pack would have preferred, so the ownership fact must survive those
+    /// filters. Operator ruling 2026-08-19: "prefer whatever is declared in
+    /// the pixi.toml".
+    declared_pypi: BTreeSet<String>,
     /// Common selected conda fact for mapped Python distributions. A fact is
     /// present only when every consuming environment selected the same
     /// version of the mapped conda package.
@@ -6440,6 +6461,7 @@ fn facts_from_solved_records(
 
     if env_records.is_empty() {
         return WorkspaceCondaFacts {
+            declared_pypi: owned_pypi.clone(),
             owned_pypi,
             ..Default::default()
         };
@@ -6564,6 +6586,7 @@ fn facts_from_solved_records(
     WorkspaceCondaFacts {
         owned_conda,
         owned_conda_pypi,
+        declared_pypi: owned_pypi.clone(),
         owned_pypi,
         common_pypi,
         common_conda_versions,
@@ -6782,6 +6805,7 @@ async fn solve_workspace_conda_facts(
 
     if conda_deps.iter().all(BTreeMap::is_empty) {
         return WorkspaceCondaFacts {
+            declared_pypi: owned_pypi.clone(),
             owned_pypi,
             ..Default::default()
         };
@@ -9807,6 +9831,7 @@ async fn resolve_bundle(
             uv_dependency_graph: Default::default(),
             workspace_conda_versions: Default::default(),
             workspace_conda_provider_facts: Default::default(),
+            workspace_declared_pypi: Default::default(),
         });
     }
 
@@ -10418,6 +10443,7 @@ async fn resolve_bundle(
         uv_dependency_graph: Default::default(),
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
+        workspace_declared_pypi: Default::default(),
     };
 
     Ok(bfs_bundle)
@@ -12989,6 +13015,86 @@ type ProducedOutput = (
     BTreeMap<String, BTreeSet<EmissionSupport>>,
 );
 
+/// The bundled dists the CONSUMING WORKSPACE already owns because it declares
+/// them -- or their ancestor -- in `[pypi-dependencies]`.
+///
+/// Operator ruling 2026-08-19: "prefer whatever is declared in the pixi.toml".
+/// A name in the workspace's `[pypi-dependencies]` (or a feature's) is resolved
+/// and installed by pixi's OWN pypi phase, together with its whole transitive
+/// closure. Retread cannot see that resolution -- pixi does not hand the
+/// backend its pypi solve -- so the closure is approximated by the pack's own
+/// uv adjacency, which resolved the same roots against the same index chain:
+///
+///   `declared_pypi_owned = closure(declared roots) ∩ bundled dists`
+///
+/// Anything in that set has TWO owners writing the same site-packages path:
+/// pixi's pypi phase and the courier's wheel replay. Each write invalidates the
+/// other's, and the courier's payload verification then reinstalls forever
+/// (F11: `viral-gpu` ping-ponged `networkx` / `sympy` between the env's
+/// pypi torch closure and the pack's conda-torch closure, four identical
+/// 142-wheel replays). The declared owner wins; the pack neither bundles nor
+/// verifies these dists, and carries its wheels' bounds on them as conda
+/// `constrains` instead.
+///
+/// Two exclusions, both explicit pack intent that cannot be overruled by a
+/// transitive reachability fact:
+/// * the pack's own primary wheel -- a first-party artifact is never dropped
+///   from the pack that exists to ship it;
+/// * `retread-keep-pypi` entries -- the user said "this stays a bundled wheel".
+fn declared_pypi_owned_dists(bundle: &Bundle, config: &RetreadConfig) -> BTreeSet<String> {
+    let reachable = declared_pypi_reachable(bundle, config);
+    bundle
+        .all_wheels()
+        .map(|wheel| canonical_conda_name(&wheel.pypi_name))
+        .filter(|name| reachable.contains(name))
+        .collect()
+}
+
+/// Everything reachable from the workspace's declared `[pypi-dependencies]`
+/// roots over the pack's uv adjacency, whether or not the pack bundles it.
+///
+/// This is the EMISSION-side view: a wheel requirement (or an auto-route)
+/// naming anything in here must not become a conda `depends` edge, because
+/// pixi's pypi phase is already going to install that name. The bundled
+/// subset (`declared_pypi_owned_dists`) is the INSTALL-side view.
+fn declared_pypi_reachable(bundle: &Bundle, config: &RetreadConfig) -> BTreeSet<String> {
+    let roots: BTreeSet<String> = bundle
+        .workspace_declared_pypi
+        .iter()
+        .map(|name| canonical_conda_name(name))
+        .collect();
+    if roots.is_empty() {
+        return BTreeSet::new();
+    }
+    let mut adjacency: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for edge in &bundle.uv_dependency_graph.edges {
+        adjacency
+            .entry(canonical_conda_name(&edge.parent))
+            .or_default()
+            .push(canonical_conda_name(&edge.child));
+    }
+    let mut reachable: BTreeSet<String> = BTreeSet::new();
+    let mut queue: Vec<String> = roots.into_iter().collect();
+    while let Some(name) = queue.pop() {
+        if !reachable.insert(name.clone()) {
+            continue;
+        }
+        for child in adjacency.get(&name).into_iter().flatten() {
+            if !reachable.contains(child) {
+                queue.push(child.clone());
+            }
+        }
+    }
+    let mut protected: BTreeSet<String> = config
+        .keep_pypi
+        .iter()
+        .map(|name| canonical_conda_name(name))
+        .collect();
+    protected.insert(canonical_conda_name(&bundle.primary.pypi_name));
+    reachable.retain(|name| !protected.contains(name));
+    reachable
+}
+
 fn produce_output_with_conflicts(
     bundle: &Bundle,
     config: &RetreadConfig,
@@ -13107,8 +13213,34 @@ fn produce_output_with_conflicts(
     // normalizer converts an effective singleton to its within-minor ABI band.
     // Names with an explicit `retread-overrides` entry remain exact because
     // hand-written intent always wins over an auto-derived range.
+    // Operator ruling 2026-08-19 ("prefer whatever is declared in the
+    // pixi.toml"): a name the consuming workspace declares in
+    // `[pypi-dependencies]`, and everything that name pulls in, belongs to
+    // pixi's own pypi phase. The pack must not claim any of them as a conda
+    // `depends` edge -- see `declared_pypi_reachable`.
+    let declared_pypi_owned = declared_pypi_reachable(bundle, config);
     for auto_route in &bundle.auto_routed {
         let pypi_name = PypiKey::from_pypi(&auto_route.route.pypi_name);
+        // The pack maps this PyPI name onto a conda package (e.g.
+        // `torch` -> `pytorch`), but THIS workspace declares the PyPI name
+        // itself. Emitting the conda `depends` would install a second copy of
+        // the same library under a different package name, and the two would
+        // fight over site-packages forever (F11). Carry the route's bound as
+        // `constrains` instead: inert unless something else pulls the conda
+        // package in, binding when it does.
+        let route_declared_owned =
+            declared_pypi_owned.contains(&canonical_conda_name(&auto_route.route.pypi_name));
+        if route_declared_owned {
+            tracing::info!(
+                dep = %auto_route.route.pypi_name,
+                conda = %auto_route.route.conda_name,
+                bundle = %bundle.conda_name,
+                "declared-pypi ownership: {} provided by workspace pypi-dependencies; \
+                 not emitting a conda `{}` depend (carried as constrains)",
+                auto_route.route.pypi_name,
+                auto_route.route.conda_name,
+            );
+        }
         let route_support = EmissionSupport::AutoRoute {
             owner_conda_name: canonical_conda_name(&auto_route.route.conda_name),
         };
@@ -13129,7 +13261,7 @@ fn produce_output_with_conflicts(
                     constraint: workspace_provider.constraint.clone(),
                     native_conda_override: None,
                     support: route_support,
-                    constrains_only: false,
+                    constrains_only: route_declared_owned,
                 },
             )?;
             continue;
@@ -13199,7 +13331,7 @@ fn produce_output_with_conflicts(
                     },
                     native_conda_override: None,
                     support: route_support.clone(),
-                    constrains_only: false,
+                    constrains_only: route_declared_owned,
                 },
             )?;
         }
@@ -13239,7 +13371,7 @@ fn produce_output_with_conflicts(
                 },
                 native_conda_override: None,
                 support: route_support.clone(),
-                constrains_only: false,
+                constrains_only: route_declared_owned,
             },
         )?;
         for input in &auto_route.route.input_requirements {
@@ -13284,7 +13416,7 @@ fn produce_output_with_conflicts(
                     },
                     native_conda_override: None,
                     support: route_support.clone(),
-                    constrains_only: false,
+                    constrains_only: route_declared_owned,
                 },
             )?;
         }
@@ -13338,7 +13470,18 @@ fn produce_output_with_conflicts(
             let in_set = |set: &HashSet<String>| {
                 crate::relax::already_covered(set, &dep_name, Some(raw_pypi_name))
             };
-            if in_set(&vendored) {
+            // The consuming workspace declares this name -- or an ancestor
+            // of it -- in `[pypi-dependencies]`, so pixi's own pypi phase
+            // installs it and the pack cedes the dist (it is recorded in the
+            // lock's `declared_pypi_owned` and never materialized). This is
+            // computed BEFORE the `vendored` gate on purpose: the dist is
+            // still in the pack's wheel list, so `vendored` would otherwise
+            // swallow the requirement -- and a bound the pack no longer
+            // SHIPS is precisely the bound it must still ADVERTISE, or the
+            // workspace's own resolution is unconstrained (F11).
+            let canonical_dep = canonical_conda_name(raw_pypi_name);
+            let workspace_pypi_owned = declared_pypi_owned.contains(&canonical_dep);
+            if in_set(&vendored) && !workspace_pypi_owned {
                 continue;
             }
             if in_set(&user_dropped) {
@@ -13357,10 +13500,27 @@ fn produce_output_with_conflicts(
             // at `relax_decision::decide`, the sole policy boundary) and emit
             // the decided spec as a conda `constrains` entry: inert unless the
             // provider is pulled in, binding when it is.
-            let constrains_only = bundle
-                .auto_dropped
-                .contains(&canonical_conda_name(raw_pypi_name));
-            if constrains_only {
+            let workspace_conda_owned = bundle.auto_dropped.contains(&canonical_dep);
+            // The consuming workspace declares this name (or an ancestor of
+            // it) in `[pypi-dependencies]`: pixi's own pypi phase installs it,
+            // so the pack must not claim it either. Same treatment as a
+            // workspace CONDA provider -- carry the bound, drop the edge.
+            let constrains_only = workspace_conda_owned || workspace_pypi_owned;
+            if workspace_pypi_owned {
+                tracing::info!(
+                    dep = %dep_name,
+                    bundle = %bundle.conda_name,
+                    "declared-pypi ownership: {} provided by workspace \
+                     pypi-dependencies (via {}); not bundled",
+                    raw_pypi_name,
+                    bundle
+                        .workspace_declared_pypi
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                );
+            } else if workspace_conda_owned {
                 tracing::debug!(
                     dep = %dep_name,
                     bundle = %bundle.conda_name,
@@ -15556,6 +15716,7 @@ async fn materialize_from_lock_for_target(
         .iter()
         .map(lock_run_dep_string)
         .collect();
+    let declared_pypi_owned: Vec<String> = lock.declared_pypi_owned.clone();
     let result = materialize_and_pack(
         None, // bundle=None: replay path, audit skipped
         config,
@@ -15568,6 +15729,7 @@ async fn materialize_from_lock_for_target(
         conda_capable,
         run_deps,
         constrains,
+        declared_pypi_owned,
         index_urls,
         config_fp,
         work_dir,
@@ -15606,6 +15768,11 @@ async fn materialize_and_pack(
     // path: derived from the emission. Replay/incremental: read back from the
     // authoritative lock.
     constrains: Vec<String>,
+    // PEP 503-normalized names in `emit_wheels` the consuming workspace's own
+    // `[pypi-dependencies]` closure owns. Cold path: derived from the bundle.
+    // Replay/incremental: read back from the committed lock, which is
+    // authoritative for the install record exactly as it is for `run_deps`.
+    declared_pypi_owned: Vec<String>,
     index_urls: Vec<String>,
     config_fp: &str,
     work_dir: &Path,
@@ -15634,6 +15801,7 @@ async fn materialize_and_pack(
         &conda_capable,
         &run_deps,
         &constrains,
+        &declared_pypi_owned,
         &index_urls,
         config_fp,
         source_dir,
@@ -16118,6 +16286,7 @@ async fn resolve_incremental_add(
         .iter()
         .map(lock_run_dep_string)
         .collect();
+    let declared_pypi_owned: Vec<String> = lock.declared_pypi_owned.clone();
     let result = materialize_and_pack(
         None, // bundle=None: incremental path, no full Bundle available
         config,
@@ -16130,6 +16299,7 @@ async fn resolve_incremental_add(
         conda_capable,
         run_deps,
         constrains,
+        declared_pypi_owned,
         index_urls,
         config_fp,
         work_dir,
@@ -16580,6 +16750,9 @@ async fn build_one(
             conda_capable,
             run_deps,
             constrains,
+            declared_pypi_owned_dists(bundle, config)
+                .into_iter()
+                .collect::<Vec<_>>(),
             index_urls,
             &config_fp,
             work_dir,
@@ -17653,6 +17826,7 @@ mod replay_tests {
                 sdist_source: None,
             }],
             conda_run_constraints: Vec::new(),
+            declared_pypi_owned: Vec::new(),
             conda_run_deps: vec![CondaDep {
                 name: "numpy".into(),
                 spec: ">=1.21".into(),
@@ -18546,6 +18720,7 @@ mod replay_tests {
                 sdist_source: None,
             }],
             conda_run_constraints: Vec::new(),
+            declared_pypi_owned: Vec::new(),
             conda_run_deps: vec![],
             index_urls: vec!["https://pypi.org/simple/".into()],
             prerelease: BTreeMap::new(),
@@ -18625,6 +18800,7 @@ mod replay_tests {
                 sdist_source: None,
             }],
             conda_run_constraints: Vec::new(),
+            declared_pypi_owned: Vec::new(),
             conda_run_deps: vec![],
             index_urls: vec!["https://pypi.org/simple/".into()],
             prerelease: BTreeMap::new(),
@@ -18741,6 +18917,7 @@ mod replay_tests {
                 sdist_source: Some(sdist_src),
             }],
             conda_run_constraints: Vec::new(),
+            declared_pypi_owned: Vec::new(),
             conda_run_deps: vec![],
             index_urls: vec!["https://pypi.org/simple/".into()],
             prerelease: BTreeMap::new(),
@@ -18951,6 +19128,7 @@ mod replay_tests {
                 sdist_source: Some(sdist_src.clone()),
             }],
             conda_run_constraints: Vec::new(),
+            declared_pypi_owned: Vec::new(),
             conda_run_deps: vec![],
             index_urls: vec!["https://pypi.org/simple/".into()],
             prerelease: BTreeMap::new(),
@@ -19338,6 +19516,7 @@ mod replay_tests {
             root_requirements: vec![],
             wheels: cold_staged.lock.wheels.clone(),
             conda_run_constraints: Vec::new(),
+            declared_pypi_owned: Vec::new(),
             conda_run_deps: vec![],
             index_urls: index_urls.to_vec(),
             prerelease: BTreeMap::new(),
@@ -19538,6 +19717,7 @@ mod replay_tests {
                 sdist_source: None,
             }],
             conda_run_constraints: Vec::new(),
+            declared_pypi_owned: Vec::new(),
             conda_run_deps: vec![],
             index_urls: vec!["https://pypi.org/simple/".into()],
             prerelease: BTreeMap::new(),
@@ -20674,6 +20854,7 @@ include = ["retread_bfs_git_leaf*"]
                 },
             ],
             conda_run_constraints: Vec::new(),
+            declared_pypi_owned: Vec::new(),
             conda_run_deps: vec![],
             index_urls: vec!["https://pypi.org/simple/".into()],
             prerelease: std::collections::BTreeMap::new(),
@@ -21599,6 +21780,7 @@ mod emit_wheel_upstream_url_tests {
             uv_dependency_graph: Default::default(),
             workspace_conda_versions: Default::default(),
             workspace_conda_provider_facts: Default::default(),
+            workspace_declared_pypi: Default::default(),
         };
 
         // Reproduce the exact mapping from build_one that populates EmitWheel.
@@ -21722,6 +21904,7 @@ mod emit_wheel_upstream_url_tests {
             uv_dependency_graph: Default::default(),
             workspace_conda_versions: Default::default(),
             workspace_conda_provider_facts: Default::default(),
+            workspace_declared_pypi: Default::default(),
         };
 
         let emit_wheels: Vec<crate::emit_pypi::EmitWheel> = bundle
@@ -21811,6 +21994,7 @@ mod load_favored_versions_tests {
             root_requirements: vec![],
             wheels,
             conda_run_constraints: Vec::new(),
+            declared_pypi_owned: Vec::new(),
             conda_run_deps: vec![CondaDep {
                 name: "numpy".into(),
                 spec: ">=1.0".into(),
@@ -23749,6 +23933,7 @@ mod incremental_add_tests {
             root_requirements: vec![],
             wheels: vec![valid_payload_wheel()],
             conda_run_constraints: Vec::new(),
+            declared_pypi_owned: Vec::new(),
             conda_run_deps: vec![],
             index_urls: vec!["https://pypi.org/simple".into()],
             prerelease: BTreeMap::new(),
@@ -23852,6 +24037,7 @@ mod incremental_add_tests {
             root_requirements: vec![],
             wheels: vec![valid_payload_wheel()],
             conda_run_constraints: Vec::new(),
+            declared_pypi_owned: Vec::new(),
             conda_run_deps: vec![],
             index_urls: vec![],
             prerelease: BTreeMap::new(),
@@ -23941,6 +24127,7 @@ mod incremental_add_tests {
             root_requirements: vec![],
             wheels: vec![valid_payload_wheel()],
             conda_run_constraints: Vec::new(),
+            declared_pypi_owned: Vec::new(),
             conda_run_deps: vec![],
             index_urls,
             prerelease: BTreeMap::new(),
@@ -24495,6 +24682,7 @@ mod incremental_add_tests {
             root_requirements: vec![],
             wheels: lock_wheels,
             conda_run_constraints: Vec::new(),
+            declared_pypi_owned: Vec::new(),
             conda_run_deps: vec![],
             index_urls: vec!["https://pypi.org/simple".into()],
             prerelease: BTreeMap::new(),
