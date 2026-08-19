@@ -14255,6 +14255,66 @@ fn produce_output_with_conflicts(
         }
     }
 
+    // ---- F16 BEGIN: native providers derived from the pack's own wheel set ----
+    // A `nvidia-<component>-cu12` lib-shim wheel in this pack is DROPPED at
+    // install time whenever conda provides the same component
+    // (`installer::conda_provides_cuda_component`, the F10 decision). That
+    // decision can only come out true if the conda provider is actually in the
+    // environment, so the pack itself must REQUIRE it -- otherwise the
+    // consuming workspace has to hand-pin the provider, which is exactly the
+    // `cusparselt = "*"` line imprint-data carries today.
+    //
+    // MEASURED 2026-08-19 (imprint-data/.pixi/envs/flashsac-gpu):
+    // `conda-meta/cuda-version-*.json` has `depends: []` -- the metapackage
+    // closure is EMPTY, so no shim component is covered by `cuda-version` and
+    // every shadowed component's provider must be named explicitly.
+    //
+    // The mapping has exactly one owner (`installer::conda_cuda_shadow_providers`);
+    // emission reads it and never restates a provider name.
+    {
+        let already: HashSet<String> = run_dep_specs
+            .iter()
+            .map(|spec| spec.name.as_str().to_string())
+            .collect();
+        let mut native: BTreeSet<&'static str> = BTreeSet::new();
+        for wheel in bundle.all_wheels() {
+            let Some(component) = crate::installer::pypi_cuda_shadow_component(&wheel.pypi_name)
+            else {
+                continue;
+            };
+            let providers = crate::installer::conda_cuda_shadow_providers(&component);
+            let Some(provider) = providers.first() else {
+                // Doctrine: never silent. A shim wheel retread cannot map is a
+                // hole in the table, and the pack ships without the native lib.
+                tracing::warn!(
+                    wheel = %wheel.pypi_name,
+                    component = %component,
+                    bundle = %bundle.conda_name,
+                    "native provider: no conda package is mapped for this CUDA \
+                     lib-shim component; the pack cannot require the native library",
+                );
+                continue;
+            };
+            if already.contains(*provider) || !native.insert(*provider) {
+                continue;
+            }
+            tracing::info!(
+                wheel = %wheel.pypi_name,
+                provider = %provider,
+                bundle = %bundle.conda_name,
+                "native provider: {} shadowed by conda -> emitting {}",
+                wheel.pypi_name,
+                provider,
+            );
+        }
+        for provider in native {
+            if seen_dep_names.insert(provider.to_string()) {
+                run_dep_specs.push(spec_from_str(provider)?);
+            }
+        }
+    }
+    // ---- F16 END ----
+
     // Probe and conflict-localization assemblies pass through here repeatedly.
     // Keep their full dependency lists out of normal logs; the committed
     // outputs are logged exactly once by `log_final_bundle_outputs`.
