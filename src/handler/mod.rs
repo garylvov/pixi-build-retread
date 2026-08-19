@@ -7953,6 +7953,13 @@ async fn uv_group_closure(
     // pins/wheels (the offender keeps its own index wheel); collected here
     // only for logging/audit parity with the route/build ledgers.
     let sdist_prereleased = Arc::new(std::sync::Mutex::new(persisted_facts.prereleased));
+    // Innermost: a LEARNED workspace conda fact that a hard requirement in
+    // the closure excludes is dropped and the lock retried (F13 turn 2). It
+    // wraps `raw_solve` so the outer heal/override wrappers only ever see a
+    // constraint set the closure's own requirements can accept.
+    let yielded_learned_facts = Arc::new(std::sync::Mutex::new(BTreeSet::new()));
+    let raw_solve =
+        crate::uv_closure::with_learned_fact_yields(raw_solve, Arc::clone(&yielded_learned_facts));
     let solve = crate::uv_closure::with_workspace_fact_overrides(
         raw_solve,
         Arc::clone(&workspace_overrides),

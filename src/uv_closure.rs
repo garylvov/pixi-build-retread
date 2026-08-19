@@ -3696,6 +3696,218 @@ fn apply_workspace_fact_overrides(req: &mut UvClosureRequest, facts: &[Workspace
     }
 }
 
+/// Structured signal that a LEARNED workspace conda fact contradicts a hard
+/// requirement stated inside the closure itself.
+///
+/// F18/F13-turn-2. F13 began feeding the workspace's SOLVED conda versions --
+/// transitives included -- to uv as `constraint-dependencies`. Those learned
+/// floats are not operator intent: on `sage-isaac-pack` the learned
+/// `sympy==1.14.0` (what the sibling envs' last conda solve happened to pick)
+/// contradicted `torch==2.5.1+cu124`'s own `Requires-Dist: sympy==1.13.1`, and
+/// uv's Pass B died on that contradiction -- masking the healable evdev sdist
+/// error Pass A had reported. Same ruling as `8b5178b` made at EMISSION
+/// (`a_learned_workspace_conda_fact_cannot_veto_a_bundled_wheels_cap`): a
+/// LEARNED fact must YIELD to a hard requirement a wheel in the closure states;
+/// a DECLARED fact stays hard and keeps its Rule-3 recovery
+/// ([`WorkspaceFactOverrideNeeded`]), which pushes in the opposite direction.
+///
+/// The contradicting requirement is read from uv's own conflict prose rather
+/// than from a pre-injection metadata walk: the requirer is usually NOT a root
+/// (`torch` reaches `sage-isaac-pack` only through `torchvision`/`torchaudio`'s
+/// pins), so no set of root `Requires-Dist` values can see the collision.
+#[derive(Debug, Clone)]
+struct LearnedFactYieldNeeded {
+    /// Canonical PyPI name whose learned constraint must be dropped.
+    pypi_name: String,
+    /// The learned version that lost.
+    learned_version: String,
+    /// The hard requirement, verbatim from uv, that it lost to.
+    upstream_requirement: String,
+    original_error: String,
+}
+
+impl std::fmt::Display for LearnedFactYieldNeeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.original_error)
+    }
+}
+
+impl std::error::Error for LearnedFactYieldNeeded {}
+
+/// Select the first LEARNED workspace conda fact that a hard requirement in
+/// uv's conflict prose excludes. DECLARED facts
+/// ([`Provenance::WorkspaceCondaFact`]) are never returned -- they are
+/// operator intent and keep their own recovery.
+fn learned_fact_yield_needed(
+    attributions: &[ConflictAttribution],
+    original_error: &str,
+) -> Option<LearnedFactYieldNeeded> {
+    for attribution in attributions {
+        if !matches!(attribution.conda_source.provenance, Provenance::UvConstraint)
+            || attribution.conda_source.source != LEARNED_WORKSPACE_FACT_SOURCE
+        {
+            continue;
+        }
+        let Some(required) = attribution.required.as_deref() else {
+            continue;
+        };
+        let Some((constraint_name, _, learned_version)) =
+            exact_requirement_pin(&attribution.conda_source.constraint)
+        else {
+            continue;
+        };
+        if constraint_name != canonical_conda_name(&attribution.package) {
+            continue;
+        }
+        let Ok(upstream) = uv_pep508::uv_pep440::VersionSpecifiers::from_str(required.trim())
+        else {
+            continue;
+        };
+        // Only a requirement that EXCLUDES the learned version is a
+        // contradiction. A learned fact the closure's requirements accept is
+        // left exactly where F13 put it.
+        if upstream.contains(&learned_version) {
+            continue;
+        }
+        return Some(LearnedFactYieldNeeded {
+            pypi_name: constraint_name,
+            learned_version: learned_version.to_string(),
+            upstream_requirement: format!("{}{}", attribution.package, required),
+            original_error: original_error.to_string(),
+        });
+    }
+    None
+}
+
+/// Drop every yielded LEARNED constraint line from the request, keeping
+/// `auto_route_constraint_indices` aligned with the shortened vector.
+///
+/// Only lines whose provenance says LEARNED are removed: a declared fact that
+/// happens to share the name stays.
+fn apply_learned_fact_yields(req: &mut UvClosureRequest, yielded: &BTreeSet<String>) {
+    if yielded.is_empty() {
+        return;
+    }
+    let droppable: BTreeSet<String> = yielded
+        .iter()
+        .filter(|name| {
+            req.constraints
+                .provenance
+                .get(*name)
+                .is_some_and(|prov| prov.source == LEARNED_WORKSPACE_FACT_SOURCE)
+        })
+        .cloned()
+        .collect();
+    if droppable.is_empty() {
+        return;
+    }
+    let mut kept: Vec<String> = Vec::with_capacity(req.constraints.constraints.len());
+    let mut remapped: BTreeSet<usize> = BTreeSet::new();
+    for (index, line) in req.constraints.constraints.iter().enumerate() {
+        let parsed: Result<Requirement, _> = Requirement::from_str(line);
+        let name = parsed
+            .ok()
+            .map(|parsed| canonical_conda_name(parsed.name.as_ref()));
+        if name.is_some_and(|name| droppable.contains(&name)) {
+            continue;
+        }
+        if req.constraints.auto_route_constraint_indices.contains(&index) {
+            remapped.insert(kept.len());
+        }
+        kept.push(line.clone());
+    }
+    req.constraints.constraints = kept;
+    req.constraints.auto_route_constraint_indices = remapped;
+    req.constraints
+        .provenance
+        .retain(|name, _| !droppable.contains(name));
+}
+
+/// Retry uv closure resolution after dropping a LEARNED workspace conda fact
+/// that a hard requirement inside the closure excludes.
+///
+/// Mirror image of [`with_workspace_fact_overrides`]: that wrapper makes a
+/// DECLARED fact win over an upstream pin; this one makes a LEARNED float lose
+/// to one. Yielded names are shared across calls so auto-route and sdist-heal
+/// relocks see the same constraint set. Progress is monotonic and finite: a
+/// retry happens only after a previously unyielded name is recorded.
+pub fn with_learned_fact_yields<S>(
+    solve: S,
+    yielded: std::sync::Arc<std::sync::Mutex<BTreeSet<String>>>,
+) -> impl FnMut(UvClosureRequest) -> futures::future::BoxFuture<'static, Result<UvClosure>>
+where
+    S: FnMut(UvClosureRequest) -> futures::future::BoxFuture<'static, Result<UvClosure>>
+        + Send
+        + 'static,
+{
+    let solve = std::sync::Arc::new(std::sync::Mutex::new(solve));
+    move |mut req: UvClosureRequest| {
+        let solve = std::sync::Arc::clone(&solve);
+        let yielded = std::sync::Arc::clone(&yielded);
+        {
+            let names = yielded.lock().unwrap();
+            apply_learned_fact_yields(&mut req, &names);
+        }
+        let first = {
+            let mut locked = solve.lock().unwrap();
+            (*locked)(req.clone())
+        };
+        Box::pin(async move {
+            let mut attempt = first;
+            loop {
+                match attempt.await {
+                    Ok(closure) => return Ok(closure),
+                    Err(error) => {
+                        let needed = match error.downcast::<LearnedFactYieldNeeded>() {
+                            Ok(needed) => needed,
+                            Err(other) => return Err(other),
+                        };
+                        let original_error = needed.original_error.clone();
+                        let inserted = {
+                            let mut names = yielded.lock().unwrap();
+                            names.insert(needed.pypi_name.clone())
+                        };
+                        if !inserted {
+                            return Err(anyhow!(original_error));
+                        }
+                        tracing::warn!(
+                            bundle = %req.bundle,
+                            package = %needed.pypi_name,
+                            learned = %format!("{}=={}", needed.pypi_name, needed.learned_version),
+                            required = %needed.upstream_requirement,
+                            "learned conda fact {}=={} yields to the closure's hard requirement {}; \
+                             dropping the learned constraint and re-locking",
+                            needed.pypi_name,
+                            needed.learned_version,
+                            needed.upstream_requirement,
+                        );
+                        let mut names = BTreeSet::new();
+                        names.insert(needed.pypi_name.clone());
+                        apply_learned_fact_yields(&mut req, &names);
+                        attempt = {
+                            let mut locked = solve.lock().unwrap();
+                            (*locked)(req.clone())
+                        };
+                    }
+                }
+            }
+        })
+    }
+}
+
+/// Compose Pass A's and Pass B's failure text into one message.
+///
+/// Law 9: a Pass-B failure that surfaces only Pass A's prose is a failure with
+/// no reader -- exactly how the F13 `sympy` contradiction stayed invisible
+/// behind a healable evdev error for a whole cert run.
+fn both_passes_failed(pass_a: &str, pass_b: &str) -> String {
+    format!(
+        "{}\n\n--- uv closure pass B (sdist/prerelease detection) also failed ---\n\n{}\n",
+        pass_a.trim_end(),
+        pass_b.trim_end(),
+    )
+}
+
 /// Retry uv closure resolution when a structured Rule-3 signal proves that a
 /// transitive upstream exact pin contradicts a precise workspace conda fact.
 /// Learned facts are shared across calls so auto-route and sdist-heal relocks
@@ -4040,6 +4252,9 @@ const META_FILE: &str = "retread-closure.meta.json";
 const PYLOCK_FILE: &str = "pylock.retread.toml";
 const PROVENANCE_FILE: &str = "constraints.provenance.json";
 const CONFLICT_FILE: &str = "retread-conflict.json";
+/// Pass-B (sdist/prerelease detection) conflict record, written beside
+/// [`CONFLICT_FILE`] so a Pass-B failure has a reader (Law 9).
+const PASS_B_CONFLICT_FILE: &str = "retread-passb-conflict.json";
 static CLOSURE_META_TMP_SEQUENCE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -5429,6 +5644,13 @@ pub(crate) async fn compute_closure_for_target(
         if let Some(needed) = workspace_fact_override_needed(req, &attributions, &original_error) {
             return Err(anyhow::Error::new(needed));
         }
+        // A LEARNED workspace conda fact that a hard requirement in the
+        // closure excludes yields (F13 turn 2) -- drop it and re-lock rather
+        // than letting a float from a sibling env's last solve veto a wheel's
+        // own `Requires-Dist`.
+        if let Some(needed) = learned_fact_yield_needed(&attributions, &original_error) {
+            return Err(anyhow::Error::new(needed));
+        }
 
         // -- uv lock (Pass B): relax the offending restrictions ----------
         // Same invocation as Pass A, single-sourced through
@@ -5460,12 +5682,41 @@ pub(crate) async fn compute_closure_for_target(
                 let pass_b_attributions =
                     attribute_conflict(&pass_b_stderr, &resolved_constraints.provenance);
                 let pass_b_error = format_lock_failure(req, &pass_b_stderr, &pass_b_attributions);
+                // Law 9: Pass B's failure must reach an actor. Before this,
+                // every Pass-B exit re-surfaced Pass A's text with no log and
+                // no artifact, so a hard contradiction here read as Pass A's
+                // (healable) error -- the F18 cert misdiagnosis.
+                tracing::error!(
+                    bundle = %req.bundle,
+                    python = %req.python_version,
+                    platform = %req.conda_subdir,
+                    stderr = %pass_b_stderr.trim_end(),
+                    "uv closure pass B failed: {}",
+                    pass_b_stderr.trim_end(),
+                );
+                let pass_b_record = serde_json::json!({
+                    "bundle": req.bundle,
+                    "pass": "B",
+                    "python": req.python_version,
+                    "platform": req.conda_subdir,
+                    "uv_stderr": pass_b_stderr,
+                    "attributions": pass_b_attributions,
+                });
+                let _ = std::fs::write(
+                    project_dir.join(PASS_B_CONFLICT_FILE),
+                    serde_json::to_string_pretty(&pass_b_record).unwrap_or_default(),
+                );
                 if let Some(needed) =
                     workspace_fact_override_needed(req, &pass_b_attributions, &pass_b_error)
                 {
                     return Err(anyhow::Error::new(needed));
                 }
-                bail!("{original_error}");
+                if let Some(needed) =
+                    learned_fact_yield_needed(&pass_b_attributions, &pass_b_error)
+                {
+                    return Err(anyhow::Error::new(needed));
+                }
+                bail!("{}", both_passes_failed(&original_error, &pass_b_error));
             }
 
             // Pass B resolved. Export its lock and read the offenders
@@ -7417,6 +7668,168 @@ sha256 = "6666666666666666666666666666666666666666666666666666666666666666"
     }
 
     // ---- auto-route (spec-uv-restructure M2) -------------------------------
+
+    // ---- learned facts yield to the closure's hard requirements (F13 t2) ---
+
+    /// Verbatim Pass-B prose measured on the cert relock of `sage-isaac-pack`
+    /// (`tasks/retread-cold-solve/fix_f18_evdev_sdist/artifacts/passb.log:10-13`,
+    /// ANSI stripped). Pass A had reported the HEALABLE `evdev` sdist error;
+    /// this contradiction is what actually killed the lock.
+    const SAGE_PASS_B_STDERR: &str = "\
+  x No solution found when resolving dependencies:
+  |-> Because torch==2.5.1+cu124 depends on sympy==1.13.1 and sympy==1.14.0,
+      we can conclude that torch==2.5.1+cu124 cannot be used.
+      And because torchvision==0.20.1+cu124 depends on torch, we can conclude
+      that your project's requirements are unsatisfiable.";
+
+    /// The learned `sympy==1.14.0` float F13 injects for that pack.
+    fn sage_learned_sympy_constraints() -> ConstraintSet {
+        learned_fact_constraints(
+            &BTreeMap::from([("sympy".to_string(), "1.14.0".to_string())]),
+            &BTreeMap::new(),
+            &Default::default(),
+            &ConstraintSet::default(),
+            &BTreeSet::new(),
+            "precise-consuming-envs",
+        )
+    }
+
+    #[test]
+    fn a_learned_conda_fact_yields_to_a_hard_requirement_in_the_closure() {
+        let learned = sage_learned_sympy_constraints();
+        assert_eq!(learned.constraints, vec!["sympy==1.14.0".to_string()]);
+
+        let attributions = attribute_conflict(SAGE_PASS_B_STDERR, &learned.provenance);
+        let needed = learned_fact_yield_needed(&attributions, "pass A: evdev has no usable wheels")
+            .expect(
+                "a LEARNED float must yield to the pinned wheel's own Requires-Dist \
+                 (8b5178b's ruling, applied at closure input)",
+            );
+        assert_eq!(needed.pypi_name, "sympy");
+        assert_eq!(needed.learned_version, "1.14.0");
+        assert!(
+            needed.upstream_requirement.contains("1.13.1"),
+            "the yield must name the requirement it lost to: {}",
+            needed.upstream_requirement,
+        );
+    }
+
+    #[tokio::test]
+    async fn a_yielded_learned_fact_is_dropped_and_the_closure_resolves() {
+        let mut req = sample_request();
+        req.constraints = sage_learned_sympy_constraints();
+
+        let seen = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+        let raw = {
+            let seen = Arc::clone(&seen);
+            move |req: UvClosureRequest| {
+                let seen = Arc::clone(&seen);
+                Box::pin(async move {
+                    seen.lock()
+                        .unwrap()
+                        .push(req.constraints.constraints.clone());
+                    if req
+                        .constraints
+                        .constraints
+                        .iter()
+                        .any(|line| line == "sympy==1.14.0")
+                    {
+                        let attributions =
+                            attribute_conflict(SAGE_PASS_B_STDERR, &req.constraints.provenance);
+                        let needed = learned_fact_yield_needed(
+                            &attributions,
+                            "pass A: evdev==1.7.1 has no usable wheels",
+                        )
+                        .expect("fixture must arm the yield");
+                        return Err(anyhow::Error::new(needed));
+                    }
+                    Ok(UvClosure {
+                        wheels: vec![],
+                        pins: BTreeMap::from([("sympy".to_string(), "1.13.1".to_string())]),
+                        uv_version: "test".to_string(),
+                        auto_routed: vec![],
+                        auto_dropped: BTreeSet::new(),
+                        effective_input_requirements: None,
+                        dependency_graph: UvDependencyGraph::default(),
+                    })
+                }) as futures::future::BoxFuture<'static, Result<UvClosure>>
+            }
+        };
+
+        let yielded = Arc::new(Mutex::new(BTreeSet::new()));
+        let mut solve = with_learned_fact_yields(raw, Arc::clone(&yielded));
+        let closure = solve(req)
+            .await
+            .expect("dropping the contradicting learned float must let the closure resolve");
+
+        assert_eq!(closure.pins["sympy"], "1.13.1");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "exactly one retry: {seen:?}");
+        assert!(
+            !seen[1].iter().any(|line| line.starts_with("sympy")),
+            "the retry's constraint set must carry no sympy pin at all: {:?}",
+            seen[1],
+        );
+        assert_eq!(*yielded.lock().unwrap(), BTreeSet::from(["sympy".to_string()]));
+    }
+
+    #[test]
+    fn a_learned_fact_no_requirement_contradicts_is_still_injected() {
+        let learned = sage_learned_sympy_constraints();
+        // Same shape, but the closure's requirement ACCEPTS the learned float.
+        let compatible = "Because torch==2.5.1+cu124 depends on sympy>=1.13 and sympy==1.14.0, \
+                          we can conclude that torch==2.5.1+cu124 cannot be used.";
+        let attributions = attribute_conflict(compatible, &learned.provenance);
+        assert!(
+            learned_fact_yield_needed(&attributions, "original").is_none(),
+            "a learned fact the closure's requirements accept keeps F13's behaviour",
+        );
+
+        // A DECLARED fact is operator intent and never yields: it keeps its own
+        // (opposite-direction) Rule-3 recovery.
+        let mut declared = ConstraintSet::default();
+        declared.constraints.push("sympy==1.14.0".to_string());
+        declared.provenance.insert(
+            "sympy".to_string(),
+            ConstraintProvenance {
+                constraint: "sympy==1.14.0".to_string(),
+                conda_name: "sympy".to_string(),
+                conda_version: "==1.14.0".to_string(),
+                source: "workspace-solved".to_string(),
+                env: "precise-consuming-envs".to_string(),
+                provenance: Provenance::WorkspaceCondaFact("precise-consuming-envs".to_string()),
+            },
+        );
+        let attributions = attribute_conflict(SAGE_PASS_B_STDERR, &declared.provenance);
+        assert!(
+            !attributions.is_empty(),
+            "the declared fact is still attributed to the conflict",
+        );
+        assert!(
+            learned_fact_yield_needed(&attributions, "original").is_none(),
+            "a DECLARED workspace fact stays hard",
+        );
+    }
+
+    #[test]
+    fn a_pass_b_failure_names_both_passes() {
+        let pass_a = "uv lock failed for bundle `sage-isaac-pack`:\n\
+                      Because evdev==1.7.1 has no usable wheels and building from \
+                      source is disabled";
+        let message = both_passes_failed(pass_a, SAGE_PASS_B_STDERR);
+        assert!(
+            message.contains("evdev==1.7.1"),
+            "pass A's text must survive: {message}",
+        );
+        assert!(
+            message.contains("sympy==1.13.1") && message.contains("torch==2.5.1+cu124"),
+            "pass B's text is what actually killed the lock and must be reported: {message}",
+        );
+        assert!(
+            message.contains("pass B"),
+            "the message must say which pass each half came from: {message}",
+        );
+    }
 
     fn workspace_fact_needed_error(name: &str, version: &str, upstream_pin: &str) -> anyhow::Error {
         anyhow::Error::new(WorkspaceFactOverrideNeeded {
