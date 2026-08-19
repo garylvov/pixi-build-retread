@@ -518,8 +518,8 @@ pub(crate) fn build_courier_recipe_with_mode_lock_and_relaxations(
          if [ \"${{RETREAD_GUARD_STRICT:-0}}\" = \"1\" ]; then return 1 2>/dev/null || true; fi\n\
          elif ! \"$CONDA_PREFIX/bin/retread\" verify --lock \"$RETREAD_LOCK\" --prefix \"$CONDA_PREFIX\" >/dev/null 2>&1; then\n\
          echo \"retread: '{conda_name}' PyPI wheels missing from this env; repairing...\" >&2\n\
-         if \"$CONDA_PREFIX/bin/retread\" install --lock \"$RETREAD_LOCK\" --prefix \"$CONDA_PREFIX\" >\"$RETREAD_REPAIR_LOG\" 2>&1; then\n\
-         rm -f \"$RETREAD_BROKEN_FILE\" \"$RETREAD_REPAIR_LOG\"\n\
+         if \"$CONDA_PREFIX/bin/retread\" install --lock \"$RETREAD_LOCK\" --prefix \"$CONDA_PREFIX\" >>\"$RETREAD_REPAIR_LOG\" 2>&1; then\n\
+         rm -f \"$RETREAD_BROKEN_FILE\"\n\
          unset RETREAD_BROKEN_{var_pack}\n\
          else\n\
          tail -n 80 \"$RETREAD_REPAIR_LOG\" >&2 2>/dev/null || true\n\

@@ -1405,6 +1405,81 @@ fn write_marker_atomic(marker: &Path, body: &str) -> Result<()> {
         .with_context(|| format!("renaming marker {} -> {}", tmp.display(), marker.display()))
 }
 
+/// The post-transaction tail of [`run`], as ONE fallible section.
+///
+/// Every step here used to be a bare `?` in `run()`, so any of them returned
+/// straight out of the function, bypassing BOTH
+/// `repair::mark_state(Installed)` and `repair::fail_repair`. The prefix was
+/// then left in state `repairing` with no `.installed` marker forever, and
+/// every later activation read that as "a previous repair was interrupted
+/// mid-transaction" -- a FALSE diagnosis (the transaction completed; the
+/// bookkeeping after it failed) -- and replayed the whole ~10 min uv
+/// transaction again. Observed on hover-gpu 2026-08-19.
+///
+/// So: any error routes through [`crate::repair::fail_post_verify`], which
+/// records `broken` naming the check that failed, and the success arm is the
+/// ONLY path to `Installed`.
+///
+/// The rollback in `fail_repair` is deliberately NOT used here: uv finished,
+/// so site-packages holds a freshly installed tree rather than a half-removed
+/// one, and deleting it would destroy a good install.
+fn finish_repair(
+    lock: &RetreadLock,
+    prefix: &Path,
+    share: &Path,
+    marker: &Path,
+    want: &str,
+    relaxed_platform: Option<String>,
+    declaration_source: Option<String>,
+) -> Result<()> {
+    let outcome = (move || -> std::result::Result<(), (&'static str, anyhow::Error)> {
+        verify_payload_installed(lock, prefix).map_err(|e| {
+            (
+                "verify_payload_installed",
+                e.context(format!(
+                    "retread install: {} post-install verification failed",
+                    lock.bundle
+                )),
+            )
+        })?;
+        let (site_packages, libs) = installed_payload_libraries(lock, prefix)
+            .map_err(|e| ("installed_payload_libraries", e))?;
+        let previous = crate::glibc::marker_audit(marker);
+        let audit = crate::glibc::install_audit(
+            lock,
+            prefix,
+            &site_packages,
+            &libs,
+            previous.as_ref(),
+            relaxed_platform,
+            declaration_source,
+        )
+        .map_err(|e| ("install_audit", e))?;
+        std::fs::create_dir_all(share).ok();
+        let body = crate::glibc::marker_body(want, &audit).map_err(|e| ("marker_body", e))?;
+        write_marker_atomic(marker, &body).map_err(|e| ("write_marker_atomic", e))?;
+        Ok(())
+    })();
+    match outcome {
+        Ok(()) => {
+            let _ = std::fs::remove_file(share.join(format!("{}.broken", lock.bundle)));
+            crate::repair::mark_state(
+                share,
+                &lock.bundle,
+                crate::repair::RepairState::Installed,
+                "",
+            );
+            Ok(())
+        }
+        Err((check, err)) => Err(crate::repair::fail_post_verify(
+            share,
+            &lock.bundle,
+            check,
+            err,
+        )),
+    }
+}
+
 /// Install (or no-op) the bundle described by `lock_path` into `prefix`.
 pub async fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
     let (raw, lock) = read_validated_lock(lock_path)?;
@@ -1690,7 +1765,15 @@ pub async fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
             .ok();
 
         // The prefix is about to be mutated destructively; record it so a
-        // crashed or killed repair is distinguishable from a completed one.
+        // crashed or killed repair is distinguishable from a completed one,
+        // and open a new APPEND section in the repair log so this attempt's
+        // failure text does not overwrite the previous attempt's.
+        let attempt = crate::repair::begin_attempt_log(&share, &lock.bundle);
+        crate::repair::append_repair_log(
+            &share,
+            &lock.bundle,
+            &format!("{install_msg} (repair attempt #{attempt})"),
+        );
         crate::repair::mark_state(
             &share,
             &lock.bundle,
@@ -1753,32 +1836,15 @@ pub async fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
         }
     }
 
-    verify_payload_installed(&lock, prefix).with_context(|| {
-        format!(
-            "retread install: {} post-install verification failed",
-            lock.bundle
-        )
-    })?;
-    let (site_packages, libs) = installed_payload_libraries(&lock, prefix)?;
-    let previous = crate::glibc::marker_audit(&marker);
-    let audit = crate::glibc::install_audit(
+    finish_repair(
         &lock,
         prefix,
-        &site_packages,
-        &libs,
-        previous.as_ref(),
+        &share,
+        &marker,
+        &want,
         relaxed_platform,
         declaration_source,
     )?;
-    std::fs::create_dir_all(&share).ok();
-    write_marker_atomic(&marker, &crate::glibc::marker_body(&want, &audit)?)?;
-    let _ = std::fs::remove_file(share.join(format!("{}.broken", lock.bundle)));
-    crate::repair::mark_state(
-        &share,
-        &lock.bundle,
-        crate::repair::RepairState::Installed,
-        "",
-    );
     let done_msg = format!("retread install: {} installed", lock.bundle);
     eprintln!("{done_msg}");
     crate::status::phase(
@@ -3396,6 +3462,91 @@ mod tests {
 
         verify(&lock_path, &prefix, false).expect("fixture must verify before the state is set");
         (root, prefix, lock_path, lock)
+    }
+
+    // GUARD (d2 turn 3): the post-transaction tail must be a single fallible
+    // section. A failure AFTER a completed uv transaction used to `?` straight
+    // out of `run()`, skipping both `mark_state(Installed)` and
+    // `fail_repair`, so `.state` stayed `repairing` with no `.installed`
+    // marker and every later activation falsely reported "a previous repair
+    // was interrupted mid-transaction" and replayed the whole ~10 min
+    // transaction. Now it must land on `broken`, name the check, and -- since
+    // uv finished -- leave the freshly installed tree alone.
+    #[test]
+    fn post_verify_failure_marks_broken_names_the_check_and_keeps_the_tree() {
+        let (root, prefix, _lock_path, lock) = healthy_verifying_prefix("post-verify-fail");
+        let share = prefix.join("share").join("retread");
+        let marker = share.join(lock.marker_name());
+        let site_packages = site_packages_dir(&prefix, &lock.python);
+
+        // A completed transaction whose result does not verify: the payload
+        // tree is there, the metadata that proves ownership is not.
+        std::fs::remove_dir_all(site_packages.join("mypackage-1.0.0.dist-info")).unwrap();
+        std::fs::remove_file(&marker).unwrap();
+        crate::repair::mark_state(
+            &share,
+            &lock.bundle,
+            crate::repair::RepairState::Repairing,
+            "replay in flight",
+        );
+
+        let err = finish_repair(&lock, &prefix, &share, &marker, "deadbeef", None, None)
+            .expect_err("a post-transaction verification failure must not return Ok");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("transaction completed but post-verify failed")
+                && msg.contains("verify_payload_installed"),
+            "the failing check must be named and distinguished from a mid-way \
+             abort, got: {msg}"
+        );
+        assert_eq!(
+            crate::repair::read_state(&share, &lock.bundle),
+            Some(crate::repair::RepairState::Broken),
+            "a completed-but-unverified repair must be recorded broken, not left repairing"
+        );
+        assert!(
+            !marker.exists(),
+            "the .installed marker must not exist after a failed post-verify"
+        );
+        assert!(
+            site_packages.join("mypackage/__init__.py").exists(),
+            "uv finished, so the freshly installed tree must NOT be rolled back"
+        );
+        // The failure text must survive in the repair log, not only in stderr.
+        let log =
+            std::fs::read_to_string(crate::repair::repair_log_path(&share, &lock.bundle)).unwrap();
+        assert!(
+            log.contains("post-verify failed"),
+            "repair log must carry the failure text, got: {log}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // GUARD: the success arm is the ONLY path to `installed`, and `installed`
+    // is the ABSENCE of the state file plus a present marker.
+    #[test]
+    fn finish_repair_success_clears_the_state_and_writes_the_marker() {
+        let (root, prefix, _lock_path, lock) = healthy_verifying_prefix("post-verify-ok");
+        let share = prefix.join("share").join("retread");
+        let marker = share.join(lock.marker_name());
+        std::fs::remove_file(&marker).unwrap();
+        crate::repair::mark_state(
+            &share,
+            &lock.bundle,
+            crate::repair::RepairState::Repairing,
+            "replay in flight",
+        );
+
+        finish_repair(&lock, &prefix, &share, &marker, "deadbeef", None, None)
+            .expect("a healthy prefix must finish the repair");
+
+        assert!(marker.exists(), "success must write the .installed marker");
+        assert!(
+            !crate::repair::state_path(&share, &lock.bundle).exists(),
+            "installed is the ABSENCE of the state file"
+        );
+        assert_eq!(crate::repair::read_state(&share, &lock.bundle), None);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     // Reader half of the `<bundle>.state` writer: `retread verify` must refuse
