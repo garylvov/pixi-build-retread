@@ -367,6 +367,7 @@ async fn resolve_build_requirements(
                 .arg("--output-file")
                 .arg(&lock_path)
                 .env("UV_PYTHON_DOWNLOADS", "automatic");
+            crate::uv_closure::apply_uv_lock_budget(&mut command);
             if constrain_legacy_setuptools {
                 command.arg("--constraints").arg(&constraints);
             }
@@ -6454,6 +6455,9 @@ exec "$uv" "${filtered[@]}" --python="$build_python" --no-build-isolation
         crate::fasttmp::apply_backend_env(&mut cmd);
     }
     configure_reproducible_source_build(&mut cmd);
+    // Sibling backends share one uv cache during a single `pixi lock`; a cold
+    // sdist build here can hold its cache lock far past uv's 300 s default.
+    crate::uv_closure::apply_uv_lock_budget(&mut cmd);
     #[cfg(unix)]
     cmd.process_group(0);
     let child = cmd
