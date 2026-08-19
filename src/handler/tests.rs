@@ -8714,3 +8714,94 @@ fn a_record_without_advertised_depends_is_not_an_emission_authority() {
     let record = advertised_output_record(Vec::new(), Vec::new());
     assert!(cold_emission_authority(Some(&record)).is_none());
 }
+
+// ---- F16 guards: native providers are EMITTED by the pack, not hand-pinned ----
+
+fn emitted_dep_names(output: &super::CondaOutput) -> Vec<String> {
+    output
+        .run_dependencies
+        .depends
+        .iter()
+        .map(|dependency| dependency.name.as_str().to_string())
+        .collect()
+}
+
+/// Guard (F16a). A pack that ships `nvidia-cusparselt-cu12` must REQUIRE the
+/// conda package that owns `libcusparseLt.so.0` -- the installer drops the
+/// shim wheel exactly when that package is present, so the pack has to put it
+/// there. Without this, imprint-data has to hand-pin `cusparselt = "*"`
+/// (pixi.toml:568) and `import torch` fails in any workspace that forgets to.
+#[test]
+fn shadowed_cuda_shim_wheel_emits_its_conda_native_provider() {
+    let mut bundle = solo_bundle("flashsac-pack", vec![]);
+    bundle.extras.push(rw(
+        "nvidia-cusparselt-cu12",
+        meta("nvidia-cusparselt-cu12", "0.8.1.1", vec![], true),
+    ));
+    let output = super::produce_output(
+        &bundle,
+        &cfg(),
+        rattler_conda_types::Platform::Linux64,
+        "3.11",
+        &[],
+        None,
+        None,
+    )
+    .unwrap();
+    let names = emitted_dep_names(&output);
+    assert!(
+        names.iter().any(|name| name == "cusparselt"),
+        "the pack must emit the conda owner of libcusparseLt.so.0: {names:?}",
+    );
+}
+
+/// Guard (F16b). No CUDA lib-shim wheel in the pack -> no native provider is
+/// invented. The emission is DERIVED from the wheel set, never blanket.
+#[test]
+fn a_pack_without_cuda_shim_wheels_emits_no_native_provider() {
+    let bundle = solo_bundle("plain-pack", vec![]);
+    let output = super::produce_output(
+        &bundle,
+        &cfg(),
+        rattler_conda_types::Platform::Linux64,
+        "3.11",
+        &[],
+        None,
+        None,
+    )
+    .unwrap();
+    let names = emitted_dep_names(&output);
+    for provider in ["cusparselt", "libcusparselt", "nccl", "cudnn", "libcublas"] {
+        assert!(
+            !names.iter().any(|name| name == provider),
+            "no shim wheel in the pack, so `{provider}` must not be emitted: {names:?}",
+        );
+    }
+}
+
+/// Guard (F16d). `patchelf` is a HERMETIC SOURCE-BUILD tool, not a courier or
+/// installer runtime dependency: the only invocations are in the generated
+/// build script (`src/hermetic_build.rs:1485-1530`), whose environment is
+/// solved separately with `patchelf >=0.17.2,<0.19`
+/// (`src/conda_solve.rs:886`). `grep -n patchelf src/courier.rs src/installer.rs`
+/// is empty. So the pack must NOT emit it as a run requirement -- and the
+/// workspace does not need it either.
+#[test]
+fn patchelf_is_not_a_pack_run_requirement() {
+    let bundle = solo_bundle("plain-pack", vec![]);
+    let output = super::produce_output(
+        &bundle,
+        &cfg(),
+        rattler_conda_types::Platform::Linux64,
+        "3.11",
+        &[],
+        None,
+        None,
+    )
+    .unwrap();
+    let names = emitted_dep_names(&output);
+    assert!(
+        !names.iter().any(|name| name == "patchelf"),
+        "patchelf is a hermetic-build tool, never a pack run dep: {names:?}",
+    );
+}

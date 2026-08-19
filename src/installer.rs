@@ -1094,7 +1094,7 @@ fn conda_owned_at_version(
 /// `nvidia-ml-py`, `nvidia-cudnn-frontend`, etc. fall through.
 /// The `<component>` of a `nvidia-<component>-cu<digits>` lib-shim wheel
 /// name, or `None` when the name is not one.
-fn pypi_cuda_shadow_component(name: &str) -> Option<String> {
+pub(crate) fn pypi_cuda_shadow_component(name: &str) -> Option<String> {
     let normalized = normalize_dist_name(name);
     let rest = normalized.strip_prefix("nvidia-")?;
     // rest = "<component>-cu<digits>", component itself may contain '-'
@@ -1115,7 +1115,7 @@ fn pypi_cuda_shadow_component(name: &str) -> Option<String> {
 /// family; dropping `nvidia-cusparselt-cu12` while conda has no
 /// `libcusparselt` broke `import torch` with "libcusparseLt.so.0: cannot open
 /// shared object file".
-fn conda_cuda_shadow_providers(component: &str) -> &'static [&'static str] {
+pub(crate) fn conda_cuda_shadow_providers(component: &str) -> &'static [&'static str] {
     match component {
         "nccl" => &["nccl"],
         "cublas" => &["libcublas"],
@@ -1128,11 +1128,49 @@ fn conda_cuda_shadow_providers(component: &str) -> &'static [&'static str] {
         "curand" => &["libcurand"],
         "cusolver" => &["libcusolver"],
         "cusparse" => &["libcusparse"],
-        "cusparselt" => &["libcusparselt"],
+        // MEASURED 2026-08-19 in imprint-data/.pixi/envs/flashsac-gpu:
+        // `conda-meta/cusparselt-0.8.1.1-h58dd1b1_1.json` owns
+        // `lib/libcusparseLt.so.0`; there is NO `libcusparselt` record in that
+        // prefix. The conda-forge name that actually provides the library is
+        // `cusparselt`, so it must be FIRST -- emission takes the head of this
+        // list as the package to require.
+        "cusparselt" => &["cusparselt", "libcusparselt"],
         "nvjitlink" => &["libnvjitlink"],
         "nvshmem" => &["nvshmem", "libnvshmem"],
         "nvtx" => &["cuda-nvtx"],
         _ => &[],
+    }
+}
+
+/// The conda distribution that owns a linked `SONAME`, or `None` when retread
+/// has no mapping for it.
+///
+/// Same table shape and same authority as [`conda_cuda_shadow_providers`]:
+/// emission reads this, nothing hard-codes a provider name at a call site.
+/// An unmapped soname is NEVER silently dropped -- the caller must WARN with
+/// the soname so the gap reaches an actor (doctrine: failure is loud).
+pub(crate) fn conda_provider_for_soname(soname: &str) -> Option<&'static str> {
+    // Match on the soname stem so version suffixes (`.so.0`, `.so.0.8.1.1`)
+    // all land on the same provider.
+    let stem = soname.split(".so").next().unwrap_or(soname);
+    match stem {
+        "libcusparseLt" => Some("cusparselt"),
+        "libnccl" => Some("nccl"),
+        "libcudnn" => Some("cudnn"),
+        "libcublas" | "libcublasLt" => Some("libcublas"),
+        "libcufft" => Some("libcufft"),
+        "libcufile" => Some("libcufile"),
+        "libcurand" => Some("libcurand"),
+        "libcusolver" | "libcusolverMg" => Some("libcusolver"),
+        "libcusparse" => Some("libcusparse"),
+        "libnvJitLink" => Some("libnvjitlink"),
+        "libnvrtc" => Some("cuda-nvrtc"),
+        "libcudart" => Some("cuda-cudart"),
+        "libcupti" => Some("cuda-cupti"),
+        "libnvToolsExt" => Some("cuda-nvtx"),
+        "libxkbcommon" | "libxkbcommon-x11" => Some("libxkbcommon"),
+        "libxkbfile" => Some("xkeyboard-config"),
+        _ => None,
     }
 }
 
@@ -2319,13 +2357,38 @@ mod tests {
         );
         assert_eq!(pypi_cuda_shadow_component("nvidia-ml-py"), None);
 
+        // MEASURED 2026-08-19: the conda-forge record that owns
+        // `lib/libcusparseLt.so.0` is `cusparselt`, not `libcusparselt`
+        // (imprint-data/.pixi/envs/flashsac-gpu/conda-meta/cusparselt-0.8.1.1-h58dd1b1_1.json).
+        // The real provider must be FIRST -- emission requires the head.
         assert_eq!(
             conda_cuda_shadow_providers("cusparselt"),
-            &["libcusparselt"]
+            &["cusparselt", "libcusparselt"]
         );
+        assert_eq!(conda_cuda_shadow_providers("cusparselt")[0], "cusparselt");
         assert_eq!(conda_cuda_shadow_providers("nccl"), &["nccl"]);
         // Unknown component: no provider names, so the wheel is KEPT.
         assert!(conda_cuda_shadow_providers("hypothetical-new-lib").is_empty());
+    }
+
+    /// Guard (F16c): a linked SONAME retread knows maps to exactly one conda
+    /// provider; an unmapped one returns `None` so the caller must WARN with
+    /// the name rather than drop it silently.
+    #[test]
+    fn linked_sonames_map_to_conda_providers() {
+        assert_eq!(conda_provider_for_soname("libcusparseLt.so.0"), Some("cusparselt"));
+        assert_eq!(
+            conda_provider_for_soname("libcusparseLt.so.0.8.1.1"),
+            Some("cusparselt")
+        );
+        assert_eq!(conda_provider_for_soname("libxkbfile.so.1"), Some("xkeyboard-config"));
+        assert_eq!(
+            conda_provider_for_soname("libxkbcommon.so.0"),
+            Some("libxkbcommon")
+        );
+        assert_eq!(conda_provider_for_soname("libnccl.so.2"), Some("nccl"));
+        // Unmapped: the caller WARNs with the soname; never a silent drop.
+        assert_eq!(conda_provider_for_soname("libtotallyunknown.so.7"), None);
     }
 
     #[test]
