@@ -1611,6 +1611,9 @@ pub(crate) async fn auto_bundle_transitives(
                     git_source: None,
                     sdist_source,
                     metadata_provenance,
+                    // This path fetches the wheel as-is (no phase-D rewrite of
+                    // its own), so the read metadata IS the pre-D view.
+                    original_requires_dist: metadata.requires_dist.clone(),
                     metadata,
                     extras_requested: vec![],
                     auto_data: None,
@@ -3973,6 +3976,10 @@ mod tests {
             git_source: None,
             sdist_source: None,
             metadata_provenance: Provenance::IndexWheelMetadata,
+            original_requires_dist: requires_dist
+                .iter()
+                .map(|requirement| (*requirement).to_string())
+                .collect(),
             metadata: WheelMetadata {
                 name: metadata_name.to_string(),
                 version: version.to_string(),

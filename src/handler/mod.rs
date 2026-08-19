@@ -1992,6 +1992,20 @@ struct ResolvedWheel {
     /// cannot be classified correctly from those fields after the fact.
     metadata_provenance: Provenance,
     metadata: WheelMetadata,
+    /// PRE-relaxation (pre-phase-D) `Requires-Dist` lines of this wheel.
+    ///
+    /// `metadata.requires_dist` is read back out of the POST-D wheel, so under
+    /// `RelaxPolicy::StrongMajor`/`CondaAware` every `<`/`<=` clause has
+    /// already been deleted by `relax::strip_upper_bounds` before anything
+    /// downstream can see it. Final emission is documented as strict-first
+    /// (`relax_decision::decide` is the sole policy-aware relaxation
+    /// boundary), and that contract is only real if emission reads the
+    /// UN-relaxed lines: otherwise a requirer's cap (`huggingface-hub<1.0`)
+    /// is silently gone by the time the policy runs, and the conda side
+    /// happily resolves above it.
+    ///
+    /// Equal to `metadata.requires_dist` when `relax == RelaxPolicy::None`.
+    original_requires_dist: Vec<String>,
     /// v0.12.0+: extras the user requested on the originating
     /// `[retread-wheels]` entry. Surfaced in the audit so debugging
     /// "did extras=[all] expand to the right sub-wheels?" is grep-able.
@@ -10138,6 +10152,10 @@ async fn resolve_bundle(
                 sdist_source: sub_sdist_source,
                 metadata_provenance: sub_metadata_provenance,
                 metadata: sub_metadata,
+                // Pre-D lines: the same value the BFS seeds sub-resolution
+                // from, so emission and resolution agree on what the wheel
+                // actually requires.
+                original_requires_dist: sub_seed_rd.clone(),
                 extras_requested: vec![],
                 auto_data: None,
                 auto_data_dedup_skipped_root: None,
@@ -11257,6 +11275,7 @@ async fn materialize_and_rewrite_with_abi_aliases(
             auto_data: auto_data_report,
             auto_data_dedup_skipped_root: audit_info.dedup_skipped_root,
             metadata,
+            original_requires_dist: original_requires_dist.clone(),
         },
         original_requires_dist,
     ))
@@ -13011,7 +13030,10 @@ fn produce_output_with_conflicts(
                 run_dep_specs.push(dependency);
             }
         }
-        for raw in &wheel.metadata.requires_dist {
+        // Pre-D lines, not `metadata.requires_dist`: phase D already stripped
+        // the caps out of the latter, so reading it made the strict-first
+        // contract below a no-op for exactly the clauses that matter.
+        for raw in &wheel.original_requires_dist {
             let Some(dep) = crate::relax::translate(
                 raw,
                 &env,
@@ -20899,6 +20921,7 @@ mod emit_wheel_upstream_url_tests {
             metadata_provenance: crate::constraint::Provenance::IndexWheelMetadata,
             metadata: dummy_metadata("isaacsim", "6.0.0"),
             extras_requested: vec![],
+            original_requires_dist: vec![],
             auto_data: None,
             auto_data_dedup_skipped_root: None,
         };
@@ -21002,6 +21025,7 @@ mod emit_wheel_upstream_url_tests {
             metadata_provenance: crate::constraint::Provenance::IndexWheelMetadata,
             metadata: dummy_metadata("isaacsim-kernel", "6.0.0"),
             extras_requested: vec![],
+            original_requires_dist: vec![],
             auto_data: None,
             auto_data_dedup_skipped_root: None,
         };
@@ -21024,6 +21048,7 @@ mod emit_wheel_upstream_url_tests {
                 metadata_provenance: crate::constraint::Provenance::IndexWheelMetadata,
                 metadata: dummy_metadata("isaacsim", "6.0.0"),
                 extras_requested: vec![],
+                original_requires_dist: vec![],
                 auto_data: None,
                 auto_data_dedup_skipped_root: None,
             },
