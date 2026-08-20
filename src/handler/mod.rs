@@ -1338,6 +1338,67 @@ struct SiblingPinReconciliation {
     relaxed: BTreeSet<String>,
     /// Recorded relaxations, written into the bundle's relaxation manifest.
     records: Vec<auto_bundle::WheelMetadataRelaxation>,
+    /// F33: `override-dependencies` lines to emit, for conflicts whose losing
+    /// pin lives INSIDE uv's resolution (an upstream `Requires-Dist`) and so
+    /// cannot be rewritten in a constraint or a root line.
+    overrides: Vec<String>,
+}
+
+/// Warn about, and RECORD, one co-resident sibling convergence.
+///
+/// Every within-major sibling relaxation flows through this single path --
+/// whichever lever actually moved: a DECLARED constraint line (F32), this
+/// pack's own uv ROOT requirement, or an `override-dependencies` line that
+/// outranks an upstream `Requires-Dist` (both F33). So the warning and the
+/// bundle's relaxation manifest always name both packs, both versions, the
+/// version chosen, the rule that fired, and the ruling ("pin explicitly to
+/// override").
+///
+/// `role` says which lever moved and reads naturally in both sentences:
+/// `"declared"`, `"root-pinned"`, `"upstream-pinned"`.
+fn record_sibling_convergence(
+    name: &str,
+    role: &str,
+    original: &VersionSpecifiers,
+    relaxed: &str,
+    reason: &str,
+    bundle: &str,
+    sibling_bundle: &str,
+    sibling_version: &Version,
+) -> Vec<auto_bundle::WheelMetadataRelaxation> {
+    tracing::warn!(
+        bundle = %bundle,
+        "co-resident convergence: {name}{original} {role} by `{bundle}` \
+         conflicts with co-activated sibling `{sibling_bundle}` pin {name}=={sibling_version}; \
+         relaxed to {relaxed} so both converge on {sibling_version} (reason={reason}; \
+         within-major sibling conflict auto-relaxed; pin explicitly to override)",
+    );
+    let sibling_version_text = sibling_version.to_string();
+    let decision = crate::relax_decision::RelaxationDecision {
+        origin_id: ConstraintOriginId::from_parts(
+            "co-resident-sibling-pin",
+            [name, sibling_bundle, sibling_version_text.as_str()],
+        ),
+        kind: crate::relax_decision::RelaxationKind::ExactPinWidened,
+        original: original.to_string(),
+        relaxed: relaxed.to_string(),
+        original_clause: original.to_string(),
+        relaxed_clause: Some(relaxed.to_string()),
+        source: format!(
+            "{role} {name}{original} in `{bundle}` vs co-activated sibling \
+             `{sibling_bundle}` pin {name}=={sibling_version}; converged on \
+             {sibling_version} (reason={reason}; within-major sibling conflict \
+             auto-relaxed; pin explicitly to override)"
+        ),
+        tier: RelaxPolicy::Major,
+    };
+    auto_bundle::wheel_metadata_relaxations(
+        &crate::relax::PypiKey::from_pypi(name),
+        &[],
+        vec![decision],
+        bundle,
+        format!(" for bundle '{bundle}'"),
+    )
 }
 
 /// Reconcile a co-activated sibling's RESOLVED pin with this pack's DECLARED
@@ -1441,41 +1502,15 @@ fn reconcile_sibling_pins_with_declared(
             continue;
         };
         let line = format!("{name}{relaxed}");
-        tracing::warn!(
-            bundle = %bundle,
-            "co-resident convergence: {name}{declared_specifiers} declared by `{bundle}` \
-             conflicts with co-activated sibling `{sibling_bundle}` pin {name}=={sibling_version}; \
-             relaxed to {relaxed} so both converge on {sibling_version} (reason={reason}; \
-             within-major sibling conflict auto-relaxed; pin explicitly to override)",
-        );
-        let decision = crate::relax_decision::RelaxationDecision {
-            origin_id: ConstraintOriginId::from_parts(
-                "co-resident-sibling-pin",
-                [
-                    name.as_str(),
-                    sibling_bundle.as_str(),
-                    sibling_version.to_string().as_str(),
-                ],
-            ),
-            kind: crate::relax_decision::RelaxationKind::ExactPinWidened,
-            original: declared_specifiers.to_string(),
-            relaxed: relaxed.clone(),
-            original_clause: declared_specifiers.to_string(),
-            relaxed_clause: Some(relaxed.clone()),
-            source: format!(
-                "declared {name}{declared_specifiers} in `{bundle}` vs co-activated sibling \
-                 `{sibling_bundle}` pin {name}=={sibling_version}; converged on \
-                 {sibling_version} (reason={reason}; within-major sibling conflict \
-                 auto-relaxed; pin explicitly to override)"
-            ),
-            tier: RelaxPolicy::Major,
-        };
-        out.records.extend(auto_bundle::wheel_metadata_relaxations(
-            &crate::relax::PypiKey::from_pypi(&name),
-            &[],
-            vec![decision],
+        out.records.extend(record_sibling_convergence(
+            &name,
+            "declared",
+            &declared_specifiers,
+            &relaxed,
+            reason,
             bundle,
-            format!(" for bundle '{bundle}'"),
+            &sibling_bundle,
+            &sibling_version,
         ));
         declared
             .constraints
@@ -1497,6 +1532,182 @@ fn reconcile_sibling_pins_with_declared(
     sibling
         .constraints
         .retain(|line| !out.superseded.contains(line));
+    out
+}
+
+/// Split a uv ROOT requirement line into its `name[extras]` prefix and its
+/// version specifiers, for the subset of shapes it is safe to REWRITE.
+///
+/// Roots are built as `{name}{extras}{spec}` (`uv_group_closure`) or arrive as
+/// PEP 508 lines from `retread-deps-from`. A marker (`;`) or a direct
+/// reference (`@`) is left alone: neither is a plain version pin, so neither
+/// is a lever this reconciliation may pull.
+fn root_pin_parts(req: &str) -> Option<(String, VersionSpecifiers)> {
+    if req.contains(';') || req.contains('@') {
+        return None;
+    }
+    let index = req.find(['<', '>', '=', '!', '~'])?;
+    let (prefix, spec) = req.split_at(index);
+    let specifiers = VersionSpecifiers::from_str(spec.trim()).ok()?;
+    Some((prefix.trim().to_string(), specifiers))
+}
+
+/// This pack's OWN committed lock, as canonical PyPI name -> resolved version.
+///
+/// The symmetric read of [`push_sibling_resolved_pins`]: it is how a pack
+/// learns the version an UPSTREAM distribution's exact `Requires-Dist` pinned
+/// it to last solve -- a pin that appears in neither our declared constraints
+/// nor our roots, because it lives inside uv's resolution. Empty on a cold
+/// pass (no lock yet), which leaves pre-F33 behaviour untouched.
+fn own_resolved_pins(
+    source_dir: &Path,
+    bundle_name: &str,
+    target: &ResolutionTarget,
+) -> BTreeMap<String, Version> {
+    let Ok(lock) =
+        crate::lock::RetreadLock::load(&lock_path_for_target(source_dir, bundle_name, target))
+    else {
+        return BTreeMap::new();
+    };
+    if lock.schema != crate::lock::SCHEMA {
+        return BTreeMap::new();
+    }
+    lock.wheels
+        .iter()
+        .filter_map(|wheel| {
+            Version::from_str(&wheel.version)
+                .ok()
+                .map(|version| (canonical_conda_name(&wheel.name), version))
+        })
+        .collect()
+}
+
+/// Reconcile a co-activated sibling's RESOLVED pin against the pins this pack
+/// holds OUTSIDE its declared constraint lines (F33).
+///
+/// F32 relaxes a within-major sibling conflict only when the losing side is a
+/// declared CONSTRAINT line. Every conflict measured on cert18 has its losing
+/// side in one of two other shapes, so none of them converged:
+///
+/// * a uv ROOT requirement -- a workspace-declared exact `[retread-wheels]`
+///   pin (`rtree==1.2.0`, `wandb==0.23.0` in protomotions' closure). Rewritten
+///   in place to the band [`classify_ceded_bound`] computes, exactly as F32
+///   rewrites a constraint line, so the surviving sibling pin carries the
+///   convergence and stays yieldable.
+/// * an upstream distribution's exact `Requires-Dist`
+///   (isaacsim-core's `trimesh==4.5.1` in isaaclab's closure). That pin is
+///   inside uv's resolution and is not ours to rewrite; only an
+///   `override-dependencies` line outranks it, so one is emitted for
+///   `name=={sibling}`. The losing version is read back from this pack's own
+///   committed lock ([`own_resolved_pins`]) -- the symmetric counterpart of
+///   the sibling pin we are reconciling against.
+///
+/// Determinism is the same rule F32 uses: the target is `max(pair)`, computed
+/// from the two versions and never from arrival order. Only the LOSING side
+/// moves -- when this pack already holds the pair's maximum nothing is done,
+/// because uv's own conflict/yield path (`is_yieldable_advisory_source`) drops
+/// the lower, yieldable sibling pin and both packs land on the same maximum.
+///
+/// Precedence honesty: a workspace-declared exact ROOT pin is only ever
+/// relaxed when it ACTUALLY conflicts with a co-resident sibling's resolved
+/// pin -- that conflict is exactly the operator's within-major ruling. With no
+/// sibling pin for the name, or with the sibling at the same version, the root
+/// line is passed through byte-identical. Cross-major still refuses, and the
+/// F26 CalVer arm still applies (both come from `classify_ceded_bound`).
+fn reconcile_sibling_pins_with_local_pins(
+    sibling: &crate::uv_closure::ConstraintSet,
+    declared: &crate::uv_closure::ConstraintSet,
+    roots: &mut [String],
+    own_resolved: &BTreeMap<String, Version>,
+    already_relaxed: &BTreeSet<String>,
+    bundle: &str,
+) -> SiblingPinReconciliation {
+    let mut out = SiblingPinReconciliation::default();
+    let shared: Vec<(String, crate::uv_closure::ConstraintProvenance)> = sibling
+        .provenance
+        .iter()
+        .filter(|(_, provenance)| {
+            provenance
+                .source
+                .starts_with(crate::uv_closure::COACTIVATED_SIBLING_PIN_SOURCE_PREFIX)
+        })
+        .map(|(name, provenance)| (name.clone(), provenance.clone()))
+        .collect();
+    for (name, sibling_provenance) in shared {
+        let Some(sibling_version) = constraint_specifiers(&name, &sibling_provenance.constraint)
+            .as_ref()
+            .and_then(exact_pinned_version)
+        else {
+            continue;
+        };
+        let sibling_bundle = sibling_provenance
+            .source
+            .strip_prefix(crate::uv_closure::COACTIVATED_SIBLING_PIN_SOURCE_PREFIX)
+            .unwrap_or(sibling_provenance.source.as_str())
+            .to_string();
+        // Which lever, if any, holds this pack's losing pin?
+        let root_index = roots
+            .iter()
+            .position(|req| root_req_name(req).as_deref() == Some(name.as_str()));
+        let lever = match root_index {
+            Some(index) => root_pin_parts(&roots[index])
+                .map(|(prefix, specifiers)| (Some((index, prefix)), specifiers)),
+            // A name this pack DECLARES a bound for belongs to F32; never
+            // relax the same name twice through two different levers.
+            None if declared.provenance.contains_key(&name) => None,
+            None => own_resolved.get(&name).and_then(|version| {
+                VersionSpecifiers::from_str(&format!("=={version}"))
+                    .ok()
+                    .map(|specifiers| (None, specifiers))
+            }),
+        };
+        let Some((root_target, local_specifiers)) = lever else {
+            continue;
+        };
+        let Some(local_version) = exact_pinned_version(&local_specifiers) else {
+            continue;
+        };
+        // No conflict, or this pack already holds max(pair): leave the line
+        // byte-identical. uv's yield path converges the sibling on us.
+        if local_version >= sibling_version {
+            continue;
+        }
+        let CededBoundVerdict::WithinMajor { relaxed, reason } =
+            classify_ceded_bound(&local_specifiers, &sibling_version)
+        else {
+            // Satisfied is unreachable (the versions differ); CrossMajor keeps
+            // the refusal to relax across a major.
+            continue;
+        };
+        let (role, applied) = match root_target {
+            Some((index, prefix)) => {
+                roots[index] = format!("{prefix}{relaxed}");
+                ("root-pinned", relaxed.clone())
+            }
+            None => {
+                let line = format!("{name}=={sibling_version}");
+                if !out.overrides.contains(&line) {
+                    out.overrides.push(line);
+                }
+                ("upstream-pinned", format!("=={sibling_version}"))
+            }
+        };
+        // F32 already warned and recorded for this name; the lever above still
+        // has to move, but the manifest must not carry the row twice.
+        if !already_relaxed.contains(&name) {
+            out.records.extend(record_sibling_convergence(
+                &name,
+                role,
+                &local_specifiers,
+                &applied,
+                reason,
+                bundle,
+                &sibling_bundle,
+                &sibling_version,
+            ));
+        }
+        out.relaxed.insert(name);
+    }
     out
 }
 
@@ -2057,6 +2268,246 @@ composed = { features = ["composed"], no-default-feature = true }
         assert_eq!(
             a, b,
             "A-then-B and B-then-A must converge on the same version",
+        );
+    }
+
+    /// Only the sibling half of [`f32_pair`] -- the F33 shapes hold their
+    /// losing pin somewhere OTHER than a declared constraint line.
+    fn f33_sibling_pin(
+        name: &str,
+        sibling_version: &str,
+        sibling_bundle: &str,
+    ) -> crate::uv_closure::ConstraintSet {
+        f32_pair(name, "0.0.0", sibling_version, sibling_bundle).1
+    }
+
+    fn f33_own_lock(pins: &[(&str, &str)]) -> BTreeMap<String, super::Version> {
+        pins.iter()
+            .map(|(name, version)| {
+                (
+                    (*name).to_string(),
+                    version.parse::<super::Version>().expect("test version"),
+                )
+            })
+            .collect()
+    }
+
+    /// F33 guard (a): the losing pin is a uv ROOT REQUIREMENT line -- the
+    /// cert18 `rtree`/`wandb` shape, where protomotions' workspace-declared
+    /// exact `[retread-wheels]` pin (not a constraint line) is what F32 could
+    /// not reach. It must widen to the same band, with the same record.
+    #[test]
+    fn a_within_major_root_requirement_pin_relaxes_toward_the_sibling() {
+        let sibling = f33_sibling_pin("rtree", "1.3.0", "isaaclab-2.3x-pack");
+        let mut roots = vec![
+            "rtree==1.2.0".to_string(),
+            "numpy==1.26.4".to_string(),
+            "torch[opt]==2.5.1".to_string(),
+        ];
+
+        let out = super::reconcile_sibling_pins_with_local_pins(
+            &sibling,
+            &crate::uv_closure::ConstraintSet::default(),
+            &mut roots,
+            &BTreeMap::new(),
+            &std::collections::BTreeSet::new(),
+            "protomotions-deps-pack",
+        );
+
+        assert_eq!(
+            roots,
+            vec![
+                "rtree>=1.2.0,<2".to_string(),
+                "numpy==1.26.4".to_string(),
+                "torch[opt]==2.5.1".to_string(),
+            ],
+            "the losing ROOT pin widens to the compatible band; unrelated roots \
+             are byte-identical",
+        );
+        assert!(
+            out.overrides.is_empty(),
+            "a rewritable root needs no override: {:?}",
+            out.overrides,
+        );
+        assert_eq!(
+            out.relaxed,
+            std::collections::BTreeSet::from(["rtree".to_string()]),
+        );
+        assert_eq!(out.records.len(), 1);
+        let record = out.records[0].to_string();
+        for needle in [
+            "rtree",
+            "protomotions-deps-pack",
+            "isaaclab-2.3x-pack",
+            "1.2.0",
+            "1.3.0",
+            "converged on 1.3.0",
+            "reason=within-major",
+            "within-major sibling conflict auto-relaxed; pin explicitly to override",
+        ] {
+            assert!(
+                record.contains(needle),
+                "the relaxation record must name {needle}: {record}",
+            );
+        }
+    }
+
+    /// F33 guard (b): the losing pin is an UPSTREAM distribution's exact
+    /// `Requires-Dist` -- the cert18 `trimesh` shape (isaacsim-core pins
+    /// `trimesh==4.5.1` inside uv's resolution while protomotions resolved
+    /// 4.5.3). It is in no line we own, so the only lever is an
+    /// `override-dependencies` entry for `max(pair)`; the losing version is
+    /// read back from this pack's own committed lock.
+    #[test]
+    fn an_upstream_requires_dist_pin_relaxes_via_an_override() {
+        let sibling = f33_sibling_pin("trimesh", "4.5.3", "protomotions-deps-pack");
+        let mut roots = vec!["isaacsim-core==4.5.0".to_string()];
+
+        let out = super::reconcile_sibling_pins_with_local_pins(
+            &sibling,
+            &crate::uv_closure::ConstraintSet::default(),
+            &mut roots,
+            &f33_own_lock(&[("trimesh", "4.5.1"), ("isaacsim-core", "4.5.0")]),
+            &std::collections::BTreeSet::new(),
+            "isaaclab-2.3x-pack",
+        );
+
+        assert_eq!(
+            out.overrides,
+            vec!["trimesh==4.5.3".to_string()],
+            "only an override outranks an upstream Requires-Dist exact pin",
+        );
+        assert_eq!(
+            roots,
+            vec!["isaacsim-core==4.5.0".to_string()],
+            "the roots hold no trimesh pin and must be untouched",
+        );
+        assert_eq!(
+            out.relaxed,
+            std::collections::BTreeSet::from(["trimesh".to_string()]),
+        );
+        assert_eq!(out.records.len(), 1);
+        let record = out.records[0].to_string();
+        for needle in [
+            "trimesh",
+            "isaaclab-2.3x-pack",
+            "protomotions-deps-pack",
+            "4.5.1",
+            "4.5.3",
+            "converged on 4.5.3",
+            "reason=within-major",
+            "within-major sibling conflict auto-relaxed; pin explicitly to override",
+        ] {
+            assert!(
+                record.contains(needle),
+                "the relaxation record must name {needle}: {record}",
+            );
+        }
+    }
+
+    /// F33 guard (c) -- PRECEDENCE HONESTY. A workspace-declared exact pin is
+    /// relaxed ONLY where it actually conflicts with a co-resident sibling's
+    /// resolved pin. No sibling pin for the name, and a sibling pin at the
+    /// SAME version, both leave every line byte-identical and record nothing.
+    #[test]
+    fn a_declared_pin_without_a_sibling_conflict_is_untouched() {
+        let unrelated = f33_sibling_pin("rtree", "1.3.0", "isaaclab-2.3x-pack");
+        let mut roots = vec!["wandb==0.23.0".to_string(), "numpy==1.26.4".to_string()];
+        let before = roots.clone();
+
+        let out = super::reconcile_sibling_pins_with_local_pins(
+            &unrelated,
+            &crate::uv_closure::ConstraintSet::default(),
+            &mut roots,
+            &f33_own_lock(&[("wandb", "0.23.0"), ("numpy", "1.26.4")]),
+            &std::collections::BTreeSet::new(),
+            "protomotions-deps-pack",
+        );
+
+        assert_eq!(roots, before, "no sibling pin names these -- nothing moves");
+        assert!(out.overrides.is_empty());
+        assert!(out.relaxed.is_empty());
+        assert!(out.records.is_empty());
+
+        // Same name, same version: co-resident agreement, not a conflict.
+        let agreed = f33_sibling_pin("wandb", "0.23.0", "isaaclab-2.3x-pack");
+        let mut roots = before.clone();
+        let out = super::reconcile_sibling_pins_with_local_pins(
+            &agreed,
+            &crate::uv_closure::ConstraintSet::default(),
+            &mut roots,
+            &f33_own_lock(&[("wandb", "0.23.0")]),
+            &std::collections::BTreeSet::new(),
+            "protomotions-deps-pack",
+        );
+        assert_eq!(roots, before, "an agreeing sibling pin is not a conflict");
+        assert!(out.overrides.is_empty());
+        assert!(out.records.is_empty());
+    }
+
+    /// F33 guard (d): a CROSS-major conflict is still refused at the new
+    /// levers -- neither the root line nor an override moves, and nothing is
+    /// recorded. Same refusal F32 keeps for constraint lines.
+    #[test]
+    fn a_cross_major_root_requirement_conflict_is_still_refused() {
+        let sibling = f33_sibling_pin("rtree", "2.3.0", "isaaclab-2.3x-pack");
+        let mut roots = vec!["rtree==1.2.0".to_string()];
+
+        let out = super::reconcile_sibling_pins_with_local_pins(
+            &sibling,
+            &crate::uv_closure::ConstraintSet::default(),
+            &mut roots,
+            &BTreeMap::new(),
+            &std::collections::BTreeSet::new(),
+            "protomotions-deps-pack",
+        );
+
+        assert_eq!(roots, vec!["rtree==1.2.0".to_string()]);
+        assert!(out.overrides.is_empty());
+        assert!(out.relaxed.is_empty());
+        assert!(out.records.is_empty());
+
+        // ... and the same refusal on the upstream/override lever.
+        let sibling = f33_sibling_pin("trimesh", "5.1.0", "protomotions-deps-pack");
+        let mut roots: Vec<String> = Vec::new();
+        let out = super::reconcile_sibling_pins_with_local_pins(
+            &sibling,
+            &crate::uv_closure::ConstraintSet::default(),
+            &mut roots,
+            &f33_own_lock(&[("trimesh", "4.5.1")]),
+            &std::collections::BTreeSet::new(),
+            "isaaclab-2.3x-pack",
+        );
+        assert!(out.overrides.is_empty(), "{:?}", out.overrides);
+        assert!(out.records.is_empty());
+    }
+
+    /// F33 guard (e): a name F32 already relaxed on the DECLARED lever keeps
+    /// its single manifest row -- the root line still has to move (uv reads
+    /// both), but the relaxation is not recorded twice.
+    #[test]
+    fn a_name_f32_already_relaxed_moves_its_root_without_a_second_record() {
+        let sibling = f33_sibling_pin("rtree", "1.3.0", "isaaclab-2.3x-pack");
+        let mut roots = vec!["rtree==1.2.0".to_string()];
+
+        let out = super::reconcile_sibling_pins_with_local_pins(
+            &sibling,
+            &crate::uv_closure::ConstraintSet::default(),
+            &mut roots,
+            &BTreeMap::new(),
+            &std::collections::BTreeSet::from(["rtree".to_string()]),
+            "protomotions-deps-pack",
+        );
+
+        assert_eq!(roots, vec!["rtree>=1.2.0,<2".to_string()]);
+        assert!(
+            out.records.is_empty(),
+            "F32 already recorded this name: {:?}",
+            out.records,
+        );
+        assert_eq!(
+            out.relaxed,
+            std::collections::BTreeSet::from(["rtree".to_string()]),
         );
     }
 
@@ -8792,6 +9243,9 @@ async fn uv_group_closure(
     // co-activated sibling's resolved pin. Returned so they land in the
     // bundle's relaxation manifest like every other recorded relaxation.
     let mut sibling_pin_relaxations: Vec<auto_bundle::WheelMetadataRelaxation> = Vec::new();
+    // F33: override-dependencies lines emitted for sibling conflicts whose
+    // losing pin lives inside uv's resolution (an upstream `Requires-Dist`).
+    let mut sibling_pin_overrides: Vec<String> = Vec::new();
     if let (Some(manifest), Some(ws_dir)) = (manifest_opt.as_ref(), workspace_dir) {
         let mut sibling_constraints =
             sibling_lock_constraints(manifest, ws_dir, source_dir, target);
@@ -8827,6 +9281,22 @@ async fn uv_group_closure(
         );
         let superseded = reconciliation.superseded;
         sibling_pin_relaxations.extend(reconciliation.records);
+        // F33: the losing side of a within-major sibling conflict is usually
+        // NOT a declared constraint line -- it is this pack's own uv ROOT
+        // requirement or an upstream distribution's exact `Requires-Dist`.
+        // Neither is reachable from `constraints`, so pull those two levers
+        // here, through the same warning/record path.
+        let local_reconciliation = reconcile_sibling_pins_with_local_pins(
+            &sibling_constraints,
+            &constraints,
+            &mut roots,
+            &own_resolved_pins(source_dir, group_name, target),
+            &reconciliation.relaxed,
+            group_name,
+        );
+        let relaxed_for_sibling = reconciliation.relaxed.len() + local_reconciliation.relaxed.len();
+        sibling_pin_relaxations.extend(local_reconciliation.records);
+        sibling_pin_overrides.extend(local_reconciliation.overrides);
         let sibling_pins = sibling_constraints
             .provenance
             .values()
@@ -8843,7 +9313,7 @@ async fn uv_group_closure(
                 pins = sibling_pins,
                 advisory_pins = advisory_pins,
                 superseded_by_declared = superseded.len(),
-                relaxed_for_sibling = reconciliation.relaxed.len(),
+                relaxed_for_sibling = relaxed_for_sibling,
                 "uv closure: applying co-activated sibling pack requirements",
             );
         }
@@ -8987,6 +9457,29 @@ async fn uv_group_closure(
             "uv closure: injected built-in Windows-only drops (packs need no \
              retread-drop-deps for these); re-enable any via retread-overrides",
         );
+    }
+    // F33 co-resident convergence overrides: an upstream distribution's exact
+    // `Requires-Dist` lives inside uv's resolution, so an override is the only
+    // line that outranks it. Emitted LAST so an explicit user
+    // `retread-overrides`/`retread-drop-deps` entry for the same name always
+    // wins -- the same precedence the win-only injection uses.
+    for line in &sibling_pin_overrides {
+        let Some(name) = root_req_name(line) else {
+            continue;
+        };
+        if overrides
+            .iter()
+            .any(|existing| root_req_name(existing).as_deref() == Some(name.as_str()))
+        {
+            continue;
+        }
+        tracing::info!(
+            bundle = %group_name,
+            override_line = %line,
+            "uv closure: co-resident convergence override (an upstream Requires-Dist \
+             exact pin loses a within-major sibling conflict)",
+        );
+        overrides.push(line.clone());
     }
 
     // Root chain: explicit entry indexes in group order, then the complete
