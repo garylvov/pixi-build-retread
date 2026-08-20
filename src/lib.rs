@@ -9,6 +9,7 @@ pub mod concurrency;
 pub mod conda_solve;
 pub mod config;
 pub mod constraint;
+pub mod coresident_pins;
 pub mod courier;
 pub mod deps_from;
 pub mod emit_pypi;
