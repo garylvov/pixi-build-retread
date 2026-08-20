@@ -2089,8 +2089,8 @@ pub fn classify_pylock_offenders(pylock_text: &str) -> Result<ClosureOffenders> 
 }
 
 /// A wheel AUTO-BUILT from a PyPI sdist by the sdist-only self-heal's
-/// THIRD rung (ladder: wheel -> conda-route -> sdist auto-build ->
-/// error), reached when a package has no wheels at all AND no conda
+/// SECOND rung (ladder: conda-route -> sdist auto-build -> wheel retreat
+/// -> error), reached when a package has no wheels at all AND no conda
 /// channel carries any version of it. Built through the SAME machinery
 /// git-sourced `[retread-wheels]` entries use
 /// ([`crate::source_build::build_wheel_from_sdist_url`]), stored
@@ -2180,9 +2180,20 @@ pub fn sdist_build_failed_message(failures: &[(String, String)]) -> String {
 ///    the default). Registers a `tool.uv.sources` path source so the
 ///    re-solve is satisfied like a real index wheel, and records a
 ///    [`BuiltSdistWheel`] for the caller to splice into the closure.
-/// 3. **error**: build rung disabled (`sdist_build` is `None`) or the
-///    build itself fails -> Pass A's original error surfaces (with the
-///    build failure's log tail on a build failure). Never silently drops a
+/// 3. **wheel retreat**: the build FAILED. Pass B drops `--no-build`, so
+///    it is free to drift a package UP onto a release that publishes no
+///    wheel at all (mujoco 3.12.0 ships only a tar.gz and its build needs
+///    `MUJOCO_PATH`), even though Pass A had happily resolved the newest
+///    WHEELED release (3.11.0). A build failure is therefore the signal
+///    that this offender is a drift artifact, not a genuine sdist-only
+///    package -- genuinely sdist-only names (pyperclip, antlr4) BUILD, so
+///    they never reach this rung. Inject a `name<version` cap into
+///    `req.constraints` and re-solve, retreating the closure to the newest
+///    wheeled release. Bounded by [`SDIST_HEAL_MAX_CAPS`] caps per bundle.
+/// 4. **error**: build rung disabled (`sdist_build` is `None`), the same
+///    version comes back with its cap already in force, or the cap bound
+///    is exhausted -> Pass A's original error surfaces (with the build
+///    failure's log tail on a build failure). Never silently drops a
 ///    dependency. (Under `sdist-build = "never"`, Pass B keeps
 ///    `--no-build` so sdist-only offenders never appear here in the first
 ///    place -- this branch is defensive.)
@@ -2200,6 +2211,42 @@ pub fn sdist_build_failed_message(failures: &[(String, String)]) -> String {
 /// discovered are appended to `routed` / `built` / `prereleased` (shared
 /// with the caller via `Arc<Mutex<_>>`) so a wrapping caller can splice
 /// them into the final closure and log them.
+/// Maximum sdist-build RETREAT caps the heal may inject for one bundle
+/// (see [`with_sdist_heal`] rung 3). Each cap walks one package down to
+/// its previous release; a bundle that needs more than this is drifting,
+/// not healing, and the error names every cap attempted.
+pub const SDIST_HEAL_MAX_CAPS: usize = 4;
+
+/// `ConstraintProvenance::source` for a retreat cap the sdist heal
+/// injected. Never a workspace/user fact: solver bookkeeping only.
+pub const SDIST_HEAL_CAP_SOURCE: &str = "sdist-heal-cap";
+
+/// Inject `name<version` retreat caps into the request's constraints
+/// (idempotent). Marked as auto-route-class bookkeeping so the cap is
+/// never mistaken for an authoritative workspace requirement.
+fn apply_heal_caps(req: &mut UvClosureRequest, caps: &[(String, String)]) {
+    for (name, version) in caps {
+        let line = format!("{name}<{version}");
+        if req.constraints.constraints.contains(&line) {
+            continue;
+        }
+        let index = req.constraints.constraints.len();
+        req.constraints.constraints.push(line.clone());
+        req.constraints.auto_route_constraint_indices.insert(index);
+        req.constraints.provenance.insert(
+            name.clone(),
+            ConstraintProvenance {
+                constraint: line,
+                conda_name: name.clone(),
+                conda_version: format!("<{version}"),
+                source: SDIST_HEAL_CAP_SOURCE.to_string(),
+                env: "default".to_string(),
+                provenance: Provenance::PriorSelection,
+            },
+        );
+    }
+}
+
 pub fn with_sdist_heal<S, SP, SB>(
     bundle: String,
     solve: S,
@@ -2229,11 +2276,17 @@ where
     let solve = std::sync::Arc::new(std::sync::Mutex::new(solve));
     let sdist_probe = std::sync::Arc::new(sdist_probe);
     let sdist_build = std::sync::Arc::new(sdist_build);
+    // Retreat caps (rung 3) survive the OUTER fixpoint's rounds the same
+    // way routes/builds do: the fixpoint owns `req` and knows nothing
+    // about them, so they are re-applied to every incoming request.
+    let heal_caps: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     move |mut req: UvClosureRequest| {
         let bundle = bundle.clone();
         let solve = std::sync::Arc::clone(&solve);
         let sdist_probe = std::sync::Arc::clone(&sdist_probe);
         let sdist_build = std::sync::Arc::clone(&sdist_build);
+        let heal_caps = std::sync::Arc::clone(&heal_caps);
         let routed = std::sync::Arc::clone(&routed);
         let built = std::sync::Arc::clone(&built);
         let prereleased = std::sync::Arc::clone(&prereleased);
@@ -2264,6 +2317,10 @@ where
                 req.explicit_pins
                     .insert(p.pypi_name.clone(), p.version.clone());
             }
+        }
+        {
+            let already = heal_caps.lock().unwrap();
+            apply_heal_caps(&mut req, &already);
         }
         let fut = (*solve.lock().unwrap())(req.clone());
         Box::pin(async move {
@@ -2414,15 +2471,68 @@ where
                                     }
                                 }
                             }
-                            // Rung 3: any build failure aborts loudly (a
-                            // partial success still fails rather than
-                            // silently dropping the failed name).
+                            // Rung 3: a build failure means Pass B drifted
+                            // this name UP onto a wheel-less release (Pass A
+                            // resolved the newest WHEELED one under
+                            // `--no-build`). Cap it below the failing version
+                            // and re-solve so the closure retreats to that
+                            // wheeled release. Genuine sdist-only packages
+                            // BUILD, so they never reach here.
                             if !build_failures.is_empty() {
-                                bail!(
-                                    "{}{}",
-                                    heal.original_error,
-                                    sdist_build_failed_message(&build_failures)
-                                );
+                                let mut caps = heal_caps.lock().unwrap();
+                                let mut fresh: Vec<(String, String, String)> = Vec::new();
+                                for (name, err) in &build_failures {
+                                    let Some((_, version)) =
+                                        sdist_names.iter().find(|(n, _)| n == name)
+                                    else {
+                                        continue;
+                                    };
+                                    // Same version back WITH its cap already
+                                    // in force: no retreat left (rung 4).
+                                    if caps.iter().any(|(n, v)| n == name && v == version) {
+                                        continue;
+                                    }
+                                    fresh.push((
+                                        name.clone(),
+                                        version.clone(),
+                                        err.lines()
+                                            .next()
+                                            .unwrap_or("build failed")
+                                            .trim()
+                                            .to_string(),
+                                    ));
+                                }
+                                if fresh.is_empty() {
+                                    bail!(
+                                        "{}{}",
+                                        heal.original_error,
+                                        sdist_build_failed_message(&build_failures)
+                                    );
+                                }
+                                if caps.len() + fresh.len() > SDIST_HEAL_MAX_CAPS {
+                                    let attempts: Vec<String> = caps
+                                        .iter()
+                                        .map(|(n, v)| format!("{n}<{v}"))
+                                        .chain(fresh.iter().map(|(n, v, _)| format!("{n}<{v}")))
+                                        .collect();
+                                    bail!(
+                                        "sdist-build retreat exceeded {} caps for bundle `{}` \
+                                         (attempted: {}){}",
+                                        SDIST_HEAL_MAX_CAPS,
+                                        bundle,
+                                        attempts.join(", "),
+                                        sdist_build_failed_message(&build_failures),
+                                    );
+                                }
+                                for (name, version, first) in &fresh {
+                                    tracing::warn!(
+                                        bundle = %bundle,
+                                        "sdist build for {name}=={version} failed ({first}); \
+                                         capping {name}<{version} and re-solving",
+                                    );
+                                    caps.push((name.clone(), version.clone()));
+                                }
+                                apply_heal_caps(&mut req, &caps);
                             }
                         }
 
@@ -11732,6 +11842,126 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
         assert!(msg.contains("has no usable wheels"), "{msg}");
         assert!(msg.contains("sdist auto-build failed"), "{msg}");
         assert!(msg.contains("missing gcc"), "{msg}");
+    }
+
+    /// F28 rung 3 (wheel retreat): Pass B drifted `mujoco` up onto
+    /// 3.12.0, which publishes only a tar.gz whose build needs
+    /// `MUJOCO_PATH`. The build FAILS, so the heal must cap
+    /// `mujoco<3.12.0` and re-solve rather than surfacing Pass A's error;
+    /// the retreat lands on the newest wheeled release (3.11.0).
+    #[tokio::test]
+    async fn heal_caps_and_resolves_when_sdist_build_fails() {
+        let seen_constraints = Arc::new(Mutex::new(Vec::new()));
+        let solve = {
+            let seen_constraints = Arc::clone(&seen_constraints);
+            move |r: UvClosureRequest| {
+                let seen_constraints = Arc::clone(&seen_constraints);
+                Box::pin(async move {
+                    let constraints = r.constraints.constraints.clone();
+                    seen_constraints.lock().unwrap().push(constraints.clone());
+                    if constraints.iter().any(|c| c == "mujoco<3.12.0") {
+                        // Capped: uv retreats to the wheeled 3.11.0.
+                        parse_pylock_closure(
+                            PYLOCK_FIXTURE,
+                            &target("3.12", "linux-64"),
+                            &BTreeSet::new(),
+                            "0.11.15",
+                        )
+                    } else {
+                        Err(heal_needed(
+                            &[("mujoco", "3.12.0")],
+                            &[],
+                            "distribution mujoco==3.12.0 can't be installed \
+                             because it has no usable wheels",
+                        ))
+                    }
+                }) as futures::future::BoxFuture<'static, Result<UvClosure>>
+            }
+        };
+        let probe = |_n: String, _s: String| {
+            Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
+        };
+        let sdist_probe = |_n: String, _s: String| {
+            Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
+        };
+        let sdist_build = |_n: String, _r: Option<String>| {
+            Box::pin(async {
+                bail!(
+                    "uv [\"build\", \"--wheel\"] failed (status 1)\n    RuntimeError: \
+                     MUJOCO_PATH environment variable is not set"
+                )
+            }) as futures::future::BoxFuture<'static, Result<BuiltSdistWheel>>
+        };
+        auto_route_fixpoint_with_sdist_heal(
+            &auto_route_req(),
+            &auto_route_opts(),
+            solve,
+            probe,
+            sdist_probe,
+            Some(sdist_build),
+        )
+        .await
+        .expect("the retreat cap must heal the closure, not surface Pass A's error");
+        let seen = seen_constraints.lock().unwrap();
+        assert!(seen.len() >= 2, "expected a re-solve after the cap: {seen:?}");
+        assert!(
+            !seen[0].iter().any(|c| c == "mujoco<3.12.0"),
+            "the first attempt must be uncapped: {seen:?}"
+        );
+        assert!(
+            seen[1].iter().any(|c| c == "mujoco<3.12.0"),
+            "the re-solve after the failed build must carry the cap: {seen:?}"
+        );
+    }
+
+    /// The retreat is BOUNDED: a package that keeps failing to build at a
+    /// fresh version each round stops after [`SDIST_HEAL_MAX_CAPS`] caps
+    /// and the error names every cap attempted.
+    #[tokio::test]
+    async fn heal_cap_retreat_is_bounded_and_names_every_attempt() {
+        let rounds = Arc::new(Mutex::new(0usize));
+        let versions = ["3.12.0", "3.11.0", "3.10.0", "3.9.0", "3.8.0"];
+        let solve = {
+            let rounds = Arc::clone(&rounds);
+            move |_r: UvClosureRequest| {
+                let rounds = Arc::clone(&rounds);
+                Box::pin(async move {
+                    let mut n = rounds.lock().unwrap();
+                    let version = versions[(*n).min(versions.len() - 1)];
+                    *n += 1;
+                    Err(heal_needed(
+                        &[("mujoco", version)],
+                        &[],
+                        "package `mujoco` has no usable wheels",
+                    ))
+                }) as futures::future::BoxFuture<'static, Result<UvClosure>>
+            }
+        };
+        let probe = |_n: String, _s: String| {
+            Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
+        };
+        let sdist_probe = |_n: String, _s: String| {
+            Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
+        };
+        let sdist_build = |_n: String, _r: Option<String>| {
+            Box::pin(async { bail!("RuntimeError: MUJOCO_PATH environment variable is not set") })
+                as futures::future::BoxFuture<'static, Result<BuiltSdistWheel>>
+        };
+        let err = auto_route_fixpoint_with_sdist_heal(
+            &auto_route_req(),
+            &auto_route_opts(),
+            solve,
+            probe,
+            sdist_probe,
+            Some(sdist_build),
+        )
+        .await
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("retreat exceeded 4 caps"), "{msg}");
+        for version in versions {
+            assert!(msg.contains(&format!("mujoco<{version}")), "{msg}");
+        }
     }
 
     /// `sdist-build = "never"` with a (defensive) sdist-only offender and
