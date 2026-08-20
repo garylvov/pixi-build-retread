@@ -51,13 +51,52 @@ fn pep440_versions_equal(left: &str, right: &str) -> bool {
     }
 }
 
-fn installed_version_path<'a>(
+/// A PEP 440 version with its LOCAL SEGMENT removed: `2.5.1+cu124` ->
+/// `2.5.1`. Unparseable input is returned unchanged.
+fn strip_local_segment(version: &str) -> String {
+    match uv_pep508::uv_pep440::Version::from_str(version) {
+        Ok(parsed) => parsed.clone().without_local().to_string(),
+        Err(_) => version.to_string(),
+    }
+}
+
+/// PEP 440 equality with the local segment stripped from the WHEEL (locked)
+/// side only.
+///
+/// conda versions never carry a local tag -- conda encodes the CUDA variant in
+/// the BUILD STRING (`pytorch-2.5.1-py3.10_cuda12.4_...`), not in the version --
+/// while a PyPI CUDA wheel does: `torch==2.5.1+cu124`. Comparing the two
+/// strictly makes `2.5.1+cu124 != 2.5.1`, so a conda-provided torch is not
+/// recognised as owning the locked torch, uv is asked to replace it, and its
+/// legacy-egg-info uninstall aborts with
+/// `failed to remove directory .../site-packages/torch: Directory not empty`
+/// (F27, `ws.C4g2` sage env / `sage-isaac-pack`). The local tag is metadata
+/// about the build, not a different release: a conda 2.5.1 DOES satisfy a
+/// locked 2.5.1+cu124. A genuine release difference (conda 2.5.0 vs locked
+/// 2.5.1+cu124) still does not match, because only the local segment is
+/// discarded.
+fn pep440_equal_ignoring_wheel_local(installed: &str, locked: &str) -> bool {
+    pep440_versions_equal(installed, locked)
+        || pep440_versions_equal(installed, &strip_local_segment(locked))
+}
+
+/// The installed dist root that satisfies a locked `name==version`. Exact
+/// PEP 440 equality always; the local-tag relaxation above only when conda
+/// owns this distribution at the stripped version, so a non-conda 2.5.1 can
+/// never stand in for a locked 2.5.1+cu124.
+fn installed_path_for_locked<'a>(
     versions: &'a BTreeMap<String, PathBuf>,
-    expected: &str,
+    locked_version: &str,
+    conda_owned_here: bool,
 ) -> Option<&'a PathBuf> {
-    versions
-        .iter()
-        .find_map(|(version, path)| pep440_versions_equal(version, expected).then_some(path))
+    versions.iter().find_map(|(version, path)| {
+        let hit = if conda_owned_here {
+            pep440_equal_ignoring_wheel_local(version, locked_version)
+        } else {
+            pep440_versions_equal(version, locked_version)
+        };
+        hit.then_some(path)
+    })
 }
 
 /// True if uv's output shows a wheel rejected purely for an unsatisfied
@@ -893,11 +932,32 @@ async fn materialize_locked_wheels(
             );
             continue;
         }
-        if conda_owned_at_version(conda_owned, &normalized_name, &wheel.version) {
+        if let Some(owned_version) =
+            conda_owned_version_at(conda_owned, &normalized_name, &wheel.version)
+        {
+            if !pep440_versions_equal(owned_version, &wheel.version) {
+                tracing::info!(
+                    bundle = %lock.bundle,
+                    dist = %wheel.name,
+                    locked_version = %wheel.version,
+                    conda_version = %owned_version,
+                    "retread install: {} conda-provided {} matches locked {} once the \
+                     wheel's local segment (+{}) is stripped; conda spells the CUDA \
+                     variant in its build string, so the two name the same release",
+                    wheel.name,
+                    owned_version,
+                    wheel.version,
+                    wheel
+                        .version
+                        .split_once('+')
+                        .map(|(_, local)| local)
+                        .unwrap_or(""),
+                );
+            }
             eprintln!(
-                "retread install: {}=={} is conda-provided in the prefix; \
-                 skipping wheel replay to avoid clobbering the conda payload",
-                wheel.name, wheel.version
+                "retread install: {}=={} is conda-provided in the prefix (conda has \
+                 {}); skipping wheel replay to avoid clobbering the conda payload",
+                wheel.name, wheel.version, owned_version
             );
             continue;
         }
@@ -1233,14 +1293,28 @@ fn conda_meta_claimed_dirs(prefix: &Path) -> BTreeSet<PathBuf> {
     dirs
 }
 
+/// The conda-provided version that owns `normalized_name` at the locked
+/// `version`, or `None`. The comparison discards the WHEEL side's local tag
+/// (see `pep440_equal_ignoring_wheel_local`): conda spells the CUDA variant in
+/// the build string, PyPI spells it as `+cu124`, and they name the same
+/// release.
+fn conda_owned_version_at<'a>(
+    conda_owned: &'a BTreeSet<(String, String)>,
+    normalized_name: &str,
+    version: &str,
+) -> Option<&'a String> {
+    conda_owned.iter().find_map(|(name, owned_version)| {
+        (name == normalized_name && pep440_equal_ignoring_wheel_local(owned_version, version))
+            .then_some(owned_version)
+    })
+}
+
 fn conda_owned_at_version(
     conda_owned: &BTreeSet<(String, String)>,
     normalized_name: &str,
     version: &str,
 ) -> bool {
-    conda_owned.iter().any(|(name, owned_version)| {
-        name == normalized_name && pep440_versions_equal(owned_version, version)
-    })
+    conda_owned_version_at(conda_owned, normalized_name, version).is_some()
 }
 
 /// True if `name` is one of PyPI's `nvidia-<component>-cu<major>` CUDA-runtime
@@ -1547,15 +1621,24 @@ fn editable_owned_distributions(site_packages: &Path) -> BTreeSet<String> {
 pub(crate) fn missing_locked_wheels_from_installed(
     lock: &RetreadLock,
     installed: &BTreeMap<String, BTreeMap<String, PathBuf>>,
+    conda_owned: &BTreeSet<(String, String)>,
 ) -> Vec<String> {
     let mut missing: Vec<String> = lock
         .wheels
         .iter()
         .filter_map(|wheel| {
             let name = normalize_dist_name(&wheel.name);
+            // A conda-provided distribution satisfies the locked version even
+            // when the lock carries a local tag conda cannot spell
+            // (`2.5.1+cu124` vs conda's `2.5.1`): the installer deliberately
+            // left conda's payload in place, so demanding the wheel back here
+            // would fail verify on a healthy prefix (F27).
+            let conda_owned_here = conda_owned_at_version(conda_owned, &name, &wheel.version);
             let present = installed
                 .get(&name)
-                .and_then(|versions| installed_version_path(versions, &wheel.version))
+                .and_then(|versions| {
+                    installed_path_for_locked(versions, &wheel.version, conda_owned_here)
+                })
                 .is_some();
             (!present).then(|| format!("{}=={}", wheel.name, wheel.version))
         })
@@ -1652,8 +1735,9 @@ fn missing_after_exemptions(
     installed: &BTreeMap<String, BTreeMap<String, PathBuf>>,
     editable_owned: &BTreeSet<String>,
     conda_shadowed: &BTreeSet<String>,
+    conda_owned: &BTreeSet<(String, String)>,
 ) -> Vec<String> {
-    missing_locked_wheels_from_installed(lock, installed)
+    missing_locked_wheels_from_installed(lock, installed, conda_owned)
         .into_iter()
         .filter(|item| {
             let name = item.split("==").next().map(normalize_dist_name);
@@ -1677,6 +1761,7 @@ fn missing_locked_wheels_in_prefix(lock: &RetreadLock, prefix: &Path) -> Vec<Str
         &installed,
         &editable_owned_distributions(&site_packages),
         &not_courier_owned,
+        &conda_owned_distributions(prefix, &site_packages),
     )
 }
 
@@ -1733,7 +1818,13 @@ fn verify_payload_installed(lock: &RetreadLock, prefix: &Path) -> Result<()> {
     // the reader half of the writer/reader pair.
     let mut not_courier_owned = conda_shadowed_locked_dists(lock, prefix);
     not_courier_owned.extend(not_courier_owned_pypi(lock, prefix));
-    let missing = missing_after_exemptions(lock, &installed, &editable_owned, &not_courier_owned);
+    let missing = missing_after_exemptions(
+        lock,
+        &installed,
+        &editable_owned,
+        &not_courier_owned,
+        &conda_owned,
+    );
     if !missing.is_empty() {
         bail!(
             "retread verify: bundle {} is missing {} locked wheel(s) in {}: {}",
@@ -1749,9 +1840,12 @@ fn verify_payload_installed(lock: &RetreadLock, prefix: &Path) -> Result<()> {
         if editable_owned.contains(&name) || not_courier_owned.contains(&name) {
             continue;
         }
+        let conda_owned_here = conda_owned_at_version(&conda_owned, &name, &wheel.version);
         let dist_root = installed
             .get(&name)
-            .and_then(|versions| installed_version_path(versions, &wheel.version))
+            .and_then(|versions| {
+                installed_path_for_locked(versions, &wheel.version, conda_owned_here)
+            })
             .expect("missing list already checked");
         // conda owns this distribution at the exact locked version, so
         // `materialize_locked_wheels` dropped it from the replay entirely
@@ -1774,7 +1868,7 @@ fn verify_payload_installed(lock: &RetreadLock, prefix: &Path) -> Result<()> {
         // Presence and locked-version agreement are still enforced above by
         // `missing_after_exemptions`, which grants conda-owned dists no
         // exemption at all.
-        if conda_owned_at_version(&conda_owned, &name, &wheel.version) {
+        if conda_owned_here {
             tracing::info!(
                 bundle = %lock.bundle,
                 dist = %wheel.name,
@@ -1835,9 +1929,12 @@ fn installed_payload_libraries(
         if editable_owned.contains(&name) || not_courier_owned.contains(&name) {
             continue;
         }
+        let conda_owned_here = conda_owned_at_version(&conda_owned, &name, &wheel.version);
         let dist_root = installed
             .get(&name)
-            .and_then(|versions| installed_version_path(versions, &wheel.version))
+            .and_then(|versions| {
+                installed_path_for_locked(versions, &wheel.version, conda_owned_here)
+            })
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "retread audit: {}=={} is not installed in {}",
@@ -1850,7 +1947,7 @@ fn installed_payload_libraries(
         // Recordless conda metadata has no wheel payload inventory to audit.
         // Preserve the prior library audit for every conda distribution that
         // does expose RECORD.
-        if conda_owned_at_version(&conda_owned, &name, &wheel.version) && !record.is_file() {
+        if conda_owned_here && !record.is_file() {
             continue;
         }
         let body = std::fs::read_to_string(&record)
@@ -4287,6 +4384,187 @@ packages:
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// F27 fixture: a prefix where conda provides `torch` as a marker-less
+    /// egg-info claimed by `conda-meta` (exactly the `ws.C4g2` sage env:
+    /// conda `pytorch-2.5.1-py3.10_cuda12.4` ships
+    /// `site-packages/torch-2.5.1-py3.10.egg-info` with no INSTALLER), at
+    /// `conda_version`. Returns the prefix.
+    fn conda_torch_egg_info_prefix(root: &Path, conda_version: &str) -> PathBuf {
+        let prefix = root.join("prefix");
+        let sp = site_packages_dir(&prefix, "3.11");
+        std::fs::create_dir_all(&sp).unwrap();
+        let egg = sp.join(format!("torch-{conda_version}-py3.10.egg-info"));
+        std::fs::create_dir_all(&egg).unwrap();
+        std::fs::write(
+            egg.join("PKG-INFO"),
+            format!("Name: torch\nVersion: {conda_version}\n"),
+        )
+        .unwrap();
+        assert!(!egg.join("INSTALLER").exists());
+        std::fs::create_dir_all(prefix.join("conda-meta")).unwrap();
+        std::fs::write(
+            prefix.join("conda-meta").join("pytorch-2.5.1-py3.10.json"),
+            serde_json::json!({
+                "name": "pytorch",
+                "version": conda_version,
+                "files": [format!(
+                    "lib/python3.11/site-packages/torch-{conda_version}-py3.10.egg-info/PKG-INFO"
+                )],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        prefix
+    }
+
+    fn torch_local_tag_lock(locked_version: &str) -> RetreadLock {
+        let mut lock = make_lock(vec![], vec![], BTreeMap::new());
+        lock.root_requirements = vec![format!("torch=={locked_version}")];
+        lock.wheels = vec![lock_wheel("torch", locked_version)];
+        lock
+    }
+
+    /// F27 unit: only the LOCAL segment is discarded, and only from the wheel
+    /// side.
+    #[test]
+    fn local_segment_is_stripped_from_the_wheel_side_only() {
+        assert_eq!(strip_local_segment("2.5.1+cu124"), "2.5.1");
+        assert_eq!(strip_local_segment("2.5.1"), "2.5.1");
+        assert_eq!(strip_local_segment("not a version"), "not a version");
+        assert!(pep440_equal_ignoring_wheel_local("2.5.1", "2.5.1+cu124"));
+        assert!(pep440_equal_ignoring_wheel_local("2.5.1", "2.5.1"));
+        // Release differences survive the strip.
+        assert!(!pep440_equal_ignoring_wheel_local("2.5.0", "2.5.1+cu124"));
+        assert!(!pep440_equal_ignoring_wheel_local("2.5.1", "2.5.2+cu124"));
+        // The relaxation is one-directional: a locked plain version is not
+        // satisfied by an installed local-tagged build.
+        assert!(!pep440_equal_ignoring_wheel_local("2.5.1+cu124", "2.5.1"));
+    }
+
+    /// F27 guard (a). conda provides torch 2.5.1; the pack locks
+    /// torch==2.5.1+cu124 (pulled in by its explicit `torchvision`/
+    /// `torchaudio` `+cu124` entries). The local tag names a build, not a
+    /// release, so conda owns the locked dist: the wheel must be dropped from
+    /// the uv replay (otherwise uv uninstalls conda's payload and dies with
+    /// "failed to remove directory .../site-packages/torch: Directory not
+    /// empty") and verify must NOT demand the wheel back.
+    #[tokio::test]
+    async fn conda_torch_owns_a_locked_wheel_that_differs_only_by_local_tag() {
+        let root = tempdir("f27-local-tag-owned");
+        let prefix = conda_torch_egg_info_prefix(&root, "2.5.1");
+        let sp = site_packages_dir(&prefix, "3.11");
+        let owned = conda_owned_distributions(&prefix, &sp);
+        assert!(
+            owned.contains(&("torch".to_string(), "2.5.1".to_string())),
+            "conda-meta must own the marker-less egg-info; got {owned:?}"
+        );
+        assert!(
+            conda_owned_at_version(&owned, "torch", "2.5.1+cu124"),
+            "conda 2.5.1 must own locked 2.5.1+cu124"
+        );
+
+        // Install half: the wheel never reaches uv.
+        let wheels_dir = root.join("wheels");
+        std::fs::create_dir_all(&wheels_dir).unwrap();
+        let lock = torch_local_tag_lock("2.5.1+cu124");
+        let files = materialize_locked_wheels(
+            &lock,
+            &prefix,
+            &wheels_dir,
+            &root.join("cache"),
+            &owned,
+            &BTreeSet::new(),
+            false,
+            &BTreeSet::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            files.is_empty(),
+            "conda-owned torch must be dropped from the replay; got {files:?}"
+        );
+
+        // Verify half: presence and the deep RECORD check both defer to conda.
+        verify_payload_installed(&lock, &prefix)
+            .expect("conda-provided 2.5.1 satisfies locked 2.5.1+cu124");
+        let (_, libraries) = installed_payload_libraries(&lock, &prefix)
+            .expect("recordless conda torch stays outside the wheel library audit");
+        assert!(libraries.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// F27 guard (b). A genuine release mismatch is NOT laundered by the
+    /// local-segment strip: conda 2.5.0 does not own locked 2.5.1+cu124, so
+    /// the wheel stays in the replay and verify still reports it missing.
+    #[tokio::test]
+    async fn conda_torch_at_a_different_release_does_not_own_the_locked_wheel() {
+        let root = tempdir("f27-local-tag-mismatch");
+        let prefix = conda_torch_egg_info_prefix(&root, "2.5.0");
+        let sp = site_packages_dir(&prefix, "3.11");
+        let owned = conda_owned_distributions(&prefix, &sp);
+        assert!(owned.contains(&("torch".to_string(), "2.5.0".to_string())));
+        assert!(
+            !conda_owned_at_version(&owned, "torch", "2.5.1+cu124"),
+            "2.5.0 is a different release; the strip must not match it"
+        );
+
+        // Install half: the wheel is still demanded from the replay (no
+        // shipped file here, so materialization fails exactly as it would
+        // today rather than silently skipping).
+        let wheels_dir = root.join("wheels");
+        std::fs::create_dir_all(&wheels_dir).unwrap();
+        let lock = torch_local_tag_lock("2.5.1+cu124");
+        let err = materialize_locked_wheels(
+            &lock,
+            &prefix,
+            &wheels_dir,
+            &root.join("cache"),
+            &owned,
+            &BTreeSet::new(),
+            false,
+            &BTreeSet::new(),
+        )
+        .await
+        .expect_err("a non-owned wheel must still be materialized for the replay");
+        assert!(
+            format!("{err:#}").contains("torch"),
+            "unexpected error: {err:#}"
+        );
+
+        // Verify half: still missing.
+        let err = verify_payload_installed(&lock, &prefix)
+            .expect_err("a different conda release must not satisfy the lock");
+        assert!(
+            format!("{err:#}").contains("torch==2.5.1+cu124"),
+            "unexpected error: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// F27 guard (c). The relaxation is gated on conda ownership: a pip-owned
+    /// torch 2.5.1 does NOT stand in for a locked 2.5.1+cu124, so the strict
+    /// behaviour is unchanged where conda is not involved.
+    #[test]
+    fn a_non_conda_local_tag_mismatch_is_unchanged() {
+        let root = tempdir("f27-local-tag-no-conda");
+        let prefix = root.join("prefix");
+        let sp = site_packages_dir(&prefix, "3.11");
+        std::fs::create_dir_all(&sp).unwrap();
+        let dist_info = write_dist_info(&sp, "torch", "2.5.1", None);
+        std::fs::write(dist_info.join("INSTALLER"), "pip\n").unwrap();
+        assert!(!prefix.join("conda-meta").exists());
+        assert!(conda_owned_distributions(&prefix, &sp).is_empty());
+
+        let lock = torch_local_tag_lock("2.5.1+cu124");
+        let err = verify_payload_installed(&lock, &prefix)
+            .expect_err("without conda ownership the local tag must still be significant");
+        assert!(
+            format!("{err:#}").contains("torch==2.5.1+cu124"),
+            "unexpected error: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// Helper: write a dist-info with METADATA and an optional
     /// direct_url.json. `editable` controls the PEP 660 `dir_info.editable`
     /// flag; `None` writes no direct_url.json at all.
@@ -4430,8 +4708,12 @@ packages:
         let lock = make_lock(vec![], vec![], BTreeMap::new());
         assert_eq!(lock.wheels[0].version, "1.0.0");
         assert!(
-            missing_locked_wheels_from_installed(&lock, &installed_distributions(&sp).unwrap(),)
-                .is_empty()
+            missing_locked_wheels_from_installed(
+                &lock,
+                &installed_distributions(&sp).unwrap(),
+                &BTreeSet::new(),
+            )
+            .is_empty()
         );
         verify_payload_installed(&lock, &prefix)
             .expect("PEP 440-equivalent installed version satisfies verify");
