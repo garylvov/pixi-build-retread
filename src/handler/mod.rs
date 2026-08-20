@@ -918,15 +918,15 @@ fn workspace_solve_fingerprint_for_cache(
 /// Keeping discovery and replay-contract validation in one place is
 /// load-bearing: UV constraints and conda co-solve inputs must describe the
 /// same sibling set.
-fn coactivated_sibling_locks(
+fn coactivated_sibling_packs(
     manifest: &crate::workspace::WorkspaceManifest,
     workspace_dir: &Path,
     source_dir: &Path,
     target: &ResolutionTarget,
-) -> Vec<(String, crate::lock::RetreadLock)> {
+) -> BTreeMap<String, PathBuf> {
     let Some(envs) = workspace_precise_consuming_envs(manifest, workspace_dir, source_dir, target)
     else {
-        return Vec::new();
+        return BTreeMap::new();
     };
     let resolved = target.target_contract().and_then(|_| {
         resolved_workspace_target_from_resolution(manifest, workspace_dir, source_dir, target)
@@ -957,52 +957,101 @@ fn coactivated_sibling_locks(
     }
 
     siblings
+}
+
+/// Load every exact-target Retread lock activated beside this pack.
+///
+/// Keeping discovery and replay-contract validation in one place is
+/// load-bearing: UV constraints and conda co-solve inputs must describe the
+/// same sibling set.
+fn coactivated_sibling_locks(
+    manifest: &crate::workspace::WorkspaceManifest,
+    workspace_dir: &Path,
+    source_dir: &Path,
+    target: &ResolutionTarget,
+) -> Vec<(String, crate::lock::RetreadLock)> {
+    coactivated_sibling_packs(manifest, workspace_dir, source_dir, target)
         .into_iter()
         .filter_map(|(bundle, pack_dir)| {
-            // Exact envelopes authorize one workspace-wide
-            // environment/profile scope, so the current target names the
-            // sibling sidecar too. Direct inference can carry an identical
-            // contract and singleton scope; use explicit envelope provenance,
-            // never detected-VP presence, to distinguish them.
-            let sibling_target = match target.target_contract() {
-                // Legacy, unqualified targets have no consumer scope to
-                // rehydrate. Keep their historical target lookup.
-                None => target.clone(),
-                // An exact envelope authorizes one workspace-wide
-                // environment/profile pair, which applies to every source
-                // co-activated by that pair.
-                Some(_) if target.has_exact_workspace_envelope() => target.clone(),
-                // Direct inference aggregates consumers independently for
-                // each source. Never fall back to the current source's scope
-                // when the sibling scope cannot be proven: that could make a
-                // stale lock under the current identity look authoritative.
-                Some(contract) => {
-                    let scope =
-                        manifest.resolve_source_for_contract(workspace_dir, &pack_dir, contract)?;
-                    ResolutionTarget::try_for_contract_on_subdir(
-                        target.python_version(),
-                        target.conda_subdir(),
-                        contract.clone(),
-                    )
-                    .and_then(|resolved| resolved.with_workspace_scope(scope))
-                    .ok()?
-                }
-            };
-            // Preserve the declared bundle spelling for its lock filename and
-            // replay contract. Conda names may legally contain dots.
-            let lock_path = pack_dir.join(crate::lock::RetreadLock::file_name_for_target(
-                &bundle,
-                &sibling_target,
-            ));
-            let lock = crate::lock::RetreadLock::load(&lock_path).ok()?;
-            if lock.schema != crate::lock::SCHEMA {
-                return None;
-            }
-            lock.validate_replay_contract_for_target(&sibling_target, &bundle)
-                .ok()?;
+            let lock =
+                coactivated_sibling_lock(manifest, workspace_dir, target, &bundle, &pack_dir)?;
             Some((bundle, lock))
         })
         .collect()
+}
+
+/// The co-activated sibling packs that have NO usable exact-target lock yet.
+///
+/// On a cold first pass no sibling lock exists, so `sibling_lock_constraints`
+/// contributes nothing and each pack solves its shared names independently --
+/// the cold-pass pin race behind F29. This is the reader half that lets the
+/// build warn about it; a second lock, solved once the siblings' locks exist,
+/// converges.
+fn coactivated_siblings_missing_locks(
+    manifest: &crate::workspace::WorkspaceManifest,
+    workspace_dir: &Path,
+    source_dir: &Path,
+    target: &ResolutionTarget,
+) -> Vec<String> {
+    coactivated_sibling_packs(manifest, workspace_dir, source_dir, target)
+        .into_iter()
+        .filter(|(bundle, pack_dir)| {
+            coactivated_sibling_lock(manifest, workspace_dir, target, bundle, pack_dir).is_none()
+        })
+        .map(|(bundle, _)| bundle)
+        .collect()
+}
+
+/// One sibling pack's exact-target lock, or `None` when it has not been
+/// solved yet (cold pass) or its lock cannot replay under this target.
+fn coactivated_sibling_lock(
+    manifest: &crate::workspace::WorkspaceManifest,
+    workspace_dir: &Path,
+    target: &ResolutionTarget,
+    bundle: &str,
+    pack_dir: &Path,
+) -> Option<crate::lock::RetreadLock> {
+    // Exact envelopes authorize one workspace-wide
+    // environment/profile scope, so the current target names the
+    // sibling sidecar too. Direct inference can carry an identical
+    // contract and singleton scope; use explicit envelope provenance,
+    // never detected-VP presence, to distinguish them.
+    let sibling_target = match target.target_contract() {
+        // Legacy, unqualified targets have no consumer scope to
+        // rehydrate. Keep their historical target lookup.
+        None => target.clone(),
+        // An exact envelope authorizes one workspace-wide
+        // environment/profile pair, which applies to every source
+        // co-activated by that pair.
+        Some(_) if target.has_exact_workspace_envelope() => target.clone(),
+        // Direct inference aggregates consumers independently for
+        // each source. Never fall back to the current source's scope
+        // when the sibling scope cannot be proven: that could make a
+        // stale lock under the current identity look authoritative.
+        Some(contract) => {
+            let scope = manifest.resolve_source_for_contract(workspace_dir, pack_dir, contract)?;
+            ResolutionTarget::try_for_contract_on_subdir(
+                target.python_version(),
+                target.conda_subdir(),
+                contract.clone(),
+            )
+            .and_then(|resolved| resolved.with_workspace_scope(scope))
+            .ok()?
+        }
+    };
+    // Preserve the declared bundle spelling for its lock filename and
+    // replay contract. Conda names may legally contain dots.
+    let lock_path = pack_dir.join(crate::lock::RetreadLock::file_name_for_target(
+        bundle,
+        &sibling_target,
+    ));
+    let lock = crate::lock::RetreadLock::load(&lock_path).ok()?;
+    if lock.schema != crate::lock::SCHEMA {
+        return None;
+    }
+    lock.validate_replay_contract_for_target(&sibling_target, bundle)
+        .ok()?;
+    Some(lock)
 }
 
 /// Exact emitted conda contracts of co-activated sibling packs.
@@ -1130,8 +1179,9 @@ mod sibling_lock_constraint_tests {
     use std::collections::BTreeMap;
 
     use super::{
-        CondaCoSolveContext, RetreadConfig, VariantValue, conda_outputs_cache_key_for_target,
-        sibling_conda_run_dependencies, sibling_lock_constraints, workspace_solve_fingerprint,
+        CondaCoSolveContext, RetreadConfig, VariantValue, coactivated_siblings_missing_locks,
+        conda_outputs_cache_key_for_target, sibling_conda_run_dependencies,
+        sibling_lock_constraints, workspace_solve_fingerprint,
         workspace_solve_fingerprint_for_cache,
     };
     use crate::lock::{CondaDep, LockWheel, Origin, RetreadLock, SCHEMA};
@@ -1222,6 +1272,32 @@ composed = { features = ["composed"], no-default-feature = true }
             Some(BTreeMap::new()),
             "a contract-qualified empty detected set must suppress host VP inheritance",
         );
+    }
+
+    /// F29 cold pass: the sibling pack is co-activated but has not been
+    /// solved yet, so no constraint can be applied and the two packs pin
+    /// their shared names independently. The build must SAY so -- one warning
+    /// per unlocked sibling -- instead of diverging silently.
+    #[test]
+    fn a_co_activated_sibling_with_no_lock_yet_is_reported_for_the_cold_pass_warning() {
+        let dir = temp_workspace();
+        let target = ResolutionTarget::try_for_subdir("3.11", "linux-64").unwrap();
+        let manifest = crate::workspace::WorkspaceManifest::load(&dir).unwrap();
+        assert!(
+            sibling_lock_constraints(&manifest, &dir, &dir.join("current"), &target)
+                .constraints
+                .is_empty(),
+            "no sibling lock exists on a cold pass, so no constraint can apply",
+        );
+        let unlocked =
+            coactivated_siblings_missing_locks(&manifest, &dir, &dir.join("current"), &target);
+        assert_eq!(unlocked, vec!["sibling.pack".to_string()]);
+        let warning = crate::coresident_pins::sibling_lock_absent_warning(&unlocked[0]);
+        assert!(
+            warning.contains("sibling.pack") && warning.contains("a second lock converges"),
+            "{warning}",
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1347,6 +1423,11 @@ composed = { features = ["composed"], no-default-feature = true }
                 .iter()
                 .all(|line| !line.starts_with("numpy")),
             "transitive sibling requirements must not become constraints",
+        );
+        assert!(
+            coactivated_siblings_missing_locks(&manifest, &dir, &dir.join("current"), &target)
+                .is_empty(),
+            "a sibling whose lock IS on disk must not be reported as unlocked",
         );
         let fingerprint =
             workspace_solve_fingerprint(&manifest, &dir, &dir.join("current"), &target);
@@ -7295,6 +7376,18 @@ async fn uv_group_closure(
                 bundle = %group_name,
                 constraints = sibling_constraints.constraints.len(),
                 "uv closure: applying co-activated sibling pack requirements",
+            );
+        }
+        // A sibling with no lock on disk contributed nothing above: on a
+        // cold first pass this pack solves its shared names blind to the
+        // sibling's, which is how two co-resident packs end up pinning the
+        // same dist differently (F29). Say so once per sibling bundle.
+        for sibling in coactivated_siblings_missing_locks(manifest, ws_dir, source_dir, target) {
+            tracing::warn!(
+                bundle = %group_name,
+                sibling = %sibling,
+                "{}",
+                crate::coresident_pins::sibling_lock_absent_warning(&sibling),
             );
         }
         for line in sibling_constraints.constraints {
@@ -14209,13 +14302,15 @@ fn produce_output_with_conflicts(
                                 specifiers,
                                 decisions: diagnostics,
                             } => {
-                                pending_relaxations.extend(auto_bundle::wheel_metadata_relaxations(
-                                    &pypi_name,
-                                    &without_fact,
-                                    diagnostics,
-                                    &bundle.conda_name,
-                                    format!(" for bundle '{}'", bundle.conda_name),
-                                ));
+                                pending_relaxations.extend(
+                                    auto_bundle::wheel_metadata_relaxations(
+                                        &pypi_name,
+                                        &without_fact,
+                                        diagnostics,
+                                        &bundle.conda_name,
+                                        format!(" for bundle '{}'", bundle.conda_name),
+                                    ),
+                                );
                                 let rendered = native_conda_override
                                     .clone()
                                     .unwrap_or_else(|| specifiers.to_string().replace(", ", ","));
@@ -14570,12 +14665,11 @@ fn describe_unadvertised_sources(
         }
         let mut owners: Vec<String> = Vec::new();
         for wheel in std::iter::once(&bundle.primary).chain(bundle.extras.iter()) {
-            let declares = wheel
-                .metadata
-                .requires_dist
-                .iter()
-                .any(|raw| raw.split([';', ' ', '=', '<', '>', '!', '~', '[']).next()
-                    .is_some_and(|dep| canonical_conda_name(dep) == name));
+            let declares = wheel.metadata.requires_dist.iter().any(|raw| {
+                raw.split([';', ' ', '=', '<', '>', '!', '~', '['])
+                    .next()
+                    .is_some_and(|dep| canonical_conda_name(dep) == name)
+            });
             if declares {
                 owners.push(wheel.pypi_name.clone());
             }
@@ -17070,8 +17164,10 @@ async fn build_one(
         // authority that produced the conda/outputs advertisement.
         let constrains = match constrains_override {
             Some(advertised) => advertised.to_vec(),
-            None => bundle_emitted_constrains(bundle, config, target_subdir, workspace_python_version)
-                .context("deriving emitted conda constrains for the courier lock")?,
+            None => {
+                bundle_emitted_constrains(bundle, config, target_subdir, workspace_python_version)
+                    .context("deriving emitted conda constrains for the courier lock")?
+            }
         };
         return materialize_and_pack(
             Some(bundle),

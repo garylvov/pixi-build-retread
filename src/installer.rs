@@ -1486,7 +1486,11 @@ fn missing_locked_wheels_in_prefix(lock: &RetreadLock, prefix: &Path) -> Vec<Str
 /// actually holds under that name -- i.e. what an owner OUTSIDE the bundle
 /// put there. This is the other half of the divergence message: naming only
 /// the locked version would not tell the operator who is overwriting it.
-fn env_installed_versions_for(lock: &RetreadLock, prefix: &Path, missing: &[String]) -> Vec<String> {
+fn env_installed_versions_for(
+    lock: &RetreadLock,
+    prefix: &Path,
+    missing: &[String],
+) -> Vec<String> {
     let installed =
         installed_distributions(&site_packages_dir(prefix, &lock.python)).unwrap_or_default();
     missing
@@ -1533,13 +1537,48 @@ fn verify_payload_installed(lock: &RetreadLock, prefix: &Path) -> Result<()> {
     not_courier_owned.extend(not_courier_owned_pypi(lock, prefix));
     let missing = missing_after_exemptions(lock, &installed, &editable_owned, &not_courier_owned);
     if !missing.is_empty() {
-        bail!(
-            "retread verify: bundle {} is missing {} locked wheel(s) in {}: {}",
-            lock.bundle,
-            missing.len(),
-            site_packages.display(),
-            missing.join(", ")
+        // A "missing" dist that is actually PRESENT at exactly a co-resident
+        // sibling bundle's locked version is not missing: two co-scoped packs
+        // pinned the same shared name differently (F29's cold-pass race) and
+        // the sibling's pin is the one on disk. Still a failure -- this
+        // bundle's payload is not installed -- but naming it "missing locked
+        // wheel(s)" sends the operator hunting for a wheel that was never the
+        // problem. `not_courier_owned_pypi` cannot see this: it unions the
+        // producer record with the workspace pixi.lock, and a sibling retread
+        // bundle is in neither.
+        let installed_versions: BTreeMap<String, Vec<String>> = installed
+            .iter()
+            .map(|(name, versions)| (name.clone(), versions.keys().cloned().collect()))
+            .collect();
+        let (divergent, unexplained) = crate::coresident_pins::explain_divergent_pins(
+            &missing,
+            &installed_versions,
+            &crate::coresident_pins::coresident_pins(prefix, &lock.bundle),
         );
+        if divergent.is_empty() {
+            bail!(
+                "retread verify: bundle {} is missing {} locked wheel(s) in {}: {}",
+                lock.bundle,
+                missing.len(),
+                site_packages.display(),
+                missing.join(", ")
+            );
+        }
+        let mut report = format!(
+            "retread verify: bundle {} cannot use {} locked dist(s) in {}: {}",
+            lock.bundle,
+            divergent.len(),
+            site_packages.display(),
+            divergent.join("; ")
+        );
+        if !unexplained.is_empty() {
+            report.push_str(&format!(
+                "; and is missing {} locked wheel(s): {}",
+                unexplained.len(),
+                unexplained.join(", ")
+            ));
+        }
+        bail!(report);
     }
 
     for wheel in &lock.wheels {
@@ -3721,6 +3760,68 @@ packages:
         assert_eq!(lock.wheels[0].version, "1.0.0");
         verify_payload_installed(&lock, &prefix)
             .expect("editable overlay at any version satisfies verify");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// F29: two co-resident bundles pinned `mypackage` differently on a cold
+    /// pass and the sibling's pin is what is installed. Verify must name both
+    /// packs, both versions and the remedy -- not "missing locked wheel(s)",
+    /// which sends the operator hunting a wheel that is not the problem.
+    #[test]
+    fn verify_payload_installed_names_a_divergent_co_resident_pin() {
+        let root = tempdir("verify-coresident-divergence");
+        let prefix = root.join("prefix");
+        let sp = site_packages_dir(&prefix, "3.11");
+        std::fs::create_dir_all(&sp).unwrap();
+        // The sibling's pin, not this bundle's locked 1.0.0.
+        write_dist_info(&sp, "mypackage", "2.0.0", None);
+        let share = prefix.join("share").join("retread");
+        std::fs::create_dir_all(&share).unwrap();
+        std::fs::write(
+            share.join("retread-sibling-pack.lock.json"),
+            r#"{"bundle":"sibling-pack","wheels":[{"name":"mypackage","version":"2.0.0"}]}"#,
+        )
+        .unwrap();
+
+        let lock = make_lock(vec![], vec![], BTreeMap::new());
+        let err = format!(
+            "{:#}",
+            verify_payload_installed(&lock, &prefix)
+                .expect_err("a divergent co-resident pin is still a verify failure")
+        );
+        for needle in [
+            "shared dist mypackage",
+            "this bundle pins 1.0.0",
+            "co-resident sibling-pack pins 2.0.0",
+            "installed 2.0.0",
+            "re-lock to converge (cold-pass race)",
+        ] {
+            assert!(err.contains(needle), "{needle:?} missing from {err}");
+        }
+        assert!(
+            !err.contains("missing 1 locked wheel(s)"),
+            "the divergent pin must not be reported as a missing wheel: {err}",
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The rename is scoped: with no co-resident sibling lock explaining the
+    /// installed version, the honest report is still "missing locked wheel(s)".
+    #[test]
+    fn verify_payload_installed_still_reports_a_plain_missing_wheel() {
+        let root = tempdir("verify-plain-missing");
+        let prefix = root.join("prefix");
+        let sp = site_packages_dir(&prefix, "3.11");
+        std::fs::create_dir_all(&sp).unwrap();
+        write_dist_info(&sp, "mypackage", "2.0.0", None);
+
+        let lock = make_lock(vec![], vec![], BTreeMap::new());
+        let err = format!(
+            "{:#}",
+            verify_payload_installed(&lock, &prefix).expect_err("the locked version is absent")
+        );
+        assert!(err.contains("missing 1 locked wheel(s)"), "{err}");
+        assert!(!err.contains("co-resident"), "{err}");
         let _ = std::fs::remove_dir_all(root);
     }
 
