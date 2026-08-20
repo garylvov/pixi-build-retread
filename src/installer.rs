@@ -1627,14 +1627,38 @@ fn verify_payload_installed(lock: &RetreadLock, prefix: &Path) -> Result<()> {
             .get(&name)
             .and_then(|versions| installed_version_path(versions, &wheel.version))
             .expect("missing list already checked");
-        // Conda-generated dist-info can legitimately omit RECORD (for example
-        // `pin` from the `pinocchio` package). Trust exact-version conda
-        // ownership only when wheel-layout verification is unavailable; keep
-        // the existing strict payload check for conda distributions that do
-        // publish RECORD.
-        if conda_owned_at_version(&conda_owned, &name, &wheel.version)
-            && !dist_root.join("RECORD").is_file()
-        {
+        // conda owns this distribution at the exact locked version, so
+        // `materialize_locked_wheels` dropped it from the replay entirely
+        // (see the "is conda-provided in the prefix" skip). retread did not
+        // lay a single byte of this payload down, and the deep RECORD check
+        // must not demand one back -- one dist, one owner: conda's own
+        // package manager verifies conda's payload.
+        //
+        // The RECORD such a dist-info carries is UPSTREAM'S WHEEL RECORD
+        // shipped verbatim by the conda package, not an inventory of what
+        // conda installed, and conda routinely relayouts the payload. The
+        // observed break: conda `pytorch-2.10.0` ships the PyPI
+        // `torch-2.10.0.dist-info/RECORD` (13806 entries) while splitting the
+        // C++ headers into the `libtorch` package at `$PREFIX/include/...`,
+        // so 9102 `torch/include/{ATen,torch,c10,tensorpipe,caffe2}` entries
+        // have no file under site-packages BY DESIGN. Checking them
+        // file-by-file failed the post-install gate on a healthy prefix,
+        // marked it `.broken` and drove the activation repair loop to its cap
+        // -- the same reader/writer defect the CUDA-shadow exemption fixed.
+        // Presence and locked-version agreement are still enforced above by
+        // `missing_after_exemptions`, which grants conda-owned dists no
+        // exemption at all.
+        if conda_owned_at_version(&conda_owned, &name, &wheel.version) {
+            tracing::info!(
+                bundle = %lock.bundle,
+                dist = %wheel.name,
+                version = %wheel.version,
+                "retread verify: {}=={} is conda-provided at the locked version; \
+                 the wheel replay was skipped, so the deep RECORD payload check \
+                 does not apply (conda owns and verifies this payload)",
+                wheel.name,
+                wheel.version
+            );
             continue;
         }
         verify_record_payload(&site_packages, dist_root).with_context(|| {
@@ -3701,14 +3725,92 @@ packages:
         let _ = std::fs::remove_dir_all(bare);
     }
 
+    /// F23. A conda package that ships UPSTREAM'S wheel RECORD verbatim while
+    /// relaying the payload out elsewhere in the prefix must not be
+    /// deep-checked file-by-file: retread skipped the replay for exactly this
+    /// dist, so it never installed those files and cannot demand them back.
+    /// Observed: conda `pytorch-2.10.0` ships the PyPI
+    /// `torch-2.10.0.dist-info/RECORD` (13806 entries) but splits the C++
+    /// headers into `libtorch` at `$PREFIX/include/ATen/...`, leaving 9102
+    /// `torch/include/**` RECORD entries with no file under site-packages.
+    /// The old behaviour failed the post-install gate on a healthy prefix and
+    /// drove the activation repair loop to its cap.
     #[test]
-    fn conda_owned_distribution_with_record_keeps_strict_payload_check() {
-        let root = tempdir("verify-conda-owned-record");
+    fn conda_owned_record_relayed_out_of_site_packages_satisfies_verify() {
+        let root = tempdir("verify-conda-owned-relayout");
         let prefix = root.join("prefix");
         let sp = site_packages_dir(&prefix, "3.11");
         std::fs::create_dir_all(&sp).unwrap();
         let dist_info = write_dist_info(&sp, "mypackage", "1.0.0", None);
         std::fs::write(dist_info.join("INSTALLER"), "conda\n").unwrap();
+        // Upstream's wheel RECORD: the header tree conda moved to
+        // `$PREFIX/include` is still listed, and is absent under
+        // site-packages.
+        std::fs::write(
+            dist_info.join("RECORD"),
+            "mypackage/__init__.py,,\n\
+             mypackage/include/ATen/ATen.h,,\n\
+             mypackage-1.0.0.dist-info/RECORD,,\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(sp.join("mypackage")).unwrap();
+        std::fs::write(sp.join("mypackage/__init__.py"), "").unwrap();
+        // conda put the header here instead.
+        std::fs::create_dir_all(prefix.join("include/ATen")).unwrap();
+        std::fs::write(prefix.join("include/ATen/ATen.h"), "").unwrap();
+
+        let lock = make_lock(vec![], vec![], BTreeMap::new());
+        verify_payload_installed(&lock, &prefix).expect(
+            "a conda-provided dist whose replay was skipped is not deep-RECORD-verified",
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// F23, the co-resident case that broke the real prefix: TWO bundles
+    /// installed into one env both pin the same conda-provided dist. Neither
+    /// replays it, so neither may deep-RECORD-verify it -- otherwise the
+    /// second bundle's post-install gate fails on a prefix the first one
+    /// declared green, and the activation repair loop runs to its cap.
+    #[test]
+    fn two_co_resident_bundles_sharing_a_conda_provided_dist_both_verify() {
+        let root = tempdir("verify-two-bundles-shared-conda-dist");
+        let prefix = root.join("prefix");
+        let sp = site_packages_dir(&prefix, "3.11");
+        std::fs::create_dir_all(&sp).unwrap();
+        let dist_info = write_dist_info(&sp, "mypackage", "1.0.0", None);
+        std::fs::write(dist_info.join("INSTALLER"), "conda\n").unwrap();
+        std::fs::write(
+            dist_info.join("RECORD"),
+            "mypackage/__init__.py,,\n\
+             mypackage/include/ATen/ATen.h,,\n\
+             mypackage-1.0.0.dist-info/RECORD,,\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(sp.join("mypackage")).unwrap();
+        std::fs::write(sp.join("mypackage/__init__.py"), "").unwrap();
+
+        let mut first = make_lock(vec![], vec![], BTreeMap::new());
+        first.bundle = "newton-pack-latest".into();
+        let mut second = make_lock(vec![], vec![], BTreeMap::new());
+        second.bundle = "robojudo-pack".into();
+        verify_payload_installed(&first, &prefix)
+            .expect("first co-resident bundle verifies the shared conda dist green");
+        verify_payload_installed(&second, &prefix)
+            .expect("second co-resident bundle must reach the SAME verdict, not .broken");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The exemption is scoped to the dist conda actually owns at the locked
+    /// version: a wheel retread DID replay keeps the strict RECORD check, so
+    /// this guard fails the moment the exemption is widened to everything.
+    #[test]
+    fn non_conda_distribution_with_record_keeps_strict_payload_check() {
+        let root = tempdir("verify-uv-owned-record");
+        let prefix = root.join("prefix");
+        let sp = site_packages_dir(&prefix, "3.11");
+        std::fs::create_dir_all(&sp).unwrap();
+        let dist_info = write_dist_info(&sp, "mypackage", "1.0.0", None);
+        std::fs::write(dist_info.join("INSTALLER"), "uv\n").unwrap();
         std::fs::write(
             dist_info.join("RECORD"),
             "mypackage.py,,\nmypackage-1.0.0.dist-info/RECORD,,\n",
@@ -3717,7 +3819,7 @@ packages:
 
         let lock = make_lock(vec![], vec![], BTreeMap::new());
         let err = verify_payload_installed(&lock, &prefix)
-            .expect_err("a conda RECORD must still detect a missing payload file");
+            .expect_err("a replayed wheel's RECORD must still detect a missing payload file");
         assert!(format!("{err:#}").contains("missing installed file"));
         let _ = std::fs::remove_dir_all(root);
     }
