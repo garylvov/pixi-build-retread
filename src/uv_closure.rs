@@ -2820,6 +2820,36 @@ pub fn build_constraints(
 pub const LEARNED_WORKSPACE_FACT_SOURCE: &str =
     "workspace conda fact (learned: selected by every consuming env's conda solve)";
 
+/// Source prefix recorded on every constraint that carries a co-activated
+/// sibling pack's RESOLVED pin (`co-activated-sibling-pin:<bundle>`).
+///
+/// Two packs installed into the same prefix must agree on every shared dist,
+/// so once a sibling has locked, its resolved versions constrain this pack's
+/// closure (F30). Like a LEARNED conda fact the pin is ADVISORY: a sibling
+/// that pinned a version this closure genuinely cannot use yields under uv's
+/// own sentence instead of failing the pack.
+pub const COACTIVATED_SIBLING_PIN_SOURCE_PREFIX: &str = "co-activated-sibling-pin:";
+
+/// Constraint sources that are ADVISORY and therefore yield to a hard
+/// requirement inside the closure, rather than failing the pack.
+///
+/// DECLARED operator intent (workspace conda facts, manifest pins) is never
+/// in this set: it keeps its own loud recovery.
+fn is_yieldable_advisory_source(source: &str) -> bool {
+    source == LEARNED_WORKSPACE_FACT_SOURCE
+        || source.starts_with(COACTIVATED_SIBLING_PIN_SOURCE_PREFIX)
+}
+
+/// Human label for the advisory constraint class that lost, for the yield
+/// warning. Naming the real owner is load-bearing: a sibling pin reported as
+/// a "learned conda fact" sends the reader to the wrong producer.
+fn advisory_source_label(source: &str) -> String {
+    match source.strip_prefix(COACTIVATED_SIBLING_PIN_SOURCE_PREFIX) {
+        Some(bundle) => format!("co-activated sibling pin from {bundle}"),
+        None => "learned conda fact".to_string(),
+    }
+}
+
 /// Turn the workspace's SOLVED conda versions -- transitives included -- into
 /// uv `constraint-dependencies`.
 ///
@@ -3900,6 +3930,10 @@ struct LearnedFactYieldNeeded {
     pypi_name: String,
     /// The learned version that lost.
     learned_version: String,
+    /// Provenance `source` of the advisory constraint that lost, so the
+    /// warning names the real producer (learned conda fact vs. a
+    /// co-activated sibling pack's resolved pin).
+    source: String,
     /// Why the learned fact has to go.
     reason: LearnedFactYieldReason,
     /// uv's own reason sentence for this package, verbatim (box-drawing and
@@ -4063,7 +4097,7 @@ fn learned_fact_yield_needed(
         if !matches!(
             attribution.conda_source.provenance,
             Provenance::UvConstraint
-        ) || attribution.conda_source.source != LEARNED_WORKSPACE_FACT_SOURCE
+        ) || !is_yieldable_advisory_source(&attribution.conda_source.source)
         {
             continue;
         }
@@ -4110,6 +4144,7 @@ fn learned_fact_yield_needed(
         return Some(LearnedFactYieldNeeded {
             pypi_name: constraint_name,
             learned_version: learned_version.to_string(),
+            source: attribution.conda_source.source.clone(),
             reason,
             uv_reason: uv_reason_sentence(original_error, &attribution.package).unwrap_or_default(),
             original_error: original_error.to_string(),
@@ -4133,7 +4168,7 @@ fn apply_learned_fact_yields(req: &mut UvClosureRequest, yielded: &BTreeSet<Stri
             req.constraints
                 .provenance
                 .get(*name)
-                .is_some_and(|prov| prov.source == LEARNED_WORKSPACE_FACT_SOURCE)
+                .is_some_and(|prov| is_yieldable_advisory_source(&prov.source))
         })
         .cloned()
         .collect();
@@ -4229,15 +4264,18 @@ where
                             ),
                             LearnedFactYieldReason::NamedInConflict => String::new(),
                         };
+                        let origin = advisory_source_label(&needed.source);
                         tracing::warn!(
                             bundle = %req.bundle,
                             package = %needed.pypi_name,
                             learned = %format!("{}=={}", needed.pypi_name, needed.learned_version),
                             reason = %needed.reason.label(),
+                            source = %needed.source,
                             uv_reason = %needed.uv_reason,
-                            "learned conda fact {}=={} is named in uv's conflict \
+                            "{} {}=={} is named in uv's conflict \
                              (reason={}){}; dropping the learned constraint and re-locking. \
                              uv's reason: {}",
+                            origin,
                             needed.pypi_name,
                             needed.learned_version,
                             needed.reason.label(),
@@ -8502,6 +8540,127 @@ Using CPython 3.8.20
         assert_eq!(
             *yielded.lock().unwrap(),
             BTreeSet::from(["sympy".to_string()])
+        );
+    }
+
+    /// The same `sympy==1.14.0` line, but produced by a co-activated sibling
+    /// pack's RESOLVED pin (F30) instead of a learned conda fact.
+    fn sibling_pin_sympy_constraints() -> ConstraintSet {
+        let mut set = ConstraintSet::default();
+        set.constraints.push("sympy==1.14.0".to_string());
+        set.provenance.insert(
+            "sympy".to_string(),
+            ConstraintProvenance {
+                constraint: "sympy==1.14.0".to_string(),
+                conda_name: "sympy".to_string(),
+                conda_version: "==1.14.0".to_string(),
+                source: format!("{COACTIVATED_SIBLING_PIN_SOURCE_PREFIX}protomotions-deps-pack"),
+                env: "precise-consuming-envs".to_string(),
+                provenance: Provenance::UvConstraint,
+            },
+        );
+        set
+    }
+
+    /// F30 guard (b): a sibling pin this closure genuinely cannot satisfy is
+    /// ADVISORY -- it yields through the SAME machinery as a learned fact and
+    /// the pack re-locks, instead of hard-failing on a co-resident's choice.
+    /// The warning names the sibling bundle, not "learned conda fact".
+    #[tokio::test]
+    async fn an_incompatible_co_activated_sibling_pin_yields_and_relocks() {
+        let sibling = sibling_pin_sympy_constraints();
+        let attributions = attribute_conflict(SAGE_PASS_B_STDERR, &sibling.provenance);
+        let needed = learned_fact_yield_needed(&attributions, "pass A: evdev has no usable wheels")
+            .expect("a sibling's resolved pin must yield to a hard requirement in the closure");
+        assert_eq!(needed.pypi_name, "sympy");
+        assert_eq!(
+            needed.source,
+            format!("{COACTIVATED_SIBLING_PIN_SOURCE_PREFIX}protomotions-deps-pack"),
+        );
+        assert_eq!(
+            advisory_source_label(&needed.source),
+            "co-activated sibling pin from protomotions-deps-pack",
+            "the yield warning must name the sibling that produced the pin",
+        );
+
+        let mut req = sample_request();
+        req.constraints = sibling_pin_sympy_constraints();
+        let seen = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+        let raw = {
+            let seen = Arc::clone(&seen);
+            move |req: UvClosureRequest| {
+                let seen = Arc::clone(&seen);
+                Box::pin(async move {
+                    seen.lock()
+                        .unwrap()
+                        .push(req.constraints.constraints.clone());
+                    if req
+                        .constraints
+                        .constraints
+                        .iter()
+                        .any(|line| line == "sympy==1.14.0")
+                    {
+                        let attributions =
+                            attribute_conflict(SAGE_PASS_B_STDERR, &req.constraints.provenance);
+                        let needed = learned_fact_yield_needed(
+                            &attributions,
+                            "pass A: evdev==1.7.1 has no usable wheels",
+                        )
+                        .expect("fixture must arm the yield");
+                        return Err(anyhow::Error::new(needed));
+                    }
+                    Ok(UvClosure {
+                        wheels: vec![],
+                        pins: BTreeMap::from([("sympy".to_string(), "1.13.1".to_string())]),
+                        uv_version: "test".to_string(),
+                        auto_routed: vec![],
+                        auto_dropped: BTreeSet::new(),
+                        effective_input_requirements: None,
+                        dependency_graph: UvDependencyGraph::default(),
+                    })
+                }) as futures::future::BoxFuture<'static, Result<UvClosure>>
+            }
+        };
+        let yielded = Arc::new(Mutex::new(BTreeSet::new()));
+        let mut solve = with_learned_fact_yields(raw, Arc::clone(&yielded));
+        let closure = solve(req)
+            .await
+            .expect("an incompatible sibling pin must yield, not fail the pack");
+        assert_eq!(closure.pins["sympy"], "1.13.1");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "exactly one retry: {seen:?}");
+        assert!(
+            !seen[1].iter().any(|line| line.starts_with("sympy")),
+            "the retry must carry no sibling sympy pin: {:?}",
+            seen[1],
+        );
+        assert_eq!(
+            *yielded.lock().unwrap(),
+            BTreeSet::from(["sympy".to_string()]),
+        );
+    }
+
+    /// A DECLARED workspace conda fact is still never yielded -- the sibling
+    /// widening must not turn operator intent into an advisory float.
+    #[test]
+    fn a_declared_workspace_fact_still_never_yields_after_the_sibling_widening() {
+        let mut declared = ConstraintSet::default();
+        declared.constraints.push("sympy==1.14.0".to_string());
+        declared.provenance.insert(
+            "sympy".to_string(),
+            ConstraintProvenance {
+                constraint: "sympy==1.14.0".to_string(),
+                conda_name: "sympy".to_string(),
+                conda_version: "==1.14.0".to_string(),
+                source: "workspace conda fact (declared)".to_string(),
+                env: "consuming-envs".to_string(),
+                provenance: Provenance::WorkspaceCondaFact("declared".to_string()),
+            },
+        );
+        let attributions = attribute_conflict(SAGE_PASS_B_STDERR, &declared.provenance);
+        assert!(
+            learned_fact_yield_needed(&attributions, "pass A").is_none(),
+            "declared operator intent keeps its own loud recovery",
         );
     }
 
