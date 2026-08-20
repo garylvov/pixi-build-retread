@@ -997,6 +997,11 @@ fn coactivated_siblings_missing_locks(
         .into_iter()
         .filter(|(bundle, pack_dir)| {
             coactivated_sibling_lock(manifest, workspace_dir, target, bundle, pack_dir).is_none()
+                && workspace_precise_consuming_envs(manifest, workspace_dir, source_dir, target)
+                    .is_none_or(|our_envs| {
+                        coactivated_sibling_advisory_lock(target, bundle, pack_dir, &our_envs)
+                            .is_none()
+                    })
         })
         .map(|(bundle, _)| bundle)
         .collect()
@@ -1052,6 +1057,225 @@ fn coactivated_sibling_lock(
     lock.validate_replay_contract_for_target(&sibling_target, bundle)
         .ok()?;
     Some(lock)
+}
+
+/// Emit `name==version` for every dist a co-activated sibling actually
+/// RESOLVED (F30). Shared by the exact-identity sidecar path and the
+/// advisory cross-identity path (F31); both stamp the same
+/// `co-activated-sibling-pin:{bundle}` source, which is what makes the pin
+/// yieldable in `uv_closure::is_yieldable_advisory_source`.
+fn push_sibling_resolved_pins(
+    locks: &[(String, crate::lock::RetreadLock)],
+    out: &mut crate::uv_closure::ConstraintSet,
+    pinned: &mut BTreeSet<String>,
+    seen: &mut BTreeSet<String>,
+) {
+    for (bundle, lock) in locks {
+        for wheel in &lock.wheels {
+            let name = canonical_conda_name(&wheel.name);
+            if !pinned.insert(name.clone()) {
+                continue;
+            }
+            let specifiers = format!("=={}", wheel.version);
+            let line = format!("{name}{specifiers}");
+            if !seen.insert(line.clone()) {
+                continue;
+            }
+            out.constraints.push(line.clone());
+            let conda_name = name.clone();
+            out.provenance.insert(
+                name,
+                crate::uv_closure::ConstraintProvenance {
+                    constraint: line,
+                    conda_name,
+                    conda_version: specifiers,
+                    source: format!(
+                        "{}{bundle}",
+                        crate::uv_closure::COACTIVATED_SIBLING_PIN_SOURCE_PREFIX
+                    ),
+                    env: "precise-consuming-envs".to_string(),
+                    provenance: Provenance::UvConstraint,
+                },
+            );
+        }
+    }
+}
+
+/// Deterministic rank of a workspace-environment scope: (count, sorted names).
+///
+/// F31 tie-break. Two co-resident packs with different consuming-env sets have
+/// different target identities, so each can only ever see the other ACROSS
+/// identities; if both adopted the other's pins they would swap versions on
+/// every pair of rebuilds. A pack therefore adopts a cross-identity sibling's
+/// pins only when the sibling ranks STRICTLY LOWER here -- a strict total
+/// order is acyclic, so exactly one of A->B / B->A can apply and the pair
+/// cannot oscillate. Narrower scope leads because the narrow pack's closure
+/// has to hold inside our envelope anyway, while our extra environments place
+/// no obligation on it. Equal rank means equal identity, which the
+/// exact-identity path already handles -- and refusing it is exactly the
+/// staleness protection `coactivated_sibling_lock` documents: a lock written
+/// under OUR OWN scope never stands in for the sibling's.
+fn sibling_scope_rank(envs: &[String]) -> (usize, Vec<String>) {
+    let mut sorted: Vec<String> = envs.to_vec();
+    sorted.sort();
+    sorted.dedup();
+    (sorted.len(), sorted)
+}
+
+/// An ADVISORY sibling lock written under a DIFFERENT target identity (F31).
+///
+/// `coactivated_sibling_lock` names the sidecar from a target it can PROVE
+/// applies to the sibling; under an exact workspace envelope that is the
+/// current pack's own scope, so a co-resident pack with a different
+/// consuming-env set is invisible (the isaaclab/protomotions asymmetry). This
+/// scans the sibling pack dir instead and accepts a candidate only when it
+/// proves itself: same conda contract, an environment set that INTERSECTS our
+/// precise consuming envs, a strictly lower scope rank, a scope that
+/// reproduces the very filename it was found under, and the same
+/// `validate_replay_contract_for_target` the exact path runs.
+///
+/// The result is advisory-only. It feeds ONLY the yieldable
+/// `co-activated-sibling-pin:` path; it never reaches `sibling_lock_constraints`
+/// (and hence never `workspace_solve_fingerprint`), never
+/// `sibling_conda_run_dependencies`, and never the sibling's declared
+/// `requires_dist` ranges -- those treat a sidecar as authoritative, which a
+/// lock we could not name from our own target has not earned.
+fn coactivated_sibling_advisory_lock(
+    target: &ResolutionTarget,
+    bundle: &str,
+    pack_dir: &Path,
+    our_envs: &[String],
+) -> Option<crate::lock::RetreadLock> {
+    let contract = target.target_contract()?;
+    let our_rank = sibling_scope_rank(our_envs);
+    let prefix = format!("retread-{bundle}.target-");
+    let mut best: Option<(String, crate::lock::RetreadLock)> = None;
+    for entry in std::fs::read_dir(pack_dir).ok()?.flatten() {
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+        if !file_name.starts_with(&prefix) || !file_name.ends_with(".lock.json") {
+            continue;
+        }
+        let Ok(lock) = crate::lock::RetreadLock::load(&entry.path()) else {
+            continue;
+        };
+        if lock.schema != crate::lock::SCHEMA {
+            continue;
+        }
+        let Some(scope) = lock.target_scope.clone() else {
+            continue;
+        };
+        // Same conda contract, or the two packs did not solve for the same
+        // platform/virtual-package world at all.
+        if scope.contract != *contract {
+            continue;
+        }
+        // Co-residency is what authorizes convergence: the packs must share
+        // at least one environment that installs them into one prefix.
+        if !scope
+            .environments
+            .iter()
+            .any(|env| our_envs.iter().any(|ours| ours == env))
+        {
+            continue;
+        }
+        // Deterministic direction (see `sibling_scope_rank`).
+        if sibling_scope_rank(&scope.environments) >= our_rank {
+            continue;
+        }
+        // Rebuild the sibling's own target from the scope the lock declares
+        // -- with OUR python and subdir, so a lock for another interpreter or
+        // platform cannot reproduce its filename below.
+        let rebuilt = crate::pypi::ResolutionTarget::try_for_contract_on_subdir(
+            target.python_version(),
+            target.conda_subdir(),
+            scope.contract.clone(),
+        );
+        let sibling_target = if lock.exact_workspace_envelope {
+            rebuilt.and_then(|resolved| resolved.with_exact_workspace_scope(scope))
+        } else {
+            rebuilt.and_then(|resolved| resolved.with_workspace_scope(scope))
+        };
+        let Ok(sibling_target) = sibling_target else {
+            continue;
+        };
+        if crate::lock::RetreadLock::file_name_for_target(bundle, &sibling_target) != file_name {
+            continue;
+        }
+        if lock
+            .validate_replay_contract_for_target(&sibling_target, bundle)
+            .is_err()
+        {
+            continue;
+        }
+        // Several qualifying sidecars would be ambiguous; take the
+        // lowest-ranked one and break ties on the filename so the choice is
+        // reproducible.
+        let replace = match &best {
+            None => true,
+            Some((best_name, best_lock)) => {
+                let best_rank = best_lock
+                    .target_scope
+                    .as_ref()
+                    .map(|scope| sibling_scope_rank(&scope.environments))
+                    .unwrap_or_default();
+                let candidate_rank = sibling_target
+                    .workspace_scope()
+                    .map(|scope| sibling_scope_rank(&scope.environments))
+                    .unwrap_or_default();
+                (candidate_rank, &file_name) < (best_rank, best_name)
+            }
+        };
+        if replace {
+            best = Some((file_name, lock));
+        }
+    }
+    best.map(|(_, lock)| lock)
+}
+
+/// Every co-activated sibling whose lock is only reachable across target
+/// identities (F31). Exact-identity siblings are excluded: they are already
+/// authoritative through `coactivated_sibling_locks`.
+fn coactivated_sibling_advisory_locks(
+    manifest: &crate::workspace::WorkspaceManifest,
+    workspace_dir: &Path,
+    source_dir: &Path,
+    target: &ResolutionTarget,
+) -> Vec<(String, crate::lock::RetreadLock)> {
+    let Some(our_envs) =
+        workspace_precise_consuming_envs(manifest, workspace_dir, source_dir, target)
+    else {
+        return Vec::new();
+    };
+    coactivated_sibling_packs(manifest, workspace_dir, source_dir, target)
+        .into_iter()
+        .filter(|(bundle, pack_dir)| {
+            coactivated_sibling_lock(manifest, workspace_dir, target, bundle, pack_dir).is_none()
+        })
+        .filter_map(|(bundle, pack_dir)| {
+            let lock = coactivated_sibling_advisory_lock(target, &bundle, &pack_dir, &our_envs)?;
+            Some((bundle, lock))
+        })
+        .collect()
+}
+
+/// Yieldable convergence pins from cross-identity sibling sidecars (F31).
+///
+/// PINS ONLY. A sibling's declared `requires_dist` RANGES stay on the
+/// exact-identity path in `sibling_lock_constraints`: those are not yieldable
+/// and a lock we could not name from our own target must never be able to
+/// fail this pack's solve.
+fn sibling_advisory_pin_constraints(
+    manifest: &crate::workspace::WorkspaceManifest,
+    workspace_dir: &Path,
+    source_dir: &Path,
+    target: &ResolutionTarget,
+) -> crate::uv_closure::ConstraintSet {
+    let mut out = crate::uv_closure::ConstraintSet::default();
+    let mut pinned = BTreeSet::new();
+    let mut seen = BTreeSet::new();
+    let locks = coactivated_sibling_advisory_locks(manifest, workspace_dir, source_dir, target);
+    push_sibling_resolved_pins(&locks, &mut out, &mut pinned, &mut seen);
+    out
 }
 
 /// Exact emitted conda contracts of co-activated sibling packs.
@@ -1143,35 +1367,7 @@ fn sibling_lock_constraints(
     // INSIDE the sibling's own declared range by construction: it is the same
     // contract, stated exactly.
     let mut pinned: BTreeSet<String> = BTreeSet::new();
-    for (bundle, lock) in &sibling_locks {
-        for wheel in &lock.wheels {
-            let name = canonical_conda_name(&wheel.name);
-            if !pinned.insert(name.clone()) {
-                continue;
-            }
-            let specifiers = format!("=={}", wheel.version);
-            let line = format!("{name}{specifiers}");
-            if !seen.insert(line.clone()) {
-                continue;
-            }
-            out.constraints.push(line.clone());
-            let conda_name = name.clone();
-            out.provenance.insert(
-                name,
-                crate::uv_closure::ConstraintProvenance {
-                    constraint: line,
-                    conda_name,
-                    conda_version: specifiers,
-                    source: format!(
-                        "{}{bundle}",
-                        crate::uv_closure::COACTIVATED_SIBLING_PIN_SOURCE_PREFIX
-                    ),
-                    env: "precise-consuming-envs".to_string(),
-                    provenance: Provenance::UvConstraint,
-                },
-            );
-        }
-    }
+    push_sibling_resolved_pins(&sibling_locks, &mut out, &mut pinned, &mut seen);
     // Pass 2 -- the sibling's declared entry requirements, for names the
     // sibling did NOT resolve (a marker-gated or extra-gated requirement).
     for (bundle, lock) in sibling_locks {
@@ -1898,6 +2094,401 @@ alias = { features = ["sibling", "alias"], no-default-feature = true }
         );
 
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // ── F31: cross-identity sidecar discovery ────────────────────────────
+
+    /// Two co-resident packs with DIFFERENT consuming-environment sets. The
+    /// current pack is consumed by `broad`/`narrow`/`wide`; the sibling by
+    /// `narrow`/`alone`. Scope-derived identity therefore differs, which is
+    /// exactly the isaaclab-2.3x-pack (4 envs) / protomotions-deps-pack
+    /// (1 env) shape from cert17.
+    fn f31_workspace() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "retread-f31-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("current")).unwrap();
+        std::fs::create_dir_all(dir.join("sibling")).unwrap();
+        std::fs::write(
+            dir.join("pixi.toml"),
+            r#"[workspace]
+channels = ["conda-forge"]
+platforms = [
+  { name = "p1", platform = "linux-64", glibc = "2.28", linux = "4.18" },
+]
+
+[feature.current.dependencies]
+current-pack = { path = "./current" }
+
+[feature.sibling.dependencies]
+"sibling.pack" = { path = "./sibling" }
+
+[environments]
+broad = { features = ["current"], no-default-feature = true }
+narrow = { features = ["current", "sibling"], no-default-feature = true }
+wide = { features = ["current"], no-default-feature = true }
+alone = { features = ["sibling"], no-default-feature = true }
+"#,
+        )
+        .unwrap();
+        dir
+    }
+
+    fn f31_lock(bundle: &str, target: &ResolutionTarget, pin: (&str, &str)) -> RetreadLock {
+        RetreadLock {
+            schema: SCHEMA,
+            retread_version: env!("CARGO_PKG_VERSION").to_string(),
+            bundle: bundle.to_string(),
+            version: "1.0.0".to_string(),
+            python: target.python_version().to_string(),
+            target_subdir: target.conda_subdir().to_string(),
+            target_contract: target.target_contract().cloned(),
+            target_identity: Some(target.resolution_identity()),
+            target_scope: target.workspace_scope().cloned(),
+            exact_workspace_envelope: target.has_exact_workspace_envelope(),
+            inputs_hash: format!("f31-{bundle}"),
+            root_requirements: vec![format!("{bundle}-root==1.0.0")],
+            wheels: vec![LockWheel {
+                name: pin.0.to_string(),
+                version: pin.1.to_string(),
+                origin: Origin::Index,
+                filename: format!("{}-{}-py3-none-any.whl", pin.0.replace('-', "_"), pin.1),
+                url: Some(format!(
+                    "https://example.invalid/{}-{}-py3-none-any.whl",
+                    pin.0.replace('-', "_"),
+                    pin.1
+                )),
+                sha256: Some("44".repeat(32)),
+                requires_dist: vec!["range-only>=9".to_string()],
+                must_ship: false,
+                upstream_url: None,
+                git_source: None,
+                sdist_source: None,
+            }],
+            conda_run_constraints: Vec::new(),
+            declared_pypi_owned: Vec::new(),
+            conda_run_deps: vec![CondaDep {
+                name: "numba".to_string(),
+                spec: ">=0.59.1,<0.60".to_string(),
+            }],
+            index_urls: vec!["https://pypi.org/simple/".to_string()],
+            prerelease: BTreeMap::new(),
+            shadow_libs: BTreeMap::new(),
+            declared_glibc: target.declared_glibc().map(crate::glibc::format_glibc),
+            resolution_glibc: target.effective_glibc().map(crate::glibc::format_glibc),
+            conda_capable: Vec::new(),
+            entry_specs: vec![format!("{bundle}-root==1.0.0")],
+            wheel_store: None,
+            abi_context: None,
+            relaxations: vec![],
+        }
+    }
+
+    /// `(workspace dir, manifest, our exact-envelope target, sibling scope)`.
+    /// The current pack's target carries an EXACT workspace envelope, which is
+    /// the branch that names the sibling sidecar from OUR OWN identity
+    /// (`coactivated_sibling_lock`, mod.rs) and therefore never finds it.
+    fn f31_setup(
+        dir: &std::path::Path,
+        sibling_envs: &[&str],
+    ) -> (
+        crate::workspace::WorkspaceManifest,
+        ResolutionTarget,
+        crate::workspace::ResolvedWorkspaceTarget,
+    ) {
+        let manifest = crate::workspace::WorkspaceManifest::load(dir).unwrap();
+        let ours = manifest
+            .resolve_target_for_source(dir, &dir.join("current"), "linux-64", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ours.environments,
+            vec![
+                "broad".to_string(),
+                "narrow".to_string(),
+                "wide".to_string()
+            ],
+            "the current pack must be consumed by three environments",
+        );
+        let our_target = ResolutionTarget::try_for_contract("3.11", ours.contract.clone())
+            .unwrap()
+            .with_exact_workspace_scope(ours.clone())
+            .unwrap();
+        assert!(our_target.has_exact_workspace_envelope());
+        let sibling_scope = crate::workspace::ResolvedWorkspaceTarget {
+            contract: ours.contract.clone(),
+            profiles: ours.profiles.clone(),
+            environments: sibling_envs.iter().map(|env| env.to_string()).collect(),
+        };
+        (manifest, our_target, sibling_scope)
+    }
+
+    fn f31_write_sibling(
+        dir: &std::path::Path,
+        scope: crate::workspace::ResolvedWorkspaceTarget,
+        pin: (&str, &str),
+    ) -> ResolutionTarget {
+        let target = ResolutionTarget::try_for_contract("3.11", scope.contract.clone())
+            .unwrap()
+            .with_workspace_scope(scope)
+            .unwrap();
+        let lock = f31_lock("sibling.pack", &target, pin);
+        std::fs::write(
+            dir.join("sibling")
+                .join(RetreadLock::file_name_for_target("sibling.pack", &target)),
+            lock.to_pretty_json().unwrap(),
+        )
+        .unwrap();
+        target
+    }
+
+    /// F31 guard (a): the isaaclab/protomotions shape. A sibling sidecar
+    /// written under a DIFFERENT (narrower) scope identity is discovered and
+    /// its RESOLVED pins constrain this pack.
+    #[test]
+    fn a_cross_identity_sibling_sidecar_contributes_advisory_pins() {
+        let dir = f31_workspace();
+        let (manifest, our_target, sibling_scope) = f31_setup(&dir, &["alone", "narrow"]);
+        let sibling_target = f31_write_sibling(&dir, sibling_scope, ("shared-transitive", "2.0.0"));
+        assert_ne!(
+            sibling_target.resolution_identity(),
+            our_target.resolution_identity(),
+            "the two packs must not share a target identity, or there is nothing to fix",
+        );
+        assert_eq!(
+            super::workspace_precise_consuming_envs(
+                &manifest,
+                &dir,
+                &dir.join("current"),
+                &our_target
+            ),
+            Some(vec![
+                "broad".to_string(),
+                "narrow".to_string(),
+                "wide".to_string()
+            ]),
+        );
+        assert!(
+            sibling_lock_constraints(&manifest, &dir, &dir.join("current"), &our_target)
+                .constraints
+                .is_empty(),
+            "the exact-identity lookup cannot name this sidecar -- that is the bug",
+        );
+
+        let advisory = super::sibling_advisory_pin_constraints(
+            &manifest,
+            &dir,
+            &dir.join("current"),
+            &our_target,
+        );
+        assert!(
+            advisory
+                .constraints
+                .iter()
+                .any(|line| line == "shared-transitive==2.0.0"),
+            "a cross-identity sibling's resolved pin must constrain us: {:?}",
+            advisory.constraints,
+        );
+        assert_eq!(
+            advisory
+                .provenance
+                .get("shared-transitive")
+                .expect("the advisory pin must carry provenance")
+                .source,
+            format!(
+                "{}sibling.pack",
+                crate::uv_closure::COACTIVATED_SIBLING_PIN_SOURCE_PREFIX
+            ),
+            "the advisory pin must use the YIELDABLE sibling-pin source",
+        );
+        assert!(
+            crate::uv_closure::is_yieldable_advisory_source(
+                &advisory.provenance["shared-transitive"].source
+            ),
+            "an advisory pin that cannot yield could fail this pack's solve",
+        );
+        assert!(
+            advisory
+                .constraints
+                .iter()
+                .all(|line| !line.starts_with("range-only")),
+            "only PINS cross identities; declared ranges stay authoritative: {:?}",
+            advisory.constraints,
+        );
+        assert!(
+            coactivated_siblings_missing_locks(&manifest, &dir, &dir.join("current"), &our_target)
+                .is_empty(),
+            "a sibling we DID converge onto must not raise the cold-pass warning",
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// F31 guard (b): co-residency is what authorizes convergence. A sidecar
+    /// whose scope names no environment we are consumed by is not ours to
+    /// converge onto.
+    #[test]
+    fn a_cross_identity_sidecar_with_no_shared_environment_is_not_discovered() {
+        let dir = f31_workspace();
+        let (manifest, our_target, sibling_scope) = f31_setup(&dir, &["alone"]);
+        f31_write_sibling(&dir, sibling_scope, ("shared-transitive", "2.0.0"));
+        let advisory = super::sibling_advisory_pin_constraints(
+            &manifest,
+            &dir,
+            &dir.join("current"),
+            &our_target,
+        );
+        assert!(
+            advisory.constraints.is_empty(),
+            "`alone` is not one of our consuming envs, so nothing is co-installed \
+             with us: {:?}",
+            advisory.constraints,
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// F31 guard (c): a sidecar solved for a different conda contract
+    /// describes a different platform/virtual-package world.
+    #[test]
+    fn a_cross_identity_sidecar_with_a_different_contract_is_not_discovered() {
+        let dir = f31_workspace();
+        let (manifest, our_target, mut sibling_scope) = f31_setup(&dir, &["alone", "narrow"]);
+        sibling_scope
+            .contract
+            .declared_virtual_packages
+            .insert("glibc".to_string(), "2.34".to_string());
+        assert_ne!(
+            sibling_scope.contract,
+            *our_target.target_contract().unwrap(),
+            "the fixture must actually diverge on the contract",
+        );
+        let sibling_target = f31_write_sibling(&dir, sibling_scope, ("shared-transitive", "2.0.0"));
+        assert!(
+            dir.join("sibling")
+                .join(RetreadLock::file_name_for_target(
+                    "sibling.pack",
+                    &sibling_target
+                ))
+                .is_file(),
+            "the divergent-contract sidecar must be on disk to be rejected on merit",
+        );
+        let advisory = super::sibling_advisory_pin_constraints(
+            &manifest,
+            &dir,
+            &dir.join("current"),
+            &our_target,
+        );
+        assert!(
+            advisory.constraints.is_empty(),
+            "a different conda contract is a different solve: {:?}",
+            advisory.constraints,
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// F31 guard (d): a cross-identity sidecar is ADVISORY ONLY. It must not
+    /// reach any path that treats a same-identity sidecar as authoritative --
+    /// the replay/cache fingerprint, the conda co-solve inputs, or the
+    /// sibling's declared requirement ranges.
+    #[test]
+    fn a_cross_identity_sidecar_never_enters_the_authoritative_sibling_path() {
+        let dir = f31_workspace();
+        let (manifest, our_target, sibling_scope) = f31_setup(&dir, &["alone", "narrow"]);
+        let before =
+            workspace_solve_fingerprint(&manifest, &dir, &dir.join("current"), &our_target);
+        f31_write_sibling(&dir, sibling_scope, ("shared-transitive", "2.0.0"));
+        let after = workspace_solve_fingerprint(&manifest, &dir, &dir.join("current"), &our_target);
+        assert_eq!(
+            before, after,
+            "an advisory sidecar must not change the replay/cache fingerprint",
+        );
+        assert!(
+            sibling_lock_constraints(&manifest, &dir, &dir.join("current"), &our_target)
+                .constraints
+                .is_empty(),
+            "the authoritative constraint set must stay exact-identity only",
+        );
+        assert!(
+            sibling_conda_run_dependencies(&manifest, &dir, &dir.join("current"), &our_target)
+                .is_empty(),
+            "an advisory sidecar must not veto conda routes",
+        );
+        // The pins ARE available on the advisory channel: this test proves
+        // separation, not absence.
+        assert!(
+            !super::sibling_advisory_pin_constraints(
+                &manifest,
+                &dir,
+                &dir.join("current"),
+                &our_target
+            )
+            .constraints
+            .is_empty(),
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// F31 guard (e): the tie-break. Both packs can see each other's sidecar
+    /// across identities; only the strictly-higher-ranked scope adopts, so
+    /// A->B and B->A cannot swap versions on alternating rebuilds.
+    #[test]
+    fn cross_identity_adoption_runs_in_exactly_one_direction() {
+        let dir = f31_workspace();
+        let (manifest, our_target, sibling_scope) = f31_setup(&dir, &["alone", "narrow"]);
+        f31_write_sibling(&dir, sibling_scope.clone(), ("shared-transitive", "2.0.0"));
+
+        // The current pack's own sidecar, under its 3-environment scope.
+        let ours_direct = ResolutionTarget::try_for_contract(
+            "3.11",
+            our_target.target_contract().unwrap().clone(),
+        )
+        .unwrap()
+        .with_workspace_scope(our_target.workspace_scope().unwrap().clone())
+        .unwrap();
+        std::fs::write(
+            dir.join("current").join(RetreadLock::file_name_for_target(
+                "current-pack",
+                &ours_direct,
+            )),
+            f31_lock("current-pack", &ours_direct, ("shared-transitive", "3.0.0"))
+                .to_pretty_json()
+                .unwrap(),
+        )
+        .unwrap();
+
+        let sibling_view =
+            ResolutionTarget::try_for_contract("3.11", sibling_scope.contract.clone())
+                .unwrap()
+                .with_exact_workspace_scope(sibling_scope)
+                .unwrap();
+        assert!(
+            super::sibling_advisory_pin_constraints(
+                &manifest,
+                &dir,
+                &dir.join("sibling"),
+                &sibling_view
+            )
+            .constraints
+            .is_empty(),
+            "the narrower pack must NOT adopt the broader pack's pins, or the pair oscillates",
+        );
+        assert!(
+            super::sibling_advisory_pin_constraints(
+                &manifest,
+                &dir,
+                &dir.join("current"),
+                &our_target
+            )
+            .constraints
+            .iter()
+            .any(|line| line == "shared-transitive==2.0.0"),
+            "the broader pack adopts the narrower pack's pin -- the one legal direction",
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 
@@ -7567,6 +8158,28 @@ async fn uv_group_closure(
     if let (Some(manifest), Some(ws_dir)) = (manifest_opt.as_ref(), workspace_dir) {
         let mut sibling_constraints =
             sibling_lock_constraints(manifest, ws_dir, source_dir, target);
+        // F31: a co-resident pack whose consuming-env set differs from ours
+        // has a different target identity, so its sidecar is invisible to the
+        // exact lookup above. Merge its RESOLVED pins here -- advisory and
+        // yieldable, never its declared ranges, and never into the
+        // fingerprint/conda-co-solve inputs `sibling_lock_constraints` feeds.
+        let advisory = sibling_advisory_pin_constraints(manifest, ws_dir, source_dir, target);
+        let mut advisory_pins = 0usize;
+        for (name, provenance) in advisory.provenance {
+            if sibling_constraints.provenance.contains_key(&name) {
+                continue;
+            }
+            if !sibling_constraints
+                .constraints
+                .contains(&provenance.constraint)
+            {
+                sibling_constraints
+                    .constraints
+                    .push(provenance.constraint.clone());
+            }
+            sibling_constraints.provenance.insert(name, provenance);
+            advisory_pins += 1;
+        }
         let superseded =
             drop_sibling_pins_superseded_by_declared(&mut sibling_constraints, &constraints);
         let sibling_pins = sibling_constraints
@@ -7583,6 +8196,7 @@ async fn uv_group_closure(
                 bundle = %group_name,
                 constraints = sibling_constraints.constraints.len(),
                 pins = sibling_pins,
+                advisory_pins = advisory_pins,
                 superseded_by_declared = superseded.len(),
                 "uv closure: applying co-activated sibling pack requirements",
             );

@@ -2835,7 +2835,7 @@ pub const COACTIVATED_SIBLING_PIN_SOURCE_PREFIX: &str = "co-activated-sibling-pi
 ///
 /// DECLARED operator intent (workspace conda facts, manifest pins) is never
 /// in this set: it keeps its own loud recovery.
-fn is_yieldable_advisory_source(source: &str) -> bool {
+pub(crate) fn is_yieldable_advisory_source(source: &str) -> bool {
     source == LEARNED_WORKSPACE_FACT_SOURCE
         || source.starts_with(COACTIVATED_SIBLING_PIN_SOURCE_PREFIX)
 }
