@@ -1082,6 +1082,38 @@ fn sibling_conda_run_dependencies(
     out
 }
 
+/// Declared precedence over a co-activated sibling's RESOLVED pin.
+///
+/// A workspace- or pack-declared constraint for a name already speaks for it
+/// (it is assembled into `declared` from the manifest / conda facts before the
+/// sibling set is merged). A sibling pin is advisory convergence, so it must
+/// never restate a declared name: two lines for one name are either redundant
+/// or hand uv a conflict the operator already decided. Returns the pin lines
+/// that were dropped, for the log.
+///
+/// Only PINS are superseded. A sibling's declared requirement RANGE keeps its
+/// pre-F30 behaviour.
+fn drop_sibling_pins_superseded_by_declared(
+    sibling: &mut crate::uv_closure::ConstraintSet,
+    declared: &crate::uv_closure::ConstraintSet,
+) -> BTreeSet<String> {
+    let mut superseded: BTreeSet<String> = BTreeSet::new();
+    sibling.provenance.retain(|name, provenance| {
+        let is_sibling_pin = provenance
+            .source
+            .starts_with(crate::uv_closure::COACTIVATED_SIBLING_PIN_SOURCE_PREFIX);
+        if is_sibling_pin && declared.provenance.contains_key(name) {
+            superseded.insert(provenance.constraint.clone());
+            return false;
+        }
+        true
+    });
+    sibling
+        .constraints
+        .retain(|line| !superseded.contains(line));
+    superseded
+}
+
 /// Read the exact-target committed locks of Retread path packages activated
 /// beside `source_dir` and turn their real wheel metadata requirements into
 /// non-installing uv constraints for this pack.
@@ -1098,7 +1130,51 @@ fn sibling_lock_constraints(
 ) -> crate::uv_closure::ConstraintSet {
     let mut out = crate::uv_closure::ConstraintSet::default();
     let mut seen = BTreeSet::new();
-    for (bundle, lock) in coactivated_sibling_locks(manifest, workspace_dir, source_dir, target) {
+    let sibling_locks = coactivated_sibling_locks(manifest, workspace_dir, source_dir, target);
+    // Pass 1 -- the sibling's RESOLVED pins (F30). Two packs installed into
+    // ONE prefix must agree on every shared dist: whichever pack solves
+    // second has to converge on the versions the first already locked, or
+    // both write the same name at different versions and whichever replays
+    // last silently overwrites the other's payload. A uv constraint installs
+    // nothing, so pinning every sibling-resolved name constrains exactly the
+    // names both closures share and is inert for the rest.
+    //
+    // Ordered before the requires_dist pass because a resolved pin is a point
+    // INSIDE the sibling's own declared range by construction: it is the same
+    // contract, stated exactly.
+    let mut pinned: BTreeSet<String> = BTreeSet::new();
+    for (bundle, lock) in &sibling_locks {
+        for wheel in &lock.wheels {
+            let name = canonical_conda_name(&wheel.name);
+            if !pinned.insert(name.clone()) {
+                continue;
+            }
+            let specifiers = format!("=={}", wheel.version);
+            let line = format!("{name}{specifiers}");
+            if !seen.insert(line.clone()) {
+                continue;
+            }
+            out.constraints.push(line.clone());
+            let conda_name = name.clone();
+            out.provenance.insert(
+                name,
+                crate::uv_closure::ConstraintProvenance {
+                    constraint: line,
+                    conda_name,
+                    conda_version: specifiers,
+                    source: format!(
+                        "{}{bundle}",
+                        crate::uv_closure::COACTIVATED_SIBLING_PIN_SOURCE_PREFIX
+                    ),
+                    env: "precise-consuming-envs".to_string(),
+                    provenance: Provenance::UvConstraint,
+                },
+            );
+        }
+    }
+    // Pass 2 -- the sibling's declared entry requirements, for names the
+    // sibling did NOT resolve (a marker-gated or extra-gated requirement).
+    for (bundle, lock) in sibling_locks {
         // Compose only the sibling's declared entry wheels. Transitive wheel
         // metadata can be internally contradictory after Retread routes or
         // relaxes those dependencies (for example cmeel-boost's numpy>=2 and
@@ -1138,6 +1214,10 @@ fn sibling_lock_constraints(
                 format!(" ; {marker}")
             };
             let name = canonical_conda_name(requirement.name.as_ref());
+            if pinned.contains(&name) {
+                // Pass 1 already stated this name exactly.
+                continue;
+            }
             let line = format!("{name}{specifiers}{marker}");
             if !seen.insert(line.clone()) {
                 continue;
@@ -1300,6 +1380,88 @@ composed = { features = ["composed"], no-default-feature = true }
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// F30 guard (c): a sibling's RESOLVED pin is advisory convergence, so a
+    /// name the workspace/pack already DECLARED keeps the declared line and
+    /// the sibling pin is dropped -- never two lines for one name.
+    #[test]
+    fn a_declared_constraint_supersedes_a_co_activated_sibling_pin() {
+        let declared_provenance = crate::uv_closure::ConstraintProvenance {
+            constraint: "click==8.1.7".to_string(),
+            conda_name: "click".to_string(),
+            conda_version: "==8.1.7".to_string(),
+            source: "manifest".to_string(),
+            env: "consuming-envs".to_string(),
+            provenance: crate::constraint::Provenance::UvConstraint,
+        };
+        let mut declared = crate::uv_closure::ConstraintSet::default();
+        declared.constraints.push("click==8.1.7".to_string());
+        declared
+            .provenance
+            .insert("click".to_string(), declared_provenance);
+
+        let sibling_pin = |name: &str, version: &str| crate::uv_closure::ConstraintProvenance {
+            constraint: format!("{name}=={version}"),
+            conda_name: name.to_string(),
+            conda_version: format!("=={version}"),
+            source: format!(
+                "{}protomotions-deps-pack",
+                crate::uv_closure::COACTIVATED_SIBLING_PIN_SOURCE_PREFIX
+            ),
+            env: "precise-consuming-envs".to_string(),
+            provenance: crate::constraint::Provenance::UvConstraint,
+        };
+        let mut sibling = crate::uv_closure::ConstraintSet::default();
+        sibling.constraints.push("click==8.4.2".to_string());
+        sibling.constraints.push("scipy==1.17.1".to_string());
+        sibling.constraints.push("wrapt>=1.11".to_string());
+        sibling
+            .provenance
+            .insert("click".to_string(), sibling_pin("click", "8.4.2"));
+        sibling
+            .provenance
+            .insert("scipy".to_string(), sibling_pin("scipy", "1.17.1"));
+        sibling.provenance.insert(
+            "wrapt".to_string(),
+            crate::uv_closure::ConstraintProvenance {
+                constraint: "wrapt>=1.11".to_string(),
+                conda_name: "wrapt".to_string(),
+                conda_version: ">=1.11".to_string(),
+                source: "co-activated-retread-lock:protomotions-deps-pack".to_string(),
+                env: "precise-consuming-envs".to_string(),
+                provenance: crate::constraint::Provenance::UvConstraint,
+            },
+        );
+
+        let superseded = super::drop_sibling_pins_superseded_by_declared(&mut sibling, &declared);
+
+        assert_eq!(
+            superseded,
+            std::collections::BTreeSet::from(["click==8.4.2".to_string()]),
+        );
+        assert!(
+            !sibling
+                .constraints
+                .iter()
+                .any(|line| line == "click==8.4.2"),
+            "a declared pin must beat the sibling's resolved pin: {:?}",
+            sibling.constraints,
+        );
+        assert!(!sibling.provenance.contains_key("click"));
+        assert!(
+            sibling
+                .constraints
+                .iter()
+                .any(|line| line == "scipy==1.17.1"),
+            "an undeclared shared name still converges: {:?}",
+            sibling.constraints,
+        );
+        assert!(
+            sibling.constraints.iter().any(|line| line == "wrapt>=1.11"),
+            "a sibling requirement RANGE is not a pin and is untouched: {:?}",
+            sibling.constraints,
+        );
+    }
+
     #[test]
     fn coactivated_sibling_metadata_constrains_uv_and_fingerprints_replay() {
         let dir = temp_workspace();
@@ -1428,6 +1590,39 @@ composed = { features = ["composed"], no-default-feature = true }
             coactivated_siblings_missing_locks(&manifest, &dir, &dir.join("current"), &target)
                 .is_empty(),
             "a sibling whose lock IS on disk must not be reported as unlocked",
+        );
+        // F30 guard (a): the sibling's RESOLVED pin for a name it never
+        // DECLARED (`transitive-root` is only in its `wheels`) must constrain
+        // this pack's closure, or two co-resident packs pin the same shared
+        // transitive at different versions.
+        assert!(
+            constraints
+                .constraints
+                .iter()
+                .any(|line| line == "transitive-root==2.0.0"),
+            "a shared transitive must be pinned to the sibling's resolved \
+             version, constraints were {:?}",
+            constraints.constraints,
+        );
+        let pin = constraints
+            .provenance
+            .get("transitive-root")
+            .expect("the sibling pin must carry provenance");
+        assert_eq!(
+            pin.source,
+            format!(
+                "{}sibling.pack",
+                crate::uv_closure::COACTIVATED_SIBLING_PIN_SOURCE_PREFIX
+            ),
+            "the pin must name the sibling bundle that owns it",
+        );
+        assert!(
+            constraints
+                .constraints
+                .iter()
+                .any(|line| line == "sibling-root==1.0.0"),
+            "the sibling's own entry pin converges too: {:?}",
+            constraints.constraints,
         );
         let fingerprint =
             workspace_solve_fingerprint(&manifest, &dir, &dir.join("current"), &target);
@@ -7370,11 +7565,25 @@ async fn uv_group_closure(
         },
     };
     if let (Some(manifest), Some(ws_dir)) = (manifest_opt.as_ref(), workspace_dir) {
-        let sibling_constraints = sibling_lock_constraints(manifest, ws_dir, source_dir, target);
+        let mut sibling_constraints =
+            sibling_lock_constraints(manifest, ws_dir, source_dir, target);
+        let superseded =
+            drop_sibling_pins_superseded_by_declared(&mut sibling_constraints, &constraints);
+        let sibling_pins = sibling_constraints
+            .provenance
+            .values()
+            .filter(|provenance| {
+                provenance
+                    .source
+                    .starts_with(crate::uv_closure::COACTIVATED_SIBLING_PIN_SOURCE_PREFIX)
+            })
+            .count();
         if !sibling_constraints.constraints.is_empty() {
             tracing::info!(
                 bundle = %group_name,
                 constraints = sibling_constraints.constraints.len(),
+                pins = sibling_pins,
+                superseded_by_declared = superseded.len(),
                 "uv closure: applying co-activated sibling pack requirements",
             );
         }
