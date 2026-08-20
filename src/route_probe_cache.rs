@@ -249,7 +249,9 @@ impl RouteProbeCache {
                 return;
             }
         }
-        let tmp = self.path.with_extension(format!("tmp{}", std::process::id()));
+        let tmp = self
+            .path
+            .with_extension(format!("tmp{}", std::process::id()));
         if std::fs::write(&tmp, text.as_bytes()).is_ok() {
             let _ = std::fs::rename(&tmp, &self.path);
         }
@@ -299,7 +301,10 @@ mod tests {
             for digest in &questions {
                 if cache.lookup(digest).is_none() {
                     cold_executions += 1;
-                    cache.record(digest, CachedVerdict::ExactUnsat(vec!["no candidates".into()]));
+                    cache.record(
+                        digest,
+                        CachedVerdict::ExactUnsat(vec!["no candidates".into()]),
+                    );
                 }
             }
             assert_eq!(cache.stats(), (0, 100), "cold run is all misses");

@@ -1652,9 +1652,8 @@ fn a_declared_workspace_pin_still_decides_the_constrains_carry() {
     // ==1.28.0` in its manifest -- the wheel cap does NOT get to overrule it.
     // Policy decides, and today's policy omits the undecidable bound with a
     // WARN rather than turning a pack that built before into a hard failure.
-    let bundle = hub_cap_bundle_with_conflicting_workspace_fact(BTreeSet::from([
-        "==1.28.0".to_string()
-    ]));
+    let bundle =
+        hub_cap_bundle_with_conflicting_workspace_fact(BTreeSet::from(["==1.28.0".to_string()]));
 
     let output =
         produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
@@ -8636,8 +8635,10 @@ fn dispatch_logs_every_rpc_error_with_method_subject_and_full_message() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .expect("the guard test needs a current-thread runtime so the \
-                 thread-local tracing subscriber stays in scope");
+        .expect(
+            "the guard test needs a current-thread runtime so the \
+                 thread-local tracing subscriber stays in scope",
+        );
 
     // A conda/build_v1 request naming a pack, which cannot succeed: the
     // handler was never initialized, and the params are not a valid
@@ -8786,7 +8787,10 @@ fn drifted_advertisement(candidate: &CondaOutput) -> Vec<String> {
     advertised
 }
 
-fn advertised_output_record(depends: Vec<String>, constrains: Vec<String>) -> AdvertisedIdentityRecord {
+fn advertised_output_record(
+    depends: Vec<String>,
+    constrains: Vec<String>,
+) -> AdvertisedIdentityRecord {
     AdvertisedIdentityRecord {
         schema: advertised_identity::SCHEMA,
         name: "protomotions-deps-pack".to_string(),
@@ -9095,10 +9099,7 @@ fn an_anchor_native_provider_absent_from_run_deps_is_emitted_pinned() {
 /// widening.
 #[test]
 fn an_anchor_native_provider_already_in_run_deps_is_not_restated() {
-    let mut bundle = solo_bundle(
-        "flashsac-pack",
-        vec!["nvidia-cuda-runtime-cu12==12.9.79"],
-    );
+    let mut bundle = solo_bundle("flashsac-pack", vec!["nvidia-cuda-runtime-cu12==12.9.79"]);
     bundle.extras.push(rw(
         "nvidia-cuda-runtime-cu12",
         meta("nvidia-cuda-runtime-cu12", "12.9.79", vec![], true),

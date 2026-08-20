@@ -1781,8 +1781,7 @@ mod tests {
         let candidates = parse_index_json(json, &base).unwrap();
         assert_eq!(candidates.len(), 1);
         assert_eq!(
-            candidates[0].filename,
-            "torch-2.5.1+cu124-cp311-cp311-linux_x86_64.whl",
+            candidates[0].filename, "torch-2.5.1+cu124-cp311-cp311-linux_x86_64.whl",
             "filename must be decoded to a literal PEP 427 name"
         );
         // The URL keeps its encoding: that is what has to be fetched.

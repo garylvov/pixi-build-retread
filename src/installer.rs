@@ -1148,22 +1148,87 @@ fn installed_distributions(
 /// packages intentionally expose only minimal Python metadata and no wheel
 /// `RECORD`; verification trusts exact-version conda ownership instead of
 /// applying wheel-layout checks to those distributions.
-fn conda_owned_distributions(site_packages: &Path) -> BTreeSet<(String, String)> {
+fn conda_owned_distributions(prefix: &Path, site_packages: &Path) -> BTreeSet<(String, String)> {
     let mut out = BTreeSet::new();
     let Ok(installed) = installed_distributions(site_packages) else {
         return out;
     };
+    let claimed = conda_meta_claimed_dirs(prefix);
     for (name, versions) in &installed {
         for (version, dist_root) in versions {
-            match std::fs::read_to_string(dist_root.join("INSTALLER")) {
-                Ok(body) if body.trim() == "conda" => {
-                    out.insert((name.clone(), version.clone()));
-                }
-                _ => {}
+            let installer_marks_conda = matches!(
+                std::fs::read_to_string(dist_root.join("INSTALLER")),
+                Ok(body) if body.trim() == "conda"
+            );
+            if installer_marks_conda || claimed.contains(dist_root.as_path()) {
+                out.insert((name.clone(), version.clone()));
             }
         }
     }
     out
+}
+
+/// Every directory under `prefix` that some conda package claims in its
+/// `conda-meta/<pkg>.json` `files` list.
+///
+/// The `INSTALLER` marker is NOT a universal conda signal: conda relays some
+/// payloads with legacy setuptools metadata and no `INSTALLER` file at all.
+/// `torchtriton` is the case that broke `ws.C3g2`: it lays down
+/// `site-packages/triton-3.1.0-py3.10.egg-info/` holding only PKG-INFO,
+/// SOURCES.txt, top_level.txt, requires.txt, entry_points.txt,
+/// dependency_links.txt and not-zip-safe. Reading `INSTALLER` alone missed it,
+/// so the pack's PyPI `triton==3.1.0` wheel stayed in the replay, uv tried to
+/// uninstall the conda payload to make room, and its legacy egg-info uninstall
+/// aborted with
+/// `error: failed to remove directory .../site-packages/triton: Directory not
+/// empty (os error 39)` -- uv exit status 2, the whole 189-wheel transaction
+/// dead, on EVERY activation.
+///
+/// `conda-meta` is conda's authoritative ownership record, so consult it too:
+/// a dist-info/egg-info directory conda itself lists is conda's, marker or no
+/// marker. Directories (not files) are collected because the ownership
+/// question is always asked about a dist root.
+fn conda_meta_claimed_dirs(prefix: &Path) -> BTreeSet<PathBuf> {
+    let mut dirs = BTreeSet::new();
+    let Ok(entries) = std::fs::read_dir(prefix.join("conda-meta")) else {
+        return dirs;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) else {
+            continue;
+        };
+        let Some(files) = json.get("files").and_then(|f| f.as_array()) else {
+            continue;
+        };
+        for file in files.iter().filter_map(|f| f.as_str()) {
+            let rel = Path::new(file);
+            // Reject absolute / `..` entries: a conda-meta file list is
+            // prefix-relative, and joining anything else would claim
+            // directories outside the prefix entirely.
+            if rel.is_absolute()
+                || rel
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                continue;
+            }
+            let Some(parent) = rel.parent() else {
+                continue;
+            };
+            if parent.as_os_str().is_empty() {
+                continue;
+            }
+            dirs.insert(prefix.join(parent));
+        }
+    }
+    dirs
 }
 
 fn conda_owned_at_version(
@@ -1617,7 +1682,11 @@ fn missing_locked_wheels_in_prefix(lock: &RetreadLock, prefix: &Path) -> Vec<Str
 /// actually holds under that name -- i.e. what an owner OUTSIDE the bundle
 /// put there. This is the other half of the divergence message: naming only
 /// the locked version would not tell the operator who is overwriting it.
-fn env_installed_versions_for(lock: &RetreadLock, prefix: &Path, missing: &[String]) -> Vec<String> {
+fn env_installed_versions_for(
+    lock: &RetreadLock,
+    prefix: &Path,
+    missing: &[String],
+) -> Vec<String> {
     let installed =
         installed_distributions(&site_packages_dir(prefix, &lock.python)).unwrap_or_default();
     missing
@@ -1638,7 +1707,7 @@ fn env_installed_versions_for(lock: &RetreadLock, prefix: &Path, missing: &[Stri
 fn verify_payload_installed(lock: &RetreadLock, prefix: &Path) -> Result<()> {
     let site_packages = site_packages_dir(prefix, &lock.python);
     let installed = installed_distributions(&site_packages)?;
-    let conda_owned = conda_owned_distributions(&site_packages);
+    let conda_owned = conda_owned_distributions(prefix, &site_packages);
     // An editable overlay (`pip install -e`) satisfies a locked distribution
     // at ANY version: the user has replaced the bundled wheel's dist-info with
     // the checkout's own (PEP 660 editables ship a real dist-info + RECORD, so
@@ -1748,7 +1817,7 @@ fn installed_payload_libraries(
     // to manage; the courier neither installed nor audits them. Skip so the
     // (name, version) lookup below does not error on the overlaid version.
     let editable_owned = editable_owned_distributions(&site_packages);
-    let conda_owned = conda_owned_distributions(&site_packages);
+    let conda_owned = conda_owned_distributions(prefix, &site_packages);
     // Conda-shadowed CUDA lib-shim wheels are never laid down (see
     // `conda_provides_cuda_component`); the libraries they would have shipped
     // are conda's, and are audited as part of the conda prefix, not the wheel
@@ -1882,6 +1951,44 @@ pub(crate) fn build_uv_replay_args(
     }
 
     args
+}
+
+/// Spawn uv, MIRROR its stderr live, and return the tail alongside the status.
+///
+/// `Command::status()` merely inherits stderr, so uv's own diagnosis reached
+/// `<bundle>.repair.log` only when the caller happened to be the activate.d
+/// guard with its `2>&1 >>$REPAIR_LOG` redirect. The failing path then
+/// recorded `uv pip install failed ... (status exit status: 2)` and nothing
+/// else -- the exit code without the sentence that explains it. Mirroring
+/// keeps the live output a human watching a terminal expects, and the returned
+/// tail is what the failure arms hand to `repair::append_uv_stderr`.
+fn run_uv_capturing_stderr(
+    uv: &OsString,
+    args: &[OsString],
+) -> Result<(std::process::ExitStatus, Vec<String>)> {
+    use std::io::BufRead as _;
+
+    let mut child = Command::new(uv)
+        .args(args)
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawning uv ({uv:?})"))?;
+    let mut tail: std::collections::VecDeque<String> =
+        std::collections::VecDeque::with_capacity(crate::repair::UV_STDERR_TAIL_LINES);
+    if let Some(stderr) = child.stderr.take() {
+        for line in std::io::BufReader::new(stderr).lines() {
+            let Ok(line) = line else { break };
+            eprintln!("{line}");
+            if tail.len() == crate::repair::UV_STDERR_TAIL_LINES {
+                tail.pop_front();
+            }
+            tail.push_back(line);
+        }
+    }
+    let status = child
+        .wait()
+        .with_context(|| format!("waiting for uv ({uv:?})"))?;
+    Ok((status, tail.into()))
 }
 
 /// Atomically replace the install marker (temp file + rename). The
@@ -2206,7 +2313,7 @@ pub async fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
     // wheel (that clobbers the conda payload -- see
     // `conda_owned_distributions`). conda is authoritative at the locked
     // version even when it emits only minimal dist-info without wheel RECORD.
-    let conda_owned = conda_owned_distributions(&site_packages_dir(prefix, &lock.python));
+    let conda_owned = conda_owned_distributions(prefix, &site_packages_dir(prefix, &lock.python));
     // Editable overlays the user has installed on top of the bundle: the
     // courier must never replay the bundled wheel over a `pip install -e`
     // checkout. Dropped from the replay by name at any version.
@@ -2333,11 +2440,14 @@ pub async fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
             &install_msg,
         );
 
-        let status = Command::new(&uv)
-            .args(&args)
-            .status()
-            .with_context(|| format!("spawning uv ({uv:?})"))?;
+        let (status, uv_stderr) = run_uv_capturing_stderr(&uv, &args)?;
         if !status.success() {
+            crate::repair::append_uv_stderr(
+                &share,
+                &lock.bundle,
+                &uv_stderr,
+                &format!("status {status}"),
+            );
             // Relax on a manylinux platform-tag conflict only. Classify the failure
             // with a captured `--dry-run` resolve; if it is purely the platform tag
             // and a libc declaration authorizes a higher floor, retry once targeting
@@ -2350,11 +2460,14 @@ pub async fn run(lock_path: &Path, prefix: &Path) -> Result<()> {
                         Some(&outcome.platform),
                         force_reinstall,
                     );
-                    let status = Command::new(&uv)
-                        .args(&relaxed)
-                        .status()
-                        .with_context(|| format!("spawning uv ({uv:?}) with relaxed platform"))?;
+                    let (status, uv_stderr) = run_uv_capturing_stderr(&uv, &relaxed)?;
                     if !status.success() {
+                        crate::repair::append_uv_stderr(
+                            &share,
+                            &lock.bundle,
+                            &uv_stderr,
+                            &format!("status {status}, relaxed to {}", outcome.platform),
+                        );
                         return Err(crate::repair::fail_repair(
                             &share,
                             &lock.bundle,
@@ -2521,12 +2634,18 @@ mod tests {
     /// the name rather than drop it silently.
     #[test]
     fn linked_sonames_map_to_conda_providers() {
-        assert_eq!(conda_provider_for_soname("libcusparseLt.so.0"), Some("cusparselt"));
+        assert_eq!(
+            conda_provider_for_soname("libcusparseLt.so.0"),
+            Some("cusparselt")
+        );
         assert_eq!(
             conda_provider_for_soname("libcusparseLt.so.0.8.1.1"),
             Some("cusparselt")
         );
-        assert_eq!(conda_provider_for_soname("libxkbfile.so.1"), Some("xkeyboard-config"));
+        assert_eq!(
+            conda_provider_for_soname("libxkbfile.so.1"),
+            Some("xkeyboard-config")
+        );
         assert_eq!(
             conda_provider_for_soname("libxkbcommon.so.0"),
             Some("libxkbcommon")
@@ -2734,7 +2853,10 @@ mod tests {
             recorded,
             declared,
         );
-        assert!(message.contains(recorded), "must name the lock's sha: {message}");
+        assert!(
+            message.contains(recorded),
+            "must name the lock's sha: {message}"
+        );
         assert!(
             message.contains(declared),
             "must name the sha the index declares now: {message}"
@@ -2765,15 +2887,15 @@ mod tests {
         );
         let wheel = index_lock_wheel("isaacsim", "4.2.0.2", &url, recorded);
         let lock = make_lock(vec![], vec![], BTreeMap::new());
-        let tmp = std::env::temp_dir().join(format!(
-            "retread-f24-install-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("retread-f24-install-{}", std::process::id()));
         let err = materialize_index_wheel(&lock, &wheel, &tmp, &tmp)
             .await
             .expect_err("a superseded locked sha must refuse, not fetch");
         let rendered = format!("{err:#}");
-        assert!(rendered.contains(recorded) && rendered.contains(declared), "{rendered}");
+        assert!(
+            rendered.contains(recorded) && rendered.contains(declared),
+            "{rendered}"
+        );
         assert!(rendered.contains("refresh the lock"), "{rendered}");
         assert!(
             !tmp.exists(),
@@ -2794,10 +2916,8 @@ mod tests {
         );
         let wheel = index_lock_wheel("isaacsim", "4.2.0.2", &url, sha);
         let lock = make_lock(vec![], vec![], BTreeMap::new());
-        let tmp = std::env::temp_dir().join(format!(
-            "retread-f24-install-ok-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("retread-f24-install-ok-{}", std::process::id()));
         let err = materialize_index_wheel(&lock, &wheel, &tmp, &tmp)
             .await
             .expect_err("the unreachable host still fails the fetch");
@@ -3434,11 +3554,139 @@ mod tests {
         // no INSTALLER at all
         write_dist("orphan", "1.0.0", None);
 
-        let owned = conda_owned_distributions(&sp);
+        let owned = conda_owned_distributions(&root, &sp);
         assert!(owned.contains(&("torch".into(), "2.7.0".into())));
         assert!(!owned.contains(&("tensordict".into(), "0.9.0".into())));
         assert!(!owned.contains(&("orphan".into(), "1.0.0".into())));
         assert_eq!(owned.len(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// F25 observability guard. A uv replay that fails must put uv's OWN
+    /// stderr in the repair log, not just the exit status. `ws.C3g2`'s log
+    /// carried the cause (`failed to remove directory .../triton: Directory
+    /// not empty (os error 39)`) only because the activate.d guard redirects
+    /// our stderr into the log; a manual retry -- the very command that guard
+    /// prints -- recorded the exit code alone.
+    #[test]
+    fn a_failing_uv_puts_its_stderr_in_the_repair_log() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempdir("uv-stderr");
+        let share = root.join("share").join("retread");
+        std::fs::create_dir_all(&share).unwrap();
+        let fake_uv = root.join("fake-uv");
+        std::fs::write(
+            &fake_uv,
+            "#!/bin/sh\n             echo \"Resolved 189 packages\" >&2\n             echo \"error: failed to remove directory \\`/p/triton\\`: Directory not empty (os error 39)\" >&2\n             echo \"on stdout, not stderr\"\n             exit 2\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_uv, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let uv: OsString = fake_uv.clone().into_os_string();
+        let args: Vec<OsString> = vec!["pip".into(), "install".into()];
+        let (status, tail) = run_uv_capturing_stderr(&uv, &args).expect("fake uv must spawn");
+        assert_eq!(status.code(), Some(2), "the real exit status must survive");
+        assert!(
+            tail.iter()
+                .any(|l| l.contains("Directory not empty (os error 39)")),
+            "uv stderr must be captured, got: {tail:?}"
+        );
+        assert!(
+            !tail.iter().any(|l| l.contains("on stdout")),
+            "stdout must stay out of the stderr tail, got: {tail:?}"
+        );
+
+        crate::repair::append_uv_stderr(&share, "sage-isaac-pack", &tail, "status exit status: 2");
+        let log =
+            std::fs::read_to_string(crate::repair::repair_log_path(&share, "sage-isaac-pack"))
+                .expect("the repair log must exist");
+        assert!(
+            log.contains("Directory not empty (os error 39)")
+                && log.contains("--- uv stderr (status exit status: 2) ---")
+                && log.contains("--- end uv stderr ---"),
+            "the repair log must carry uv's own stderr, got: {log}"
+        );
+
+        // A uv that says nothing must say so, rather than leaving a silent log.
+        crate::repair::append_uv_stderr(&share, "quiet-pack", &[], "status exit status: 2");
+        let quiet =
+            std::fs::read_to_string(crate::repair::repair_log_path(&share, "quiet-pack")).unwrap();
+        assert!(quiet.contains("EMPTY"), "got: {quiet}");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// F25 guard. conda's `torchtriton` lays down a legacy
+    /// `triton-<v>-py<py>.egg-info/` with NO `INSTALLER` marker, so the marker
+    /// alone reported it as un-owned, the pack's PyPI `triton` wheel stayed in
+    /// the replay, and uv's egg-info uninstall killed the whole transaction
+    /// with `failed to remove directory .../triton: Directory not empty
+    /// (os error 39)` (exit status 2). conda-meta's own `files` list must
+    /// establish ownership too. Observed on ws.C3g2 2026-08-20.
+    #[test]
+    fn conda_meta_file_list_owns_an_egg_info_without_installer_marker() {
+        let root = tempdir("conda-meta-owned");
+        let sp = root.join("lib/python3.10/site-packages");
+        // The conda payload: an egg-info dir, no INSTALLER, exactly as
+        // `torchtriton` ships it.
+        let egg = sp.join("triton-3.1.0-py3.10.egg-info");
+        std::fs::create_dir_all(&egg).unwrap();
+        std::fs::write(egg.join("PKG-INFO"), "Name: triton\nVersion: 3.1.0\n").unwrap();
+        assert!(!egg.join("INSTALLER").exists());
+        // A pip/uv-installed neighbour conda does NOT claim.
+        let other = sp.join("tensordict-0.9.0.dist-info");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("METADATA"), "Name: tensordict\nVersion: 0.9.0\n").unwrap();
+
+        // Before conda-meta exists there is no ownership evidence at all.
+        assert!(conda_owned_distributions(&root, &sp).is_empty());
+
+        std::fs::create_dir_all(root.join("conda-meta")).unwrap();
+        std::fs::write(
+            root.join("conda-meta").join("torchtriton-3.1.0-py310.json"),
+            serde_json::json!({
+                "name": "torchtriton",
+                "version": "3.1.0",
+                "files": [
+                    "lib/python3.10/site-packages/triton-3.1.0-py3.10.egg-info/PKG-INFO",
+                    "lib/python3.10/site-packages/triton-3.1.0-py3.10.egg-info/top_level.txt",
+                    "lib/python3.10/site-packages/triton/__init__.py",
+                    // Hostile entries must never claim anything: an absolute
+                    // path and a traversal out of the prefix.
+                    "/etc/passwd",
+                    "../../escaped/evil.py",
+                ],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        // A non-json sibling and a malformed json must not abort the scan.
+        std::fs::write(root.join("conda-meta").join("history"), b"not json").unwrap();
+        std::fs::write(root.join("conda-meta").join("broken.json"), b"{").unwrap();
+
+        let owned = conda_owned_distributions(&root, &sp);
+        assert!(
+            owned.contains(&("triton".into(), "3.1.0".into())),
+            "conda-meta must own the marker-less egg-info; got {owned:?}"
+        );
+        assert!(!owned.contains(&("tensordict".into(), "0.9.0".into())));
+        assert_eq!(owned.len(), 1);
+
+        let claimed = conda_meta_claimed_dirs(&root);
+        assert!(claimed.contains(&egg));
+        assert!(claimed.contains(&sp.join("triton")));
+        assert!(!claimed.contains(Path::new("/etc")));
+        assert!(
+            !claimed
+                .iter()
+                .any(|d| d.to_string_lossy().contains("escaped"))
+        );
+
+        // And the replay drop that ownership feeds: the locked PyPI wheel at
+        // the same version is conda-owned, so it never reaches uv.
+        assert!(conda_owned_at_version(&owned, "triton", "3.1.0"));
+
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3905,9 +4153,8 @@ packages:
         std::fs::write(prefix.join("include/ATen/ATen.h"), "").unwrap();
 
         let lock = make_lock(vec![], vec![], BTreeMap::new());
-        verify_payload_installed(&lock, &prefix).expect(
-            "a conda-provided dist whose replay was skipped is not deep-RECORD-verified",
-        );
+        verify_payload_installed(&lock, &prefix)
+            .expect("a conda-provided dist whose replay was skipped is not deep-RECORD-verified");
         let _ = std::fs::remove_dir_all(root);
     }
 

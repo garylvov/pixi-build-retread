@@ -1828,7 +1828,11 @@ mod tests {
         std::fs::write(parent.join("pixi.lock"), "version: 6\n").unwrap();
 
         // The nested project: its own workspace, silent on glibc.
-        std::fs::write(child.join("pixi.toml"), "[workspace]\nplatforms = [\"linux-64\"]\n").unwrap();
+        std::fs::write(
+            child.join("pixi.toml"),
+            "[workspace]\nplatforms = [\"linux-64\"]\n",
+        )
+        .unwrap();
         std::fs::write(child.join("pixi.lock"), "version: 6\n").unwrap();
 
         let mut candidates = Vec::new();
