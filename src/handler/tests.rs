@@ -9464,7 +9464,10 @@ fn a_calver_year_disagreement_relaxes_instead_of_refusing_as_cross_major() {
     // and the relaxed band CONTAINS the version it is accepting.
     let CededBoundVerdict::WithinMajor { relaxed, reason } = classify("==2024.6.1", "2026.7.0")
     else {
-        panic!("a CalVer year difference is not a major boundary: {:?}", classify("==2024.6.1", "2026.7.0"));
+        panic!(
+            "a CalVer year difference is not a major boundary: {:?}",
+            classify("==2024.6.1", "2026.7.0")
+        );
     };
     assert_eq!(reason, "calver");
     assert_eq!(relaxed, ">=2024.6.1,<2027");
@@ -9508,7 +9511,10 @@ fn a_calver_year_disagreement_relaxes_instead_of_refusing_as_cross_major() {
     assert_eq!(classify("<1.0", "2026.7.0"), CededBoundVerdict::CrossMajor);
     assert_eq!(classify("==2024.6.1", "3.3"), CededBoundVerdict::CrossMajor);
     // A satisfied CalVer bound is still just satisfied.
-    assert_eq!(classify(">=2024.6", "2026.7.0"), CededBoundVerdict::Satisfied);
+    assert_eq!(
+        classify(">=2024.6", "2026.7.0"),
+        CededBoundVerdict::Satisfied
+    );
 }
 
 /// F26, end to end on the BUILD side: the same fsspec facts must produce a
