@@ -752,10 +752,12 @@ fn check_env_pypi_bounds(lock: &RetreadLock, owned: &BTreeMap<String, String>) -
             // bound it advertises, and refusing here would refuse exactly what
             // the build deliberately accepted. Only a MAJOR-boundary crossing
             // is a hard stop.
-            if crate::handler::ceded_bound_is_within_major(specifiers, &locked_version) {
+            if let Some(reason) =
+                crate::handler::ceded_bound_relaxation_reason(specifiers, &locked_version)
+            {
                 eprintln!(
                     "retread install: accepting env-pypi owner {name}=={locked} over bundled \
-                     wheel {wheel_file} requirement {raw} (within-major relaxation; declared \
+                     wheel {wheel_file} requirement {raw} (reason={reason}; declared \
                      pypi provider wins)",
                     wheel_file = wheel.filename,
                 );
@@ -3215,6 +3217,25 @@ packages:
         check_env_pypi_bounds(&conda_owned_lock, &major_owned).expect(
             "a name this pack emits as a conda depends edge is conda-owned, not env-pypi-ceded",
         );
+
+        // F26. `fsspec` is CalVer: the env's `2026.7.0` against the bundled
+        // `==2024.6.1` is two release YEARS, not two API majors, and conda
+        // cannot own the name because the env locks it as pypi. Install must
+        // ACCEPT it -- exactly what the build now accepts. Measured from the
+        // `uwlab-gpu` / `unitree-rl-lab-gpu` repair logs, which refused here.
+        let mut calver_lock = lock.clone();
+        calver_lock.wheels[0].requires_dist = vec!["fsspec==2024.6.1".into()];
+        let calver_owned = BTreeMap::from([("fsspec".to_string(), "2026.7.0".to_string())]);
+        check_env_pypi_bounds(&calver_lock, &calver_owned)
+            .expect("a CalVer year difference is not a MAJOR boundary");
+        // The same shape with a real semver major still refuses.
+        let mut semver_lock = lock.clone();
+        semver_lock.wheels[0].requires_dist = vec!["trimesh==4.11.1".into()];
+        check_env_pypi_bounds(
+            &semver_lock,
+            &BTreeMap::from([("trimesh".to_string(), "5.0.0".to_string())]),
+        )
+        .expect_err("trimesh 4 -> 5 is a real MAJOR boundary");
 
         // Satisfied bound -> builds.
         let mut ok_lock = lock.clone();

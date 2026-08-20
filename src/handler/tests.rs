@@ -8831,3 +8831,143 @@ fn a_learned_workspace_fact_without_an_override_keeps_its_prior_treatment() {
         "{message}"
     );
 }
+
+/// F26 guard. A CalVer leading component is a DATE, not a semver major.
+///
+/// Measured on `uwlab-gpu` / `unitree-rl-lab-gpu` repair logs under
+/// `ws.C3g1/.pixi/envs/*/share/retread/`: install refused with `env-pypi owner
+/// fsspec==2026.7.0 (from the workspace pixi.lock) violates bundled wheel
+/// isaacsim_core-5.1.0.0...whl requirement fsspec==2024.6.1 across a MAJOR
+/// boundary`. fsspec is CalVer -- 2024 -> 2026 is two release YEARS, and conda
+/// cannot be made the owner because the env locks the name as pypi, so the
+/// cross-major arm had no exit and the env could never solve cold.
+///
+/// Ruling: when BOTH sides lead with a plausible year, the disagreement is
+/// WithinMajor and relaxes through the recorded-relaxation path with
+/// `reason=calver`. Ordinary semver is untouched.
+#[test]
+fn a_calver_year_disagreement_relaxes_instead_of_refusing_as_cross_major() {
+    let classify = |bound: &str, offered: &str| {
+        classify_ceded_bound(
+            &VersionSpecifiers::from_str(bound).unwrap(),
+            &uv_pep508::uv_pep440::Version::from_str(offered).unwrap(),
+        )
+    };
+
+    // (a) the F26 case itself: CalVer year drift -> WithinMajor, reason=calver,
+    // and the relaxed band CONTAINS the version it is accepting.
+    let CededBoundVerdict::WithinMajor { relaxed, reason } = classify("==2024.6.1", "2026.7.0")
+    else {
+        panic!("a CalVer year difference is not a major boundary: {:?}", classify("==2024.6.1", "2026.7.0"));
+    };
+    assert_eq!(reason, "calver");
+    assert_eq!(relaxed, ">=2024.6.1,<2027");
+    assert!(
+        VersionSpecifiers::from_str(&relaxed)
+            .unwrap()
+            .contains(&uv_pep508::uv_pep440::Version::from_str("2026.7.0").unwrap()),
+        "the relaxed band must admit the env version it accepts: {relaxed}",
+    );
+    // The shared predicate both build and install read reports the same rule.
+    assert_eq!(
+        ceded_bound_relaxation_reason(
+            &VersionSpecifiers::from_str("==2024.6.1").unwrap(),
+            &uv_pep508::uv_pep440::Version::from_str("2026.7.0").unwrap(),
+        ),
+        Some("calver"),
+    );
+
+    // (b) `huggingface_hub <1.0` vs 1.28 -- neither side is a year. Unchanged.
+    assert_eq!(classify("<1.0", "1.28.0"), CededBoundVerdict::CrossMajor);
+    assert_eq!(
+        ceded_bound_relaxation_reason(
+            &VersionSpecifiers::from_str("<1.0").unwrap(),
+            &uv_pep508::uv_pep440::Version::from_str("1.28.0").unwrap(),
+        ),
+        None,
+    );
+
+    // (c) `trimesh ==4.11.1` vs 5.0.0 -- a real semver major. Unchanged.
+    assert_eq!(classify("==4.11.1", "5.0.0"), CededBoundVerdict::CrossMajor);
+
+    // (d) same year on both sides was ALREADY within-major, and stays so under
+    // the ordinary rule -- the CalVer arm must not steal it or relabel it.
+    let CededBoundVerdict::WithinMajor { relaxed, reason } = classify("==2026.4", "2026.7") else {
+        panic!("a same-year disagreement is within-major");
+    };
+    assert_eq!(reason, "within-major");
+    assert_eq!(relaxed, ">=2026.4,<2027");
+
+    // One side CalVer, the other not, is a genuine scheme change: refuse.
+    assert_eq!(classify("<1.0", "2026.7.0"), CededBoundVerdict::CrossMajor);
+    assert_eq!(classify("==2024.6.1", "3.3"), CededBoundVerdict::CrossMajor);
+    // A satisfied CalVer bound is still just satisfied.
+    assert_eq!(classify(">=2024.6", "2026.7.0"), CededBoundVerdict::Satisfied);
+}
+
+/// F26, end to end on the BUILD side: the same fsspec facts must produce a
+/// build, a recorded relaxation naming `reason=calver`, and an advertised bound
+/// that admits the env's version -- never a conda `depends` handover and never
+/// a refusal.
+#[test]
+fn a_calver_ceded_bound_builds_and_records_the_calver_relaxation() {
+    let mut bundle = solo_bundle("isaacsim-core-pack", vec!["fsspec==2024.6.1"]);
+    bundle.primary.original_requires_dist = vec!["fsspec==2024.6.1".to_string()];
+    bundle.primary.metadata.requires_dist = vec!["fsspec==2024.6.1".to_string()];
+    bundle
+        .workspace_declared_pypi
+        .insert(canonical_conda_name("torch"));
+    bundle
+        .uv_dependency_graph
+        .edges
+        .insert(crate::uv_closure::UvDependencyEdge {
+            parent: "torch".to_string(),
+            child: "fsspec".to_string(),
+        });
+    bundle
+        .workspace_locked_pypi
+        .insert("fsspec".to_string(), "2026.7.0".to_string());
+
+    let (output, relaxations) = produce_output_pending_relaxations(
+        &bundle,
+        &cfg(),
+        Platform::Linux64,
+        "3.11",
+        &[],
+        None,
+        None,
+    )
+    .expect("a CalVer year disagreement must build, not refuse across a MAJOR boundary");
+
+    let depends: Vec<String> = output
+        .run_dependencies
+        .depends
+        .iter()
+        .map(|d| d.name.clone())
+        .collect();
+    assert!(
+        !depends.iter().any(|name| name == "fsspec"),
+        "a CalVer relaxation must not hand the name to conda: {depends:?}",
+    );
+    let constrains: Vec<String> = output
+        .run_dependencies
+        .constraints
+        .iter()
+        .map(format_constraint_spec)
+        .collect();
+    let line = constrains
+        .iter()
+        .find(|line| line.split(' ').next() == Some("fsspec"))
+        .unwrap_or_else(|| panic!("the relaxed bound must still be advertised: {constrains:?}"));
+    assert!(
+        line.contains("<2027") && line.contains(">=2024.6.1"),
+        "the advertised bound must be the CalVer year band above the built floor: {line}",
+    );
+    let rendered: Vec<String> = relaxations.iter().map(|r| format!("{r}")).collect();
+    assert!(
+        rendered
+            .iter()
+            .any(|r| r.contains("fsspec") && r.contains("reason=calver")),
+        "the relaxation record must name the CalVer rule: {rendered:?}",
+    );
+}

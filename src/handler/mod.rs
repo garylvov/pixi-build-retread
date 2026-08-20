@@ -13161,7 +13161,14 @@ enum CededBoundVerdict {
     /// bound admits. Operator ruling 2026-08-19: the declared-pypi provider
     /// WINS -- the pack's bound is relaxed to the major band, the relaxation is
     /// recorded, and the build proceeds. `relaxed` is the replacement spec.
-    WithinMajor { relaxed: String },
+    ///
+    /// `reason` is `"within-major"` for an ordinary semver disagreement and
+    /// `"calver"` when the leading component is a DATE on both sides (F26), so
+    /// every warning and every recorded relaxation says which rule fired.
+    WithinMajor {
+        relaxed: String,
+        reason: &'static str,
+    },
     /// The violation crosses a MAJOR boundary (`huggingface_hub 1.28` against a
     /// bundled `<1.0`). No within-major relaxation is defensible, so conda must
     /// become the single owner of the name -- or the build refuses.
@@ -13191,19 +13198,53 @@ fn clause_admits_major(clause: &VersionSpecifier, major: u64) -> bool {
     }
 }
 
-/// Shared build/install policy predicate: does a ceded name's env-provided
-/// version violate `specifiers` only WITHIN the major that bound admits?
+/// Shared build/install policy predicate: may a ceded name's violation of
+/// `specifiers` be relaxed rather than refused, and under which rule?
+///
+/// `Some("within-major")` -- the violation stays inside the major the bound
+/// admits. `Some("calver")` -- the leading component is a date on both sides,
+/// so there is no major to cross (F26). `None` -- a real major boundary.
 ///
 /// The installer must never refuse what the build accepted, so both sides read
 /// this one function.
-pub(crate) fn ceded_bound_is_within_major(
+pub(crate) fn ceded_bound_relaxation_reason(
     specifiers: &VersionSpecifiers,
     env_version: &Version,
-) -> bool {
+) -> Option<&'static str> {
+    match classify_ceded_bound(specifiers, env_version) {
+        CededBoundVerdict::WithinMajor { reason, .. } => Some(reason),
+        _ => None,
+    }
+}
+
+/// Is this release's LEADING component a plausible CalVer year?
+///
+/// F26. fsspec ships `2024.6.1` and `2026.7.0`: two release YEARS, one project,
+/// no API break between them. A leading component in `[2000, 2100]` is a DATE
+/// field, not a semver major, so a difference in it carries no compatibility
+/// meaning and must never be read as a major boundary. The window is deliberate
+/// -- `1.28` and `5.0.0` fall outside it, so ordinary semver is untouched.
+fn is_calver_year(version: &Version) -> bool {
     matches!(
-        classify_ceded_bound(specifiers, env_version),
-        CededBoundVerdict::WithinMajor { .. }
+        version.release().first().copied(),
+        Some(year) if (2000..=2100).contains(&year)
     )
+}
+
+/// Is EVERY version this bound pins a CalVer year? (Empty bounds are not.)
+///
+/// Both sides must look like CalVer before the CalVer rule fires: a bound of
+/// `<1.0` against an env `2026.7.0` is a genuine scheme change, not a date
+/// drift, and stays a cross-major refusal.
+fn spec_pins_calver(specifiers: &VersionSpecifiers) -> bool {
+    let mut seen = false;
+    for clause in specifiers.iter() {
+        if !is_calver_year(clause.version()) {
+            return false;
+        }
+        seen = true;
+    }
+    seen
 }
 
 fn spec_admits_major(specifiers: &VersionSpecifiers, major: u64) -> bool {
@@ -13246,6 +13287,24 @@ fn classify_ceded_bound(
         let floor = spec_floor(specifiers).unwrap_or_else(|| env_version.clone());
         return CededBoundVerdict::WithinMajor {
             relaxed: format!(">={floor},<{}", major + 1),
+            reason: "within-major",
+        };
+    }
+    // F26. A CalVer leading component is a DATE on both sides, so the years
+    // simply differ -- there is no major to cross, and the disagreement is the
+    // ordinary within-major case. Measured on `uwlab-gpu` / `unitree-rl-lab-gpu`:
+    // env-pypi `fsspec==2026.7.0` against bundled `isaacsim_core`'s
+    // `fsspec==2024.6.1` refused as a MAJOR boundary, which it never was.
+    if is_calver_year(env_version) && spec_pins_calver(specifiers) {
+        // The band must contain the version it is accepting: an env year BELOW
+        // the pinned floor takes the env year as the floor.
+        let floor = match spec_floor(specifiers) {
+            Some(floor) if floor <= *env_version => floor,
+            _ => env_version.clone(),
+        };
+        return CededBoundVerdict::WithinMajor {
+            relaxed: format!(">={floor},<{}", major + 1),
+            reason: "calver",
         };
     }
     CededBoundVerdict::CrossMajor
@@ -13368,12 +13427,12 @@ fn resolve_ceded_pypi_bounds(
             };
             match classify_ceded_bound(specifiers, &locked_version) {
                 CededBoundVerdict::Satisfied => continue,
-                CededBoundVerdict::WithinMajor { relaxed } => {
+                CededBoundVerdict::WithinMajor { relaxed, reason } => {
                     tracing::warn!(
                         bundle = %bundle.conda_name,
                         "declared-pypi ownership: accepting {name}=={locked} over bundled wheel \
                          {wheel_file} requirement {raw}; relaxed to {relaxed} \
-                         (within-major relaxation; declared pypi provider wins)",
+                         (reason={reason}; declared pypi provider wins)",
                         wheel_file = wheel.metadata.filename,
                     );
                     let decision = crate::relax_decision::RelaxationDecision {
@@ -13388,7 +13447,7 @@ fn resolve_ceded_pypi_bounds(
                         relaxed_clause: Some(relaxed.clone()),
                         source: format!(
                             "wheel `{}` Requires-Dist `{raw}` vs declared-pypi owner \
-                             {name}=={locked} (within-major; declared pypi provider wins)",
+                             {name}=={locked} (reason={reason}; declared pypi provider wins)",
                             wheel.metadata.filename,
                         ),
                         tier: RelaxPolicy::Major,
