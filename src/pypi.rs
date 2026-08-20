@@ -110,6 +110,24 @@ pub(crate) fn is_pypi_index_miss(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| cause.is::<PypiIndexMiss>())
 }
 
+/// Extract the artifact hash a PEP 503 index declares in a wheel URL's
+/// fragment (`#sha256=<64 hex>`).
+///
+/// This is the index's OWN statement about the bytes it serves at that exact
+/// filename, carried on every URL the resolver records, so a lock entry's
+/// `url` remembers what the index declared when the entry was written. F24:
+/// comparing it against the entry's recorded `sha256` detects an artifact the
+/// publisher REPUBLISHED IN PLACE (same filename, new bytes) without any
+/// network round trip.
+pub fn sha256_from_url_fragment(url: &url::Url) -> Option<String> {
+    url.fragment().and_then(|fragment| {
+        fragment
+            .strip_prefix("sha256=")
+            .filter(|hex| hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit()))
+            .map(|hex| hex.to_ascii_lowercase())
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct ResolvedWheel {
     pub url: url::Url,
@@ -1114,11 +1132,7 @@ fn parse_index_links_any(html: &str, base: &url::Url) -> Result<Vec<ResolvedWhee
                 .into_owned(),
             _ => continue,
         };
-        let sha256 = url.fragment().and_then(|f| {
-            f.strip_prefix("sha256=")
-                .filter(|h| h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()))
-                .map(|h| h.to_ascii_lowercase())
-        });
+        let sha256 = sha256_from_url_fragment(&url);
         out.push(ResolvedWheel {
             url,
             sha256,
@@ -1205,11 +1219,7 @@ fn parse_index_links(html: &str, base: &url::Url) -> Result<Vec<ResolvedWheel>> 
         if !filename.ends_with(".whl") {
             continue;
         }
-        let sha256 = url.fragment().and_then(|f| {
-            f.strip_prefix("sha256=")
-                .filter(|h| h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()))
-                .map(|h| h.to_ascii_lowercase())
-        });
+        let sha256 = sha256_from_url_fragment(&url);
         out.push(ResolvedWheel {
             url,
             sha256,

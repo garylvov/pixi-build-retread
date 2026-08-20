@@ -533,6 +533,32 @@ fn validate_materialized_wheel(
     })
 }
 
+/// F24: message for a locked index wheel whose recorded sha256 no longer
+/// matches the hash the index declares for the same artifact URL.
+///
+/// The install path is `--frozen`: it may NOT re-derive the lock, so the only
+/// honest move is to refuse. The refusal must therefore carry the remedy —
+/// both hashes, the fact that the index itself now declares the served one
+/// (i.e. upstream republished in place rather than the download being
+/// corrupt), and that a relock is what fixes it.
+fn stale_locked_sha_refusal(
+    name: &str,
+    version: &str,
+    filename: &str,
+    recorded_sha256: &str,
+    index_declared_sha256: &str,
+) -> String {
+    format!(
+        "retread install: locked wheel {name}=={version} records sha256 \
+         {recorded_sha256}, but the index declares sha256 \
+         {index_declared_sha256} for the same artifact `{filename}`. \
+         Upstream republished this wheel in place: the bytes served now are \
+         NOT the bytes this lock was built against, and `--frozen` install \
+         may not re-derive the lock. Remedy: refresh the lock (rebuild/relock \
+         the pack) so it records the current artifact, then reinstall."
+    )
+}
+
 async fn materialize_index_wheel(
     lock: &RetreadLock,
     wheel: &crate::lock::LockWheel,
@@ -557,6 +583,23 @@ async fn materialize_index_wheel(
             url_filename,
             wheel.filename
         );
+    }
+
+    // F24: the locked URL carries the hash the index declared for this exact
+    // artifact. When it disagrees with the recorded sha256, the wheel was
+    // republished in place upstream — refuse BEFORE downloading (potentially
+    // multi-GB) bytes we already know we will reject, and name the remedy.
+    if url.scheme() != "file"
+        && let Some(declared) = crate::pypi::sha256_from_url_fragment(&url)
+        && !declared.eq_ignore_ascii_case(expected_sha)
+    {
+        bail!(stale_locked_sha_refusal(
+            &wheel.name,
+            &wheel.version,
+            &wheel.filename,
+            expected_sha,
+            &declared,
+        ));
     }
 
     if url.scheme() == "file" {
@@ -587,11 +630,23 @@ async fn materialize_index_wheel(
         }
     }
 
+    let index_stance = if crate::pypi::sha256_from_url_fragment(&url).is_some() {
+        "the index declares that same hash, so bytes that fail it are the \
+         server contradicting its own index — retry, then report it upstream"
+    } else {
+        "the index declares no hash for this artifact — if the served bytes \
+         differ it was republished in place upstream, so refresh the lock"
+    };
     let fetched = crate::wheel::fetch_wheel_cached(&url, Some(expected_sha), fetch_dir, store_root)
         .await
         .with_context(|| {
+            // F24: the pre-check above already refused a url whose DECLARED
+            // hash disagrees with the lock, so a hash failure here has a
+            // different meaning depending on whether the index declares one
+            // at all. Say which, next to the hashes the inner error prints.
             format!(
-                "retread install: fetching locked wheel {}=={} from {}",
+                "retread install: fetching locked wheel {}=={} from {} \
+                 (lock records sha256 {expected_sha}; {index_stance})",
                 wheel.name, wheel.version, url
             )
         })?;
@@ -2662,6 +2717,96 @@ mod tests {
             git_source: None,
             sdist_source: None,
         }
+    }
+
+    /// F24 guard (c): the `--frozen` install refusal for a locked wheel the
+    /// publisher republished in place must name BOTH hashes and the remedy —
+    /// the operator's only fix is a relock, and the old message ("SHA-256
+    /// mismatch ... expected <sha>") read like a corrupt download.
+    #[test]
+    fn stale_locked_sha_refusal_names_both_shas_and_remedy() {
+        let recorded = "aca6dcd4c8ab15fed2a3acbb644c306ee4e2f87fd69c48e523fe8ff526a9f64f";
+        let declared = "d7cec2130e81386db34bf389b5924168efe6c1a90fd686111e4741a4a50c80af";
+        let message = stale_locked_sha_refusal(
+            "isaacsim",
+            "4.2.0.2",
+            "isaacsim-4.2.0.2-cp310-none-manylinux_2_34_x86_64.whl",
+            recorded,
+            declared,
+        );
+        assert!(message.contains(recorded), "must name the lock's sha: {message}");
+        assert!(
+            message.contains(declared),
+            "must name the sha the index declares now: {message}"
+        );
+        assert!(
+            message.contains("isaacsim==4.2.0.2"),
+            "must name the distribution: {message}"
+        );
+        assert!(
+            message.contains("republished"),
+            "must say upstream republished in place (not a corrupt download): {message}"
+        );
+        assert!(
+            message.contains("refresh the lock"),
+            "must name the remedy: {message}"
+        );
+    }
+
+    /// F24 guard (c), trigger half: the refusal fires from the locked URL's
+    /// declared hash alone — BEFORE any download — so a multi-GB wheel is not
+    /// fetched only to be rejected, and no network is needed to reproduce it.
+    #[tokio::test]
+    async fn materialize_index_wheel_refuses_superseded_locked_sha_without_fetching() {
+        let recorded = "aca6dcd4c8ab15fed2a3acbb644c306ee4e2f87fd69c48e523fe8ff526a9f64f";
+        let declared = "d7cec2130e81386db34bf389b5924168efe6c1a90fd686111e4741a4a50c80af";
+        let url = format!(
+            "https://pypi.nvidia.com/isaacsim/isaacsim-4.2.0.2-cp310-none-manylinux_2_34_x86_64.whl#sha256={declared}"
+        );
+        let wheel = index_lock_wheel("isaacsim", "4.2.0.2", &url, recorded);
+        let lock = make_lock(vec![], vec![], BTreeMap::new());
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-f24-install-{}",
+            std::process::id()
+        ));
+        let err = materialize_index_wheel(&lock, &wheel, &tmp, &tmp)
+            .await
+            .expect_err("a superseded locked sha must refuse, not fetch");
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains(recorded) && rendered.contains(declared), "{rendered}");
+        assert!(rendered.contains("refresh the lock"), "{rendered}");
+        assert!(
+            !tmp.exists(),
+            "refusal must precede any download into {}",
+            tmp.display()
+        );
+    }
+
+    /// F24 control: when the locked URL declares the SAME hash the lock
+    /// records, the pre-check must stay out of the way (this one proceeds to
+    /// the normal fetch path, which fails on the unreachable host rather than
+    /// on the stale-sha refusal).
+    #[tokio::test]
+    async fn materialize_index_wheel_allows_agreeing_locked_sha() {
+        let sha = "aca6dcd4c8ab15fed2a3acbb644c306ee4e2f87fd69c48e523fe8ff526a9f64f";
+        let url = format!(
+            "https://127.0.0.1:1/isaacsim/isaacsim-4.2.0.2-cp310-none-manylinux_2_34_x86_64.whl#sha256={sha}"
+        );
+        let wheel = index_lock_wheel("isaacsim", "4.2.0.2", &url, sha);
+        let lock = make_lock(vec![], vec![], BTreeMap::new());
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-f24-install-ok-{}",
+            std::process::id()
+        ));
+        let err = materialize_index_wheel(&lock, &wheel, &tmp, &tmp)
+            .await
+            .expect_err("the unreachable host still fails the fetch");
+        let rendered = format!("{err:#}");
+        assert!(
+            !rendered.contains("refresh the lock"),
+            "an agreeing sha must not raise the stale-sha refusal: {rendered}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

@@ -1601,6 +1601,59 @@ fn validate_native_stage_target(
     Ok(())
 }
 
+/// F24: outcome of checking an unchanged index wheel's RECORDED sha256
+/// against the sha256 the index declares for that exact artifact URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum IndexShaDecision {
+    /// The index declares no hash, or declares the recorded one: record the
+    /// recorded sha unchanged (the overwhelmingly common case, including the
+    /// pure-replay path where url and sha are both read from the same lock).
+    Unchanged,
+    /// The index declares a DIFFERENT hash for the same filename: the
+    /// publisher republished the artifact in place. Record the current
+    /// artifact's hash and warn.
+    Superseded { fresh: String, warning: String },
+}
+
+/// Compare a lock-bound wheel entry's recorded sha256 against the hash the
+/// index declares in `index_url`'s `#sha256=` fragment.
+///
+/// WHY (F24): a favor-locked entry keeps a previously verified `sha256` while
+/// its `url` is re-recorded from THIS run's index fetch. When the publisher
+/// republishes an artifact in place (observed: `pypi.nvidia.com`
+/// `isaacsim-4.2.0.2-cp310-none-manylinux_2_34_x86_64.whl`, recorded
+/// `aca6dcd4…`, index now declares `d7cec213…`), the two halves disagree and
+/// the lock ships an entry that CANNOT install: install fetches the current
+/// bytes and refuses them against the stale expectation. A lock/build is
+/// allowed to re-derive, so it adopts the current artifact and warns; the
+/// `--frozen` install path keeps its loud refusal (see
+/// `installer::stale_locked_sha_refusal`).
+///
+/// Pure comparison of metadata already in hand — NO extra download.
+pub(crate) fn reconcile_index_wheel_sha(
+    name: &str,
+    version: &str,
+    index_url: &url::Url,
+    recorded_sha256: &str,
+) -> IndexShaDecision {
+    let Some(declared) = crate::pypi::sha256_from_url_fragment(index_url) else {
+        return IndexShaDecision::Unchanged;
+    };
+    if declared.eq_ignore_ascii_case(recorded_sha256) {
+        return IndexShaDecision::Unchanged;
+    }
+    let warning = format!(
+        "locked wheel {name}=={version} sha {old}… superseded upstream \
+         (index now declares {new}…); adopting the current artifact",
+        old = &recorded_sha256[..recorded_sha256.len().min(8)],
+        new = &declared[..8],
+    );
+    IndexShaDecision::Superseded {
+        fresh: declared,
+        warning,
+    }
+}
+
 /// Stage the courier artifacts. Built wheels (`must_ship()`) AND index
 /// wheels whose metadata relax CHANGED are written to `staging_dir` (they
 /// ship in the conda package as `Origin::Built`); unchanged index wheels are
@@ -2179,6 +2232,33 @@ pub(crate) async fn stage_for_target_with_store_root_and_relaxations(
                                 index_url
                             )
                         })?;
+                        // F24: the recorded sha may have been superseded by an
+                        // in-place republish upstream. `index_url` carries the
+                        // hash the index declared when this URL was recorded,
+                        // so the check is free. A lock/build may re-derive:
+                        // adopt the current artifact and say so loudly.
+                        let sha256 = match url::Url::parse(&index_url)
+                            .ok()
+                            .map(|parsed| {
+                                reconcile_index_wheel_sha(
+                                    &w.pypi_name,
+                                    &w.version,
+                                    &parsed,
+                                    &sha256,
+                                )
+                            })
+                            .unwrap_or(IndexShaDecision::Unchanged)
+                        {
+                            IndexShaDecision::Unchanged => sha256,
+                            IndexShaDecision::Superseded { fresh, warning } => {
+                                tracing::warn!(
+                                    wheel = %w.pypi_name,
+                                    url = %index_url,
+                                    "{warning}",
+                                );
+                                fresh
+                            }
+                        };
                         final_requires_dist.insert(
                             crate::relax::canonical_conda_name(&w.pypi_name),
                             w.requires_dist.clone(),
@@ -4515,6 +4595,113 @@ mod tests {
         assert_ne!(
             shadow_bytes, raw_bytes,
             "shadow bytes must differ from raw input (rewrite_wheel_with must have run)"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// F24 guard (a), unit half: a recorded sha the index no longer declares
+    /// for the same artifact means the publisher republished in place
+    /// (observed: `pypi.nvidia.com` isaacsim 4.2.0.2). A lock/build may
+    /// re-derive, so it adopts the current artifact and warns with both
+    /// hashes.
+    #[test]
+    fn reconcile_index_wheel_sha_adopts_republished_artifact() {
+        let recorded = "aca6dcd4c8ab15fed2a3acbb644c306ee4e2f87fd69c48e523fe8ff526a9f64f";
+        let declared = "d7cec2130e81386db34bf389b5924168efe6c1a90fd686111e4741a4a50c80af";
+        let url = url::Url::parse(&format!(
+            "https://pypi.nvidia.com/isaacsim/isaacsim-4.2.0.2-cp310-none-manylinux_2_34_x86_64.whl#sha256={declared}"
+        ))
+        .unwrap();
+        match reconcile_index_wheel_sha("isaacsim", "4.2.0.2", &url, recorded) {
+            IndexShaDecision::Superseded { fresh, warning } => {
+                assert_eq!(fresh, declared, "the current artifact's hash is recorded");
+                assert!(warning.contains("isaacsim==4.2.0.2"), "{warning}");
+                assert!(warning.contains("aca6dcd4"), "{warning}");
+                assert!(warning.contains("d7cec213"), "{warning}");
+                assert!(warning.contains("superseded upstream"), "{warning}");
+                assert!(warning.contains("adopting the current artifact"), "{warning}");
+            }
+            other => panic!("expected Superseded, got {other:?}"),
+        }
+    }
+
+    /// F24 guard (b): when the index declares the recorded hash (or declares
+    /// none at all), the favor-locked entry is left exactly as it was — the
+    /// check must not churn locks on the overwhelmingly common path.
+    #[test]
+    fn reconcile_index_wheel_sha_leaves_agreeing_entry_unchanged() {
+        let recorded = "aca6dcd4c8ab15fed2a3acbb644c306ee4e2f87fd69c48e523fe8ff526a9f64f";
+        let base = "https://pypi.nvidia.com/isaacsim/isaacsim-4.2.0.2-cp310-none-manylinux_2_34_x86_64.whl";
+        let agreeing = url::Url::parse(&format!("{base}#sha256={recorded}")).unwrap();
+        assert_eq!(
+            reconcile_index_wheel_sha("isaacsim", "4.2.0.2", &agreeing, recorded),
+            IndexShaDecision::Unchanged,
+        );
+        // Same hash, upper-cased by the index: still the same artifact.
+        let upper = url::Url::parse(&format!("{base}#sha256={}", recorded.to_ascii_uppercase()))
+            .unwrap();
+        assert_eq!(
+            reconcile_index_wheel_sha("isaacsim", "4.2.0.2", &upper, recorded),
+            IndexShaDecision::Unchanged,
+        );
+        // Index that advertises no hash (py.mujoco.org and friends): nothing
+        // to compare against, so nothing to adopt.
+        let silent = url::Url::parse(base).unwrap();
+        assert_eq!(
+            reconcile_index_wheel_sha("isaacsim", "4.2.0.2", &silent, recorded),
+            IndexShaDecision::Unchanged,
+        );
+    }
+
+    /// F24 guard (a), end-to-end half: `stage()` must write the CURRENT
+    /// artifact hash into the lock for an unchanged index wheel whose carried
+    /// sha256 was superseded upstream. Pre-fix the lock shipped the stale sha
+    /// next to a freshly recorded URL, and `retread install` refused every
+    /// download of that wheel.
+    #[tokio::test]
+    async fn stage_adopts_republished_index_sha_into_lock() {
+        let tmp = make_test_dir("f24-republished-index-sha");
+        let staging = tmp.join("staging");
+
+        let bundle = "republished-pkg";
+        let whl_name = format!("{}-1.0.0-py3-none-any.whl", wheel_dist_name(bundle));
+        let local = tmp.join(&whl_name);
+        std::fs::write(&local, make_wheel_bytes(bundle, "1.0.0", &[])).unwrap();
+        // The index now declares a DIFFERENT hash for this exact filename.
+        let declared = "d7cec2130e81386db34bf389b5924168efe6c1a90fd686111e4741a4a50c80af";
+        let url = format!("https://pypi.nvidia.com/x/{whl_name}#sha256={declared}");
+        let wheel = make_emit_wheel(bundle, "1.0.0", &[], Some(&local), Some(&url));
+        let carried = wheel.sha256.clone().expect("emit wheel carries a sha");
+        assert_ne!(carried, declared, "test setup: the carried sha must be stale");
+
+        let result = stage(
+            &minimal_config(bundle),
+            bundle,
+            "1.0.0",
+            "3.12",
+            &vec![wheel],
+            &HashSet::new(),
+            &[],
+            &["https://pypi.org/simple/".to_string()],
+            "",
+            &tmp,
+            &staging,
+        )
+        .await
+        .expect("stage must adopt the current artifact, not fail");
+
+        let w = result
+            .lock
+            .wheels
+            .iter()
+            .find(|w| w.name == bundle)
+            .expect("bundle wheel present in lock");
+        assert_eq!(w.origin, Origin::Index);
+        assert_eq!(
+            w.sha256.as_deref(),
+            Some(declared),
+            "lock must record the hash the index declares now, not the stale one",
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
