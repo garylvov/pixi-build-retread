@@ -1204,13 +1204,14 @@ impl WheelEntry {
             }
             return Ok(None);
         };
-        let specifiers = <VersionSpecifiers as std::str::FromStr>::from_str(&text).map_err(|e| {
-            anyhow!(
-                "wheel `{name}`: `version = \"{}\"` is not a PEP 440 version or specifier \
+        let specifiers =
+            <VersionSpecifiers as std::str::FromStr>::from_str(&text).map_err(|e| {
+                anyhow!(
+                    "wheel `{name}`: `version = \"{}\"` is not a PEP 440 version or specifier \
                  set (accepted: `5.1.0`, `==5.1.0`, `>=5.1,<6`): {e}",
-                self.version.as_deref().unwrap_or("")
-            )
-        })?;
+                    self.version.as_deref().unwrap_or("")
+                )
+            })?;
         Ok(Some(specifiers))
     }
 
@@ -1395,7 +1396,9 @@ mod tests {
     #[test]
     fn f15_bare_version_still_lifts_to_exact_pin() {
         let mut entry = spec_entry("27.1.0");
-        entry.normalize("pyzmq").expect("bare version must normalize");
+        entry
+            .normalize("pyzmq")
+            .expect("bare version must normalize");
         entry.validate("pyzmq").expect("bare version must validate");
         assert_eq!(entry.version.as_deref(), Some("==27.1.0"));
         assert_eq!(entry.version_specifier_text().as_deref(), Some("==27.1.0"));

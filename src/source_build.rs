@@ -6842,7 +6842,8 @@ mod tests {
         remove_owned_cache_entry(&entry).unwrap();
 
         for leftover in std::fs::read_dir(&root).into_iter().flatten().flatten() {
-            let _ = std::fs::set_permissions(leftover.path(), std::fs::Permissions::from_mode(0o755));
+            let _ =
+                std::fs::set_permissions(leftover.path(), std::fs::Permissions::from_mode(0o755));
         }
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -6863,11 +6864,16 @@ mod tests {
             .with_hermetic_builds(false);
         let source_identity = hash_fields(
             b"f12-concurrent-sdist-test\0",
-            &[unique_test_dir("f12-concurrent").to_string_lossy().as_bytes()],
+            &[unique_test_dir("f12-concurrent")
+                .to_string_lossy()
+                .as_bytes()],
         );
         let cache = built_wheel_cache_dir("sdist", &source_identity, &target);
         remove_owned_cache_entry(&cache).unwrap();
-        let family = cache.parent().expect("cache leaf has a family dir").to_path_buf();
+        let family = cache
+            .parent()
+            .expect("cache leaf has a family dir")
+            .to_path_buf();
         let policy = crate::pypi::native_source_build_policy(
             "linux-64",
             "linux-64",
@@ -6963,11 +6969,16 @@ mod tests {
             .with_hermetic_builds(false);
         let source_identity = hash_fields(
             b"f12-ownership-test\0",
-            &[unique_test_dir("f12-ownership").to_string_lossy().as_bytes()],
+            &[unique_test_dir("f12-ownership")
+                .to_string_lossy()
+                .as_bytes()],
         );
         let cache = built_wheel_cache_dir("sdist", &source_identity, &target);
         remove_owned_cache_entry(&cache).unwrap();
-        let family = cache.parent().expect("cache leaf has a family dir").to_path_buf();
+        let family = cache
+            .parent()
+            .expect("cache leaf has a family dir")
+            .to_path_buf();
         std::fs::create_dir_all(&family).unwrap();
 
         // Two directories owned by a different (fabricated) pid.
@@ -6997,7 +7008,11 @@ mod tests {
             BuiltWheelRequirement::TargetCompatible,
             false,
             move |private_out, _environment| async move {
-                write_test_wheel(&private_out.join("pkg-1.0.0-py3-none-any.whl"), "pkg", "1.0.0");
+                write_test_wheel(
+                    &private_out.join("pkg-1.0.0-py3-none-any.whl"),
+                    "pkg",
+                    "1.0.0",
+                );
                 let held = private_out.join("held");
                 std::fs::create_dir_all(&held).unwrap();
                 std::fs::write(held.join(".nfs0000deadbeef"), b"open elsewhere").unwrap();

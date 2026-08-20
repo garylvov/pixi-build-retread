@@ -2880,8 +2880,7 @@ mod tests {
 
         let normalized = normalize_recorded_wheel_filenames(&[encoded]);
         assert_eq!(
-            normalized[0].wheel_filename,
-            "torch-2.5.1+cu124-cp310-cp310-linux_x86_64.whl",
+            normalized[0].wheel_filename, "torch-2.5.1+cu124-cp310-cp310-linux_x86_64.whl",
             "the recorded basename must be decoded to a literal PEP 427 name"
         );
         assert!(
@@ -2901,8 +2900,7 @@ mod tests {
         let plain_name = plain.wheel_filename.clone();
 
         let mut local_version = make_emit_wheel("torch", "2.5.1+cu124", &[], None, None);
-        local_version.wheel_filename =
-            "torch-2.5.1+cu124-cp310-cp310-linux_x86_64.whl".to_string();
+        local_version.wheel_filename = "torch-2.5.1+cu124-cp310-cp310-linux_x86_64.whl".to_string();
 
         let normalized = normalize_recorded_wheel_filenames(&[plain, local_version]);
         assert_eq!(normalized[0].wheel_filename, plain_name);
@@ -4620,7 +4618,10 @@ mod tests {
                 assert!(warning.contains("aca6dcd4"), "{warning}");
                 assert!(warning.contains("d7cec213"), "{warning}");
                 assert!(warning.contains("superseded upstream"), "{warning}");
-                assert!(warning.contains("adopting the current artifact"), "{warning}");
+                assert!(
+                    warning.contains("adopting the current artifact"),
+                    "{warning}"
+                );
             }
             other => panic!("expected Superseded, got {other:?}"),
         }
@@ -4639,8 +4640,8 @@ mod tests {
             IndexShaDecision::Unchanged,
         );
         // Same hash, upper-cased by the index: still the same artifact.
-        let upper = url::Url::parse(&format!("{base}#sha256={}", recorded.to_ascii_uppercase()))
-            .unwrap();
+        let upper =
+            url::Url::parse(&format!("{base}#sha256={}", recorded.to_ascii_uppercase())).unwrap();
         assert_eq!(
             reconcile_index_wheel_sha("isaacsim", "4.2.0.2", &upper, recorded),
             IndexShaDecision::Unchanged,
@@ -4673,7 +4674,10 @@ mod tests {
         let url = format!("https://pypi.nvidia.com/x/{whl_name}#sha256={declared}");
         let wheel = make_emit_wheel(bundle, "1.0.0", &[], Some(&local), Some(&url));
         let carried = wheel.sha256.clone().expect("emit wheel carries a sha");
-        assert_ne!(carried, declared, "test setup: the carried sha must be stale");
+        assert_ne!(
+            carried, declared,
+            "test setup: the carried sha must be stale"
+        );
 
         let result = stage(
             &minimal_config(bundle),

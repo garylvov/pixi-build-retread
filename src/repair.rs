@@ -481,6 +481,36 @@ pub fn append_repair_log(share: &Path, bundle: &str, line: &str) {
     }
 }
 
+/// How many trailing lines of uv's own stderr are copied into the repair log
+/// when a replay fails.
+pub const UV_STDERR_TAIL_LINES: usize = 60;
+
+/// Copy uv's own stderr tail into `<bundle>.repair.log`, labelled.
+///
+/// The repair log only ever held uv's stderr by ACCIDENT: the activate.d guard
+/// runs `retread install ... >>"$REPAIR_LOG" 2>&1` (`crate::recipe`), and uv
+/// inherits that stderr. Every other way of reaching the same replay -- the
+/// manual retry the guard itself prints, a courier-driven install, a CI run --
+/// leaves the log with nothing but `uv pip install failed for bundle <b>
+/// (status exit status: 2)`, which names the symptom and destroys the cause.
+/// So the failure path copies the tail in explicitly, and no longer depends on
+/// where our stderr happened to be pointing.
+pub fn append_uv_stderr(share: &Path, bundle: &str, tail: &[String], status: &str) {
+    if tail.is_empty() {
+        append_repair_log(
+            share,
+            bundle,
+            &format!("--- uv stderr ({status}): EMPTY (uv wrote nothing to stderr) ---"),
+        );
+        return;
+    }
+    append_repair_log(share, bundle, &format!("--- uv stderr ({status}) ---"));
+    for line in tail {
+        append_repair_log(share, bundle, line);
+    }
+    append_repair_log(share, bundle, "--- end uv stderr ---");
+}
+
 /// Number of attempts already recorded in a repair log.
 fn recorded_attempts(path: &Path) -> usize {
     std::fs::read_to_string(path)
@@ -537,7 +567,6 @@ pub fn fail_post_verify(
     eprintln!("{line}");
     err.context(detail)
 }
-
 
 // ── F11: repair budget + divergence detector ─────────────────────────────
 //

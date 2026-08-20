@@ -186,12 +186,14 @@ pub(crate) fn plan_virtual_overrides(
         }
         let satisfied = match host_value {
             None => false,
-            Some(host_value) => match (Version::from_str(host_value), Version::from_str(declared)) {
-                (Ok(host_version), Ok(declared_version)) => host_version >= declared_version,
-                // An unparseable version on either side is not evidence of a
-                // gap; a false WARN is worse than a missing one here.
-                _ => true,
-            },
+            Some(host_value) => {
+                match (Version::from_str(host_value), Version::from_str(declared)) {
+                    (Ok(host_version), Ok(declared_version)) => host_version >= declared_version,
+                    // An unparseable version on either side is not evidence of a
+                    // gap; a false WARN is worse than a missing one here.
+                    _ => true,
+                }
+            }
         };
         if !satisfied {
             gaps.push(VirtualGap {

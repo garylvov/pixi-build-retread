@@ -14827,13 +14827,15 @@ fn produce_output_with_conflicts(
                                 specifiers,
                                 decisions: diagnostics,
                             } => {
-                                pending_relaxations.extend(auto_bundle::wheel_metadata_relaxations(
-                                    &pypi_name,
-                                    &without_fact,
-                                    diagnostics,
-                                    &bundle.conda_name,
-                                    format!(" for bundle '{}'", bundle.conda_name),
-                                ));
+                                pending_relaxations.extend(
+                                    auto_bundle::wheel_metadata_relaxations(
+                                        &pypi_name,
+                                        &without_fact,
+                                        diagnostics,
+                                        &bundle.conda_name,
+                                        format!(" for bundle '{}'", bundle.conda_name),
+                                    ),
+                                );
                                 let rendered = native_conda_override
                                     .clone()
                                     .unwrap_or_else(|| specifiers.to_string().replace(", ", ","));
@@ -15356,12 +15358,11 @@ fn describe_unadvertised_sources(
         }
         let mut owners: Vec<String> = Vec::new();
         for wheel in std::iter::once(&bundle.primary).chain(bundle.extras.iter()) {
-            let declares = wheel
-                .metadata
-                .requires_dist
-                .iter()
-                .any(|raw| raw.split([';', ' ', '=', '<', '>', '!', '~', '[']).next()
-                    .is_some_and(|dep| canonical_conda_name(dep) == name));
+            let declares = wheel.metadata.requires_dist.iter().any(|raw| {
+                raw.split([';', ' ', '=', '<', '>', '!', '~', '['])
+                    .next()
+                    .is_some_and(|dep| canonical_conda_name(dep) == name)
+            });
             if declares {
                 owners.push(wheel.pypi_name.clone());
             }
@@ -17856,8 +17857,10 @@ async fn build_one(
         // authority that produced the conda/outputs advertisement.
         let constrains = match constrains_override {
             Some(advertised) => advertised.to_vec(),
-            None => bundle_emitted_constrains(bundle, config, target_subdir, workspace_python_version)
-                .context("deriving emitted conda constrains for the courier lock")?,
+            None => {
+                bundle_emitted_constrains(bundle, config, target_subdir, workspace_python_version)
+                    .context("deriving emitted conda constrains for the courier lock")?
+            }
         };
         return materialize_and_pack(
             Some(bundle),
