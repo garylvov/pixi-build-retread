@@ -13685,6 +13685,39 @@ struct CededOwnership {
     /// Recorded relaxations, written into the bundle's relaxation manifest
     /// through the same seam every other emission relaxation uses.
     records: Vec<auto_bundle::WheelMetadataRelaxation>,
+    /// Canonical name -> the workspace-conda version that satisfies the bundled
+    /// bound a cross-major disagreement made undefendable. Presence here means
+    /// CONDA is the single owner of the name: the pack emits the bundled bound
+    /// as a real conda `depends` edge instead of ceding it to pixi's pypi
+    /// phase, and the bundled dist is never materialized.
+    conda_owned: BTreeMap<String, String>,
+}
+
+/// The workspace-conda version of `name` that satisfies `specifiers`, if any.
+///
+/// Reads exactly the ABI facts F21's post-emission invariant check reads
+/// (`output_workspace_abi_versions`, through `relax::semantic_aliases`), so
+/// "can conda own this name?" at emission time and "does the emitted contract
+/// cover the workspace pin?" afterwards can never disagree.
+fn conda_version_satisfying(
+    name: &str,
+    specifiers: &VersionSpecifiers,
+    workspace_versions: &WorkspaceAbiVersions,
+    aliases: &AbiAliasGraph,
+) -> Option<String> {
+    for alias in semantic_aliases(name, aliases) {
+        let Some(candidates) = workspace_versions.get(&alias) else {
+            continue;
+        };
+        for candidate in candidates {
+            if let Ok(version) = uv_pep508::uv_pep440::Version::from_str(candidate)
+                && specifiers.contains(&version)
+            {
+                return Some(candidate.clone());
+            }
+        }
+    }
+    None
 }
 
 /// Resolve every contradiction between a bundled wheel's requirement and the
@@ -13714,6 +13747,8 @@ fn resolve_ceded_pypi_bounds(
     bundle: &Bundle,
     declared_pypi_owned: &BTreeSet<String>,
     marker_env: &uv_pep508::MarkerEnvironment,
+    workspace_versions: &WorkspaceAbiVersions,
+    aliases: &AbiAliasGraph,
 ) -> Result<CededOwnership> {
     let mut ownership = CededOwnership::default();
     if declared_pypi_owned.is_empty() || bundle.workspace_locked_pypi.is_empty() {
@@ -13796,6 +13831,28 @@ fn resolve_ceded_pypi_bounds(
                     ownership.relaxed.insert(name.clone(), relaxed);
                 }
                 CededBoundVerdict::CrossMajor => {
+                    // Conda first, refusal second (F11 turn 5). No within-major
+                    // relaxation is defensible here, but if a workspace conda
+                    // provider offers the name at a version the bundled bound
+                    // ADMITS, conda can be made the single owner: the pack emits
+                    // the bundled bound as a conda `depends` edge, the bundled
+                    // dist is ceded (never materialized), and pixi's pypi phase
+                    // no longer contests the name. Only when conda cannot
+                    // satisfy the bound is the disagreement unresolvable.
+                    if let Some(conda_version) =
+                        conda_version_satisfying(&name, specifiers, workspace_versions, aliases)
+                    {
+                        tracing::info!(
+                            bundle = %bundle.conda_name,
+                            "ownership: name={name} owner=conda reason=cross-major bundled pin; \
+                             conda provides =={conda_version} (satisfies bundled wheel \
+                             {wheel_file} requirement {raw}; declared-pypi owner {name}=={locked} \
+                             is ceded to conda, not to pixi's pypi phase)",
+                            wheel_file = wheel.metadata.filename,
+                        );
+                        ownership.conda_owned.insert(name.clone(), conda_version);
+                        continue;
+                    }
                     bail!(
                         "declared-pypi owner {name}=={locked} violates bundled wheel \
                          {wheel_file} requirement {raw} across a MAJOR boundary; declared by \
@@ -13957,7 +14014,18 @@ fn produce_output_with_conflicts(
     // provides are resolved HERE and nowhere else (operator ruling 2026-08-19):
     // within-major -> relax + record + WARN and let the declared pypi provider
     // win; across a major boundary -> refuse, naming all three sides.
-    let ceded_ownership = resolve_ceded_pypi_bounds(bundle, &declared_pypi_owned, &env)?;
+    // Same solved-workspace ABI facts F21's post-emission invariant check
+    // reads: they are what decides whether conda can be made the single owner
+    // of a cross-major-contested name instead of refusing the build.
+    let ceded_workspace_versions = output_workspace_abi_versions(bundle, workspace_python_version);
+    let ceded_aliases = output_abi_aliases(bundle, config);
+    let ceded_ownership = resolve_ceded_pypi_bounds(
+        bundle,
+        &declared_pypi_owned,
+        &env,
+        &ceded_workspace_versions,
+        &ceded_aliases,
+    )?;
     // One greppable ownership verdict per name the bundle carries, at the one
     // point where all three owners are decidable. `pack` means this build
     // ships the dist; `conda` means a workspace conda provider supplies it;
@@ -14293,8 +14361,23 @@ fn produce_output_with_conflicts(
             // it) in `[pypi-dependencies]`: pixi's own pypi phase installs it,
             // so the pack must not claim it either. Same treatment as a
             // workspace CONDA provider -- carry the bound, drop the edge.
-            let constrains_only = workspace_conda_owned || workspace_pypi_owned;
-            if workspace_pypi_owned {
+            // F11 turn 5: a cross-major contested name conda was made the
+            // single owner of is NOT ceded to pixi's pypi phase -- carrying its
+            // bound as an inert `constrains` entry would leave the workspace
+            // free to resolve the pypi side to the very version that crosses
+            // the major boundary. It must be a real `depends` edge so the conda
+            // solve is forced onto the provider that satisfies the bundled pin.
+            let conda_cross_major_owned = ceded_ownership.conda_owned.contains_key(&canonical_dep);
+            let constrains_only =
+                (workspace_conda_owned || workspace_pypi_owned) && !conda_cross_major_owned;
+            if conda_cross_major_owned {
+                tracing::info!(
+                    dep = %dep_name,
+                    bundle = %bundle.conda_name,
+                    "ownership: name={raw_pypi_name} owner=conda reason=cross-major bundled pin; \
+                     emitting `depends` for the bundled bound `{raw}`",
+                );
+            } else if workspace_pypi_owned {
                 tracing::info!(
                     dep = %dep_name,
                     bundle = %bundle.conda_name,
@@ -14355,7 +14438,7 @@ fn produce_output_with_conflicts(
             // every failure this gate exists to prevent (a pypi-only name or an
             // unsatisfiable spec becoming a REQUIRED conda edge) is out of
             // reach for it. The gate therefore only drops non-carry edges.
-            if !constrains_only && in_set(&bundle.uv_closure_names) {
+            if !constrains_only && !conda_cross_major_owned && in_set(&bundle.uv_closure_names) {
                 tracing::debug!(
                     dep = %dep_name,
                     bundle = %bundle.conda_name,

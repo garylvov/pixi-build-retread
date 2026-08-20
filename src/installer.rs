@@ -761,6 +761,29 @@ fn check_env_pypi_bounds(lock: &RetreadLock, owned: &BTreeMap<String, String>) -
                 );
                 continue;
             }
+            // SAME POLICY AS BUILD (F11 turn 5). A cross-major disagreement the
+            // producer resolved by making CONDA the single owner shows up in the
+            // committed lock as a conda `depends` edge on the contested name.
+            // That edge IS the record that the name is conda-owned, not
+            // env-pypi-ceded: the bundled dist is not materialized, conda
+            // supplies the version, and refusing here would refuse exactly what
+            // the build deliberately emitted.
+            if let Some(dep) = lock
+                .conda_run_deps
+                .iter()
+                .find(|dep| normalize_dist_name(&dep.name) == name)
+            {
+                eprintln!(
+                    "retread install: {name} is conda-owned by this pack (`depends {} {}`; \
+                     cross-major bundled pin), not ceded to the env's pypi phase; ignoring \
+                     env-pypi owner {name}=={locked} for bundled wheel {wheel_file} \
+                     requirement {raw}",
+                    dep.name,
+                    dep.spec,
+                    wheel_file = wheel.filename,
+                );
+                continue;
+            }
             bail!(
                 "retread install: env-pypi owner {name}=={locked} (from the workspace \
                  pixi.lock) violates bundled wheel {wheel_file} requirement {raw} across a \
@@ -3650,6 +3673,19 @@ packages:
         ] {
             assert!(err.contains(needle), "message must name {needle}: {err}");
         }
+
+        // F11 turn 5: the SAME cross-major disagreement, but the producer
+        // resolved it by making conda the single owner -- recorded in the lock
+        // as a conda `depends` edge on the contested name. Install must then
+        // accept exactly what the build emitted, not refuse it.
+        let mut conda_owned_lock = major_lock.clone();
+        conda_owned_lock.conda_run_deps = vec![crate::lock::CondaDep {
+            name: "huggingface_hub".to_string(),
+            spec: "0.35.0".to_string(),
+        }];
+        check_env_pypi_bounds(&conda_owned_lock, &major_owned).expect(
+            "a name this pack emits as a conda depends edge is conda-owned, not env-pypi-ceded",
+        );
 
         // Satisfied bound -> builds.
         let mut ok_lock = lock.clone();

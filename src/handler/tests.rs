@@ -1279,6 +1279,106 @@ fn a_declared_owned_name_locked_outside_a_bundled_wheels_bound_refuses_at_build(
         .expect("a name neither declared-reachable nor lock-listed is never bound-checked");
 }
 
+/// F11 turn 5 guard. A cross-major disagreement is not automatically a refusal:
+/// it is a refusal only when NOBODY can own the name. Measured from
+/// `certify_4_10_90/artifacts/isaaclab-gpu-latest.cert-install.log:2-12` --
+/// `trimesh==5.0.0` is declared-pypi owned (via `mujoco`), the bundled
+/// `isaacsim_core` wheel requires `trimesh==4.11.1`, and the build refused,
+/// even though the workspace conda side offers exactly 4.11.1.
+///
+/// Ruling: when the conda channels provide the name at a version the bundled
+/// bound ADMITS, conda becomes the single owner -- the pack emits the bundled
+/// bound as a real conda `depends` edge (never an inert `constrains`), the
+/// build proceeds, and the bundled dist is still ceded so replay never
+/// materializes it. Only when conda cannot satisfy the bound is the
+/// disagreement unresolvable (arm 1b of the guard above, unchanged).
+#[test]
+fn a_cross_major_contested_name_conda_can_satisfy_becomes_a_conda_depends_edge() {
+    let contested_bundle = || {
+        let mut bundle = solo_bundle("viral-pack", vec!["trimesh==4.11.1"]);
+        bundle.primary.original_requires_dist = vec!["trimesh==4.11.1".to_string()];
+        bundle.primary.metadata.requires_dist = vec!["trimesh==4.11.1".to_string()];
+        // The contested name is ALSO a bundled dist, exactly as in the measured
+        // isaacsim pack: the wheel must be ceded (not materialized) even though
+        // conda -- not pixi's pypi phase -- ends up owning it.
+        bundle
+            .extras
+            .push(rw("trimesh", meta("trimesh", "4.11.1", vec![], true)));
+        bundle.uv_closure_names.insert("trimesh".to_string());
+        bundle
+            .workspace_declared_pypi
+            .insert(canonical_conda_name("mujoco"));
+        bundle
+            .uv_dependency_graph
+            .edges
+            .insert(crate::uv_closure::UvDependencyEdge {
+                parent: "mujoco".to_string(),
+                child: "trimesh".to_string(),
+            });
+        bundle
+            .workspace_locked_pypi
+            .insert("trimesh".to_string(), "5.0.0".to_string());
+        bundle
+    };
+
+    // (a) conda HAS a version the bundled `==4.11.1` admits -> no refusal.
+    let mut bundle = contested_bundle();
+    bundle
+        .workspace_conda_versions
+        .insert("trimesh".to_string(), "4.11.1".to_string());
+    let output = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None)
+        .expect("conda can own the name at the bundled pin, so the build must NOT refuse");
+
+    let depends: Vec<(String, String)> = output
+        .run_dependencies
+        .depends
+        .iter()
+        .map(|d| (d.name.clone(), format_packagespec(&d.spec)))
+        .collect();
+    let (_, spec) = depends
+        .iter()
+        .find(|(name, _)| name == "trimesh")
+        .unwrap_or_else(|| {
+            panic!(
+                "conda owning the name means a REAL depends edge, not an inert \
+                 constrains entry: {depends:?}"
+            )
+        });
+    assert!(
+        spec.contains("4.11.1"),
+        "the depends edge must carry the bundled pin conda was chosen to satisfy: {spec}",
+    );
+
+    // The bundled dist is still ceded, so replay never materializes it -- the
+    // same skip record the declared-owned path writes.
+    assert!(
+        declared_pypi_owned_dists(&bundle, &cfg()).contains("trimesh"),
+        "the contested bundled wheel must stay out of the install replay",
+    );
+
+    // (b) conda does NOT have a satisfying version -> today's loud refusal.
+    let mut bundle = contested_bundle();
+    bundle
+        .workspace_conda_versions
+        .insert("trimesh".to_string(), "5.0.0".to_string());
+    let err = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None)
+        .expect_err("conda cannot satisfy the bundled pin, so the refusal stands");
+    let message = format!("{err:#}");
+    for needle in [
+        "declared-pypi owner",
+        "trimesh==5.0.0",
+        "MAJOR boundary",
+        "conda cannot be made the single owner",
+        "fix the manifest/pack, not the repair",
+    ] {
+        assert!(
+            message.contains(needle),
+            "the unresolvable refusal must still name every side; missing {needle:?} in \
+             {message:?}",
+        );
+    }
+}
+
 /// NOT reachable from any declared root is untouched.
 #[test]
 fn a_dist_in_the_declared_pypi_closure_is_ceded_to_the_workspace() {
