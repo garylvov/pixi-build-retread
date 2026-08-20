@@ -538,7 +538,6 @@ pub fn fail_post_verify(
     err.context(detail)
 }
 
-
 // ── F11: repair budget + divergence detector ─────────────────────────────
 //
 // A repair is only worth running if it can CONVERGE. On `viral-gpu`

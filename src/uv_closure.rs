@@ -11903,7 +11903,10 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
         .await
         .expect("the retreat cap must heal the closure, not surface Pass A's error");
         let seen = seen_constraints.lock().unwrap();
-        assert!(seen.len() >= 2, "expected a re-solve after the cap: {seen:?}");
+        assert!(
+            seen.len() >= 2,
+            "expected a re-solve after the cap: {seen:?}"
+        );
         assert!(
             !seen[0].iter().any(|c| c == "mujoco<3.12.0"),
             "the first attempt must be uncapped: {seen:?}"

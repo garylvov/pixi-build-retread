@@ -2800,8 +2800,7 @@ mod tests {
 
         let normalized = normalize_recorded_wheel_filenames(&[encoded]);
         assert_eq!(
-            normalized[0].wheel_filename,
-            "torch-2.5.1+cu124-cp310-cp310-linux_x86_64.whl",
+            normalized[0].wheel_filename, "torch-2.5.1+cu124-cp310-cp310-linux_x86_64.whl",
             "the recorded basename must be decoded to a literal PEP 427 name"
         );
         assert!(
@@ -2821,8 +2820,7 @@ mod tests {
         let plain_name = plain.wheel_filename.clone();
 
         let mut local_version = make_emit_wheel("torch", "2.5.1+cu124", &[], None, None);
-        local_version.wheel_filename =
-            "torch-2.5.1+cu124-cp310-cp310-linux_x86_64.whl".to_string();
+        local_version.wheel_filename = "torch-2.5.1+cu124-cp310-cp310-linux_x86_64.whl".to_string();
 
         let normalized = normalize_recorded_wheel_filenames(&[plain, local_version]);
         assert_eq!(normalized[0].wheel_filename, plain_name);
