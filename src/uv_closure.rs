@@ -1127,6 +1127,13 @@ impl CoInstallVerdict {
     fn is_unsat(&self) -> bool {
         matches!(self, Self::Unsat(_) | Self::ExactUnsat(_))
     }
+
+    /// Only solver-proven unsatisfiability is monotone under adding routes.
+    /// `ExactUnsat` can be a policy rejection, so it cannot justify skipping
+    /// candidate-local recovery probes.
+    fn is_monotone_unsat(&self) -> bool {
+        matches!(self, Self::Unsat(_))
+    }
 }
 
 /// One conda route considered for generated run-dependency emission.
@@ -1861,39 +1868,43 @@ where
             // driven by outcome instead of by string search — so it
             // catches conflicts whose unsat text never mentions an
             // auto-routed name at all.
+            let baseline_verdict = co_solve(Vec::new()).await;
+            let baseline_unsat = baseline_verdict.is_monotone_unsat();
             let mut greedy: Vec<AutoRoutedPackage> = Vec::new();
-            let mut probe_set = candidate.clone();
-            loop {
-                // Re-check the CURRENT probe_set before trying another
-                // removal — once it's already Sat/Skipped, stop; a
-                // single-candidate subset of an already-satisfiable set
-                // is not evidence that subset was the offender.
-                if !co_solve(probe_set.clone()).await.is_unsat() {
-                    break;
-                }
-                let mut healed_idx: Option<usize> = None;
-                for (i, pkg) in probe_set.iter().enumerate() {
-                    if opts.force_conda.contains(&pkg.pypi_name) {
-                        continue;
-                    }
-                    let mut trial = probe_set.clone();
-                    trial.remove(i);
-                    if !co_solve(trial).await.is_unsat() {
-                        healed_idx = Some(i);
+            if !baseline_unsat {
+                let mut probe_set = candidate.clone();
+                loop {
+                    // Re-check the CURRENT probe_set before trying another
+                    // removal — once it's already Sat/Skipped, stop; a
+                    // single-candidate subset of an already-satisfiable set
+                    // is not evidence that subset was the offender.
+                    if !co_solve(probe_set.clone()).await.is_unsat() {
                         break;
                     }
+                    let mut healed_idx: Option<usize> = None;
+                    for (i, pkg) in probe_set.iter().enumerate() {
+                        if opts.force_conda.contains(&pkg.pypi_name) {
+                            continue;
+                        }
+                        let mut trial = probe_set.clone();
+                        trial.remove(i);
+                        if !co_solve(trial).await.is_unsat() {
+                            healed_idx = Some(i);
+                            break;
+                        }
+                    }
+                    let Some(i) = healed_idx else { break };
+                    let removed = probe_set.remove(i);
+                    tracing::info!(
+                        bundle = %req.bundle,
+                        "auto-route: greedy retry-solve isolated {}=={} as the \
+                         transitive-conflict offender (unsat report named no \
+                         auto-routed package directly)",
+                        removed.pypi_name,
+                        removed.pypi_version,
+                    );
+                    greedy.push(removed);
                 }
-                let Some(i) = healed_idx else { break };
-                let removed = probe_set.remove(i);
-                tracing::info!(
-                    bundle = %req.bundle,
-                    "auto-route: greedy retry-solve isolated {}=={} as the \
-                     transitive-conflict offender (unsat report named no \
-                     auto-routed package directly)",
-                    removed.pypi_name,
-                    removed.pypi_version,
-                );
-                greedy.push(removed);
             }
             if !greedy.is_empty() {
                 for pkg in &greedy {
@@ -1907,14 +1918,23 @@ where
                 }
                 continue;
             }
-            tracing::warn!(
-                bundle = %req.bundle,
-                reasons = ?reasons,
-                "auto-route: conda co-install check is unsat but names no \
-                 auto-routed package and greedy retry-solve found no \
-                 single-candidate fix; un-routing cannot heal this — \
-                 applying the round unchanged",
-            );
+            if baseline_unsat {
+                tracing::warn!(
+                    bundle = %req.bundle,
+                    reasons = ?reasons,
+                    "auto-route: fixed conda baseline is solver-unsatisfiable; \
+                     un-routing cannot heal this — applying the round unchanged",
+                );
+            } else {
+                tracing::warn!(
+                    bundle = %req.bundle,
+                    reasons = ?reasons,
+                    "auto-route: conda co-install check is unsat but names no \
+                     auto-routed package and greedy retry-solve found no \
+                     single-candidate fix; un-routing cannot heal this — \
+                     applying the round unchanged",
+                );
+            }
         } else if let CoInstallVerdict::Skipped(why) = &verdict {
             tracing::debug!(
                 bundle = %req.bundle,
@@ -11436,6 +11456,59 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
         .unwrap();
         assert_eq!(closure.auto_routed.len(), 1);
         assert_eq!(closure.auto_routed[0].pypi_name, "numpy");
+    }
+
+    /// A solver-proven failure of the fixed workspace baseline cannot be
+    /// healed by removing auto-routes. Keep the emitted route set exactly as
+    /// before, but do not spend one solve per candidate subset proving it.
+    #[tokio::test]
+    async fn unsat_fixed_baseline_skips_greedy_candidate_subsets() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut hits = BTreeMap::new();
+        for (name, version) in [("numpy", "2.1.0"), ("typing-extensions", "4.12.2")] {
+            hits.insert(
+                name.to_string(),
+                RouteProbeHit {
+                    conda_version: version.into(),
+                    channel: "c/linux-64".into(),
+                    depends: Vec::new(),
+                },
+            );
+        }
+        let co_solve_calls = Arc::new(AtomicUsize::new(0));
+        let co_solve = {
+            let co_solve_calls = Arc::clone(&co_solve_calls);
+            move |_candidate: Vec<AutoRoutedPackage>| {
+                co_solve_calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async {
+                    CoInstallVerdict::Unsat(vec![
+                        "cuda-toolkit requires __win, for which no candidates were found".into(),
+                    ])
+                }) as futures::future::BoxFuture<'static, CoInstallVerdict>
+            }
+        };
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let closure = auto_route_fixpoint_checked(
+            &auto_route_req(),
+            &auto_route_opts(),
+            canned_solve(Arc::clone(&calls)),
+            canned_probe(hits),
+            co_solve,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            closure.auto_routed.len(),
+            2,
+            "the fixed-baseline failure must preserve the legacy accepted routes"
+        );
+        assert_eq!(
+            co_solve_calls.load(Ordering::SeqCst),
+            2,
+            "one candidate check plus one fixed-baseline proof; no greedy subsets"
+        );
     }
 
     // ---- self-heal: structured two-pass detection ------------------------
