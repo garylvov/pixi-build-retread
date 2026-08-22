@@ -41,6 +41,26 @@ async fn async_main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // `retread preflight` — explicit environment check for callers (Slurm
+    // scripts, CI) that want to fail at second zero instead of twenty minutes
+    // into a staged run. Diagnostics go to stderr; stdout stays clean.
+    if matches!(argv.get(1).map(String::as_str), Some("preflight")) {
+        return match pixi_build_retread::uv_closure::preflight_uv().await {
+            Ok((bin, version)) => {
+                eprintln!(
+                    "preflight OK: uv {version} at {} (retread {})",
+                    bin.display(),
+                    env!("CARGO_PKG_VERSION")
+                );
+                Ok(())
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(error.exit_code());
+            }
+        };
+    }
+
     if matches!(argv.get(1).map(String::as_str), Some("migrate-overrides")) {
         return run_migrate_overrides(&argv[2..]);
     }
@@ -86,6 +106,15 @@ async fn async_main() -> anyhow::Result<()> {
             "verify" => installer::verify(lock, prefix, full),
             _ => unreachable!("matched above"),
         };
+    }
+
+    // AUTOMATIC PREFLIGHT. Runs on every RPC invocation before the transport
+    // starts, so a misconfigured uv fails here in milliseconds instead of
+    // surfacing twenty minutes into a staged build. Diagnostics go to stderr;
+    // stdout is the JSON-RPC channel and MUST stay clean.
+    if let Err(error) = pixi_build_retread::uv_closure::preflight_uv().await {
+        eprintln!("{error}");
+        std::process::exit(error.exit_code());
     }
 
     // Log to stderr only — stdout is reserved for the JSON-RPC transport.

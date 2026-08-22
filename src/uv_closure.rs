@@ -4489,6 +4489,153 @@ pub async fn detect_uv() -> Result<(PathBuf, String)> {
     Ok((bin, version))
 }
 
+/// The uv version this build of retread is validated against.
+///
+/// A mismatch is a hard error, not a warning: uv's resolver output is an
+/// input to the lock, so an unvalidated uv silently changes what we ship.
+pub const REQUIRED_UV: &str = "0.12.5";
+
+/// Why the automatic preflight refused to run.
+#[derive(Debug)]
+pub enum PreflightError {
+    /// `RETREAD_UV` (or `uv` on PATH) could not be executed. Carries the path
+    /// that was tried, so the message names what it looked for.
+    UvMissing(String),
+    /// uv ran, but reports a version this build is not validated against.
+    UvVersion { want: String, got: String },
+}
+
+impl std::fmt::Display for PreflightError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PreflightError::UvMissing(tried) => write!(
+                f,
+                "preflight: uv not usable at `{tried}`\n  \
+                 looked for: ${UV_BIN_ENV} (unset -> `uv` on PATH)",
+            ),
+            PreflightError::UvVersion { want, got } => write!(
+                f,
+                "preflight: uv version mismatch\n  \
+                 wanted: {want}\n  \
+                 got:    {got}",
+            ),
+        }
+    }
+}
+
+impl PreflightError {
+    /// Distinguishable exit codes so a caller can branch without parsing text.
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            PreflightError::UvMissing(_) => 10,
+            PreflightError::UvVersion { .. } => 11,
+        }
+    }
+}
+
+/// Validate this process's own environment before doing any work.
+///
+/// Runs on EVERY invocation. It is one `uv --version` exec (milliseconds), and
+/// there is deliberately no environment variable to skip it: an escape hatch
+/// reintroduces exactly the silent misconfiguration this exists to remove.
+pub async fn preflight_uv() -> std::result::Result<(PathBuf, String), PreflightError> {
+    let tried = std::env::var_os(UV_BIN_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("uv"));
+    let (bin, got) = detect_uv()
+        .await
+        .map_err(|_| PreflightError::UvMissing(tried.display().to_string()))?;
+    if got != REQUIRED_UV {
+        return Err(PreflightError::UvVersion {
+            want: REQUIRED_UV.to_string(),
+            got,
+        });
+    }
+    Ok((bin, got))
+}
+
+#[cfg(test)]
+mod preflight_tests {
+    use super::*;
+
+    struct UvEnvGuard(Option<OsString>);
+
+    impl UvEnvGuard {
+        fn set(path: &Path) -> Self {
+            let prior = std::env::var_os(UV_BIN_ENV);
+            // SAFETY: TEST_ASYNC_ENV_MUTEX serializes environment mutation.
+            unsafe { std::env::set_var(UV_BIN_ENV, path) };
+            Self(prior)
+        }
+    }
+
+    impl Drop for UvEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: TEST_ASYNC_ENV_MUTEX remains held while this guard drops.
+            unsafe {
+                match &self.0 {
+                    Some(value) => std::env::set_var(UV_BIN_ENV, value),
+                    None => std::env::remove_var(UV_BIN_ENV),
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn version_script(version: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = std::env::temp_dir().join(format!(
+            "retread-preflight-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&script, format!("#!/bin/sh\necho 'uv {version}'\n")).unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        script
+    }
+
+    #[tokio::test]
+    async fn preflight_uv_reports_missing_binary() {
+        let _lock = crate::TEST_ASYNC_ENV_MUTEX.lock().await;
+        let ghost = std::env::temp_dir().join(format!(
+            "retread-missing-uv-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _env = UvEnvGuard::set(&ghost);
+        let err = preflight_uv().await.expect_err("missing uv must fail");
+        assert_eq!(err.exit_code(), 10, "missing uv is exit 10: {err}");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains(&ghost.display().to_string()),
+            "message must name the path it tried, got: {rendered}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preflight_uv_rejects_wrong_version() {
+        let _lock = crate::TEST_ASYNC_ENV_MUTEX.lock().await;
+        let script = version_script("0.11.15");
+        let _env = UvEnvGuard::set(&script);
+        let err = preflight_uv().await.expect_err("wrong uv version must fail");
+        assert_eq!(err.exit_code(), 11, "wrong version is exit 11");
+        let rendered = err.to_string();
+        assert!(rendered.contains(REQUIRED_UV), "must print wanted: {rendered}");
+        assert!(rendered.contains("0.11.15"), "must print got: {rendered}");
+        let _ = std::fs::remove_file(script);
+    }
+}
+
 #[cfg(unix)]
 struct ClosureUvProcessGroupGuard {
     pgid: nix::unistd::Pid,
