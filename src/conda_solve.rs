@@ -277,11 +277,10 @@ type SparseLoadResult = std::result::Result<(Vec<RepoDataRecord>, Vec<String>), 
 /// Bundle-scoped sparse-repodata and reachable-record cache.
 ///
 /// The same [`CondaCoSolveContext`](crate::handler::CondaCoSolveContext) runs
-/// many counterfactual solves whose root sets are subsets of the first full
-/// route set. Sparse handles are shared once, and reachable records grow only
-/// when a later phase introduces a root that was not covered previously.
-/// Returning `Arc` snapshots lets concurrent solves share the exact record
-/// allocation while a later root expansion safely replaces the cached union.
+/// many counterfactual solves. Sparse handles are shared once, while each
+/// exact root-name set gets its own immutable reachable-record snapshot.
+/// A larger route question must never change the candidate universe of an
+/// earlier, narrower question: doing so can change its resolvo verdict.
 #[derive(Clone)]
 pub(crate) struct SharedSparseSolveData {
     channels: Arc<[ChannelUrl]>,
@@ -302,10 +301,12 @@ impl std::fmt::Debug for SharedSparseSolveData {
 
 #[derive(Default)]
 struct ReachableState {
-    root_order: Vec<PackageName>,
-    covered_roots: BTreeSet<PackageName>,
-    record_names: BTreeSet<PackageName>,
-    records: Option<Arc<[RepoDataRecord]>>,
+    snapshots: BTreeMap<Vec<PackageName>, ReachableSnapshot>,
+}
+
+#[derive(Clone)]
+struct ReachableSnapshot {
+    records: Arc<[RepoDataRecord]>,
     consulted: Arc<[String]>,
 }
 
@@ -347,48 +348,40 @@ impl SharedSparseSolveData {
         Load: FnOnce(Arc<[SparsePair]>, Vec<PackageName>) -> LoadFuture,
         LoadFuture: std::future::Future<Output = SparseLoadResult>,
     {
-        let requested_roots = exact_root_names(parsed_specs);
-        let mut state = self.reachable.lock().await;
-        if requested_roots
-            .iter()
-            .all(|root| state.covered_roots.contains(root) || state.record_names.contains(root))
-            && let Some(records) = &state.records
+        let mut requested_roots = exact_root_names(parsed_specs);
+        requested_roots.sort();
+        if let Some(snapshot) = self
+            .reachable
+            .lock()
+            .await
+            .snapshots
+            .get(&requested_roots)
+            .cloned()
         {
             tracing::debug!(
-                records = records.len(),
-                covered_roots = state.covered_roots.len(),
+                records = snapshot.records.len(),
                 requested_roots = requested_roots.len(),
-                "bench: reusing bundle-scoped sparse reachable records",
+                "bench: reusing question-scoped sparse reachable records",
             );
-            return (Arc::clone(records), Arc::clone(&state.consulted));
+            return (snapshot.records, snapshot.consulted);
         }
 
-        let mut root_order = state.root_order.clone();
-        let mut covered_roots = state.covered_roots.clone();
-        for root in requested_roots {
-            if !covered_roots.contains(&root) && !state.record_names.contains(&root) {
-                covered_roots.insert(root.clone());
-                root_order.push(root);
-            }
-        }
         let pairs = self.pairs().await;
-        let (records, consulted) = match load(pairs, root_order.clone()).await {
+        let (records, consulted) = match load(pairs, requested_roots.clone()).await {
             Ok(loaded) => loaded,
             // Gateway errors and spawn-blocking panics both take this path.
             // Keep the last good snapshot intact so a later probe can retry.
             Err(consulted) => return (Arc::from([]), consulted.into()),
         };
-        let record_names = records
-            .iter()
-            .map(|record| record.package_record.name.clone())
-            .collect();
         let records: Arc<[RepoDataRecord]> = records.into();
         let consulted: Arc<[String]> = consulted.into();
-        state.root_order = root_order;
-        state.covered_roots = covered_roots;
-        state.record_names = record_names;
-        state.records = Some(Arc::clone(&records));
-        state.consulted = Arc::clone(&consulted);
+        self.reachable.lock().await.snapshots.insert(
+            requested_roots,
+            ReachableSnapshot {
+                records: Arc::clone(&records),
+                consulted: Arc::clone(&consulted),
+            },
+        );
         (records, consulted)
     }
 }
@@ -1150,7 +1143,7 @@ pub async fn solve_selected_records_for_target(
 }
 
 /// Bundle-scoped form of [`solve_selected_records_for_target`] that shares
-/// sparse handles and the grow-only reachable record union across probes.
+/// sparse handles and immutable reachable-record snapshots across probes.
 pub(crate) async fn solve_selected_records_for_target_shared(
     shared: &SharedSparseSolveData,
     specs: &[CondaMatchSpec],
@@ -1182,10 +1175,7 @@ pub(crate) async fn solve_selected_records_for_target_shared(
     .await
 }
 
-/// Populate the bundle-scoped reachable-record union without running resolvo.
-///
-/// Standalone provider probes can then share one complete immutable snapshot
-/// instead of introducing roots one at a time and rebuilding a growing union.
+/// Populate the exact-question reachable-record snapshot without running resolvo.
 pub(crate) async fn prewarm_selected_records_for_target_shared(
     shared: &SharedSparseSolveData,
     specs: &[CondaMatchSpec],
@@ -1356,154 +1346,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_sparse_solve_data_reuses_covered_record_arc() {
+    async fn shared_sparse_solve_data_reuses_exact_question_snapshot() {
         let records: Arc<[RepoDataRecord]> = vec![
             repo_record("python", "3.11.5", &[]),
             repo_record("numpy", "2.1.0", &["python >=3.11,<3.12"]),
         ]
         .into();
-        let shared = SharedSparseSolveData {
-            channels: Arc::from([]),
-            target_subdir: Arc::from("linux-64"),
-            pairs: Arc::new(tokio::sync::OnceCell::new()),
-            reachable: Arc::new(tokio::sync::Mutex::new(ReachableState {
-                root_order: vec![
-                    PackageName::from_str("python").unwrap(),
-                    PackageName::from_str("numpy").unwrap(),
-                ],
-                covered_roots: BTreeSet::from([
-                    PackageName::from_str("numpy").unwrap(),
-                    PackageName::from_str("python").unwrap(),
-                ]),
-                record_names: BTreeSet::from([
-                    PackageName::from_str("numpy").unwrap(),
-                    PackageName::from_str("python").unwrap(),
-                ]),
-                records: Some(Arc::clone(&records)),
-                consulted: Arc::from(["fixture/linux-64".to_string()]),
-            })),
-        };
+        let roots = vec![
+            PackageName::from_str("numpy").unwrap(),
+            PackageName::from_str("python").unwrap(),
+        ];
+        let shared = shared_sparse_fixture(ReachableState {
+            snapshots: BTreeMap::from([(
+                roots,
+                ReachableSnapshot {
+                    records: Arc::clone(&records),
+                    consulted: Arc::from(["fixture/linux-64".to_string()]),
+                },
+            )]),
+        });
 
         let full = parse_match_specs(&["python 3.11.*".into(), "numpy >=2".into()]);
-        let subset = parse_match_specs(&["python 3.11.*".into()]);
+        let reordered = parse_match_specs(&["numpy >=2".into(), "python 3.11.*".into()]);
         let (full_records, full_consulted) = shared.records_for(&full).await;
-        let (subset_records, subset_consulted) = shared.records_for(&subset).await;
+        let (reordered_records, reordered_consulted) = shared.records_for(&reordered).await;
 
         assert!(Arc::ptr_eq(&records, &full_records));
-        assert!(Arc::ptr_eq(&full_records, &subset_records));
-        assert_eq!(&*full_consulted, &*subset_consulted);
+        assert!(Arc::ptr_eq(&full_records, &reordered_records));
+        assert_eq!(&*full_consulted, &*reordered_consulted);
     }
 
     #[tokio::test]
-    async fn shared_sparse_solve_data_reuses_transitively_loaded_root() {
-        let parent = PackageName::from_str("parent").unwrap();
-        let child = PackageName::from_str("child").unwrap();
-        let records: Arc<[RepoDataRecord]> = vec![
-            repo_record("parent", "1.0", &["child >=1"]),
-            repo_record("child", "1.0", &[]),
-        ]
-        .into();
-        let shared = shared_sparse_fixture(ReachableState {
-            root_order: vec![parent.clone()],
-            covered_roots: BTreeSet::from([parent.clone()]),
-            record_names: BTreeSet::from([parent, child]),
-            records: Some(Arc::clone(&records)),
-            consulted: Arc::from(["fixture/linux-64".to_string()]),
-        });
-        let loader_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let loader_calls_for_probe = Arc::clone(&loader_calls);
-        let specs = parse_match_specs(&["child >=1".to_string()]);
-
-        let (reused, consulted) = shared
-            .records_for_with_loader(&specs, move |_pairs, _roots| async move {
-                loader_calls_for_probe.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Ok((Vec::new(), Vec::new()))
-            })
-            .await;
-
-        assert_eq!(loader_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
-        assert!(Arc::ptr_eq(&records, &reused));
-        assert_eq!(&*consulted, ["fixture/linux-64"]);
-    }
-
-    #[tokio::test]
-    async fn failed_sparse_load_does_not_poison_reachable_cache() {
-        let parent = PackageName::from_str("parent").unwrap();
-        let child = PackageName::from_str("child").unwrap();
-        let missing = PackageName::from_str("missing").unwrap();
-        let original_records: Arc<[RepoDataRecord]> = vec![
-            repo_record("parent", "1.0", &["child >=1"]),
-            repo_record("child", "1.0", &[]),
-        ]
-        .into();
-        let shared = shared_sparse_fixture(ReachableState {
-            root_order: vec![parent.clone()],
-            covered_roots: BTreeSet::from([parent.clone()]),
-            record_names: BTreeSet::from([parent.clone(), child.clone()]),
-            records: Some(Arc::clone(&original_records)),
-            consulted: Arc::from(["fixture/linux-64".to_string()]),
-        });
-        let specs = parse_match_specs(&["missing >=1".to_string()]);
-        let failed_roots = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let failed_roots_for_probe = Arc::clone(&failed_roots);
-
-        let (failed_records, failed_consulted) = shared
-            .records_for_with_loader(&specs, move |_pairs, roots| async move {
-                failed_roots_for_probe.lock().unwrap().push(roots);
-                Err(vec!["fixture/linux-64".to_string()])
-            })
-            .await;
-
-        assert!(failed_records.is_empty());
-        assert_eq!(&*failed_consulted, ["fixture/linux-64"]);
-        {
-            let state = shared.reachable.lock().await;
-            assert_eq!(state.root_order, [parent.clone()]);
-            assert_eq!(state.covered_roots, BTreeSet::from([parent.clone()]));
-            assert_eq!(
-                state.record_names,
-                BTreeSet::from([parent.clone(), child.clone()])
-            );
-            assert!(Arc::ptr_eq(
-                state.records.as_ref().unwrap(),
-                &original_records
-            ));
-        }
-
+    async fn larger_question_cannot_replace_baseline_candidate_snapshot() {
+        let shared = shared_sparse_fixture(ReachableState::default());
+        let baseline = parse_match_specs(&["baseline >=1".to_string()]);
+        let expanded = parse_match_specs(&["baseline >=1".to_string(), "route >=1".to_string()]);
+        let baseline_records = vec![repo_record("baseline", "1.0", &[])];
         let expanded_records = vec![
-            repo_record("parent", "1.0", &["child >=1"]),
-            repo_record("child", "1.0", &[]),
-            repo_record("missing", "1.0", &[]),
+            repo_record("baseline", "1.0", &[]),
+            repo_record("route", "1.0", &[]),
         ];
-        let retried_roots = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let retried_roots_for_probe = Arc::clone(&retried_roots);
-        let expected_records = expanded_records.clone();
-        let (loaded_records, loaded_consulted) = shared
-            .records_for_with_loader(&specs, move |_pairs, roots| async move {
-                retried_roots_for_probe.lock().unwrap().push(roots);
-                Ok((expected_records, vec!["fixture/linux-64".to_string()]))
+
+        let (before, _) = shared
+            .records_for_with_loader(&baseline, move |_pairs, roots| async move {
+                assert_eq!(roots, [PackageName::from_str("baseline").unwrap()]);
+                Ok((baseline_records, vec!["fixture/linux-64".to_string()]))
+            })
+            .await;
+        let (grown, _) = shared
+            .records_for_with_loader(&expanded, move |_pairs, roots| async move {
+                assert_eq!(
+                    roots,
+                    [
+                        PackageName::from_str("baseline").unwrap(),
+                        PackageName::from_str("route").unwrap(),
+                    ]
+                );
+                Ok((expanded_records, vec!["fixture/linux-64".to_string()]))
+            })
+            .await;
+        let (after, _) = shared
+            .records_for_with_loader(&baseline, |_pairs, _roots| async move {
+                panic!("the original question must use its immutable snapshot")
             })
             .await;
 
-        assert_eq!(loaded_records.len(), 3);
-        assert_eq!(&*loaded_consulted, ["fixture/linux-64"]);
-        let expected_root_order = vec![parent.clone(), missing.clone()];
-        assert_eq!(*failed_roots.lock().unwrap(), [expected_root_order.clone()]);
-        assert_eq!(*retried_roots.lock().unwrap(), [expected_root_order]);
-        let state = shared.reachable.lock().await;
-        assert_eq!(state.root_order, [parent, missing.clone()]);
-        assert_eq!(
-            state.covered_roots,
-            BTreeSet::from([PackageName::from_str("parent").unwrap(), missing])
-        );
-        assert_eq!(
-            state.record_names,
-            BTreeSet::from([
-                PackageName::from_str("parent").unwrap(),
-                child,
-                PackageName::from_str("missing").unwrap(),
-            ])
-        );
+        assert_eq!(before.len(), 1);
+        assert_eq!(grown.len(), 2);
+        assert!(Arc::ptr_eq(&before, &after));
+        assert_eq!(after.len(), 1, "candidate growth must not change baseline");
     }
 
     #[test]
