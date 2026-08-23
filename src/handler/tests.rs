@@ -863,6 +863,7 @@ fn courier_pure_python_bundle_is_platform_specific_not_noarch() {
         uv_dependency_graph: Default::default(),
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
+        workspace_selected_conda_packages: Default::default(),
         workspace_declared_pypi: Default::default(),
         workspace_locked_pypi: Default::default(),
     };
@@ -945,6 +946,7 @@ fn produce_output_emits_auto_routed_conda_run_deps() {
         uv_dependency_graph: Default::default(),
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
+        workspace_selected_conda_packages: Default::default(),
         workspace_declared_pypi: Default::default(),
         workspace_locked_pypi: Default::default(),
     };
@@ -3041,6 +3043,7 @@ fn produce_output_softens_deps_from_floor_pin_to_floor_spec() {
         uv_dependency_graph: Default::default(),
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
+        workspace_selected_conda_packages: Default::default(),
         workspace_declared_pypi: Default::default(),
         workspace_locked_pypi: Default::default(),
     };
@@ -3100,6 +3103,7 @@ fn produce_output_preserves_deps_from_bare_and_range_specs() {
         uv_dependency_graph: Default::default(),
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
+        workspace_selected_conda_packages: Default::default(),
         workspace_declared_pypi: Default::default(),
         workspace_locked_pypi: Default::default(),
     };
@@ -3646,6 +3650,7 @@ fn solo_bundle(name: &str, requires: Vec<&str>) -> Bundle {
         uv_dependency_graph: Default::default(),
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
+        workspace_selected_conda_packages: Default::default(),
         workspace_declared_pypi: Default::default(),
         workspace_locked_pypi: Default::default(),
     }
@@ -4524,6 +4529,7 @@ fn vendored_sub_packages_dropped_from_run_deps() {
         uv_dependency_graph: Default::default(),
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
+        workspace_selected_conda_packages: Default::default(),
         workspace_declared_pypi: Default::default(),
         workspace_locked_pypi: Default::default(),
     };
@@ -4681,6 +4687,7 @@ fn bundle_field_groups_entries_into_one_output() {
         uv_dependency_graph: Default::default(),
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
+        workspace_selected_conda_packages: Default::default(),
         workspace_declared_pypi: Default::default(),
         workspace_locked_pypi: Default::default(),
     };
@@ -4782,6 +4789,7 @@ fn relaxed_pure_python_primary_pins_python_to_workspace_variant() {
         uv_dependency_graph: Default::default(),
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
+        workspace_selected_conda_packages: Default::default(),
         workspace_declared_pypi: Default::default(),
         workspace_locked_pypi: Default::default(),
     };

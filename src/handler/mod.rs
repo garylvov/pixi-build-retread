@@ -3906,6 +3906,10 @@ struct Bundle {
     /// differ across consumers, together with the direct workspace specs that
     /// constrain them.
     workspace_conda_provider_facts: BTreeMap<String, WorkspaceCondaProviderFact>,
+    /// Selected canonical conda package names, retained separately for each
+    /// exact consuming environment. This is evidence only in this slice;
+    /// emission does not yet make ownership or drop decisions from it.
+    workspace_selected_conda_packages: BTreeMap<String, BTreeSet<String>>,
     /// Canonical names the consuming workspace declares in
     /// `[pypi-dependencies]` / `[feature.*.pypi-dependencies]` (intersected
     /// over every precise consumer). Pixi's OWN pypi phase resolves and
@@ -7135,6 +7139,7 @@ async fn resolve_all(
         }
         bundle.workspace_conda_versions = workspace_facts.common_selected_versions.clone();
         bundle.workspace_conda_provider_facts = workspace_facts.provider_facts.clone();
+        bundle.workspace_selected_conda_packages = workspace_facts.selected_conda_packages.clone();
         bundle.workspace_declared_pypi = workspace_facts.declared_pypi.clone();
         // The locked PyPI selections of the very envs whose conda solves
         // produced these facts. Used only to REFUSE a build whose bundled
@@ -7547,6 +7552,11 @@ struct WorkspaceCondaFacts {
     /// separate from exact selected versions so ownership can reason about
     /// ranged and transitive providers without weakening exact validation.
     provider_facts: BTreeMap<String, WorkspaceCondaProviderFact>,
+    /// Canonical names from each successful exact consuming-environment solve,
+    /// keyed by `PreciseConsumerInput::env`. Keeping the environments separate
+    /// prevents a package selected for one consumer from being attributed to
+    /// another consumer at emission.
+    selected_conda_packages: BTreeMap<String, BTreeSet<String>>,
     /// Full exact selected specs per consuming environment. These are never
     /// ownership evidence; they are the immutable baseline for route trials.
     env_exact_specs: BTreeMap<String, Vec<String>>,
@@ -8465,6 +8475,10 @@ fn facts_from_solved_records(
             (env.clone(), versions)
         })
         .collect();
+    let selected_conda_packages = per_env_versions
+        .iter()
+        .map(|(env, versions)| (env.clone(), versions.keys().cloned().collect()))
+        .collect();
 
     let mut provider_facts: BTreeMap<String, WorkspaceCondaProviderFact> = BTreeMap::new();
     for versions in per_env_versions.values() {
@@ -8564,6 +8578,7 @@ fn facts_from_solved_records(
         common_conda_versions,
         common_selected_versions,
         provider_facts,
+        selected_conda_packages,
         env_exact_specs,
         fingerprint: format!("{:x}", hasher.finalize()),
     }
@@ -10780,6 +10795,28 @@ gpu = { features = ["gpu"], no-default-feature = true }
     }
 
     #[test]
+    fn selected_conda_package_names_are_retained_per_consuming_environment() {
+        let facts = facts_from_solved_records(
+            BTreeMap::from([(
+                "pace".to_string(),
+                vec![
+                    repo_record("python", "3.11.14", &[]),
+                    repo_record("jaxlib", "0.7.0", &[]),
+                ],
+            )]),
+            BTreeMap::from([("pace".to_string(), BTreeMap::new())]),
+            BTreeSet::new(),
+            &NameMap::default(),
+            "demo-pack",
+        );
+
+        assert!(
+            facts.selected_conda_packages["pace"].contains("jaxlib"),
+            "the precise consuming environment's selected package name must reach emission"
+        );
+    }
+
+    #[test]
     fn workspace_fact_derivation_requires_mapping_and_cross_env_agreement() {
         let env_records = BTreeMap::from([
             (
@@ -12062,6 +12099,7 @@ async fn resolve_bundle(
             uv_dependency_graph: Default::default(),
             workspace_conda_versions: Default::default(),
             workspace_conda_provider_facts: Default::default(),
+            workspace_selected_conda_packages: Default::default(),
             workspace_declared_pypi: Default::default(),
             workspace_locked_pypi: Default::default(),
         });
@@ -12675,6 +12713,7 @@ async fn resolve_bundle(
         uv_dependency_graph: Default::default(),
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
+        workspace_selected_conda_packages: Default::default(),
         workspace_declared_pypi: Default::default(),
         workspace_locked_pypi: Default::default(),
     };
@@ -24795,6 +24834,7 @@ mod emit_wheel_upstream_url_tests {
             uv_dependency_graph: Default::default(),
             workspace_conda_versions: Default::default(),
             workspace_conda_provider_facts: Default::default(),
+            workspace_selected_conda_packages: Default::default(),
             workspace_declared_pypi: Default::default(),
             workspace_locked_pypi: Default::default(),
         };
@@ -24920,6 +24960,7 @@ mod emit_wheel_upstream_url_tests {
             uv_dependency_graph: Default::default(),
             workspace_conda_versions: Default::default(),
             workspace_conda_provider_facts: Default::default(),
+            workspace_selected_conda_packages: Default::default(),
             workspace_declared_pypi: Default::default(),
             workspace_locked_pypi: Default::default(),
         };
