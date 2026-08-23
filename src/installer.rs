@@ -78,6 +78,44 @@ fn strip_local_segment(version: &str) -> String {
 fn pep440_equal_ignoring_wheel_local(installed: &str, locked: &str) -> bool {
     pep440_versions_equal(installed, locked)
         || pep440_versions_equal(installed, &strip_local_segment(locked))
+        || conda_release_prefix_of(installed, locked)
+}
+
+/// True when `installed` is the same upstream release as `locked` but spelled
+/// with FEWER trailing release components.
+///
+/// conda-forge drops the PyPI build component for projects that carry one:
+/// `py-opencv 4.11.0` is the same upstream release as PyPI
+/// `opencv-python 4.11.0.86`. The conda payload has no wheel `RECORD` (conda
+/// does not write one), so if the version gate rejects it the wheel stays in
+/// the replay, uv cannot uninstall the conda distribution, payload
+/// verification cannot confirm it, and the courier re-replays the whole
+/// bundle -- 187 wheels for `sage`, every activation.
+///
+/// Deliberately one-directional and prefix-anchored: the installed (conda)
+/// spelling may be SHORTER, never longer, and every component it does carry
+/// must match. `4.11.0` vs `4.11.0.86` is the same release; `4.11.0` vs
+/// `4.12.0`, `4.11.1` or `4.11` vs `4.2.0.86` are not. Epoch, pre/post/dev
+/// markers and the local segment must agree exactly, so a conda `1.0` can
+/// never stand in for a locked `1.0rc1` or `1.0.post1`.
+fn conda_release_prefix_of(installed: &str, locked: &str) -> bool {
+    let (Ok(installed), Ok(locked)) = (
+        uv_pep508::uv_pep440::Version::from_str(installed),
+        uv_pep508::uv_pep440::Version::from_str(locked),
+    ) else {
+        return false;
+    };
+    if installed.epoch() != locked.epoch()
+        || installed.pre() != locked.pre()
+        || installed.post() != locked.post()
+        || installed.dev() != locked.dev()
+        || installed.local() != locked.local()
+    {
+        return false;
+    }
+    let (i, l) = (installed.release(), locked.release());
+    // A shorter conda spelling only: never accept a longer installed version.
+    !i.is_empty() && i.len() < l.len() && l.starts_with(i.as_ref())
 }
 
 /// The installed dist root that satisfies a locked `name==version`. Exact
@@ -213,6 +251,45 @@ fn relax_platform_on_conflict(
 
 fn lock_digest(raw: &[u8]) -> String {
     format!("{:x}", Sha256::digest(raw))
+}
+
+
+#[cfg(test)]
+mod conda_release_prefix_tests {
+    use super::*;
+
+    #[test]
+    fn conda_shorter_release_is_the_same_upstream_release() {
+        // py-opencv 4.11.0 IS opencv-python 4.11.0.86 (sage's 187-wheel replay).
+        assert!(conda_release_prefix_of("4.11.0", "4.11.0.86"));
+        assert!(pep440_equal_ignoring_wheel_local("4.11.0", "4.11.0.86"));
+    }
+
+    #[test]
+    fn different_releases_never_match() {
+        assert!(!conda_release_prefix_of("4.11.0", "4.12.0"));
+        assert!(!conda_release_prefix_of("4.11.0", "4.11.1"));
+        assert!(!conda_release_prefix_of("4.11", "4.2.0.86"));
+    }
+
+    #[test]
+    fn longer_installed_version_never_stands_in() {
+        assert!(!conda_release_prefix_of("4.11.0.86", "4.11.0"));
+    }
+
+    #[test]
+    fn pre_post_dev_and_local_must_agree_exactly() {
+        assert!(!conda_release_prefix_of("1.0", "1.0.1rc1"));
+        assert!(!conda_release_prefix_of("1.0", "1.0.1.post1"));
+        assert!(!conda_release_prefix_of("1.0", "1.0.1.dev1"));
+        assert!(!conda_release_prefix_of("1.0", "1.0.1+cu124"));
+    }
+
+    #[test]
+    fn existing_local_tag_relaxation_still_holds() {
+        // torch: conda 2.5.1 vs locked 2.5.1+cu124
+        assert!(pep440_equal_ignoring_wheel_local("2.5.1", "2.5.1+cu124"));
+    }
 }
 
 #[cfg(test)]
