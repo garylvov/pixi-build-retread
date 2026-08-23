@@ -3925,6 +3925,86 @@ struct Bundle {
     workspace_locked_pypi: BTreeMap<String, String>,
 }
 
+/// Evidence that a wheel this bundle emits has the same canonical name as a
+/// conda package selected by one consuming environment. This is deliberately
+/// diagnostic-only: callers log these rows but make no ownership or emission
+/// decision from them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SupersedeDiagnosticRow {
+    env: String,
+    canonical_conda_name: String,
+    wheel_dist_name: String,
+    wheel_version: String,
+    /// Present only when every precise consumer selected this exact version.
+    /// A selected package that is absent here is still an overlap; its version
+    /// is simply not common across all consumers.
+    conda_version: Option<String>,
+}
+
+/// Return every wheel/selected-conda name collision without changing the
+/// bundle. `canonical_conda_name` is the identity mapping available at this
+/// seam: `relax::map_name` is private to `relax.rs`, so no configured mapping
+/// table is consulted or duplicated here.
+fn bundled_wheel_conda_overlaps(
+    wheels: &[(String, String)],
+    workspace_selected_conda_packages: &BTreeMap<String, BTreeSet<String>>,
+    workspace_conda_versions: &BTreeMap<String, String>,
+) -> Vec<SupersedeDiagnosticRow> {
+    let mut rows = Vec::new();
+    for (env, selected_names) in workspace_selected_conda_packages {
+        for (wheel_dist_name, wheel_version) in wheels {
+            let canonical_conda_name = canonical_conda_name(wheel_dist_name);
+            if selected_names.contains(&canonical_conda_name) {
+                rows.push(SupersedeDiagnosticRow {
+                    env: env.clone(),
+                    conda_version: workspace_conda_versions.get(&canonical_conda_name).cloned(),
+                    canonical_conda_name,
+                    wheel_dist_name: wheel_dist_name.clone(),
+                    wheel_version: wheel_version.clone(),
+                });
+            }
+        }
+    }
+    rows
+}
+
+#[cfg(test)]
+mod supersede_diagnostic_tests {
+    use super::{SupersedeDiagnosticRow, bundled_wheel_conda_overlaps};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    #[test]
+    fn jaxlib_wheel_overlap_reports_environment_and_both_versions() {
+        let rows = bundled_wheel_conda_overlaps(
+            &[("jaxlib".to_string(), "0.7.2".to_string())],
+            &BTreeMap::from([("pace".to_string(), BTreeSet::from(["jaxlib".to_string()]))]),
+            &BTreeMap::from([("jaxlib".to_string(), "0.10.2".to_string())]),
+        );
+
+        assert_eq!(
+            rows,
+            vec![SupersedeDiagnosticRow {
+                env: "pace".to_string(),
+                canonical_conda_name: "jaxlib".to_string(),
+                wheel_dist_name: "jaxlib".to_string(),
+                wheel_version: "0.7.2".to_string(),
+                conda_version: Some("0.10.2".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn wheel_without_selected_conda_counterpart_has_no_overlap() {
+        let rows = bundled_wheel_conda_overlaps(
+            &[("wheel-only".to_string(), "1.2.3".to_string())],
+            &BTreeMap::from([("pace".to_string(), BTreeSet::from(["jaxlib".to_string()]))]),
+            &BTreeMap::from([("jaxlib".to_string(), "0.10.2".to_string())]),
+        );
+
+        assert!(rows.is_empty());
+    }
+}
+
 /// One mutable uv auto-route retained on a bundle until the final emitted
 /// conda dependency set has passed the joint co-solvability check. Keeping the
 /// complete route (rather than only its conda name/version) preserves the PyPI
@@ -19658,6 +19738,24 @@ async fn build_one(
             metadata: &w.metadata,
         })
         .collect();
+    let bundled_wheels: Vec<(String, String)> = bundle
+        .all_wheels()
+        .map(|wheel| (wheel.pypi_name.clone(), wheel.metadata.version.clone()))
+        .collect();
+    for row in bundled_wheel_conda_overlaps(
+        &bundled_wheels,
+        &bundle.workspace_selected_conda_packages,
+        &bundle.workspace_conda_versions,
+    ) {
+        tracing::info!(
+            env = %row.env,
+            canonical_conda_name = %row.canonical_conda_name,
+            wheel_dist_name = %row.wheel_dist_name,
+            wheel_version = %row.wheel_version,
+            conda_version = %row.conda_version.as_deref().unwrap_or("unknown-not-common"),
+            "retread-supersede: bundled wheel overlaps selected conda package",
+        );
+    }
     if target_subdir == Platform::NoArch
         && (config.courier || sources.iter().any(|source| !source.metadata.is_pure_python))
     {
