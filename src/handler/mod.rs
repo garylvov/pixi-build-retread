@@ -8506,6 +8506,34 @@ struct PreciseConsumerInput {
     env: String,
     conda_deps: BTreeMap<String, String>,
     pypi_deps: BTreeMap<String, Vec<String>>,
+    channels: Vec<String>,
+}
+
+/// Keep RPC-provided channels ahead of manifest channels so existing resolution
+/// priority is unchanged, while allowing an environment's feature channels to
+/// supply its otherwise-invisible direct dependencies.
+fn precise_consumer_solve_channels(
+    conda_channels: &[ChannelUrl],
+    input: &PreciseConsumerInput,
+) -> Vec<ChannelUrl> {
+    let mut channels = conda_channels.to_vec();
+    for channel in &input.channels {
+        match url::Url::parse(channel) {
+            Ok(url) => {
+                let channel = ChannelUrl::from(url);
+                if !channels.contains(&channel) {
+                    channels.push(channel);
+                }
+            }
+            Err(error) => tracing::warn!(
+                env = %input.env,
+                channel,
+                %error,
+                "conda facts: skipping malformed effective manifest channel"
+            ),
+        }
+    }
+    channels
 }
 
 fn precise_consumer_inputs_for_target(
@@ -8536,6 +8564,7 @@ fn precise_consumer_inputs_for_target(
                     manifest.effective_pypi_dependencies_for_target(&env, target.conda_subdir())
                 }
             },
+            channels: manifest.effective_channels(&env),
             env,
         });
     }
@@ -8981,6 +9010,7 @@ async fn solve_workspace_conda_facts(
         .map(|input| {
             let env = &input.env;
             let deps = &input.conda_deps;
+            let channels = precise_consumer_solve_channels(conda_channels, input);
             let mut specs = deps
                 .iter()
                 .filter_map(|(name, spec)| {
@@ -8996,7 +9026,7 @@ async fn solve_workspace_conda_facts(
             let sysreqs = workspace_effective_system_requirements(manifest, env, target);
             async move {
                 let result = crate::conda_solve::solve_selected_records_for_target(
-                    conda_channels,
+                    &channels,
                     &specs,
                     &target.python_version,
                     &target.conda_subdir,
@@ -10279,12 +10309,13 @@ mod workspace_conda_facts_tests {
         CondaCoSolveContext, PypiToCondaMap, SolvedPypiFact, WorkspaceCondaFacts,
         WorkspaceRouteOwnership, dependency_name_intersection, effective_name_map,
         facts_from_solved_records, precise_consumer_inputs_for_target,
-        workspace_conda_provider_candidates, workspace_fact_constraints,
+        precise_consumer_solve_channels, workspace_conda_provider_candidates,
+        workspace_fact_constraints,
     };
     use crate::constraint::Provenance;
     use crate::pypi::{ResolutionTarget, WheelTarget};
     use crate::relax::{CondaName, CondaTarget, NameMap, PypiKey};
-    use rattler_conda_types::{PackageRecord, RepoDataRecord, VersionWithSource};
+    use rattler_conda_types::{ChannelUrl, PackageRecord, RepoDataRecord, VersionWithSource};
     use std::collections::{BTreeMap, BTreeSet};
     use std::str::FromStr;
     use url::Url;
@@ -10607,6 +10638,9 @@ pytorch = "==2.5.1"
 cuda-version = "==12.4"
 python = ">=3.10.12,<3.11"
 
+[feature.sage]
+channels = ["https://conda.anaconda.org/pytorch", "https://prefix.dev/pytorch"]
+
 [feature.gpu.dependencies]
 pytorch-gpu = "==2.10.0"
 
@@ -10623,6 +10657,27 @@ gpu = { features = ["gpu"], no-default-feature = true }
 
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].env, "sage");
+        assert_eq!(
+            inputs[0].channels,
+            vec![
+                "https://conda.anaconda.org/pytorch",
+                "https://prefix.dev/pytorch",
+            ],
+        );
+        let rpc_channels = vec![
+            ChannelUrl::from(Url::parse("https://prefix.dev/conda-forge").unwrap()),
+            ChannelUrl::from(Url::parse("https://prefix.dev/pixi-build-backends").unwrap()),
+        ];
+        assert_eq!(
+            precise_consumer_solve_channels(&rpc_channels, &inputs[0]),
+            vec![
+                ChannelUrl::from(Url::parse("https://prefix.dev/conda-forge").unwrap()),
+                ChannelUrl::from(Url::parse("https://prefix.dev/pixi-build-backends").unwrap()),
+                ChannelUrl::from(Url::parse("https://conda.anaconda.org/pytorch").unwrap()),
+                ChannelUrl::from(Url::parse("https://prefix.dev/pytorch").unwrap()),
+            ],
+            "RPC channels retain first priority before feature channels",
+        );
         assert_eq!(
             inputs[0].conda_deps.get("pytorch").map(String::as_str),
             Some("==2.5.1")
