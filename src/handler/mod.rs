@@ -3941,6 +3941,44 @@ struct SupersedeDiagnosticRow {
     conda_version: Option<String>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct SupersedeDiagnosticFacts {
+    env_count: usize,
+    selected_name_total: usize,
+    bundled_wheel_count: usize,
+    conda_version_map_len: usize,
+    envs: String,
+}
+
+fn supersede_diagnostic_facts(
+    workspace_selected_conda_packages: &BTreeMap<String, BTreeSet<String>>,
+    workspace_conda_versions: &BTreeMap<String, String>,
+    bundled_wheel_count: usize,
+) -> SupersedeDiagnosticFacts {
+    let envs = workspace_selected_conda_packages
+        .keys()
+        .fold(String::new(), |mut envs, env| {
+            if !envs.is_empty() {
+                envs.push(',');
+            }
+            envs.push_str(env);
+            envs
+        })
+        .chars()
+        .take(200)
+        .collect();
+    SupersedeDiagnosticFacts {
+        env_count: workspace_selected_conda_packages.len(),
+        selected_name_total: workspace_selected_conda_packages
+            .values()
+            .map(BTreeSet::len)
+            .sum(),
+        bundled_wheel_count,
+        conda_version_map_len: workspace_conda_versions.len(),
+        envs,
+    }
+}
+
 /// Return every wheel/selected-conda name collision without changing the
 /// bundle. `canonical_conda_name` is the identity mapping available at this
 /// seam: `relax::map_name` is private to `relax.rs`, so no configured mapping
@@ -3970,8 +4008,38 @@ fn bundled_wheel_conda_overlaps(
 
 #[cfg(test)]
 mod supersede_diagnostic_tests {
-    use super::{SupersedeDiagnosticRow, bundled_wheel_conda_overlaps};
+    use super::{SupersedeDiagnosticRow, bundled_wheel_conda_overlaps, supersede_diagnostic_facts};
     use std::collections::{BTreeMap, BTreeSet};
+
+    #[test]
+    fn supersede_facts_count_empty_and_populated_evidence() {
+        let empty = supersede_diagnostic_facts(&BTreeMap::new(), &BTreeMap::new(), 0);
+        assert_eq!(empty.env_count, 0);
+        assert_eq!(empty.selected_name_total, 0);
+        assert_eq!(empty.bundled_wheel_count, 0);
+        assert_eq!(empty.conda_version_map_len, 0);
+        assert_eq!(empty.envs, "");
+
+        let populated = supersede_diagnostic_facts(
+            &BTreeMap::from([
+                (
+                    "dev".to_string(),
+                    BTreeSet::from(["numpy".to_string(), "python".to_string()]),
+                ),
+                ("prod".to_string(), BTreeSet::from(["requests".to_string()])),
+            ]),
+            &BTreeMap::from([
+                ("numpy".to_string(), "2.0.0".to_string()),
+                ("requests".to_string(), "2.32.0".to_string()),
+            ]),
+            3,
+        );
+        assert_eq!(populated.env_count, 2);
+        assert_eq!(populated.selected_name_total, 3);
+        assert_eq!(populated.bundled_wheel_count, 3);
+        assert_eq!(populated.conda_version_map_len, 2);
+        assert_eq!(populated.envs, "dev,prod");
+    }
 
     #[test]
     fn jaxlib_wheel_overlap_reports_environment_and_both_versions() {
@@ -19742,6 +19810,19 @@ async fn build_one(
         .all_wheels()
         .map(|wheel| (wheel.pypi_name.clone(), wheel.metadata.version.clone()))
         .collect();
+    let supersede_facts = supersede_diagnostic_facts(
+        &bundle.workspace_selected_conda_packages,
+        &bundle.workspace_conda_versions,
+        bundled_wheels.len(),
+    );
+    tracing::info!(
+        env_count = supersede_facts.env_count,
+        selected_name_total = supersede_facts.selected_name_total,
+        bundled_wheel_count = supersede_facts.bundled_wheel_count,
+        conda_version_map_len = supersede_facts.conda_version_map_len,
+        envs = %supersede_facts.envs,
+        "retread-supersede-facts: diagnostic evidence cardinality",
+    );
     for row in bundled_wheel_conda_overlaps(
         &bundled_wheels,
         &bundle.workspace_selected_conda_packages,
