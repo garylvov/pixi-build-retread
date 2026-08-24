@@ -523,7 +523,10 @@ fn recorded_attempts(path: &Path) -> usize {
 }
 
 /// Open a new attempt in the repair log: rotate it if it has grown past
-/// [`REPAIR_LOG_MAX_BYTES`], then append an `=== attempt N <UTC> ===` header.
+/// [`REPAIR_LOG_MAX_BYTES`], then append an `=== attempt N <UTC> reason=… ===`
+/// header. When a prior `repairing` or `broken` state triggered this replay,
+/// preserve its distrust reason in the log before the successful replay clears
+/// that state marker.
 ///
 /// The log used to be TRUNCATED by the activate.d guard's `>` redirect on
 /// every activation, so attempt #1's failure text — the only record of why a
@@ -535,10 +538,17 @@ pub fn begin_attempt_log(share: &Path, bundle: &str) -> usize {
         let _ = std::fs::rename(&path, share.join(format!("{bundle}.repair.log.1")));
     }
     let attempt = recorded_attempts(&path) + 1;
+    let reason = read_state(share, bundle)
+        .filter(|state| state_is_distrusted(*state))
+        .map(|state| distrust_reason(share, bundle, state))
+        .unwrap_or_else(|| "no preceding distrust state was recorded".to_string());
     append_repair_log(
         share,
         bundle,
-        &format!("=== attempt {attempt} {} ===", utc_stamp(now_epoch_secs())),
+        &format!(
+            "=== attempt {attempt} {} reason={reason} ===",
+            utc_stamp(now_epoch_secs())
+        ),
     );
     attempt
 }
@@ -751,8 +761,8 @@ mod tests {
             "each attempt must be headed, got: {body}"
         );
         assert!(
-            body.contains("Z ===") && body.contains("20"),
-            "the header must carry a timestamp, got: {body}"
+            body.contains("Z reason=") && body.contains("20"),
+            "the header must carry a timestamp followed by its reason, got: {body}"
         );
 
         // Cap: an oversized log rotates instead of growing without bound, and
@@ -766,6 +776,37 @@ mod tests {
         assert!(std::fs::metadata(&log).unwrap().len() < 200);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn attempt_banner_preserves_distrust_reason_and_attempt_prefix() {
+        let root = tempdir("attempt-reason");
+        let share = root.join("share/retread");
+        let bundle = "b";
+        mark_state(
+            &share,
+            bundle,
+            RepairState::Broken,
+            "uv died after uninstall",
+        );
+
+        assert_eq!(begin_attempt_log(&share, bundle), 1);
+
+        let log = repair_log_path(&share, bundle);
+        let body = std::fs::read_to_string(&log).unwrap();
+        let banner = body.lines().next().unwrap();
+        assert!(banner.starts_with("=== attempt "), "banner: {banner}");
+        assert!(
+            banner.contains(&distrust_reason(&share, bundle, RepairState::Broken)),
+            "banner must retain the distrust reason: {banner}"
+        );
+        assert_eq!(
+            recorded_attempts(&log),
+            1,
+            "new-format banners must remain countable"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
