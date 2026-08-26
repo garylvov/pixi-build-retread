@@ -17,6 +17,7 @@ pub mod fasttmp;
 pub mod glibc;
 pub mod handler;
 pub mod hermetic_build;
+pub mod import_scan;
 mod index_chain;
 pub mod installer;
 pub mod lock;

@@ -57,6 +57,10 @@ xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 # uv's PEP 508 parser is the gold standard for Requires-Dist values.
 uv-pep508 = { git = "https://github.com/astral-sh/uv", tag = "0.9.5" }
 uv-normalize = { git = "https://github.com/astral-sh/uv", tag = "0.9.5" }
+# Native Python AST parser used to identify imports from source, rather than
+# trusting declared requirement metadata.
+ruff_python_parser = "=0.0.10"
+ruff_python_ast = "=0.0.10"
 
 # Recipe generation. rattler-build is invoked as a subprocess (matches what
 # pixi-build-rattler-build does); the conda recipe for this backend declares
