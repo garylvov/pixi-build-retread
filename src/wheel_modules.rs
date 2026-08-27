@@ -43,8 +43,25 @@ fn is_metadata_dir(name: &str) -> bool {
         || name == "__pycache__"
 }
 
+/// Strip a nested install prefix so the real module root is visible.
+///
+/// MEASURED (2026-08-27, wheel store): cmeel-packaged wheels -- `coal`,
+/// `hpp_fcl`, `cmeel_boost`, and 18 others in a 400-wheel sample -- ship an
+/// entire prefix tree and put site-packages UNDER it:
+/// `cmeel.prefix/lib/python3.12/site-packages/coal/__init__.py`.
+/// Taking the first component yields `cmeel.prefix`, which is not importable,
+/// so those wheels read as providing nothing and their real modules (`coal`,
+/// `hppfcl`) are missed entirely.
+fn strip_install_prefix(path: &str) -> &str {
+    match path.split_once("site-packages/") {
+        Some((_, rest)) if !rest.is_empty() => rest,
+        _ => path,
+    }
+}
+
 /// A RECORD path's first component, when it names a real module.
 fn record_top_level(path: &str) -> Option<String> {
+    let path = strip_install_prefix(path);
     let first = path.split('/').next()?;
     if first.is_empty() || is_metadata_dir(first) {
         return None;
@@ -118,7 +135,7 @@ pub fn wheel_modules(wheel: &Path) -> Result<WheelModules> {
                 // Retain the SECOND component: `etils/epath/__init__.py` ->
                 // `etils.epath`, which is what makes `etils[epath]` inferable
                 // against the dist's Provides-Extra list.
-                let mut parts = path.split('/');
+                let mut parts = strip_install_prefix(path).split('/');
                 let (Some(first), Some(second)) = (parts.next(), parts.next()) else {
                     continue;
                 };
@@ -239,4 +256,82 @@ mod tests {
         assert!(m.modules.is_empty(), "got {:?}", m.modules);
         let _ = std::fs::remove_file(w);
     }
+    /// Diagnostic against REAL wheels from the store, not synthetic zips.
+    /// `#[ignore]` because it depends on a populated local wheel store; run
+    /// with `cargo test --lib real_wheels -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn real_wheels_from_the_store() {
+        let index = std::path::Path::new(
+            "/users/glvov/.claude/jobs/78d7a173/tmp/wheel_index.txt",
+        );
+        let Ok(list) = std::fs::read_to_string(index) else {
+            eprintln!("no wheel index at {}; skipping", index.display());
+            return;
+        };
+        let mut with_txt = 0usize;
+        let mut from_record = 0usize;
+        let mut empty = 0usize;
+        let mut errs = 0usize;
+        for line in list.lines().take(400) {
+            let p = std::path::Path::new(line);
+            match wheel_modules(p) {
+                Ok(m) => {
+                    if m.modules.is_empty() {
+                        empty += 1;
+                    } else if m.from_top_level_txt {
+                        with_txt += 1;
+                    } else {
+                        from_record += 1;
+                    }
+                    let base = p.file_name().unwrap().to_string_lossy();
+                    if m.modules.is_empty() {
+                        eprintln!("  EMPTY: {base}");
+                    }
+                    if base.starts_with("opencv") || base.starts_with("etils") {
+                        eprintln!(
+                            "  {base}\n    modules={:?}\n    from_top_level_txt={}\n    submodules(sample)={:?}",
+                            m.modules,
+                            m.from_top_level_txt,
+                            m.submodules.iter().take(6).collect::<Vec<_>>()
+                        );
+                    }
+                }
+                Err(e) => {
+                    errs += 1;
+                    eprintln!("  ERROR {}: {e:#}", p.display());
+                }
+            }
+        }
+        eprintln!(
+            "\nTOTALS  top_level.txt={with_txt}  RECORD-fallback={from_record}  empty={empty}  errors={errs}"
+        );
+        assert_eq!(errs, 0, "no real wheel may fail to parse");
+    }
+
+    /// cmeel-packaged wheels nest site-packages under an install prefix.
+    /// Measured on coal-3.0.3 in the real store: without stripping, this
+    /// wheel reports NO modules while actually providing `coal` and `hppfcl`.
+    #[test]
+    fn nested_site_packages_prefix_is_stripped() {
+        let w = make_wheel(
+            "cmeel",
+            &[(
+                "coal-3.0.3.dist-info/RECORD",
+                "cmeel.prefix/lib/python3.12/site-packages/coal/__init__.py,,\n\
+                 cmeel.prefix/lib/python3.12/site-packages/coal/viewer.py,,\n\
+                 cmeel.prefix/lib/python3.12/site-packages/hppfcl/__init__.py,,\n\
+                 coal-3.0.3.dist-info/METADATA,,\n",
+            )],
+        );
+        let m = wheel_modules(&w).unwrap();
+        assert_eq!(
+            m.modules,
+            ["coal".to_string(), "hppfcl".to_string()].into_iter().collect(),
+            "cmeel prefix must not hide the real modules"
+        );
+        assert!(m.submodules.contains("coal.viewer"), "got {:?}", m.submodules);
+        let _ = std::fs::remove_file(w);
+    }
+
 }
