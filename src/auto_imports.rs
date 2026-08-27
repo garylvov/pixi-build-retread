@@ -69,15 +69,18 @@ pub struct AutoImportReport {
 struct ClosureIndex {
     by_module: BTreeMap<String, (String, ProvenanceSource)>,
     submodules: BTreeMap<String, BTreeSet<String>>,
+    /// Declared extras per top-level module, from the providing wheel.
+    extras: BTreeMap<String, BTreeSet<String>>,
     unreadable: Vec<(PathBuf, String)>,
 }
 
 fn build_index(wheels: &[PathBuf]) -> ClosureIndex {
     let mut by_module = BTreeMap::new();
     let mut submodules: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut extras: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut unreadable = Vec::new();
     for w in wheels {
-        let WheelModules { modules, submodules: subs, from_top_level_txt } =
+        let WheelModules { modules, submodules: subs, from_top_level_txt, provides_extra } =
             match wheel_modules(w) {
                 Ok(m) => m,
                 Err(e) => {
@@ -94,6 +97,11 @@ fn build_index(wheels: &[PathBuf]) -> ClosureIndex {
         } else {
             ProvenanceSource::Record
         };
+        for m in &modules {
+            if !provides_extra.is_empty() {
+                extras.entry(m.clone()).or_default().extend(provides_extra.iter().cloned());
+            }
+        }
         for m in modules {
             // First writer wins; a later duplicate does not silently displace
             // the earlier provider.
@@ -108,7 +116,7 @@ fn build_index(wheels: &[PathBuf]) -> ClosureIndex {
             }
         }
     }
-    ClosureIndex { by_module, submodules, unreadable }
+    ClosureIndex { by_module, submodules, extras, unreadable }
 }
 
 /// Scan `root`, resolve every non-stdlib import against `wheels`.
@@ -129,8 +137,15 @@ pub fn resolve_imports(
     {
         match index.by_module.get(&module) {
             Some((provider, source)) => {
+                let declared = index.extras.get(&module);
                 if let Some(subs) = index.submodules.get(&module) {
                     for sub in subs {
+                        // A submodule is only an extras candidate if the dist
+                        // DECLARES that extra. Without this every submodule
+                        // qualifies: 917 candidates on a real closure.
+                        if !declared.is_some_and(|d| d.contains(sub)) {
+                            continue;
+                        }
                         report.extra_hints.push(ExtraHint {
                             distribution: provider.clone(),
                             module: module.clone(),
@@ -310,10 +325,16 @@ mod tests {
         let w = wheel(
             &wd,
             "etils-1.13.0-py3-none-any.whl",
-            &[(
-                "etils-1.13.0.dist-info/RECORD",
-                "etils/__init__.py,,\netils/epath/__init__.py,,\n",
-            )],
+            &[
+                (
+                    "etils-1.13.0.dist-info/RECORD",
+                    "etils/__init__.py,,\netils/epath/__init__.py,,\netils/internal/x.py,,\n",
+                ),
+                (
+                    "etils-1.13.0.dist-info/METADATA",
+                    "Name: etils\nProvides-Extra: epath\nProvides-Extra: enp\n\nbody\n",
+                ),
+            ],
         );
         let r = resolve_imports(&root, &BTreeSet::new(), "3.11", &[w]);
         assert_eq!(r.resolved.len(), 1);
@@ -321,6 +342,14 @@ mod tests {
         assert!(
             r.extra_hints.iter().any(|h| h.candidate_extra == "epath"),
             "got {:?}",
+            r.extra_hints
+        );
+        // `internal` is a real submodule but NOT a declared extra. Emitting it
+        // would be the PIL[BmpImagePlugin] failure: on a real closure the
+        // unfiltered heuristic produced 917 candidates, 899 of them noise.
+        assert!(
+            !r.extra_hints.iter().any(|h| h.candidate_extra == "internal"),
+            "undeclared submodules must not become extras candidates: {:?}",
             r.extra_hints
         );
         let _ = std::fs::remove_dir_all(root);
@@ -337,4 +366,50 @@ mod tests {
         assert!(r.missing.is_empty(), "own code must not read as a dep: {:?}", r.missing);
         let _ = std::fs::remove_dir_all(root);
     }
+    /// Diagnostic against a REAL source tree and a REAL closure. `#[ignore]`
+    /// because it depends on the local checkout and wheel store; run with
+    /// `cargo test --lib real_tree -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn real_tree_against_real_closure() {
+        let root = std::path::Path::new("/oscar/data/stellex/glvov/imprint-data/src/imprint");
+        let index = std::path::Path::new("/users/glvov/.claude/jobs/78d7a173/tmp/wheel_index.txt");
+        let (Ok(list), true) = (std::fs::read_to_string(index), root.is_dir()) else {
+            eprintln!("real tree or wheel index unavailable; skipping");
+            return;
+        };
+        let wheels: Vec<PathBuf> = list.lines().map(PathBuf::from).collect();
+        let own: BTreeSet<String> = ["imprint".to_string()].into_iter().collect();
+        let t0 = std::time::Instant::now();
+        let r = resolve_imports(root, &own, "3.11", &wheels);
+        eprintln!(
+            "\nwheels={}  elapsed={:?}\nresolved={}  missing={}  extra_hints={}  unreadable={}",
+            wheels.len(),
+            t0.elapsed(),
+            r.resolved.len(),
+            r.missing.len(),
+            r.extra_hints.len(),
+            r.unreadable.len()
+        );
+        let via_record = r
+            .resolved
+            .iter()
+            .filter(|x| x.source == Some(ProvenanceSource::Record))
+            .count();
+        eprintln!("resolved via RECORD fallback: {via_record}");
+        eprintln!("\n--- first 25 MISSING ---");
+        for m in r.missing.iter().take(25) {
+            eprintln!(
+                "  {:<28} conditional={:<5} files={}",
+                m.module,
+                m.conditional,
+                m.files.len()
+            );
+        }
+        eprintln!("\n--- sample extras candidates ---");
+        for h in r.extra_hints.iter().take(8) {
+            eprintln!("  {} -> {}[{}]", h.submodule, h.module, h.candidate_extra);
+        }
+    }
+
 }

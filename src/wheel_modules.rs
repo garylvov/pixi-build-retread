@@ -33,6 +33,11 @@ pub struct WheelModules {
     /// True when `top_level.txt` supplied the answer; false when it was
     /// derived from RECORD paths.
     pub from_top_level_txt: bool,
+    /// Extras the distribution actually declares (`Provides-Extra:` in
+    /// METADATA). A submodule name is only an extras candidate if it appears
+    /// HERE -- without this filter every submodule looks like an extra, which
+    /// on a real closure produced 917 candidates including PIL[BmpImagePlugin].
+    pub provides_extra: BTreeSet<String>,
 }
 
 /// Names that appear at a wheel's root but are never importable modules.
@@ -156,7 +161,30 @@ pub fn wheel_modules(wheel: &Path) -> Result<WheelModules> {
         }
     }
 
-    Ok(WheelModules { modules, submodules, from_top_level_txt })
+    // 3. Provides-Extra from METADATA, the only sound basis for an extras hint.
+    let mut provides_extra: BTreeSet<String> = BTreeSet::new();
+    if let Some(entry) = names.iter().find(|n| n.ends_with(".dist-info/METADATA")).cloned() {
+        let mut buf = String::new();
+        if archive
+            .by_name(&entry)
+            .ok()
+            .and_then(|mut f| f.read_to_string(&mut buf).ok())
+            .is_some()
+        {
+            for line in buf.lines() {
+                if let Some(rest) = line.strip_prefix("Provides-Extra:") {
+                    let e = rest.trim();
+                    if !e.is_empty() {
+                        provides_extra.insert(e.to_string());
+                    }
+                } else if line.is_empty() {
+                    break; // headers end at the first blank line
+                }
+            }
+        }
+    }
+
+    Ok(WheelModules { modules, submodules, from_top_level_txt, provides_extra })
 }
 
 #[cfg(test)]
