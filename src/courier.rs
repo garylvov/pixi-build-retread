@@ -5795,11 +5795,11 @@ version = "1.0.0"
             "metadata-light courier must ship the tiny JSON record"
         );
         assert!(
-            result
+            !result
                 .source_urls
                 .iter()
-                .any(|url| url.ends_with(crate::relaxation_record::RELAXATION_HOOK_FILENAME)),
-            "metadata-light courier must ship the tiny activate.d hook"
+                .any(|url| url.ends_with("retread-relaxations.sh")),
+            "the activate.d hook was removed and must never be shipped"
         );
         let staged_json_url = result
             .source_urls
@@ -5827,16 +5827,7 @@ version = "1.0.0"
             .iter()
             .find(|url| url.ends_with(crate::relaxation_record::RELAXATION_JSON_FILENAME))
             .unwrap();
-        let cold_hook_url = result
-            .source_urls
-            .iter()
-            .find(|url| url.ends_with(crate::relaxation_record::RELAXATION_HOOK_FILENAME))
-            .unwrap();
         let cold_json = url::Url::parse(cold_json_url)
-            .unwrap()
-            .to_file_path()
-            .unwrap();
-        let cold_hook = url::Url::parse(cold_hook_url)
             .unwrap()
             .to_file_path()
             .unwrap();
@@ -5845,11 +5836,7 @@ version = "1.0.0"
             std::fs::read(replay_payload.json_path).unwrap(),
             "cold and replay JSON payloads must be byte-identical"
         );
-        assert_eq!(
-            std::fs::read(cold_hook).unwrap(),
-            std::fs::read(replay_payload.hook_path).unwrap(),
-            "cold and replay hooks must be byte-identical"
-        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
+
 }

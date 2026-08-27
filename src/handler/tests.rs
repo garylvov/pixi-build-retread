@@ -1922,11 +1922,11 @@ fn within_major_relaxation_becomes_the_final_structured_bundle_record() {
     let reparsed: RelaxationManifest =
         serde_json::from_str(&manifest.to_pretty_json().unwrap()).unwrap();
     assert_eq!(reparsed, manifest);
-    assert!(
-        manifest
-            .activate_script()
-            .contains("[retread] auto-relaxed: demo ==1.24.0 -> >=1.24,<2 (exact pin widened)")
-    );
+    // The activation hook was removed; the JSON payload is now the record.
+    let payload = manifest.to_pretty_json().unwrap();
+    assert!(payload.contains("\"demo\""), "payload: {payload}");
+    assert!(payload.contains("\"==1.24.0\""), "payload: {payload}");
+    assert!(payload.contains("\">=1.24,<2\""), "payload: {payload}");
 }
 
 #[test]
@@ -4915,9 +4915,11 @@ fn bare_major_abi_anchor_emission_auto_completes_within_major_cap_and_warning() 
             manifest.records()[0].kind,
             crate::relaxation_record::RelaxationRecordKind::AbiAnchorCapCompleted
         );
-        let hook = manifest.activate_script();
-        assert!(hook.contains("bundle `flashsac-pack`"));
-        assert!(hook.contains(&format!("numpy {original} -> >=2.0,<3")));
+        let payload = manifest.to_pretty_json().unwrap();
+        assert!(payload.contains("flashsac-pack"), "payload: {payload}");
+        assert!(payload.contains("\"numpy\""), "payload: {payload}");
+        assert!(payload.contains(&format!("\"{original}\"")), "payload: {payload}");
+        assert!(payload.contains("\">=2.0,<3\""), "payload: {payload}");
     }
 }
 
