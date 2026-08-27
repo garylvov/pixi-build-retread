@@ -18,6 +18,7 @@ pub mod glibc;
 pub mod handler;
 pub mod hermetic_build;
 pub mod import_scan;
+pub mod auto_imports;
 pub mod wheel_modules;
 mod index_chain;
 pub mod installer;
