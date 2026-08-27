@@ -70,6 +70,15 @@ fn record_top_level(path: &str) -> Option<String> {
         // A single-file module at the wheel root.
         return (!stem.is_empty() && stem != "__init__").then(|| stem.to_string());
     }
+    // A compiled EXTENSION module at the wheel root. MEASURED (2026-08-27):
+    // manifold3d and xatlas ship exactly one file each --
+    // `manifold3d.cpython-310-x86_64-linux-gnu.so` -- and are importable as
+    // `manifold3d` / `xatlas`. CPython takes the name up to the FIRST dot, so
+    // the ABI tag must be cut there, not with a plain extension strip.
+    if first.ends_with(".so") || first.ends_with(".pyd") {
+        let stem = first.split('.').next().unwrap_or_default();
+        return (!stem.is_empty()).then(|| stem.to_string());
+    }
     // A package directory only counts if the path descends into it.
     if path.contains('/') && !first.contains('.') {
         return Some(first.to_string());
@@ -331,6 +340,29 @@ mod tests {
             "cmeel prefix must not hide the real modules"
         );
         assert!(m.submodules.contains("coal.viewer"), "got {:?}", m.submodules);
+        let _ = std::fs::remove_file(w);
+    }
+
+    /// Root-level compiled extension modules. Measured on manifold3d-3.5.2 and
+    /// xatlas-0.0.11 in the real store: each wheel's only payload file is
+    /// `<name>.cpython-310-x86_64-linux-gnu.so`, importable as `<name>`.
+    /// Without this they report NO modules at all.
+    #[test]
+    fn root_level_extension_modules_are_found() {
+        let w = make_wheel(
+            "extmod",
+            &[(
+                "manifold3d-3.5.2.dist-info/RECORD",
+                "manifold3d.cpython-310-x86_64-linux-gnu.so,,\n\
+                 manifold3d-3.5.2.dist-info/METADATA,,\n",
+            )],
+        );
+        let m = wheel_modules(&w).unwrap();
+        assert_eq!(
+            m.modules,
+            ["manifold3d".to_string()].into_iter().collect(),
+            "the ABI tag must be cut at the FIRST dot, not treated as an extension"
+        );
         let _ = std::fs::remove_file(w);
     }
 
