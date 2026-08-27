@@ -83,6 +83,46 @@ pub struct AutoImportReport {
     pub unreadable: Vec<(PathBuf, String)>,
 }
 
+
+/// Does this entry have a local source tree to scan, and where is it?
+///
+/// Auto-import scanning is a PER-ENTRY property. The predicate is retread's
+/// own source-built test, `wheel_entry_metadata_provenance`
+/// (`handler/mod.rs:3772`): `path || git || from`. Reusing it rather than
+/// inventing a second notion of "has source" keeps the two from drifting.
+///
+/// * `path=` -- the tree is the path, absolute or joined to `source_dir`,
+///   matching `handler/mod.rs:13613-13617`.
+/// * `git=` / `from=` -- the tree is a checkout the caller has already
+///   materialised (`source_build::git_checkout_root`), so the caller passes
+///   it; this function will not guess a checkout location.
+/// * `version=` / `url=` -- NO tree. Returns None. That is not an error: an
+///   index wheel has no source for us to read, and its dependencies are
+///   already declared in its own metadata.
+///
+/// BUNDLES NEED NO SPECIAL RULE. Within a group, entries resolve
+/// individually -- `handler/mod.rs:5239` drives per-entry futures through
+/// `buffered(N)` and merges `sub_bundles` afterwards -- so each entry
+/// contributes requirements to its own resolve. A `bundle` grouping entries
+/// of mixed kinds needs no arbitration: the ones with trees are scanned, the
+/// ones without contribute nothing.
+pub fn entry_source_tree(
+    has_path: Option<&str>,
+    is_git_backed: bool,
+    source_dir: &Path,
+    materialised_checkout: Option<&Path>,
+) -> Option<PathBuf> {
+    if let Some(path) = has_path {
+        let p = Path::new(path);
+        return Some(if p.is_absolute() { p.to_path_buf() } else { source_dir.join(p) });
+    }
+    if is_git_backed {
+        // Only what the caller actually materialised. Never guessed.
+        return materialised_checkout.map(Path::to_path_buf);
+    }
+    None
+}
+
 /// PEP 503 normalisation: the requirement form of a name.
 fn normalize_dist_name(module: &str) -> String {
     module.replace('_', "-").to_lowercase()
@@ -467,6 +507,33 @@ mod tests {
         for h in r.extra_hints.iter().take(8) {
             eprintln!("  {} -> {}[{}]", h.submodule, h.module, h.candidate_extra);
         }
+    }
+
+    /// The entry-kind gate. An index wheel (`version=`/`url=`) has no source
+    /// tree; returning None is correct, not an error -- its dependencies are
+    /// declared in its own metadata and it is not ours to scan.
+    #[test]
+    fn only_source_bearing_entries_have_a_tree() {
+        let src = Path::new("/ws/pack");
+        // path=, relative -> joined to source_dir (handler/mod.rs:13617)
+        assert_eq!(
+            entry_source_tree(Some("./sub/pkg"), false, src, None),
+            Some(PathBuf::from("/ws/pack/./sub/pkg"))
+        );
+        // path=, absolute -> used as-is
+        assert_eq!(
+            entry_source_tree(Some("/abs/pkg"), false, src, None),
+            Some(PathBuf::from("/abs/pkg"))
+        );
+        // git= with a materialised checkout -> that checkout
+        assert_eq!(
+            entry_source_tree(None, true, src, Some(Path::new("/cache/co"))),
+            Some(PathBuf::from("/cache/co"))
+        );
+        // git= WITHOUT one -> None. Never guess a checkout location.
+        assert_eq!(entry_source_tree(None, true, src, None), None);
+        // version= / url= -> no tree at all
+        assert_eq!(entry_source_tree(None, false, src, None), None);
     }
 
 }
