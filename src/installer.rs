@@ -1308,6 +1308,13 @@ fn conda_owned_distributions(prefix: &Path, site_packages: &Path) -> BTreeSet<(S
 }
 
 /// Every directory under `prefix` that some conda package claims in its
+/// conda-meta key under which retread records the payload paths it placed
+/// itself. Those paths also appear in conda's `files` array -- that is the
+/// point, it is what makes the payload visible to conda, `conda list` and
+/// uninstall -- but they are retread-placed, not conda-placed, and every
+/// ownership question must subtract them.
+pub(crate) const RETREAD_PLACED_KEY: &str = "retread_placed";
+
 /// `conda-meta/<pkg>.json` `files` list.
 ///
 /// The `INSTALLER` marker is NOT a universal conda signal: conda relays some
@@ -1346,7 +1353,28 @@ fn conda_meta_claimed_dirs(prefix: &Path) -> BTreeSet<PathBuf> {
         let Some(files) = json.get("files").and_then(|f| f.as_array()) else {
             continue;
         };
-        for file in files.iter().filter_map(|f| f.as_str()) {
+        // Paths RETREAD placed and recorded are listed in `files` so conda,
+        // `conda list` and uninstall can see the payload -- but they are NOT
+        // conda-placed, and must not be read as conda ownership here.
+        //
+        // Without this subtraction, tracking the payload would be
+        // self-defeating: `conda_owned_distributions` (below) classifies a dist
+        // conda-owned on `installer_marks_conda || claimed`, and its caller then
+        // "trusts exact-version conda ownership instead of applying wheel-layout
+        // checks". Listing our own wheels in `files` would therefore make
+        // `retread verify` STOP verifying the very payload it exists to check.
+        // The condition is an OR, so an `INSTALLER` file saying `uv` does not
+        // save us -- the exclusion has to be explicit.
+        let retread_placed: BTreeSet<&str> = json
+            .get(RETREAD_PLACED_KEY)
+            .and_then(|f| f.as_array())
+            .map(|a| a.iter().filter_map(|f| f.as_str()).collect())
+            .unwrap_or_default();
+        for file in files
+            .iter()
+            .filter_map(|f| f.as_str())
+            .filter(|f| !retread_placed.contains(f))
+        {
             let rel = Path::new(file);
             // Reject absolute / `..` entries: a conda-meta file list is
             // prefix-relative, and joining anything else would claim
@@ -6006,4 +6034,69 @@ packages:
         );
         assert_eq!(record_path_token(",,").as_deref(), None);
     }
+    /// A path retread placed and recorded appears in conda's `files` -- that is
+    /// what makes the payload visible to conda -- but it is NOT conda-placed.
+    /// Reading it as conda ownership would make verification skip wheel-layout
+    /// checks on our own payload, i.e. tracking the payload would silently
+    /// disable the check that detects it missing.
+    #[test]
+    fn retread_placed_paths_are_not_read_as_conda_ownership() {
+        let root = std::env::temp_dir().join(format!(
+            "retread-claimed-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let meta = root.join("conda-meta");
+        std::fs::create_dir_all(&meta).unwrap();
+        std::fs::write(
+            meta.join("demo-1.0-h0.json"),
+            r#"{
+              "name": "demo",
+              "files": [
+                "lib/python3.12/site-packages/conda_owned/__init__.py",
+                "lib/python3.12/site-packages/retread_payload/__init__.py"
+              ],
+              "retread_placed": [
+                "lib/python3.12/site-packages/retread_payload/__init__.py"
+              ]
+            }"#,
+        )
+        .unwrap();
+
+        let claimed = conda_meta_claimed_dirs(&root);
+        assert!(
+            claimed.contains(&root.join("lib/python3.12/site-packages/conda_owned")),
+            "a genuinely conda-placed dir must still be claimed: {claimed:?}"
+        );
+        assert!(
+            !claimed.contains(&root.join("lib/python3.12/site-packages/retread_payload")),
+            "a retread-placed dir must NOT be claimed as conda-owned: {claimed:?}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Absent the key, behaviour is exactly as before -- every listed path is
+    /// conda's. The fix must not change existing packages' ownership.
+    #[test]
+    fn conda_meta_without_the_retread_key_is_unchanged() {
+        let root = std::env::temp_dir().join(format!(
+            "retread-claimed-nokey-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let meta = root.join("conda-meta");
+        std::fs::create_dir_all(&meta).unwrap();
+        std::fs::write(
+            meta.join("plain-1.0-h0.json"),
+            r#"{"name":"plain","files":["lib/python3.12/site-packages/plain/__init__.py"]}"#,
+        )
+        .unwrap();
+        let claimed = conda_meta_claimed_dirs(&root);
+        assert!(
+            claimed.contains(&root.join("lib/python3.12/site-packages/plain")),
+            "{claimed:?}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
 }
