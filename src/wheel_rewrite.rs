@@ -880,6 +880,144 @@ pub(crate) fn runpath_for_member(
     Some(format!("$ORIGIN/{}", parts.join("/")))
 }
 
+
+
+/// Remove a scratch directory when it goes out of scope, including on the
+/// error paths below -- a failed patchelf must not leave debris in TMPDIR.
+struct ScratchDir(PathBuf);
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+fn scopeguard_dir(p: PathBuf) -> ScratchDir {
+    ScratchDir(p)
+}
+
+/// Rewrite RUNPATHs so a wheel's own shipped libraries resolve without
+/// `LD_LIBRARY_PATH`. Returns the members it changed.
+///
+/// This is the caller for [`runpath_for_member`], and the reason the
+/// `activate.d` guard needs an `LD_LIBRARY_PATH` export at all: payload wheels
+/// ship libraries their own extension modules cannot find. Measured on
+/// hover-gpu, two shapes account for 8 unresolved link edges, and both are
+/// stale vendor RUNPATHs baked in upstream (`/tmpfs/src/git/mujoco_internal/
+/// build/lib` -- a build machine that does not exist here).
+///
+/// Runs at BUILD time, not install time. That is not a preference: patchelf is
+/// ABSENT from `hover-gpu` and `isaaclab-gpu-latest`, the two environments that
+/// actually carry a payload, so an install-time pass cannot be built. The build
+/// environment has it (`conda_solve.rs` requires `patchelf >=0.17.2,<0.19`).
+///
+/// Uses plain `--set-rpath`, which emits DT_RUNPATH. Measured sufficient: the
+/// libraries are DIRECT dependencies of their consumers, and RUNPATH covers
+/// direct dependencies. `--force-rpath` would change the tag on every payload
+/// binary to buy propagation nothing here needs.
+///
+/// A member whose needed library the wheel does not ship is LEFT ALONE --
+/// that is a missing dependency, not a path problem.
+pub(crate) fn repair_wheel_runpaths(wheel_path: &Path, patchelf: &Path) -> Result<Vec<String>> {
+    let bytes = std::fs::read(wheel_path)
+        .with_context(|| format!("reading wheel {}", wheel_path.display()))?;
+    let mut archive = ZipArchive::new(Cursor::new(bytes))
+        .with_context(|| format!("opening wheel {}", wheel_path.display()))?;
+    let members: Vec<String> = (0..archive.len())
+        .filter_map(|i| archive.by_index(i).ok().map(|e| e.name().replace('\\', "/")))
+        .collect();
+    let shared_objects: Vec<String> = members
+        .iter()
+        .filter(|m| {
+            let base = m.rsplit('/').next().unwrap_or(m);
+            base.ends_with(".so") || base.contains(".so.")
+        })
+        .cloned()
+        .collect();
+    if shared_objects.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Unique scratch dir; the crate has no tempfile dependency and the rest
+    // of the codebase uses pid+nonce naming for the same purpose.
+    static RUNPATH_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let scratch = std::env::temp_dir().join(format!(
+        "retread-runpath-{}-{}",
+        std::process::id(),
+        RUNPATH_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&scratch)
+        .with_context(|| format!("creating runpath scratch dir {}", scratch.display()))?;
+    let scratch = scopeguard_dir(scratch);
+    let mut replacements: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    let mut changed = Vec::new();
+
+    for member in &shared_objects {
+        let mut buf = Vec::new();
+        {
+            let mut entry = archive
+                .by_name(member)
+                .with_context(|| format!("reading member {member}"))?;
+            std::io::copy(&mut entry, &mut buf)
+                .with_context(|| format!("extracting member {member}"))?;
+        }
+        let tmp = scratch.0.join("member.so");
+        std::fs::write(&tmp, &buf).with_context(|| format!("staging {member}"))?;
+
+        let needed = std::process::Command::new(patchelf)
+            .arg("--print-needed")
+            .arg(&tmp)
+            .output()
+            .with_context(|| format!("patchelf --print-needed {member}"))?;
+        if !needed.status.success() {
+            continue; // not an ELF we can read; leave it untouched
+        }
+        let wanted: Vec<String> = String::from_utf8_lossy(&needed.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect();
+
+        // Only act when the wheel itself ships the needed library.
+        let Some(runpath) = wanted
+            .iter()
+            .find_map(|soname| runpath_for_member(member, soname, &members))
+        else {
+            continue;
+        };
+        let current = std::process::Command::new(patchelf)
+            .arg("--print-rpath")
+            .arg(&tmp)
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        if current == runpath {
+            continue; // already correct; do not churn the wheel
+        }
+
+        let set = std::process::Command::new(patchelf)
+            .arg("--set-rpath")
+            .arg(&runpath)
+            .arg(&tmp)
+            .output()
+            .with_context(|| format!("patchelf --set-rpath {runpath} {member}"))?;
+        if !set.status.success() {
+            anyhow::bail!(
+                "patchelf --set-rpath failed for {member}: {}",
+                String::from_utf8_lossy(&set.stderr)
+            );
+        }
+        let patched = std::fs::read(&tmp).with_context(|| format!("re-reading {member}"))?;
+        replacements.insert(member.clone(), patched);
+        changed.push(member.clone());
+    }
+
+    if !replacements.is_empty() {
+        replace_wheel_payloads(wheel_path, &replacements)?;
+    }
+    Ok(changed)
+}
+
 pub(crate) fn replace_wheel_payloads(
     wheel_path: &Path,
     replacements: &BTreeMap<String, Vec<u8>>,
@@ -1512,6 +1650,90 @@ mod tests {
             runpath_for_member("pkg/a/consumer.so", "libdep.so.1", &members).as_deref(),
             Some("$ORIGIN/../b/lib")
         );
+    }
+
+    /// End-to-end on a REAL payload binary: build a wheel with the measured
+    /// mujoco layout, run the pass, and assert the RUNPATH actually changed
+    /// from the stale vendor path to the computed one. Skips when patchelf is
+    /// unavailable -- it is a BUILD dependency, absent from some envs.
+    #[test]
+    fn repair_rewrites_the_stale_vendor_runpath_in_a_real_wheel() {
+        let pe = ["/oscar/data/stellex/glvov/imprint-data/.pixi/envs/flashsac-gpu/bin/patchelf"]
+            .iter()
+            .map(Path::new)
+            .find(|p| p.is_file());
+        let Some(patchelf) = pe else {
+            eprintln!("patchelf unavailable; skipping");
+            return;
+        };
+        let src = Path::new(
+            "/oscar/data/stellex/glvov/imprint-data/.pixi/envs/hover-gpu/lib/python3.10/\
+site-packages/mujoco/plugin/libactuator.so",
+        );
+        let lib = Path::new(
+            "/oscar/data/stellex/glvov/imprint-data/.pixi/envs/hover-gpu/lib/python3.10/\
+site-packages/mujoco/libmujoco.so.3.11.0",
+        );
+        if !src.is_file() || !lib.is_file() {
+            eprintln!("real payload unavailable; skipping");
+            return;
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "retread-runpath-e2e-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let wheel = root.join("mujoco-3.11.0-cp310-none-any.whl");
+        {
+            let f = std::fs::File::create(&wheel).unwrap();
+            let mut z = zip::ZipWriter::new(f);
+            let o: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            z.start_file("mujoco/plugin/libactuator.so", o).unwrap();
+            std::io::Write::write_all(&mut z, &std::fs::read(src).unwrap()).unwrap();
+            z.start_file("mujoco/libmujoco.so.3.11.0", o).unwrap();
+            std::io::Write::write_all(&mut z, &std::fs::read(lib).unwrap()).unwrap();
+            z.start_file("mujoco-3.11.0.dist-info/RECORD", o).unwrap();
+            std::io::Write::write_all(
+                &mut z,
+                b"mujoco/plugin/libactuator.so,,\nmujoco/libmujoco.so.3.11.0,,\n",
+            )
+            .unwrap();
+            z.finish().unwrap();
+        }
+
+        let changed = repair_wheel_runpaths(&wheel, patchelf).expect("repair");
+        assert_eq!(
+            changed,
+            vec!["mujoco/plugin/libactuator.so".to_string()],
+            "only the consumer needs rewriting, not the library itself"
+        );
+
+        // Read the patched member back OUT of the wheel and confirm the RUNPATH.
+        let mut ar = ZipArchive::new(Cursor::new(std::fs::read(&wheel).unwrap())).unwrap();
+        let mut out = Vec::new();
+        std::io::copy(
+            &mut ar.by_name("mujoco/plugin/libactuator.so").unwrap(),
+            &mut out,
+        )
+        .unwrap();
+        let check = root.join("check.so");
+        std::fs::write(&check, &out).unwrap();
+        let got = std::process::Command::new(patchelf)
+            .arg("--print-rpath")
+            .arg(&check)
+            .output()
+            .unwrap();
+        let got = String::from_utf8_lossy(&got.stdout).trim().to_string();
+        assert_eq!(got, "$ORIGIN/..", "stale vendor RUNPATH must be replaced");
+
+        // Idempotent: a second pass finds nothing to change.
+        let again = repair_wheel_runpaths(&wheel, patchelf).expect("repair again");
+        assert!(again.is_empty(), "already-correct RUNPATH must not churn: {again:?}");
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
 }
