@@ -2234,6 +2234,112 @@ fn run_uv_capturing_stderr(
 /// lock-free fast path in `run()` reads the marker without holding the
 /// install lock, so a plain `std::fs::write` (truncate-then-write) could
 /// expose a torn marker to a concurrent reader; rename is atomic on POSIX.
+
+/// Record the payload retread installed into the prefix's conda-meta, so
+/// conda, `conda list` and uninstall can see it.
+///
+/// The guard this exists to retire says why it is needed, in its own header:
+/// the wheels "are installed by the post-link as a side effect that conda/pixi
+/// does [not track]".
+///
+/// Writes THREE things into the bundle's own `conda-meta/<pkg>.json`:
+///   * `files[]`            -- conda's ownership record; what makes it visible
+///   * `paths_data.paths[]` -- the same paths in conda's structured form
+///   * `retread_placed[]`   -- OUR marker, subtracted by every ownership
+///                             question (see RETREAD_PLACED_KEY)
+///
+/// The third is not optional. Without it `conda_meta_claimed_dirs` reads our
+/// own payload as conda-placed and `retread verify` stops layout-checking it.
+///
+/// MEASURED: appended entries survive plain install, `pixi run`, a transaction
+/// and a repair attempt. They do NOT survive an upgrade of the package itself,
+/// which rewrites the file -- but an upgrade relinks, and the post-link runs
+/// again, so the entries are re-emitted.
+///
+/// Idempotent: re-recording the same paths does not duplicate them.
+/// A missing conda-meta record is a NO-OP, not an error: retread can install
+/// into a prefix it did not build, and refusing there would break that.
+fn record_payload_in_conda_meta(
+    prefix: &Path,
+    bundle: &str,
+    payload_paths: &BTreeSet<String>,
+) -> Result<bool> {
+    if payload_paths.is_empty() {
+        return Ok(false);
+    }
+    let meta_dir = prefix.join("conda-meta");
+    let Ok(entries) = std::fs::read_dir(&meta_dir) else {
+        return Ok(false);
+    };
+    // The bundle's own conda-meta record is `<bundle>-<version>-<build>.json`.
+    let mut target = None;
+    for e in entries.flatten() {
+        let path = e.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|x| x.to_str()) else {
+            continue;
+        };
+        if stem.starts_with(&format!("{bundle}-")) {
+            target = Some(path);
+            break;
+        }
+    }
+    let Some(target) = target else {
+        return Ok(false);
+    };
+    let body = std::fs::read_to_string(&target)
+        .with_context(|| format!("reading {}", target.display()))?;
+    let mut json: serde_json::Value = serde_json::from_str(&body)
+        .with_context(|| format!("parsing {}", target.display()))?;
+
+    let existing: BTreeSet<String> = json
+        .get("files")
+        .and_then(|f| f.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str()).map(str::to_string).collect())
+        .unwrap_or_default();
+    let to_add: Vec<&String> = payload_paths.difference(&existing).collect();
+    if to_add.is_empty() {
+        return Ok(false);
+    }
+
+    if let Some(files) = json.get_mut("files").and_then(|f| f.as_array_mut()) {
+        for p in &to_add {
+            files.push(serde_json::Value::String((*p).clone()));
+        }
+    }
+    if let Some(paths) = json
+        .get_mut("paths_data")
+        .and_then(|p| p.get_mut("paths"))
+        .and_then(|p| p.as_array_mut())
+    {
+        for p in &to_add {
+            paths.push(serde_json::json!({
+                "_path": p,
+                "path_type": "hardlink",
+            }));
+        }
+    }
+    let placed = json
+        .as_object_mut()
+        .context("conda-meta record is not a JSON object")?
+        .entry(RETREAD_PLACED_KEY)
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    if let Some(arr) = placed.as_array_mut() {
+        let known: BTreeSet<String> =
+            arr.iter().filter_map(|x| x.as_str()).map(str::to_string).collect();
+        for p in payload_paths.difference(&known) {
+            arr.push(serde_json::Value::String(p.clone()));
+        }
+    }
+
+    let rendered = serde_json::to_string(&json).context("serializing conda-meta record")?;
+    write_marker_atomic(&target, &rendered)
+        .with_context(|| format!("writing {}", target.display()))?;
+    Ok(true)
+}
+
 fn write_marker_atomic(marker: &Path, body: &str) -> Result<()> {
     let tmp = marker.with_extension(format!("tmp.{}", std::process::id()));
     std::fs::write(&tmp, body).with_context(|| format!("writing marker temp {}", tmp.display()))?;
@@ -6096,6 +6202,88 @@ packages:
             claimed.contains(&root.join("lib/python3.12/site-packages/plain")),
             "{claimed:?}"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The emitter is the WRITER for RETREAD_PLACED_KEY, whose reader landed in
+    /// 320f41c. It must put payload paths in `files[]` (so conda sees them) AND
+    /// in `retread_placed[]` (so ownership subtracts them). Emitting only the
+    /// first would make retread verify stop checking its own payload.
+    #[test]
+    fn recording_payload_writes_both_files_and_the_retread_marker() {
+        let root = std::env::temp_dir().join(format!(
+            "retread-emit-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let meta = root.join("conda-meta");
+        std::fs::create_dir_all(&meta).unwrap();
+        let rec = meta.join("demo-pack-1.0-h0.json");
+        std::fs::write(
+            &rec,
+            r#"{"name":"demo-pack","files":["bin/retread"],
+                "paths_data":{"paths_version":1,
+                  "paths":[{"_path":"bin/retread","path_type":"hardlink"}]}}"#,
+        )
+        .unwrap();
+
+        let payload: BTreeSet<String> = [
+            "lib/python3.12/site-packages/foo/__init__.py".to_string(),
+            "lib/python3.12/site-packages/bar/__init__.py".to_string(),
+        ]
+        .into_iter()
+        .collect();
+
+        assert!(record_payload_in_conda_meta(&root, "demo-pack", &payload).unwrap());
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&rec).unwrap()).unwrap();
+        let files: Vec<&str> =
+            v["files"].as_array().unwrap().iter().filter_map(|x| x.as_str()).collect();
+        let placed: Vec<&str> = v[RETREAD_PLACED_KEY]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|x| x.as_str())
+            .collect();
+        for p in &payload {
+            assert!(files.contains(&p.as_str()), "files must list it: {files:?}");
+            assert!(placed.contains(&p.as_str()), "retread_placed must list it: {placed:?}");
+        }
+        assert!(files.contains(&"bin/retread"), "conda's own entry must survive");
+        assert!(
+            !placed.contains(&"bin/retread"),
+            "conda's own entry must NOT be marked retread-placed"
+        );
+        assert_eq!(v["paths_data"]["paths"].as_array().unwrap().len(), 3);
+
+        // The round trip that matters: ownership must now EXCLUDE our payload
+        // while still claiming conda's own entry.
+        let claimed = conda_meta_claimed_dirs(&root);
+        assert!(
+            !claimed.contains(&root.join("lib/python3.12/site-packages/foo")),
+            "emitted payload must not read back as conda-owned: {claimed:?}"
+        );
+
+        // Idempotent: a second call adds nothing.
+        assert!(!record_payload_in_conda_meta(&root, "demo-pack", &payload).unwrap());
+        let v2: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&rec).unwrap()).unwrap();
+        assert_eq!(v2["files"].as_array().unwrap().len(), 3);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Retread can install into a prefix it did not build. No conda-meta
+    /// record for the bundle is a NO-OP, never an error.
+    #[test]
+    fn recording_payload_is_a_noop_without_a_conda_meta_record() {
+        let root = std::env::temp_dir().join(format!(
+            "retread-emit-noop-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(root.join("conda-meta")).unwrap();
+        let payload: BTreeSet<String> = ["lib/x.py".to_string()].into_iter().collect();
+        assert!(!record_payload_in_conda_meta(&root, "absent-pack", &payload).unwrap());
         let _ = std::fs::remove_dir_all(root);
     }
 
