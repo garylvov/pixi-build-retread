@@ -824,6 +824,62 @@ fn update_record_line(
 /// refresh their RECORD attestations without weakening ZIP structure or mode
 /// preservation. The caller supplies archive member names, never filesystem
 /// paths, so extraction traversal is outside this boundary.
+
+/// Compute the `RUNPATH` a wheel member needs so a shipped sibling library
+/// resolves without `LD_LIBRARY_PATH`.
+///
+/// MEASURED on `hover-gpu`'s payload (2026-08-28). Two real shapes, both
+/// resolved by the same rule -- point at the directory holding the shipped
+/// `.so`, expressed relative to `$ORIGIN`:
+/// ```text
+/// mujoco/plugin/libactuator.so          needs libmujoco.so.3.11.0
+///   shipped at mujoco/libmujoco.so.3.11.0            -> $ORIGIN/..
+/// mujoco/experimental/studio/renderer...so  needs libmujoco.so.3.11.0
+///   shipped at mujoco/libmujoco.so.3.11.0            -> $ORIGIN/../..
+/// ```
+/// Applying both, the mujoco subtree went from 8 unresolved link edges to 0.
+///
+/// The depth is counted in HOPS TO THE TARGET, not path components. An earlier
+/// version of this rule said the studio modules were "three levels up"; they
+/// are two, and `$ORIGIN/../../..` pointed past `mujoco/` into `site-packages/`
+/// and fixed nothing. That error survived thirteen ticks because it was
+/// reasoned about rather than tested.
+///
+/// Returns `None` when the wheel does not ship the needed library at all --
+/// that is a MISSING dependency, not a path problem, and no RUNPATH fixes it.
+/// The `libQt6*` edges in the same environment are exactly that case: the
+/// libraries are absent from the prefix entirely.
+pub(crate) fn runpath_for_member(
+    member: &str,
+    needed_soname: &str,
+    members: &[String],
+) -> Option<String> {
+    let member_dir = member.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+    let target_dir = members.iter().find_map(|m| {
+        let (dir, base) = m.rsplit_once('/').unwrap_or(("", m.as_str()));
+        (base == needed_soname).then_some(dir)
+    })?;
+    if target_dir == member_dir {
+        return Some("$ORIGIN".to_string());
+    }
+    // Hops from the member's directory up to the common root, then down.
+    let mem: Vec<&str> = member_dir.split('/').filter(|c| !c.is_empty()).collect();
+    let tgt: Vec<&str> = target_dir.split('/').filter(|c| !c.is_empty()).collect();
+    let common = mem
+        .iter()
+        .zip(tgt.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut parts: Vec<String> = std::iter::repeat("..".to_string())
+        .take(mem.len() - common)
+        .collect();
+    parts.extend(tgt[common..].iter().map(|c| (*c).to_string()));
+    if parts.is_empty() {
+        return Some("$ORIGIN".to_string());
+    }
+    Some(format!("$ORIGIN/{}", parts.join("/")))
+}
+
 pub(crate) fn replace_wheel_payloads(
     wheel_path: &Path,
     replacements: &BTreeMap<String, Vec<u8>>,
@@ -1399,4 +1455,63 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
+    /// Both shapes measured on the real hover-gpu payload, plus the cases
+    /// where the rule must NOT fire.
+    #[test]
+    fn runpath_points_at_the_directory_holding_the_shipped_library() {
+        let members: Vec<String> = [
+            "mujoco/libmujoco.so.3.11.0",
+            "mujoco/__init__.py",
+            "mujoco/plugin/libactuator.so",
+            "mujoco/experimental/studio/renderer.cpython-310-x86_64-linux-gnu.so",
+            "mujoco/sibling.so",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        // Measured case 1: plugin dir -> one hop up.
+        assert_eq!(
+            runpath_for_member("mujoco/plugin/libactuator.so", "libmujoco.so.3.11.0", &members)
+                .as_deref(),
+            Some("$ORIGIN/..")
+        );
+        // Measured case 2: studio is TWO hops, not three. $ORIGIN/../../..
+        // pointed past mujoco/ into site-packages/ and fixed nothing.
+        assert_eq!(
+            runpath_for_member(
+                "mujoco/experimental/studio/renderer.cpython-310-x86_64-linux-gnu.so",
+                "libmujoco.so.3.11.0",
+                &members
+            )
+            .as_deref(),
+            Some("$ORIGIN/../..")
+        );
+        // Same directory needs no traversal.
+        assert_eq!(
+            runpath_for_member("mujoco/sibling.so", "libmujoco.so.3.11.0", &members).as_deref(),
+            Some("$ORIGIN")
+        );
+        // The wheel does not ship it: MISSING dependency, not a path problem.
+        // This is the libQt6* case -- absent from the prefix entirely, and no
+        // RUNPATH form fixes a file that is not there.
+        assert_eq!(
+            runpath_for_member("mujoco/plugin/libactuator.so", "libQt6Core.so.6", &members),
+            None
+        );
+    }
+
+    /// A target in a sibling subtree needs both up-hops AND down-components.
+    #[test]
+    fn runpath_handles_a_sibling_subtree() {
+        let members: Vec<String> = ["pkg/a/consumer.so", "pkg/b/lib/libdep.so.1"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            runpath_for_member("pkg/a/consumer.so", "libdep.so.1", &members).as_deref(),
+            Some("$ORIGIN/../b/lib")
+        );
+    }
+
 }
