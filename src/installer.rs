@@ -2235,6 +2235,71 @@ fn run_uv_capturing_stderr(
 /// install lock, so a plain `std::fs::write` (truncate-then-write) could
 /// expose a torn marker to a concurrent reader; rename is atomic on POSIX.
 
+
+/// Prefix-relative paths the courier payload placed, for conda-meta recording.
+///
+/// Derived from each installed distribution's own RECORD, which is the
+/// authority on what a wheel laid down. Only distributions the LOCK names are
+/// collected: a prefix contains plenty retread did not place, and claiming
+/// those would be a lie in the opposite direction.
+///
+/// Skips anything conda already owns. A distribution conda placed is conda's,
+/// and re-listing it under `retread_placed` would make ownership subtract a
+/// path that genuinely IS conda's -- the mirror image of the hazard this whole
+/// pairing exists to avoid.
+fn payload_paths_for_conda_meta(
+    lock: &RetreadLock,
+    prefix: &Path,
+    site_packages: &Path,
+) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let Ok(rel_site) = site_packages.strip_prefix(prefix) else {
+        return out; // site-packages outside the prefix: nothing to record
+    };
+    let installed = match installed_distributions(site_packages) {
+        Ok(i) => i,
+        Err(_) => return out,
+    };
+    let conda_owned = conda_owned_distributions(prefix, site_packages);
+    let locked: BTreeSet<String> = lock
+        .wheels
+        .iter()
+        .map(|w| normalize_dist_name(&w.name))
+        .collect();
+
+    for (name, versions) in &installed {
+        if !locked.contains(&normalize_dist_name(name)) {
+            continue;
+        }
+        for (version, dist_root) in versions {
+            if conda_owned.contains(&(name.clone(), version.clone())) {
+                continue;
+            }
+            let record = dist_root.join("RECORD");
+            let Ok(body) = std::fs::read_to_string(&record) else {
+                continue;
+            };
+            for line in body.lines() {
+                let Some(rel) = line.split(',').next().filter(|r| !r.is_empty()) else {
+                    continue;
+                };
+                let p = Path::new(rel);
+                // RECORD paths are site-packages-relative. Reject absolute and
+                // `..` entries: they would name files outside the prefix, and a
+                // conda-meta file list is prefix-relative by definition.
+                if p.is_absolute()
+                    || p.components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir))
+                {
+                    continue;
+                }
+                out.insert(rel_site.join(p).to_string_lossy().into_owned());
+            }
+        }
+    }
+    out
+}
+
 /// Record the payload retread installed into the prefix's conda-meta, so
 /// conda, `conda list` and uninstall can see it.
 ///
@@ -2398,6 +2463,25 @@ fn finish_repair(
         )
         .map_err(|e| ("install_audit", e))?;
         std::fs::create_dir_all(share).ok();
+        // Make the payload visible to conda BEFORE the success marker, so a
+        // marker never claims a payload that was not recorded. A failure here
+        // is not fatal: tracking is an improvement to observability, and
+        // refusing an otherwise-good install over it would be a regression.
+        let payload = payload_paths_for_conda_meta(lock, prefix, &site_packages);
+        match record_payload_in_conda_meta(prefix, &lock.bundle, &payload) {
+            Ok(true) => tracing::info!(
+                bundle = %lock.bundle,
+                paths = payload.len(),
+                "retread install: recorded payload in conda-meta"
+            ),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                bundle = %lock.bundle,
+                error = %format!("{e:#}"),
+                "retread install: could not record payload in conda-meta; \
+                 the install itself is unaffected"
+            ),
+        }
         let body = crate::glibc::marker_body(want, &audit).map_err(|e| ("marker_body", e))?;
         write_marker_atomic(marker, &body).map_err(|e| ("write_marker_atomic", e))?;
         Ok(())
@@ -6284,6 +6368,60 @@ packages:
         std::fs::create_dir_all(root.join("conda-meta")).unwrap();
         let payload: BTreeSet<String> = ["lib/x.py".to_string()].into_iter().collect();
         assert!(!record_payload_in_conda_meta(&root, "absent-pack", &payload).unwrap());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The collector must take ONLY what the lock names and what conda does
+    /// not already own. Over-claiming is the mirror of the hazard the pairing
+    /// exists to avoid: marking a genuinely conda-placed dist as
+    /// retread-placed would make ownership subtract a path that IS conda's.
+    #[test]
+    fn payload_paths_take_only_locked_and_not_conda_owned() {
+        let root = std::env::temp_dir().join(format!(
+            "retread-paths-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let sp = root.join("lib/python3.12/site-packages");
+        std::fs::create_dir_all(&sp).unwrap();
+
+        // (a) locked, retread-placed -> COLLECTED
+        let mine = sp.join("mine-1.0.dist-info");
+        std::fs::create_dir_all(&mine).unwrap();
+        std::fs::write(mine.join("RECORD"), "mine/__init__.py,,\nmine/a.py,,\n").unwrap();
+        std::fs::write(mine.join("METADATA"), "Name: mine\nVersion: 1.0\n").unwrap();
+        // (b) locked, but conda-owned via INSTALLER -> SKIPPED
+        let theirs = sp.join("theirs-2.0.dist-info");
+        std::fs::create_dir_all(&theirs).unwrap();
+        std::fs::write(theirs.join("RECORD"), "theirs/__init__.py,,\n").unwrap();
+        std::fs::write(theirs.join("METADATA"), "Name: theirs\nVersion: 2.0\n").unwrap();
+        std::fs::write(theirs.join("INSTALLER"), "conda\n").unwrap();
+        // (c) present but NOT in the lock -> SKIPPED
+        let other = sp.join("other-3.0.dist-info");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("RECORD"), "other/__init__.py,,\n").unwrap();
+        std::fs::write(other.join("METADATA"), "Name: other\nVersion: 3.0\n").unwrap();
+
+        let mut lock = make_lock(vec![], vec![], BTreeMap::new());
+        lock.bundle = "demo".to_string();
+        lock.wheels = vec![
+            index_lock_wheel("mine", "1.0", "https://x/mine-1.0-py3-none-any.whl", "a"),
+            index_lock_wheel("theirs", "2.0", "https://x/theirs-2.0-py3-none-any.whl", "b"),
+        ];
+
+        let got = payload_paths_for_conda_meta(&lock, &root, &sp);
+        assert!(
+            got.contains("lib/python3.12/site-packages/mine/__init__.py"),
+            "a locked, retread-placed dist must be collected: {got:?}"
+        );
+        assert!(
+            !got.iter().any(|p| p.contains("theirs/")),
+            "a conda-OWNED dist must be skipped: {got:?}"
+        );
+        assert!(
+            !got.iter().any(|p| p.contains("other/")),
+            "a dist the lock does not name must be skipped: {got:?}"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
