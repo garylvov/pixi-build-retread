@@ -461,9 +461,27 @@ pub(crate) fn build_courier_recipe_with_mode_lock_and_relaxations(
         ),
         crate::config::CourierMode::Activation => String::new(),
     };
-    // Loud-failure guard: an activate.d script runs on every activation
-    // (regardless of the post-link toggle) and warns when the marker is absent
-    // or no longer matches the actual installed wheel state.
+    // Loud-failure guard: an activate.d script that installs the payload and
+    // warns when the marker is absent or no longer matches the installed wheel
+    // state.
+    //
+    // Emitted ONLY in Activation mode, where it is the ONLY installer -- the
+    // `post_link_section` above is empty in that mode, so removing the guard
+    // there would leave the payload with nothing to install it.
+    //
+    // In PostLink mode the post-link script installs the payload at link time,
+    // and the guard is pure duplication: a shell hook sourced into EVERY
+    // activation to re-check work that already happened. Suppressing it there
+    // is the whole point of the activate.d removal.
+    //
+    // MEASURED, and this is why suppressing it is safe rather than merely
+    // tidy: the guard's `LD_LIBRARY_PATH` export was believed load-bearing
+    // because `ldd` reports 1,326 unresolved `libpython3.10.so.1.0` edges
+    // without it. At RUNTIME the loading process IS the interpreter, so those
+    // symbols are already in the process image -- `import isaacsim` succeeds
+    // identically with and without the export on a fully installed hover-gpu.
+    // A static link check cannot see that.
+    let emit_activation_guard = matches!(courier_mode, crate::config::CourierMode::Activation);
     let activate_guard = format!("$PREFIX/etc/conda/activate.d/zzz-retread-{conda_name}.sh");
     let deactivate_guard = format!("$PREFIX/etc/conda/deactivate.d/zzz-retread-{conda_name}.sh");
     let var_pack = shell_ident(conda_name);
