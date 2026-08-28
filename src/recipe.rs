@@ -490,17 +490,9 @@ pub(crate) fn build_courier_recipe_with_mode_lock_and_relaxations(
     } else {
         String::new()
     };
-    let script = format!(
-        "set -euo pipefail\n\
-         SHARE=\"$PREFIX/share/retread\"\n\
-         WHEELS=\"$SHARE/{conda_name}/wheels\"\n\
-         mkdir -p \"$WHEELS\" \"$PREFIX/bin\" \"$PREFIX/etc/conda/activate.d\" \"$PREFIX/etc/conda/deactivate.d\"\n\
-         cp \"$SRC_DIR\"/*.whl \"$WHEELS\"/ 2>/dev/null || true\n\
-         cp \"$SRC_DIR\"/{lock_filename} \"$SHARE\"/\n\
-         cp \"$SRC_DIR\"/retread-installer \"$PREFIX/bin/retread\"\n\
-         chmod +x \"$PREFIX/bin/retread\"\n\
-         {post_link_section}\
-         cat > \"{activate_guard}\" <<'ACTIVATE'\n\
+    let guard_section = if emit_activation_guard {
+        format!(
+            "cat > \"{activate_guard}\" <<'ACTIVATE'\n\
          #!/bin/bash\n\
          # SELF-HEAL guard, sourced on every activation. The bundle's PyPI wheels\n\
          # are installed by the post-link as a side effect that conda/pixi does\n\
@@ -559,8 +551,22 @@ pub(crate) fn build_courier_recipe_with_mode_lock_and_relaxations(
          fi\n\
          unset _RETREAD_SAVED_LDLP_{var_pack}\n\
          DEACTIVATE\n\
-         chmod +x \"{deactivate_guard}\"\n\
-         {relaxation_section}"
+         chmod +x \"{deactivate_guard}\"\n"
+        )
+    } else {
+        String::new()
+    };
+    let script = format!(
+        "set -euo pipefail\n\
+         SHARE=\"$PREFIX/share/retread\"\n\
+         WHEELS=\"$SHARE/{conda_name}/wheels\"\n\
+         mkdir -p \"$WHEELS\" \"$PREFIX/bin\" \"$PREFIX/etc/conda/activate.d\" \"$PREFIX/etc/conda/deactivate.d\"\n\
+         cp \"$SRC_DIR\"/*.whl \"$WHEELS\"/ 2>/dev/null || true\n\
+         cp \"$SRC_DIR\"/{lock_filename} \"$SHARE\"/\n\
+         cp \"$SRC_DIR\"/retread-installer \"$PREFIX/bin/retread\"\n\
+         chmod +x \"$PREFIX/bin/retread\"\n\
+         {post_link_section}\
+         {guard_section}         {relaxation_section}"
     );
 
     let source = source_urls
@@ -733,7 +739,7 @@ mod courier_tests {
         std::fs::write(src.join("retread-isaac-pack.lock.json"), "{}").unwrap();
         std::fs::write(src.join("retread-installer"), "#!/bin/sh\n").unwrap();
 
-        let recipe = build_courier_recipe("isaac-pack", "5.1.0", "3.11", &[], &[], None);
+        let recipe = build_courier_recipe_with_mode("isaac-pack", "5.1.0", "3.11", &[], &[], None, crate::config::CourierMode::Activation);
         let build = Command::new(&bash)
             .arg("-c")
             .arg(&recipe.build.script)
@@ -877,7 +883,7 @@ mod courier_tests {
         std::fs::write(src.join("retread-isaac-pack.lock.json"), "{}").unwrap();
         std::fs::write(src.join("retread-installer"), "#!/bin/sh\n").unwrap();
 
-        let recipe = build_courier_recipe("isaac-pack", "5.1.0", "3.11", &[], &[], None);
+        let recipe = build_courier_recipe_with_mode("isaac-pack", "5.1.0", "3.11", &[], &[], None, crate::config::CourierMode::Activation);
         let build = Command::new(&bash)
             .arg("-c")
             .arg(&recipe.build.script)
@@ -1261,79 +1267,31 @@ mod courier_tests {
             r.build.script.contains("\nPOSTLINK\n"),
             "heredoc terminator must be at column 0 to close the heredoc"
         );
-        // Self-heal guard: a conda activate.d script that verifies the payload
-        // on every activation and repairs it when missing.
+        // In PostLink mode the post-link script installs the payload, so the
+        // activate.d guard is pure duplication and is NOT emitted. This is the
+        // step-5 contract: suppress in PostLink, keep in Activation (where the
+        // guard is the ONLY installer -- post_link_section is empty there).
         assert!(
-            r.build
-                .script
-                .contains("etc/conda/activate.d/zzz-retread-isaac-pack.sh"),
-            "must ship an activate.d guard"
+            !r.build.script.contains("etc/conda/activate.d/zzz-retread-isaac-pack.sh"),
+            "PostLink mode must NOT ship an activate.d guard"
         );
         assert!(
-            r.build
-                .script
-                .contains("etc/conda/deactivate.d/zzz-retread-isaac-pack.sh"),
-            "must ship a matching deactivate.d hook"
+            !r.build.script.contains("etc/conda/deactivate.d/zzz-retread-isaac-pack.sh"),
+            "PostLink mode must NOT ship a deactivate.d hook"
         );
-        assert!(
-            r.build
-                .script
-                .contains("LD_LIBRARY_PATH=\"$CONDA_PREFIX/lib"),
-            "activate.d must prepend $CONDA_PREFIX/lib to LD_LIBRARY_PATH"
-        );
-        assert!(
-            r.build.script.contains("_RETREAD_SAVED_LDLP_isaac_pack"),
-            "activate/deactivate hooks must use a sanitized pack-specific saved variable"
-        );
-        assert!(
-            r.build
-                .script
-                .contains("\"$CONDA_PREFIX/bin/retread\" verify --lock"),
-            "guard must verify marker plus installed wheel metadata"
-        );
-        assert!(
-            r.build.script.contains("retread-isaac-pack.lock.json"),
-            "guard must verify against the bundle lock"
-        );
+        // Everything below here asserted guard CONTENT -- the LD_LIBRARY_PATH
+        // prepend, the saved-variable naming, the `retread verify` call. None
+        // of it exists in PostLink mode now, and asserting its absence twice
+        // adds nothing over the two assertions above. The guard's content is
+        // covered where the guard still lives: the two Activation-mode tests.
         // Self-heal: on a failed verify the guard must RUN the installer to
         // repair the payload (not merely warn), so an env whose non-conda-
         // tracked wheels were lost (moved / node-local /tmp wiped / post-link
         // skipped on relink) is restored on next activation.
-        assert!(
-            r.build
-                .script
-                .contains("\"$CONDA_PREFIX/bin/retread\" install --lock"),
-            "guard must self-heal by running the installer when verify fails"
-        );
-        assert!(
-            r.build.script.contains("repairing..."),
-            "guard should announce the repair"
-        );
-        // Sourced into the user's shell -> must not carry set -e / exit that
-        // would abort activation on a repair failure.
-        let activate_body = r
-            .build
-            .script
-            .split("<<'ACTIVATE'\n")
-            .nth(1)
-            .and_then(|s| s.split("\nACTIVATE\n").next())
-            .expect("activate.d heredoc body");
-        assert!(
-            !activate_body.contains("set -e") && !activate_body.contains("\nexit "),
-            "activate.d guard is sourced; it must not set -e or exit"
-        );
-        assert!(
-            activate_body.contains("RETREAD_GUARD_STRICT"),
-            "return 1 must be strict-mode-only"
-        );
-        assert!(
-            r.build.script.contains("\nACTIVATE\n"),
-            "activate.d heredoc terminator must be at column 0"
-        );
-        assert!(
-            r.build.script.contains("\nDEACTIVATE\n"),
-            "deactivate.d heredoc terminator must be at column 0"
-        );
+        // The remaining guard-content assertions (self-heal installer call,
+        // heredoc body and terminator shape) describe a guard that PostLink
+        // mode no longer emits. They live on in the two Activation-mode tests,
+        // where the guard is still the only installer.
     }
     #[test]
     fn courier_relaxation_payload_is_installed_and_copy_failure_is_fatal() {
