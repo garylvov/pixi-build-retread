@@ -9197,6 +9197,12 @@ async fn uv_group_closure(
                 "uv closure: source-built entry is not a uv root; it resolves \
                  via the legacy materialization path (milestone-1 limit)",
             );
+            // LOG-ONLY dry run of Lane C (auto-dependency detection).
+            // Measures what `resolve_imports` WOULD contribute as roots for
+            // this source-built entry. Nothing is pushed into `roots`; no
+            // existing log line changes. This arm only fires for
+            // path/git/from entries, so the scan stays off the hot path.
+            auto_imports_dry_run(name, group_name, entry, effective, target, source_dir, cache_dir);
         }
     }
     // retread-deps-from: fetch + parse each configured source and append
@@ -13279,6 +13285,114 @@ fn checkout_root_for_entry(
     } else {
         None
     }
+}
+
+/// Modules the entry itself provides, so the import scanner does not report
+/// a package's own packages as external dependencies.
+///
+/// There is no existing source for this, so it is derived from two things:
+/// 1. the entry NAME, normalized to module form (`-`/`.` -> `_`, lowercased),
+///    plus the un-normalized name as written; and
+/// 2. the source tree's own top-level package/module names -- every
+///    directory holding an `__init__.py` and every top-level `*.py` stem,
+///    looked for both at the tree root and under a `src/` layout root.
+///
+/// Deliberately over-inclusive: a name wrongly claimed as "own" only drops a
+/// requirement from this DRY-RUN log, whereas a missing one adds a bogus row.
+fn auto_imports_own_top_level(entry_name: &str, tree: &Path) -> std::collections::BTreeSet<String> {
+    let mut own: std::collections::BTreeSet<String> = Default::default();
+    own.insert(entry_name.to_string());
+    own.insert(entry_name.replace(['-', '.'], "_").to_lowercase());
+    for root in [tree.to_path_buf(), tree.join("src")] {
+        let Ok(rd) = std::fs::read_dir(&root) else { continue };
+        for dent in rd.flatten() {
+            let path = dent.path();
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+            if path.is_dir() {
+                if path.join("__init__.py").is_file() {
+                    own.insert(stem.to_string());
+                }
+            } else if path.extension().and_then(|e| e.to_str()) == Some("py") {
+                own.insert(stem.to_string());
+            }
+        }
+    }
+    own
+}
+
+/// LOG-ONLY: report what auto-import detection WOULD contribute for a
+/// source-built entry that milestone 1 leaves out of the uv root set.
+///
+/// Emits nothing into the solver. Passes an EMPTY wheel slice, so every
+/// detected module falls through `resolve_imports`' name-fallback arm and is
+/// reported under its normalized module name.
+fn auto_imports_dry_run(
+    entry_name: &str,
+    group_name: &str,
+    entry: &WheelEntry,
+    effective: &RetreadConfig,
+    target: &ResolutionTarget,
+    source_dir: &Path,
+    cache_dir: &Path,
+) {
+    let checkout = checkout_root_for_entry(entry, &effective.git_sources, source_dir, cache_dir);
+    let tree = crate::auto_imports::entry_source_tree(
+        entry.path.as_deref(),
+        entry.is_git() || entry.is_named_git(),
+        source_dir,
+        checkout.as_deref(),
+    );
+    let Some(tree) = tree else {
+        tracing::debug!(
+            entry = %entry_name,
+            bundle = %group_name,
+            "auto_imports_dry: no local source tree for this entry; nothing to scan",
+        );
+        return;
+    };
+    if !tree.is_dir() {
+        tracing::debug!(
+            entry = %entry_name,
+            bundle = %group_name,
+            tree = %tree.display(),
+            "auto_imports_dry: source tree is not materialized at closure time; nothing to scan",
+        );
+        return;
+    }
+    let own_top_level = auto_imports_own_top_level(entry_name, &tree);
+    let report = crate::auto_imports::resolve_imports(
+        &tree,
+        &own_top_level,
+        target.python_version(),
+        &[],
+    );
+    let mut conditional_count = 0usize;
+    for req in &report.requirements {
+        let line = req.provider.clone().unwrap_or_else(|| req.module.clone());
+        if req.conditional {
+            conditional_count += 1;
+        }
+        tracing::info!(
+            entry = %entry_name,
+            bundle = %group_name,
+            module = %req.module,
+            conditional = req.conditional,
+            would_emit = %line,
+            files = req.files.len(),
+            "auto_imports_dry: detected requirement (NOT added to roots)",
+        );
+    }
+    tracing::info!(
+        entry = %entry_name,
+        bundle = %group_name,
+        tree = %tree.display(),
+        own_top_level = own_top_level.len(),
+        requirements = report.requirements.len(),
+        conditional = conditional_count,
+        unmapped = report.unmapped.len(),
+        extra_hints = report.extra_hints.len(),
+        "auto_imports_dry: summary for this source-built entry (log-only, roots unchanged)",
+    );
 }
 
 /// v0.12.0+: per-bundle configuration for the auto-data-files inject
