@@ -9138,6 +9138,10 @@ async fn uv_group_closure(
     // the store on the same filesystem).
     let url_prefetch_dir = cache_dir.join("uv-url-wheel-prefetch");
     let wheel_store_root = crate::courier::retread_wheel_store_root();
+    // Built at most ONCE per bundle, on the first source-built entry, and only
+    // then: building it opens every wheel zip in the store, so an all-spec
+    // bundle must not pay for it. See `auto_imports_store_wheels`.
+    let mut auto_imports_index: Option<crate::auto_imports::ClosureIndex> = None;
     for (name, entry) in group_entries {
         if entry.is_spec() {
             let extras = if entry.extras.is_empty() {
@@ -9202,7 +9206,34 @@ async fn uv_group_closure(
             // this source-built entry. Nothing is pushed into `roots`; no
             // existing log line changes. This arm only fires for
             // path/git/from entries, so the scan stays off the hot path.
-            auto_imports_dry_run(name, group_name, entry, effective, target, source_dir, cache_dir);
+            let index = match auto_imports_index {
+                Some(ref idx) => idx,
+                None => {
+                    let store = wheel_store_root.clone();
+                    let wheels = tokio::task::spawn_blocking(move || {
+                        auto_imports_store_wheels(&store)
+                    })
+                    .await
+                    .unwrap_or_default();
+                    tracing::info!(
+                        bundle = %group_name,
+                        store = %wheel_store_root.display(),
+                        wheels = wheels.len(),
+                        "auto_imports_dry: indexing the wheel store for import->distribution \
+                         naming (a SUPERSET of this bundle's closure, which does not exist yet)",
+                    );
+                    let idx = tokio::task::spawn_blocking(move || {
+                        crate::auto_imports::build_index(&wheels)
+                    })
+                    .await
+                    .unwrap_or_else(|_| crate::auto_imports::build_index(&[]));
+                    auto_imports_index.insert(idx)
+                }
+            };
+            auto_imports_dry_run(
+                name, group_name, entry, effective, target, source_dir, cache_dir, index,
+            )
+            .await;
         }
     }
     // retread-deps-from: fetch + parse each configured source and append
@@ -13293,40 +13324,128 @@ fn checkout_root_for_entry(
 /// There is no existing source for this, so it is derived from two things:
 /// 1. the entry NAME, normalized to module form (`-`/`.` -> `_`, lowercased),
 ///    plus the un-normalized name as written; and
-/// 2. the source tree's own top-level package/module names -- every
-///    directory holding an `__init__.py` and every top-level `*.py` stem,
-///    looked for both at the tree root and under a `src/` layout root.
+/// 2. every intra-repo module name in the scanned tree, at ANY depth: every
+///    directory holding an `__init__.py`, and every `*.py` stem.
+///
+/// The depth matters. The earlier derivation read only `tree/` and
+/// `tree/src/`, so a module nested any deeper was invisible to it and got
+/// reported as an external requirement. Probe 5544932 measured the result:
+/// of 106 distinct non-conditional names, ~28 were not PyPI distributions at
+/// all but intra-repo modules below the root -- `vision-cfg`,
+/// `convert-amass-to-proto`, `test-settings`. Injecting those into a uv
+/// resolve is a hard failure, so they must be recognised as the tree's own.
+///
+/// The walk uses the SAME `ignore::WalkBuilder` standard filters as
+/// `import_scan`, so the set of files that can DEFINE a name is exactly the
+/// set that can USE one; a `.gitignore`d tree cannot contribute either way.
 ///
 /// Deliberately over-inclusive: a name wrongly claimed as "own" only drops a
 /// requirement from this DRY-RUN log, whereas a missing one adds a bogus row.
+/// The cost of that choice is real -- a vendored `six.py` in the tree would
+/// suppress a genuine `six` requirement -- and is accepted only because this
+/// is log-only.
 fn auto_imports_own_top_level(entry_name: &str, tree: &Path) -> std::collections::BTreeSet<String> {
     let mut own: std::collections::BTreeSet<String> = Default::default();
     own.insert(entry_name.to_string());
     own.insert(entry_name.replace(['-', '.'], "_").to_lowercase());
-    for root in [tree.to_path_buf(), tree.join("src")] {
-        let Ok(rd) = std::fs::read_dir(&root) else { continue };
-        for dent in rd.flatten() {
-            let path = dent.path();
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
-            if path.is_dir() {
-                if path.join("__init__.py").is_file() {
-                    own.insert(stem.to_string());
-                }
-            } else if path.extension().and_then(|e| e.to_str()) == Some("py") {
+    for dent in ignore::WalkBuilder::new(tree)
+        .standard_filters(true)
+        .build()
+        .flatten()
+    {
+        let path = dent.path();
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+        let is_dir = dent.file_type().is_some_and(|t| t.is_dir());
+        if is_dir {
+            if path.join("__init__.py").is_file() {
                 own.insert(stem.to_string());
             }
+        } else if path.extension().and_then(|e| e.to_str()) == Some("py") {
+            own.insert(stem.to_string());
         }
     }
     own
 }
 
+/// The `(url, rev)` an entry's checkout comes from, when it has one.
+///
+/// Split out of [`checkout_root_for_entry`] so the dry run can hand the pair
+/// to `ensure_git_checkout` rather than only deriving a path and hoping
+/// someone else already made it.
+fn checkout_source_for_entry(
+    entry: &WheelEntry,
+    git_sources: &std::collections::BTreeMap<String, crate::config::NamedGitSource>,
+) -> Option<(String, String)> {
+    if let Some(from_name) = &entry.from {
+        let src = git_sources.get(from_name)?;
+        Some((src.url.clone(), src.rev.clone()))
+    } else if let Some(git_url) = &entry.git {
+        Some((git_url.clone(), entry.rev.as_ref()?.clone()))
+    } else {
+        None
+    }
+}
+
+/// Every wheel in the content-addressed store, as an import->distribution
+/// mapping source for the dry run.
+///
+/// This is NOT the bundle's closure. The closure does not exist yet at the
+/// else-arm -- the arm runs while the ROOT LIST for that very closure is
+/// being built, so there is nothing narrower to pass. The store is a
+/// superset: every wheel retread has ever fetched or built on this machine.
+/// For a dry run whose only job is import->dist NAMING that superset is the
+/// right trade -- probe 5544932 passed an empty slice and so reported `pil`,
+/// `cv2`, `skimage` and `yaml` under their MODULE names instead of `pillow`,
+/// `opencv-python`, `scikit-image` and `pyyaml`. A superset can mis-attribute
+/// a module to a wheel not in this bundle's closure; that is a naming
+/// question, and every name still goes through the real resolver downstream
+/// when this stops being log-only.
+///
+/// Layout is `<store>/<sha256>/<real wheel filename>.whl`, so the PEP 427
+/// filename -- which is what `build_index` derives the distribution name
+/// from -- survives content addressing.
+fn auto_imports_store_wheels(store_root: &Path) -> Vec<PathBuf> {
+    let mut wheels = Vec::new();
+    let Ok(rd) = std::fs::read_dir(store_root) else { return wheels };
+    for shard in rd.flatten() {
+        if !shard.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let Ok(inner) = std::fs::read_dir(shard.path()) else { continue };
+        for f in inner.flatten() {
+            let p = f.path();
+            // Skip the `.<name>.retread-integrity-v1.json` sidecars.
+            if p.extension().and_then(|e| e.to_str()) == Some("whl")
+                && !p.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.'))
+            {
+                wheels.push(p);
+            }
+        }
+    }
+    wheels.sort();
+    wheels
+}
+
 /// LOG-ONLY: report what auto-import detection WOULD contribute for a
 /// source-built entry that milestone 1 leaves out of the uv root set.
 ///
-/// Emits nothing into the solver. Passes an EMPTY wheel slice, so every
-/// detected module falls through `resolve_imports`' name-fallback arm and is
-/// reported under its normalized module name.
-fn auto_imports_dry_run(
+/// Emits nothing into the solver.
+///
+/// MATERIALIZATION. Probe 5544932 measured 44 of 52 entries hitting the
+/// "not materialized" guard: which entries got scanned was a race against
+/// whoever happened to have cloned first. This now calls
+/// `source_build::ensure_git_checkout` -- the SAME function the build half
+/// calls (`source_build.rs:5857,5925`), keyed by the same `(url, rev)`,
+/// landing at the same `git_checkout_root` path, holding the same reader
+/// lease. It is idempotent by construction: the first caller takes EX, clones
+/// once, publishes the ready marker and downgrades to SH; everyone else takes
+/// SH. Calling it here does not change WHAT gets cloned or WHERE, only WHEN --
+/// the clone this bundle needs later is paid at closure time instead. That is
+/// why option (a) is safe here and neither (b) (move the call site) nor (c)
+/// (leave the gap, improve the log line) was needed. Failure is non-fatal:
+/// a dry run must never be able to fail a build, so a checkout error is
+/// logged and the entry is skipped.
+async fn auto_imports_dry_run(
     entry_name: &str,
     group_name: &str,
     entry: &WheelEntry,
@@ -13334,13 +13453,32 @@ fn auto_imports_dry_run(
     target: &ResolutionTarget,
     source_dir: &Path,
     cache_dir: &Path,
+    index: &crate::auto_imports::ClosureIndex,
 ) {
+    let mut checkout_lease = None;
+    if let Some((url, rev)) = checkout_source_for_entry(entry, &effective.git_sources) {
+        match crate::source_build::ensure_git_checkout(&url, &rev, cache_dir).await {
+            Ok(lease) => checkout_lease = Some(lease),
+            Err(e) => {
+                tracing::debug!(
+                    entry = %entry_name,
+                    bundle = %group_name,
+                    error = %format!("{e:#}"),
+                    "auto_imports_dry: checkout could not be materialized; nothing to scan",
+                );
+                return;
+            }
+        }
+    }
+    // The lease is held for the whole scan below; `checkout_root_for_entry`
+    // derives the path, the lease is the permission to read it.
     let checkout = checkout_root_for_entry(entry, &effective.git_sources, source_dir, cache_dir);
     let tree = crate::auto_imports::entry_source_tree(
         entry.path.as_deref(),
         entry.is_git() || entry.is_named_git(),
         source_dir,
         checkout.as_deref(),
+        entry.subdirectory.as_deref(),
     );
     let Some(tree) = tree else {
         tracing::debug!(
@@ -13350,22 +13488,37 @@ fn auto_imports_dry_run(
         );
         return;
     };
+    let scope = tree.scope;
+    let tree = tree.path;
     if !tree.is_dir() {
-        tracing::debug!(
+        tracing::info!(
             entry = %entry_name,
             bundle = %group_name,
             tree = %tree.display(),
-            "auto_imports_dry: source tree is not materialized at closure time; nothing to scan",
+            scope = %scope.as_str(),
+            materialized = checkout_lease.is_some(),
+            "auto_imports_dry: source tree is not a directory; nothing to scan",
         );
         return;
     }
+    if scope == crate::auto_imports::TreeScope::SharedCheckoutRoot {
+        tracing::info!(
+            entry = %entry_name,
+            bundle = %group_name,
+            tree = %tree.display(),
+            "auto_imports_dry: no `subdirectory` for this git entry, so the scan \
+             scope is the WHOLE shared checkout; requirements below are not \
+             attributable to this entry alone",
+        );
+    }
     let own_top_level = auto_imports_own_top_level(entry_name, &tree);
-    let report = crate::auto_imports::resolve_imports(
+    let report = crate::auto_imports::resolve_imports_with_index(
         &tree,
         &own_top_level,
         target.python_version(),
-        &[],
+        index,
     );
+    drop(checkout_lease);
     let mut conditional_count = 0usize;
     for req in &report.requirements {
         let line = req.provider.clone().unwrap_or_else(|| req.module.clone());
@@ -13386,6 +13539,7 @@ fn auto_imports_dry_run(
         entry = %entry_name,
         bundle = %group_name,
         tree = %tree.display(),
+        scope = %scope.as_str(),
         own_top_level = own_top_level.len(),
         requirements = report.requirements.len(),
         conditional = conditional_count,

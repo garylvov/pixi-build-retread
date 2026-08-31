@@ -95,7 +95,14 @@ pub struct AutoImportReport {
 ///   matching `handler/mod.rs:13613-13617`.
 /// * `git=` / `from=` -- the tree is a checkout the caller has already
 ///   materialised (`source_build::git_checkout_root`), so the caller passes
-///   it; this function will not guess a checkout location.
+///   it; this function will not guess a checkout location. The entry's
+///   `subdirectory` is joined onto that checkout, because a checkout is a
+///   REPO and an entry is a PACKAGE inside it. Without this join, every
+///   `from = "isaaclab"` entry scans the whole monorepo and the five
+///   isaaclab-* entries emit five byte-identical requirement lists that are
+///   the union of scripts/, tests and tools/ -- measured on probe 5544932.
+///   This mirrors `source_build::git_source_root`, which is what the BUILD
+///   half of the pipeline compiles: same checkout root, same `.join`.
 /// * `version=` / `url=` -- NO tree. Returns None. That is not an error: an
 ///   index wheel has no source for us to read, and its dependencies are
 ///   already declared in its own metadata.
@@ -111,16 +118,63 @@ pub fn entry_source_tree(
     is_git_backed: bool,
     source_dir: &Path,
     materialised_checkout: Option<&Path>,
-) -> Option<PathBuf> {
+    subdirectory: Option<&str>,
+) -> Option<EntrySourceTree> {
     if let Some(path) = has_path {
         let p = Path::new(path);
-        return Some(if p.is_absolute() { p.to_path_buf() } else { source_dir.join(p) });
+        let root = if p.is_absolute() { p.to_path_buf() } else { source_dir.join(p) };
+        return Some(EntrySourceTree { path: root, scope: TreeScope::DeclaredPath });
     }
     if is_git_backed {
         // Only what the caller actually materialised. Never guessed.
-        return materialised_checkout.map(Path::to_path_buf);
+        let checkout = materialised_checkout?;
+        // `subdirectory` defaults to "." (config.rs:943) and "." is exactly
+        // the case where the scope IS the whole shared checkout. Say so
+        // rather than pretending the scan is per-entry.
+        let sub = subdirectory.map(str::trim).filter(|s| !s.is_empty() && *s != ".");
+        return Some(match sub {
+            Some(sub) => EntrySourceTree {
+                path: checkout.join(sub),
+                scope: TreeScope::EntrySubdirectory,
+            },
+            None => EntrySourceTree {
+                path: checkout.to_path_buf(),
+                scope: TreeScope::SharedCheckoutRoot,
+            },
+        });
     }
     None
+}
+
+/// How narrowly the returned tree is scoped to the entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TreeScope {
+    /// `path=` entry: the declared path IS the package.
+    DeclaredPath,
+    /// `git=`/`from=` with a `subdirectory`: scoped to this entry's package.
+    EntrySubdirectory,
+    /// `git=`/`from=` with no `subdirectory`: the whole checkout, which
+    /// sibling entries of the same `(url, rev)` also see. Requirements
+    /// derived from this tree are NOT attributable to this entry alone.
+    SharedCheckoutRoot,
+}
+
+/// The tree to scan for one entry, plus how tightly it is scoped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntrySourceTree {
+    pub path: PathBuf,
+    pub scope: TreeScope,
+}
+
+impl TreeScope {
+    /// Stable log token.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TreeScope::DeclaredPath => "declared-path",
+            TreeScope::EntrySubdirectory => "entry-subdirectory",
+            TreeScope::SharedCheckoutRoot => "shared-checkout-root",
+        }
+    }
 }
 
 /// PEP 503 normalisation: the requirement form of a name.
@@ -129,7 +183,12 @@ fn normalize_dist_name(module: &str) -> String {
 }
 
 /// Index of module name -> providing wheel, built from the closure.
-struct ClosureIndex {
+///
+/// Public because building it means opening every wheel zip in the slice, and
+/// a caller scanning N entries against one slice must pay that ONCE. Building
+/// per entry is N x |slice| zip opens -- on the measured workload, 52 entries
+/// against a 300+ wheel store.
+pub struct ClosureIndex {
     by_module: BTreeMap<String, (String, ProvenanceSource)>,
     submodules: BTreeMap<String, BTreeSet<String>>,
     /// Declared extras per top-level module, from the providing wheel.
@@ -137,7 +196,7 @@ struct ClosureIndex {
     unreadable: Vec<(PathBuf, String)>,
 }
 
-fn build_index(wheels: &[PathBuf]) -> ClosureIndex {
+pub fn build_index(wheels: &[PathBuf]) -> ClosureIndex {
     let mut by_module = BTreeMap::new();
     let mut submodules: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut extras: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -199,8 +258,19 @@ pub fn resolve_imports(
     python_version: &str,
     wheels: &[PathBuf],
 ) -> AutoImportReport {
-    let index = build_index(wheels);
-    let mut report = AutoImportReport { unreadable: index.unreadable, ..Default::default() };
+    resolve_imports_with_index(root, own_top_level, python_version, &build_index(wheels))
+}
+
+/// [`resolve_imports`] against a pre-built index, so one index serves many
+/// entries. See [`ClosureIndex`] for why that matters.
+pub fn resolve_imports_with_index(
+    root: &Path,
+    own_top_level: &BTreeSet<String>,
+    python_version: &str,
+    index: &ClosureIndex,
+) -> AutoImportReport {
+    let mut report =
+        AutoImportReport { unreadable: index.unreadable.clone(), ..Default::default() };
 
     for ImportHit { module, conditional, files } in
         scan_imports_non_stdlib(root, own_top_level, python_version)
@@ -517,23 +587,58 @@ mod tests {
         let src = Path::new("/ws/pack");
         // path=, relative -> joined to source_dir (handler/mod.rs:13617)
         assert_eq!(
-            entry_source_tree(Some("./sub/pkg"), false, src, None),
-            Some(PathBuf::from("/ws/pack/./sub/pkg"))
+            entry_source_tree(Some("./sub/pkg"), false, src, None, None),
+            Some(EntrySourceTree {
+                path: PathBuf::from("/ws/pack/./sub/pkg"),
+                scope: TreeScope::DeclaredPath,
+            })
         );
         // path=, absolute -> used as-is
         assert_eq!(
-            entry_source_tree(Some("/abs/pkg"), false, src, None),
-            Some(PathBuf::from("/abs/pkg"))
+            entry_source_tree(Some("/abs/pkg"), false, src, None, None),
+            Some(EntrySourceTree {
+                path: PathBuf::from("/abs/pkg"),
+                scope: TreeScope::DeclaredPath,
+            })
         );
-        // git= with a materialised checkout -> that checkout
+        // git= with a materialised checkout and no subdirectory -> the whole
+        // checkout, flagged SHARED because sibling entries see it too.
         assert_eq!(
-            entry_source_tree(None, true, src, Some(Path::new("/cache/co"))),
-            Some(PathBuf::from("/cache/co"))
+            entry_source_tree(None, true, src, Some(Path::new("/cache/co")), None),
+            Some(EntrySourceTree {
+                path: PathBuf::from("/cache/co"),
+                scope: TreeScope::SharedCheckoutRoot,
+            })
         );
         // git= WITHOUT one -> None. Never guess a checkout location.
-        assert_eq!(entry_source_tree(None, true, src, None), None);
+        assert_eq!(entry_source_tree(None, true, src, None, None), None);
         // version= / url= -> no tree at all
-        assert_eq!(entry_source_tree(None, false, src, None), None);
+        assert_eq!(entry_source_tree(None, false, src, None, None), None);
+    }
+
+    /// The 5544932 defect: five `from = "isaaclab"` entries share ONE
+    /// checkout and, unscoped, produce five byte-identical 78-requirement
+    /// lists (the union of scripts/, tests and tools/). `subdirectory` is the
+    /// per-entry sub-path the build half already uses
+    /// (`source_build::git_source_root`), so scanning must use it too.
+    #[test]
+    fn git_entry_scopes_to_its_own_subdirectory() {
+        let src = Path::new("/ws/pack");
+        let co = Path::new("/cache/co");
+        let a = entry_source_tree(None, true, src, Some(co), Some("source/isaaclab")).unwrap();
+        let b =
+            entry_source_tree(None, true, src, Some(co), Some("source/isaaclab_assets")).unwrap();
+        assert_eq!(a.path, PathBuf::from("/cache/co/source/isaaclab"));
+        assert_eq!(b.path, PathBuf::from("/cache/co/source/isaaclab_assets"));
+        assert_ne!(a.path, b.path, "siblings must not scan one shared tree");
+        assert_eq!(a.scope, TreeScope::EntrySubdirectory);
+        // "." is the documented default and means the repo root -- which IS
+        // shared. It must report as shared, not as a per-entry scope.
+        let dot = entry_source_tree(None, true, src, Some(co), Some(".")).unwrap();
+        assert_eq!(dot.path, PathBuf::from("/cache/co"));
+        assert_eq!(dot.scope, TreeScope::SharedCheckoutRoot);
+        let blank = entry_source_tree(None, true, src, Some(co), Some("  ")).unwrap();
+        assert_eq!(blank.scope, TreeScope::SharedCheckoutRoot);
     }
 
 }
