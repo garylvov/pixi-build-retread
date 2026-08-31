@@ -97,13 +97,63 @@ pub(crate) fn rewrite_wheel_with(
     })
 }
 
+/// sha256 of a file, streamed in fixed-size chunks. Never materializes the
+/// file in RAM: isaacsim extscache wheels are ~5.9 GB, and the previous
+/// `std::fs::read` + `sha256_hex` pair paid that in resident memory on every
+/// rewrite, including the overwhelmingly common no-op one.
+fn sha256_file_hex(path: &Path) -> Result<String> {
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("hashing {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let read = file
+            .read(&mut buf)
+            .with_context(|| format!("hashing {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Recover a wheel's sha256 from its position in the content-addressed
+/// fetch store (`.../.retread-wheel-fetch/v1/sha256/<sha>/<name>.whl`),
+/// whose directory name IS the digest of the bytes underneath it. Callers
+/// also pass temp/cache paths outside the store, so this is best-effort:
+/// `None` means "hash the file".
+fn sha256_from_store_path(path: &Path) -> Option<String> {
+    let sha_dir = path.parent()?;
+    let sha = sha_dir.file_name()?.to_str()?;
+    if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
+        return None;
+    }
+    let sha256_dir = sha_dir.parent()?;
+    if sha256_dir.file_name()?.to_str()? != "sha256" {
+        return None;
+    }
+    let v1_dir = sha256_dir.parent()?;
+    if v1_dir.file_name()?.to_str()? != "v1" {
+        return None;
+    }
+    if v1_dir.parent()?.file_name()?.to_str()? != ".retread-wheel-fetch" {
+        return None;
+    }
+    Some(sha.to_string())
+}
+
 fn rewrite_wheel_metadata_with(
     src: &Path,
     dst: &Path,
     transform: &dyn Fn(&str) -> Result<String>,
 ) -> Result<(String, bool)> {
-    let bytes = std::fs::read(src).with_context(|| format!("reading {}", src.display()))?;
-    let mut archive = ZipArchive::new(Cursor::new(&bytes))
+    // Read through a File handle rather than slurping `src`: the ZIP central
+    // directory tells us where METADATA lives, so the common no-op rewrite
+    // touches a few KB instead of the whole (multi-GB) wheel.
+    let src_file =
+        std::fs::File::open(src).with_context(|| format!("reading {}", src.display()))?;
+    let mut archive = ZipArchive::new(std::io::BufReader::new(src_file))
         .with_context(|| format!("opening zip {}", src.display()))?;
 
     // Find the root-level dist-info directory (one with exactly one `/`).
@@ -152,7 +202,13 @@ fn rewrite_wheel_metadata_with(
             std::fs::copy(src, &tmp)?;
         }
         crate::wheel::commit_atomic_write(&tmp, dst)?;
-        let h = sha256_hex(&bytes);
+        // The output is byte-identical to `src`, so its digest is `src`'s.
+        // Prefer the content-addressed store path's own digest; fall back to
+        // a streaming hash for temp/cache sources outside the store.
+        let h = match sha256_from_store_path(src) {
+            Some(sha) => sha,
+            None => sha256_file_hex(src)?,
+        };
         return Ok((h, false));
     }
     let new_metadata_bytes = new_metadata.as_bytes();
@@ -211,9 +267,9 @@ fn rewrite_wheel_metadata_with(
     drop(finished);
     crate::wheel::commit_atomic_write(&tmp, dst)?;
 
-    // sha256 of the rewritten wheel file (for recipe.yaml's source: sha256).
-    let dst_bytes = std::fs::read(dst)?;
-    Ok((sha256_hex(&dst_bytes), true))
+    // sha256 of the rewritten wheel file (for recipe.yaml's source: sha256),
+    // streamed so a multi-GB rewrite never doubles as a multi-GB allocation.
+    Ok((sha256_file_hex(dst)?, true))
 }
 
 pub(crate) fn inject_native_abi_metadata(
