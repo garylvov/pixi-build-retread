@@ -5827,11 +5827,92 @@ fn closure_metadata_from_lock(
     Ok((dependency_graph, owned_drops))
 }
 
+/// Process-wide memo for [`validate_built_wheel_sources`], keyed by
+/// [`built_source_validation_key`]. The expensive half of validation is
+/// `read_metadata_strict`, which inflates every ZIP member: an isaacsim
+/// extscache wheel is ~5.9 GB and costs ~45 s per read. A closure is
+/// re-validated once per relax retry (measured: isaac-pack-latest validated
+/// 5x in one solve, 302.7 s total, all of it identical work), so the first
+/// computation pays for the whole run.
+#[allow(clippy::type_complexity)]
+static BUILT_SOURCE_VALIDATION_MEMO: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, (BTreeMap<String, PathBuf>, String)>>,
+> = std::sync::OnceLock::new();
+
+#[allow(clippy::type_complexity)]
+fn built_source_validation_memo()
+-> &'static std::sync::Mutex<std::collections::HashMap<String, (BTreeMap<String, PathBuf>, String)>>
+{
+    BUILT_SOURCE_VALIDATION_MEMO.get_or_init(Default::default)
+}
+
+/// Cheap identity for one `validate_built_wheel_sources` call: the requested
+/// sources, each source file's `(len, mtime)`, the resolution target, and the
+/// explicit pins actually consulted. `None` whenever an input cannot be
+/// stat'd, which forces the full validation path rather than trusting a
+/// possibly-stale entry — a memo hit must never be able to accept a wheel the
+/// full path would have rejected.
+fn built_source_validation_key(
+    req: &UvClosureRequest,
+    target: &ResolutionTarget,
+) -> Option<String> {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"retread-built-wheel-source-memo-v1\0");
+    let field = |hasher: &mut Sha256, value: &[u8]| {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value);
+    };
+    field(&mut hasher, target.python_version().as_bytes());
+    field(&mut hasher, target.conda_subdir().as_bytes());
+    for (requested_name, path) in &req.built_wheel_sources {
+        let metadata = std::fs::metadata(path).ok()?;
+        let mtime = metadata
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        field(&mut hasher, requested_name.as_bytes());
+        field(&mut hasher, path.as_os_str().as_encoded_bytes());
+        hasher.update(metadata.len().to_be_bytes());
+        hasher.update(mtime.as_secs().to_be_bytes());
+        hasher.update(mtime.subsec_nanos().to_be_bytes());
+        // Only the pin for this name is consulted by validation.
+        let pin = req
+            .explicit_pins
+            .get(&canonical_conda_name(requested_name))
+            .map(String::as_str)
+            .unwrap_or("");
+        field(&mut hasher, pin.as_bytes());
+    }
+    Some(format!("{:x}", hasher.finalize()))
+}
+
 fn validate_built_wheel_sources(
     req: &mut UvClosureRequest,
     target: &ResolutionTarget,
 ) -> Result<String> {
     use sha2::{Digest, Sha256};
+
+    // Memo lookup BEFORE the `mem::take` below, so a hit leaves `req` holding
+    // the same normalized (canonicalized) sources the full path would have
+    // written back. Errors are never memoized: an invalid source re-fails.
+    let memo_key = built_source_validation_key(req, target);
+    if let Some(key) = memo_key.as_ref() {
+        let hit = built_source_validation_memo()
+            .lock()
+            .ok()
+            .and_then(|memo| memo.get(key).cloned());
+        if let Some((normalized_sources, fingerprint)) = hit {
+            tracing::info!(
+                sources = normalized_sources.len(),
+                "bench: built-wheel source validation memo hit",
+            );
+            req.built_wheel_sources = normalized_sources;
+            return Ok(fingerprint);
+        }
+    }
 
     let sources = std::mem::take(&mut req.built_wheel_sources);
     let mut normalized_sources = BTreeMap::new();
@@ -5929,7 +6010,13 @@ fn validate_built_wheel_sources(
         normalized_sources.insert(requested_name, path);
     }
     req.built_wheel_sources = normalized_sources;
-    Ok(format!("{:x}", fingerprint.finalize()))
+    let fingerprint = format!("{:x}", fingerprint.finalize());
+    if let Some(key) = memo_key {
+        if let Ok(mut memo) = built_source_validation_memo().lock() {
+            memo.insert(key, (req.built_wheel_sources.clone(), fingerprint.clone()));
+        }
+    }
+    Ok(fingerprint)
 }
 
 /// Compute the closure for `req` under `project_dir` (created if absent):
