@@ -148,6 +148,13 @@ fn rewrite_wheel_metadata_with(
     dst: &Path,
     transform: &dyn Fn(&str) -> Result<String>,
 ) -> Result<(String, bool)> {
+    // bench (measurement only): this is the single choke point every wheel
+    // METADATA rewrite passes through (rewrite_wheel_with,
+    // inject_native_abi_metadata). Cost is dominated by whether the no-op
+    // hard-link fast path is taken or the whole (multi-GB) zip is re-emitted.
+    let rewrite_started = std::time::Instant::now();
+    let src_bytes = std::fs::metadata(src).map(|m| m.len()).unwrap_or(0);
+
     // Read through a File handle rather than slurping `src`: the ZIP central
     // directory tells us where METADATA lives, so the common no-op rewrite
     // touches a few KB instead of the whole (multi-GB) wheel.
@@ -197,18 +204,30 @@ fn rewrite_wheel_metadata_with(
         // mid-operation leaves either the old `dst` or the new one,
         // never neither/a truncated stub.
         let tmp = crate::wheel::atomic_tmp_path(dst);
-        if std::fs::hard_link(src, &tmp).is_err() {
+        let linked = if std::fs::hard_link(src, &tmp).is_err() {
             let _ = std::fs::remove_file(&tmp);
             std::fs::copy(src, &tmp)?;
-        }
+            false
+        } else {
+            true
+        };
         crate::wheel::commit_atomic_write(&tmp, dst)?;
         // The output is byte-identical to `src`, so its digest is `src`'s.
         // Prefer the content-addressed store path's own digest; fall back to
         // a streaming hash for temp/cache sources outside the store.
-        let h = match sha256_from_store_path(src) {
-            Some(sha) => sha,
-            None => sha256_file_hex(src)?,
+        let (h, sha_source) = match sha256_from_store_path(src) {
+            Some(sha) => (sha, "store-path"),
+            None => (sha256_file_hex(src)?, "streamed"),
         };
+        tracing::info!(
+            src = %src.display(),
+            dst = %dst.display(),
+            bytes = src_bytes,
+            path = if linked { "no-op/hard-link" } else { "no-op/copy" },
+            sha_source,
+            elapsed_ms = rewrite_started.elapsed().as_millis() as u64,
+            "bench: rewrite_wheel_metadata_with",
+        );
         return Ok((h, false));
     }
     let new_metadata_bytes = new_metadata.as_bytes();
@@ -269,7 +288,17 @@ fn rewrite_wheel_metadata_with(
 
     // sha256 of the rewritten wheel file (for recipe.yaml's source: sha256),
     // streamed so a multi-GB rewrite never doubles as a multi-GB allocation.
-    Ok((sha256_file_hex(dst)?, true))
+    let dst_sha = sha256_file_hex(dst)?;
+    tracing::info!(
+        src = %src.display(),
+        dst = %dst.display(),
+        bytes = src_bytes,
+        path = "changed/rewrite",
+        sha_source = "streamed",
+        elapsed_ms = rewrite_started.elapsed().as_millis() as u64,
+        "bench: rewrite_wheel_metadata_with",
+    );
+    Ok((dst_sha, true))
 }
 
 pub(crate) fn inject_native_abi_metadata(

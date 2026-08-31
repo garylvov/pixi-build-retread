@@ -13918,11 +13918,27 @@ async fn materialize_and_rewrite_with_abi_aliases(
         with_data_path
     } else {
         let rewritten = with_data_path.with_extension("relaxed.whl");
+        // bench (measurement only): the relaxed-wheel cache hit is a distinct
+        // call site from rewrite_wheel_metadata_with -- it skips the rewrite
+        // entirely, so its cost is the freshness stamp check alone. Time the
+        // whole phase-2 block so hit and miss are directly comparable.
+        let relax_started = std::time::Instant::now();
+        let relax_bytes = std::fs::metadata(&with_data_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
         if is_relaxed_wheel_cache_fresh(&rewritten, &with_data_path, relax, abi_aliases)? {
             tracing::info!(
                 entry = %entry_name,
                 wheel = %rewritten.display(),
                 "reusing cached relaxed wheel",
+            );
+            tracing::info!(
+                entry = %entry_name,
+                wheel = %rewritten.display(),
+                bytes = relax_bytes,
+                path = "cache-hit",
+                elapsed_ms = relax_started.elapsed().as_millis() as u64,
+                "bench: phase2_relax_wheel",
             );
         } else {
             tracing::info!(
@@ -13945,6 +13961,14 @@ async fn materialize_and_rewrite_with_abi_aliases(
                 )
             })?;
             write_relaxed_wheel_cache_stamp(&rewritten, relax, abi_aliases)?;
+            tracing::info!(
+                entry = %entry_name,
+                wheel = %rewritten.display(),
+                bytes = relax_bytes,
+                path = "cache-miss",
+                elapsed_ms = relax_started.elapsed().as_millis() as u64,
+                "bench: phase2_relax_wheel",
+            );
         }
         rewritten
     };
