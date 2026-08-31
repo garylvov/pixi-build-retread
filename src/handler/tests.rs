@@ -7685,6 +7685,93 @@ fn root_req_name_normalizes_pep508_names() {
     assert_eq!(root_req_name("!!! not a requirement !!!"), None);
 }
 
+/// Lane C skip guard. Every row is a name the p4n dry run (job 5545786)
+/// actually produced against the real 27-env workspace, so this pins the
+/// measured behaviour, not a hypothetical.
+#[test]
+fn auto_imports_injection_verdict_skips_unmappable_names() {
+    use crate::auto_imports::{ProvenanceSource, ResolvedImport};
+
+    fn req(module: &str, provider: &str, indexed: bool, conditional: bool) -> ResolvedImport {
+        ResolvedImport {
+            module: module.to_string(),
+            provider: Some(provider.to_string()),
+            source: indexed.then_some(ProvenanceSource::TopLevelTxt),
+            conditional,
+            files: vec![std::path::PathBuf::from("a.py")],
+        }
+    }
+    let siblings: BTreeSet<String> =
+        ["isaaclab-assets", "isaaclab-tasks"].iter().map(|s| s.to_string()).collect();
+    let verdict = |r: &ResolvedImport| auto_imports_injection_verdict(r, &siblings);
+
+    // --- INJECTED ---
+    // Index-provided: PIL -> pillow, the naming the warm wheel slice gave.
+    assert_eq!(verdict(&req("PIL", "pillow", true, false)), Ok("pillow".to_string()));
+    // Fallback-named but plausible: conda-provided roots absent from a cold
+    // wheel slice must still be injected.
+    for (module, name) in
+        [("numpy", "numpy"), ("torch", "torch"), ("dm_control", "dm-control"), ("mani_skill", "mani-skill")]
+    {
+        assert_eq!(verdict(&req(module, name, false, false)), Ok(name.to_string()), "{module}");
+    }
+    // An INDEX-provided name is authoritative even with many segments, and
+    // even when it is on the denylist.
+    assert_eq!(
+        verdict(&req("some_mod", "a-b-c-d", true, false)),
+        Ok("a-b-c-d".to_string())
+    );
+    assert_eq!(verdict(&req("warp", "warp-lang", true, false)), Ok("warp-lang".to_string()));
+
+    // --- SKIPPED, with the reason each one is skipped for ---
+    // (a) conditional: `import cv2` inside a try/except.
+    assert!(verdict(&req("cv2", "cv2", false, true)).unwrap_err().contains("conditional"));
+    // (b) not PEP 508: `_winreg` normalizes to a leading-hyphen name.
+    assert!(verdict(&req("_winreg", "-winreg", false, false)).unwrap_err().contains("PEP 508"));
+    // (c) sibling entry of the same bundle.
+    assert!(
+        verdict(&req("isaaclab_assets", "isaaclab-assets", false, false))
+            .unwrap_err()
+            .contains("another entry")
+    );
+    // (d) host-application internals with no PyPI distribution. `warp` and
+    // `mpl_toolkits` matter most: those DO resolve, to unrelated projects.
+    for module in ["pxr", "carb", "omni", "usdrt", "bpy", "mathutils", "warp", "mpl_toolkits"] {
+        let name = module.replace('_', "-");
+        assert!(
+            verdict(&req(module, &name, false, false)).unwrap_err().contains("no PyPI distribution"),
+            "{module} must be denied"
+        );
+    }
+    // (e) repo-local module paths the own-top-level screen missed because
+    // they live in a SIBLING directory of a shared checkout.
+    for (module, name) in [
+        ("convert_rigv1_to_proto", "convert-rigv1-to-proto"),
+        ("frame_view_contract_utils", "frame-view-contract-utils"),
+    ] {
+        assert!(
+            verdict(&req(module, name, false, false)).unwrap_err().contains("repo-local"),
+            "{module} must be denied"
+        );
+    }
+    // No provider name at all is never injected.
+    let mut nameless = req("x", "x", false, false);
+    nameless.provider = None;
+    assert!(verdict(&nameless).is_err());
+}
+
+/// The gate is OFF unless the value is exactly `1`.
+#[test]
+fn auto_imports_injection_is_off_by_default() {
+    // Not asserting on the process env (tests share it); assert the parse.
+    let parse = |v: Option<&str>| v.map(|v| v == "1").unwrap_or(false);
+    assert!(!parse(None));
+    assert!(!parse(Some("")));
+    assert!(!parse(Some("0")));
+    assert!(!parse(Some("true")));
+    assert!(parse(Some("1")));
+}
+
 #[test]
 fn dedupe_roots_last_wins_keeps_last_occurrence_by_name() {
     let roots = vec![

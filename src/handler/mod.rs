@@ -9142,6 +9142,17 @@ async fn uv_group_closure(
     // then: building it opens every wheel zip in the store, so an all-spec
     // bundle must not pay for it. See `auto_imports_store_wheels`.
     let mut auto_imports_index: Option<crate::auto_imports::ClosureIndex> = None;
+    // Lane C: roots detected from source-built entries' imports. Collected
+    // separately and PREPENDED to `roots` after the loop, so that on a
+    // same-name collision both `[retread-wheels]` roots and `retread-deps-from`
+    // roots -- both appended later -- win under `dedupe_roots_last_wins`.
+    let mut auto_imports_roots: Vec<String> = Vec::new();
+    // Sibling entries of this bundle, canonicalized: an import naming one of
+    // these is intra-bundle, not a PyPI requirement.
+    let auto_imports_siblings: BTreeSet<String> = group_entries
+        .iter()
+        .map(|(name, _)| canonical_conda_name(name))
+        .collect();
     for (name, entry) in group_entries {
         if entry.is_spec() {
             let extras = if entry.extras.is_empty() {
@@ -9230,11 +9241,37 @@ async fn uv_group_closure(
                     auto_imports_index.insert(idx)
                 }
             };
-            auto_imports_dry_run(
-                name, group_name, entry, effective, target, source_dir, cache_dir, index,
-            )
-            .await;
+            auto_imports_roots.extend(
+                auto_imports_dry_run(
+                    name,
+                    group_name,
+                    entry,
+                    effective,
+                    target,
+                    source_dir,
+                    cache_dir,
+                    index,
+                    &auto_imports_siblings,
+                )
+                .await,
+            );
         }
+    }
+    // Prepend, so every explicitly declared root outranks a detected one.
+    // Empty unless RETREAD_AUTO_IMPORTS=1, so this is a no-op by default.
+    if !auto_imports_roots.is_empty() {
+        auto_imports_roots.sort();
+        auto_imports_roots.dedup();
+        tracing::info!(
+            bundle = %group_name,
+            injected = auto_imports_roots.len(),
+            declared_roots = roots.len(),
+            roots = %auto_imports_roots.join(","),
+            "auto_imports: injecting detected requirements as uv roots \
+             (RETREAD_AUTO_IMPORTS=1); declared roots win on name collisions",
+        );
+        auto_imports_roots.extend(std::mem::take(&mut roots));
+        roots = dedupe_roots_last_wins(auto_imports_roots);
     }
     // retread-deps-from: fetch + parse each configured source and append
     // its PEP 508 lines as additional roots. A pure deps-from bundle (no
@@ -13344,6 +13381,95 @@ fn checkout_root_for_entry(
 /// The cost of that choice is real -- a vendored `six.py` in the tree would
 /// suppress a genuine `six` requirement -- and is accepted only because this
 /// is log-only.
+/// Lane C master switch. OFF unless `RETREAD_AUTO_IMPORTS=1` exactly, so a
+/// merge of this code changes no existing lock: with the var unset the scan
+/// still runs and still logs (the dry run is unchanged), but every detected
+/// requirement is reported as `injected=false`.
+fn auto_imports_injection_enabled() -> bool {
+    std::env::var("RETREAD_AUTO_IMPORTS").map(|v| v == "1").unwrap_or(false)
+}
+
+/// Import names that provably have NO PyPI distribution of the same meaning:
+/// USD/Omniverse/Isaac/Blender/matplotlib internals that ship with a host
+/// application or a parent distribution, never as a same-named wheel. Naming
+/// one as a root is not "let the solver decide" -- `pxr` and `carb` do not
+/// resolve at all, and `warp` / `mpl-toolkits` resolve to an UNRELATED
+/// project, which is worse. Consulted ONLY for fallback-named requirements
+/// (`source == None`): if the bundle's own wheel slice really does provide
+/// the module, the index is authority and the denylist does not apply.
+const AUTO_IMPORTS_NO_PYPI_DISTRIBUTION: &[&str] = &[
+    "bmesh",
+    "bpy",
+    "carb",
+    "gymtorch",
+    "isaacgym",
+    "isaacgymenvs",
+    "mathutils",
+    "mpl_toolkits",
+    "omni",
+    "pxr",
+    "pysurvive",
+    "usdrt",
+    "usdshade",
+    "warp",
+];
+
+/// Verdict for one detected import: `Ok(root)` to inject, `Err(reason)` to
+/// log and skip. Never panics, never injects on doubt.
+///
+/// The governing rule: a detected import may become a root ONLY if its name
+/// maps to a distribution we have some reason to believe exists. Two ways to
+/// earn that -- the wheel-store index provides the module (`source` is
+/// `Some`, authoritative), or the PEP 503 fallback name is *plausibly* a
+/// distribution name. Everything else is logged and skipped, never injected.
+fn auto_imports_injection_verdict(
+    req: &crate::auto_imports::ResolvedImport,
+    sibling_entries: &BTreeSet<String>,
+) -> std::result::Result<String, &'static str> {
+    // (a) Conditional imports are optional by construction (every import site
+    // sits in a try/except). Requiring one turns an optional feature into a
+    // hard resolve failure.
+    if req.conditional {
+        return Err("conditional import (every site is inside try/except)");
+    }
+    let Some(name) = req.provider.as_deref() else {
+        return Err("no distribution name at all");
+    };
+    // (b) Must be a legal PEP 508 root. Kills shapes like `_winreg` ->
+    // `-winreg`, which uv rejects outright.
+    let Some(canonical) = root_req_name(name) else {
+        return Err("not a parseable PEP 508 requirement name");
+    };
+    // (c) A sibling entry of this same bundle is already a root (spec entry)
+    // or is built from source here (`isaaclab-tasks` importing
+    // `isaaclab_assets`). Re-adding it as a PyPI root would send uv to the
+    // index for something this bundle produces itself.
+    if sibling_entries.contains(&canonical) {
+        return Err("names another entry of this same bundle");
+    }
+    if req.source.is_some() {
+        // Index-provided: a wheel in the store really ships this module under
+        // this distribution name. Authoritative; no further screening.
+        return Ok(canonical);
+    }
+    // --- fallback naming from here down: the name is a GUESS. ---
+    // (d) Known host-application internals.
+    if AUTO_IMPORTS_NO_PYPI_DISTRIBUTION.contains(&req.module.as_str()) {
+        return Err("module has no PyPI distribution (host-application internal)");
+    }
+    // (e) Intra-repo module PATH shapes. A distribution name carries at most
+    // one separator in practice (`dm-control`, `mani-skill`, `opencv-python`);
+    // two or more is the signature of a repo-local module such as
+    // `convert_rigv1_to_proto` or `frame_view_contract_utils`, which the
+    // own-top-level screen missed because it lives in a SIBLING directory of
+    // a shared checkout. Only applied to guesses: an index-provided name with
+    // three separators is still a real distribution.
+    if canonical.matches('-').count() >= 2 {
+        return Err("multi-segment name reads as a repo-local module path, not a distribution");
+    }
+    Ok(canonical)
+}
+
 fn auto_imports_own_top_level(entry_name: &str, tree: &Path) -> std::collections::BTreeSet<String> {
     let mut own: std::collections::BTreeSet<String> = Default::default();
     own.insert(entry_name.to_string());
@@ -13454,7 +13580,8 @@ async fn auto_imports_dry_run(
     source_dir: &Path,
     cache_dir: &Path,
     index: &crate::auto_imports::ClosureIndex,
-) {
+    sibling_entries: &BTreeSet<String>,
+) -> Vec<String> {
     let mut checkout_lease = None;
     if let Some((url, rev)) = checkout_source_for_entry(entry, &effective.git_sources) {
         match crate::source_build::ensure_git_checkout(&url, &rev, cache_dir).await {
@@ -13466,7 +13593,7 @@ async fn auto_imports_dry_run(
                     error = %format!("{e:#}"),
                     "auto_imports_dry: checkout could not be materialized; nothing to scan",
                 );
-                return;
+                return Vec::new();
             }
         }
     }
@@ -13486,7 +13613,7 @@ async fn auto_imports_dry_run(
             bundle = %group_name,
             "auto_imports_dry: no local source tree for this entry; nothing to scan",
         );
-        return;
+        return Vec::new();
     };
     let scope = tree.scope;
     let tree = tree.path;
@@ -13499,7 +13626,7 @@ async fn auto_imports_dry_run(
             materialized = checkout_lease.is_some(),
             "auto_imports_dry: source tree is not a directory; nothing to scan",
         );
-        return;
+        return Vec::new();
     }
     if scope == crate::auto_imports::TreeScope::SharedCheckoutRoot {
         tracing::info!(
@@ -13519,22 +13646,53 @@ async fn auto_imports_dry_run(
         index,
     );
     drop(checkout_lease);
+    let inject = auto_imports_injection_enabled();
     let mut conditional_count = 0usize;
+    let mut skipped_count = 0usize;
+    let mut injected: Vec<String> = Vec::new();
     for req in &report.requirements {
         let line = req.provider.clone().unwrap_or_else(|| req.module.clone());
         if req.conditional {
             conditional_count += 1;
         }
-        tracing::info!(
-            entry = %entry_name,
-            bundle = %group_name,
-            module = %req.module,
-            conditional = req.conditional,
-            would_emit = %line,
-            files = req.files.len(),
-            "auto_imports_dry: detected requirement (NOT added to roots)",
-        );
+        // The verdict is computed WHETHER OR NOT injection is enabled, so the
+        // OFF arm still measures exactly what the ON arm would have done.
+        match auto_imports_injection_verdict(req, sibling_entries) {
+            Ok(root) => {
+                if inject {
+                    injected.push(root.clone());
+                }
+                tracing::info!(
+                    entry = %entry_name,
+                    bundle = %group_name,
+                    module = %req.module,
+                    conditional = req.conditional,
+                    would_emit = %line,
+                    root = %root,
+                    indexed = req.source.is_some(),
+                    injected = inject,
+                    files = req.files.len(),
+                    "auto_imports_dry: detected requirement (INJECTABLE)",
+                );
+            }
+            Err(reason) => {
+                skipped_count += 1;
+                tracing::info!(
+                    entry = %entry_name,
+                    bundle = %group_name,
+                    module = %req.module,
+                    conditional = req.conditional,
+                    would_emit = %line,
+                    indexed = req.source.is_some(),
+                    skip_reason = reason,
+                    files = req.files.len(),
+                    "auto_imports_dry: detected requirement SKIPPED (never injected)",
+                );
+            }
+        }
     }
+    injected.sort();
+    injected.dedup();
     tracing::info!(
         entry = %entry_name,
         bundle = %group_name,
@@ -13543,10 +13701,15 @@ async fn auto_imports_dry_run(
         own_top_level = own_top_level.len(),
         requirements = report.requirements.len(),
         conditional = conditional_count,
+        skipped = skipped_count,
+        injectable = report.requirements.len() - skipped_count,
+        injected = injected.len(),
+        enabled = inject,
         unmapped = report.unmapped.len(),
         extra_hints = report.extra_hints.len(),
-        "auto_imports_dry: summary for this source-built entry (log-only, roots unchanged)",
+        "auto_imports_dry: summary for this source-built entry",
     );
+    injected
 }
 
 /// v0.12.0+: per-bundle configuration for the auto-data-files inject
