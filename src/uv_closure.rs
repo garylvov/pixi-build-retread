@@ -5877,8 +5877,19 @@ fn validate_built_wheel_sources(
                 "built-wheel source identity mismatch: request names `{requested_name_canonical}` but filename names `{filename_name}`"
             );
         }
+        // bench (measurement only): read_metadata_strict decompresses every ZIP
+        // member, so its cost tracks the wheel's on-disk size. Record both.
+        let source_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let read_metadata_started = std::time::Instant::now();
         let metadata = crate::wheel::read_metadata_strict(&path)
             .with_context(|| format!("validating built-wheel source {}", path.display()))?;
+        tracing::info!(
+            source = %requested_name_canonical,
+            path = %path.display(),
+            bytes = source_bytes,
+            elapsed_ms = read_metadata_started.elapsed().as_millis() as u64,
+            "bench: built-wheel source metadata read",
+        );
         if canonical_conda_name(&metadata.name) != requested_name_canonical {
             bail!(
                 "built-wheel source identity mismatch: request names `{requested_name_canonical}` but METADATA names `{}`",
@@ -5969,6 +5980,8 @@ pub(crate) async fn compute_closure_for_target(
     }
     let normalized_req = req.clone();
     let target_for_validation = target.clone();
+    let validate_started = std::time::Instant::now();
+    let built_source_count = normalized_req.built_wheel_sources.len();
     let (normalized_req, built_source_fingerprint) = tokio::task::spawn_blocking(move || {
         let mut normalized_req = normalized_req;
         let fingerprint =
@@ -5977,14 +5990,33 @@ pub(crate) async fn compute_closure_for_target(
     })
     .await
     .context("built-wheel source validation task panicked")??;
+    tracing::info!(
+        bundle = %normalized_req.bundle,
+        sources = built_source_count,
+        elapsed_ms = validate_started.elapsed().as_millis() as u64,
+        "bench: validate_built_wheel_sources",
+    );
     let req = &normalized_req;
     let project_dir_storage = resolution_project_dir(project_dir, target);
     let uv_cache_dir_storage = artifact_uv_cache_dir(uv_cache_dir, target);
     let project_dir = project_dir_storage.as_path();
     let uv_cache_dir = uv_cache_dir_storage.as_path();
     let resolution_identity = target.resolution_identity();
+    let project_lock_started = std::time::Instant::now();
     let _project_lock = acquire_closure_project_lock(project_dir).await?;
+    tracing::info!(
+        bundle = %req.bundle,
+        project = %project_dir.display(),
+        elapsed_ms = project_lock_started.elapsed().as_millis() as u64,
+        "bench: acquire_closure_project_lock",
+    );
+    let detect_uv_started = std::time::Instant::now();
     let (uv_bin, uv_version) = detect_uv().await?;
+    tracing::info!(
+        bundle = %req.bundle,
+        elapsed_ms = detect_uv_started.elapsed().as_millis() as u64,
+        "bench: detect_uv",
+    );
     tracing::info!(
         uv = %uv_bin.display(),
         version = %uv_version,
