@@ -7734,13 +7734,9 @@ fn auto_imports_injection_verdict_skips_unmappable_names() {
             .unwrap_err()
             .contains("another entry")
     );
-    // (d) host-application internals with no PyPI distribution. `warp` and
+    // (g1) host-application internals with no PyPI distribution. `warp` and
     // `mpl_toolkits` matter most: those DO resolve, to unrelated projects.
-    // `hydra` is the same shape: the PyPI project of that name is unrelated
-    // and wheel-less, and injecting it UNSAT'd arm B of job 5547304.
-    for module in
-        ["pxr", "carb", "omni", "usdrt", "bpy", "mathutils", "warp", "mpl_toolkits", "hydra"]
-    {
+    for module in ["pxr", "carb", "omni", "usdrt", "bpy", "mathutils", "warp", "mpl_toolkits"] {
         let name = module.replace('_', "-");
         assert!(
             verdict(&req(module, &name, false, false)).unwrap_err().contains("no PyPI distribution"),
@@ -7774,11 +7770,15 @@ fn auto_imports_injection_verdict_skips_unmappable_names() {
             "{module} must be denied"
         );
     }
-    // The prefix rule must not swallow unrelated names that merely start
-    // with the same letters, nor an index-provided Isaac Lab naming.
-    assert_eq!(verdict(&req("isaaclabel", "isaaclabel", false, false)), Ok("isaaclabel".to_string()));
+    // The prefix rule must not swallow unrelated names that merely start with
+    // the same letters -- `isaaclabel` is refused as an unmapped LEAD, not as
+    // an Isaac Lab extension.
+    assert_eq!(
+        verdict(&req("isaaclabel", "isaaclabel", false, false)),
+        Err(AUTO_IMPORTS_LEAD_REASON)
+    );
     // (`isaaclab_tasks` is a sibling in this fixture, so screen (c) claims it
-    // first; use a non-sibling to exercise index authority over (d2).)
+    // first; use a non-sibling to exercise index authority over (g2).)
     assert_eq!(
         verdict(&req("isaaclab_newton", "isaaclab-newton", true, false)),
         Ok("isaaclab-newton".to_string())
@@ -7798,6 +7798,111 @@ fn auto_imports_injection_verdict_skips_unmappable_names() {
     let mut nameless = req("x", "x", false, false);
     nameless.provider = None;
     assert!(verdict(&nameless).is_err());
+
+    // --- (e) CURATED MAP: the only naming source besides the index ---
+    // Each of these UNSAT'd or would have UNSAT'd a real 27-env lock under
+    // the old guess-and-see rule. The map must inject the MAPPED name, not
+    // the PEP 503 fallback, even though the fallback is what `provider`
+    // carries on a cold store.
+    for (module, fallback, mapped) in [
+        ("PIL", "pil", "pillow"),               // UNSAT'd job 5549254 arm B
+        ("hydra", "hydra", "hydra-core"),       // UNSAT'd job 5547304 arm B
+        ("cv2", "cv2", "opencv-python"),
+        ("sklearn", "sklearn", "scikit-learn"),
+        ("skimage", "skimage", "scikit-image"),
+        ("yaml", "yaml", "pyyaml"),
+        ("zmq", "zmq", "pyzmq"),
+        ("absl", "absl", "absl-py"),
+        ("bs4", "bs4", "beautifulsoup4"),
+        ("dateutil", "dateutil", "python-dateutil"),
+        ("attr", "attr", "attrs"),
+        ("box", "box", "python-box"),
+    ] {
+        assert_eq!(
+            verdict(&req(module, fallback, false, false)),
+            Ok(mapped.to_string()),
+            "{module} must map to {mapped}, not the fallback {fallback}"
+        );
+    }
+    // Identity rows are assertions too: these inject because they are IN the
+    // table, not because the fallback happened to look right.
+    for module in ["omegaconf", "wandb", "numpy", "torch", "gymnasium", "tqdm"] {
+        assert_eq!(
+            verdict(&req(module, module, false, false)),
+            Ok(module.to_string()),
+            "{module} is a checked identity row"
+        );
+    }
+
+    // --- (h) UNMAPPED FALLBACK GUESSES ARE LEADS, NEVER ROOTS ---
+    // Every one of these is a real name the dry run produced and that appears
+    // NOWHERE in the 1549-name baseline lock of job 5549254 arm A -- i.e. the
+    // backlog of UNSATs that guess-and-see still had queued up.
+    for module in [
+        "alphashape", "annoy", "curobo", "easynmt", "faiss", "gr00t", "hnswlib",
+        "isaacteleop", "lafan1", "phc", "poselib", "pyfqmr", "pyroki", "opustools",
+    ] {
+        assert_eq!(
+            verdict(&req(module, module, false, false)),
+            Err(AUTO_IMPORTS_LEAD_REASON),
+            "{module} is unmapped and unindexed: lead only"
+        );
+    }
+
+    // --- DETERMINISM: the verdict for a mapped module cannot depend on
+    // whether the wheel store happened to be warm. Job 5549254 arm A emitted
+    // BOTH `pillow` and `pil` for module `PIL` inside a single run because
+    // the index answered differently mid-scan. Cold (fallback `provider`,
+    // no index) and warm (index-provided) must now agree. ---
+    for (module, cold_provider, warm_provider, expected) in [
+        ("PIL", "pil", "pillow", "pillow"),
+        ("cv2", "cv2", "opencv-python", "opencv-python"),
+        ("hydra", "hydra", "hydra-core", "hydra-core"),
+    ] {
+        let cold = verdict(&req(module, cold_provider, false, false));
+        let warm = verdict(&req(module, warm_provider, true, false));
+        assert_eq!(cold, Ok(expected.to_string()), "{module} cold");
+        assert_eq!(warm, Ok(expected.to_string()), "{module} warm");
+        assert_eq!(cold, warm, "{module}: verdict must not depend on store warmth");
+    }
+    // Determinism holds even when the index DISAGREES with the table: the
+    // table wins, so two entries scanned at different store states cannot
+    // produce two different roots for one module.
+    assert_eq!(
+        verdict(&req("PIL", "pil-something-else", true, false)),
+        Ok("pillow".to_string()),
+        "the curated table outranks the index"
+    );
+    // An unmapped module is a lead when cold and a root when the index knows
+    // it -- that asymmetry is intended (the index is evidence, the fallback
+    // is not), and is the one case where warmth legitimately matters.
+    assert_eq!(verdict(&req("annoy", "annoy", false, false)), Err(AUTO_IMPORTS_LEAD_REASON));
+    assert_eq!(verdict(&req("annoy", "annoy", true, false)), Ok("annoy".to_string()));
+}
+
+/// The curated table is a set of CLAIMS about PyPI. Guard its shape so a
+/// careless edit cannot introduce a duplicate key, an unsorted-by-accident
+/// lookup miss, or a value that is not a legal PEP 508 requirement name.
+#[test]
+fn auto_imports_distribution_map_is_well_formed() {
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for (module, dist) in AUTO_IMPORTS_DISTRIBUTION_MAP {
+        assert!(seen.insert(*module), "duplicate key in the map: {module}");
+        assert!(!module.is_empty(), "empty module key");
+        // Every value must survive PEP 508 parsing unchanged -- i.e. it is
+        // already canonical, so injection emits exactly what is written here.
+        let canonical =
+            root_req_name(dist).unwrap_or_else(|| panic!("{dist} is not a PEP 508 name"));
+        assert_eq!(canonical.as_str(), *dist, "map value {dist} is not PEP 503 canonical");
+        // Lookup must actually find it.
+        assert_eq!(auto_imports_mapped_distribution(module), Some(*dist));
+    }
+    // A module NOT in the table must miss, not fuzzy-match.
+    assert_eq!(auto_imports_mapped_distribution("definitely-not-a-module"), None);
+    // Case sensitivity is the whole point of keying on the raw module name:
+    // `PIL` is mapped, `pil` (what the fallback produces) is not a key.
+    assert_eq!(auto_imports_mapped_distribution("PIL"), Some("pillow"));
+    assert_eq!(auto_imports_mapped_distribution("pil"), None);
 }
 
 /// The gate is OFF unless the value is exactly `1`.

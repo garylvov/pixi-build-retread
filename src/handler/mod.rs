@@ -13391,24 +13391,22 @@ fn auto_imports_injection_enabled() -> bool {
 
 /// Import names that provably have NO PyPI distribution of the same meaning:
 /// USD/Omniverse/Isaac/Blender/matplotlib internals that ship with a host
-/// application or a parent distribution, never as a same-named wheel, plus
-/// names whose real distribution is spelled DIFFERENTLY (`hydra` is published
-/// as `hydra-core`; the PyPI project literally named `hydra` is an unrelated
-/// 2013 project with no usable wheels, so naming it as a root is an instant
-/// UNSAT -- measured, job 5547304 arm B). Naming one as a root is not "let
-/// the solver decide" -- `pxr` and `carb` do not resolve at all, and `warp` /
-/// `mpl-toolkits` / `hydra` resolve to an UNRELATED project, which is worse.
-/// Lane C detects requirements; it does not RENAME them, so a name-drift case
-/// is skipped rather than guessed at. Consulted ONLY for fallback-named
-/// requirements (`source == None`): if the bundle's own wheel slice really
-/// does provide the module, the index is authority and the denylist does not
-/// apply.
+/// application or a parent distribution, never as a same-named wheel. Naming
+/// one as a root is not "let the solver decide" -- `pxr` and `carb` do not
+/// resolve at all, and `warp` / `mpl-toolkits` resolve to an UNRELATED
+/// project, which is worse.
+///
+/// Since the injection channel closed to unmapped guesses (see
+/// [`auto_imports_injection_verdict`]) this list no longer GATES anything:
+/// an unmapped module is already refused. It survives purely as DIAGNOSTICS,
+/// so the skip log names the specific reason instead of the generic lead
+/// reason. Consulted only for names that are neither mapped nor
+/// index-provided.
 const AUTO_IMPORTS_NO_PYPI_DISTRIBUTION: &[&str] = &[
     "bmesh",
     "bpy",
     "carb",
     "gymtorch",
-    "hydra",
     "isaacgym",
     "isaacgymenvs",
     "mathutils",
@@ -13420,6 +13418,132 @@ const AUTO_IMPORTS_NO_PYPI_DISTRIBUTION: &[&str] = &[
     "usdshade",
     "warp",
 ];
+
+/// The skip reason for a name that is neither mapped nor index-provided.
+/// Compared by the caller to route the row to the `auto_imports_lead:` log.
+const AUTO_IMPORTS_LEAD_REASON: &str =
+    "unmapped fallback guess -- logged as a lead, never injected";
+
+/// CURATED import-module -> PyPI distribution table. The ONLY naming source
+/// for injection besides the wheel-store index.
+///
+/// WHY A TABLE AT ALL. Three consecutive A/B jobs (5547304, 5549254) each
+/// died on a DIFFERENT PEP 503 fallback guess -- `hydra`, `isaaclab-tasks`,
+/// `pil` -- all `indexed=false`. The fallback is `module.replace('_', "-")
+/// .to_lowercase()`, which is right for `dm_control` and catastrophically
+/// wrong for `PIL`. Measured: of arm B's 137 distinct injectable names, 61
+/// appear nowhere in the 1549-name baseline lock, so the guess-and-see
+/// approach had ~61 more UNSATs queued behind `pil`.
+///
+/// WHY IT MUST BE CONSULTED BEFORE THE INDEX. In job 5549254 arm A the SAME
+/// module `PIL` in the SAME bundle produced `would_emit=pillow` in one row
+/// and `would_emit=pil` in another, because the wheel store warmed mid-scan.
+/// A verdict that depends on cache warmth is not reproducible. The table is
+/// keyed on the module name and consulted first, so the verdict for a mapped
+/// module is identical warm or cold.
+///
+/// KEYS ARE RAW MODULE NAMES, case-sensitive as written in the `import`
+/// statement (`PIL`, not `pil`) -- that case is exactly what the fallback
+/// destroys. VALUES are PEP 503 canonical distribution names.
+///
+/// Two kinds of row, both required to be here to be injectable:
+///   * DRIFT -- the distribution is spelled differently from the module.
+///     These are the failure cases; each is a specific claim about PyPI.
+///   * IDENTITY -- module and distribution genuinely coincide. Listed
+///     explicitly rather than inferred, because "the fallback happens to be
+///     right here" is precisely the assumption that broke three times. An
+///     identity row is an assertion that this name was checked.
+const AUTO_IMPORTS_DISTRIBUTION_MAP: &[(&str, &str)] = &[
+    // --- DRIFT: module name != distribution name ---
+    ("OpenGL", "pyopengl"),
+    ("PIL", "pillow"),             // measured UNSAT, job 5549254 arm B
+    ("absl", "absl-py"),
+    ("attr", "attrs"),
+    ("bs4", "beautifulsoup4"),
+    ("box", "python-box"),
+    ("cv2", "opencv-python"),
+    ("dateutil", "python-dateutil"),
+    ("git", "gitpython"),
+    ("hydra", "hydra-core"),       // measured UNSAT, job 5547304 arm B
+    ("jwt", "pyjwt"),
+    ("pkg_resources", "setuptools"),
+    ("serial", "pyserial"),
+    ("skimage", "scikit-image"),
+    ("sklearn", "scikit-learn"),
+    ("yaml", "pyyaml"),
+    ("zmq", "pyzmq"),
+    // --- IDENTITY after PEP 503 normalisation, individually checked ---
+    ("brax", "brax"),
+    ("colorlog", "colorlog"),
+    ("decorator", "decorator"),
+    ("defusedxml", "defusedxml"),
+    ("dm_control", "dm-control"),
+    ("filelock", "filelock"),
+    ("gym", "gym"),
+    ("gymnasium", "gymnasium"),
+    ("h5py", "h5py"),
+    ("importlib_metadata", "importlib-metadata"),
+    ("importlib_resources", "importlib-resources"),
+    ("jax", "jax"),
+    ("jinja2", "jinja2"),
+    ("joblib", "joblib"),
+    ("lazy_loader", "lazy-loader"),
+    ("lightning", "lightning"),
+    ("loguru", "loguru"),
+    ("mani_skill", "mani-skill"),
+    ("matplotlib", "matplotlib"),
+    ("msgpack", "msgpack"),
+    ("msgpack_numpy", "msgpack-numpy"),
+    ("mujoco", "mujoco"),
+    ("networkx", "networkx"),
+    ("nltk", "nltk"),
+    ("numba", "numba"),
+    ("numpy", "numpy"),
+    ("omegaconf", "omegaconf"),
+    ("onnx", "onnx"),
+    ("onnxruntime", "onnxruntime"),
+    ("open3d", "open3d"),
+    ("packaging", "packaging"),
+    ("prettytable", "prettytable"),
+    ("psutil", "psutil"),
+    ("pydantic", "pydantic"),
+    ("pygame", "pygame"),
+    ("pyglet", "pyglet"),
+    ("pytest", "pytest"),
+    ("pytorch_lightning", "pytorch-lightning"),
+    ("redis", "redis"),
+    ("requests", "requests"),
+    ("rich", "rich"),
+    ("scipy", "scipy"),
+    ("setuptools", "setuptools"),
+    ("shimmy", "shimmy"),
+    ("smart_open", "smart-open"),
+    ("sphinx", "sphinx"),
+    ("stable_baselines3", "stable-baselines3"),
+    ("tensorboard", "tensorboard"),
+    ("tensordict", "tensordict"),
+    ("termcolor", "termcolor"),
+    ("toml", "toml"),
+    ("torch", "torch"),
+    ("torchvision", "torchvision"),
+    ("tqdm", "tqdm"),
+    ("transformers", "transformers"),
+    ("trimesh", "trimesh"),
+    ("typer", "typer"),
+    ("typing_extensions", "typing-extensions"),
+    ("tyro", "tyro"),
+    ("viser", "viser"),
+    ("wandb", "wandb"),
+];
+
+/// Curated distribution name for an import module, if the table knows it.
+/// Exact, case-sensitive match on the module as imported.
+fn auto_imports_mapped_distribution(module: &str) -> Option<&'static str> {
+    AUTO_IMPORTS_DISTRIBUTION_MAP
+        .iter()
+        .find(|(m, _)| *m == module)
+        .map(|(_, dist)| *dist)
+}
 
 /// Isaac Lab ships as a git checkout of same-named extension subdirectories
 /// (`isaaclab`, `isaaclab_tasks`, `isaaclab_assets`, `isaaclab_rl`,
@@ -13438,11 +13562,25 @@ fn auto_imports_is_isaaclab_extension(module: &str) -> bool {
 /// Verdict for one detected import: `Ok(root)` to inject, `Err(reason)` to
 /// log and skip. Never panics, never injects on doubt.
 ///
-/// The governing rule: a detected import may become a root ONLY if its name
-/// maps to a distribution we have some reason to believe exists. Two ways to
-/// earn that -- the wheel-store index provides the module (`source` is
-/// `Some`, authoritative), or the PEP 503 fallback name is *plausibly* a
-/// distribution name. Everything else is logged and skipped, never injected.
+/// THE GOVERNING RULE, as of the 3-strike rethink: a detected import may
+/// become a root ONLY if its distribution name comes from a source that
+/// KNOWS it -- the curated table, or the wheel-store index. A PEP 503
+/// fallback guess is never injected again; it is logged as a LEAD.
+///
+/// Order matters and is load-bearing:
+///   (e) the curated table, keyed on the raw module name, is consulted
+///       FIRST. That makes the verdict for a mapped module deterministic:
+///       independent of whether the wheel store happened to be warm when
+///       this entry was scanned. Job 5549254 arm A produced two different
+///       names for `PIL` in one run because the index answered differently
+///       mid-scan; consulting the table first removes that race.
+///   (f) the index is authority for anything the table does not cover, and
+///       is real coverage wherever the store persists across runs.
+///   (g/h) everything else is a lead, never a root.
+///
+/// The screens below (g) no longer gate anything -- (h) already refuses the
+/// row -- they exist to give the log a specific reason instead of a generic
+/// one.
 fn auto_imports_injection_verdict(
     req: &crate::auto_imports::ResolvedImport,
     sibling_entries: &BTreeSet<String>,
@@ -13468,33 +13606,38 @@ fn auto_imports_injection_verdict(
     if sibling_entries.contains(&canonical) {
         return Err("names another entry of this same bundle");
     }
+    // (e) CURATED TABLE FIRST -- deterministic, and the only channel that can
+    // correct name drift (`PIL` -> `pillow`). Beats the index deliberately:
+    // a verdict must not depend on cache warmth.
+    if let Some(mapped) = auto_imports_mapped_distribution(&req.module) {
+        return Ok(mapped.to_string());
+    }
+    // (f) Index authority: a wheel in the store really ships this module
+    // under this distribution name.
     if req.source.is_some() {
-        // Index-provided: a wheel in the store really ships this module under
-        // this distribution name. Authoritative; no further screening.
         return Ok(canonical);
     }
-    // --- fallback naming from here down: the name is a GUESS. ---
-    // (d) Known host-application internals.
+    // --- Neither mapped nor indexed: NEVER injected from here down. The
+    // remaining screens only sharpen the reason recorded in the log. ---
+    // (g1) Known host-application internals.
     if AUTO_IMPORTS_NO_PYPI_DISTRIBUTION.contains(&req.module.as_str()) {
         return Err("module has no PyPI distribution (host-application internal)");
     }
-    // (d2) Isaac Lab extensions: source-built entries of SOME bundle in this
+    // (g2) Isaac Lab extensions: source-built entries of SOME bundle in this
     // workspace, never PyPI distributions. Screen (c) sees only the importing
     // bundle's own entries, so a cross-bundle import needs this.
     if auto_imports_is_isaaclab_extension(&req.module) {
         return Err("Isaac Lab extension is source-built in this workspace, not a PyPI distribution");
     }
-    // (e) Intra-repo module PATH shapes. A distribution name carries at most
-    // one separator in practice (`dm-control`, `mani-skill`, `opencv-python`);
-    // two or more is the signature of a repo-local module such as
-    // `convert_rigv1_to_proto` or `frame_view_contract_utils`, which the
-    // own-top-level screen missed because it lives in a SIBLING directory of
-    // a shared checkout. Only applied to guesses: an index-provided name with
-    // three separators is still a real distribution.
+    // (g3) Intra-repo module PATH shapes: `convert_rigv1_to_proto` and
+    // friends, which the own-top-level screen missed because they live in a
+    // SIBLING directory of a shared checkout.
     if canonical.matches('-').count() >= 2 {
         return Err("multi-segment name reads as a repo-local module path, not a distribution");
     }
-    Ok(canonical)
+    // (h) Plausible, unverified, and therefore a LEAD -- surfaced in the log
+    // as `auto_imports_lead:` for manifest work, never handed to the solver.
+    Err(AUTO_IMPORTS_LEAD_REASON)
 }
 
 fn auto_imports_own_top_level(entry_name: &str, tree: &Path) -> std::collections::BTreeSet<String> {
@@ -13676,6 +13819,9 @@ async fn auto_imports_dry_run(
     let inject = auto_imports_injection_enabled();
     let mut conditional_count = 0usize;
     let mut skipped_count = 0usize;
+    // Subset of `skipped_count`: rows refused only because no source could
+    // name them confidently. Reported so a run's lead backlog is one grep.
+    let mut lead_count = 0usize;
     let mut injected: Vec<String> = Vec::new();
     for req in &report.requirements {
         let line = req.provider.clone().unwrap_or_else(|| req.module.clone());
@@ -13700,6 +13846,31 @@ async fn auto_imports_dry_run(
                     injected = inject,
                     files = req.files.len(),
                     "auto_imports_dry: detected requirement (INJECTABLE)",
+                );
+            }
+            Err(reason) if reason == AUTO_IMPORTS_LEAD_REASON => {
+                // Plausible dependency we cannot NAME with confidence. Not a
+                // root (that is what UNSAT'd three jobs), but not nothing
+                // either: this is the detection value Lane C exists for, so
+                // it is emitted on its own line for manifest work.
+                skipped_count += 1;
+                lead_count += 1;
+                tracing::info!(
+                    entry = %entry_name,
+                    bundle = %group_name,
+                    module = %req.module,
+                    guessed_name = %line,
+                    indexed = req.source.is_some(),
+                    files = req.files.len(),
+                    file_list = %req
+                        .files
+                        .iter()
+                        .take(3)
+                        .map(|f| f.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    "auto_imports_lead: detected dependency with no confident distribution \
+                     name; add it to the manifest or to AUTO_IMPORTS_DISTRIBUTION_MAP",
                 );
             }
             Err(reason) => {
@@ -13729,6 +13900,7 @@ async fn auto_imports_dry_run(
         requirements = report.requirements.len(),
         conditional = conditional_count,
         skipped = skipped_count,
+        leads = lead_count,
         injectable = report.requirements.len() - skipped_count,
         injected = injected.len(),
         enabled = inject,
