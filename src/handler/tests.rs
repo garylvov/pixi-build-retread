@@ -8023,6 +8023,50 @@ fn abi_backoff_fires_only_for_an_abi_violation_with_injected_roots() {
     assert!(!gate(true, &injected, &suppressed, "newton-pack-latest"));
 }
 
+/// RESOLVE-TIME BACK-OFF. The emission-time back-off cannot catch a failure
+/// that happens BEFORE any emission exists -- a resolver UNSAT, or metadata
+/// that will not parse. Job 5554414 hit the latter: `holosoma-pack` pulled a
+/// wheel whose METADATA says `PyYAML (>=5.1.*)`, which is not valid PEP 440,
+/// and `resolve_all` failed outright. This pins the gate and the sentinel.
+#[test]
+fn resolve_backoff_fires_once_and_suppresses_every_bundle() {
+    // The gate, exactly as written at the resolve_all call site.
+    let gate = |gate_on: bool, suppressed: &BTreeSet<String>| {
+        gate_on && !suppressed.contains(AUTO_IMPORTS_SUPPRESS_ALL)
+    };
+    let none: BTreeSet<String> = BTreeSet::new();
+    assert!(gate(true, &none), "first resolve failure with the gate on retries");
+    assert!(!gate(false, &none), "gate off: fails exactly as today");
+
+    let mut suppressed: BTreeSet<String> = BTreeSet::new();
+    suppressed.insert(AUTO_IMPORTS_SUPPRESS_ALL.to_string());
+    assert!(!gate(true, &suppressed), "at most ONE resolve back-off per request");
+
+    // The sentinel suppresses every bundle, which is how `uv_group_closure`
+    // reads it -- the coarseness is deliberate, since a resolve_all failure
+    // carries no per-bundle attribution.
+    let flag = |group: &str, set: &BTreeSet<String>| {
+        set.contains(AUTO_IMPORTS_SUPPRESS_ALL)
+            || set.contains(&canonical_conda_name(group))
+    };
+    for group in ["holosoma-pack", "flashsac-pack", "newton-pack-latest"] {
+        assert!(flag(group, &suppressed), "{group} must be suppressed by the sentinel");
+        assert!(!flag(group, &none), "{group} unsuppressed on the first pass");
+    }
+
+    // The sentinel can never collide with a real bundle key: canonical conda
+    // names are lowercase alphanumerics and hyphens.
+    assert_ne!(canonical_conda_name("holosoma-pack"), AUTO_IMPORTS_SUPPRESS_ALL);
+    assert!(!AUTO_IMPORTS_SUPPRESS_ALL.chars().any(|c| c.is_ascii_alphanumeric()));
+    // A per-bundle suppression (emission back-off) must NOT act as the
+    // sentinel: peers keep their injections.
+    let mut one: BTreeSet<String> = BTreeSet::new();
+    one.insert(canonical_conda_name("newton-pack-latest"));
+    assert!(flag("newton-pack-latest", &one));
+    assert!(!flag("holosoma-pack", &one));
+    assert!(gate(true, &one), "a per-bundle suppression does not consume the resolve retry");
+}
+
 /// The back-off's re-resolve must differ from the failed attempt by EXACTLY
 /// the injected-roots delta: suppression drops this bundle's Lane C roots and
 /// touches nothing else.

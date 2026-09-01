@@ -4869,23 +4869,76 @@ impl Handler {
             // Phase 1: materialize wheels + auto-bundle. Env-agnostic;
             // results reused across all per-env emissions.
             let t_materialize = std::time::Instant::now();
+            // RESOLVE-TIME BACK-OFF. The emission-time back-off below catches
+            // an ABI rejection, but a bundle's RESOLUTION can fail outright --
+            // a resolver UNSAT, or malformed wheel metadata that will not even
+            // parse (`PyYAML (>=5.1.*)`, job 5554414) -- and that happens
+            // before any emission exists to retry. Same decided principle:
+            // Lane C must never break a lock that would otherwise succeed. So
+            // one resolve failure with the gate on is retried with injection
+            // suppressed, and the difference is again exactly the
+            // injected-roots delta.
+            //
+            // COARSER than the emission-time back-off, unavoidably: a
+            // `resolve_all` failure carries no per-bundle attribution, so the
+            // retry suppresses injection for every bundle in this request
+            // rather than one. Bounded to a single extra resolve by the
+            // sentinel, and loud, so it is a reported finding either way.
+            let resolve_attempt = resolve_all(
+                &config,
+                &target,
+                &download_dir,
+                &source_dir,
+                &cache_dir,
+                &params.channels,
+                workspace_dir.as_deref(),
+                &abi_backoff_suppressed,
+            )
+            .await;
             let (materialized, base_config, restore_relaxations, auto_imports_injected) =
-                resolve_all(
-                    &config,
-                    &target,
-                    &download_dir,
-                    &source_dir,
-                    &cache_dir,
-                    &params.channels,
-                    workspace_dir.as_deref(),
-                    &abi_backoff_suppressed,
-                )
-                .await
-            .map_err(|e| {
-                RpcError::invalid_params(format!(
-                    "resolving wheels for python {python_version}: {e:#}"
-                ))
-            })?;
+                match resolve_attempt {
+                    Ok(resolved) => resolved,
+                    Err(error)
+                        if auto_imports_injection_enabled()
+                            && !abi_backoff_suppressed
+                                .contains(AUTO_IMPORTS_SUPPRESS_ALL) =>
+                    {
+                        tracing::warn!(
+                            python = %python_version,
+                            error = %format!("{error:#}"),
+                            "auto_imports: RESOLVE BACK-OFF -- wheel resolution failed with                              Lane C roots injected; retrying with injection suppressed for                              every bundle in this request. The error above is a FINDING: a                              detected dependency this workspace cannot resolve.",
+                        );
+                        abi_backoff_suppressed
+                            .insert(AUTO_IMPORTS_SUPPRESS_ALL.to_string());
+                        abi_backoff_count += 1;
+                        let retried = resolve_all(
+                            &config,
+                            &target,
+                            &download_dir,
+                            &source_dir,
+                            &cache_dir,
+                            &params.channels,
+                            workspace_dir.as_deref(),
+                            &abi_backoff_suppressed,
+                        )
+                        .await
+                        .map_err(|e| {
+                            RpcError::invalid_params(format!(
+                                "resolving wheels for python {python_version}                                  (after Lane C resolve back-off): {e:#}"
+                            ))
+                        })?;
+                        tracing::warn!(
+                            python = %python_version,
+                            "auto_imports: RESOLVE BACK-OFF SUCCEEDED -- resolved without                              injected roots",
+                        );
+                        retried
+                    }
+                    Err(e) => {
+                        return Err(RpcError::invalid_params(format!(
+                            "resolving wheels for python {python_version}: {e:#}"
+                        )));
+                    }
+                };
             pending_output_relaxations.extend(restore_relaxations.iter().cloned());
             tracing::info!(
                 python = %python_version,
@@ -5485,7 +5538,8 @@ impl Handler {
             tracing::warn!(
                 backoffs = abi_backoff_count,
                 bundles = %abi_backoff_suppressed.iter().cloned().collect::<Vec<_>>().join(","),
-                "auto_imports: ABI BACK-OFF SUMMARY -- these bundles emitted WITHOUT their                  detected roots because injecting them contradicted a workspace ABI anchor",
+                suppressed_all = abi_backoff_suppressed.contains(AUTO_IMPORTS_SUPPRESS_ALL),
+                "auto_imports: LANE C BACK-OFF SUMMARY -- these bundles emitted WITHOUT their detected roots, because injecting them either contradicted a workspace ABI anchor or made resolution fail. Every dropped root is a FINDING for manifest work, not a resolved issue. A `*` entry means the resolve-time back-off suppressed every bundle in the request.",
             );
         }
         Ok(result)
@@ -7225,7 +7279,8 @@ async fn resolve_all(
                     .get(&group_name)
                     .expect("every bundle group has one probe metrics ledger"),
             ),
-            suppress_auto_imports.contains(&canonical_conda_name(&group_name)),
+            suppress_auto_imports.contains(AUTO_IMPORTS_SUPPRESS_ALL)
+                || suppress_auto_imports.contains(&canonical_conda_name(&group_name)),
         )
         .await
         .with_context(|| format!("computing uv closure for bundle `{group_name}`"))?;
@@ -13598,6 +13653,13 @@ const AUTO_IMPORTS_NO_PYPI_DISTRIBUTION: &[&str] = &[
     "usdshade",
     "warp",
 ];
+
+/// Sentinel member of the back-off suppression set meaning "suppress Lane C
+/// injection for EVERY bundle in this request". Used by the resolve-time
+/// back-off, which has no per-bundle attribution to work with. Cannot collide
+/// with a real key: every other member is a `canonical_conda_name`, which is
+/// lowercase alphanumerics and hyphens only.
+const AUTO_IMPORTS_SUPPRESS_ALL: &str = "*";
 
 /// The skip reason for a name that is itself an ABI anchor. Never injected
 /// at any version: the anchor is the workspace's contract, and an
