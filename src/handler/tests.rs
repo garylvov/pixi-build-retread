@@ -7736,13 +7736,53 @@ fn auto_imports_injection_verdict_skips_unmappable_names() {
     );
     // (d) host-application internals with no PyPI distribution. `warp` and
     // `mpl_toolkits` matter most: those DO resolve, to unrelated projects.
-    for module in ["pxr", "carb", "omni", "usdrt", "bpy", "mathutils", "warp", "mpl_toolkits"] {
+    // `hydra` is the same shape: the PyPI project of that name is unrelated
+    // and wheel-less, and injecting it UNSAT'd arm B of job 5547304.
+    for module in
+        ["pxr", "carb", "omni", "usdrt", "bpy", "mathutils", "warp", "mpl_toolkits", "hydra"]
+    {
         let name = module.replace('_', "-");
         assert!(
             verdict(&req(module, &name, false, false)).unwrap_err().contains("no PyPI distribution"),
             "{module} must be denied"
         );
     }
+    // (d2) Isaac Lab extensions imported ACROSS bundles. `isaaclab_tasks` is
+    // an entry of `isaaclab-hover-pack`, so screen (c) does not fire while
+    // resolving `flashsac-pack` -- and uv then reports "isaaclab-tasks was
+    // not found in the package registry" (job 5547304 arm B). Every row here
+    // is a module the dry run actually produced.
+    // The sibling set here is `flashsac-pack`'s real one: `isaaclab-tasks` is
+    // NOT in it, which is precisely why screen (c) could not save arm B.
+    let foreign_siblings: BTreeSet<String> = ["flashrl"].iter().map(|s| s.to_string()).collect();
+    let foreign = |r: &ResolvedImport| auto_imports_injection_verdict(r, &foreign_siblings);
+    for module in [
+        "isaaclab",
+        "isaaclab_tasks",
+        "isaaclab_contrib",
+        "isaaclab_assets",
+        "isaaclab_rl",
+        "isaaclab_newton",
+        "isaaclab_physx",
+        "isaaclab_ppisp",
+        "isaaclab_visualizers",
+        "isaaclab_tasks_experimental",
+    ] {
+        let name = module.replace('_', "-");
+        assert!(
+            foreign(&req(module, &name, false, false)).unwrap_err().contains("Isaac Lab extension"),
+            "{module} must be denied"
+        );
+    }
+    // The prefix rule must not swallow unrelated names that merely start
+    // with the same letters, nor an index-provided Isaac Lab naming.
+    assert_eq!(verdict(&req("isaaclabel", "isaaclabel", false, false)), Ok("isaaclabel".to_string()));
+    // (`isaaclab_tasks` is a sibling in this fixture, so screen (c) claims it
+    // first; use a non-sibling to exercise index authority over (d2).)
+    assert_eq!(
+        verdict(&req("isaaclab_newton", "isaaclab-newton", true, false)),
+        Ok("isaaclab-newton".to_string())
+    );
     // (e) repo-local module paths the own-top-level screen missed because
     // they live in a SIBLING directory of a shared checkout.
     for (module, name) in [

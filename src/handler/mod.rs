@@ -13391,17 +13391,24 @@ fn auto_imports_injection_enabled() -> bool {
 
 /// Import names that provably have NO PyPI distribution of the same meaning:
 /// USD/Omniverse/Isaac/Blender/matplotlib internals that ship with a host
-/// application or a parent distribution, never as a same-named wheel. Naming
-/// one as a root is not "let the solver decide" -- `pxr` and `carb` do not
-/// resolve at all, and `warp` / `mpl-toolkits` resolve to an UNRELATED
-/// project, which is worse. Consulted ONLY for fallback-named requirements
-/// (`source == None`): if the bundle's own wheel slice really does provide
-/// the module, the index is authority and the denylist does not apply.
+/// application or a parent distribution, never as a same-named wheel, plus
+/// names whose real distribution is spelled DIFFERENTLY (`hydra` is published
+/// as `hydra-core`; the PyPI project literally named `hydra` is an unrelated
+/// 2013 project with no usable wheels, so naming it as a root is an instant
+/// UNSAT -- measured, job 5547304 arm B). Naming one as a root is not "let
+/// the solver decide" -- `pxr` and `carb` do not resolve at all, and `warp` /
+/// `mpl-toolkits` / `hydra` resolve to an UNRELATED project, which is worse.
+/// Lane C detects requirements; it does not RENAME them, so a name-drift case
+/// is skipped rather than guessed at. Consulted ONLY for fallback-named
+/// requirements (`source == None`): if the bundle's own wheel slice really
+/// does provide the module, the index is authority and the denylist does not
+/// apply.
 const AUTO_IMPORTS_NO_PYPI_DISTRIBUTION: &[&str] = &[
     "bmesh",
     "bpy",
     "carb",
     "gymtorch",
+    "hydra",
     "isaacgym",
     "isaacgymenvs",
     "mathutils",
@@ -13413,6 +13420,20 @@ const AUTO_IMPORTS_NO_PYPI_DISTRIBUTION: &[&str] = &[
     "usdshade",
     "warp",
 ];
+
+/// Isaac Lab ships as a git checkout of same-named extension subdirectories
+/// (`isaaclab`, `isaaclab_tasks`, `isaaclab_assets`, `isaaclab_rl`,
+/// `isaaclab_newton`, plus per-workspace ones like `isaaclab_ppisp`). NONE of
+/// them is published to PyPI: every one is a source-built entry of some
+/// bundle in this workspace. Screen (c) catches them only when the importing
+/// entry sits in the SAME bundle, and one backend request sees one bundle's
+/// entries -- so `flashsac-pack` importing `isaaclab_tasks` (an entry of
+/// `isaaclab-hover-pack`) sailed past (c) and made uv report "isaaclab-tasks
+/// was not found in the package registry" (job 5547304 arm B). A prefix rule,
+/// not a name list, because the family grows per workspace.
+fn auto_imports_is_isaaclab_extension(module: &str) -> bool {
+    module == "isaaclab" || module.starts_with("isaaclab_")
+}
 
 /// Verdict for one detected import: `Ok(root)` to inject, `Err(reason)` to
 /// log and skip. Never panics, never injects on doubt.
@@ -13456,6 +13477,12 @@ fn auto_imports_injection_verdict(
     // (d) Known host-application internals.
     if AUTO_IMPORTS_NO_PYPI_DISTRIBUTION.contains(&req.module.as_str()) {
         return Err("module has no PyPI distribution (host-application internal)");
+    }
+    // (d2) Isaac Lab extensions: source-built entries of SOME bundle in this
+    // workspace, never PyPI distributions. Screen (c) sees only the importing
+    // bundle's own entries, so a cross-bundle import needs this.
+    if auto_imports_is_isaaclab_extension(&req.module) {
+        return Err("Isaac Lab extension is source-built in this workspace, not a PyPI distribution");
     }
     // (e) Intra-repo module PATH shapes. A distribution name carries at most
     // one separator in practice (`dm-control`, `mani-skill`, `opencv-python`);
