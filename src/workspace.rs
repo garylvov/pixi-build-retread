@@ -1344,6 +1344,47 @@ impl WorkspaceManifest {
         self.effective_pypi_dependencies_for_profile(env_name, target_subdir, target_subdir)
     }
 
+    /// Every PyPI version spec the workspace declares for a name ANYWHERE:
+    /// the top-level `[pypi-dependencies]` table, each of its target
+    /// overlays, and the same pair for every feature -- regardless of which
+    /// environment activates it.
+    ///
+    /// Lane C injection (operator ruling 2026-09-01) consumes this: an
+    /// injected root's emitted conda run-dep constraint is DERIVED from what
+    /// the workspace already declares for that name, never hardened to the
+    /// version this pack's closure happened to resolve. The union is
+    /// deliberately env-independent -- the failure being closed is a
+    /// constraint emitted for one env colliding with a DIFFERENT env's
+    /// declaration (`pillow ==11.3.0` from the isaaclab pack vs `pace`'s own
+    /// `pillow ==10.4.0`), so a per-env view could never see the collision.
+    ///
+    /// Names are already PEP 503 / conda canonical (see
+    /// `parse_pypi_dependencies`). Values keep first-seen order and are
+    /// deduped; `*` (the direct-source placeholder) is retained so callers
+    /// can tell "declared with no constraint" from "not declared".
+    pub fn declared_pypi_specs_anywhere(&self) -> BTreeMap<String, Vec<String>> {
+        let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut absorb = |table: &BTreeMap<String, String>| {
+            for (name, spec) in table {
+                let specs = out.entry(name.clone()).or_default();
+                if !specs.contains(spec) {
+                    specs.push(spec.clone());
+                }
+            }
+        };
+        absorb(&self.pypi_dependencies);
+        for (_, target) in &self.target_dependencies {
+            absorb(&target.pypi_dependencies);
+        }
+        for feature in self.features.values() {
+            absorb(&feature.pypi_dependencies);
+            for (_, target) in &feature.target_dependencies {
+                absorb(&target.pypi_dependencies);
+            }
+        }
+        out
+    }
+
     pub fn effective_pypi_dependencies_for_resolved_env(
         &self,
         env_name: &str,
@@ -4190,6 +4231,53 @@ Torch_Vision = "==0.24"
         let gpu = &ws.features["gpu"].pypi_dependencies;
         assert_eq!(gpu.get("torch-vision").map(String::as_str), Some("==0.24"));
         assert_eq!(gpu.get("feature-direct").map(String::as_str), Some("*"));
+    }
+
+    #[test]
+    fn declared_pypi_specs_anywhere_unions_every_declaration_site() {
+        // Lane C injection reads this to grok an injected root's constraint.
+        // It must see declarations no single environment activates -- the
+        // pillow failure was a pack emitting a pin that a DIFFERENT env's
+        // declaration could not satisfy.
+        let ws = ws_toml(
+            r#"
+[pypi-dependencies]
+pillow = "==10.4.0"
+NumPy = ">=1.26,<3"
+local = { path = "../local-project" }
+
+[feature.viz.pypi-dependencies]
+pillow = ">=9"
+
+[feature.gpu.target.linux-64.pypi-dependencies]
+torch = "==2.5.1"
+
+[environments]
+default = { features = [] }
+"#,
+        );
+        let declared = ws.declared_pypi_specs_anywhere();
+        assert_eq!(
+            declared.get("pillow").map(Vec::as_slice),
+            Some(["==10.4.0".to_string(), ">=9".to_string()].as_slice()),
+            "every declaration site for a name is unioned, feature or not: {declared:?}"
+        );
+        assert_eq!(
+            declared.get("numpy").map(Vec::as_slice),
+            Some([">=1.26,<3".to_string()].as_slice())
+        );
+        assert_eq!(
+            declared.get("torch").map(Vec::as_slice),
+            Some(["==2.5.1".to_string()].as_slice()),
+            "a feature target overlay is a declaration site too: {declared:?}"
+        );
+        assert_eq!(
+            declared.get("local").map(Vec::as_slice),
+            Some(["*".to_string()].as_slice()),
+            "a direct source stays `*` so callers can tell declared-without-a-\
+             constraint from undeclared: {declared:?}"
+        );
+        assert!(!declared.contains_key("absent"));
     }
 
     #[test]

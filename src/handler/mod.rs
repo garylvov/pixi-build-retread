@@ -3891,6 +3891,24 @@ struct Bundle {
     /// Empty on the legacy (non-uv) path, where the BFS bundles the
     /// full closure and the `vendored` set already covers members.
     uv_closure_names: std::collections::HashSet<String>,
+    /// Canonical names of the Lane C roots INJECTED into this bundle's
+    /// closure (the `auto_imports` accumulator's output for this bundle).
+    ///
+    /// Operator ruling 2026-09-01: an injected dependency must NEVER harden
+    /// into an exact version pin on the pack's conda package. The resolved
+    /// version is an accident of THIS pack's solve; pinning it propagates a
+    /// version another environment never agreed to (job 5555157: `pillow`
+    /// injected into isaaclab-2.3x-pack emitted `pillow ==11.3.0`, which the
+    /// `pace` env's own `pillow ==10.4.0` cannot satisfy -- workspace conda
+    /// solve UNSAT). `produce_output` consults this set to replace the
+    /// decided spec with a workspace-derived or loose one. Non-injected
+    /// members are untouched and keep their exact pins.
+    auto_imports_injected: std::collections::HashSet<String>,
+    /// Every PyPI version spec the workspace manifest declares for a name
+    /// anywhere in its `[pypi-dependencies]` tables (see
+    /// `WorkspaceManifest::declared_pypi_specs_anywhere`). Sole input to
+    /// precedence step (a) of the injected-constraint ruling.
+    workspace_declared_pypi_specs: BTreeMap<String, Vec<String>>,
     /// Full uv-selected adjacency, including routed/no-emit packages that
     /// are absent from the exported wheel set. Diagnostics use this only to
     /// walk a conflict back to its introducing root edge.
@@ -7110,6 +7128,16 @@ async fn resolve_all(
         .map(|manifest| manifest.resolution_pypi_index_urls())
         .unwrap_or_else(|| vec![crate::index_chain::PUBLIC_PYPI.to_string()]);
 
+    // Lane C injection (operator ruling 2026-09-01): what the workspace
+    // itself declares for a name is the constraint an INJECTED root gets to
+    // advertise. Collected once, env-independently, so the emission side can
+    // grok a constraint instead of hardening the version this pack's closure
+    // happened to resolve. See `Bundle::workspace_declared_pypi_specs`.
+    let workspace_declared_pypi_specs: BTreeMap<String, Vec<String>> = workspace_dir
+        .and_then(crate::workspace::WorkspaceManifest::load)
+        .map(|manifest| manifest.declared_pypi_specs_anywhere())
+        .unwrap_or_default();
+
     // Load parselmouth once and reuse across bundles. We also merge it
     // into the effective name-map: when parselmouth says PyPI name X
     // corresponds to conda name Y, we emit Y in the conda run-deps
@@ -7453,6 +7481,14 @@ async fn resolve_all(
                 .map(|k| canonical_conda_name(k))
                 .collect();
             bundle.uv_dependency_graph = closure.dependency_graph.clone();
+            // Lane C: the roots THIS bundle's closure had injected, plus the
+            // workspace's own declarations, are the two inputs the emission
+            // side needs to derive (never harden) an injected constraint.
+            bundle.auto_imports_injected = auto_imports_injected
+                .iter()
+                .map(|name| canonical_conda_name(name))
+                .collect();
+            bundle.workspace_declared_pypi_specs = workspace_declared_pypi_specs.clone();
             bundle.uv_dependency_graph.deps_from_root_requirements = deps_from_root_names
                 .iter()
                 .filter_map(|name| {
@@ -12608,6 +12644,8 @@ async fn resolve_bundle(
             auto_routed: vec![],
             auto_dropped: Default::default(),
             uv_closure_names: Default::default(),
+            auto_imports_injected: Default::default(),
+            workspace_declared_pypi_specs: Default::default(),
             uv_dependency_graph: Default::default(),
             workspace_conda_versions: Default::default(),
             workspace_conda_provider_facts: Default::default(),
@@ -13222,6 +13260,8 @@ async fn resolve_bundle(
         auto_routed: vec![],
         auto_dropped: Default::default(),
         uv_closure_names: Default::default(),
+        auto_imports_injected: Default::default(),
+        workspace_declared_pypi_specs: Default::default(),
         uv_dependency_graph: Default::default(),
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
@@ -15215,6 +15255,126 @@ struct PypiEmissionGroup {
     /// spec is emitted as a conda `constrains` entry instead of a `depends`
     /// one. One real depend edge flips it false for the whole group.
     constrains_only: bool,
+}
+
+/// Stable log prefix for every injected-member constraint decision. Grep this
+/// in a backend log to see exactly what Lane C advertised and why.
+const INJECTED_CONSTRAINT_LOG: &str = "retread-inject-constraint";
+
+/// The run-dep constraint an INJECTED Lane C member is allowed to advertise on
+/// the pack's conda package, or `None` when this group is not injected.
+///
+/// Operator ruling 2026-09-01: injected dependencies must never harden into
+/// exact version pins. The resolved version is whatever THIS pack's solve
+/// happened to pick; advertising it as `name ==<resolved>` propagates a
+/// version other environments never agreed to and takes the workspace conda
+/// solve UNSAT (job 5555157: injected `pillow` emitted `pillow ==11.3.0`,
+/// which `pace`'s own `pillow ==10.4.0` cannot satisfy).
+///
+/// Precedence:
+///
+/// (a) **Manifest-derived.** Whatever the workspace already declares for that
+///     name anywhere in its `[pypi-dependencies]` tables. This is the whole
+///     point of "grokked": the pack advertises the band the workspace itself
+///     chose, so the two can never disagree. A declaration that is `*`, that
+///     conda cannot represent (`~=4.0`), or that appears in two conflicting
+///     forms falls through to (b) with a log line -- picking "the loosest that
+///     satisfies all" across contradictory declarations is not a decision this
+///     seam gets to invent.
+///
+/// (b) **Loose.** The bare name, no version constraint.
+///
+///     The house loosening primitive (`relax::widen_exact`, and the
+///     `RETREAD AUTO-WIDENED` path that drives it) tops out at
+///     `>={major}` -- a floor-only, uncapped envelope, matching
+///     `emit_pypi`'s "FLOOR-ONLY envelopes, deliberately uncapped"
+///     doctrine. That precedent is deliberately NOT followed here: a floor
+///     derived from the resolved version is exactly the hardening this
+///     ruling forbids. `>=11` reproduces the pillow failure verbatim against
+///     `pace`'s `pillow ==10.4.0`. An injected member is provided by the uv
+///     wheel closure at install time anyway; the conda edge exists to name a
+///     provider, not to bound it. Bare name is the only form that is correct
+///     for every consumer.
+///
+/// Returns `(rendered_spec, source_label)`; an empty spec renders as the bare
+/// name through [`CondaName::match_spec`].
+fn injected_run_dep_constraint(
+    bundle: &Bundle,
+    conda_name: &CondaName,
+    pypi_names: &BTreeSet<PypiKey>,
+) -> Option<(String, &'static str)> {
+    let conda_key = conda_name.key().into_string();
+    let injected = bundle.auto_imports_injected.contains(&conda_key)
+        || pypi_names.iter().any(|name| {
+            bundle
+                .auto_imports_injected
+                .contains(&canonical_conda_name(name.as_str()))
+        });
+    if !injected {
+        return None;
+    }
+
+    let declared: Vec<&String> = std::iter::once(conda_key.as_str())
+        .chain(pypi_names.iter().map(PypiKey::as_str))
+        .filter_map(|name| bundle.workspace_declared_pypi_specs.get(name))
+        .flatten()
+        .filter(|spec| {
+            let spec = spec.trim();
+            !spec.is_empty() && spec != "*"
+        })
+        .collect();
+    let mut distinct: Vec<&&String> = Vec::new();
+    for spec in &declared {
+        if !distinct.iter().any(|kept| kept.trim() == spec.trim()) {
+            distinct.push(spec);
+        }
+    }
+    match distinct.as_slice() {
+        [] => Some((String::new(), "loose")),
+        [only] => {
+            // The declaration is PyPI syntax. Only a conda-representable one
+            // may be advertised on a conda package, and the whole candidate
+            // must be a VERSION spec: `spec_from_str` splits a `name spec`
+            // line on whitespace and reads the tail as a conda BUILD string,
+            // so a spec carrying an internal space would silently emit half
+            // itself as a build match. Whitespace is stripped (conda writes
+            // `>=1.26,<3`, pixi manifests may write `>=1.26, <3`), an
+            // operator is required so a bare word cannot pass as an implicit
+            // version, and the result must still parse.
+            let candidate: String = only.chars().filter(|c| !c.is_whitespace()).collect();
+            let has_operator = candidate.starts_with(['<', '>', '=', '!', '~']);
+            match (has_operator, spec_from_str(conda_name.match_spec(&candidate).as_str())) {
+                (true, Ok(_)) => Some((candidate, "manifest")),
+                (has_operator, parsed) => {
+                    tracing::info!(
+                        target: "pixi_build_retread",
+                        package = %conda_name,
+                        declared = %candidate,
+                        has_operator,
+                        error = %parsed.err().map_or_else(String::new, |e| e.to_string()),
+                        "{INJECTED_CONSTRAINT_LOG}: workspace declaration is not \
+                         representable as a conda version spec; falling back to the \
+                         loose form",
+                    );
+                    Some((String::new(), "loose"))
+                }
+            }
+        }
+        many => {
+            tracing::info!(
+                target: "pixi_build_retread",
+                package = %conda_name,
+                declared = %many
+                    .iter()
+                    .map(|spec| spec.trim())
+                    .collect::<Vec<_>>()
+                    .join(" | "),
+                "{INJECTED_CONSTRAINT_LOG}: workspace declares conflicting constraints \
+                 for this injected name; falling back to the loose form",
+            );
+            Some((String::new(), "loose"))
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -17739,6 +17899,22 @@ fn produce_output_with_conflicts(
                 config.overrides.contains_key(name) && !config.ledger_overrides.contains(name)
             });
         let native_conda_override = native_conda_overrides.into_iter().next();
+        // Lane C injected members never advertise the version this pack's
+        // solve happened to resolve (operator ruling 2026-09-01). Withheld
+        // from the three groups that are exact BY CONTRACT: an ABI anchor
+        // (whose exactness is the anchor guard's whole job), a name the user
+        // pinned by hand via `retread-overrides`, and a native conda override
+        // (the sole conda-syntax boundary). `constrains_only` groups are inert
+        // -- they add no package to the solve -- so they are left alone too.
+        let injected_override = if constrains_only
+            || has_anchor_alias
+            || has_manual_override
+            || native_conda_override.is_some()
+        {
+            None
+        } else {
+            injected_run_dep_constraint(bundle, &conda_name, &pypi_names)
+        };
         let conda_key = conda_name.key().into_string();
         if !constrains_only {
             // Rule 2's route oracle indexes EMITTED routes. A constrains-only
@@ -17753,6 +17929,31 @@ fn produce_output_with_conflicts(
                  refusing to discard a whole constraint edge"
             );
         }
+        // Sole place an injected member's decided spec is replaced. The
+        // decide pipeline still runs in full above -- its diagnostics,
+        // relaxation records and conflict back-off are unchanged -- only the
+        // RENDERED constraint is swapped, and only for injected members.
+        let apply_injected_override = |rendered: String| -> String {
+            let Some((constraint, source)) = injected_override.as_ref() else {
+                return rendered;
+            };
+            let emitted = if constraint.is_empty() {
+                "<bare name>"
+            } else {
+                constraint.as_str()
+            };
+            tracing::info!(
+                target: "pixi_build_retread",
+                bundle = %bundle.conda_name,
+                package = %conda_name,
+                emitted = %emitted,
+                source = %source,
+                decided = %rendered,
+                "{INJECTED_CONSTRAINT_LOG}: injected member emits a derived constraint \
+                 instead of the resolved pin",
+            );
+            constraint.clone()
+        };
         match decide_for_emission(
             &pypi_name,
             &constraints,
@@ -17787,7 +17988,7 @@ fn produce_output_with_conflicts(
                 } else {
                     rendered
                 };
-                let spec = conda_name.match_spec(&rendered);
+                let spec = conda_name.match_spec(&apply_injected_override(rendered));
                 if constrains_only {
                     constrains_specs.push(constraint_spec_from_str(spec.as_str())?);
                 } else {
@@ -17821,7 +18022,7 @@ fn produce_output_with_conflicts(
                 } else {
                     rendered
                 };
-                let spec = conda_name.match_spec(&rendered);
+                let spec = conda_name.match_spec(&apply_injected_override(rendered));
                 if constrains_only {
                     constrains_specs.push(constraint_spec_from_str(spec.as_str())?);
                 } else {
@@ -26073,6 +26274,8 @@ mod emit_wheel_upstream_url_tests {
             auto_routed: vec![],
             auto_dropped: Default::default(),
             uv_closure_names: Default::default(),
+            auto_imports_injected: Default::default(),
+            workspace_declared_pypi_specs: Default::default(),
             uv_dependency_graph: Default::default(),
             workspace_conda_versions: Default::default(),
             workspace_conda_provider_facts: Default::default(),
@@ -26199,6 +26402,8 @@ mod emit_wheel_upstream_url_tests {
             auto_routed: vec![],
             auto_dropped: Default::default(),
             uv_closure_names: Default::default(),
+            auto_imports_injected: Default::default(),
+            workspace_declared_pypi_specs: Default::default(),
             uv_dependency_graph: Default::default(),
             workspace_conda_versions: Default::default(),
             workspace_conda_provider_facts: Default::default(),

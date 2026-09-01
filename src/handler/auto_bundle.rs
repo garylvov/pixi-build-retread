@@ -4051,6 +4051,8 @@ mod tests {
             auto_routed: vec![],
             auto_dropped: HashSet::new(),
             uv_closure_names: HashSet::new(),
+            auto_imports_injected: HashSet::new(),
+            workspace_declared_pypi_specs: BTreeMap::new(),
             uv_dependency_graph: Default::default(),
             workspace_conda_versions: BTreeMap::new(),
             workspace_conda_provider_facts: BTreeMap::new(),

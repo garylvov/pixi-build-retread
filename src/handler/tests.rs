@@ -860,6 +860,8 @@ fn courier_pure_python_bundle_is_platform_specific_not_noarch() {
         auto_routed: vec![],
         auto_dropped: Default::default(),
         uv_closure_names: Default::default(),
+        auto_imports_injected: Default::default(),
+        workspace_declared_pypi_specs: Default::default(),
         uv_dependency_graph: Default::default(),
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
@@ -943,6 +945,8 @@ fn produce_output_emits_auto_routed_conda_run_deps() {
         ],
         auto_dropped: Default::default(),
         uv_closure_names: Default::default(),
+        auto_imports_injected: Default::default(),
+        workspace_declared_pypi_specs: Default::default(),
         uv_dependency_graph: Default::default(),
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
@@ -978,6 +982,8 @@ fn produce_output_emits_auto_routed_conda_run_deps() {
     let plain = Bundle {
         auto_routed: vec![],
         uv_closure_names: Default::default(),
+        auto_imports_injected: Default::default(),
+        workspace_declared_pypi_specs: Default::default(),
         uv_dependency_graph: Default::default(),
         ..bundle
     };
@@ -3040,6 +3046,8 @@ fn produce_output_softens_deps_from_floor_pin_to_floor_spec() {
         ],
         auto_dropped: Default::default(),
         uv_closure_names: Default::default(),
+        auto_imports_injected: Default::default(),
+        workspace_declared_pypi_specs: Default::default(),
         uv_dependency_graph: Default::default(),
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
@@ -3100,6 +3108,8 @@ fn produce_output_preserves_deps_from_bare_and_range_specs() {
         auto_routed: vec![pandas, scipy],
         auto_dropped: Default::default(),
         uv_closure_names: Default::default(),
+        auto_imports_injected: Default::default(),
+        workspace_declared_pypi_specs: Default::default(),
         uv_dependency_graph: Default::default(),
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
@@ -3647,6 +3657,8 @@ fn solo_bundle(name: &str, requires: Vec<&str>) -> Bundle {
         auto_routed: vec![],
         auto_dropped: Default::default(),
         uv_closure_names: Default::default(),
+        auto_imports_injected: Default::default(),
+        workspace_declared_pypi_specs: Default::default(),
         uv_dependency_graph: Default::default(),
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
@@ -4526,6 +4538,8 @@ fn vendored_sub_packages_dropped_from_run_deps() {
         auto_routed: vec![],
         auto_dropped: Default::default(),
         uv_closure_names: Default::default(),
+        auto_imports_injected: Default::default(),
+        workspace_declared_pypi_specs: Default::default(),
         uv_dependency_graph: Default::default(),
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
@@ -4684,6 +4698,8 @@ fn bundle_field_groups_entries_into_one_output() {
         auto_routed: vec![],
         auto_dropped: Default::default(),
         uv_closure_names: Default::default(),
+        auto_imports_injected: Default::default(),
+        workspace_declared_pypi_specs: Default::default(),
         uv_dependency_graph: Default::default(),
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
@@ -4786,6 +4802,8 @@ fn relaxed_pure_python_primary_pins_python_to_workspace_variant() {
         auto_routed: vec![],
         auto_dropped: Default::default(),
         uv_closure_names: Default::default(),
+        auto_imports_injected: Default::default(),
+        workspace_declared_pypi_specs: Default::default(),
         uv_dependency_graph: Default::default(),
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
@@ -10122,4 +10140,123 @@ fn a_calver_ceded_bound_builds_and_records_the_calver_relaxation() {
             .any(|r| r.contains("fsspec") && r.contains("reason=calver")),
         "the relaxation record must name the CalVer rule: {rendered:?}",
     );
+}
+
+/// Shared shape for the Lane C injected-constraint tests: a pack whose
+/// closure auto-routed `pillow` to conda at the version the solve happened to
+/// pick. `injected` marks it as a Lane C injection; `declared` is what the
+/// workspace manifest says about the name anywhere in its pypi deps.
+fn pillow_injection_bundle(injected: bool, declared: &[&str]) -> Bundle {
+    let mut bundle = solo_bundle("isaaclab-2-3x-pack", vec![]);
+    bundle.auto_routed = vec![bundle_auto_route(
+        "pillow",
+        "11.3.0",
+        Provenance::PriorSelection,
+    )];
+    if injected {
+        bundle.auto_imports_injected.insert("pillow".to_string());
+    }
+    if !declared.is_empty() {
+        bundle.workspace_declared_pypi_specs.insert(
+            "pillow".to_string(),
+            declared.iter().map(|s| (*s).to_string()).collect(),
+        );
+    }
+    bundle
+}
+
+fn emitted_spec_for(bundle: &Bundle, name: &str) -> Option<String> {
+    let out = produce_output(bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
+    out.run_dependencies
+        .depends
+        .iter()
+        .find(|d| d.name == name)
+        .map(|d| format_packagespec(&d.spec))
+}
+
+#[test]
+fn an_injected_member_emits_the_workspace_declared_constraint() {
+    // Operator ruling 2026-09-01: an injected dependency's emitted constraint
+    // is GROKKED from the workspace's own pinned deps, never hardened to the
+    // version this pack's solve resolved.
+    let bundle = pillow_injection_bundle(true, &["==10.4.0"]);
+    assert_eq!(
+        emitted_spec_for(&bundle, "pillow").as_deref(),
+        Some("==10.4.0"),
+        "an injected member must advertise the constraint the workspace declares",
+    );
+}
+
+#[test]
+fn an_injected_member_without_a_workspace_declaration_emits_the_loose_form() {
+    // No declaration anywhere -> precedence step (b): the bare name. A floor
+    // derived from the resolved version (the house `widen_exact` shape,
+    // `>=11`) is deliberately NOT used -- it reproduces the very conflict
+    // this ruling closes.
+    let bundle = pillow_injection_bundle(true, &[]);
+    assert_eq!(
+        emitted_spec_for(&bundle, "pillow").as_deref(),
+        Some(""),
+        "an injected member with no workspace declaration must emit a bare name",
+    );
+}
+
+#[test]
+fn an_injected_member_with_conflicting_declarations_falls_back_to_the_loose_form() {
+    // Two contradictory declarations: "the loosest that satisfies all" is not
+    // a decision this seam invents. Log and fall back to (b).
+    let bundle = pillow_injection_bundle(true, &["==10.4.0", "==9.5.0"]);
+    assert_eq!(
+        emitted_spec_for(&bundle, "pillow").as_deref(),
+        Some(""),
+        "conflicting workspace declarations must fall back to the loose form",
+    );
+}
+
+#[test]
+fn an_injected_member_whose_declaration_is_not_conda_representable_falls_back() {
+    // Defensive: a declaration retread cannot render as a conda matchspec is
+    // never advertised. (`~=` and `>=a,<b` both ARE conda-representable and
+    // pass through verbatim; this covers the residue.)
+    let bundle = pillow_injection_bundle(true, &["not a version spec"]);
+    assert_eq!(
+        emitted_spec_for(&bundle, "pillow").as_deref(),
+        Some(""),
+        "a declaration conda cannot represent must fall back to the loose form",
+    );
+}
+
+#[test]
+fn a_non_injected_member_still_emits_its_exact_resolved_pin() {
+    // Control: the ruling touches INJECTED members only. An ordinary
+    // auto-routed member keeps the bounded band derived from its resolved
+    // conda selection, exactly as before.
+    let bundle = pillow_injection_bundle(false, &["==10.4.0"]);
+    assert_eq!(
+        emitted_spec_for(&bundle, "pillow").as_deref(),
+        Some(">=11.3.0,<12"),
+        "a non-injected member must be untouched by the injection ruling",
+    );
+}
+
+#[test]
+fn an_injected_member_never_advertises_the_version_its_own_solve_resolved() {
+    // Job 5555157 verbatim: `pillow` injected into isaaclab-2.3x-pack
+    // resolved 11.3.0 and was emitted as `pillow ==11.3.0`, which env `pace`
+    // (`pillow ==10.4.0`) cannot satisfy -- the workspace conda solve went
+    // UNSAT. Whatever the emitted constraint is, it must not pin 11.3.0.
+    for declared in [&["==10.4.0"][..], &[][..]] {
+        let bundle = pillow_injection_bundle(true, declared);
+        let spec = emitted_spec_for(&bundle, "pillow")
+            .expect("the injected member is still emitted as a conda run-dep");
+        assert!(
+            !spec.contains("11.3.0"),
+            "an injected member must never advertise its own resolved version \
+             (declared={declared:?}, emitted={spec:?})",
+        );
+        // And the pace pin must remain satisfiable against what we emit.
+        let emitted = crate::handler::spec_from_str(&format!("pillow {spec}").trim().to_string())
+            .expect("the emitted constraint must be a parseable conda spec");
+        assert_eq!(emitted.name, "pillow");
+    }
 }
