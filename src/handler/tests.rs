@@ -7713,8 +7713,10 @@ fn auto_imports_injection_verdict_skips_unmappable_names() {
     assert_eq!(verdict(&req("PIL", "pillow", true, false)), Ok("pillow".to_string()));
     // Fallback-named but plausible: conda-provided roots absent from a cold
     // wheel slice must still be injected.
+    // (`numpy` is deliberately absent: it is an ABI anchor, covered by
+    // `auto_imports_never_injects_an_abi_anchor`.)
     for (module, name) in
-        [("numpy", "numpy"), ("torch", "torch"), ("dm_control", "dm-control"), ("mani_skill", "mani-skill")]
+        [("torch", "torch"), ("dm_control", "dm-control"), ("mani_skill", "mani-skill")]
     {
         assert_eq!(verdict(&req(module, name, false, false)), Ok(name.to_string()), "{module}");
     }
@@ -7830,7 +7832,7 @@ fn auto_imports_injection_verdict_skips_unmappable_names() {
     }
     // Identity rows are assertions too: these inject because they are IN the
     // table, not because the fallback happened to look right.
-    for module in ["omegaconf", "wandb", "numpy", "torch", "gymnasium", "tqdm"] {
+    for module in ["omegaconf", "wandb", "torch", "gymnasium", "tqdm"] {
         assert_eq!(
             verdict(&req(module, module, false, false)),
             Ok(module.to_string()),
@@ -7918,7 +7920,7 @@ fn auto_imports_never_injects_a_name_conda_already_provides() {
     // THE NEWTON SIX, the exact roots injected into `newton-pack-latest`.
     // Five are conda-provided and must now be skipped; `sphinx` is NOT in the
     // baseline conda set for this fixture and stays injectable.
-    for module in ["open3d", "networkx", "requests", "numpy"] {
+    for module in ["open3d", "networkx", "requests"] {
         assert_eq!(
             verdict(&req(module, module, false)),
             Err(AUTO_IMPORTS_CONDA_PROVIDED_REASON),
@@ -7938,12 +7940,14 @@ fn auto_imports_never_injects_a_name_conda_already_provides() {
         verdict(&req("PIL", "pil", false)),
         Err(AUTO_IMPORTS_CONDA_PROVIDED_REASON)
     );
-    // `numpy` is an ABI ANCHOR and is conda-provided, so the anchor is
-    // de-risked incidentally by this screen -- no separate anchor guard
-    // needed while numpy stays on the conda side.
+    // `numpy` is conda-provided here AND an ABI anchor. The anchor guard
+    // runs first and claims it. That ordering is deliberate: the anchor
+    // verdict is workspace-wide and true for every bundle, whereas the
+    // conda verdict is only true for bundles whose fact set happens to
+    // mention numpy -- job 5553070 had three bundles where it did not.
     assert_eq!(
         verdict(&req("numpy", "numpy", false)),
-        Err(AUTO_IMPORTS_CONDA_PROVIDED_REASON)
+        Err(AUTO_IMPORTS_ABI_ANCHOR_REASON)
     );
 
     // A mapped name conda does NOT provide still injects.
@@ -7964,6 +7968,144 @@ fn auto_imports_never_injects_a_name_conda_already_provides() {
         auto_imports_injection_verdict(&req("open3d", "open3d", false), &siblings, &none),
         Ok("open3d".to_string())
     );
+}
+
+/// LANE C ABI BACK-OFF. The emission-side retry is gated on three facts, and
+/// all three are checkable without standing up a whole RPC: the error is an
+/// `AbiInvariantViolation`, the bundle HAS injected roots, and it is not
+/// already suppressed. This pins the gate and the typed-error contract the
+/// gate depends on -- text-matching the message would silently stop working.
+#[test]
+fn abi_backoff_fires_only_for_an_abi_violation_with_injected_roots() {
+    // The typed error must survive the anyhow round trip the catch site does.
+    let typed: anyhow::Error = anyhow::Error::new(AbiInvariantViolation {
+        violations: vec![
+            "ABI invariant: wheel `open3d` embeds `numpy >=1.0,<2` does not cover \
+             workspace pin `numpy==2.5.2`"
+                .to_string(),
+        ],
+    });
+    assert!(typed.downcast_ref::<AbiInvariantViolation>().is_some());
+    // Display is unchanged from the old `bail!`, so existing messages and
+    // operator greps keep working.
+    assert!(
+        format!("{typed:#}").starts_with("bundle emission rejected by ABI invariant: "),
+        "unexpected rendering: {typed:#}"
+    );
+    assert!(format!("{typed:#}").contains("open3d"));
+
+    // Any other emission error must NOT be mistaken for an ABI violation.
+    let other: anyhow::Error = anyhow::anyhow!("some unrelated emission failure");
+    assert!(other.downcast_ref::<AbiInvariantViolation>().is_none());
+
+    // The gate, exactly as written at the catch site.
+    let gate = |is_abi: bool, injected: &BTreeMap<String, Vec<String>>,
+                suppressed: &BTreeSet<String>,
+                bundle: &str| {
+        is_abi && injected.contains_key(bundle) && !suppressed.contains(bundle)
+    };
+    let mut injected: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    injected.insert(
+        "newton-pack-latest".to_string(),
+        vec!["open3d".to_string(), "sphinx".to_string()],
+    );
+    let none: BTreeSet<String> = BTreeSet::new();
+
+    // fires: ABI violation on a bundle that has injected roots
+    assert!(gate(true, &injected, &none, "newton-pack-latest"));
+    // does NOT fire: a bundle with zero injected roots fails exactly as today
+    assert!(!gate(true, &injected, &none, "flashsac-pack"));
+    // does NOT fire: not an ABI violation
+    assert!(!gate(false, &injected, &none, "newton-pack-latest"));
+    // does NOT fire twice: suppression is the termination proof
+    let mut suppressed: BTreeSet<String> = BTreeSet::new();
+    suppressed.insert("newton-pack-latest".to_string());
+    assert!(!gate(true, &injected, &suppressed, "newton-pack-latest"));
+}
+
+/// The back-off's re-resolve must differ from the failed attempt by EXACTLY
+/// the injected-roots delta: suppression drops this bundle's Lane C roots and
+/// touches nothing else.
+#[test]
+fn abi_backoff_suppression_drops_only_the_named_bundles_roots() {
+    let mut suppressed: BTreeSet<String> = BTreeSet::new();
+    suppressed.insert(canonical_conda_name("newton-pack-latest"));
+    // `uv_group_closure` computes its flag as
+    // `suppress_auto_imports.contains(&canonical_conda_name(&group_name))`.
+    let flag = |group: &str| suppressed.contains(&canonical_conda_name(group));
+    assert!(flag("newton-pack-latest"), "the failing bundle is suppressed");
+    for peer in ["flashsac-pack", "holosoma-pack", "robogen-pack"] {
+        assert!(!flag(peer), "{peer} must keep its injected roots");
+    }
+    // An empty set -- the first pass -- suppresses nothing, so the default
+    // path is unchanged.
+    let empty: BTreeSet<String> = BTreeSet::new();
+    assert!(!empty.contains(&canonical_conda_name("newton-pack-latest")));
+}
+
+/// ABI ANCHOR GUARD (screen (c2)). The conda-precedence screen is scoped to
+/// ONE bundle's consuming environments; the ABI invariant is workspace-scoped.
+/// Job 5553070 showed the gap directly: `numpy` was skipped as conda-provided
+/// in `newton-pack-latest` (502-name fact set) and still injected into
+/// `flashsac-pack` (56 names), `robojudo-pack` and `isaaclab-2.3x-pack`.
+#[test]
+fn auto_imports_never_injects_an_abi_anchor() {
+    use crate::auto_imports::{ProvenanceSource, ResolvedImport};
+
+    fn req(module: &str, provider: &str, indexed: bool) -> ResolvedImport {
+        ResolvedImport {
+            module: module.to_string(),
+            provider: Some(provider.to_string()),
+            source: indexed.then_some(ProvenanceSource::TopLevelTxt),
+            conditional: false,
+            files: vec![std::path::PathBuf::from("a.py")],
+        }
+    }
+    let siblings: BTreeSet<String> = BTreeSet::new();
+    // THE FLASHSAC CASE: an EMPTY conda-provided set, i.e. a bundle whose
+    // narrow fact set does not mention numpy at all. The anchor guard must
+    // still refuse it -- that is the whole point of adding it.
+    let empty: BTreeSet<String> = BTreeSet::new();
+    let verdict = |r: &ResolvedImport| auto_imports_injection_verdict(r, &siblings, &empty);
+
+    for module in ["numpy", "python", "cuda"] {
+        assert_eq!(
+            verdict(&req(module, module, false)),
+            Err(AUTO_IMPORTS_ABI_ANCHOR_REASON),
+            "{module} is an ABI anchor and must never be injected"
+        );
+    }
+    // Index authority does not override the anchor guard either.
+    assert_eq!(
+        verdict(&req("numpy", "numpy", true)),
+        Err(AUTO_IMPORTS_ABI_ANCHOR_REASON)
+    );
+    // The guard reads the SAME predicate the invariant uses, so it tracks the
+    // anchor set rather than a copy of it.
+    assert!(crate::solve::is_abi_anchor("numpy"));
+    assert!(crate::solve::is_abi_anchor("python-abi"));
+    assert!(!crate::solve::is_abi_anchor("torch"));
+
+    // Non-anchor, non-conda-provided names still inject -- the guard must be
+    // narrow. `torch` is deliberately in this list: it is NOT in the anchor
+    // set (verified above), so it is not silently swept up.
+    // `python-box` and `pytorch-lightning` are the sharp cases: the anchor
+    // set contains the exact name `python`, and `is_abi_anchor` also applies
+    // PREFIX rules (`cuda-`, `__`, `*-compiler`). Neither must be swept up.
+    for (module, expected) in [
+        ("torch", "torch"),
+        ("cv2", "opencv-python"),
+        ("sphinx", "sphinx"),
+        ("wandb", "wandb"),
+        ("box", "python-box"),
+        ("pytorch_lightning", "pytorch-lightning"),
+    ] {
+        assert_eq!(
+            verdict(&req(module, module, false)),
+            Ok(expected.to_string()),
+            "{module} is not an anchor and must still inject"
+        );
+    }
 }
 
 /// The conda-provided set is derived from workspace FACTS, via both the

@@ -4843,6 +4843,12 @@ impl Handler {
         let mut outputs = Vec::new();
         let mut output_conflicts = Vec::new();
         let mut pending_output_relaxations = Vec::new();
+        // Lane C ABI back-off state, shared across every python version and
+        // emission in this request: a bundle suppressed once stays suppressed,
+        // which is also the termination proof (the set only grows, and each
+        // bundle can trigger at most one re-resolve).
+        let mut abi_backoff_suppressed: BTreeSet<String> = BTreeSet::new();
+        let mut abi_backoff_count = 0usize;
         // v4.2.0: the per-env pre-emission solve check (and its
         // bookkeeping / fail gate) was deleted with the legacy
         // mirror-solver; outputs ship unvalidated and `retread solve`
@@ -4863,16 +4869,18 @@ impl Handler {
             // Phase 1: materialize wheels + auto-bundle. Env-agnostic;
             // results reused across all per-env emissions.
             let t_materialize = std::time::Instant::now();
-            let (materialized, base_config, restore_relaxations) = resolve_all(
-                &config,
-                &target,
-                &download_dir,
-                &source_dir,
-                &cache_dir,
-                &params.channels,
-                workspace_dir.as_deref(),
-            )
-            .await
+            let (materialized, base_config, restore_relaxations, auto_imports_injected) =
+                resolve_all(
+                    &config,
+                    &target,
+                    &download_dir,
+                    &source_dir,
+                    &cache_dir,
+                    &params.channels,
+                    workspace_dir.as_deref(),
+                    &abi_backoff_suppressed,
+                )
+                .await
             .map_err(|e| {
                 RpcError::invalid_params(format!(
                     "resolving wheels for python {python_version}: {e:#}"
@@ -5230,6 +5238,96 @@ impl Handler {
                         version_override_for_bundle,
                     ) {
                         Ok(output) => output,
+                        // LANE C ABI BACK-OFF. An ABI-invariant rejection on a
+                        // bundle that carries injected roots is retried ONCE
+                        // without them. The retry differs from the failed
+                        // attempt by exactly the injected-roots delta: same
+                        // `resolve_all`, same emission call, same inputs
+                        // otherwise. A bundle with zero injected roots, or one
+                        // already suppressed, falls through and fails exactly
+                        // as it does today.
+                        //
+                        // Safe to re-run: emission is pure (it writes nothing
+                        // and mutates no shared state before the invariant
+                        // bails), and every bundle-keyed cache -- the uv
+                        // closure meta and the heal facts -- hashes the root
+                        // list into its validity key, so dropping the injected
+                        // roots forces a genuine re-resolve rather than
+                        // replaying the failed attempt.
+                        Err(error)
+                            if error.downcast_ref::<AbiInvariantViolation>().is_some()
+                                && auto_imports_injected
+                                    .contains_key(&base_bundle.conda_name)
+                                && !abi_backoff_suppressed
+                                    .contains(&base_bundle.conda_name) =>
+                        {
+                            let violation = format!("{error:#}");
+                            let dropped = auto_imports_injected
+                                .get(&base_bundle.conda_name)
+                                .cloned()
+                                .unwrap_or_default();
+                            tracing::warn!(
+                                bundle = %base_bundle.conda_name,
+                                dropped_roots = %dropped.join(","),
+                                dropped = dropped.len(),
+                                violation = %violation,
+                                "auto_imports: ABI BACK-OFF -- emission failed the ABI                                  invariant with Lane C roots injected; re-resolving this                                  bundle WITHOUT them. The dropped names are a FINDING:                                  each is a detected dependency this workspace cannot                                  satisfy under its current ABI anchors.",
+                            );
+                            abi_backoff_suppressed.insert(base_bundle.conda_name.clone());
+                            abi_backoff_count += 1;
+                            let (retry_materialized, retry_config, _, _) = resolve_all(
+                                &config,
+                                &target,
+                                &download_dir,
+                                &source_dir,
+                                &cache_dir,
+                                &params.channels,
+                                workspace_dir.as_deref(),
+                                &abi_backoff_suppressed,
+                            )
+                            .await
+                            .map_err(|e| {
+                                RpcError::invalid_params(format!(
+                                    "ABI back-off re-resolve for {} (python                                      {python_version}): {e:#}",
+                                    base_bundle.conda_name
+                                ))
+                            })?;
+                            let Some(retry_base) = retry_materialized
+                                .iter()
+                                .find(|b| b.conda_name == base_bundle.conda_name)
+                            else {
+                                return Err(RpcError::internal(format!(
+                                    "ABI back-off for {} produced no such bundle",
+                                    base_bundle.conda_name
+                                )));
+                            };
+                            let (retry_bundle, retry_effective) =
+                                apply_emission(retry_base, &retry_config, emission);
+                            match produce_output_pending_relaxations(
+                                &retry_bundle,
+                                &retry_effective,
+                                params.host_platform,
+                                python_version,
+                                &siblings,
+                                output_build_hash,
+                                version_override_for_bundle,
+                            ) {
+                                Ok(output) => {
+                                    tracing::warn!(
+                                        bundle = %base_bundle.conda_name,
+                                        "auto_imports: ABI BACK-OFF SUCCEEDED -- bundle                                          emitted without its injected roots",
+                                    );
+                                    output
+                                }
+                                Err(retry_error) => {
+                                    return Err(RpcError::internal(format!(
+                                        "output for {} (after Lane C ABI back-off dropped                                          {}): {retry_error:#}",
+                                        base_bundle.conda_name,
+                                        dropped.join(","),
+                                    )));
+                                }
+                            }
+                        }
                         Err(error) => {
                             let mut bundle_conflicts = Vec::new();
                             if let Err(error) = collect_conflicts(error, &mut bundle_conflicts) {
@@ -5380,6 +5478,15 @@ impl Handler {
         }
         for relaxation in pending_output_relaxations {
             relaxation.emit();
+        }
+        // One summary line per request, so a back-off is always a reported
+        // finding and never a silent retreat. Emitted at WARN when it fired.
+        if abi_backoff_count > 0 {
+            tracing::warn!(
+                backoffs = abi_backoff_count,
+                bundles = %abi_backoff_suppressed.iter().cloned().collect::<Vec<_>>().join(","),
+                "auto_imports: ABI BACK-OFF SUMMARY -- these bundles emitted WITHOUT their                  detected roots because injecting them contradicted a workspace ABI anchor",
+            );
         }
         Ok(result)
     }
@@ -6035,17 +6142,19 @@ impl Handler {
 
         // Re-resolve materialized bundles, then autodiscover emissions
         // and pick the one matching the requested output name.
-        let (materialized, base_config, restore_relaxations) = resolve_all(
-            &config,
-            &target,
-            &download_dir,
-            &source_dir,
-            &cache_dir,
-            &params.channels,
-            workspace_dir.as_deref(),
-        )
-        .await
-        .map_err(|e| RpcError::internal(format!("resolving wheels: {e:#}")))?;
+        let (materialized, base_config, restore_relaxations, _auto_imports_injected) =
+            resolve_all(
+                &config,
+                &target,
+                &download_dir,
+                &source_dir,
+                &cache_dir,
+                &params.channels,
+                workspace_dir.as_deref(),
+                &BTreeSet::new(),
+            )
+            .await
+            .map_err(|e| RpcError::internal(format!("resolving wheels: {e:#}")))?;
         let bundle_names: HashSet<PypiKey> = materialized
             .iter()
             .map(|b| PypiKey::from_pypi(&b.conda_name))
@@ -6915,11 +7024,20 @@ async fn resolve_all(
     cache_dir: &Path,
     conda_channels: &[ChannelUrl],
     workspace_dir: Option<&Path>,
+    // Canonical conda names of bundles whose Lane C injection is suppressed
+    // for this pass. Grows by one bundle per ABI back-off; empty on the
+    // first pass, so the default path is byte-identical to before.
+    suppress_auto_imports: &BTreeSet<String>,
 ) -> Result<(
     Vec<Bundle>,
     RetreadConfig,
     Vec<auto_bundle::WheelMetadataRelaxation>,
+    // Lane C roots injected per bundle (canonical conda name -> roots).
+    // Lets the emission side decide whether an ABI failure is worth a
+    // back-off, and name the roots it dropped.
+    BTreeMap<String, Vec<String>>,
 )> {
+    let mut auto_imports_injected_by_bundle: BTreeMap<String, Vec<String>> = BTreeMap::new();
     // Bind the pack-level policy to the target used by every source-build
     // branch in this resolution. Resolution/cache identity intentionally does
     // not change: the policy controls how an exact cache miss is produced,
@@ -7080,6 +7198,7 @@ async fn resolve_all(
             protected_workspace_fact_names,
             conda_co_solve,
             sibling_pin_relaxations,
+            auto_imports_injected,
         ): (
             Option<crate::uv_closure::UvClosure>,
             std::collections::BTreeSet<String>,
@@ -7088,6 +7207,7 @@ async fn resolve_all(
             BTreeSet<String>,
             CondaCoSolveContext,
             Vec<auto_bundle::WheelMetadataRelaxation>,
+            Vec<String>,
         ) = uv_group_closure(
             &group_name,
             &group_entries,
@@ -7105,9 +7225,16 @@ async fn resolve_all(
                     .get(&group_name)
                     .expect("every bundle group has one probe metrics ledger"),
             ),
+            suppress_auto_imports.contains(&canonical_conda_name(&group_name)),
         )
         .await
         .with_context(|| format!("computing uv closure for bundle `{group_name}`"))?;
+        if !auto_imports_injected.is_empty() {
+            auto_imports_injected_by_bundle.insert(
+                canonical_conda_name(&group_name),
+                auto_imports_injected.clone(),
+            );
+        }
         // F32: declared pins widened to converge on a co-activated sibling are
         // recorded like every other relaxation (writer -> reader).
         pending_relaxations.extend(sibling_pin_relaxations);
@@ -7415,7 +7542,12 @@ async fn resolve_all(
     if !route_conflicts.is_empty() {
         return Err(aggregate_conflicts(route_conflicts));
     }
-    Ok((bundles, effective, pending_relaxations))
+    Ok((
+        bundles,
+        effective,
+        pending_relaxations,
+        auto_imports_injected_by_bundle,
+    ))
 }
 
 /// Compose the persisted sdist source URL, appending the advertised
@@ -9115,6 +9247,11 @@ async fn uv_group_closure(
     conda_channels: &[ChannelUrl],
     uv_retry_keep: &BTreeSet<PypiKey>,
     probe_metrics: Arc<BundleProbeMetrics>,
+    // Lane C back-off: when true this bundle's auto-detected imports are
+    // NOT injected, even with RETREAD_AUTO_IMPORTS=1. Set after an ABI
+    // invariant rejection so the retry differs from the failed attempt by
+    // exactly the injected-roots delta and nothing else.
+    suppress_auto_imports: bool,
 ) -> Result<(
     Option<crate::uv_closure::UvClosure>,
     std::collections::BTreeSet<String>,
@@ -9123,6 +9260,10 @@ async fn uv_group_closure(
     BTreeSet<String>,
     CondaCoSolveContext,
     Vec<auto_bundle::WheelMetadataRelaxation>,
+    // Lane C roots actually injected for this bundle. Empty when the gate
+    // is off or the back-off suppressed them. Carried out so the emission
+    // side can tell whether an ABI failure is worth retrying without them.
+    Vec<String>,
 )> {
     let uv_retry_keep_names: BTreeSet<String> = uv_retry_keep
         .iter()
@@ -9304,9 +9445,22 @@ async fn uv_group_closure(
     }
     // Prepend, so every explicitly declared root outranks a detected one.
     // Empty unless RETREAD_AUTO_IMPORTS=1, so this is a no-op by default.
+    if suppress_auto_imports && !auto_imports_roots.is_empty() {
+        auto_imports_roots.sort();
+        auto_imports_roots.dedup();
+        tracing::warn!(
+            bundle = %group_name,
+            suppressed = auto_imports_roots.len(),
+            roots = %auto_imports_roots.join(","),
+            "auto_imports: BACK-OFF ACTIVE -- detected roots NOT injected for this              bundle because a previous emission failed the ABI invariant",
+        );
+        auto_imports_roots.clear();
+    }
+    let mut auto_imports_injected: Vec<String> = Vec::new();
     if !auto_imports_roots.is_empty() {
         auto_imports_roots.sort();
         auto_imports_roots.dedup();
+        auto_imports_injected = auto_imports_roots.clone();
         tracing::info!(
             bundle = %group_name,
             injected = auto_imports_roots.len(),
@@ -9917,6 +10071,7 @@ async fn uv_group_closure(
             protected_root_names,
             conda_co_solve,
             sibling_pin_relaxations,
+            auto_imports_injected,
         ));
     }
     // ABI-anchor pins (`cuda-version`, `python_abi`, ...) from the
@@ -10256,6 +10411,7 @@ async fn uv_group_closure(
         protected_root_names,
         conda_co_solve,
         sibling_pin_relaxations,
+        auto_imports_injected,
     ))
 }
 
@@ -13443,6 +13599,13 @@ const AUTO_IMPORTS_NO_PYPI_DISTRIBUTION: &[&str] = &[
     "warp",
 ];
 
+/// The skip reason for a name that is itself an ABI anchor. Never injected
+/// at any version: the anchor is the workspace's contract, and an
+/// unconstrained root is exactly how that contract gets renegotiated by
+/// accident.
+const AUTO_IMPORTS_ABI_ANCHOR_REASON: &str =
+    "abi-anchor: the workspace pins this name as an ABI contract";
+
 /// The skip reason for a name the conda side of the workspace already
 /// provides. Distinct from the lead reason: this one is not a naming failure
 /// at all -- detection worked, the dependency is simply not missing.
@@ -13684,14 +13847,30 @@ fn auto_imports_injection_verdict(
     if sibling_entries.contains(&canonical) {
         return Err("names another entry of this same bundle");
     }
-    // (d) CONDA PRECEDENCE. Tested against the name we would ACTUALLY inject,
-    // not the raw fallback spelling: on a cold store `PIL` carries the
-    // provider `pil`, but the root we would emit is `pillow`, and `pillow` is
-    // what the conda side provides. Checking `canonical` alone would miss
-    // every drift case exactly when the store is cold.
+    // The name we would ACTUALLY inject, not the raw fallback spelling: on a
+    // cold store `PIL` carries the provider `pil`, but the root we would emit
+    // is `pillow`. Both screens below must judge the emitted name, or they
+    // miss every drift case exactly when the store is cold.
     let candidate = auto_imports_mapped_distribution(&req.module)
         .map(str::to_string)
         .unwrap_or_else(|| canonical.clone());
+    // (c2) ABI ANCHOR. An anchor is the workspace's cross-ecosystem contract
+    // (`numpy==2.5.2`, `python-abi ==3.12`); injecting one as an
+    // UNCONSTRAINED root invites uv to pick a different version and then
+    // fails the very invariant that protects it. The anchor set is read from
+    // `crate::solve::is_abi_anchor` (`src/solve/repair.rs:2029`) -- the SAME
+    // predicate `emit_pypi.rs:473` and `relax_decision.rs:53` use, so this
+    // can never drift from what the invariant enforces.
+    //
+    // This is not redundant with (d) below: (d) is scoped to ONE bundle's
+    // consuming environments, while the invariant is workspace-scoped.
+    // Measured in job 5553070, `numpy` was skipped as conda-provided in
+    // `newton-pack-latest` (502-name fact set) yet still injected into
+    // `flashsac-pack` (56 names), `robojudo-pack` and `isaaclab-2.3x-pack`.
+    if crate::solve::is_abi_anchor(&candidate) || crate::solve::is_abi_anchor(&req.module) {
+        return Err(AUTO_IMPORTS_ABI_ANCHOR_REASON);
+    }
+    // (d) CONDA PRECEDENCE.
     if conda_provided.contains(&candidate) {
         return Err(AUTO_IMPORTS_CONDA_PROVIDED_REASON);
     }
@@ -16238,11 +16417,34 @@ fn ensure_output_abi_invariants(
             "bundle emission rejected by ABI invariant",
         );
     }
-    bail!(
-        "bundle emission rejected by ABI invariant: {}",
-        violations.join("; ")
-    )
+    // Typed, not a bare string bail: the Lane C back-off in `conda_outputs`
+    // must tell an ABI violation apart from every other emission error, and
+    // text-matching an anyhow message is not a contract. This mirrors the
+    // existing `Conflict` / `ConflictReport` precedent in `constraint.rs`.
+    // `Display` is unchanged, so every existing message and test still reads
+    // exactly as before.
+    Err(anyhow::Error::new(AbiInvariantViolation { violations }))
 }
+
+/// Emission rejected because the bundle's wheels contradict a workspace ABI
+/// anchor. Carried as a typed error so callers can recognise it without
+/// matching on message text; see `ensure_output_abi_invariants`.
+#[derive(Debug, Clone)]
+pub(crate) struct AbiInvariantViolation {
+    pub(crate) violations: Vec<String>,
+}
+
+impl std::fmt::Display for AbiInvariantViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "bundle emission rejected by ABI invariant: {}",
+            self.violations.join("; ")
+        )
+    }
+}
+
+impl std::error::Error for AbiInvariantViolation {}
 
 type ProducedOutput = (
     CondaOutput,
