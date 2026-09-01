@@ -7703,7 +7703,10 @@ fn auto_imports_injection_verdict_skips_unmappable_names() {
     }
     let siblings: BTreeSet<String> =
         ["isaaclab-assets", "isaaclab-tasks"].iter().map(|s| s.to_string()).collect();
-    let verdict = |r: &ResolvedImport| auto_imports_injection_verdict(r, &siblings);
+    // Empty conda-provided set for the naming assertions below; the
+    // conda-precedence screen gets its own dedicated test.
+    let no_conda: BTreeSet<String> = BTreeSet::new();
+    let verdict = |r: &ResolvedImport| auto_imports_injection_verdict(r, &siblings, &no_conda);
 
     // --- INJECTED ---
     // Index-provided: PIL -> pillow, the naming the warm wheel slice gave.
@@ -7751,7 +7754,8 @@ fn auto_imports_injection_verdict_skips_unmappable_names() {
     // The sibling set here is `flashsac-pack`'s real one: `isaaclab-tasks` is
     // NOT in it, which is precisely why screen (c) could not save arm B.
     let foreign_siblings: BTreeSet<String> = ["flashrl"].iter().map(|s| s.to_string()).collect();
-    let foreign = |r: &ResolvedImport| auto_imports_injection_verdict(r, &foreign_siblings);
+    let foreign =
+        |r: &ResolvedImport| auto_imports_injection_verdict(r, &foreign_siblings, &no_conda);
     for module in [
         "isaaclab",
         "isaaclab_tasks",
@@ -7878,6 +7882,114 @@ fn auto_imports_injection_verdict_skips_unmappable_names() {
     // is not), and is the one case where warmth legitimately matters.
     assert_eq!(verdict(&req("annoy", "annoy", false, false)), Err(AUTO_IMPORTS_LEAD_REASON));
     assert_eq!(verdict(&req("annoy", "annoy", true, false)), Ok("annoy".to_string()));
+}
+
+/// CONDA PRECEDENCE (screen (d)). Job 5551014 died because `open3d` was
+/// injected into `newton-pack-latest` as an unconstrained root: uv resolved it
+/// from PyPI, dragging in dash/plotly/pandas/scikit-learn whose METADATA
+/// embeds `numpy >=1.0,<2`, which does not cover the workspace anchor
+/// `numpy==2.5.2`, and the ABI invariant rejected the emission. All of those
+/// packages were already satisfied on the CONDA side of the baseline lock.
+#[test]
+fn auto_imports_never_injects_a_name_conda_already_provides() {
+    use crate::auto_imports::{ProvenanceSource, ResolvedImport};
+
+    fn req(module: &str, provider: &str, indexed: bool) -> ResolvedImport {
+        ResolvedImport {
+            module: module.to_string(),
+            provider: Some(provider.to_string()),
+            source: indexed.then_some(ProvenanceSource::TopLevelTxt),
+            conditional: false,
+            files: vec![std::path::PathBuf::from("a.py")],
+        }
+    }
+    let siblings: BTreeSet<String> = BTreeSet::new();
+    // Exactly the conda names the 5551014 arm A baseline lock carried for the
+    // packages involved in the rejection.
+    let conda: BTreeSet<String> = [
+        "open3d", "networkx", "requests", "pyyaml", "numpy", "dash", "plotly", "joblib",
+        "scikit-learn", "pandas", "pillow",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let verdict = |r: &ResolvedImport| auto_imports_injection_verdict(r, &siblings, &conda);
+
+    // THE NEWTON SIX, the exact roots injected into `newton-pack-latest`.
+    // Five are conda-provided and must now be skipped; `sphinx` is NOT in the
+    // baseline conda set for this fixture and stays injectable.
+    for module in ["open3d", "networkx", "requests", "numpy"] {
+        assert_eq!(
+            verdict(&req(module, module, false)),
+            Err(AUTO_IMPORTS_CONDA_PROVIDED_REASON),
+            "{module} is conda-provided and must never be injected"
+        );
+    }
+    // `yaml` -> `pyyaml` via the map, and `pyyaml` is what conda provides:
+    // the screen must test the MAPPED name, not the raw fallback `yaml`.
+    assert_eq!(
+        verdict(&req("yaml", "yaml", false)),
+        Err(AUTO_IMPORTS_CONDA_PROVIDED_REASON),
+        "the conda check must run against the name we would actually inject"
+    );
+    // Same shape, cold store: module `PIL`, provider `pil`, injected name
+    // would be `pillow` -- which conda provides.
+    assert_eq!(
+        verdict(&req("PIL", "pil", false)),
+        Err(AUTO_IMPORTS_CONDA_PROVIDED_REASON)
+    );
+    // `numpy` is an ABI ANCHOR and is conda-provided, so the anchor is
+    // de-risked incidentally by this screen -- no separate anchor guard
+    // needed while numpy stays on the conda side.
+    assert_eq!(
+        verdict(&req("numpy", "numpy", false)),
+        Err(AUTO_IMPORTS_CONDA_PROVIDED_REASON)
+    );
+
+    // A mapped name conda does NOT provide still injects.
+    assert_eq!(verdict(&req("sphinx", "sphinx", false)), Ok("sphinx".to_string()));
+    assert_eq!(verdict(&req("cv2", "cv2", false)), Ok("opencv-python".to_string()));
+    assert_eq!(verdict(&req("torch", "torch", false)), Ok("torch".to_string()));
+
+    // Conda precedence outranks INDEX authority too: an indexed name the
+    // conda side supplies is still a re-route to PyPI, which is the harm.
+    assert_eq!(
+        verdict(&req("open3d", "open3d", true)),
+        Err(AUTO_IMPORTS_CONDA_PROVIDED_REASON)
+    );
+    // With an empty conda set nothing is screened out -- the check is driven
+    // entirely by workspace facts, never by a hardcoded list.
+    let none: BTreeSet<String> = BTreeSet::new();
+    assert_eq!(
+        auto_imports_injection_verdict(&req("open3d", "open3d", false), &siblings, &none),
+        Ok("open3d".to_string())
+    );
+}
+
+/// The conda-provided set is derived from workspace FACTS, via both the
+/// declared name-map edge and the PEP 503 identity guess.
+#[test]
+fn auto_imports_conda_provided_set_uses_facts_and_mapping_edges() {
+    let mut facts = WorkspaceCondaFacts::default();
+    for (conda_name, version) in
+        [("open3d", "0.19.0"), ("py-opencv", "4.10.0"), ("numpy", "2.5.2")]
+    {
+        facts
+            .common_selected_versions
+            .insert(conda_name.to_string(), version.to_string());
+    }
+    // A declared edge opencv-python -> py-opencv: the PyPI spelling must be
+    // recognised as conda-provided even though the names differ.
+    let map = name_map(&[("opencv-python", "py-opencv")]);
+    let provided = auto_imports_conda_provided_names(&facts, &map);
+    // identity guesses
+    assert!(provided.contains("open3d"));
+    assert!(provided.contains("numpy"));
+    // mapping edge
+    assert!(provided.contains("opencv-python"));
+    // not provided
+    assert!(!provided.contains("torch"));
+    assert!(!provided.contains("sphinx"));
 }
 
 /// The curated table is a set of CLAIMS about PyPI. Guard its shape so a

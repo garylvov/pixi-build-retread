@@ -9153,6 +9153,50 @@ async fn uv_group_closure(
         .iter()
         .map(|(name, _)| canonical_conda_name(name))
         .collect();
+
+    let manifest_opt = workspace_dir.and_then(crate::workspace::WorkspaceManifest::load);
+    // Solve precise consuming environments for every policy. Ownership/drop
+    // actions remain validated-policy-only below, but Rule 3 and
+    // harmonization must never fall back to non-consuming feature unions.
+    // Only the pack's declared map may establish PyPI -> conda fact identity;
+    // fallback/parselmouth routing aliases are not fact authority.
+    //
+    // HOISTED above the entry loop (was: just after it) so Lane C's injection
+    // verdict can consult the conda side. Its inputs -- manifest, workspace
+    // dir, source dir, target, channels, name map, group name -- are all
+    // immutable parameters that the loop does not touch, so moving the call
+    // changes WHEN it runs, never WHAT it returns. Nothing between the old and
+    // new position feeds it (the deps-from block only extends `roots`).
+    let mut workspace_facts = match (manifest_opt.as_ref(), workspace_dir) {
+        (Some(manifest), Some(ws_dir)) => {
+            solve_workspace_conda_facts(
+                manifest,
+                ws_dir,
+                source_dir,
+                target,
+                conda_channels,
+                fact_name_map,
+                group_name,
+            )
+            .await
+        }
+        _ => WorkspaceCondaFacts::default(),
+    };
+    // Names the CONDA side of this workspace already provides. Lane C exists
+    // to surface MISSING dependencies; a conda-provided module is not
+    // missing, and injecting it re-routes the solve toward a PyPI wheel whose
+    // embedded ABI pins can contradict the workspace anchors -- exactly how
+    // job 5551014 died (`open3d` injected into `newton-pack-latest` pulled
+    // dash/plotly/pandas/scikit-learn from PyPI, all embedding
+    // `numpy >=1.0,<2` against the workspace pin `numpy==2.5.2`).
+    let auto_imports_conda_provided =
+        auto_imports_conda_provided_names(&workspace_facts, fact_name_map);
+    tracing::info!(
+        bundle = %group_name,
+        conda_provided = auto_imports_conda_provided.len(),
+        "auto_imports: conda-provided names that are never injected",
+    );
+
     for (name, entry) in group_entries {
         if entry.is_spec() {
             let extras = if entry.extras.is_empty() {
@@ -9252,6 +9296,7 @@ async fn uv_group_closure(
                     cache_dir,
                     index,
                     &auto_imports_siblings,
+                    &auto_imports_conda_provided,
                 )
                 .await,
             );
@@ -9311,27 +9356,6 @@ async fn uv_group_closure(
         roots = dedupe_roots_last_wins(roots);
     }
 
-    let manifest_opt = workspace_dir.and_then(crate::workspace::WorkspaceManifest::load);
-    // Solve precise consuming environments for every policy. Ownership/drop
-    // actions remain validated-policy-only below, but Rule 3 and
-    // harmonization must never fall back to non-consuming feature unions.
-    // Only the pack's declared map may establish PyPI -> conda fact identity;
-    // fallback/parselmouth routing aliases are not fact authority.
-    let mut workspace_facts = match (manifest_opt.as_ref(), workspace_dir) {
-        (Some(manifest), Some(ws_dir)) => {
-            solve_workspace_conda_facts(
-                manifest,
-                ws_dir,
-                source_dir,
-                target,
-                conda_channels,
-                fact_name_map,
-                group_name,
-            )
-            .await
-        }
-        _ => WorkspaceCondaFacts::default(),
-    };
     if effective.route_policy == crate::config::RoutePolicy::PreferCondaValidated {
         let manual: BTreeSet<String> = effective
             .overrides
@@ -13419,6 +13443,12 @@ const AUTO_IMPORTS_NO_PYPI_DISTRIBUTION: &[&str] = &[
     "warp",
 ];
 
+/// The skip reason for a name the conda side of the workspace already
+/// provides. Distinct from the lead reason: this one is not a naming failure
+/// at all -- detection worked, the dependency is simply not missing.
+const AUTO_IMPORTS_CONDA_PROVIDED_REASON: &str =
+    "conda-provided: the workspace's conda side already supplies this name";
+
 /// The skip reason for a name that is neither mapped nor index-provided.
 /// Compared by the caller to route the row to the `auto_imports_lead:` log.
 const AUTO_IMPORTS_LEAD_REASON: &str =
@@ -13536,6 +13566,53 @@ const AUTO_IMPORTS_DISTRIBUTION_MAP: &[(&str, &str)] = &[
     ("wandb", "wandb"),
 ];
 
+/// PyPI-side canonical names that the CONDA side of this workspace already
+/// provides, and which Lane C must therefore never inject.
+///
+/// AUTHORITY: [`WorkspaceCondaFacts::common_selected_versions`] -- "common
+/// selected versions for all conda records, including transitives ... the
+/// exact workspace fact boundary used to drop-own matching wheel
+/// requirements after materialization" (`handler/mod.rs`, the field's own
+/// doc). Retread already treats that set as "conda owns this name" when it
+/// drops wheel requirements; using the same boundary to decline an injection
+/// keeps one definition of conda ownership instead of inventing a second.
+/// Transitives are included deliberately: `open3d` is not directly declared
+/// anywhere, yet the conda side supplies it, and it is what broke 5551014.
+///
+/// Two ways a PyPI name is matched to that conda-keyed set, unioned:
+///   1. a declared `name_map` edge pypi -> conda, the identity/provenance
+///      proof the fact solver itself uses; and
+///   2. the PEP 503 identity guess (`canonical_conda_name`), for the common
+///      case where the two ecosystems agree on spelling.
+/// The identity guess is the same "same-name collision" hazard the fact
+/// solver fails closed on -- but in the OPPOSITE direction. Here a false
+/// positive only declines an injection (conservative, and Lane C's rule is
+/// never to inject on doubt); a false negative is the bug we are fixing.
+fn auto_imports_conda_provided_names(
+    facts: &WorkspaceCondaFacts,
+    name_map: &NameMap,
+) -> BTreeSet<String> {
+    let mut provided: BTreeSet<String> = BTreeSet::new();
+    // (2) identity: the conda record name, read as a PyPI name.
+    for conda_name in facts.common_selected_versions.keys() {
+        provided.insert(canonical_conda_name(conda_name));
+    }
+    // (1) declared mapping edges: pypi -> conda, kept when the conda side
+    // actually selected that package.
+    for (pypi, target) in name_map {
+        let Some(conda) = target.mapped_name() else {
+            continue;
+        };
+        if facts
+            .common_selected_versions
+            .contains_key(&conda.key().into_string())
+        {
+            provided.insert(canonical_conda_name(pypi.as_str()));
+        }
+    }
+    provided
+}
+
 /// Curated distribution name for an import module, if the table knows it.
 /// Exact, case-sensitive match on the module as imported.
 fn auto_imports_mapped_distribution(module: &str) -> Option<&'static str> {
@@ -13584,6 +13661,7 @@ fn auto_imports_is_isaaclab_extension(module: &str) -> bool {
 fn auto_imports_injection_verdict(
     req: &crate::auto_imports::ResolvedImport,
     sibling_entries: &BTreeSet<String>,
+    conda_provided: &BTreeSet<String>,
 ) -> std::result::Result<String, &'static str> {
     // (a) Conditional imports are optional by construction (every import site
     // sits in a try/except). Requiring one turns an optional feature into a
@@ -13605,6 +13683,17 @@ fn auto_imports_injection_verdict(
     // index for something this bundle produces itself.
     if sibling_entries.contains(&canonical) {
         return Err("names another entry of this same bundle");
+    }
+    // (d) CONDA PRECEDENCE. Tested against the name we would ACTUALLY inject,
+    // not the raw fallback spelling: on a cold store `PIL` carries the
+    // provider `pil`, but the root we would emit is `pillow`, and `pillow` is
+    // what the conda side provides. Checking `canonical` alone would miss
+    // every drift case exactly when the store is cold.
+    let candidate = auto_imports_mapped_distribution(&req.module)
+        .map(str::to_string)
+        .unwrap_or_else(|| canonical.clone());
+    if conda_provided.contains(&candidate) {
+        return Err(AUTO_IMPORTS_CONDA_PROVIDED_REASON);
     }
     // (e) CURATED TABLE FIRST -- deterministic, and the only channel that can
     // correct name drift (`PIL` -> `pillow`). Beats the index deliberately:
@@ -13751,6 +13840,7 @@ async fn auto_imports_dry_run(
     cache_dir: &Path,
     index: &crate::auto_imports::ClosureIndex,
     sibling_entries: &BTreeSet<String>,
+    conda_provided: &BTreeSet<String>,
 ) -> Vec<String> {
     let mut checkout_lease = None;
     if let Some((url, rev)) = checkout_source_for_entry(entry, &effective.git_sources) {
@@ -13830,7 +13920,7 @@ async fn auto_imports_dry_run(
         }
         // The verdict is computed WHETHER OR NOT injection is enabled, so the
         // OFF arm still measures exactly what the ON arm would have done.
-        match auto_imports_injection_verdict(req, sibling_entries) {
+        match auto_imports_injection_verdict(req, sibling_entries, conda_provided) {
             Ok(root) => {
                 if inject {
                     injected.push(root.clone());
