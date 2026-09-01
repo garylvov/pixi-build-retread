@@ -28461,6 +28461,7 @@ mod incremental_add_tests {
     /// Gate 1: RETREAD_INCREMENTAL not set → always None.
     #[test]
     fn no_env_var_returns_none() {
+        let _env_guard = super::TEST_ENV_MUTEX.lock().unwrap();
         let dir = std::env::temp_dir().join(format!(
             "retread-incr-test-{}",
             std::time::SystemTime::now()
@@ -28474,7 +28475,7 @@ mod incremental_add_tests {
         let config = empty_config();
 
         // Ensure RETREAD_INCREMENTAL is NOT set.
-        // SAFETY: single-threaded test context; no concurrent env access.
+        // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
         unsafe { std::env::remove_var("RETREAD_INCREMENTAL") };
         let result = detect_incremental_add(
             &lock_path,
@@ -28495,10 +28496,11 @@ mod incremental_add_tests {
     /// Gate 2: missing lock → None.
     #[test]
     fn missing_lock_returns_none() {
+        let _env_guard = super::TEST_ENV_MUTEX.lock().unwrap();
         let missing = PathBuf::from("/tmp/retread-test-does-not-exist-xyz.json");
         let config = empty_config();
 
-        // SAFETY: single-threaded test context; no concurrent env access.
+        // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
         unsafe { std::env::set_var("RETREAD_INCREMENTAL", "1") };
         let result = detect_incremental_add(
             &missing,
@@ -28509,6 +28511,7 @@ mod incremental_add_tests {
             "3.11",
             "fp",
         );
+        // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
         unsafe { std::env::remove_var("RETREAD_INCREMENTAL") };
         assert!(result.is_none(), "missing lock must return None");
     }
@@ -28516,6 +28519,7 @@ mod incremental_add_tests {
     /// Gate 2: lock with wrong schema → None.
     #[test]
     fn wrong_schema_returns_none() {
+        let _env_guard = super::TEST_ENV_MUTEX.lock().unwrap();
         let dir = std::env::temp_dir().join(format!(
             "retread-incr-schema-{}",
             std::time::SystemTime::now()
@@ -28560,7 +28564,7 @@ mod incremental_add_tests {
         std::fs::write(&lock_path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
 
         let config = empty_config();
-        // SAFETY: single-threaded test context; no concurrent env access.
+        // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
         unsafe { std::env::set_var("RETREAD_INCREMENTAL", "1") };
         let result = detect_incremental_add(
             &lock_path,
@@ -28571,6 +28575,7 @@ mod incremental_add_tests {
             "3.11",
             "fp",
         );
+        // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
         unsafe { std::env::remove_var("RETREAD_INCREMENTAL") };
         assert!(result.is_none(), "wrong schema must return None");
         let _ = std::fs::remove_dir_all(&dir);
@@ -28579,6 +28584,7 @@ mod incremental_add_tests {
     /// Gate 2: lock with empty entry_specs → None (old schema).
     #[test]
     fn empty_entry_specs_returns_none() {
+        let _env_guard = super::TEST_ENV_MUTEX.lock().unwrap();
         let dir = std::env::temp_dir().join(format!(
             "retread-incr-empty-specs-{}",
             std::time::SystemTime::now()
@@ -28591,7 +28597,7 @@ mod incremental_add_tests {
         make_lock_at(&lock_path, vec![], "dummy-hash"); // empty entry_specs
 
         let config = empty_config();
-        // SAFETY: single-threaded test context; no concurrent env access.
+        // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
         unsafe { std::env::set_var("RETREAD_INCREMENTAL", "1") };
         let result = detect_incremental_add(
             &lock_path,
@@ -28602,6 +28608,7 @@ mod incremental_add_tests {
             "3.11",
             "fp",
         );
+        // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
         unsafe { std::env::remove_var("RETREAD_INCREMENTAL") };
         assert!(result.is_none(), "empty entry_specs must return None");
         let _ = std::fs::remove_dir_all(&dir);
@@ -28689,6 +28696,7 @@ mod incremental_add_tests {
     /// their indexes → STEP A passes, STEP B passes → ENGAGE (Some returned).
     #[test]
     fn step_a_new_index_entry_engages() {
+        let _env_guard = super::TEST_ENV_MUTEX.lock().unwrap();
         let dir = tmp_incr("a");
         let lock_path = dir.join(RetreadLock::file_name("test-bundle"));
 
@@ -28720,7 +28728,7 @@ mod incremental_add_tests {
         }))
         .unwrap();
 
-        // SAFETY: single-threaded test context.
+        // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
         unsafe { std::env::set_var("RETREAD_INCREMENTAL", "1") };
         let result = detect_incremental_add(
             &lock_path,
@@ -28731,6 +28739,7 @@ mod incremental_add_tests {
             "3.11",
             "fp",
         );
+        // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
         unsafe { std::env::remove_var("RETREAD_INCREMENTAL") };
         let incr = result.expect("(a) should ENGAGE on add-dep-new-index");
         assert_eq!(
@@ -28744,6 +28753,7 @@ mod incremental_add_tests {
     /// (b) COLD when an EXISTING entry's index changes.
     #[test]
     fn step_a_changed_existing_entry_index_is_cold() {
+        let _env_guard = super::TEST_ENV_MUTEX.lock().unwrap();
         let dir = tmp_incr("b");
         let lock_path = dir.join(RetreadLock::file_name("test-bundle"));
 
@@ -28774,6 +28784,7 @@ mod incremental_add_tests {
         .unwrap();
 
         // STEP A: locked chain for [isaacsim] (pypi now) = [pypi] ≠ [nvidia, pypi] → COLD.
+        // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
         unsafe { std::env::set_var("RETREAD_INCREMENTAL", "1") };
         let result = detect_incremental_add(
             &lock_path,
@@ -28784,6 +28795,7 @@ mod incremental_add_tests {
             "3.11",
             "fp",
         );
+        // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
         unsafe { std::env::remove_var("RETREAD_INCREMENTAL") };
         assert!(
             result.is_none(),
@@ -28795,6 +28807,7 @@ mod incremental_add_tests {
     /// (c) COLD when a workspace extra-index is added (STEP A catches it).
     #[test]
     fn step_a_new_ws_index_is_cold() {
+        let _env_guard = super::TEST_ENV_MUTEX.lock().unwrap();
         let dir = tmp_incr("c");
         let lock_path = dir.join(RetreadLock::file_name("test-bundle"));
 
@@ -28825,6 +28838,7 @@ mod incremental_add_tests {
 
         // ws_indexes now has an extra index → locked_chain differs from lock.index_urls.
         let new_ws = vec!["https://extra.example.com/simple/".to_string()];
+        // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
         unsafe { std::env::set_var("RETREAD_INCREMENTAL", "1") };
         let result = detect_incremental_add(
             &lock_path,
@@ -28835,6 +28849,7 @@ mod incremental_add_tests {
             "3.11",
             "fp",
         );
+        // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
         unsafe { std::env::remove_var("RETREAD_INCREMENTAL") };
         assert!(result.is_none(), "(c) new ws index must be COLD");
         let _ = std::fs::remove_dir_all(&dir);
@@ -28843,6 +28858,7 @@ mod incremental_add_tests {
     /// (d) COLD when relax changes (STEP B hash mismatch), even though STEP A passes.
     #[test]
     fn step_b_changed_relax_is_cold() {
+        let _env_guard = super::TEST_ENV_MUTEX.lock().unwrap();
         let dir = tmp_incr("d");
         let lock_path = dir.join(RetreadLock::file_name("test-bundle"));
 
@@ -28872,6 +28888,7 @@ mod incremental_add_tests {
         .unwrap();
 
         // Relax changed to "Conservative" → STEP B hash mismatch.
+        // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
         unsafe { std::env::set_var("RETREAD_INCREMENTAL", "1") };
         let result = detect_incremental_add(
             &lock_path,
@@ -28882,6 +28899,7 @@ mod incremental_add_tests {
             "3.11",
             "fp",
         );
+        // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
         unsafe { std::env::remove_var("RETREAD_INCREMENTAL") };
         assert!(
             result.is_none(),
@@ -28894,6 +28912,7 @@ mod incremental_add_tests {
     /// Regression guard: must still work when no new index is involved.
     #[test]
     fn genesis_style_add_engages() {
+        let _env_guard = super::TEST_ENV_MUTEX.lock().unwrap();
         let dir = tmp_incr("e");
         let lock_path = dir.join(RetreadLock::file_name("test-bundle"));
 
@@ -28921,6 +28940,7 @@ mod incremental_add_tests {
         }))
         .unwrap();
 
+        // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
         unsafe { std::env::set_var("RETREAD_INCREMENTAL", "1") };
         let result = detect_incremental_add(
             &lock_path,
@@ -28931,6 +28951,7 @@ mod incremental_add_tests {
             "3.11",
             "fp",
         );
+        // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
         unsafe { std::env::remove_var("RETREAD_INCREMENTAL") };
         let incr = result.expect("(e) genesis-style same-index add must ENGAGE");
         assert_eq!(incr.added_specs, vec!["pkgb==2.0"]);
@@ -28940,6 +28961,7 @@ mod incremental_add_tests {
     /// (f) COLD when an added spec is bare/range (Gate 5).
     #[test]
     fn gate5_bare_added_spec_is_cold() {
+        let _env_guard = super::TEST_ENV_MUTEX.lock().unwrap();
         let dir = tmp_incr("f");
         let lock_path = dir.join(RetreadLock::file_name("test-bundle"));
 
@@ -28968,6 +28990,7 @@ mod incremental_add_tests {
         }))
         .unwrap();
 
+        // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
         unsafe { std::env::set_var("RETREAD_INCREMENTAL", "1") };
         let result = detect_incremental_add(
             &lock_path,
@@ -28978,6 +29001,7 @@ mod incremental_add_tests {
             "3.11",
             "fp",
         );
+        // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
         unsafe { std::env::remove_var("RETREAD_INCREMENTAL") };
         assert!(
             result.is_none(),
@@ -28991,6 +29015,7 @@ mod incremental_add_tests {
     /// so the pack-wide chain still matches lock.index_urls → ENGAGE.
     #[test]
     fn multi_bundle_step_a_uses_pack_wide_entries() {
+        let _env_guard = super::TEST_ENV_MUTEX.lock().unwrap();
         let dir = tmp_incr("g");
         let lock_path = dir.join(RetreadLock::file_name("test-bundle"));
 
@@ -29018,6 +29043,7 @@ mod incremental_add_tests {
         }))
         .unwrap();
 
+        // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
         unsafe { std::env::set_var("RETREAD_INCREMENTAL", "1") };
         let result = detect_incremental_add(
             &lock_path,
@@ -29028,6 +29054,7 @@ mod incremental_add_tests {
             "3.11",
             "fp",
         );
+        // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
         unsafe { std::env::remove_var("RETREAD_INCREMENTAL") };
         let incr = result.expect(
             "(g) multi-bundle: STEP A must use pack-wide (not bundle-filtered) entries -> ENGAGE",
@@ -29097,6 +29124,7 @@ mod incremental_add_tests {
     /// public PyPI, so STEP A detects the changed index universe and goes cold.
     #[test]
     fn step_a_existing_index_change_is_cold() {
+        let _env_guard = super::TEST_ENV_MUTEX.lock().unwrap();
         let dir = tmp_incr("i");
         let lock_path = dir.join(RetreadLock::file_name("test-bundle"));
 
@@ -29129,6 +29157,7 @@ mod incremental_add_tests {
         }))
         .unwrap();
 
+        // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
         unsafe { std::env::set_var("RETREAD_INCREMENTAL", "1") };
         let result = detect_incremental_add(
             &lock_path,
@@ -29139,6 +29168,7 @@ mod incremental_add_tests {
             "3.11",
             "fp",
         );
+        // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
         unsafe { std::env::remove_var("RETREAD_INCREMENTAL") };
         assert!(
             result.is_none(),
