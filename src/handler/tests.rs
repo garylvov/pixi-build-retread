@@ -8085,6 +8085,62 @@ fn resolve_backoff_fires_once_and_suppresses_every_bundle() {
     assert!(gate(true, &one), "a per-bundle suppression does not consume the resolve retry");
 }
 
+/// The Lane C master switch is an ENV BINDING, and until now no test bound it.
+/// The sibling gate tests above re-declare the predicate as a LOCAL CLOSURE,
+/// which pins the shape of the gate but never the variable it reads: renaming
+/// `RETREAD_AUTO_IMPORTS`, or loosening the `== "1"` comparison into a truthy
+/// parse, leaves every one of them green while silently changing which locks a
+/// merge of this code can move. This test calls the REAL
+/// `auto_imports_injection_enabled`, so the var's NAME and the EXACTNESS of the
+/// match are both load-bearing here.
+///
+/// The negative cases are the ones that matter. `"true"` and `"01"` are what a
+/// person types when they assume a truthy parse; `" 1"` is what a shell here-doc
+/// or a trailing-space export produces. All three must read as OFF, because the
+/// documented contract is "OFF unless `RETREAD_AUTO_IMPORTS=1` exactly" and a
+/// half-on switch would inject roots into a lock nobody opted in for.
+///
+/// Serialised on the house `TEST_ENV_MUTEX` (handler/mod.rs) like every other
+/// env-mutating test in this file, and the prior value is restored on exit so a
+/// developer running with the switch on in their own shell does not inherit a
+/// clobbered environment.
+#[test]
+fn auto_imports_env_var_binds_the_master_switch() {
+    let _env_guard = super::TEST_ENV_MUTEX.lock().unwrap();
+    let prior = std::env::var_os("RETREAD_AUTO_IMPORTS");
+
+    // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
+    unsafe { std::env::remove_var("RETREAD_AUTO_IMPORTS") };
+    assert!(
+        !auto_imports_injection_enabled(),
+        "unset must leave Lane C OFF -- that is what makes merging this code \
+         change no existing lock"
+    );
+
+    // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
+    unsafe { std::env::set_var("RETREAD_AUTO_IMPORTS", "1") };
+    assert!(
+        auto_imports_injection_enabled(),
+        "exactly \"1\" is the documented opt-in"
+    );
+
+    // Everything else is OFF: an exact match, never a truthy parse.
+    for off in ["true", "0", "01", " 1", ""] {
+        // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
+        unsafe { std::env::set_var("RETREAD_AUTO_IMPORTS", off) };
+        assert!(
+            !auto_imports_injection_enabled(),
+            "RETREAD_AUTO_IMPORTS={off:?} must NOT enable injection"
+        );
+    }
+
+    // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
+    match prior {
+        Some(value) => unsafe { std::env::set_var("RETREAD_AUTO_IMPORTS", value) },
+        None => unsafe { std::env::remove_var("RETREAD_AUTO_IMPORTS") },
+    }
+}
+
 /// The back-off's re-resolve must differ from the failed attempt by EXACTLY
 /// the injected-roots delta: suppression drops this bundle's Lane C roots and
 /// touches nothing else.
