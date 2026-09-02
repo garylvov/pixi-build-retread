@@ -286,6 +286,119 @@ fn conda_outputs_disk_cache_path(
         .join(format!("{hex}.json"))
 }
 
+/// Key for the SHARED built-output store (`retread-built-output-store`).
+///
+/// [`conda_outputs_disk_cache_path`]'s key cannot be reused: it folds the
+/// workspace manifest's MTIME and the pack's ABSOLUTE `source_dir`, and both
+/// move when the same manifest is staged into a new workspace — which is
+/// exactly the case the store exists to serve. Measured on the canonical
+/// manifest: a fresh workspace re-ran all 14 `conda/outputs` calls and all 315
+/// route probes with fully warm download caches.
+///
+/// So this key restates the same inputs with those two removed:
+///
+/// * the mtime is dropped (the key is computed with the `None` sentinel) and
+///   replaced by the sha256 of the workspace manifest's BYTES — a rollback
+///   restores the old bytes and must restore the old key, the same reasoning
+///   [`auto_overrides_fingerprint`] already applies to the override ledger;
+/// * every occurrence of the workspace directory and of the pack's own
+///   directory is rewritten to a fixed token before hashing, so a path that
+///   leaks in from any producer (a sibling-lock discovery inside the workspace
+///   solve fingerprint, say) cannot make two identical workspaces disagree.
+///   The pack's identity is carried instead by its path RELATIVE to the
+///   workspace plus the sha256 of its own manifest bytes — which is what
+///   distinguishes two sibling packs, the collision
+///   [`conda_outputs_disk_cache_path`] documents.
+///
+/// The backend's version + git hash arrive through `backend_build_identity()`,
+/// already folded into the restated key, and the store's own `SCHEMA` is
+/// hashed alongside it: a backend change or a payload-format change makes
+/// every existing entry unreachable rather than misreadable.
+///
+/// Nothing here consults an mtime, a job id, a cache directory or an absolute
+/// path. A leak would cost a MISS (a cold compute, i.e. today's behaviour),
+/// never a wrong hit.
+#[allow(clippy::too_many_arguments)]
+fn built_output_store_key_for_outputs(
+    params: &CondaOutputsParams,
+    auto_overrides_fp: &str,
+    target: &ResolutionTarget,
+    consumer_scope: Option<&ResolvedWorkspaceTarget>,
+    workspace_solve_fingerprint: &str,
+    workspace_dir: Option<&std::path::Path>,
+    source_dir: &std::path::Path,
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    fn file_digest(path: &std::path::Path) -> String {
+        match std::fs::read(path) {
+            Ok(bytes) => format!("{:x}", Sha256::digest(&bytes)),
+            Err(_) => "absent".to_string(),
+        }
+    }
+
+    // Same inputs as the in-process/disk memo key, minus the mtime.
+    let mut restated = conda_outputs_cache_key_for_target(
+        params,
+        None,
+        auto_overrides_fp,
+        target,
+        consumer_scope,
+        workspace_solve_fingerprint,
+    );
+
+    // Rewrite both spellings of each directory (as given, and canonicalized)
+    // so a symlinked staging root cannot split the key either.
+    let mut redact = |dir: &std::path::Path, token: &str| {
+        let mut forms = vec![dir.to_string_lossy().into_owned()];
+        if let Ok(canon) = std::fs::canonicalize(dir) {
+            forms.push(canon.to_string_lossy().into_owned());
+        }
+        forms.sort_by_key(|form| std::cmp::Reverse(form.len()));
+        for form in forms {
+            if !form.is_empty() {
+                restated = restated.replace(&form, token);
+            }
+        }
+    };
+    // The pack directory first: it is usually UNDER the workspace, and
+    // redacting the workspace first would leave a half-rewritten pack path.
+    redact(source_dir, "<RETREAD-SOURCE-DIR>");
+    if let Some(workspace_dir) = workspace_dir {
+        redact(workspace_dir, "<RETREAD-WORKSPACE-DIR>");
+    }
+
+    // Which pack this is, said without an absolute path.
+    let source_identity = workspace_dir
+        .and_then(|ws| {
+            let ws = std::fs::canonicalize(ws).unwrap_or_else(|_| ws.to_path_buf());
+            let src = std::fs::canonicalize(source_dir).unwrap_or_else(|_| source_dir.into());
+            src.strip_prefix(&ws).ok().map(|rel| rel.to_path_buf())
+        })
+        .or_else(|| source_dir.file_name().map(std::path::PathBuf::from))
+        .unwrap_or_default();
+
+    let workspace_manifest_digest = workspace_dir
+        .map(|dir| file_digest(&dir.join("pixi.toml")))
+        .unwrap_or_else(|| "no-workspace".to_string());
+    let source_manifest_digest = file_digest(&source_dir.join("pixi.toml"));
+
+    let mut hasher = Sha256::new();
+    for part in [
+        crate::built_output_store::SCHEMA,
+        backend_build_identity(),
+        &restated,
+        &source_identity.to_string_lossy(),
+        &workspace_manifest_digest,
+        &source_manifest_digest,
+    ] {
+        hasher.update((part.len() as u64).to_le_bytes());
+        hasher.update(part.as_bytes());
+    }
+    let digest = hasher.finalize();
+    digest.iter().take(16).map(|b| format!("{b:02x}")).collect()
+}
+
 /// Load a memoized [`CondaOutputsResult`] from disk. Returns `None` on
 /// any failure (missing file, unreadable, stale schema) so the caller
 /// always has a safe cold-compute fallback -- this is a pure speed
@@ -4680,6 +4793,24 @@ impl Handler {
             resolved_workspace_target.as_ref(),
             &cache_workspace_solve_fingerprint,
         );
+        // The SHARED built-output store, if the pack opted into one. Keyed on
+        // content alone, so a workspace staged at a new path can adopt this
+        // result instead of recomputing it. Unset = the store does not exist.
+        let built_output_store =
+            crate::built_output_store::BuiltOutputStore::from_config(
+                pre_key_config.built_output_store.as_deref(),
+            );
+        let built_output_store_key = built_output_store.as_ref().map(|_| {
+            built_output_store_key_for_outputs(
+                &params,
+                &auto_overrides_fp,
+                &cache_target,
+                resolved_workspace_target.as_ref(),
+                &cache_workspace_solve_fingerprint,
+                pre_key_workspace_dir.as_deref(),
+                &pre_key_source_dir,
+            )
+        });
         let memory_cached = {
             let cache = CONDA_OUTPUTS_CACHE
                 .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
@@ -4768,6 +4899,62 @@ impl Handler {
             self.invalidate_prepared_builds().await;
             log_final_bundle_outputs(&cached);
             return Ok(cached);
+        }
+        // The shared store. Consulted after the job-scoped memos because those
+        // are cheaper and strictly fresher; a hit here is what a FRESH
+        // workspace gets instead of a cold multi-env solve. Loud either way:
+        // a miss that should have hit is the thing an operator needs to see.
+        if let (Some(store), Some(key)) = (built_output_store.as_ref(), built_output_store_key.as_ref())
+        {
+            let (lookup, payload) = store.get(key);
+            let cached = payload
+                .as_deref()
+                .and_then(|bytes| serde_json::from_slice::<CondaOutputsResult>(bytes).ok());
+            match (&lookup, &cached) {
+                (crate::built_output_store::Lookup::Hit, Some(cached)) => {
+                    tracing::info!(
+                        key = %key,
+                        root = %store.root().display(),
+                        outputs = cached.outputs.len(),
+                        "bench: built_output_store hit -- adopting a previously computed conda/outputs result (no resolve, no probes)",
+                    );
+                    crate::status::tty(
+                        "reusing a previously-computed solve for this source package from the shared built-output store.",
+                    );
+                    CONDA_OUTPUTS_CACHE
+                        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+                        .lock()
+                        .unwrap()
+                        .insert(
+                            cache_key.clone(),
+                            CondaOutputsMemo {
+                                result: cached.clone(),
+                                requires_prepared_plan: false,
+                            },
+                        );
+                    self.invalidate_prepared_builds().await;
+                    log_final_bundle_outputs(cached);
+                    return Ok(cached.clone());
+                }
+                (crate::built_output_store::Lookup::Hit, None) => {
+                    // Marked complete but the payload does not deserialize:
+                    // a schema drift the SCHEMA tag failed to catch. Treat it
+                    // as a miss and say so at WARN rather than at debug.
+                    tracing::warn!(
+                        key = %key,
+                        root = %store.root().display(),
+                        "bench: built_output_store unreadable payload -- treating as a miss and recomputing",
+                    );
+                }
+                (lookup, _) => {
+                    tracing::info!(
+                        key = %key,
+                        root = %store.root().display(),
+                        lookup = ?lookup,
+                        "bench: built_output_store miss -- computing conda/outputs cold and publishing on success",
+                    );
+                }
+            }
         }
         // Coalesce simultaneous cold requests for this exact source/target
         // key. A waiter rechecks the memo after acquiring the lock and returns
@@ -5546,6 +5733,38 @@ impl Handler {
         // recomputed by each backend process so build_v1 has their plan.
         if !requires_prepared_plan {
             write_conda_outputs_disk_cache(&disk_cache_path, &result).await;
+            // Same guard, same reason: an output whose identity depends on a
+            // job-local prepared plan must never be adopted by another
+            // workspace. Publishing is best-effort and never fails the RPC.
+            if let (Some(store), Some(key)) =
+                (built_output_store.as_ref(), built_output_store_key.as_ref())
+            {
+                match serde_json::to_vec(&result) {
+                    Ok(bytes) => match store.publish(key, &bytes) {
+                        Ok(true) => tracing::info!(
+                            key = %key,
+                            root = %store.root().display(),
+                            bytes = bytes.len(),
+                            "bench: built_output_store published",
+                        ),
+                        Ok(false) => tracing::info!(
+                            key = %key,
+                            root = %store.root().display(),
+                            "bench: built_output_store publish skipped -- another process published this key first",
+                        ),
+                        Err(error) => tracing::warn!(
+                            key = %key,
+                            root = %store.root().display(),
+                            error = %error,
+                            "bench: built_output_store publish failed -- the result is still correct, only unshared",
+                        ),
+                    },
+                    Err(error) => tracing::warn!(
+                        error = %error,
+                        "bench: built_output_store publish failed to serialize",
+                    ),
+                }
+            }
         }
         for relaxation in pending_output_relaxations {
             relaxation.emit();

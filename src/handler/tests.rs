@@ -709,6 +709,7 @@ fn pythons_for_rejects_bare_major_variant() {
         hermetic: true,
         retread_wheels: BTreeMap::new(),
         relax: RelaxPolicy::Minor,
+        built_output_store: None,
         overrides: BTreeMap::new(),
         name_map: BTreeMap::new(),
         shadow_libs: BTreeMap::new(),
@@ -761,6 +762,7 @@ fn pythons_for_accepts_dotted_variant() {
         hermetic: true,
         retread_wheels: BTreeMap::new(),
         relax: RelaxPolicy::Minor,
+        built_output_store: None,
         overrides: BTreeMap::new(),
         name_map: BTreeMap::new(),
         shadow_libs: BTreeMap::new(),
@@ -813,6 +815,7 @@ fn pythons_for_filters_bare_major_keeps_dotted() {
         hermetic: true,
         retread_wheels: BTreeMap::new(),
         relax: RelaxPolicy::Minor,
+        built_output_store: None,
         overrides: BTreeMap::new(),
         name_map: BTreeMap::new(),
         shadow_libs: BTreeMap::new(),
@@ -3584,6 +3587,7 @@ fn cfg() -> RetreadConfig {
         hermetic: true,
         retread_wheels: BTreeMap::new(),
         relax: RelaxPolicy::Minor,
+        built_output_store: None,
         overrides: BTreeMap::new(),
         name_map: BTreeMap::new(),
         shadow_libs: BTreeMap::new(),
@@ -10384,4 +10388,238 @@ fn conda_output_ignores_python_run_export_but_keeps_python_abi() {
             .any(|d| d.name == "python"),
         "the output must still carry its own python run dep"
     );
+}
+
+// -----------------------------------------------------------------
+// p5w: the SHARED built-output store.
+//
+// The measured defect these guard: a fresh workspace holding a
+// byte-identical manifest re-ran all 14 `conda/outputs` calls and all 315
+// route probes with fully warm download caches, because the memo that
+// could have served it is keyed on the manifest's MTIME and the pack's
+// ABSOLUTE directory -- and is written under a `fasttmp` job-scoped cache
+// dir besides (verified on disk:
+// `.../fast-tmp/retread-glvov/<ws-hash>/job-<id>/caches/retread/retread-conda-outputs-cache`).
+// -----------------------------------------------------------------
+
+/// Stage a workspace holding one pack, both with the given manifest bytes.
+/// Returns (workspace_dir, source_dir). The caller owns cleanup.
+fn stage_store_key_workspace(
+    tag: &str,
+    workspace_manifest: &str,
+    pack_manifest: &str,
+    pack_rel: &str,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let ws = std::env::temp_dir().join(format!(
+        "retread-p5w-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    let pack = ws.join(pack_rel);
+    std::fs::create_dir_all(&pack).unwrap();
+    std::fs::write(ws.join("pixi.toml"), workspace_manifest).unwrap();
+    std::fs::write(pack.join("pixi.toml"), pack_manifest).unwrap();
+    (ws, pack)
+}
+
+fn store_key_params() -> pixi_build_types::procedures::conda_outputs::CondaOutputsParams {
+    pixi_build_types::procedures::conda_outputs::CondaOutputsParams {
+        host_platform: rattler_conda_types::Platform::Linux64,
+        build_platform: rattler_conda_types::Platform::Linux64,
+        channels: vec![],
+        variant_configuration: None,
+        variant_files: None,
+        work_directory: std::path::PathBuf::new(),
+    }
+}
+
+fn store_key_for(
+    workspace_dir: &std::path::Path,
+    source_dir: &std::path::Path,
+) -> String {
+    let target = ResolutionTarget::for_subdir("3.11", "linux-64");
+    // Production's workspace solve fingerprint carries ABSOLUTE paths:
+    // `coactivated_sibling_packs` canonicalizes every sibling pack directory
+    // and `workspace_solve_fingerprint` folds the result in. Reproduce that
+    // here, or the path redaction the key depends on is never exercised and
+    // the guard would pass for the wrong reason.
+    let solve_fingerprint = format!(
+        "co-activated-sibling:{}/packs/two/retread-linux-64-py3.11.lock\nsource:{}",
+        workspace_dir.display(),
+        source_dir.display(),
+    );
+    built_output_store_key_for_outputs(
+        &store_key_params(),
+        "none",
+        &target,
+        None,
+        &solve_fingerprint,
+        Some(workspace_dir),
+        source_dir,
+    )
+}
+
+#[test]
+fn built_output_store_key_is_workspace_path_and_mtime_free() {
+    const WS_MANIFEST: &str = "[workspace]\nname = \"p5w\"\n";
+    const PACK_MANIFEST: &str = "[package]\nname = \"p5w-pack\"\n";
+
+    let (ws_a, pack_a) = stage_store_key_workspace("a", WS_MANIFEST, PACK_MANIFEST, "packs/one");
+    // Deliberately staged AFTER, at a different path, so both the mtimes and
+    // the absolute paths differ -- exactly what an rsync'd relock workspace
+    // looks like.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let (ws_b, pack_b) = stage_store_key_workspace("b", WS_MANIFEST, PACK_MANIFEST, "packs/one");
+
+    let key_a = store_key_for(&ws_a, &pack_a);
+    let key_b = store_key_for(&ws_b, &pack_b);
+    assert_eq!(
+        key_a, key_b,
+        "two workspaces at different paths holding byte-identical manifests must produce ONE store key"
+    );
+
+    // And the key that ships today does NOT have that property -- this is the
+    // whole reason the store needs its own. If this assert ever starts
+    // failing because the shipped key became content-keyed too, the store key
+    // can be retired, not silently kept.
+    let target = ResolutionTarget::for_subdir("3.11", "linux-64");
+    let legacy = |ws: &std::path::Path| {
+        conda_outputs_cache_key_for_target(
+            &store_key_params(),
+            workspace_manifest_mtime(Some(ws)),
+            "none",
+            &target,
+            None,
+            "",
+        )
+    };
+    assert_ne!(
+        legacy(&ws_a),
+        legacy(&ws_b),
+        "the shipped conda/outputs key folds the manifest mtime, so it cannot cross workspaces"
+    );
+
+    // Content still decides. A changed workspace manifest, a changed pack
+    // manifest, and a pack at a different place in the workspace must each
+    // produce a different key.
+    let (ws_c, pack_c) = stage_store_key_workspace(
+        "c",
+        "[workspace]\nname = \"p5w\"\nchannels = [\"conda-forge\"]\n",
+        PACK_MANIFEST,
+        "packs/one",
+    );
+    assert_ne!(
+        key_a,
+        store_key_for(&ws_c, &pack_c),
+        "a changed workspace manifest must change the key"
+    );
+    let (ws_d, pack_d) = stage_store_key_workspace(
+        "d",
+        WS_MANIFEST,
+        "[package]\nname = \"p5w-pack\"\nversion = \"2\"\n",
+        "packs/one",
+    );
+    assert_ne!(
+        key_a,
+        store_key_for(&ws_d, &pack_d),
+        "a changed pack manifest must change the key"
+    );
+    let (ws_e, pack_e) =
+        stage_store_key_workspace("e", WS_MANIFEST, PACK_MANIFEST, "packs/two");
+    assert_ne!(
+        key_a,
+        store_key_for(&ws_e, &pack_e),
+        "two sibling packs in one workspace must not share a store key"
+    );
+
+    // The backend's own identity is in the key, so a backend change
+    // invalidates every entry rather than serving a stale render.
+    let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+    sha2::Digest::update(&mut hasher, backend_build_identity().as_bytes());
+    assert!(
+        !backend_build_identity().is_empty(),
+        "backend build identity must be non-empty for the key to carry it"
+    );
+
+    for dir in [ws_a, ws_b, ws_c, ws_d, ws_e] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[tokio::test]
+async fn built_output_store_hit_serves_the_same_result_a_cold_compute_produced() {
+    use pixi_build_types::procedures::conda_outputs::CondaOutputsResult;
+
+    const WS_MANIFEST: &str = "[workspace]\nname = \"p5w-hit\"\n";
+    const PACK_MANIFEST: &str = "[package]\nname = \"p5w-hit-pack\"\n";
+
+    let store_root = std::env::temp_dir().join(format!(
+        "retread-p5w-store-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    let store = crate::built_output_store::BuiltOutputStore::from_config(Some(&store_root))
+        .expect("a configured root yields a store");
+
+    // Job 1: a cold compute in workspace A publishes its result.
+    let (ws_a, pack_a) = stage_store_key_workspace("hit-a", WS_MANIFEST, PACK_MANIFEST, "packs/one");
+    let key_a = store_key_for(&ws_a, &pack_a);
+    let result = CondaOutputsResult {
+        outputs: Default::default(),
+        input_globs: Default::default(),
+    };
+    let payload = serde_json::to_vec(&result).unwrap();
+    assert_eq!(
+        store.get(&key_a).0,
+        crate::built_output_store::Lookup::Miss,
+        "the first job must miss"
+    );
+    assert!(store.publish(&key_a, &payload).unwrap());
+
+    // Job 2: a FRESH workspace at a different path, the case that measured as
+    // a full cold relock today. It must hit, and adopt the identical result.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let (ws_b, pack_b) = stage_store_key_workspace("hit-b", WS_MANIFEST, PACK_MANIFEST, "packs/one");
+    let key_b = store_key_for(&ws_b, &pack_b);
+    let (lookup, bytes) = store.get(&key_b);
+    assert_eq!(
+        lookup,
+        crate::built_output_store::Lookup::Hit,
+        "a fresh workspace with identical content must hit the shared store"
+    );
+    let adopted: CondaOutputsResult = serde_json::from_slice(&bytes.unwrap()).unwrap();
+    assert_eq!(adopted.outputs.len(), result.outputs.len());
+    assert_eq!(
+        serde_json::to_vec(&adopted).unwrap(),
+        payload,
+        "the adopted result must be byte-identical to what the cold compute published"
+    );
+
+    // The job-scoped disk memo cannot serve that second job, which is why the
+    // store exists: same content, two different cache-file paths.
+    let memo_a = conda_outputs_disk_cache_path(
+        &std::env::temp_dir().join("p5w-memo-a"),
+        "same-key",
+        &pack_a,
+    );
+    let memo_b = conda_outputs_disk_cache_path(
+        &std::env::temp_dir().join("p5w-memo-b"),
+        "same-key",
+        &pack_b,
+    );
+    assert_ne!(
+        memo_a.file_name(),
+        memo_b.file_name(),
+        "the shipped disk memo hashes the absolute source dir, so a moved workspace can never hit it"
+    );
+
+    for dir in [store_root, ws_a, ws_b] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

@@ -1519,6 +1519,7 @@ mod tests {
             hermetic: true,
             retread_wheels: BTreeMap::new(),
             relax: RelaxPolicy::Minor,
+            built_output_store: None,
             overrides: BTreeMap::new(),
             name_map: BTreeMap::new(),
             shadow_libs: BTreeMap::new(),
