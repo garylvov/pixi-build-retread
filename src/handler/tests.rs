@@ -10316,3 +10316,72 @@ fn an_injected_member_never_advertises_the_version_its_own_solve_resolved() {
         assert_eq!(emitted.name, "pillow");
     }
 }
+
+// 2026-09-02: conda-forge published `python-3.12.14-h5f976f7_2_cpython`
+// (linux-64, build_number 2) carrying
+//   run_exports.weak = ["python_abi 3.12.* *_cp312",
+//                       "python 3.12.* *_debug_cpython"]
+// The second entry is the debug variant's export leaking into the release
+// build. No `*_debug_cpython` python exists in any channel, and that record
+// is the newest 3.12 at the highest build number, so it wins every host
+// solve. Every pack that host-resolved python 3.12 inherited an
+// unsatisfiable run dep and every consumer environment UNSAT'd with
+//   pm-newton-pack 1.0.0 would require python 3.12.* *_debug_cpython
+// Guard both halves: the `python` run-export must be ignored (we emit our
+// own python run dep), and `python_abi` must NOT be, because it is what
+// anchors the interpreter ABI.
+#[test]
+fn conda_output_ignores_python_run_export_but_keeps_python_abi() {
+    use rattler_conda_types::Platform;
+
+    let output = assemble_conda_output(
+        "pm-newton-pack",
+        "1.0.0",
+        "3.12",
+        false,
+        true,
+        vec![spec_from_str("python").unwrap()],
+        Vec::new(),
+        std::collections::HashSet::new(),
+        Platform::Linux64,
+        0,
+        None,
+        false,
+        &[],
+    )
+    .unwrap();
+
+    let ignored: Vec<String> = output
+        .ignore_run_exports
+        .by_name
+        .iter()
+        .map(|n| n.as_normalized().to_string())
+        .collect();
+
+    assert!(
+        ignored.iter().any(|n| n == "python"),
+        "the `python` weak run-export must be ignored -- upstream shipped \
+         `python 3.12.* *_debug_cpython` on a release build and it is \
+         unsatisfiable; ignored names were {ignored:?}"
+    );
+    assert!(
+        !ignored.iter().any(|n| n == "python_abi"),
+        "`python_abi` must keep flowing: `python_abi 3.12.* *_cp312` is the \
+         ABI anchor for the built pack; ignored names were {ignored:?}"
+    );
+    assert!(
+        output.ignore_run_exports.from_package.is_empty(),
+        "only the exported NAME is filtered; no channel package is blanket-ignored"
+    );
+
+    // The half that makes ignoring safe rather than lossy: this output still
+    // declares python itself, so dropping the exported copy loses nothing.
+    assert!(
+        output
+            .run_dependencies
+            .depends
+            .iter()
+            .any(|d| d.name == "python"),
+        "the output must still carry its own python run dep"
+    );
+}

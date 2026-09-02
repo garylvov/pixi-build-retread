@@ -15209,10 +15209,42 @@ fn assemble_conda_output(
             depends: run_dep_specs,
             constraints: constrains_specs,
         },
-        ignore_run_exports: CondaOutputIgnoreRunExports::default(),
+        ignore_run_exports: ignore_run_exports_for_output(),
         run_exports: CondaOutputRunExports::default(),
         input_globs: None,
     })
+}
+
+/// Which run-exports this output refuses to inherit from its host env.
+///
+/// Exactly one name: `python`.
+///
+/// Every retread output host-depends on `python <X.Y>.*`, so it inherits
+/// whatever the `python` conda package weak-exports. That export is
+/// upstream metadata we do not control, and on 2026-09-02 conda-forge
+/// published `python-3.12.14-h5f976f7_2_cpython` whose
+/// `run_exports.weak` reads
+/// `["python_abi 3.12.* *_cp312", "python 3.12.* *_debug_cpython"]`.
+/// The second entry is a packaging error in the release build (it is the
+/// debug variant's export), and no `*_debug_cpython` python exists in any
+/// channel, so every pack that resolved python 3.12 became permanently
+/// unsatisfiable for every consumer of that pack. Because the record is
+/// the newest version at the highest build number, it wins every solve.
+///
+/// Ignoring the `python` run-export is safe and not merely a shield:
+/// `assemble_conda_output` already emits this output's own `python` run
+/// dependency in `run_dep_specs`, so the exported copy is redundant.
+///
+/// `python_abi` is deliberately NOT ignored. It is the load-bearing half:
+/// `python_abi 3.12.* *_cp312` is what anchors the interpreter ABI (and it
+/// in turn constrains `python 3.12.* *_cpython`), so the ABI pin survives
+/// intact. Ignoring it would let a pack built against one interpreter
+/// install under another.
+fn ignore_run_exports_for_output() -> CondaOutputIgnoreRunExports {
+    CondaOutputIgnoreRunExports {
+        by_name: vec![PackageName::new_unchecked("python".to_string())],
+        from_package: Vec::new(),
+    }
 }
 
 /// `siblings`: every (conda_name, version) produced by the same
