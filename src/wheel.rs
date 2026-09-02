@@ -1694,16 +1694,132 @@ pub async fn fetch_metadata_sidecar(
     )
 }
 
+/// Test-only probe recording every full-file SHA-256 of a wheel payload, so a
+/// guard test can assert a wheel is hashed at most once per resolve entry.
+/// Fed by [`read_metadata`] here and by `wheel_rewrite::sha256_file_hex` --
+/// the only two places that stream a whole wheel through a hasher. Records
+/// carry the path so a test can select its own fixture and stay immune to
+/// whatever other tests hash concurrently.
+#[cfg(test)]
+pub(crate) mod full_hash_probe {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    /// (path hashed, bytes hashed, call site).
+    pub(crate) static HASHED: Mutex<Vec<(PathBuf, u64, &'static str)>> = Mutex::new(Vec::new());
+
+    pub(crate) fn record(path: &Path, bytes: u64, site: &'static str) {
+        if let Ok(mut hashed) = HASHED.lock() {
+            hashed.push((path.to_path_buf(), bytes, site));
+        }
+    }
+
+    /// Every full-file hash recorded so far whose path contains `needle`.
+    pub(crate) fn hashes_for(needle: &str) -> Vec<(PathBuf, u64, &'static str)> {
+        HASHED
+            .lock()
+            .map(|hashed| {
+                hashed
+                    .iter()
+                    .filter(|(path, _, _)| path.to_string_lossy().contains(needle))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn note_full_hash(path: &Path, bytes: u64, site: &'static str) {
+    full_hash_probe::record(path, bytes, site);
+}
+
+#[cfg(not(test))]
+#[inline]
+pub(crate) fn note_full_hash(_path: &Path, _bytes: u64, _site: &'static str) {}
+
+/// bench (measurement only): one row per wheel METADATA read, whichever door
+/// it came in by. `path` distinguishes the doors -- `hash+parse` streams the
+/// whole payload through SHA-256, `parse-only` was handed a digest it can
+/// trust, `requires-dist-only` never needs one. Before p5z this call site was
+/// entirely unspanned and was the largest single unmeasured cost in a relock
+/// (~224 s: 29.08 GB hashed for 14.54 GB of wheels).
+fn bench_read_metadata(
+    wheel_path: &Path,
+    started: std::time::Instant,
+    path_kind: &'static str,
+    sha_source: &'static str,
+) {
+    let bytes = std::fs::metadata(wheel_path).map(|m| m.len()).unwrap_or(0);
+    tracing::info!(
+        wheel = %wheel_path.display(),
+        bytes,
+        path = path_kind,
+        sha_source,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "bench: wheel_read_metadata",
+    );
+}
+
 /// Read the METADATA file inside a wheel zip and parse out the fields we care
-/// about.
+/// about, computing the wheel's SHA-256 by streaming the whole payload.
+///
+/// Prefer [`read_metadata_with_trusted_sha`] whenever the caller already holds
+/// a digest of these exact bytes (a rewrite that just returned one, or a
+/// content-addressed store path whose directory name IS the digest): the hash
+/// here is the expensive half and the parse is a few KB off the zip central
+/// directory.
 pub fn read_metadata(wheel_path: &Path) -> Result<WheelMetadata> {
     use sha2::{Digest, Sha256};
+    let started = std::time::Instant::now();
     let mut file = std::fs::File::open(wheel_path)
         .with_context(|| format!("opening {} for SHA-256", wheel_path.display()))?;
     let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher)
+    let hashed = std::io::copy(&mut file, &mut hasher)
         .with_context(|| format!("hashing {}", wheel_path.display()))?;
-    read_metadata_with_sha(wheel_path, format!("{:x}", hasher.finalize()))
+    note_full_hash(wheel_path, hashed, "wheel::read_metadata");
+    let out = read_metadata_with_sha(wheel_path, format!("{:x}", hasher.finalize()));
+    bench_read_metadata(wheel_path, started, "hash+parse", "full-hash");
+    out
+}
+
+/// Same as [`read_metadata`] but for callers that already hold this file's
+/// digest, skipping the full-payload hash entirely.
+///
+/// `sha256` MUST be the digest of the bytes at `wheel_path` -- the value lands
+/// in `WheelMetadata::sha256`, which becomes the recipe's `source: sha256` and
+/// the lock's wheel sha, and is re-verified against a strict read on the
+/// courier replay path (`validate_replayed_source_artifact`). `sha_source`
+/// labels the provenance in the bench row.
+pub(crate) fn read_metadata_with_trusted_sha(
+    wheel_path: &Path,
+    sha256: String,
+    sha_source: &'static str,
+) -> Result<WheelMetadata> {
+    let started = std::time::Instant::now();
+    let out = read_metadata_with_sha(wheel_path, sha256);
+    bench_read_metadata(wheel_path, started, "parse-only", sha_source);
+    out
+}
+
+/// Read ONLY the `Requires-Dist:` values out of a wheel's root-level
+/// `*.dist-info/METADATA`, never touching the payload.
+///
+/// This walks the zip central directory exactly the way
+/// `wheel_rewrite::rewrite_wheel_metadata_with` does, so a 5.9 GB wheel costs a
+/// few KB. The parse is `parse_metadata`, byte-for-byte the one
+/// [`read_metadata`] runs, so the result is identical to
+/// `read_metadata(p)?.requires_dist` -- minus the SHA-256 that call site threw
+/// away.
+pub(crate) fn read_requires_dist(wheel_path: &Path) -> Result<Vec<String>> {
+    let started = std::time::Instant::now();
+    // The digest is not read by `parse_metadata` and is dropped with the rest
+    // of the struct below; naming it says so out loud rather than passing a
+    // plausible-looking hex string a later reader might mistake for real.
+    let out = read_metadata_with_sha(wheel_path, String::from("sha256-not-computed"))
+        .map(|metadata| metadata.requires_dist);
+    bench_read_metadata(wheel_path, started, "requires-dist-only", "none");
+    out
 }
 
 /// Strict local-artifact boundary for source-built/path-source wheels.
@@ -2863,6 +2979,42 @@ mod tests {
         }
         archive.finish().unwrap();
         path
+    }
+
+    /// GUARD (p5z, 1): the metadata-only `Requires-Dist` reader returns
+    /// EXACTLY what the old full-file-hashing read returned. `read_metadata`
+    /// streamed the whole payload through SHA-256 to produce a digest the
+    /// `original_requires_dist` call site then threw away; this asserts the
+    /// cheap reader is not a different answer, on a wheel whose METADATA is
+    /// deflated and which carries a decoy nested `.dist-info` (only the
+    /// root-level one is ours) plus real payload members the cheap reader
+    /// must never touch.
+    #[test]
+    fn read_requires_dist_matches_the_full_read_it_replaced() {
+        let dir = std::env::temp_dir().join(format!(
+            "retread-p5z-rd-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wheel = dir.join("foo-1.0-py3-none-any.whl");
+        std::fs::write(&wheel, build_test_wheel_zip()).unwrap();
+
+        let full = read_metadata(&wheel).expect("full read");
+        let cheap = read_requires_dist(&wheel).expect("metadata-only read");
+        assert_eq!(cheap, full.requires_dist);
+        assert!(
+            !cheap.is_empty(),
+            "fixture must actually carry Requires-Dist lines or this guard proves nothing",
+        );
+        // The full read's digest is real; the cheap read has none to give and
+        // must never be mistaken for a source of one.
+        assert_eq!(full.sha256.len(), 64);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

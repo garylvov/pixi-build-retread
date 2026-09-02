@@ -55,6 +55,25 @@ pub enum LineAction {
 #[cfg(test)]
 pub(crate) fn rewrite_wheel(src: &Path, dst: &Path, relax: RelaxPolicy) -> Result<String> {
     rewrite_wheel_with_abi_aliases(src, dst, relax, &AbiAliasGraph::new())
+        .map(|outcome| outcome.sha256)
+}
+
+/// What a wheel rewrite produced, beyond the output file itself.
+///
+/// `sha256` is ALWAYS the digest of the bytes now at `dst`: on the no-op path
+/// `dst` is a hard link (or copy) of `src`, so `src`'s digest is `dst`'s; on
+/// the changed path it is a streaming hash of `dst`. Callers that need the
+/// final file's digest may therefore use it instead of re-hashing, which is
+/// the whole point of returning it (p5z).
+#[derive(Debug, Clone)]
+pub(crate) struct WheelRewriteOutcome {
+    pub(crate) sha256: String,
+    /// False when METADATA was unchanged and `dst` is a link/copy of `src`.
+    pub(crate) changed: bool,
+    /// Provenance of `sha256`, for bench rows: `"store-path"` (recovered from
+    /// the content-addressed fetch store's directory name) or `"streamed"`
+    /// (hashed here, once).
+    pub(crate) sha_source: &'static str,
 }
 
 /// Alias-aware production wheel rewrite.
@@ -65,19 +84,16 @@ pub(crate) fn rewrite_wheel_with_abi_aliases(
     dst: &Path,
     relax: RelaxPolicy,
     abi_aliases: &AbiAliasGraph,
-) -> Result<String> {
-    rewrite_wheel_with(src, dst, &|line| match relax_pep508_with_abi_aliases(
-        line,
-        relax,
-        abi_aliases,
-    )
-    .ok()
-    {
-        None => LineAction::Keep,
-        Some(s) if s == line => LineAction::Keep,
-        Some(s) => LineAction::Replace(s),
+) -> Result<WheelRewriteOutcome> {
+    rewrite_wheel_metadata_with(src, dst, &|metadata| {
+        rewrite_metadata_text_with(metadata, &|line| {
+            match relax_pep508_with_abi_aliases(line, relax, abi_aliases).ok() {
+                None => LineAction::Keep,
+                Some(s) if s == line => LineAction::Keep,
+                Some(s) => LineAction::Replace(s),
+            }
+        })
     })
-    .map(|(sha, _)| sha)
 }
 
 /// Generic wheel-rewrite core: apply `map` to every
@@ -95,6 +111,7 @@ pub(crate) fn rewrite_wheel_with(
     rewrite_wheel_metadata_with(src, dst, &|metadata| {
         rewrite_metadata_text_with(metadata, map)
     })
+    .map(|outcome| (outcome.sha256, outcome.changed))
 }
 
 /// sha256 of a file, streamed in fixed-size chunks. Never materializes the
@@ -106,6 +123,7 @@ fn sha256_file_hex(path: &Path) -> Result<String> {
         std::fs::File::open(path).with_context(|| format!("hashing {}", path.display()))?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 1 << 20];
+    let mut hashed = 0u64;
     loop {
         let read = file
             .read(&mut buf)
@@ -114,7 +132,9 @@ fn sha256_file_hex(path: &Path) -> Result<String> {
             break;
         }
         hasher.update(&buf[..read]);
+        hashed += read as u64;
     }
+    crate::wheel::note_full_hash(path, hashed, "wheel_rewrite::sha256_file_hex");
     Ok(format!("{:x}", hasher.finalize()))
 }
 
@@ -123,7 +143,7 @@ fn sha256_file_hex(path: &Path) -> Result<String> {
 /// whose directory name IS the digest of the bytes underneath it. Callers
 /// also pass temp/cache paths outside the store, so this is best-effort:
 /// `None` means "hash the file".
-fn sha256_from_store_path(path: &Path) -> Option<String> {
+pub(crate) fn sha256_from_store_path(path: &Path) -> Option<String> {
     let sha_dir = path.parent()?;
     let sha = sha_dir.file_name()?.to_str()?;
     if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
@@ -147,7 +167,7 @@ fn rewrite_wheel_metadata_with(
     src: &Path,
     dst: &Path,
     transform: &dyn Fn(&str) -> Result<String>,
-) -> Result<(String, bool)> {
+) -> Result<WheelRewriteOutcome> {
     // bench (measurement only): this is the single choke point every wheel
     // METADATA rewrite passes through (rewrite_wheel_with,
     // inject_native_abi_metadata). Cost is dominated by whether the no-op
@@ -228,7 +248,11 @@ fn rewrite_wheel_metadata_with(
             elapsed_ms = rewrite_started.elapsed().as_millis() as u64,
             "bench: rewrite_wheel_metadata_with",
         );
-        return Ok((h, false));
+        return Ok(WheelRewriteOutcome {
+            sha256: h,
+            changed: false,
+            sha_source,
+        });
     }
     let new_metadata_bytes = new_metadata.as_bytes();
     // RECORD hash lines use PEP 376's urlsafe-base64-nopad form (what
@@ -298,7 +322,11 @@ fn rewrite_wheel_metadata_with(
         elapsed_ms = rewrite_started.elapsed().as_millis() as u64,
         "bench: rewrite_wheel_metadata_with",
     );
-    Ok((dst_sha, true))
+    Ok(WheelRewriteOutcome {
+        sha256: dst_sha,
+        changed: true,
+        sha_source: "streamed",
+    })
 }
 
 pub(crate) fn inject_native_abi_metadata(
@@ -349,7 +377,7 @@ pub(crate) fn inject_native_abi_metadata(
         }
         Ok(rewritten)
     })
-    .map(|(sha, _)| sha)
+    .map(|outcome| outcome.sha256)
 }
 
 fn valid_wheel_tag_field(field: &str) -> bool {
