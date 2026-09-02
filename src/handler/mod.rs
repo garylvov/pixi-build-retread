@@ -14929,7 +14929,21 @@ async fn materialize_and_rewrite_with_abi_aliases(
     // way we recompute the sha256 of the final file. Cache reuse: skip
     // the rewrite when `*.relaxed.whl` is already up to date.
     let pre_d_path = with_data_path.clone();
+    // p5z: the digest of `final_path`, when it can be had without re-reading
+    // the payload. `ResolvedWheel.metadata.sha256` must be the digest of the
+    // FINAL file (it becomes the recipe's `source: sha256` and the lock's
+    // wheel sha, and courier replay re-verifies it against a strict read in
+    // `validate_replayed_source_artifact`) -- so only a digest of these exact
+    // bytes may be put here. Two sources qualify: the rewrite below, which
+    // returns `dst`'s own digest on both its paths, and the content-addressed
+    // fetch store, whose directory name IS the digest of the file under it.
+    // Everything else falls through to the full hash in `read_metadata`.
+    let mut trusted_final_sha: Option<(String, &'static str)> = None;
     let final_path = if relax == RelaxPolicy::None {
+        // No rewrite ran: `final_path` IS the phase-1.5/1.6 output. That is the
+        // store path itself whenever nothing was injected.
+        trusted_final_sha = crate::wheel_rewrite::sha256_from_store_path(&with_data_path)
+            .map(|sha| (sha, "store-path"));
         with_data_path
     } else {
         let rewritten = with_data_path.with_extension("relaxed.whl");
@@ -14961,7 +14975,12 @@ async fn materialize_and_rewrite_with_abi_aliases(
                 policy = ?relax,
                 "applying relax policy to wheel METADATA",
             );
-            let _new_sha = rewrite_wheel_with_abi_aliases(
+            // The rewrite already knows `rewritten`'s digest -- on the no-op
+            // hard-link path from the store path's own name, on the changed
+            // path from the single streaming hash it does while writing.
+            // Before p5z this was dropped on the floor and the same file was
+            // hashed again below.
+            let rewrite_outcome = rewrite_wheel_with_abi_aliases(
                 &with_data_path,
                 &rewritten,
                 relax,
@@ -14975,6 +14994,8 @@ async fn materialize_and_rewrite_with_abi_aliases(
                     rewritten.display(),
                 )
             })?;
+            trusted_final_sha =
+                Some((rewrite_outcome.sha256.clone(), rewrite_outcome.sha_source));
             write_relaxed_wheel_cache_stamp(&rewritten, relax, abi_aliases)?;
             tracing::info!(
                 entry = %entry_name,
@@ -14988,9 +15009,17 @@ async fn materialize_and_rewrite_with_abi_aliases(
         rewritten
     };
 
+    // The relaxed-wheel cache-hit branch above is the one door with no trusted
+    // digest: the file was written by an earlier process and its stamp records
+    // freshness, not content. That path still pays the full hash.
     let metadata = tokio::task::spawn_blocking({
         let p = final_path.clone();
-        move || crate::wheel::read_metadata(&p)
+        move || match trusted_final_sha {
+            Some((sha, sha_source)) => {
+                crate::wheel::read_metadata_with_trusted_sha(&p, sha, sha_source)
+            }
+            None => crate::wheel::read_metadata(&p),
+        }
     })
     .await
     .context("metadata reader panicked")??;
@@ -15009,13 +15038,17 @@ async fn materialize_and_rewrite_with_abi_aliases(
     let original_requires_dist = if relax == RelaxPolicy::None {
         metadata.requires_dist.clone()
     } else {
+        // Only `.requires_dist` is wanted here, and on a no-op relax `pre_d_path`
+        // and `final_path` are hard links to the same inode -- so the SHA-256
+        // `read_metadata` used to compute here was both discarded AND a second
+        // full pass over bytes just hashed. `read_requires_dist` walks the zip
+        // central directory instead and never touches the payload (p5z).
         tokio::task::spawn_blocking({
             let p = pre_d_path;
-            move || crate::wheel::read_metadata(&p)
+            move || crate::wheel::read_requires_dist(&p)
         })
         .await
         .context("metadata reader panicked")??
-        .requires_dist
     };
 
     // The recipe's `source:` URL points at the POST-D wheel. If we
@@ -20074,7 +20107,7 @@ async fn prepare_replayed_class2_wheel_with_abi_aliases(
     let dst = rewritten.clone();
     let abi_aliases = abi_aliases.clone();
     tokio::task::spawn_blocking(move || {
-        rewrite_wheel_with_abi_aliases(&src, &dst, relax, &abi_aliases)
+        rewrite_wheel_with_abi_aliases(&src, &dst, relax, &abi_aliases).map(|outcome| outcome.sha256)
     })
     .await
     .context("Class-2 replay relax rewrite panicked")?
@@ -26007,6 +26040,258 @@ version = "1.0.0"
                 .as_ref(),
             Some(crate::lock::GitWheelAutoData::CheckoutRoot { .. }),
         ));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+
+// -----------------------------------------------------------------
+// p5z: one wheel, one hash. `materialize_and_rewrite` used to read a
+// wheel's METADATA twice per relaxed entry -- once on the final file
+// (digest kept) and once on the pre-D file (digest discarded) -- each
+// read streaming the WHOLE payload through SHA-256. On a no-op relax the
+// two paths are hard links to the same inode, so isaacsim-extscache-kit's
+// 5.918 GB was hashed twice back to back; across 160 relaxed entries a
+// relock hashed 29.08 GB for 14.54 GB of wheels, ~224 s, none of it under
+// a bench span. These guards fail if either read comes back.
+// -----------------------------------------------------------------
+#[cfg(test)]
+mod p5z_single_hash_tests {
+    use std::collections::BTreeMap;
+    use std::io::Write as _;
+    use std::path::{Path, PathBuf};
+
+    use rattler_conda_types::Platform;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    use super::{EntryAuditInfo, ResolvedWheel, materialize_and_rewrite, wheel_target_for};
+    use crate::config::{RelaxPolicy, WheelEntry};
+
+    /// A minimal, valid pure-Python wheel: root dist-info with METADATA,
+    /// WHEEL and RECORD, stored (not deflated) so the bytes are stable.
+    fn wheel_bytes(dist: &str, version: &str, requires: &[&str]) -> Vec<u8> {
+        let normalized = dist.replace('-', "_");
+        let di = format!("{normalized}-{version}.dist-info");
+        let mut metadata = format!("Metadata-Version: 2.1\nName: {dist}\nVersion: {version}\n");
+        for req in requires {
+            metadata.push_str(&format!("Requires-Dist: {req}\n"));
+        }
+        let metadata_bytes = metadata.into_bytes();
+        let wheel_file = b"Wheel-Version: 1.0\nTag: py3-none-any\n".to_vec();
+        let record = format!("{di}/METADATA,,\n{di}/WHEEL,,\n{di}/RECORD,,\n").into_bytes();
+
+        let mut buf = Vec::new();
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (name, body) in [
+            (format!("{di}/METADATA"), metadata_bytes.as_slice()),
+            (format!("{di}/WHEEL"), wheel_file.as_slice()),
+            (format!("{di}/RECORD"), record.as_slice()),
+        ] {
+            zip.start_file(&name, opts).unwrap();
+            zip.write_all(body).unwrap();
+        }
+        zip.finish().unwrap();
+        buf
+    }
+
+    fn sha256_of(path: &Path) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(std::fs::read(path).unwrap());
+        format!("{:x}", hasher.finalize())
+    }
+
+    fn sha256_of_bytes(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        format!("{:x}", hasher.finalize())
+    }
+
+    /// Serve `bytes` at `http://127.0.0.1:<port>/<filename>` and run the
+    /// URL entry form of `materialize_and_rewrite` against it under `relax`.
+    /// The entry carries the authoritative sha256, so phase 1 lands the wheel
+    /// in the content-addressed fetch store namespace -- the shape production
+    /// uses, and the one whose directory name IS the digest.
+    async fn materialize_url_entry(
+        dist: &str,
+        version: &str,
+        requires: &[&str],
+        relax: RelaxPolicy,
+    ) -> (ResolvedWheel, Vec<String>, PathBuf) {
+        let raw = wheel_bytes(dist, version, requires);
+        let sha256 = sha256_of_bytes(&raw);
+        let filename = format!("{}-{version}-py3-none-any.whl", dist.replace('-', "_"));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let served = std::sync::Arc::new(raw);
+        let body = served.clone();
+        let _server = tokio::spawn(async move {
+            for _ in 0..8u8 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut scratch = [0u8; 1024];
+                    let _ = stream.read(&mut scratch).await;
+                    let head = format!(
+                        "HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\
+                         Content-Type: application/octet-stream\r\n\r\n",
+                        body.len(),
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(&body).await;
+                });
+            }
+        });
+
+        let base = std::env::temp_dir().join(format!(
+            "retread-p5z-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        let download_dir = base.join("download");
+        let source_dir = base.join("source");
+        let cache_dir = base.join("cache");
+        for dir in [&download_dir, &source_dir, &cache_dir] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+
+        let entry = WheelEntry {
+            url: Some(
+                url::Url::parse(&format!("http://127.0.0.1:{port}/{filename}")).unwrap(),
+            ),
+            sha256: Some(sha256),
+            ..WheelEntry::default()
+        };
+        let target = wheel_target_for(Platform::Linux64, "3.11").unwrap();
+        let (resolved, original_requires_dist) = materialize_and_rewrite(
+            &entry,
+            dist,
+            Some(version),
+            &target,
+            &download_dir,
+            &source_dir,
+            &cache_dir,
+            relax,
+            &BTreeMap::new(),
+            None,
+            EntryAuditInfo::default(),
+        )
+        .await
+        .expect("URL-form materialization");
+        (resolved, original_requires_dist, base)
+    }
+
+    /// GUARD (2): a no-op relax hashes the wheel payload ZERO extra times.
+    /// The final digest comes from the fetch store path's own name and the
+    /// pre-D `Requires-Dist` comes off the zip central directory. Before the
+    /// fix this recorded two `wheel::read_metadata` full hashes of the same
+    /// inode. Also asserts the digest is still the digest of the final file.
+    #[tokio::test]
+    async fn no_op_relax_hashes_the_wheel_payload_at_most_once() {
+        // `retread-p5z-noop` has one unversioned requirement, which every relax
+        // policy leaves alone -- so phase 2 takes the no-op hard-link path.
+        let dist = "retread-p5z-noop";
+        let (resolved, original_requires_dist, base) =
+            materialize_url_entry(dist, "1.0.0", &["retread-p5z-plain-dep"], RelaxPolicy::Minor)
+                .await;
+
+        // ONE full hash survives for this entry, and it is phase 1's strict
+        // identity validation of the downloaded file -- not phase 2. Phase 2
+        // used to add two more of the SAME inode (the final read and the
+        // discarded-digest pre-D read); both are gone.
+        let needle = dist.replace('-', "_");
+        let hashes = crate::wheel::full_hash_probe::hashes_for(&needle);
+        assert_eq!(
+            hashes.len(),
+            1,
+            "a no-op relax must stream this wheel's payload through a hasher exactly \
+             once (phase 1 validation); phase 2 takes the digest from the store path \
+             and the Requires-Dist off the zip central directory. recorded: {hashes:?}",
+        );
+        let relaxed_hashes: Vec<_> = hashes
+            .iter()
+            .filter(|(path, _, _)| path.to_string_lossy().ends_with(".relaxed.whl"))
+            .collect();
+        assert!(
+            relaxed_hashes.is_empty(),
+            "the no-op relax output is a hard link to bytes whose digest is already \
+             known; hashing it again is the p5z defect. recorded: {relaxed_hashes:?}",
+        );
+
+        let final_path = resolved.url.to_file_path().unwrap();
+        assert_eq!(
+            resolved.metadata.sha256,
+            sha256_of(&final_path),
+            "metadata sha256 must be the digest of the FINAL file it names",
+        );
+        assert_eq!(original_requires_dist, vec!["retread-p5z-plain-dep"]);
+        assert_eq!(resolved.metadata.requires_dist, original_requires_dist);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// GUARD (3): when the relax rewrite actually CHANGES the wheel, the
+    /// plumbed digest is still the digest of the rewritten output file, and
+    /// the payload is streamed exactly once (inside the rewrite that wrote
+    /// it) rather than three times.
+    #[tokio::test]
+    async fn changed_relax_yields_the_rewritten_files_own_sha() {
+        let dist = "retread-p5z-changed";
+        let (resolved, original_requires_dist, base) =
+            materialize_url_entry(dist, "2.0.0", &["strict-dep==1.2.3"], RelaxPolicy::Minor).await;
+
+        let final_path = resolved.url.to_file_path().unwrap();
+        assert!(
+            final_path.to_string_lossy().ends_with(".relaxed.whl"),
+            "test must exercise a real rewrite, got {}",
+            final_path.display(),
+        );
+        assert_eq!(
+            resolved.metadata.sha256,
+            sha256_of(&final_path),
+            "the sha plumbed out of the rewrite must be the rewritten file's own digest",
+        );
+        // The pre-D Requires-Dist is the STRICT one; the final METADATA is relaxed.
+        assert_eq!(original_requires_dist, vec!["strict-dep==1.2.3"]);
+        assert_ne!(resolved.metadata.requires_dist, original_requires_dist);
+
+        // Two full hashes, of two DIFFERENT files, one each: phase 1's strict
+        // validation of the downloaded wheel, and the rewrite's own streaming
+        // hash of the file it just wrote. Neither file is hashed twice.
+        let needle = dist.replace('-', "_");
+        let hashes = crate::wheel::full_hash_probe::hashes_for(&needle);
+        let mut paths: Vec<_> = hashes.iter().map(|(path, _, _)| path.clone()).collect();
+        paths.sort();
+        let distinct = {
+            let mut unique = paths.clone();
+            unique.dedup();
+            unique.len()
+        };
+        assert_eq!(
+            (hashes.len(), distinct),
+            (2, 2),
+            "a changed rewrite hashes the downloaded wheel once (phase 1 validation) \
+             and the rewritten output once (inside the rewrite), and neither twice; \
+             recorded: {hashes:?}",
+        );
+        assert!(
+            hashes
+                .iter()
+                .any(|(path, _, site)| path.to_string_lossy().ends_with(".relaxed.whl")
+                    && *site == "wheel_rewrite::sha256_file_hex"),
+            "the rewritten file's only hash must be the one the rewrite itself streams; \
+             recorded: {hashes:?}",
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }
