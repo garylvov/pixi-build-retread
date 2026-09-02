@@ -157,10 +157,23 @@ impl BuiltOutputStore {
             return Ok(false);
         }
         std::fs::create_dir_all(&self.root)?;
-        let tmp = self.root.join(format!("tmp-{key}-{}", std::process::id()));
-        // Only a crashed earlier run of THIS pid can own that name, so it is
-        // ours to clear.
-        let _ = std::fs::remove_dir_all(&tmp);
+        // The staging name must be unique per CALL, not per process. Two
+        // threads of one process publishing the same key share a pid, and a
+        // pid-only name made them race on one staging directory -- the full
+        // test suite caught exactly that under parallel load while the
+        // filtered run passed. The counter plus a clock reading keeps threads
+        // apart; the pid keeps processes apart.
+        static NEXT_STAGING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let unique = format!(
+            "{}-{}-{}",
+            std::process::id(),
+            NEXT_STAGING.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default(),
+        );
+        let tmp = self.root.join(format!("tmp-{key}-{unique}"));
         std::fs::create_dir_all(&tmp)?;
         let staged = tmp.join(PAYLOAD);
         std::fs::write(&staged, payload)?;
