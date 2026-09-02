@@ -6248,18 +6248,21 @@ fn prepare_hermetic_build_scratch(private_build_dir: &Path) -> Result<PathBuf> {
     })
 }
 
-async fn run_capturing_uv_in(
+/// Build (but do not spawn) the `uv` child for one source build.
+///
+/// Split out of `run_capturing_uv_in` so the transient-failure retry loop
+/// can construct a FRESH command for every attempt. That freshness is
+/// load-bearing for the hermetic branch: `prepare_hermetic_build_scratch`
+/// wipes and recreates the scratch tree, so a poisoned attempt cannot leak
+/// into the next one.
+fn build_uv_command(
     args: &[&str],
     hermetic: Option<&crate::hermetic_build::HermeticBuildEnvironment>,
     private_build_dir: Option<&Path>,
     build_requirements: Option<&BuildRequirements>,
     build_epoch: u64,
     static_cpp_runtime: bool,
-) -> Result<()> {
-    // The callers above have already exhausted their wheel-cache paths. Hold
-    // the process-wide permit only for the real build subprocess so nested
-    // handler concurrency cannot multiply expensive `uv build` work.
-    let _build_permit = crate::concurrency::acquire_build_permit().await;
+) -> Result<Command> {
     let mut cmd = if let Some(environment) = hermetic {
         let private_build_dir = private_build_dir.ok_or_else(|| {
             anyhow!("hermetic source build is missing its private build directory")
@@ -6532,39 +6535,136 @@ exec "$uv" "${filtered[@]}" --python="$build_python" --no-build-isolation
     crate::uv_closure::apply_uv_lock_budget(&mut cmd);
     #[cfg(unix)]
     cmd.process_group(0);
-    let child = cmd
+    // Configure the child the way every attempt needs it; the retry driver
+    // spawns it.
+    cmd
         // Canonical Git sources intentionally share one read-only metadata
         // store across subdirectory builds. SCM probes may read it, but Git
         // must not refresh its index or take optional locks there.
         .env("GIT_OPTIONAL_LOCKS", "0")
         // If pixi cancels a backend request, dropping this future must also
-        // terminate the direct uv child. The Unix process-group guard below
-        // additionally terminates Python/compiler descendants.
+        // terminate the direct uv child. The Unix process-group guard in the
+        // retry driver additionally terminates Python/compiler descendants.
         .kill_on_drop(true)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("spawning uv (is it on PATH? expected via retread's runtime dep)")?;
-    // Keep this guard declared after `_build_permit`: Rust drops locals in
-    // reverse declaration order, so cancellation kills the complete process
-    // group before releasing capacity to a replacement build.
-    #[cfg(unix)]
-    let mut process_group = UnixProcessGroupGuard::new(
-        child
-            .id()
-            .context("spawned uv process has no operating-system pid")?,
-        "uv build",
-    )?;
-    let output = child
-        .wait_with_output()
-        .await
-        .context("waiting for uv build subprocess")?;
-    #[cfg(unix)]
-    process_group.disarm();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if !output.status.success() {
+        .stderr(Stdio::piped());
+    Ok(cmd)
+}
+
+/// Total attempts for ONE `uv` subprocess whose failure is a KNOWN transient.
+///
+/// Three. The observed race clears the moment the sibling build that caused
+/// it finishes, so the first retry almost always wins; the second bounds the
+/// worst case. A build that keeps producing a transient signature three times
+/// running is no longer transient and must reach the operator.
+const UV_TRANSIENT_BUILD_ATTEMPTS: usize = 3;
+
+/// First backoff before a transient `uv` retry; doubled per attempt. Short
+/// in tests so the retry policy can be exercised without a real wait.
+const UV_TRANSIENT_RETRY_BASE_DELAY_MS: u64 = if cfg!(test) { 10 } else { 2_000 };
+
+/// Classify a failed `uv` invocation's stderr as a KNOWN transient, or not.
+///
+/// Deliberately narrow: every class here is earned by a named real failure,
+/// because retrying a deterministic build error just pays for it twice and
+/// hides it behind a warning. Anything unrecognized stays fatal on the first
+/// attempt, exactly as before.
+///
+/// - `uv-cache-hardlink-race` — job `5547450` (2026-08-31). Six concurrent uv
+///   builds shared one uv cache on NFS; a sibling build reclaimed its
+///   `builds-v0` temp tree while this build was hardlinking out of it, so
+///   uv's unpack died with `ENOENT` on a file that existed when the walk
+///   listed it. Nothing about the sdist, the index, or the requirement was
+///   wrong. Retread turned that into a hard `conda/outputs` abort and threw
+///   away a 1h19m55s full relock.
+pub(crate) fn uv_transient_failure_class(stderr: &str) -> Option<&'static str> {
+    if stderr.contains("failed to hardlink file from")
+        && stderr.contains("No such file or directory (os error 2)")
+    {
+        return Some("uv-cache-hardlink-race");
+    }
+    None
+}
+
+/// Spawn one `uv` build, retrying only a classified transient failure.
+///
+/// `make_command` is called fresh for every attempt so the hermetic scratch
+/// is rebuilt from clean and a poisoned attempt cannot leak into the next.
+/// Every retry is announced at WARN with its class, attempt number and
+/// backoff, and a `bench: uv_transient_retry` span records the outcome, so a
+/// recovery can never be silent.
+async fn run_uv_with_transient_retry<F>(args: &[&str], mut make_command: F) -> Result<()>
+where
+    F: FnMut() -> Result<Command>,
+{
+    let started = std::time::Instant::now();
+    let mut retried_class: Option<&'static str> = None;
+    for attempt in 1..=UV_TRANSIENT_BUILD_ATTEMPTS {
+        let mut cmd = make_command()?;
+        let child = cmd
+            .spawn()
+            .context("spawning uv (is it on PATH? expected via retread's runtime dep)")?;
+        // The caller holds the build permit for the whole retry loop, so this
+        // guard is still dropped (killing the process group) before capacity
+        // is released to a replacement build.
+        #[cfg(unix)]
+        let mut process_group = UnixProcessGroupGuard::new(
+            child
+                .id()
+                .context("spawned uv process has no operating-system pid")?,
+            "uv build",
+        )?;
+        let output = child
+            .wait_with_output()
+            .await
+            .context("waiting for uv build subprocess")?;
+        #[cfg(unix)]
+        process_group.disarm();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if output.status.success() {
+            if let Some(class) = retried_class {
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                tracing::warn!(
+                    class,
+                    attempts = attempt,
+                    elapsed_ms,
+                    args = ?args,
+                    "transient uv build failure RECOVERED by retry; the lock was not aborted",
+                );
+                tracing::info!(
+                    class,
+                    attempts = attempt,
+                    elapsed_ms,
+                    outcome = "recovered",
+                    "bench: uv_transient_retry",
+                );
+            }
+            if !stdout.trim().is_empty() {
+                tracing::debug!(stdout = %stdout, "uv output");
+            }
+            return Ok(());
+        }
+        let class = uv_transient_failure_class(&stderr);
+        if let Some(class) = class {
+            if attempt < UV_TRANSIENT_BUILD_ATTEMPTS {
+                let delay_ms = UV_TRANSIENT_RETRY_BASE_DELAY_MS * (1_u64 << (attempt - 1));
+                tracing::warn!(
+                    class,
+                    attempt,
+                    max_attempts = UV_TRANSIENT_BUILD_ATTEMPTS,
+                    delay_ms,
+                    status = %output.status,
+                    args = ?args,
+                    stderr = %stderr,
+                    "transient uv build failure; retrying after backoff instead of aborting the lock",
+                );
+                retried_class = Some(class);
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                continue;
+            }
+        }
         tracing::error!(stdout = %stdout, stderr = %stderr, args = ?args, "uv failed");
         // Include stderr in the bail message so pixi surfaces the
         // actual uv error (usage / network / build failure) instead
@@ -6583,12 +6683,52 @@ exec "$uv" "${filtered[@]}" --python="$build_python" --no-build-isolation
         } else {
             snippet.to_string()
         };
+        if let Some(class) = class {
+            tracing::info!(
+                class,
+                attempts = attempt,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                outcome = "exhausted",
+                "bench: uv_transient_retry",
+            );
+            bail!(
+                "uv {:?} failed (status {}) on all {} attempts; the failure kept the known-transient signature `{}`, so it is no longer transient: {snippet}",
+                args,
+                output.status,
+                UV_TRANSIENT_BUILD_ATTEMPTS,
+                class,
+            );
+        }
         bail!("uv {:?} failed (status {}): {snippet}", args, output.status,);
     }
-    if !stdout.trim().is_empty() {
-        tracing::debug!(stdout = %stdout, "uv output");
-    }
-    Ok(())
+    unreachable!("the uv transient retry loop returns on its final attempt")
+}
+
+async fn run_capturing_uv_in(
+    args: &[&str],
+    hermetic: Option<&crate::hermetic_build::HermeticBuildEnvironment>,
+    private_build_dir: Option<&Path>,
+    build_requirements: Option<&BuildRequirements>,
+    build_epoch: u64,
+    static_cpp_runtime: bool,
+) -> Result<()> {
+    // The callers above have already exhausted their wheel-cache paths. Hold
+    // the process-wide permit only for the real build subprocess so nested
+    // handler concurrency cannot multiply expensive `uv build` work. It is
+    // held across the whole retry loop: a transient retry is the SAME logical
+    // build, not a new claim on capacity.
+    let _build_permit = crate::concurrency::acquire_build_permit().await;
+    run_uv_with_transient_retry(args, || {
+        build_uv_command(
+            args,
+            hermetic,
+            private_build_dir,
+            build_requirements,
+            build_epoch,
+            static_cpp_runtime,
+        )
+    })
+    .await
 }
 
 /// Run a child process, capturing stdout + stderr so neither leaks to
@@ -6815,6 +6955,202 @@ fn git_slug(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------------------------
+    // Transient `uv` subprocess failure: retry instead of aborting the lock.
+    // ---------------------------------------------------------------
+
+    /// The VERBATIM stderr that killed job `5547450` (arm B, 2026-08-31) at
+    /// 1h19m55s. Six concurrent uv builds shared one uv cache on NFS and a
+    /// sibling reclaimed its `builds-v0` temp tree mid-hardlink. Kept
+    /// verbatim so a change to the classifier that stops recognizing the one
+    /// failure it was written for fails this test.
+    const UV_HARDLINK_RACE_STDERR: &str = "Building wheel from source distribution...\n\
+error: Failed to build `/cache/built-wheels/sdist/v12/abc/.tmp/build/gym-0.26.2.tar.gz`\n  \
+Caused by: Failed to install requirements from `build-system.requires`\n  \
+Caused by: Failed to install build dependencies\n  \
+Caused by: Failed to install: setuptools-80.10.2-py3-none-any.whl (setuptools==80.10.2)\n  \
+Caused by: failed to hardlink file from /cache/uv/builds-v0/.tmp4QiHoL/lib/python3.11/site-packages/pkg_resources/tests/test_working_set.py to /cache/uv/archive-v0/2Xwd2LTx6I0HEYJm/pkg_resources/tests/test_working_set.py: No such file or directory (os error 2)\n";
+
+    /// A genuine, deterministic build failure. Retrying this would burn the
+    /// build twice more and still fail.
+    const UV_REAL_BUILD_ERROR_STDERR: &str = "Building wheel from source distribution...\n\
+error: Failed to build `/cache/build/widget-1.0.tar.gz`\n  \
+Caused by: Build backend failed to determine metadata through `build_wheel`\n  \
+ModuleNotFoundError: No module named 'setuptools_scm'\n";
+
+    /// Write a stand-in for `uv` that fails `transient_failures` times with
+    /// `stderr_text`, then succeeds -- and counts its own invocations in a
+    /// file so the test can assert how many attempts actually ran.
+    #[cfg(unix)]
+    fn fake_uv_script(dir: &Path, failures_before_success: usize, stderr_text: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(dir).unwrap();
+        let counter = dir.join("attempts");
+        let stderr_file = dir.join("stderr.txt");
+        std::fs::write(&stderr_file, stderr_text).unwrap();
+        let script = dir.join("fake-uv.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 n=$(cat '{counter}' 2>/dev/null || echo 0)\n\
+                 n=$((n+1))\n\
+                 printf '%s' \"$n\" > '{counter}'\n\
+                 if [ \"$n\" -le {failures_before_success} ]; then\n\
+                   cat '{stderr}' >&2\n\
+                   exit 2\n\
+                 fi\n\
+                 echo 'built'\n\
+                 exit 0\n",
+                counter = counter.display(),
+                stderr = stderr_file.display(),
+                failures_before_success = failures_before_success,
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    #[cfg(unix)]
+    fn fake_uv_attempts(dir: &Path) -> usize {
+        std::fs::read_to_string(dir.join("attempts"))
+            .map(|raw| raw.trim().parse().unwrap())
+            .unwrap_or(0)
+    }
+
+    #[cfg(unix)]
+    fn fake_uv_command(script: &Path) -> Result<Command> {
+        let mut cmd = Command::new(script);
+        cmd.process_group(0)
+            .kill_on_drop(true)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        Ok(cmd)
+    }
+
+    /// Job `5547450`: one uv subprocess hit an NFS hardlink race in the shared
+    /// uv cache, retread treated it as a definitive answer, and a 1h19m55s
+    /// full relock died. The same race must now cost a backoff, not the lock.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn transient_uv_hardlink_race_is_retried_and_recovers() {
+        let dir = unique_test_dir("uv-transient-recover");
+        let script = fake_uv_script(&dir, 2, UV_HARDLINK_RACE_STDERR);
+
+        let result =
+            run_uv_with_transient_retry(&["build", "--wheel"], || fake_uv_command(&script)).await;
+
+        assert!(
+            result.is_ok(),
+            "the third attempt succeeds, so the build must succeed: {:?}",
+            result.err()
+        );
+        assert_eq!(
+            fake_uv_attempts(&dir),
+            3,
+            "two transient failures must be retried, not aborted on"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A deterministic build error is NOT transient. Retrying it would pay
+    /// for an expensive failed build three times and bury the real cause
+    /// under retry warnings, so it must still abort on the first attempt.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_real_uv_build_error_is_not_retried() {
+        let dir = unique_test_dir("uv-transient-nonretry");
+        // Never succeeds within the budget; if the driver retried an
+        // unclassified failure we would see attempts > 1.
+        let script = fake_uv_script(
+            &dir,
+            UV_TRANSIENT_BUILD_ATTEMPTS + 5,
+            UV_REAL_BUILD_ERROR_STDERR,
+        );
+
+        let error = run_uv_with_transient_retry(&["build", "--wheel"], || fake_uv_command(&script))
+            .await
+            .expect_err("a real build error must fail the build");
+
+        assert_eq!(
+            fake_uv_attempts(&dir),
+            1,
+            "an unclassified failure must stay fatal on the first attempt"
+        );
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("ModuleNotFoundError"),
+            "the real uv error must still reach the caller: {rendered}"
+        );
+        assert!(
+            !rendered.contains("attempts"),
+            "a non-retried failure must not claim retries happened: {rendered}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The retry is BOUNDED. A signature that keeps repeating is no longer
+    /// transient: after the bounded attempts the failure must reach the
+    /// operator, and say that it was retried and why it is now fatal.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn transient_uv_retries_are_bounded_and_then_fatal() {
+        let dir = unique_test_dir("uv-transient-exhausted");
+        let script = fake_uv_script(
+            &dir,
+            UV_TRANSIENT_BUILD_ATTEMPTS + 5,
+            UV_HARDLINK_RACE_STDERR,
+        );
+
+        let error = run_uv_with_transient_retry(&["build", "--wheel"], || fake_uv_command(&script))
+            .await
+            .expect_err("an unending transient must eventually fail");
+
+        assert_eq!(
+            fake_uv_attempts(&dir),
+            UV_TRANSIENT_BUILD_ATTEMPTS,
+            "the retry budget must be exactly UV_TRANSIENT_BUILD_ATTEMPTS attempts"
+        );
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("uv-cache-hardlink-race"),
+            "the exhausted failure must name the class it kept matching: {rendered}"
+        );
+        assert!(
+            rendered.contains("all 3 attempts"),
+            "the exhausted failure must say the retries were spent: {rendered}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The classifier is deliberately narrow. An ENOENT that is not the
+    /// hardlink race, and a hardlink failure that is not ENOENT, are both
+    /// unclassified -- otherwise "transient" grows into "retry everything".
+    #[test]
+    fn uv_transient_classifier_matches_only_the_named_race() {
+        assert_eq!(
+            uv_transient_failure_class(UV_HARDLINK_RACE_STDERR),
+            Some("uv-cache-hardlink-race")
+        );
+        assert_eq!(uv_transient_failure_class(UV_REAL_BUILD_ERROR_STDERR), None);
+        assert_eq!(
+            uv_transient_failure_class(
+                "error: failed to open `/x/pyproject.toml`: No such file or directory (os error 2)"
+            ),
+            None,
+            "a missing input file is a real error, not the cache race"
+        );
+        assert_eq!(
+            uv_transient_failure_class(
+                "Caused by: failed to hardlink file from /a to /b: Permission denied (os error 13)"
+            ),
+            None,
+            "a permissions failure will not clear on a retry"
+        );
+    }
 
     /// An eviction must free the visible cache path even when the tree cannot
     /// be fully deleted. On NFS a silly-renamed `.nfsXXXX` sibling keeps the
