@@ -6808,6 +6808,67 @@ isaaclab = { path = "wheels/isaaclab/isaaclab-2.0.0-py3-none-any.whl" }
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// 811be1f's memo must still fire on top of p6a's single-pass strict read:
+    /// re-validating UNCHANGED sources must not touch the payload at all.
+    /// Counted with the same path-keyed full-hash probe p6a's guard uses --
+    /// the only instrument that sees the read. A memo that stopped firing
+    /// would show a second pass here.
+    #[test]
+    fn built_source_validation_memo_still_skips_the_strict_read() {
+        let needle = format!(
+            "retread-uv-built-memo-{}-{}",
+            std::process::id(),
+            CLOSURE_META_TMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        );
+        let tmp = std::env::temp_dir().join(&needle);
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let wheel = tmp.join("good-1.0-py3-none-any.whl");
+        write_built_source_test_wheel_with_payload(&wheel, "good", "1.0", b"memoized payload");
+        let target = ResolutionTarget::from_parts("3.12", "linux-64", None);
+
+        let mut first = sample_request();
+        first.built_wheel_sources.clear();
+        first
+            .built_wheel_sources
+            .insert("good".to_string(), wheel.clone());
+        let first_fingerprint = validate_built_wheel_sources(&mut first, &target).unwrap();
+        let after_first = crate::wheel::full_hash_probe::hashes_for(&needle);
+        assert_eq!(
+            after_first.len(),
+            1,
+            "the cold validation reads the payload exactly once, got {after_first:?}",
+        );
+        assert_eq!(after_first[0].2, "wheel::read_metadata_strict");
+
+        // Same bytes, same (len, mtime): the memo key must hit.
+        let mut second = sample_request();
+        second.built_wheel_sources.clear();
+        second
+            .built_wheel_sources
+            .insert("good".to_string(), wheel.clone());
+        let second_fingerprint = validate_built_wheel_sources(&mut second, &target).unwrap();
+        assert_eq!(first_fingerprint, second_fingerprint);
+        assert_eq!(
+            second.built_wheel_sources["good"],
+            std::fs::canonicalize(&wheel).unwrap(),
+            "a memo hit must leave the normalized sources a full run would have written",
+        );
+        let after_second = crate::wheel::full_hash_probe::hashes_for(&needle);
+        println!(
+            "p6a: memo check -- payload passes after cold={} after warm={}",
+            after_first.len(),
+            after_second.len(),
+        );
+        assert_eq!(
+            after_second.len(),
+            1,
+            "a memo hit must not re-read the payload, got {after_second:?}",
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[tokio::test]
     async fn invalid_python_target_fails_before_project_or_cache_mutation() {
         let tmp = std::env::temp_dir().join(format!(
