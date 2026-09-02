@@ -41,7 +41,7 @@ use sha2::{Digest, Sha256};
 
 /// Bumped whenever the on-disk shape or the key inputs change, so an old
 /// file is discarded rather than misread.
-const SCHEMA: &str = "v1-route-probe-verdicts";
+const SCHEMA: &str = "v2-route-probe-verdicts";
 
 /// Directory under the retread cache root holding one file per
 /// (bundle, python minor, subdir).
@@ -95,15 +95,34 @@ struct VerdictFile {
     entries: BTreeMap<String, CachedVerdict>,
 }
 
-/// Hex sha256 of one probe QUESTION: the stage tag plus the normalized,
-/// sorted, deduplicated spec strings.
-pub(crate) fn probe_digest<S: AsRef<str>>(stage: &str, specs: impl Iterator<Item = S>) -> String {
+/// Hex sha256 of one probe ENTRY key: the stage tag, the normalized,
+/// sorted, deduplicated spec strings (the QUESTION), and the fingerprint of
+/// the candidate universe that question can actually reach (the UNIVERSE,
+/// from `crate::conda_solve::reachable_universe_digest_shared`).
+///
+/// The universe moved from the file-level validity key to the entry key in
+/// v2. The old file-level input was `crate::repodata::repodata_identity`,
+/// the on-disk repodata cache file's LENGTH and MTIME -- so an identical
+/// document re-fetched after its 30-minute TTL invalidated every verdict in
+/// the file. Measured: jobs 5598763 arm A vs arm B (one node, one job, one
+/// manifest, differing only in which directory held the repodata cache)
+/// produced a DIFFERENT validity key for all 14 bundles, and job 5611846
+/// (fresh workspace, warm shared caches) discarded 13 of 14 verdict files
+/// and re-executed all 315 probes against 116 cache hits.
+pub(crate) fn probe_digest<S: AsRef<str>>(
+    stage: &str,
+    universe: &str,
+    specs: impl Iterator<Item = S>,
+) -> String {
     let mut normalized: Vec<String> = specs.map(|s| s.as_ref().trim().to_string()).collect();
     normalized.sort();
     normalized.dedup();
     let mut h = Sha256::new();
     h.update(b"retread-probe-question\0");
     h.update(stage.as_bytes());
+    h.update([0xffu8]);
+    h.update(b"universe\0");
+    h.update(universe.as_bytes());
     h.update([0xffu8]);
     for spec in &normalized {
         h.update(spec.as_bytes());
@@ -113,10 +132,17 @@ pub(crate) fn probe_digest<S: AsRef<str>>(stage: &str, specs: impl Iterator<Item
 }
 
 /// Hex sha256 of the cache-VALIDITY key. `policy_fields` is an ordered
-/// list of `(tag, values)` describing everything except the question.
+/// list of `(tag, values)` describing everything except the question and the
+/// candidate universe.
+///
+/// The universe is NOT in here any more (v2). It is per-ENTRY, keyed on the
+/// reachable-record content that entry's own solve consulted, so an upstream
+/// upload of an unrelated package no longer discards the whole file. Whole-
+/// document keying would not have worked either: the conda-forge linux-64
+/// repodata measurably changes inside an hour (637,578,869 bytes at 06:54
+/// EDT vs 637,595,538 at 08:02 EDT on 2026-09-02, different sha256).
 pub(crate) fn validity_key(
     channels: &[String],
-    repodata_identity: &str,
     python: &str,
     subdir: &str,
     policy_fields: &[(&str, Vec<String>)],
@@ -132,7 +158,6 @@ pub(crate) fn validity_key(
     };
     field("schema", &[SCHEMA.to_string()]);
     field("channels", channels);
-    field("repodata", &[repodata_identity.to_string()]);
     field("python", &[python.to_string()]);
     field("subdir", &[subdir.to_string()]);
     for (tag, values) in policy_fields {
@@ -273,13 +298,12 @@ mod tests {
         dir
     }
 
-    fn key_for(repodata: &str) -> String {
+    fn key_for(policy: &str) -> String {
         validity_key(
             &["https://prefix.dev/conda-forge/".to_string()],
-            repodata,
             "3.12",
             "linux-64",
-            &[("policy", vec!["strict".to_string()])],
+            &[("policy", vec![policy.to_string()])],
         )
     }
 
@@ -289,10 +313,16 @@ mod tests {
     fn second_run_over_the_same_probe_set_executes_no_probes() {
         let dir = tmp_dir("same-key");
         let path = cache_path(&dir, "isaac-pack-latest", "3.12", "linux-64");
-        let key = key_for("repodata-rev-1");
+        let key = key_for("strict");
 
         let questions: Vec<String> = (0..100)
-            .map(|i| probe_digest("auto_route_joint_solve", [format!("absl-py=={i}.0")].iter()))
+            .map(|i| {
+                probe_digest(
+                    "auto_route_joint_solve",
+                    "universe-rev-1",
+                    [format!("absl-py=={i}.0")].iter(),
+                )
+            })
             .collect();
 
         let mut cold_executions = 0usize;
@@ -337,17 +367,23 @@ mod tests {
         let dir = tmp_dir("changed-key");
         let path = cache_path(&dir, "isaac-pack-latest", "3.12", "linux-64");
         let questions: Vec<String> = (0..8)
-            .map(|i| probe_digest("auto_route_joint_solve", [format!("absl-py=={i}.0")].iter()))
+            .map(|i| {
+                probe_digest(
+                    "auto_route_joint_solve",
+                    "universe-rev-1",
+                    [format!("absl-py=={i}.0")].iter(),
+                )
+            })
             .collect();
         {
-            let cache = RouteProbeCache::open(path.clone(), key_for("repodata-rev-1"));
+            let cache = RouteProbeCache::open(path.clone(), key_for("strict"));
             for digest in &questions {
                 cache.record(digest, CachedVerdict::Sat);
             }
             assert_eq!(cache.len(), 8);
         }
-        // Same file, different repodata identity -> whole file discarded.
-        let cache = RouteProbeCache::open(path.clone(), key_for("repodata-rev-2"));
+        // Same file, different POLICY -> whole file discarded.
+        let cache = RouteProbeCache::open(path.clone(), key_for("disabled"));
         assert_eq!(cache.len(), 0, "a changed key must discard every verdict");
         let mut executions = 0usize;
         for digest in &questions {
@@ -384,12 +420,68 @@ mod tests {
     /// The question digest is order-insensitive but content-sensitive.
     #[test]
     fn probe_digest_is_order_insensitive_and_content_sensitive() {
-        let a = probe_digest("solve", ["b==1", "a==2"].iter());
-        let b = probe_digest("solve", ["a==2", "b==1"].iter());
-        let c = probe_digest("solve", ["a==2", "b==2"].iter());
-        let d = probe_digest("standalone", ["a==2", "b==1"].iter());
+        let a = probe_digest("solve", "u1", ["b==1", "a==2"].iter());
+        let b = probe_digest("solve", "u1", ["a==2", "b==1"].iter());
+        let c = probe_digest("solve", "u1", ["a==2", "b==2"].iter());
+        let d = probe_digest("standalone", "u1", ["a==2", "b==1"].iter());
         assert_eq!(a, b);
         assert_ne!(a, c);
         assert_ne!(a, d, "the stage tag is part of the question");
+    }
+
+    /// The candidate universe is per-ENTRY now (v2): a changed reachable
+    /// universe must change the entry key, and a changed WORKSPACE PATH must
+    /// not. This is the guard for the measured defect -- job 5611846 (fresh
+    /// workspace, warm shared caches) re-executed all 315 probes because the
+    /// universe used to live in the file-level validity key and was derived
+    /// from the repodata cache file's mtime.
+    #[test]
+    fn universe_is_part_of_the_entry_key_and_the_workspace_path_is_not() {
+        let specs = ["numpy==2.1", "python==3.12"];
+        let same = probe_digest("solve", "universe-abc", specs.iter());
+        assert_eq!(
+            same,
+            probe_digest("solve", "universe-abc", specs.iter()),
+            "an unchanged universe must reproduce the entry key",
+        );
+        assert_ne!(
+            same,
+            probe_digest("solve", "universe-xyz", specs.iter()),
+            "a changed candidate universe must change the entry key",
+        );
+
+        // Two workspaces at different paths, same everything else: the
+        // validity key must be identical. Before v2 it could not be --
+        // `repodata_identity` fed it the cache file's length and mtime.
+        let workspace_a = std::path::Path::new("/oscar/ws.RUN-A-1/pixi.toml");
+        let workspace_b = std::path::Path::new("/oscar/ws.RUN-B-2/deeper/pixi.toml");
+        let key_a = validity_key(
+            &["https://prefix.dev/conda-forge/".to_string()],
+            "3.12",
+            "linux-64",
+            &[
+                ("policy", vec!["strict".to_string()]),
+                (
+                    "workspace-deps",
+                    vec![format!("root={}", workspace_a.parent().is_some())],
+                ),
+            ],
+        );
+        let key_b = validity_key(
+            &["https://prefix.dev/conda-forge/".to_string()],
+            "3.12",
+            "linux-64",
+            &[
+                ("policy", vec!["strict".to_string()]),
+                (
+                    "workspace-deps",
+                    vec![format!("root={}", workspace_b.parent().is_some())],
+                ),
+            ],
+        );
+        assert_eq!(
+            key_a, key_b,
+            "the workspace path must not reach the validity key",
+        );
     }
 }

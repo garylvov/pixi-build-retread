@@ -308,6 +308,64 @@ struct ReachableState {
 struct ReachableSnapshot {
     records: Arc<[RepoDataRecord]>,
     consulted: Arc<[String]>,
+    /// Content fingerprint of `records` -- the candidate universe this
+    /// question can actually see. Computed once per root-name set and
+    /// reused, so keying a memoized verdict on it costs one BTreeMap
+    /// lookup, not a rehash.
+    universe: Arc<str>,
+}
+
+/// Hex sha256 over the REACHABLE candidate universe: every field of every
+/// record that resolvo can act on, in a canonical order.
+///
+/// This is the sound, fine-grained replacement for
+/// `crate::repodata::repodata_identity` as a route-probe verdict-cache key.
+/// That function hashed the on-disk repodata cache file's LENGTH and MTIME,
+/// so an identical document re-fetched after the 30-minute TTL produced a
+/// different key and discarded every memoized verdict -- measured directly:
+/// jobs 5598763 arm A and arm B ran on ONE node in ONE job against ONE
+/// manifest and differed only in which directory held the repodata cache,
+/// and every one of their 14 bundle validity keys differed. Job 5611846
+/// (fresh workspace, warm shared caches) then discarded 13 of 14 verdict
+/// files and re-executed all 315 probes.
+///
+/// Hashing the whole repodata document instead would not have helped: the
+/// conda-forge linux-64 document measurably changes within the hour
+/// (637,578,869 bytes at 06:54 EDT vs 637,595,538 at 08:02 EDT on
+/// 2026-09-02, different sha256). What a verdict actually depends on is the
+/// transitive closure `load_records_recursive` walks from this question's
+/// exact root names -- an upload of an unrelated package cannot reach it,
+/// and a new version of a reachable package DOES change these bytes because
+/// the walk loads it. So this is both sound and stable across jobs.
+fn reachable_universe_digest(records: &[RepoDataRecord]) -> Arc<str> {
+    use sha2::{Digest, Sha256};
+    let mut lines: Vec<String> = records
+        .iter()
+        .map(|record| {
+            let package = &record.package_record;
+            format!(
+                "{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}",
+                record.file_name,
+                record.channel.as_deref().unwrap_or(""),
+                package.name.as_normalized(),
+                package.version.as_str(),
+                package.build,
+                package.build_number,
+                package.subdir,
+                package.depends.join("\u{2}"),
+                package.constrains.join("\u{2}"),
+            )
+        })
+        .collect();
+    lines.sort();
+    lines.dedup();
+    let mut hasher = Sha256::new();
+    hasher.update(b"retread-reachable-universe-v1\0");
+    for line in &lines {
+        hasher.update(line.as_bytes());
+        hasher.update([0u8]);
+    }
+    Arc::from(format!("{:x}", hasher.finalize()).as_str())
 }
 
 impl SharedSparseSolveData {
@@ -335,15 +393,27 @@ impl SharedSparseSolveData {
         &self,
         parsed_specs: &[MatchSpec],
     ) -> (Arc<[RepoDataRecord]>, Arc<[String]>) {
-        self.records_for_with_loader(parsed_specs, load_selected_records_sparse_from_pairs)
-            .await
+        let snapshot = self
+            .snapshot_for_with_loader(parsed_specs, load_selected_records_sparse_from_pairs)
+            .await;
+        (snapshot.records, snapshot.consulted)
     }
 
-    async fn records_for_with_loader<Load, LoadFuture>(
+    /// The reachable universe fingerprint for one question. `None` when no
+    /// repodata could be loaded at all -- the verdict would be `Skipped`,
+    /// which is never memoized anyway.
+    async fn universe_for(&self, parsed_specs: &[MatchSpec]) -> Option<Arc<str>> {
+        let snapshot = self
+            .snapshot_for_with_loader(parsed_specs, load_selected_records_sparse_from_pairs)
+            .await;
+        (!snapshot.records.is_empty()).then_some(snapshot.universe)
+    }
+
+    async fn snapshot_for_with_loader<Load, LoadFuture>(
         &self,
         parsed_specs: &[MatchSpec],
         load: Load,
-    ) -> (Arc<[RepoDataRecord]>, Arc<[String]>)
+    ) -> ReachableSnapshot
     where
         Load: FnOnce(Arc<[SparsePair]>, Vec<PackageName>) -> LoadFuture,
         LoadFuture: std::future::Future<Output = SparseLoadResult>,
@@ -363,7 +433,7 @@ impl SharedSparseSolveData {
                 requested_roots = requested_roots.len(),
                 "bench: reusing question-scoped sparse reachable records",
             );
-            return (snapshot.records, snapshot.consulted);
+            return snapshot;
         }
 
         let pairs = self.pairs().await;
@@ -371,18 +441,28 @@ impl SharedSparseSolveData {
             Ok(loaded) => loaded,
             // Gateway errors and spawn-blocking panics both take this path.
             // Keep the last good snapshot intact so a later probe can retry.
-            Err(consulted) => return (Arc::from([]), consulted.into()),
+            Err(consulted) => {
+                return ReachableSnapshot {
+                    records: Arc::from([]),
+                    consulted: consulted.into(),
+                    universe: Arc::from(""),
+                };
+            }
         };
+        let universe = reachable_universe_digest(&records);
         let records: Arc<[RepoDataRecord]> = records.into();
         let consulted: Arc<[String]> = consulted.into();
-        self.reachable.lock().await.snapshots.insert(
-            requested_roots,
-            ReachableSnapshot {
-                records: Arc::clone(&records),
-                consulted: Arc::clone(&consulted),
-            },
-        );
-        (records, consulted)
+        let snapshot = ReachableSnapshot {
+            records,
+            consulted,
+            universe,
+        };
+        self.reachable
+            .lock()
+            .await
+            .snapshots
+            .insert(requested_roots, snapshot.clone());
+        snapshot
     }
 }
 
@@ -1175,6 +1255,19 @@ pub(crate) async fn solve_selected_records_for_target_shared(
     .await
 }
 
+/// Content fingerprint of the candidate universe this exact question can
+/// reach, for use as a route-probe verdict-cache key. Reuses (and populates)
+/// the same question-scoped snapshot the solve itself consumes, so it adds no
+/// repodata work. `None` means no repodata was available.
+pub(crate) async fn reachable_universe_digest_shared(
+    shared: &SharedSparseSolveData,
+    specs: &[CondaMatchSpec],
+) -> Option<Arc<str>> {
+    let rendered_specs: Vec<String> = specs.iter().map(ToString::to_string).collect();
+    let parsed_specs = parse_match_specs(&rendered_specs);
+    shared.universe_for(&parsed_specs).await
+}
+
 /// Populate the exact-question reachable-record snapshot without running resolvo.
 pub(crate) async fn prewarm_selected_records_for_target_shared(
     shared: &SharedSparseSolveData,
@@ -1328,6 +1421,84 @@ mod tests {
         }
     }
 
+    /// GUARD for the measured p5u defect. The route-probe verdict key must be
+    /// a function of the candidate universe's CONTENT and of nothing on the
+    /// filesystem: not the workspace path, not the repodata cache directory,
+    /// not an mtime. Job 5611846 (fresh workspace, WARM shared caches) locked
+    /// in 2366s against arm C's 69s because the old key fed
+    /// `repodata_identity` -- the repodata cache file's length and mtime --
+    /// into the file-level validity key, so 13 of 14 verdict files were
+    /// discarded and all 315 probes re-ran against 116 hits.
+    ///
+    /// This test CAN fail: it fails the moment any path- or time-derived
+    /// input is folded back into the fingerprint.
+    #[test]
+    fn universe_digest_is_content_keyed_not_path_or_time_keyed() {
+        let records = vec![
+            repo_record("python", "3.12.1", &[]),
+            repo_record("numpy", "2.1.0", &["python >=3.12,<3.13.0a0"]),
+        ];
+        let baseline = reachable_universe_digest(&records);
+
+        // (1) Same content, different order in memory -> same digest.
+        let mut shuffled = records.clone();
+        shuffled.reverse();
+        assert_eq!(
+            baseline,
+            reachable_universe_digest(&shuffled),
+            "record order must not change the universe fingerprint",
+        );
+
+        // (2) Two different "workspaces"/cache roots -> same digest. The
+        // digest must not consult the filesystem at all.
+        let mut env_dirs = Vec::new();
+        for tag in ["ws-a-11111", "ws-b-22222"] {
+            let dir = std::env::temp_dir().join(format!(
+                "retread-p5u-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::create_dir_all(&dir).expect("temp workspace");
+            // Byte-identical pack source, written at two different paths and
+            // at two different times.
+            std::fs::write(dir.join("pack-source.txt"), b"pack source bytes\n")
+                .expect("pack source");
+            env_dirs.push(dir);
+        }
+        let digests: Vec<Arc<str>> = env_dirs
+            .iter()
+            .map(|dir| {
+                let _ = std::fs::metadata(dir.join("pack-source.txt"));
+                reachable_universe_digest(&records)
+            })
+            .collect();
+        assert_eq!(
+            digests[0], digests[1],
+            "two workspaces at different paths with identical sources must \
+             produce the identical universe fingerprint",
+        );
+        assert_eq!(baseline, digests[0]);
+        for dir in &env_dirs {
+            std::fs::remove_dir_all(dir).ok();
+        }
+
+        // (3) A one-field change in the reachable universe DOES change it.
+        let mut bumped = records.clone();
+        bumped[1].package_record.depends = vec!["python >=3.12,<3.14.0a0".to_string()];
+        assert_ne!(
+            baseline,
+            reachable_universe_digest(&bumped),
+            "a changed dependency must change the universe fingerprint",
+        );
+        let mut added = records.clone();
+        added.push(repo_record("scipy", "1.14.0", &["numpy >=2"]));
+        assert_ne!(
+            baseline,
+            reachable_universe_digest(&added),
+            "a new reachable candidate must change the universe fingerprint",
+        );
+    }
+
     #[test]
     fn exact_root_names_preserve_first_seen_order() {
         let specs = parse_match_specs(&[
@@ -1362,6 +1533,7 @@ mod tests {
                 ReachableSnapshot {
                     records: Arc::clone(&records),
                     consulted: Arc::from(["fixture/linux-64".to_string()]),
+                    universe: Arc::from("fixture-universe"),
                 },
             )]),
         });
@@ -1387,14 +1559,14 @@ mod tests {
             repo_record("route", "1.0", &[]),
         ];
 
-        let (before, _) = shared
-            .records_for_with_loader(&baseline, move |_pairs, roots| async move {
+        let before = shared
+            .snapshot_for_with_loader(&baseline, move |_pairs, roots| async move {
                 assert_eq!(roots, [PackageName::from_str("baseline").unwrap()]);
                 Ok((baseline_records, vec!["fixture/linux-64".to_string()]))
             })
             .await;
-        let (grown, _) = shared
-            .records_for_with_loader(&expanded, move |_pairs, roots| async move {
+        let grown = shared
+            .snapshot_for_with_loader(&expanded, move |_pairs, roots| async move {
                 assert_eq!(
                     roots,
                     [
@@ -1405,16 +1577,28 @@ mod tests {
                 Ok((expanded_records, vec!["fixture/linux-64".to_string()]))
             })
             .await;
-        let (after, _) = shared
-            .records_for_with_loader(&baseline, |_pairs, _roots| async move {
+        let after = shared
+            .snapshot_for_with_loader(&baseline, |_pairs, _roots| async move {
                 panic!("the original question must use its immutable snapshot")
             })
             .await;
 
-        assert_eq!(before.len(), 1);
-        assert_eq!(grown.len(), 2);
-        assert!(Arc::ptr_eq(&before, &after));
-        assert_eq!(after.len(), 1, "candidate growth must not change baseline");
+        assert_eq!(before.records.len(), 1);
+        assert_eq!(grown.records.len(), 2);
+        assert!(Arc::ptr_eq(&before.records, &after.records));
+        assert_eq!(
+            after.records.len(),
+            1,
+            "candidate growth must not change baseline"
+        );
+        assert_eq!(
+            before.universe, after.universe,
+            "an unchanged question keeps its universe fingerprint"
+        );
+        assert_ne!(
+            before.universe, grown.universe,
+            "a grown candidate universe must change the fingerprint"
+        );
     }
 
     #[test]

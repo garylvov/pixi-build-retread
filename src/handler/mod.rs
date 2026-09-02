@@ -8346,13 +8346,16 @@ impl CondaCoSolveContext {
 
     /// Attach the on-disk route-probe verdict memo for this bundle.
     ///
-    /// The validity key covers the candidate universe (channels +
-    /// repodata identity), the target (python + subdir) and the policy
-    /// inputs that can change a verdict. Changing any of them discards
-    /// every memoized verdict rather than replaying it.
+    /// The validity key covers the channel SET, the target (python +
+    /// subdir) and the policy inputs that can change a verdict. Changing
+    /// any of them discards every memoized verdict rather than replaying
+    /// it. The candidate universe is deliberately NOT here: it is keyed
+    /// per entry on the reachable records that entry's own solve consulted
+    /// (`crate::conda_solve::reachable_universe_digest_shared`), so a
+    /// re-fetched-but-unchanged repodata document, or an upload of a
+    /// package this question cannot reach, no longer discards the file.
     fn with_verdict_cache(mut self, cache_dir: &Path, subdir: &str) -> Self {
         let channels: Vec<String> = self.channels.iter().map(|c| c.to_string()).collect();
-        let repodata_identity = crate::repodata::repodata_identity(&self.channels, subdir);
         let policy_fields: Vec<(&str, Vec<String>)> = vec![
             (
                 "channel-priority",
@@ -8394,7 +8397,6 @@ impl CondaCoSolveContext {
         ];
         let key = crate::route_probe_cache::validity_key(
             &channels,
-            &repodata_identity,
             &self.python,
             subdir,
             &policy_fields,
@@ -8432,8 +8434,20 @@ impl CondaCoSolveContext {
             let _probe = self.probe_metrics.enter();
             return run().await;
         };
+        // The universe fingerprint comes from the SAME question-scoped
+        // reachable-record snapshot the probe itself will solve over, so
+        // this costs a snapshot lookup, not a repodata load. `None` means
+        // no repodata is available at all -- that verdict would be
+        // `Skipped`, which is never memoized, so probe uncached.
+        let Some(universe) =
+            crate::conda_solve::reachable_universe_digest_shared(&self.shared_solve, specs).await
+        else {
+            let _probe = self.probe_metrics.enter();
+            return run().await;
+        };
         let digest = crate::route_probe_cache::probe_digest(
             stage,
+            &universe,
             specs.iter().map(|spec| spec.to_string()),
         );
         if let Some(cached) = cache.lookup(&digest) {
