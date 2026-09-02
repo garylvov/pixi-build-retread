@@ -132,6 +132,38 @@ pub struct RetreadConfig {
     #[serde(default, rename = "retread-relax", alias = "relax")]
     pub relax: RelaxPolicy,
 
+    /// Root of a SHARED, content-addressed store of already-computed build
+    /// outputs, so a workspace staged at a new path can adopt a previously
+    /// computed `conda/outputs` result instead of recomputing it.
+    ///
+    /// Unset (the default) means the store does not exist and behaviour is
+    /// byte-for-byte what it was before the key was added. `pixi lock` in a
+    /// fresh workspace is dominated by `conda/outputs`, and the two memos that
+    /// already exist for it cannot help there: the in-process one dies with
+    /// the process, and the on-disk one is written under a `fasttmp`
+    /// job-scoped cache directory and keyed on the workspace manifest's mtime
+    /// plus the pack's absolute directory. This store is keyed on content
+    /// only — see `built_output_store` and
+    /// `handler::built_output_store_key_for_outputs`.
+    ///
+    /// ```toml
+    /// [build.config]
+    /// retread-built-output-store = "/shared/cache/retread/built-outputs"
+    /// ```
+    ///
+    /// TRADE, stated plainly: an entry freezes whatever resolution produced
+    /// it, including any exact pin the auto-route cascade chose from live
+    /// repodata. That is the same bargain a lock file makes, and it is why
+    /// this is opt-in rather than a default. The key folds the backend's own
+    /// version and git hash, so a backend change invalidates every entry.
+    #[serde(
+        default,
+        rename = "retread-built-output-store",
+        alias = "built-output-store",
+        alias = "built_output_store"
+    )]
+    pub built_output_store: Option<std::path::PathBuf>,
+
     /// Per-dependency overrides, applied after the relax policy. Map of
     /// PyPI name -> conda match-spec (e.g. `"*"`, `">=2.7"`).
     #[serde(default, rename = "retread-overrides", alias = "overrides")]

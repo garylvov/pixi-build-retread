@@ -4,6 +4,7 @@
 //! through the crate.
 
 pub mod audit;
+pub mod built_output_store;
 pub mod compat;
 pub mod concurrency;
 pub mod conda_solve;
