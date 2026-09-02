@@ -266,8 +266,13 @@ mod tests {
 
     #[test]
     fn scans_the_deception_fixture() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../tasks/retread-4-11/p4n-import-detect/artifacts/deception_fixture");
+        // The fixture lives IN the repo: a path reaching outside
+        // CARGO_MANIFEST_DIR binds the test to one checkout location and
+        // fails in every other worktree.
+        let root = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/import_scan/deception"
+        ));
         let hits = scan_imports(&root, &BTreeSet::from(["mypkg".to_owned()]));
 
         // Standard-library filtering is deliberately outside phase 1. This
