@@ -1822,10 +1822,154 @@ pub(crate) fn read_requires_dist(wheel_path: &Path) -> Result<Vec<String>> {
     out
 }
 
+/// A `Read + Seek` shim that produces the SHA-256 of the WHOLE file out of the
+/// reads the ZIP walk is already performing, so a strict validation costs ONE
+/// pass over the payload instead of two.
+///
+/// The hash must cover the file's bytes in order, but a ZIP reader does not
+/// visit them in order: `ZipArchive::new` reads the end-of-central-directory
+/// first, and each member read seeks to that member's local header. So the
+/// shim hashes only the CONTIGUOUS PREFIX it has seen -- a read is folded in
+/// exactly when it starts at or spans `hashed_upto` -- and [`Self::finish`]
+/// closes whatever prefix the walk left unhashed by reading from `hashed_upto`
+/// to EOF. That is correct for ANY access pattern (the digest is always over
+/// `[0, len)` in order); it is merely *cheap* for the pattern the ZIP walk
+/// actually has, where members are visited in offset order and only the
+/// central directory at the tail has to be re-read.
+///
+/// The ZIP walk leaves SMALL holes, and they have to be closed as they appear
+/// or the prefix never advances: `zip::read::find_content` seeks to the local
+/// header, parses its fixed 30-byte block, and then seeks straight to the data,
+/// skipping the entry's filename and extra field. That is a gap of tens of
+/// bytes per member. A read landing past `hashed_upto` therefore first pulls
+/// the skipped bytes in (bounded by [`MAX_GAP_FILL`], so a pathological archive
+/// degrades to the old two-pass cost instead of to something worse) and then
+/// hashes what it just read.
+///
+/// `total_read` counts every byte pulled from the file, which is what the
+/// single-pass guard asserts on: one pass means `total_read` stays within a
+/// hair of the file's length, not double it.
+struct HashingWheelReader {
+    inner: std::fs::File,
+    hasher: Sha256,
+    /// Current file offset.
+    pos: u64,
+    /// Length of the contiguous prefix already fed to `hasher`.
+    hashed_upto: u64,
+    /// Every byte read from the file, including the tail re-read in `finish`.
+    total_read: u64,
+}
+
+/// Largest hole the reader will close in-line. One local-header filename plus
+/// extra field is tens of bytes; the cap only exists so a strange archive can
+/// never turn one skipped region into a large out-of-band read.
+const MAX_GAP_FILL: u64 = 1 << 20;
+
+impl HashingWheelReader {
+    fn new(inner: std::fs::File) -> Self {
+        Self {
+            inner,
+            hasher: Sha256::new(),
+            pos: 0,
+            hashed_upto: 0,
+            total_read: 0,
+        }
+    }
+
+    /// Close a hole between the hashed prefix and `target` by reading the
+    /// skipped bytes, then put the file back where the caller left it.
+    /// Holes larger than [`MAX_GAP_FILL`] are left to [`Self::finish`].
+    fn fill_gap_to(&mut self, target: u64) -> std::io::Result<()> {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+
+        if self.hashed_upto >= target || target - self.hashed_upto > MAX_GAP_FILL {
+            return Ok(());
+        }
+        let resume = self.pos;
+        self.inner.seek(SeekFrom::Start(self.hashed_upto))?;
+        let mut buf = [0u8; 8192];
+        while self.hashed_upto < target {
+            let want = ((target - self.hashed_upto) as usize).min(buf.len());
+            self.inner.read_exact(&mut buf[..want])?;
+            self.hasher.update(&buf[..want]);
+            self.hashed_upto += want as u64;
+            self.total_read += want as u64;
+        }
+        self.inner.seek(SeekFrom::Start(resume))?;
+        Ok(())
+    }
+
+    /// Hash whatever the ZIP walk never reached, then finalize.
+    /// Returns `(sha256, bytes_hashed_in_the_walk, bytes_read_overall)`.
+    fn finish(mut self) -> std::io::Result<(String, u64, u64)> {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+
+        let inline = self.hashed_upto;
+        self.inner.seek(SeekFrom::Start(self.hashed_upto))?;
+        let mut buf = vec![0u8; 1 << 20];
+        loop {
+            let n = self.inner.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            self.hasher.update(&buf[..n]);
+            self.hashed_upto += n as u64;
+            self.total_read += n as u64;
+        }
+        Ok((
+            format!("{:x}", self.hasher.finalize()),
+            inline,
+            self.total_read,
+        ))
+    }
+}
+
+impl std::io::Read for HashingWheelReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        // Close the local-header hole (if any) before reading, so this read
+        // extends the hashed prefix instead of opening a second one.
+        if self.pos > self.hashed_upto {
+            self.fill_gap_to(self.pos)?;
+        }
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            let start = self.pos;
+            let end = start + n as u64;
+            // Fold in only the part that extends the contiguous prefix. Bytes
+            // before `hashed_upto` are already hashed; a read that starts
+            // beyond it leaves a gap that `finish` re-reads.
+            if self.hashed_upto >= start && self.hashed_upto < end {
+                let offset = (self.hashed_upto - start) as usize;
+                self.hasher.update(&buf[offset..n]);
+                self.hashed_upto = end;
+            }
+            self.pos = end;
+            self.total_read += n as u64;
+        }
+        Ok(n)
+    }
+}
+
+impl std::io::Seek for HashingWheelReader {
+    fn seek(&mut self, from: std::io::SeekFrom) -> std::io::Result<u64> {
+        use std::io::Seek as _;
+        self.pos = self.inner.seek(from)?;
+        Ok(self.pos)
+    }
+}
+
 /// Strict local-artifact boundary for source-built/path-source wheels.
 /// Besides hashing and parsing METADATA, this rejects symlinks/special files,
 /// requires exactly one root dist-info matching the wheel filename identity,
 /// and streams every ZIP member to EOF so CRC failures cannot enter a cache.
+///
+/// p6a: the SHA-256 comes out of the SAME pass that inflates the members --
+/// the ZIP reader runs on top of [`HashingWheelReader`] and the digest is
+/// handed to [`read_metadata_with_trusted_sha`]. Before p6a this function
+/// streamed every member to a sink and THEN called [`read_metadata`], which
+/// streamed the whole file again: two full passes over the payload in one
+/// call. The member walk, the identity checks and their error order are
+/// unchanged.
 pub(crate) fn read_metadata_strict(wheel_path: &Path) -> Result<WheelMetadata> {
     let file_type = std::fs::symlink_metadata(wheel_path)
         .with_context(|| format!("stating wheel {}", wheel_path.display()))?
@@ -1845,9 +1989,10 @@ pub(crate) fn read_metadata_strict(wheel_path: &Path) -> Result<WheelMetadata> {
         crate::pypi::wheel_filename_identity(&standard_filename)
             .ok_or_else(|| anyhow!("invalid PEP 427 wheel filename `{filename}`"))?;
 
+    let started = std::time::Instant::now();
     let file = std::fs::File::open(wheel_path)
         .with_context(|| format!("opening strict wheel ZIP {}", wheel_path.display()))?;
-    let mut archive = zip::ZipArchive::new(file)
+    let mut archive = zip::ZipArchive::new(HashingWheelReader::new(file))
         .with_context(|| format!("reading strict wheel ZIP {}", wheel_path.display()))?;
     let mut root_metadata = Vec::new();
     for index in 0..archive.len() {
@@ -1888,7 +2033,23 @@ pub(crate) fn read_metadata_strict(wheel_path: &Path) -> Result<WheelMetadata> {
             "wheel `{filename}` root dist-info `{dist_info}` does not match its filename identity"
         );
     }
-    read_metadata(wheel_path)
+    // The walk above already pulled the payload off disk; close the digest over
+    // whatever tail it did not reach (normally just the central directory) and
+    // hand the result to the parse. No second pass.
+    let (sha256, walk_hashed, total_read) = archive
+        .into_inner()
+        .finish()
+        .with_context(|| format!("hashing strict wheel ZIP {}", wheel_path.display()))?;
+    note_full_hash(wheel_path, total_read, "wheel::read_metadata_strict");
+    tracing::info!(
+        wheel = %wheel_path.display(),
+        bytes = std::fs::metadata(wheel_path).map(|m| m.len()).unwrap_or(0),
+        bytes_read = total_read,
+        hashed_in_walk = walk_hashed,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "bench: wheel_read_metadata_strict",
+    );
+    read_metadata_with_trusted_sha(wheel_path, sha256, "streamed")
 }
 
 fn read_metadata_with_sha(wheel_path: &Path, sha256: String) -> Result<WheelMetadata> {
@@ -3862,6 +4023,96 @@ mod tests {
         let metadata = read_metadata_strict(&path).unwrap();
         assert_eq!(metadata.name, "foo");
         assert_eq!(metadata.version, "1.0");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// p6a guard: a strict read streams the wheel's bytes EXACTLY ONCE.
+    ///
+    /// Before p6a `read_metadata_strict` inflated every member to a sink and
+    /// THEN called `read_metadata`, which streamed the whole file again
+    /// through SHA-256 -- two full passes over the payload in one call. The
+    /// probe is path-keyed, so this test only sees its own fixture no matter
+    /// what runs beside it. Falsifiability: put `read_metadata(wheel_path)`
+    /// back as the last statement of `read_metadata_strict` and this test
+    /// reports 2 passes and fails.
+    #[test]
+    fn strict_metadata_streams_the_payload_exactly_once() {
+        use std::io::Write as _;
+
+        let needle = format!(
+            "retread-strict-single-pass-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        );
+        let tmp = std::env::temp_dir().join(&needle);
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("foo-1.0-py3-none-any.whl");
+
+        // Stored (uncompressed) members of pseudo-random bytes, so the file's
+        // length IS its payload and a second pass is unmissable in the count.
+        let file = std::fs::File::create(&path).unwrap();
+        let mut archive = zip::ZipWriter::new(file);
+        let options: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        archive
+            .start_file("foo-1.0.dist-info/METADATA", options)
+            .unwrap();
+        archive
+            .write_all(
+                b"Metadata-Version: 2.1\nName: foo\nVersion: 1.0\nRequires-Dist: bar>=2\n\n",
+            )
+            .unwrap();
+        let mut state: u32 = 0x9e37_79b9;
+        let mut payload = vec![0u8; 1 << 20];
+        for member in 0..3 {
+            for byte in payload.iter_mut() {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *byte = (state >> 24) as u8;
+            }
+            archive
+                .start_file(format!("payload-{member}.bin"), options)
+                .unwrap();
+            archive.write_all(&payload).unwrap();
+        }
+        archive.finish().unwrap();
+
+        let len = std::fs::metadata(&path).unwrap().len();
+        let expected_sha = hex_sha256(&std::fs::read(&path).unwrap());
+
+        let metadata = read_metadata_strict(&path).unwrap();
+        let records = full_hash_probe::hashes_for(&needle);
+        let read_bytes: u64 = records.iter().map(|(_, bytes, _)| *bytes).sum();
+        println!(
+            "p6a: strict read of a {len}-byte wheel pulled {read_bytes} bytes in \
+             {} recorded pass(es) ({:.2}x the file); sites={:?}",
+            records.len(),
+            read_bytes as f64 / len as f64,
+            records
+                .iter()
+                .map(|(_, _, site)| *site)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            records.len(),
+            1,
+            "strict validation must stream the payload once, got {records:?}",
+        );
+        assert_eq!(records[0].2, "wheel::read_metadata_strict");
+        assert!(
+            read_bytes >= len && read_bytes < len + len / 2,
+            "one pass means ~{len} bytes read, got {read_bytes}",
+        );
+
+        // Single-pass or not, the answer is the two-pass answer.
+        assert_eq!(metadata.sha256, expected_sha);
+        let reference = read_metadata(&path).unwrap();
+        assert_eq!(metadata.sha256, reference.sha256);
+        assert_eq!(metadata.name, reference.name);
+        assert_eq!(metadata.version, reference.version);
+        assert_eq!(metadata.requires_dist, reference.requires_dist);
+        assert_eq!(metadata.is_pure_python, reference.is_pure_python);
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
