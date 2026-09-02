@@ -10372,12 +10372,22 @@ fn store_key_for(
     source_dir: &std::path::Path,
 ) -> String {
     let target = ResolutionTarget::for_subdir("3.11", "linux-64");
+    // Production's workspace solve fingerprint carries ABSOLUTE paths:
+    // `coactivated_sibling_packs` canonicalizes every sibling pack directory
+    // and `workspace_solve_fingerprint` folds the result in. Reproduce that
+    // here, or the path redaction the key depends on is never exercised and
+    // the guard would pass for the wrong reason.
+    let solve_fingerprint = format!(
+        "co-activated-sibling:{}/packs/two/retread-linux-64-py3.11.lock\nsource:{}",
+        workspace_dir.display(),
+        source_dir.display(),
+    );
     built_output_store_key_for_outputs(
         &store_key_params(),
         "none",
         &target,
         None,
-        "",
+        &solve_fingerprint,
         Some(workspace_dir),
         source_dir,
     )
