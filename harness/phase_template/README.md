@@ -528,15 +528,18 @@ cache's own buckets show the shape plainly — `archive-v0` 4 796 entries,
 
 * `phaseN_relock.sh` keeps `UV_LINK_MODE=copy`, hard, with the reason in the
   line above it. That phase builds, concurrently; it is the phase `5547450` was.
-* `phaseN_cert.sh` gets **`CERT_UV_LINK_MODE`** (`copy` default | `hardlink`),
+* `phaseN_cert.sh` gets **`CERT_UV_LINK_MODE`** (`hardlink` default since the
+  N=1 corner landed, below | `copy`),
   exported AFTER `retread_fast_env` and printed twice — once where it is decided
   and once at the point of use, in the `### env loop:` line — because a knob
   exported before the fast env would be a silent no-op. The loop then greps
   every install log for `failed to hardlink|EXDEV|Text file busy|builds-v0` and
   says so out loud either way, and totals the installs' `File system outputs`.
   Guard: `link_mode_guard.sh`, which drives the REAL template to `DRY_RUN=1`
-  three times (hardlink survives a copy-setting fast env; default is copy;
-  `symlink` refuses with exit 2). Falsified twice by mutation when it landed.
+  four times (hardlink survives a copy-setting fast env; the SHIPPED default
+  line -- no substitution -- is hardlink; `copy` is still reachable; `symlink`
+  refuses with exit 2). Falsified by mutation each time it changed: setting the
+  default back to `copy` fails case B while case D still passes.
 
 ### What `hardlink` measured under fan-out (job `5685816`, 2026-09-03)
 
@@ -561,18 +564,77 @@ the `5597694` serial key — `pm-isaaclab` `RED-verify` vs `AMBER-repaired` — 
 is the staged-vs-relocked pack-ownership residue the attribution lane isolated,
 reproduces at `CERT_PARALLEL=1`, and has nothing to do with the link mode.
 
-**The default is still `copy`, deliberately.** The bar for flipping it was a
-clean pair of gates AND an order-of-magnitude drop in writes. The gates are
-cleaner than asked; the writes dropped 2.35×, because the single-env test that
-predicted 31.5× measured only ONE pypi-heavy env's install bytes, and a cert also
-writes conda extractions, 14 pack builds and their replayed payloads, which no
-link mode touches. Two envs also got ~2× SLOWER (`pace` 1 290 s → 2 734 s,
-`groot-sonic-gpu` 1 779 s → 3 440 s) with no named cause, `pace` being the very
-env the concurrency-1 test was built on. And hardlinking couples every env prefix
-to the SHARED persistent uv cache: uv installs by unlink-and-create so uv cannot
-corrupt it, but any writer that rewrites a prefix file IN PLACE would write
-through into the cache every later job reads.
+### The N=1 corner, and why it flipped the default (2026-09-03, C7 closeout)
 
-To flip the default, bring: the hardlink `CERT_PARALLEL=1` corner (job `5685818`,
-queued), a named cause for the two slow envs, and a check that no cache inode's
-content changed across a cert.
+The three objections above were the flip conditions. Job `5685818` (hardlink,
+`CERT_PARALLEL=1`) answered all three, and the first one turned out to be the
+opposite of what it looked like.
+
+**The two "unexplained slow envs" were WIDTH, not link mode.** `5685818` ran
+alongside `5674559` (copy, `CERT_PARALLEL=1`) on the SAME node, the same day,
+against the same persistent cache, in the same dispatch order — so on the envs
+both have scored, the link mode is the only difference:
+
+| env | hardlink N=1 | copy N=1 | wall | hardlink GB | copy GB | bytes |
+|---|---|---|---|---|---|---|
+| `isaaclab-gpu-latest` | 3 842 s | 5 569 s | 0.69x | 26.93 | 48.34 | 0.56x |
+| `pm-isaaclab` | 1 199 s | 3 255 s | 0.37x | 23.49 | 13.49 | 1.74x |
+| `unitree-rl-lab-gpu` | 618 s | 1 105 s | 0.56x | 1.18 | 12.90 | 0.09x |
+| `hover-gpu` | 1 350 s | 1 655 s | 0.82x | 24.01 | 24.35 | 0.99x |
+| `groot-sonic-gpu` | **1 424 s** | 1 529 s | 0.93x | 3.40 | 14.79 | 0.23x |
+| `pace` | **553 s** | 1 216 s | 0.45x | 0.78 | 12.59 | 0.06x |
+| **6 envs** | **8 986 s** | **14 329 s** | **0.63x** | **79.79** | **126.46** | **0.63x** |
+
+`pace` and `groot-sonic-gpu` are the two envs the fan-out run accused. At N=1
+they are the FASTEST of all four corners — `pace` 553 s against 1 216 s (copy
+N=1, same node/day), 1 290 s (copy N=4) and 2 734 s (hardlink N=4);
+`groot-sonic-gpu` 1 424 s against 1 529 / 1 779 / 3 440. Nothing about the link
+mode slowed them down; running four installs into one write path did.
+
+That also rehabilitates the single-env test. It measured `pace` at concurrency 1
+and got 397 s / 0.75 GB against copy's 1 062 s / 23.78 GB; the N=1 corner
+reproduces it almost exactly (553 s / 0.78 GB). The test was never wrong — it
+was **width-specific**, and quoting it at N=4 was the error. Hardlink converts an
+install from a write into a refcount bump, so it gives back the most when it is
+alone on the write path and the least against the N=4 bandwidth ceiling.
+
+The one row that does not fit: `pm-isaaclab` wrote MORE under hardlink (23.49 GB
+vs 13.49) while running 2.7x faster. Unexplained, and named here rather than
+smoothed over.
+
+**Gates at N=1 are clean.** Every env `5685818` has scored is identical to copy
+at the same width on the same node the same day — `cert_verdict.sh` over the
+common rows: **0 differing, EXIT 0** — and identical to hardlink at N=4 on the
+same rows (**0 differing, EXIT 0**). `install_rc=0` throughout, and the race scan
+over every install log at BOTH widths finds zero `hardlink|EXDEV|Text file
+busy|Stale file handle|No such file` lines. The only `OUTCOME_DIFF` any corner
+scores against the campaign baseline is the one `pm-isaaclab` pack-ownership
+residue, which reproduces at `CERT_PARALLEL=1` under copy as well.
+
+**The shared-cache coupling was censused, not argued.** Of 13 920 files in 60
+`archive-v0` entries that pre-date the hardlink certs, the number whose CONTENT
+changed is **0**. 12 557 had a ctime bump — that is the link/unlink refcount
+churn — and every one is back at `st_nlink=1` now the prefixes are reclaimed.
+The entry count went 4 796 -> 8 222 by ADDING entries; none were rewritten. uv
+installs by unlink-and-create so uv itself cannot write through. A writer that
+rewrote a prefix file IN PLACE still could, so re-run that census if one appears.
+
+### The four corners, and what ships
+
+| | copy | hardlink |
+|---|---|---|
+| **N=1** | `5597694` 20 477 s walls / 307.3 GB / 1.48 GB RSS; `5674559` today | `5685818` **0.63x wall and 0.63x bytes** of copy N=1 on shared envs |
+| **N=4** | `5658928` span 13 111 s / walls 46 233 s / 302 GB / 1.25 GB RSS | `5685816` span **9 057 s** / walls 32 421 s / **128 GB** / 0.97 GB RSS |
+
+Two independent levers, and **both ship**:
+
+* **`CERT_UV_LINK_MODE=hardlink`** — it wins at BOTH widths (0.63x wall at N=1,
+  0.69x span at N=4), the gates are identical to copy at both, and the byte drop
+  is 2.35x at N=4 and 1.6x at N=1. Well clear of the 527 s noise floor: 5 343 s
+  saved on six envs at N=1, 4 054 s of span at N=4.
+* **`CERT_PARALLEL=4`** — width is still worth more than the link mode. Hardlink
+  at N=1 spent **11 144 s on 6 of 26 envs**, where hardlink at N=4 finished all
+  26 inside a **9 057 s** span. N=4 already wins by >2 000 s with 20 envs still
+  to run, four times the noise floor. Take both levers; they do not overlap.
+
+The relock keeps `copy`, unchanged: the split is by phase, and that phase builds.

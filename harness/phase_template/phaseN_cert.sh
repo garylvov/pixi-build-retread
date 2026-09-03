@@ -55,8 +55,11 @@
 #      like. Quote 3h38m of env loop instead of 5h41m, never "4x". The real
 #      lever is UV_LINK_MODE, not width: on env `pace` with a warm uv cache,
 #      copy = 1,062s / 23.78 GB written and hardlink = 397s / 0.75 GB (2.68x,
-#      31.5x). The default here stays `copy` until that is re-measured under
-#      fan-out; see README.md.
+#      31.5x). Re-measured under fan-out 2026-09-03 and shipped: the link mode
+#      now defaults to `hardlink` (see the CERT_UV_LINK_MODE block below), and
+#      the WIDTH stays 4 -- hardlink at N=1 (job 5685818) spent 11,144s on 6 of
+#      26 envs, where hardlink at N=4 (job 5685816) finished all 26 in a 9,057s
+#      span. Width and link mode are separate wins; take both. See README.md.
 #      Correctness at N=4 is CLEARED: the single row that diverged in 5658928
 #      (pm-isaaclab RED-verify vs AMBER-repaired) reproduces at CERT_PARALLEL=1
 #      under BOTH cache sitings (jobs 5674557, 5674558), so the fan-out is not
@@ -79,8 +82,10 @@
 #                           Giving each env its own package cache would multiply
 #                           108 GB of reads and 318 GB of writes by N and blow
 #                           the inode quota, so they stay shared and the
-#                           concurrency safety is: UV_LINK_MODE=copy (set below;
-#                           the 5547450 NFS hardlink race), pixi's own
+#                           concurrency safety is: CERT_UV_LINK_MODE (set below
+#                           -- `hardlink` by default since 2026-09-03; 5547450
+#                           was a BUILD race, and this phase builds nothing,
+#                           which the block below shows), pixi's own
 #                           multi-env installs already share one cache inside a
 #                           single process, and the backend carries guard tests
 #                           for exactly this (`built_output_store::tests::
@@ -175,10 +180,10 @@ ros2-jazzy-cpu isaaclab-gpu-latest newton-gpu pm-isaaclab pm-mujoco pace"
 CERT_PARALLEL=${CERT_PARALLEL:-4}
 
 # --- how uv puts wheels into the env prefixes -------------------------------
-# CERT_UV_LINK_MODE  copy (default) | hardlink. This is exported AFTER
+# CERT_UV_LINK_MODE  hardlink (default) | copy. This is exported AFTER
 #                 retread_fast_env, which sets UV_LINK_MODE=copy and used to be
 #                 the last word on it, so an A/B needs no edit:
-#                   CERT_UV_LINK_MODE=hardlink ./<harness>.sh
+#                   CERT_UV_LINK_MODE=copy ./<harness>.sh
 #
 # WHAT `copy` IS INSURANCE AGAINST, precisely. Job 5547450 died on
 # "failed to hardlink file from <uv cache>/builds-v0/.tmp4QiHoL/lib/python3.11/
@@ -201,14 +206,29 @@ CERT_PARALLEL=${CERT_PARALLEL:-4}
 #   `pace` prefix 156,275 of 161,609 files at st_nlink>1 (it really hardlinked),
 #   ZERO hardlink/EXDEV/busy/builds-v0 lines in all 26 install logs, and
 #   cert_verdict.sh scores the two runs IDENTICAL: 26 rows, 0 differing, EXIT 0.
-# The default is STILL `copy`, on purpose: the win is 2.35x on bytes, not the
-# order of magnitude the single-env test predicted; two envs got ~2x SLOWER
-# (`pace` 1,290s -> 2,734s, `groot-sonic-gpu` 1,779s -> 3,440s) with no named
-# cause; the hardlink N=1 corner is still unmeasured; and hardlinking couples
-# every env prefix to the SHARED persistent uv cache, so any writer that
-# rewrites a prefix file IN PLACE would write through into the cache every
-# future job reads. Flip it per-run until those are answered. See README.md.
-CERT_UV_LINK_MODE=${CERT_UV_LINK_MODE:-copy}
+# The default is `hardlink` as of 2026-09-03 (C7 closeout), because the three
+# things held against it were then measured and none survived:
+#   * "two envs got ~2x SLOWER under hardlink" -- they did not. That was WIDTH,
+#     not link mode. At CERT_PARALLEL=1 with hardlink (job 5685818) the two
+#     accused envs are the FASTEST of all four corners: `pace` 553s (copy N=1
+#     1,216s same node/day, copy N=4 1,290s, hardlink N=4 2,734s) and
+#     `groot-sonic-gpu` 1,424s (1,529s / 1,779s / 3,440s). Hardlink turns an
+#     install from a write into a refcount bump, so it gives back the most where
+#     it is alone on the write path and the least at the N=4 bandwidth ceiling.
+#   * "the hardlink N=1 corner is unmeasured" -- it is measured now. Every env
+#     it has scored is IDENTICAL to copy at the same width on the same node the
+#     same day (cert_verdict.sh, 0 differing), install_rc=0 throughout, and zero
+#     hardlink/EXDEV/busy/builds-v0 lines in any install log at either width.
+#   * "hardlinking couples every prefix to the SHARED persistent uv cache" -- it
+#     does, and the coupling was checked rather than argued. Across the hardlink
+#     certs, of 13,920 files in 60 archive-v0 entries that pre-date them, the
+#     number whose CONTENT changed is 0; 12,557 had a ctime bump, which is the
+#     link/unlink refcount churn, and every one is back at st_nlink=1 after the
+#     prefixes were reclaimed. uv installs by unlink-and-create, so uv itself
+#     cannot write through; a writer that rewrote a prefix file IN PLACE still
+#     could, which is why that census is worth re-running when one appears.
+# Use `copy` for a phase that BUILDS. This one does not -- see above.
+CERT_UV_LINK_MODE=${CERT_UV_LINK_MODE:-hardlink}
 CERT_WALL_TABLE=                             # e.g. $T/<lastgreen>/artifacts/memory_ledger.<job>.tsv
 
 # --- optional SECOND verdict gate --------------------------------------------

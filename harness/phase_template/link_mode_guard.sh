@@ -11,15 +11,19 @@
 #      faithfully copy-setting) fast env ran in between.
 #   2. REFUSAL. An unrecognised mode must stop the run with a named reason, not
 #      hand uv a garbage link mode.
+#   3. THE SHIPPED DEFAULT. Case B drives the CERT_UV_LINK_MODE line exactly as
+#      it ships (no substitution), so flipping the default without meaning to is
+#      a guard failure rather than a silent change of what every cert does.
 #
 # It drives the REAL phaseN_cert.sh through a derivation, like a phase harness is
 # derived, and stops at DRY_RUN=1 -- after the env block, the fast env and the
 # link-mode decision, before any install. Nothing is submitted and nothing
 # outside the guard's own temp dir is written.
 #
-# Falsification (both checked by hand when this landed): move the knob's export
-# ABOVE the `. "$FAST_ENV"` line and case A fails with copy; delete the `case`
-# and case C exits 0 instead of 2.
+# Falsification (checked by hand): move the knob's export ABOVE the
+# `. "$FAST_ENV"` line and case A fails with copy; delete the `case` and case C
+# exits 0 instead of 2; set the shipped default back to `copy` and case B fails
+# while case D still passes.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
@@ -57,7 +61,7 @@ derive() { # dst mode
       -e "s|^FAST_ENV=.*|FAST_ENV=$W/fastenv.sh|" \
       -e "s|^\[ -f \"\$FAST_ENV\" \].*||" \
       -e "s|^C=/oscar.*|C=$W/c|" \
-      -e "s|^CERT_UV_LINK_MODE=.*|CERT_UV_LINK_MODE=$2|" "$HERE/phaseN_cert.sh" > "$1"
+      ${2:+-e "s|^CERT_UV_LINK_MODE=.*|CERT_UV_LINK_MODE=$2|"} "$HERE/phaseN_cert.sh" > "$1"
   bash -n "$1" || { say "  FAIL  $1 does not parse"; FAIL=1; }
 }
 
@@ -68,10 +72,17 @@ derive "$W/a.sh" hardlink; RC=$(run "$W/a.sh" "$W/a.log")
 if [ "$RC" = 0 ] && grep -q '^### link mode AT THE POINT OF USE: UV_LINK_MODE=hardlink ' "$W/a.log"; then say "  PASS  (rc=$RC)"
 else say "  FAIL  want rc=0 and the point-of-use line saying hardlink; got rc=$RC"; grep -n 'UV_LINK_MODE\|FATAL' "$W/a.log" | head; FAIL=1; fi
 
-say "== B. the default is copy, and it is still copy after the fast env =="
-derive "$W/b.sh" '${CERT_UV_LINK_MODE:-copy}'; RC=$(run "$W/b.sh" "$W/b.log")
-if [ "$RC" = 0 ] && grep -q '^### link mode AT THE POINT OF USE: UV_LINK_MODE=copy ' "$W/b.log"; then say "  PASS  (rc=$RC)"
-else say "  FAIL  want rc=0 and the point-of-use line saying copy; got rc=$RC"; grep -n 'UV_LINK_MODE\|FATAL' "$W/b.log" | head; FAIL=1; fi
+say "== B. the SHIPPED default is hardlink, and survives the fast env =="
+# NOTE: no substitution -- this drives the real CERT_UV_LINK_MODE line as it
+# ships, so the guard fails if someone edits the default without meaning to.
+derive "$W/b.sh" ""; RC=$(run "$W/b.sh" "$W/b.log")
+if [ "$RC" = 0 ] && grep -q '^### link mode AT THE POINT OF USE: UV_LINK_MODE=hardlink ' "$W/b.log"; then say "  PASS  (rc=$RC)"
+else say "  FAIL  want rc=0 and the point-of-use line saying hardlink; got rc=$RC"; grep -n 'UV_LINK_MODE\|FATAL' "$W/b.log" | head; FAIL=1; fi
+
+say "== D. copy is still reachable, so the escape hatch has a live reader =="
+derive "$W/d.sh" copy; RC=$(run "$W/d.sh" "$W/d.log")
+if [ "$RC" = 0 ] && grep -q '^### link mode AT THE POINT OF USE: UV_LINK_MODE=copy ' "$W/d.log"; then say "  PASS  (rc=$RC)"
+else say "  FAIL  want rc=0 and the point-of-use line saying copy; got rc=$RC"; grep -n 'UV_LINK_MODE\|FATAL' "$W/d.log" | head; FAIL=1; fi
 
 say "== C. an unrecognised mode refuses, naming it =="
 derive "$W/c.sh" symlink; RC=$(run "$W/c.sh" "$W/c.log")

@@ -19,12 +19,12 @@ c9302fafd5ee1123a695bfef4dfcaf72  inode-cleanup/install_v2.sbatch
 3d87f9e032fccf45383c9e7aa21211b9  instrumented/p6b_relock.b2.sh
 3d70e31e815daff7b8a42895fad59991  instrumented/p6b_relock.sh
 a2deab8ba099cc7a3055dc5e4f74da50  instrumented/p6b_stamp.py
-a307a1743431d504d2463360211570dc  phase_template/README.md
+4914b2fd84c8b0c890cf557691431e93  phase_template/README.md
 ed155bdac121e36e9776d93491a333db  phase_template/cleanup.sh
 883d517a614357c59a463f8cdbd9ba4d  phase_template/expect_sha_gate_guard.sh
 992d975ad816f4b4b82a7056df2fa255  phase_template/leftover_check_guard.sh
-93eba0f188d2055c75d015ced1b02058  phase_template/link_mode_guard.sh
-c53a658c58339d1fda810f60617f5b68  phase_template/phaseN_cert.sh
+063ba387f091f6c66eb73ccdc632c70d  phase_template/link_mode_guard.sh
+50797da9abaa95f77c5dedb3c469be56  phase_template/phaseN_cert.sh
 aec4f6b3e62b36c76f7205eefef3f4b5  phase_template/phaseN_relock.sh
 93dc3ef4f3fc859f8b81cb4d9de90216  proof/hlgd_relock.sh
 34f54e4d6fb24b3cc7b390669ce90993  tools/b2_attribute.sh
