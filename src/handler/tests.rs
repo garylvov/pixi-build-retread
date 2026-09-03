@@ -10616,6 +10616,44 @@ fn store_key_for(
     source_dir: &std::path::Path,
     effective: &RetreadConfig,
 ) -> String {
+    store_key_full(workspace_dir, source_dir, effective).key
+}
+
+/// The absolute-path-carrying solve fingerprint production produces, restated
+/// so the key's path redaction is actually exercised.
+fn store_key_solve_fingerprint(
+    workspace_dir: &std::path::Path,
+    source_dir: &std::path::Path,
+) -> String {
+    format!(
+        "co-activated-sibling:{}/packs/two/retread-linux-64-py3.11.lock\nsource:{}",
+        workspace_dir.display(),
+        source_dir.display(),
+    )
+}
+
+fn store_key_material_for(
+    workspace_dir: &std::path::Path,
+    source_dir: &std::path::Path,
+    effective: &RetreadConfig,
+) -> Vec<String> {
+    built_output_store_key_material(
+        &store_key_params(),
+        "none",
+        &ResolutionTarget::for_subdir("3.11", "linux-64"),
+        None,
+        &store_key_solve_fingerprint(workspace_dir, source_dir),
+        Some(workspace_dir),
+        source_dir,
+        effective,
+    )
+}
+
+fn store_key_full(
+    workspace_dir: &std::path::Path,
+    source_dir: &std::path::Path,
+    effective: &RetreadConfig,
+) -> BuiltOutputStoreKey {
     let target = ResolutionTarget::for_subdir("3.11", "linux-64");
     // Production's workspace solve fingerprint carries ABSOLUTE paths:
     // `coactivated_sibling_packs` canonicalizes every sibling pack directory
@@ -10712,13 +10750,14 @@ fn built_output_store_key_is_workspace_path_and_mtime_free() {
         "two sibling packs in one workspace must not share a store key"
     );
 
-    // The backend's own identity is in the key, so a backend change
-    // invalidates every entry rather than serving a stale render.
-    let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
-    sha2::Digest::update(&mut hasher, backend_build_identity().as_bytes());
+    // C11: the backend's BEHAVIOUR identity is in the key -- not its build
+    // identity. The git-hash-freeness of the key is guarded separately in
+    // `c11_the_store_key_carries_no_backend_git_hash`; here we only state that
+    // the behaviour identity is non-empty, since an empty one would make the
+    // component vacuous.
     assert!(
-        !backend_build_identity().is_empty(),
-        "backend build identity must be non-empty for the key to carry it"
+        !backend_behaviour_identity().is_empty(),
+        "backend behaviour identity must be non-empty for the key to carry it"
     );
 
     for dir in [ws_a, ws_b, ws_c, ws_d, ws_e] {
@@ -10746,34 +10785,43 @@ async fn built_output_store_hit_serves_the_same_result_a_cold_compute_produced()
 
     // Job 1: a cold compute in workspace A publishes its result.
     let (ws_a, pack_a) = stage_store_key_workspace("hit-a", WS_MANIFEST, PACK_MANIFEST, "packs/one");
-    let key_a = store_key_for(&ws_a, &pack_a, &cfg());
+    let key_a = store_key_full(&ws_a, &pack_a, &cfg());
     let result = CondaOutputsResult {
         outputs: Default::default(),
         input_globs: Default::default(),
     };
-    let payload = serde_json::to_vec(&result).unwrap();
+    let payload =
+        crate::built_output_store::encode(&key_a.inputs_digest, backend_build_identity(), &result)
+            .unwrap();
     assert_eq!(
-        store.get(&key_a).0,
+        store.get(&key_a.key).0,
         crate::built_output_store::Lookup::Miss,
         "the first job must miss"
     );
-    assert!(store.publish(&key_a, &payload).unwrap());
+    assert!(store.publish(&key_a.key, &payload).unwrap());
 
     // Job 2: a FRESH workspace at a different path, the case that measured as
     // a full cold relock today. It must hit, and adopt the identical result.
     std::thread::sleep(std::time::Duration::from_millis(20));
     let (ws_b, pack_b) = stage_store_key_workspace("hit-b", WS_MANIFEST, PACK_MANIFEST, "packs/one");
-    let key_b = store_key_for(&ws_b, &pack_b, &cfg());
-    let (lookup, bytes) = store.get(&key_b);
+    let key_b = store_key_full(&ws_b, &pack_b, &cfg());
+    let (lookup, bytes) = store.get(&key_b.key);
     assert_eq!(
         lookup,
         crate::built_output_store::Lookup::Hit,
         "a fresh workspace with identical content must hit the shared store"
     );
-    let adopted: CondaOutputsResult = serde_json::from_slice(&bytes.unwrap()).unwrap();
+    let value = crate::built_output_store::decode(&bytes.unwrap(), &key_b.inputs_digest)
+        .expect("a record this backend wrote must be accepted by this backend");
+    let adopted: CondaOutputsResult = serde_json::from_value(value).unwrap();
     assert_eq!(adopted.outputs.len(), result.outputs.len());
     assert_eq!(
-        serde_json::to_vec(&adopted).unwrap(),
+        crate::built_output_store::encode(
+            &key_b.inputs_digest,
+            backend_build_identity(),
+            &adopted
+        )
+        .unwrap(),
         payload,
         "the adopted result must be byte-identical to what the cold compute published"
     );
@@ -10799,6 +10847,176 @@ async fn built_output_store_hit_serves_the_same_result_a_cold_compute_produced()
     for dir in [store_root, ws_a, ws_b] {
         let _ = std::fs::remove_dir_all(dir);
     }
+}
+
+// -----------------------------------------------------------------
+// C11: the shared built-output store is keyed on BEHAVIOUR, not on the
+// backend's git hash.
+//
+// Measured on two consecutive canonical 27-environment relocks (`me1b-relock`
+// 5719937 and `mf1-relock` 5723776): `built_output_store miss=14 hit=0` on
+// both, with 139 warm entries in the shared root that no run could reach,
+// because `backend_build_identity()` = CARGO_PKG_VERSION + RETREAD_GIT_HASH
+// was folded into the key TWICE -- once directly and once inside the restated
+// memo key -- so every rebuild re-addressed the whole store.
+//
+// The property the hash was buying is stated in the key's own doc comment: a
+// backend change must make old entries "unreachable rather than misreadable".
+// C11 keeps the second half and drops the first: the key folds
+// `backend_behaviour_identity()`, and the RECORD carries the schema, the
+// emission schema and the full input digest, all re-checked on read.
+// -----------------------------------------------------------------
+
+/// Guard (a): same inputs, a different backend GIT HASH -> the same address.
+///
+/// The git hash is a compile-time constant, so this cannot vary it; it states
+/// the stronger structural fact instead -- the hash's VALUE appears nowhere in
+/// the material the key is hashed from, so no build of any commit can move the
+/// address. RED on the pre-C11 tip, where the value is present twice.
+#[test]
+fn c11_the_store_key_carries_no_backend_git_hash() {
+    const WS_MANIFEST: &str = "[workspace]\nname = \"c11\"\n";
+    const PACK_MANIFEST: &str = "[package]\nname = \"c11-pack\"\n";
+    let (ws, pack) = stage_store_key_workspace("c11-a", WS_MANIFEST, PACK_MANIFEST, "packs/one");
+
+    let material = store_key_material_for(&ws, &pack, &cfg());
+
+    // NON-VACUITY: the hash must be a real, findable string, or "it is absent"
+    // is trivially true.
+    let git_hash = env!("RETREAD_GIT_HASH");
+    assert!(
+        !git_hash.is_empty() && git_hash != "unknown",
+        "this build has no usable git hash (`{git_hash}`), so this guard cannot fail; \
+         build from a git checkout"
+    );
+    assert!(
+        backend_build_identity().contains(git_hash),
+        "the memo key's identity must still carry the git hash: `{}`",
+        backend_build_identity()
+    );
+
+    for (index, part) in material.iter().enumerate() {
+        assert!(
+            !part.contains(git_hash),
+            "store key material[{index}] carries the backend git hash `{git_hash}`, so every \
+             rebuild re-addresses the whole store: `{part}`"
+        );
+    }
+
+    // And the thing that replaced it is present, in full.
+    let behaviour = backend_behaviour_identity();
+    assert!(
+        material.contains(&behaviour),
+        "the store key material must carry the behaviour identity `{behaviour}`: {material:?}"
+    );
+    assert!(
+        behaviour.contains(env!("CARGO_PKG_VERSION"))
+            && behaviour.contains(crate::built_output_store::BUILT_OUTPUT_SCHEMA)
+            && behaviour.contains(crate::uv_closure::REQUIRED_UV),
+        "the behaviour identity must carry the crate version, the emission schema and the \
+         pinned uv version: `{behaviour}`"
+    );
+
+    // The address is the truncation of the digest the record carries, so the
+    // record's check is genuinely independent of the directory name.
+    let key = store_key_full(&ws, &pack, &cfg());
+    assert_eq!(key.inputs_digest.len(), 64);
+    assert_eq!(key.key.len(), 32);
+    assert!(key.inputs_digest.starts_with(&key.key));
+
+    let _ = std::fs::remove_dir_all(ws);
+}
+
+/// Guard (b): ANY input digest component moves the address.
+///
+/// Perturbs each component of the real material and re-addresses through the
+/// same `built_output_store_key_from_material` production uses, so a component
+/// that stopped being hashed fails here instead of passing against a local
+/// copy of the hash.
+#[test]
+fn c11_every_key_material_component_moves_the_address() {
+    const WS_MANIFEST: &str = "[workspace]\nname = \"c11b\"\n";
+    const PACK_MANIFEST: &str = "[package]\nname = \"c11b-pack\"\n";
+    let (ws, pack) = stage_store_key_workspace("c11-b", WS_MANIFEST, PACK_MANIFEST, "packs/one");
+
+    let material = store_key_material_for(&ws, &pack, &cfg());
+    let base = built_output_store_key_from_material(&material);
+    assert_eq!(
+        base,
+        store_key_full(&ws, &pack, &cfg()),
+        "the material path and the production key path must agree exactly"
+    );
+    assert!(
+        material.len() >= 7,
+        "the key must still hash every declared component, got {material:?}"
+    );
+
+    for index in 0..material.len() {
+        let mut perturbed = material.clone();
+        perturbed[index] = format!("{}~c11", perturbed[index]);
+        let moved = built_output_store_key_from_material(&perturbed);
+        assert_ne!(
+            base.key, moved.key,
+            "component {index} (`{}`) does not reach the store address",
+            material[index]
+        );
+        assert_ne!(
+            base.inputs_digest, moved.inputs_digest,
+            "component {index} does not reach the record's input digest"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(ws);
+}
+
+/// Guard (c): a bump of the hand-maintained emission-schema constant is a
+/// MISS, on both halves -- a new address AND a refusal of any record found at
+/// the old one.
+#[test]
+fn c11_an_emission_schema_bump_is_a_miss() {
+    const WS_MANIFEST: &str = "[workspace]\nname = \"c11c\"\n";
+    const PACK_MANIFEST: &str = "[package]\nname = \"c11c-pack\"\n";
+    let (ws, pack) = stage_store_key_workspace("c11-c", WS_MANIFEST, PACK_MANIFEST, "packs/one");
+
+    let material = store_key_material_for(&ws, &pack, &cfg());
+    let before = built_output_store_key_from_material(&material);
+
+    // The identity is one whole component, so a bump of the constant inside it
+    // is exactly a substitution of that component.
+    let behaviour = backend_behaviour_identity();
+    let index = material
+        .iter()
+        .position(|part| *part == behaviour)
+        .expect("the behaviour identity is a key component");
+    let mut bumped = material.clone();
+    bumped[index] = behaviour.replace(
+        crate::built_output_store::BUILT_OUTPUT_SCHEMA,
+        "retread-built-output-emission-99",
+    );
+    assert_ne!(
+        bumped[index], material[index],
+        "the substitution must actually change the identity: `{behaviour}`"
+    );
+    let after = built_output_store_key_from_material(&bumped);
+    assert_ne!(
+        before.key, after.key,
+        "bumping the emission schema must re-address every entry"
+    );
+
+    // Second half: even at an address that somehow collided, the record from
+    // the pre-bump binary is refused rather than adopted.
+    let published = crate::built_output_store::encode(
+        &before.inputs_digest,
+        backend_build_identity(),
+        &serde_json::json!({"outputs": []}),
+    )
+    .unwrap();
+    assert!(
+        crate::built_output_store::decode(&published, &after.inputs_digest).is_err(),
+        "a pre-bump record must be refused at a post-bump lookup"
+    );
+
+    let _ = std::fs::remove_dir_all(ws);
 }
 
 // -----------------------------------------------------------------

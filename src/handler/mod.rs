@@ -166,7 +166,7 @@ fn workspace_consumer_scope_identity(scope: Option<&ResolvedWorkspaceTarget>) ->
     format!("{:x}", hasher.finalize())
 }
 
-fn conda_outputs_cache_key_for_target(
+fn conda_outputs_resolution_inputs_key(
     params: &CondaOutputsParams,
     workspace_mtime: Option<std::time::SystemTime>,
     auto_overrides_fp: &str,
@@ -196,7 +196,7 @@ fn conda_outputs_cache_key_for_target(
     let target_contract = target.resolution_identity();
     let consumer_scope = workspace_consumer_scope_identity(consumer_scope);
     format!(
-        "{}|{}|{}|{:?}|{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{:?}|{}|{}|{}|{}|{}",
         params.host_platform,
         params.build_platform,
         chans.join(","),
@@ -206,6 +206,37 @@ fn conda_outputs_cache_key_for_target(
         target_contract,
         consumer_scope,
         workspace_solve_fingerprint,
+    )
+}
+
+/// The in-process / cross-process memo key: the resolution inputs above plus
+/// the backend's exact BUILD identity.
+///
+/// The git hash belongs here and nowhere else. These two memos are job-scoped
+/// (the disk one lives under a `fasttmp` job namespace) and their whole job is
+/// to keep ONE pixi invocation from re-solving the same package, so busting
+/// them on every rebuild costs nothing and closes the run-31 gap the identity
+/// was added for. The SHARED store is the opposite case — its value is
+/// precisely that it outlives a rebuild — and it keys on
+/// [`backend_behaviour_identity`] instead.
+fn conda_outputs_cache_key_for_target(
+    params: &CondaOutputsParams,
+    workspace_mtime: Option<std::time::SystemTime>,
+    auto_overrides_fp: &str,
+    target: &ResolutionTarget,
+    consumer_scope: Option<&ResolvedWorkspaceTarget>,
+    workspace_solve_fingerprint: &str,
+) -> String {
+    format!(
+        "{}|{}",
+        conda_outputs_resolution_inputs_key(
+            params,
+            workspace_mtime,
+            auto_overrides_fp,
+            target,
+            consumer_scope,
+            workspace_solve_fingerprint,
+        ),
         backend_build_identity(),
     )
 }
@@ -220,6 +251,46 @@ fn conda_outputs_cache_key_for_target(
 /// upgrade must bust both the in-memory and disk memos.
 fn backend_build_identity() -> &'static str {
     concat!(env!("CARGO_PKG_VERSION"), "+", env!("RETREAD_GIT_HASH"))
+}
+
+/// The backend's BEHAVIOUR identity, folded into the SHARED built-output store
+/// key in place of [`backend_build_identity`].
+///
+/// The store's value is that an entry survives a backend rebuild; the git hash
+/// destroyed exactly that. Measured: two consecutive canonical 27-environment
+/// relocks on two binaries, `built_output_store miss=14 hit=0` on both, with
+/// 139 warm entries sitting unreachable in the shared root.
+///
+/// What is in here is only what can change the emitted bytes for fixed inputs
+/// and is not already carried by the key's own input components:
+///
+/// * `CARGO_PKG_VERSION` — a release bump invalidates the store outright, so
+///   the hand-bumped constant below only has to cover commits within one
+///   unreleased version;
+/// * [`crate::built_output_store::BUILT_OUTPUT_SCHEMA`] — the hand-bumped
+///   emission-semantics version; its doc comment states the bump rule and the
+///   reasoning for preferring it to a hash of the emitting code;
+/// * [`crate::uv_closure::REQUIRED_UV`] — the toolchain identity that reaches
+///   the bytes. This is not a best-effort probe: `uv_closure::preflight_uv`
+///   runs on EVERY invocation and refuses to proceed unless `uv --version`
+///   equals this constant, so a record in the store cannot have been produced
+///   by any other uv.
+///
+/// NOT here, because the key already carries them: the Python ABI, the conda
+/// subdir and the glibc ceiling all arrive through
+/// `ResolutionTarget::resolution_identity`, which hashes the normalized Python
+/// minor, `conda_subdir`, `max_glibc` and the declared/detected virtual
+/// packages; the channel set, variant configuration and workspace solve
+/// fingerprint arrive through [`conda_outputs_resolution_inputs_key`]; the
+/// source and pack bytes arrive as manifest digests in
+/// [`built_output_store_key_material`].
+fn backend_behaviour_identity() -> String {
+    format!(
+        "{}+emission={}+uv={}",
+        env!("CARGO_PKG_VERSION"),
+        crate::built_output_store::BUILT_OUTPUT_SCHEMA,
+        crate::uv_closure::REQUIRED_UV,
+    )
 }
 
 /// Content fingerprint of the workspace's `.retread/auto-overrides.json`
@@ -310,16 +381,23 @@ fn conda_outputs_disk_cache_path(
 ///   distinguishes two sibling packs, the collision
 ///   [`conda_outputs_disk_cache_path`] documents.
 ///
-/// The backend's version + git hash arrive through `backend_build_identity()`,
-/// already folded into the restated key, and the store's own `SCHEMA` is
-/// hashed alongside it: a backend change or a payload-format change makes
-/// every existing entry unreachable rather than misreadable.
+/// **C11.** The backend identity folded in here is
+/// [`backend_behaviour_identity`], NOT `backend_build_identity()`: a git hash
+/// makes every entry unreachable on every rebuild, which is the store's whole
+/// value thrown away once per binary. The property the git hash was buying —
+/// "a backend change makes old entries unreachable rather than misreadable" —
+/// is now bought where it belongs, in the RECORD: `built_output_store::encode`
+/// stamps the wire schema, the emission schema and the FULL input digest into
+/// every entry, and `built_output_store::decode` refuses on a mismatch of any
+/// of the three. Unreachable was a coarse way to spell unmisreadable; the
+/// envelope spells it exactly, and it also refuses a truncated-key collision
+/// and every pre-v3 entry, neither of which the hash covered.
 ///
 /// Nothing here consults an mtime, a job id, a cache directory or an absolute
 /// path. A leak would cost a MISS (a cold compute, i.e. today's behaviour),
 /// never a wrong hit.
 #[allow(clippy::too_many_arguments)]
-fn built_output_store_key_for_outputs(
+fn built_output_store_key_material(
     params: &CondaOutputsParams,
     auto_overrides_fp: &str,
     target: &ResolutionTarget,
@@ -328,7 +406,7 @@ fn built_output_store_key_for_outputs(
     workspace_dir: Option<&std::path::Path>,
     source_dir: &std::path::Path,
     effective: &RetreadConfig,
-) -> String {
+) -> Vec<String> {
     use sha2::{Digest, Sha256};
 
     fn file_digest(path: &std::path::Path) -> String {
@@ -338,8 +416,11 @@ fn built_output_store_key_for_outputs(
         }
     }
 
-    // Same inputs as the in-process/disk memo key, minus the mtime.
-    let mut restated = conda_outputs_cache_key_for_target(
+    // Same inputs as the in-process/disk memo key, minus the mtime AND minus
+    // the backend build identity: `conda_outputs_resolution_inputs_key` is the
+    // half of that key that is resolution inputs only, so the git hash cannot
+    // reach the store key through the back door of a restated memo key.
+    let mut restated = conda_outputs_resolution_inputs_key(
         params,
         None,
         auto_overrides_fp,
@@ -391,21 +472,69 @@ fn built_output_store_key_for_outputs(
     // [`resolution_policy_fingerprint`].
     let resolution_policy = resolution_policy_fingerprint(effective);
 
+    vec![
+        crate::built_output_store::SCHEMA.to_string(),
+        backend_behaviour_identity(),
+        restated,
+        source_identity.to_string_lossy().into_owned(),
+        workspace_manifest_digest,
+        source_manifest_digest,
+        resolution_policy,
+    ]
+}
+
+/// The address of a built-output entry, plus the digest that entry must carry.
+///
+/// `key` is the store directory name: the first 16 bytes of `inputs_digest`,
+/// kept short because it is a path component. `inputs_digest` is the whole
+/// sha256, written into the record and re-checked on every read, so a
+/// truncation collision is a refusal instead of a wrong adoption.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BuiltOutputStoreKey {
+    pub key: String,
+    pub inputs_digest: String,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn built_output_store_key_for_outputs(
+    params: &CondaOutputsParams,
+    auto_overrides_fp: &str,
+    target: &ResolutionTarget,
+    consumer_scope: Option<&ResolvedWorkspaceTarget>,
+    workspace_solve_fingerprint: &str,
+    workspace_dir: Option<&std::path::Path>,
+    source_dir: &std::path::Path,
+    effective: &RetreadConfig,
+) -> BuiltOutputStoreKey {
+    let material = built_output_store_key_material(
+        params,
+        auto_overrides_fp,
+        target,
+        consumer_scope,
+        workspace_solve_fingerprint,
+        workspace_dir,
+        source_dir,
+        effective,
+    );
+    built_output_store_key_from_material(&material)
+}
+
+/// Hash key material into an address. Split out so a guard can perturb ONE
+/// component and re-address through the same function production uses, rather
+/// than against a re-declared copy of the hash.
+fn built_output_store_key_from_material(material: &[String]) -> BuiltOutputStoreKey {
+    use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
-    for part in [
-        crate::built_output_store::SCHEMA,
-        backend_build_identity(),
-        &restated,
-        &source_identity.to_string_lossy(),
-        &workspace_manifest_digest,
-        &source_manifest_digest,
-        &resolution_policy,
-    ] {
+    for part in material {
         hasher.update((part.len() as u64).to_le_bytes());
         hasher.update(part.as_bytes());
     }
     let digest = hasher.finalize();
-    digest.iter().take(16).map(|b| format!("{b:02x}")).collect()
+    let inputs_digest: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    BuiltOutputStoreKey {
+        key: inputs_digest[..32].to_string(),
+        inputs_digest,
+    }
 }
 
 /// Load a memoized [`CondaOutputsResult`] from disk. Returns `None` on
@@ -4914,12 +5043,32 @@ impl Handler {
         // are cheaper and strictly fresher; a hit here is what a FRESH
         // workspace gets instead of a cold multi-env solve. Loud either way:
         // a miss that should have hit is the thing an operator needs to see.
-        if let (Some(store), Some(key)) = (built_output_store.as_ref(), built_output_store_key.as_ref())
+        if let (Some(store), Some(store_key)) =
+            (built_output_store.as_ref(), built_output_store_key.as_ref())
         {
+            let key = &store_key.key;
             let (lookup, payload) = store.get(key);
-            let cached = payload
-                .as_deref()
-                .and_then(|bytes| serde_json::from_slice::<CondaOutputsResult>(bytes).ok());
+            // C11: the stored bytes are a RECORD, not a bare payload. Decoding
+            // is the acceptance decision -- the wire schema, the emission
+            // schema and the full input digest must all match this reader, and
+            // anything else is a miss with a named reason. This is what makes
+            // it safe for the key to have stopped folding the git hash.
+            let mut refusal: Option<crate::built_output_store::Refusal> = None;
+            let cached = payload.as_deref().and_then(|bytes| {
+                match crate::built_output_store::decode(bytes, &store_key.inputs_digest) {
+                    Ok(value) => match serde_json::from_value::<CondaOutputsResult>(value) {
+                        Ok(result) => Some(result),
+                        Err(_) => {
+                            refusal = Some(crate::built_output_store::Refusal::Undecodable);
+                            None
+                        }
+                    },
+                    Err(why) => {
+                        refusal = Some(why);
+                        None
+                    }
+                }
+            });
             match (&lookup, &cached) {
                 (crate::built_output_store::Lookup::Hit, Some(cached)) => {
                     tracing::info!(
@@ -4947,13 +5096,19 @@ impl Handler {
                     return Ok(cached.clone());
                 }
                 (crate::built_output_store::Lookup::Hit, None) => {
-                    // Marked complete but the payload does not deserialize:
-                    // a schema drift the SCHEMA tag failed to catch. Treat it
-                    // as a miss and say so at WARN rather than at debug.
+                    // Marked complete, and REFUSED: the record was written by
+                    // a different schema, different emission semantics, or
+                    // different inputs than this address stands for. Never
+                    // adopted, always recomputed, and said at WARN so the
+                    // reason is in the run's own log.
                     tracing::warn!(
                         key = %key,
                         root = %store.root().display(),
-                        "bench: built_output_store unreadable payload -- treating as a miss and recomputing",
+                        reason = %refusal
+                            .as_ref()
+                            .map(|why| why.to_string())
+                            .unwrap_or_else(|| "unknown".to_string()),
+                        "bench: built_output_store record refused -- treating as a miss and recomputing",
                     );
                 }
                 (lookup, _) => {
@@ -5747,10 +5902,15 @@ impl Handler {
             // Same guard, same reason: an output whose identity depends on a
             // job-local prepared plan must never be adopted by another
             // workspace. Publishing is best-effort and never fails the RPC.
-            if let (Some(store), Some(key)) =
+            if let (Some(store), Some(store_key)) =
                 (built_output_store.as_ref(), built_output_store_key.as_ref())
             {
-                match serde_json::to_vec(&result) {
+                let key = &store_key.key;
+                match crate::built_output_store::encode(
+                    &store_key.inputs_digest,
+                    backend_build_identity(),
+                    &result,
+                ) {
                     Ok(bytes) => match store.publish(key, &bytes) {
                         Ok(true) => tracing::info!(
                             key = %key,
