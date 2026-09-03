@@ -2084,6 +2084,60 @@ pub(crate) fn read_metadata_strict(wheel_path: &Path) -> Result<WheelMetadata> {
     read_metadata_with_trusted_sha(wheel_path, sha256, "streamed")
 }
 
+/// C10: the sha256 the persistent wheel store attested for the bytes at
+/// `store_path`, or `None` when there is no live attestation there.
+///
+/// `write_store_integrity_marker` files this beside every wheel the store
+/// publishes, after `atomic_owned_copy` proved the digest and
+/// `set_store_file_readonly` froze the file. A caller may use the value as a
+/// *hint* about which bytes these are; it is never on its own a reason to
+/// accept them. The marker is honoured only while the wheel is still the
+/// read-only regular file with the exact stat tuple the marker recorded, which
+/// is `inspect_store_entry`'s own rule.
+pub(crate) fn store_integrity_marker_sha256(store_path: &Path) -> Option<String> {
+    let metadata = std::fs::symlink_metadata(store_path).ok()?;
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || !metadata.permissions().readonly()
+    {
+        return None;
+    }
+    let marker_path = store_integrity_marker_path(store_path);
+    let marker_type = std::fs::symlink_metadata(&marker_path).ok()?.file_type();
+    if !marker_type.is_file() || marker_type.is_symlink() {
+        return None;
+    }
+    let bytes = std::fs::read(&marker_path).ok()?;
+    let marker: StoreIntegrityMarker = serde_json::from_slice(&bytes).ok()?;
+    if marker.schema != "retread-wheel-store-integrity-v1"
+        || normalize_sha256(&marker.sha256, "store marker hash").is_err()
+        || marker.fingerprint != fingerprint_metadata(&metadata).ok()?
+    {
+        return None;
+    }
+    Some(marker.sha256)
+}
+
+/// C10: parse a wheel's identity from METADATA bytes a caller already holds,
+/// attributing them to `sha256`. Byte-for-byte the parse
+/// [`read_metadata_with_sha`] runs; what is skipped is opening the archive
+/// again to find the member.
+pub(crate) fn parse_metadata_bytes(
+    wheel_path: &Path,
+    metadata_bytes: &[u8],
+    sha256: String,
+) -> Result<WheelMetadata> {
+    let filename = wheel_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("wheel path has no filename: {}", wheel_path.display()))?
+        .to_string();
+    let is_pure_python = is_pure_python_wheel_filename(&filename);
+    let raw = std::str::from_utf8(metadata_bytes)
+        .with_context(|| format!("METADATA in {} is not UTF-8", wheel_path.display()))?;
+    parse_metadata(raw, filename, is_pure_python, sha256)
+}
+
 fn read_metadata_with_sha(wheel_path: &Path, sha256: String) -> Result<WheelMetadata> {
     let filename = wheel_path
         .file_name()
