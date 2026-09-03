@@ -10623,3 +10623,209 @@ async fn built_output_store_hit_serves_the_same_result_a_cold_compute_produced()
         let _ = std::fs::remove_dir_all(dir);
     }
 }
+
+// -----------------------------------------------------------------
+// p6g -- CONSTRAINS DISCIPLINE.
+//
+// Job 5668401 (LANE-C-WARM-LOG §9), arm ONCERT, on the CERTIFIED 994-line
+// manifest with all nine hand-pins deleted:
+//
+//   × failed to solve requirements of environment 'pm-isaaclab'
+//     ├─ protomotions-deps-pack 3.1 would require fsspec ==2026.7.0
+//     └─ isaaclab-2.3x-pack 0.54.2 would constrain fsspec >=2023.5.0,==2024.6.1
+//
+// Both sides are POST-INJECTION CLOSURE PICKS of packs this workspace builds,
+// measured in one relock from that job's backend log:
+//
+//   auto-routed fsspec==2024.10.0 to conda  bundle=isaaclab-2.3x-pack
+//   auto-routed fsspec==2026.7.0  to conda  bundle=protomotions-deps-pack
+//
+// The gate-OFF arm of the same job shipped a 27-environment lock carrying
+// FOUR fsspec versions side by side, and `isaaclab-2.3x-pack`'s lock entry
+// carries no fsspec row at all -- because with the gate OFF the name is not
+// reachable from the workspace's `[pypi-dependencies]`, so the route's bound
+// lands in `depends` (where the ordinary decide pipeline handles it) instead
+// of being advertised as a workspace-wide `constrains` exact.
+//
+// The discipline under guard: a `constrains` entry may state a DECLARED bound
+// (a wheel's `Requires-Dist`, a workspace fact, a manifest pin) but never this
+// pack's own closure pick.
+// -----------------------------------------------------------------
+
+fn capture_warn_logs<T>(body: impl FnOnce() -> T) -> (T, String) {
+    let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer({
+            let logs = std::sync::Arc::clone(&logs);
+            move || SharedLogWriter(std::sync::Arc::clone(&logs))
+        })
+        .finish();
+    let value = tracing::subscriber::with_default(subscriber, body);
+    let text = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    (value, text)
+}
+
+/// One pack of the p6g fixture.
+///
+/// `closure_pick` is the version THIS pack's uv closure landed on for
+/// `fsspec`; `declared_bound` is the bound its shipped wheel actually states.
+/// `injected` models the auto-imports gate: with the gate ON the injected root
+/// puts `fsspec` inside the pack's uv graph beneath a name the workspace
+/// declares in `[pypi-dependencies]`, which is precisely what makes the route
+/// `declared-pypi owned` and sends its bound to the `constrains` slot.
+fn p6g_pack(
+    pack: &str,
+    closure_pick: &str,
+    declared_bound: &str,
+    injected: bool,
+    counterparty_versions: &[&str],
+) -> Bundle {
+    let mut bundle = solo_bundle(pack, vec![&format!("fsspec{declared_bound}")]);
+    bundle.primary.original_requires_dist = vec![format!("fsspec{declared_bound}")];
+    bundle
+        .extras
+        .push(rw("fsspec", meta("fsspec", closure_pick, vec![], true)));
+    bundle.uv_closure_names.insert("fsspec".to_string());
+    bundle.auto_routed.push(bundle_auto_route(
+        "fsspec",
+        closure_pick,
+        Provenance::PriorSelection,
+    ));
+    if injected {
+        // The workspace declares `datasets`; the injected root makes `fsspec`
+        // reachable from it inside this pack's own uv graph.
+        bundle
+            .workspace_declared_pypi
+            .insert(canonical_conda_name("datasets"));
+        bundle
+            .uv_dependency_graph
+            .edges
+            .insert(crate::uv_closure::UvDependencyEdge {
+                parent: "datasets".to_string(),
+                child: "fsspec".to_string(),
+            });
+        bundle
+            .auto_imports_injected
+            .insert(canonical_conda_name("fsspec"));
+    }
+    if !counterparty_versions.is_empty() {
+        bundle.workspace_conda_provider_facts.insert(
+            "fsspec".to_string(),
+            super::WorkspaceCondaProviderFact {
+                selected_versions: counterparty_versions
+                    .iter()
+                    .map(|version| (*version).to_string())
+                    .collect(),
+                declared_specs: BTreeSet::new(),
+                present_in_all_consumers: false,
+            },
+        );
+    }
+    bundle
+}
+
+fn p6g_constrains(bundle: &Bundle) -> Vec<String> {
+    produce_output(bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None)
+        .unwrap()
+        .run_dependencies
+        .constraints
+        .iter()
+        .map(format_constraint_spec)
+        .collect()
+}
+
+fn p6g_depends(bundle: &Bundle) -> Vec<String> {
+    produce_output(bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None)
+        .unwrap()
+        .run_dependencies
+        .depends
+        .iter()
+        .map(|dependency| format!("{} {}", dependency.name, format_packagespec(&dependency.spec)))
+        .collect()
+}
+
+/// (i) Two packs, one name, two different closure exacts, gate ON.
+#[test]
+fn p6g_two_packs_pinning_one_name_emit_no_exact_constrains_and_the_log_names_both_owners() {
+    // Exactly the two sides job 5668401 put in front of `pm-isaaclab`.
+    let counterparties = ["2024.6.1", "2026.7.0"];
+    for (pack, closure_pick, declared_bound) in [
+        ("isaaclab-2-3x-pack", "2024.6.1", ">=2023.5.0"),
+        ("protomotions-deps-pack", "2026.7.0", ">=2023.5.0"),
+    ] {
+        let bundle = p6g_pack(pack, closure_pick, declared_bound, true, &counterparties);
+        let (constrains, logs) = capture_warn_logs(|| p6g_constrains(&bundle));
+        let fsspec: Vec<&String> = constrains
+            .iter()
+            .filter(|line| line.split(' ').next() == Some("fsspec"))
+            .collect();
+        assert!(
+            !fsspec.iter().any(|line| line.contains("==")),
+            "{pack}: a pack may not harden its own closure pick ({closure_pick}) into a \
+             workspace-wide `constrains` exact -- that is the bound that made pm-isaaclab \
+             unsolvable in job 5668401: {constrains:?}",
+        );
+        assert!(
+            fsspec.iter().any(|line| line.contains(">=2023.5.0")),
+            "{pack}: the DECLARED bound must survive; only the closure pick is dropped: \
+             {constrains:?}",
+        );
+        assert!(
+            logs.contains("retread-constrains-discipline"),
+            "{pack}: the drop must be loud: {logs}",
+        );
+        for counterparty in counterparties {
+            assert!(
+                logs.contains(counterparty),
+                "{pack}: the row must NAME the counterparties ({counterparty} missing): {logs}",
+            );
+        }
+    }
+}
+
+/// (ii) The same fixture with the gate OFF must be byte-identical to 44233cf.
+///
+/// The golden below was produced by running this fixture against the base
+/// commit (`integration/4.12` @ 44233cf) in a detached worktree. With the gate
+/// OFF nothing makes `fsspec` declared-pypi owned, so the route's bound is an
+/// ordinary `depends` edge and the discipline -- which only ever inspects a
+/// `constrains_only` group -- must not touch a byte of it.
+#[test]
+fn p6g_gate_off_emission_is_byte_identical_to_the_base_commit() {
+    let bundle = p6g_pack("isaaclab-2-3x-pack", "2024.6.1", ">=2023.5.0", false, &[]);
+    let rendered = format!(
+        "depends={:?}\nconstrains={:?}",
+        p6g_depends(&bundle),
+        p6g_constrains(&bundle),
+    );
+    assert_eq!(rendered, P6G_GATE_OFF_GOLDEN_44233CF, "gate-OFF emission moved");
+}
+
+/// (iii) A name exactly one pack owns still advertises its declared bound.
+#[test]
+fn p6g_a_single_owner_name_keeps_its_declared_constrains_bound_with_the_gate_on() {
+    let bundle = p6g_pack("solo-pack", "2024.6.1", ">=2023.5.0,<2025", true, &["2024.6.1"]);
+    let constrains = p6g_constrains(&bundle);
+    let line = constrains
+        .iter()
+        .find(|line| line.split(' ').next() == Some("fsspec"))
+        .unwrap_or_else(|| {
+            panic!("dropping the closure exact must not delete the entry: {constrains:?}")
+        });
+    assert!(
+        line.contains(">=2023.5.0") && line.contains("<2025"),
+        "the pack's DECLARED compatibility band is exactly what `constrains` is for: \
+         {constrains:?}",
+    );
+    assert!(
+        !line.contains("=="),
+        "no exact, even when every consumer happens to agree today: {constrains:?}",
+    );
+}
+
+/// Gate-OFF emission of the p6g fixture as produced by `integration/4.12` @
+/// 44233cf, captured in a detached worktree at that commit.
+const P6G_GATE_OFF_GOLDEN_44233CF: &str = "depends=[\"python 3.11.*\", \"fsspec >=2024.6.1,<2025\"]\nconstrains=[]";

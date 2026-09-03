@@ -15559,6 +15559,107 @@ struct PypiEmissionGroup {
 /// in a backend log to see exactly what Lane C advertised and why.
 const INJECTED_CONSTRAINT_LOG: &str = "retread-inject-constraint";
 
+/// Greppable marker on every row the `constrains` discipline writes.
+const CONSTRAINS_DISCIPLINE_LOG: &str = "retread-constrains-discipline";
+
+/// The origin KIND the auto-route emission stamps on every bound it derives
+/// from a route -- the closure's own picks and the route's typed inputs alike.
+const AUTO_ROUTE_ORIGIN_KIND: &str = "auto-route";
+
+/// The role component on the bound derived from the route's CONDA-side
+/// selection (`>=<picked>,<<ceiling>`, or `==<picked>` when no ceiling exists).
+const AUTO_ROUTE_CONDA_SELECTION_PART: &str = "conda-selection";
+
+/// The role component on the bound derived from the route's PYPI-side
+/// selection (`==<picked>`, [`Provenance::PriorSelection`]).
+const AUTO_ROUTE_PRIOR_SELECTION_PART: &str = "prior-selection";
+
+/// Origins of the bounds an emission group derived from THIS PACK'S OWN uv
+/// closure pick, rather than from anything declared.
+///
+/// Exactly the two the auto-route emission invents from `AutoRoutedPackage`'s
+/// resolved versions: the conda-side selection and the pypi-side prior
+/// selection. Both are one point inside a contract, not the contract.
+///
+/// Deliberately NOT keyed on the rendered clause being exact. The conda-side
+/// bound usually renders as `>=<picked>,<<ceiling>`, and that floor is the
+/// same hardening wearing a range's clothes: measured on the p6g fixture it
+/// emits `fsspec >=2024.6.1,<2025`, which excludes the `>=2023.5.0` the pack's
+/// own wheel actually declares.
+///
+/// The route's typed `input_requirements` share the `auto-route` KIND but
+/// carry their own role components, and they ARE declared inputs (a root, a
+/// user constraint, an override), so they stay.
+fn closure_derived_route_origins(constraints: &[Constraint]) -> BTreeSet<ConstraintOriginId> {
+    constraints
+        .iter()
+        .filter(|constraint| {
+            constraint.origin_id.kind() == Some(AUTO_ROUTE_ORIGIN_KIND)
+                && (constraint.origin_id.has_part(AUTO_ROUTE_CONDA_SELECTION_PART)
+                    || constraint.origin_id.has_part(AUTO_ROUTE_PRIOR_SELECTION_PART))
+        })
+        .map(|constraint| constraint.origin_id.clone())
+        .collect()
+}
+
+/// Every workspace counterparty this bundle knows of that states a version for
+/// `conda_key`, rendered for the log.
+///
+/// Doctrine: a refusal or a drop names the party that must fix it. A row that
+/// says "dropped the exact" without saying WHO disagrees sends the reader
+/// nowhere.
+fn constrains_counterparties(
+    bundle: &Bundle,
+    conda_key: &str,
+    pypi_names: &BTreeSet<PypiKey>,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Some(fact) = bundle.workspace_conda_provider_facts.get(conda_key) {
+        if !fact.selected_versions.is_empty() {
+            out.push(format!(
+                "workspace conda providers selected {}",
+                fact.selected_versions
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if !fact.declared_specs.is_empty() {
+            out.push(format!(
+                "workspace conda declarations {}",
+                fact.declared_specs
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+    for name in std::iter::once(conda_key).chain(pypi_names.iter().map(PypiKey::as_str)) {
+        if let Some(locked) = bundle.workspace_locked_pypi.get(name) {
+            out.push(format!("consuming pixi.lock pypi {name}=={locked}"));
+        }
+        if let Some(specs) = bundle.workspace_declared_pypi_specs.get(name) {
+            let declared: Vec<&str> = specs
+                .iter()
+                .map(|spec| spec.trim())
+                .filter(|spec| !spec.is_empty() && *spec != "*")
+                .collect();
+            if !declared.is_empty() {
+                out.push(format!(
+                    "workspace [pypi-dependencies] {name} {}",
+                    declared.join(" | ")
+                ));
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+
 /// The run-dep constraint an INJECTED Lane C member is allowed to advertise on
 /// the pack's conda package, or `None` when this group is not injected.
 ///
@@ -17760,7 +17861,7 @@ fn produce_output_with_conflicts(
                                 auto_route.route.conda_name.as_str(),
                                 auto_route.route.conda_version.as_str(),
                                 auto_route.route.channel.as_str(),
-                                "conda-selection",
+                                AUTO_ROUTE_CONDA_SELECTION_PART,
                                 route_spec.as_str(),
                             ],
                         ),
@@ -17800,7 +17901,7 @@ fn produce_output_with_conflicts(
                             auto_route.route.conda_name.as_str(),
                             auto_route.route.conda_version.as_str(),
                             auto_route.route.channel.as_str(),
-                            "prior-selection",
+                            AUTO_ROUTE_PRIOR_SELECTION_PART,
                             prior_spec.as_str(),
                         ],
                     ),
@@ -18174,7 +18275,7 @@ fn produce_output_with_conflicts(
             conda_name,
             conda_name_is_authoritative: _,
             constraints,
-            validation_only_origins,
+            mut validation_only_origins,
             native_conda_overrides,
             supports,
             constrains_only,
@@ -18204,6 +18305,22 @@ fn produce_output_with_conflicts(
         // pinned by hand via `retread-overrides`, and a native conda override
         // (the sole conda-syntax boundary). `constrains_only` groups are inert
         // -- they add no package to the solve -- so they are left alone too.
+        // p6g, on the reasoning this comment used to give:
+        // `constrains_only` groups were skipped here as "inert -- they add no
+        // package to the solve". That is only half true, and the half that is
+        // false killed arm ONCERT of job 5668401: a `constrains` entry is
+        // inert only until something ELSE pulls the name in, and in a
+        // workspace where every pack lands in one prefix, another pack
+        // pulling the name in is the ordinary case. But the REMEDY differs by
+        // slot, which is why this arm stays. `injected_run_dep_constraint`
+        // falls back to the BARE NAME, and a conda `depends` edge is still
+        // meaningful bare -- it names a provider. A `constrains` entry bare is
+        // nothing at all: its entire content is the bound, so loosening it to
+        // bare would discard the pack's own DECLARED compatibility band
+        // (`fsspec >=2023.5.0`) along with the closure pick. The constrains
+        // slot gets the same RULING through a different mechanism -- the
+        // closure-derived exact is projected out below and the declared
+        // bounds are what remain.
         let injected_override = if constrains_only
             || has_anchor_alias
             || has_manual_override
@@ -18252,6 +18369,83 @@ fn produce_output_with_conflicts(
             );
             constraint.clone()
         };
+        // ---- CONSTRAINS DISCIPLINE (p6g) ----
+        // A `constrains` entry is the pack's COMPATIBILITY CONTRACT with
+        // whatever else lands in the same prefix. This pack's own uv closure
+        // pick is not a contract -- it is one point inside one, and the same
+        // name routes to a different point in every other pack (job 5668401
+        // auto-routed `fsspec` to `2024.10.0` for the three isaaclab packs and
+        // to `2026.7.0` for five others, in one relock). Hardening that pick
+        // into a workspace-wide `==` is what made `pm-isaaclab` unsolvable
+        // with the auto-imports gate ON, on a manifest with every hand-pin
+        // already deleted.
+        //
+        // So: for a constrains-only group, a closure-derived EXACT is demoted
+        // to validation-only. It still participates in the decide pipeline in
+        // full -- diagnostics, relaxation records, emission-time and
+        // resolve-time back-offs are all unchanged, which is the whole reason
+        // this uses `validation_only_origins` rather than deleting the
+        // constraint -- but it is projected OUT of the emitted bound, leaving
+        // the DECLARED bounds (wheel `Requires-Dist`, workspace facts,
+        // manifest pins) to state the contract. Where nothing declared
+        // remains, the entry is omitted rather than shipped bare.
+        //
+        // Exact BY CONTRACT is untouched: an ABI anchor, a hand-written
+        // `retread-overrides` pin, and a native conda override all keep their
+        // exactness, as they do in the `depends` slot.
+        //
+        // This cannot move the gate-OFF path: `PriorSelection` and the route's
+        // typed inputs are pushed with `constrains_only: route_declared_owned`,
+        // and a name is `route_declared_owned` only when the consuming
+        // workspace's `[pypi-dependencies]` reach it -- which is what
+        // injection creates. With the gate OFF those bounds land in ordinary
+        // `depends` groups, which this arm never sees.
+        let mut discipline_dropped: Vec<String> = Vec::new();
+        if constrains_only
+            && !has_anchor_alias
+            && !has_manual_override
+            && native_conda_override.is_none()
+        {
+            let closure_exacts = closure_derived_route_origins(&constraints);
+            let newly_projected_out: BTreeSet<ConstraintOriginId> = closure_exacts
+                .into_iter()
+                .filter(|origin| !validation_only_origins.contains(origin))
+                .collect();
+            if !newly_projected_out.is_empty() {
+                discipline_dropped = constraints
+                    .iter()
+                    .filter(|constraint| newly_projected_out.contains(&constraint.origin_id))
+                    .map(|constraint| {
+                        format!("{} ({})", constraint.specifiers, constraint.source)
+                    })
+                    .collect();
+                let counterparties =
+                    constrains_counterparties(bundle, conda_name.key().as_str(), &pypi_names);
+                tracing::warn!(
+                    target: "pixi_build_retread",
+                    bundle = %bundle.conda_name,
+                    package = %conda_name,
+                    dropped = %discipline_dropped.join(" | "),
+                    counterparties = %if counterparties.is_empty() {
+                        "none known to this bundle".to_string()
+                    } else {
+                        counterparties.join(" | ")
+                    },
+                    "{CONSTRAINS_DISCIPLINE_LOG}: a conda `constrains` entry may not harden \
+                     this pack's own closure pick into a workspace-wide exact bound; \
+                     projecting it out of the emitted bound and advertising the declared \
+                     bounds instead. Another pack in this workspace resolves the same name \
+                     to its own version, and both are legitimate.",
+                );
+                validation_only_origins.extend(newly_projected_out);
+            }
+        }
+        // A constrains entry the discipline emptied states nothing. Shipping a
+        // bare name would advertise a bound the pack does not have, so omit it
+        // -- loudly, because a silently dropped advertisement is exactly the
+        // defect the carry exists to prevent.
+        let omit_if_unbounded = !discipline_dropped.is_empty();
+        // ---- CONSTRAINS DISCIPLINE END ----
         match decide_for_emission(
             &pypi_name,
             &constraints,
@@ -18288,7 +18482,20 @@ fn produce_output_with_conflicts(
                 };
                 let spec = conda_name.match_spec(&apply_injected_override(rendered));
                 if constrains_only {
-                    constrains_specs.push(constraint_spec_from_str(spec.as_str())?);
+                    if omit_if_unbounded && spec.as_str().trim() == conda_name.as_spec() {
+                        tracing::warn!(
+                            target: "pixi_build_retread",
+                            bundle = %bundle.conda_name,
+                            package = %conda_name,
+                            dropped = %discipline_dropped.join(" | "),
+                            "{CONSTRAINS_DISCIPLINE_LOG}: nothing DECLARED bounds this name \
+                             once the pack's own closure pick is projected out; omitting the \
+                             `constrains` entry rather than advertising a bare name. The \
+                             per-environment conda solve decides the version.",
+                        );
+                    } else {
+                        constrains_specs.push(constraint_spec_from_str(spec.as_str())?);
+                    }
                 } else {
                     run_dep_specs.push(spec_from_str(spec.as_str())?);
                 }
@@ -18322,7 +18529,20 @@ fn produce_output_with_conflicts(
                 };
                 let spec = conda_name.match_spec(&apply_injected_override(rendered));
                 if constrains_only {
-                    constrains_specs.push(constraint_spec_from_str(spec.as_str())?);
+                    if omit_if_unbounded && spec.as_str().trim() == conda_name.as_spec() {
+                        tracing::warn!(
+                            target: "pixi_build_retread",
+                            bundle = %bundle.conda_name,
+                            package = %conda_name,
+                            dropped = %discipline_dropped.join(" | "),
+                            "{CONSTRAINS_DISCIPLINE_LOG}: nothing DECLARED bounds this name \
+                             once the pack's own closure pick is projected out; omitting the \
+                             `constrains` entry rather than advertising a bare name. The \
+                             per-environment conda solve decides the version.",
+                        );
+                    } else {
+                        constrains_specs.push(constraint_spec_from_str(spec.as_str())?);
+                    }
                 } else {
                     run_dep_specs.push(spec_from_str(spec.as_str())?);
                 }
@@ -18848,6 +19068,24 @@ fn log_final_bundle_outputs(result: &CondaOutputsResult) {
             run_deps = ?emitted,
             "bundle run-deps emitted; if conda can't find one, add it to \
              retread-drop-deps / retread-overrides / retread-name-map"
+        );
+        // The `constrains` slot had NO reader. Job 5668401 failed twice on a
+        // bound that only the consuming env's solver error ever named
+        // (`isaaclab-2.3x-pack 0.54.2 would constrain fsspec ...`), because
+        // nothing in this backend's own log printed what the pack advertised.
+        // Every writer needs a reader: print the committed constrains, with
+        // their versions, exactly once per output.
+        let constrains: Vec<String> = output
+            .run_dependencies
+            .constraints
+            .iter()
+            .map(format_constraint_spec)
+            .collect();
+        tracing::info!(
+            bundle = %output.metadata.name.as_normalized(),
+            constrains = ?constrains,
+            "bundle constrains emitted; these bind every OTHER package in a \
+             consuming environment that pulls the same name in"
         );
     }
 }
