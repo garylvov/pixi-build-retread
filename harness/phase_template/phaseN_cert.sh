@@ -121,6 +121,18 @@ PROBES=$PROBES_CANON                         # the arm's copy -- MUST be the sam
 PROBE_TOKENS=()                              # module tokens that must be GONE from $PROBES
 EXPECT_PROBE_ROWS=26
 
+# --- every env must be probeable --------------------------------------------
+# A5a (2026-09-03). An env whose name has no row in $PROBES gets an EMPTY $MODS,
+# so both the TierA and the TierB probe are skipped. It was NOT silently green
+# -- ARC stays at its 99 initialiser and the row scored RED-tierA -- but that
+# label is a LIE: TierA never ran. Two changes, neither behind a flag:
+#   1. this gate refuses the run before any install when an env has no row;
+#   2. run_env scores such an env RED-probes-missing, an explicit state the
+#      verdict gate reads as OUTCOME_DIFF (verdict is field 8, scored).
+# REQUIRE_PROBE_ROW_PER_ENV=0 disables ONLY gate 1, so a guard run can reach
+# state 2. Nothing else may set it.
+REQUIRE_PROBE_ROW_PER_ENV=${REQUIRE_PROBE_ROW_PER_ENV:-1}
+
 # --- the environments to certify ---------------------------------------------
 # jetson is aarch64-only and is deliberately excluded; any manifest line that
 # only binds jetson is therefore CERT-BLIND and relock rc=0 is its only evidence.
@@ -237,6 +249,25 @@ for p in $DELETED_FAMILIES; do
     "$(grep -cE "/${p}-[0-9]|name: ${p}$" "$LOCK")" \
     "$(grep -oE "/${p}-[0-9][^/]*" "$LOCK" | sort -u | tr '\n' ' ')"
 done
+PROBED_ENVS=0; UNPROBED=
+for E in $CERT_ENVS; do
+  if [ -n "$(awk -F'\t' -v e="$E" '$1==e{print $2}' "$PROBES")" ]; then
+    PROBED_ENVS=$((PROBED_ENVS+1))
+  else
+    UNPROBED="$UNPROBED $E"
+  fi
+done
+echo "### probed envs: $PROBED_ENVS of $(echo $CERT_ENVS | wc -w) (every env in CERT_ENVS must have a $PROBES row)"
+if [ -n "$UNPROBED" ]; then
+  for E in $UNPROBED; do echo "### probes row missing for $E"; done
+  if [ "$REQUIRE_PROBE_ROW_PER_ENV" = 1 ]; then
+    echo "### FATAL envs with no probes row cannot be certified:$UNPROBED"
+    echo "###   add a row to $PROBES, or drop the env from CERT_ENVS. Running anyway"
+    echo "###   would score each of them RED-probes-missing."
+    exit 2
+  fi
+  echo "### REQUIRE_PROBE_ROW_PER_ENV=0 -- continuing; each unprobed env will score RED-probes-missing"
+fi
 echo "### baseline rows: $(wc -l < "$CERT_BASELINE")"
 
 collect_artifacts() {
@@ -317,6 +348,10 @@ print('TIERB_OK')" >> "$PLOG" 2>&1; BRC=$?
     RB=$PREFIX/bin/retread; VRC=0; SEEN=0
     if [ -x "$RB" ]; then for LJ in "$SHR"/retread-*.lock.json; do [ -e "$LJ" ] || continue; SEEN=$((SEEN+1)); timeout --foreground --kill-after=15s 2400s "$RB" verify --lock "$LJ" --prefix "$PREFIX" >> "$VLOG" 2>&1; R=$?; [ "$R" = 0 ] || VRC=$R; done; [ "$SEEN" = 0 ] && VRC=97; else [ "$INSTM" = 0 ] || VRC=98; fi
   else echo "SKIP install_rc=$IRC probes=$([ -n "$MODS" ] && echo present || echo missing)" >> "$PLOG"; fi
+  if [ -z "$MODS" ]; then
+    echo "### probes row missing for $ENV -- TierA and TierB never ran; this env is NOT certified"
+    echo "PROBES-ROW-MISSING env=$ENV probes=$PROBES" >> "$PLOG"
+  fi
   # Count repair ATTEMPTS, not lines mentioning one: the section header
   # '=== attempt N <ts> ===' is emitted exactly once per attempt, while the
   # older pattern also matched the inline '(repair attempt #N)' and so read
@@ -329,7 +364,7 @@ print('TIERB_OK')" >> "$PLOG" 2>&1; BRC=$?
     { echo "--- marker $(basename "$M") ---"; cat "$M"; } >> "$SLOG" 2>&1
   done
   find "$SHR" -maxdepth 1 -name '*.repair.log' -type f -exec sed -n '1,20p' {} + >> "$SLOG" 2>/dev/null || true
-  if [ "$IRC" != 0 ]; then V=RED-install; elif [ "$BROKEN" != 0 ]; then V=RED-broken-marker; elif [ "$STATEF" != 0 ]; then V=RED-stale-state; elif [ "$ARC" != 0 ]; then V=RED-tierA; elif [ "$BRC" != 0 ]; then V=RED-tierB; elif [ "$VRC" != 0 ]; then V=RED-verify; elif [ "$ATT" != 0 ]; then V=AMBER-repaired; else V=GREEN; fi
+  if [ "$IRC" != 0 ]; then V=RED-install; elif [ -z "$MODS" ]; then V=RED-probes-missing; elif [ "$BROKEN" != 0 ]; then V=RED-broken-marker; elif [ "$STATEF" != 0 ]; then V=RED-stale-state; elif [ "$ARC" != 0 ]; then V=RED-tierA; elif [ "$BRC" != 0 ]; then V=RED-tierB; elif [ "$VRC" != 0 ]; then V=RED-verify; elif [ "$ATT" != 0 ]; then V=AMBER-repaired; else V=GREEN; fi
   # Atomic-ish row emission: write the row to a per-env temp file and rename it
   # into place, so a killed env leaves NO row rather than half a row (a missing
   # row is NOT_RUN under cert_verdict.sh, which is loud; a truncated row would
@@ -379,7 +414,17 @@ for ENV in $(cert_run_order); do
   RUNNING=$((RUNNING+1))
   echo "### dispatched $ENV (in flight $RUNNING/$CERT_PARALLEL) $(date -Is)"
 done
-wait
+# `wait` with NO arguments also waits for the `tee` of the
+# `exec > >(tee -a ...)` process substitution at the top of this script. That
+# tee never exits, so a bare `wait` here hangs forever: MEASURED on job 5658928
+# (bash 5.1.8, node2320) -- all 26 env rows were on disk at 01:55:39 EDT and the
+# job was still sitting in `wait` when its 4 h limit killed it at 02:16, with no
+# cert_results.tsv, no verdict and no cleanup submitted. Reproducer:
+#   exec > >(tee -a /tmp/w.log) 2>&1; ( sleep 1 ) & wait; echo unreachable
+# The THROTTLE above is safe for the same reason the bare wait is not: `wait -n`
+# returns on the FIRST child to exit, and the tee never does. So drain exactly
+# the $RUNNING env subshells, one `wait -n` each, and never call bare `wait`.
+while [ "$RUNNING" -gt 0 ]; do wait -n; RUNNING=$((RUNNING-1)); done
 LOOP_W=$(( $(date +%s) - LOOP_S ))
 echo "### env loop DONE wall=${LOOP_W}s $(date -Is)"
 

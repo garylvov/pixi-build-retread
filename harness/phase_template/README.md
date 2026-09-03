@@ -1,4 +1,5 @@
 # `tools/phase_template/` — the fast, correct starting point for a new relock/cert pair
+**Versioned copy: retread repo branch `harness/tools-20260902` → `harness/`; sync direction task-dir ← repo (one-time repo ← task-dir catch-up 2026-09-03 02:22; from here the repo is the source and the task dir is synced FROM it before each campaign).**
 
 Three files:
 
@@ -87,19 +88,26 @@ same node with the same manifest and the same binary.
 5. **Submit. The memory numbers in each header are measured, not inherited.**
    ```
    env -u SLURM_JOB_ID sbatch --partition=batch --qos=normal --cpus-per-task=16 \
-       --mem=72G  --time=03:00:00 --job-name=<tag>-p1 \
+       --mem=24G  --time=03:00:00 --job-name=<tag>-p1 \
        --output=<T>/<newbatch>/logs/slurm-%j.out ./<newbatch>_relock.sh
    env -u SLURM_JOB_ID sbatch --partition=batch --qos=normal --cpus-per-task=16 \
-       --mem=100G --time=08:00:00 --job-name=<tag>-p2 --dependency=afterok:<p1 job> \
+       --mem=32G  --time=04:00:00 --job-name=<tag>-p2 --dependency=afterok:<p1 job> \
        --output=<T>/<newbatch>/logs/slurm-%j.out ./<newbatch>_cert.sh
    ```
-   72G relock / 100G cert. Worst relock peak RSS ever measured with
-   `/usr/bin/time -v` is **8,854,172 K** (job 5597671); worst cert *env* is
-   **1,475,216 K** (env `gpu`, job 5597694). `sacct` MaxRSS is unusable here —
-   every job reports ~100 % of its cgroup cap regardless of what it did, which
+   **24G relock / 32G cert, and the cert asks for 4 hours, not 8** — both changed
+   2026-09-02 with the parallel env loop (next section). Sizing, all of it
+   `/usr/bin/time -v` `Maximum resident set size`, never `sacct`: worst relock
+   peak **8,854,172 K = 8.85 GB** (job 5597671), worst single cert *env*
+   **1,475,216 K = 1.48 GB** (env `gpu`, job 5597694), and at `CERT_PARALLEL=6`
+   the six largest envs of that ledger sum to **7,763,312 K = 7.8 GB**. So 24G is
+   2.7× the relock peak and 32G is >4× the worst parallel cert, with the rest
+   left as page cache for a phase that reads 108 GB and writes 318 GB. `sacct`
+   MaxRSS is unusable here — every job reports ~100 % of its cgroup cap
+   (160G → 167,772,480 K, 100G → 104,858,688 K) regardless of what it did, which
    is reclaimable page cache, not demand. The binding constraint is the per-user
    QOS cap (`normal` = cpu 64, mem 492G for the *whole* user): a 160G request is
-   why job 5597889 pended behind `QOSMaxMemoryPerUser` with a node sitting idle.
+   why job 5597889 pended behind `QOSMaxMemoryPerUser` with a node sitting idle,
+   and 32G takes the pair from 3 concurrent jobs to ~15.
 
 ---
 
@@ -333,3 +341,72 @@ deliberate — it keeps the staged tree structurally identical to what the rsync
 path produced and keeps `### .git present: yes` meaning what it meant. Dropping
 it is worth a measured 248 s off the mirror build and ~40 % of every `cp -al`,
 and is the obvious next lever, behind its own variable.
+
+---
+
+## The cert env loop is `CERT_PARALLEL` wide — and that is NOT VALIDATED YET
+
+`phaseN_cert.sh` dispatches its 26 installs `CERT_PARALLEL` at a time
+(default **4**; `CERT_PARALLEL=1` reproduces the pre-2026-09-02 serial loop
+exactly), longest-first from `CERT_WALL_TABLE` — a previous cert's
+`memory_ledger.<job>.tsv`, used only for ordering, never for scoring. An env the
+table does not name sorts first. Set it in the SUBSTITUTE block:
+
+    CERT_PARALLEL=${CERT_PARALLEL:-4}
+    CERT_WALL_TABLE=$T/<last green cert>/artifacts/memory_ledger.<job>.tsv
+
+Each env gets its own subshell, its own `TMPDIR`, and its own row files under
+`artifacts/rows.<job>/<env>.{row,led,span}`. Nothing appends to a shared file
+while installs are in flight; the rows are concatenated in DECLARATION order
+after the last env finishes, so `cert_results.tsv` is byte-comparable with the
+serial format whatever order the envs ran in. A subshell that dies leaves no row,
+`cert_verdict.sh` reports `NOT_RUN`, and the job exits 1 — a short results file
+never passes quietly. The `.span` files give the concurrency ACTUALLY achieved
+(`artifacts/env_spans.<job>.tsv`, and the job prints peak and mean width).
+
+`CERT_SERIAL_KEY` (optional) names a results file from a previous run of the SAME
+lock; it is scored by a second `cert_verdict.sh` call whose exit is ANDed into the
+job's.
+
+### Three things the first proof run measured, and all three are warnings
+
+Job **`5658928`** ran `CERT_PARALLEL=4` against the already-certified bfinal lock
+with `bfinal-phase2/artifacts/cert_results.5597694.tsv` as the serial answer key.
+All 26 envs installed rc=0.
+
+1. **One scored field diverged — both verdict gates EXIT 1.** `pm-isaaclab` came
+   back `RED-verify` against the key's `AMBER-repaired` (25 of 26 rows match,
+   `hover-gpu`'s known `RED-tierA` included): inside that one env prefix,
+   `isaaclab-2.3x-pack` and the co-resident `protomotions-deps-pack` disagree on
+   `lxml`, `platformdirs` and `wandb` ("divergent co-resident pins — re-lock to
+   converge"). Three causes are confounded in that single run — the fan-out, this
+   template's move of the cert's package caches from job-scoped to persistent
+   (`retread_fast_env`, which the certified reference `bfinal_phase2.sh` did NOT
+   do), and a day of index drift, all three divergent versions being the newer
+   side. **Until `CERT_PARALLEL=1` has been run on a freshly staged workspace to
+   separate them, a `CERT_PARALLEL>1` result is unqualified for a release
+   decision.**
+
+2. **4 wide is 1.56×, not 4×.** Env-loop span 20 477 s → **13 111 s**, saving
+   **2 h 03 m**, against an LPT prediction of 5 123 s. The total install work grew
+   **2.26×** (20 477 s → 46 233 s) and **22 of 26 envs are past 2×** —
+   `tensorboard-tools` 68.5×, `test` 23.2×, `cpu` 13.4×, `unitree-rl-gym` 5.9×,
+   `flashsac-gpu` 4.7×. Concurrency achieved was **peak 4, mean 3.53** (width 4
+   for 66.5 % of the span), so the schedule is not the problem: these installs are
+   I/O bound — 108 GB read and 318 GB written per cert at 18.7 % of one core — and
+   four writers share the NFS write bandwidth rather than multiplying it. The
+   small envs suffer most because their wall is almost pure per-file NFS latency.
+   **The LPT makespans are an upper bound on the saving, not a forecast.** Peak
+   per-env RSS under fan-out was 1 249 420 K = 1.25 GB, *below* the serial worst
+   case, so the 32 G request is confirmed.
+
+3. **The loop had a join deadlock, and this run found it.** Bare `wait` also waits
+   for the `tee` of `exec > >(tee -a …)`, which never exits: job 5658928 had all
+   26 rows on disk at 01:55:39 and was still in `wait` when Slurm killed it at
+   02:16:57, producing no `cert_results.tsv`, no verdict and no cleanup job. The
+   loop now drains exactly the subshells it dispatched
+   (`while [ "$RUNNING" -gt 0 ]; do wait -n; RUNNING=$((RUNNING-1)); done`) and
+   never calls bare `wait`. Per-env row files are what saved the run: reassembling
+   `artifacts/rows.<job>/` in declaration order reproduced the full 26-row results
+   file after the timeout. **Never add a bare `wait` to a script that tees its own
+   stdout.**

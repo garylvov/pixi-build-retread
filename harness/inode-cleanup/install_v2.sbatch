@@ -13,7 +13,7 @@ B=/oscar/data/stellex/glvov/agrescap/tasks/retread-4-11/p6-inode-cleanup
 V1=$B/delete_stale_roots.sh; V2=$B/delete_stale_roots.v2.sh
 echo "### install_v2 job=$SLURM_JOB_ID start=$(date -Is) host=$(hostname)"
 LIVE=$(squeue -u glvov -h -t RUNNING,PENDING,CONFIGURING,COMPLETING \
-       -o "%i %j" | awk '$2 ~ /^p6-(sweep-[0-9]+|fu-)/ {print $1}' | tr '\n' ' ')
+       -o "%i %j" | awk '$2 ~ /^p6-(sweep|fu)-/ {print $1}' | tr '\n' ' ')
 if [ -n "$LIVE" ]; then
   echo "REFUSE: v1-invoking sweep jobs still non-terminal: $LIVE"; exit 4; fi
 echo "gate OK: no p6-sweep-*/p6-fu-* job is live"

@@ -67,3 +67,6 @@ Scripts and READMEs only. No logs, no `artifacts/`, no `.tsv` outputs, no
 evidence of a particular run, not the harness.
 
 `MANIFEST.md5` records the md5 of every file in this directory as committed.
+
+2026-09-03 02:22 synced FROM task dir (one-time); from here the repo is the
+source and the task dir is synced FROM it before each campaign.
