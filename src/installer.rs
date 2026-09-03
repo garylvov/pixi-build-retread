@@ -151,7 +151,20 @@ pub(crate) fn is_platform_tag_conflict(text: &str) -> bool {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    t.contains("matching platform tag") || (t.contains("platform tag") && t.contains("manylinux"))
+    // ANCHORED ON UV'S OWN PHRASE. This used to accept the disjunct
+    // `("platform tag" AND "manylinux")` anywhere in the text, which is a
+    // conjunction of two words that co-occur in ordinary uv DEBUG output. Once
+    // p6f gave the child uv `-v`, its streamed stderr carried
+    // `DEBUG Unknown platform tag in wheel tag: win_ia64` alongside dozens of
+    // routine `manylinux` mentions, and EVERY closure failure classified as a
+    // platform-tag rejection -- which `bail!`s before the workspace-fact and
+    // learned-fact yields can run. Measured on job 5683236's captured stderr:
+    // 3,762 of 3,774 lines were DEBUG; the real error was 696 bytes of prose
+    // containing neither phrase. The caller must ALSO hand this clean text
+    // (see `uv_closure::strip_child_log_lines`) -- both halves are needed, and
+    // this half is the one that must not be satisfiable by log noise.
+    t.contains("no wheels with a matching platform tag")
+        || (t.contains("matching platform tag") && t.contains("manylinux"))
 }
 
 /// Decide whether to relax the glibc/manylinux host gate after a uv install

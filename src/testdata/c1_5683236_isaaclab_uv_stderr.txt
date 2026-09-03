@@ -1,0 +1,57 @@
+warning: The `if-necessary-or-explicit` pre-release mode is deprecated and will be removed in a future release. Use `if-necessary` instead.
+DEBUG Using request connect timeout of 10s and read timeout of 30s
+Using CPython 3.11.16
+DEBUG Using request connect timeout of 10s and read timeout of 30s
+DEBUG Found static `pyproject.toml` for: retread-closure-isaaclab-2-3x-pack @ file:///oscar/data/stellex/glvov/retread/certC1A-5683236/g/fast-tmp/retread-glvov/479fc2eb1d61/job-5683236/caches/retread/uv-projects/isaaclab-2-3x-pack-py3.11-linux-64/v3/ac56143d254e659035e44766b9c4b37d0d0a5ee8a0119c8b2e7a8a9b0f76d736
+DEBUG Solving with installed Python version: 3.11.16
+DEBUG Solving with target Python version: ==3.11.*
+DEBUG Solving split (markers: python_full_version == '3.11.*' and platform_machine == 'x86_64' and sys_platform == 'linux') (requires-python: RequiresPython { specifiers: VersionSpecifiers([VersionSpecifier { operator: EqualStar, version: "3.11" }]), range: RequiresPythonRange(LowerBound(Included("3.11")), UpperBound(Excluded("3.12"))) })
+DEBUG Adding direct dependency: retread-closure-isaaclab-2-3x-pack*
+DEBUG Searching for a compatible version of retread-closure-isaaclab-2-3x-pack @ file:///oscar/data/stellex/glvov/retread/certC1A-5683236/g/fast-tmp/retread-glvov/479fc2eb1d61/job-5683236/caches/retread/uv-projects/isaaclab-2-3x-pack-py3.11-linux-64/v3/ac56143d254e659035e44766b9c4b37d0d0a5ee8a0119c8b2e7a8a9b0f76d736 (*)
+DEBUG Adding direct dependency: isaacsim[all]>=5.1.0, <5.1.0+
+DEBUG Adding direct dependency: isaacsim[extscache]>=5.1.0, <5.1.0+
+DEBUG Adding direct dependency: pin>=2.7.0, <2.7.0+
+DEBUG No cache entry for: https://pypi.org/simple/isaacsim/
+DEBUG Sending fresh GET request for: https://pypi.org/simple/isaacsim/
+DEBUG No cache entry for: https://py.mujoco.org/isaacsim/
+DEBUG Sending fresh GET request for: https://py.mujoco.org/isaacsim/
+DEBUG No cache entry for: https://pypi.nvidia.com/isaacsim/
+DEBUG Sending fresh GET request for: https://pypi.nvidia.com/isaacsim/
+DEBUG No cache entry for: https://pypi.nvidia.com/pin/
+DEBUG Sending fresh GET request for: https://pypi.nvidia.com/pin/
+DEBUG No cache entry for: https://py.mujoco.org/pin/
+DEBUG Sending fresh GET request for: https://py.mujoco.org/pin/
+DEBUG No cache entry for: https://pypi.org/simple/pin/
+DEBUG Sending fresh GET request for: https://pypi.org/simple/pin/
+DEBUG Searching for a compatible version of isaacsim[all] (>=5.1.0, <5.1.0+)
+DEBUG Selecting: isaacsim==5.1.0.0 [compatible] (isaacsim-5.1.0.0-cp311-none-manylinux_2_35_aarch64.whl)
+DEBUG Adding transitive dependency for isaacsim==5.1.0.0: isaacsim==5.1.0.0
+DEBUG Adding transitive dependency for isaacsim==5.1.0.0: isaacsim[all]==5.1.0.0
+DEBUG Searching for a compatible version of isaacsim (==5.1.0.0)
+DEBUG Selecting: isaacsim==5.1.0.0 [compatible] (isaacsim-5.1.0.0-cp311-none-manylinux_2_35_aarch64.whl)
+DEBUG No cache entry for: https://files.pythonhosted.org/packages/10/b0/5c520558add736a4e936820afd8ebb9ff9c76f75e0860cd033c796f26a9b/pin-2.7.0-4-cp311-cp311-macosx_11_0_arm64.whl.metadata
+DEBUG Sending fresh GET request for: https://files.pythonhosted.org/packages/10/b0/5c520558add736a4e936820afd8ebb9ff9c76f75e0860cd033c796f26a9b/pin-2.7.0-4-cp311-cp311-macosx_11_0_arm64.whl.metadata
+DEBUG No cache entry for: https://pypi.nvidia.com/isaacsim/isaacsim-5.1.0.0-cp311-none-manylinux_2_35_aarch64.whl
+DEBUG Sending fresh HEAD request for: https://pypi.nvidia.com/isaacsim/isaacsim-5.1.0.0-cp311-none-manylinux_2_35_aarch64.whl
+DEBUG Adding transitive dependency for isaacsim==5.1.0.0: isaacsim-kernel>=5.1.0.0, <5.1.0.0+
+DEBUG Searching for a compatible version of isaacsim[extscache] (>=5.1.0, <5.1.0+)
+DEBUG Selecting: isaacsim==5.1.0.0 [compatible] (isaacsim-5.1.0.0-cp311-none-manylinux_2_35_aarch64.whl)
+DEBUG Adding transitive dependency for isaacsim==5.1.0.0: isaacsim==5.1.0.0
+DEBUG Adding transitive dependency for isaacsim==5.1.0.0: isaacsim[extscache]==5.1.0.0
+DEBUG Searching for a compatible version of isaacsim[all] (==5.1.0.0)
+DEBUG Selecting: isaacsim==5.1.0.0 [compatible] (isaacsim-5.1.0.0-cp311-none-manylinux_2_35_aarch64.whl)
+DEBUG Adding transitive dependency for isaacsim==5.1.0.0: isaacsim-app>=5.1.0.0, <5.1.0.0+
+DEBUG Adding transitive dependency for isaacsim==5.1.0.0: isaacsim-asset>=5.1.0.0, <5.1.0.0+
+DEBUG Adding transitive dependency for isaacsim==5.1.0.0: isaacsim-benchmark>=5.1.0.0, <5.1.0.0+
+DEBUG Adding transitive dependency for isaacsim==5.1.0.0: isaacsim-code-editor>=5.1.0.0, <5.1.0.0+
+DEBUG Adding transitive dependency for isaacsim==5.1.0.0: isaacsim-core>=5.1.0.0, <5.1.0.0+
+DEBUG Unknown platform tag in wheel tag: win_ia64
+  × No solution found when resolving dependencies for split (markers:
+  │ python_full_version == '3.11.*' and platform_machine == 'x86_64' and
+  │ sys_platform == 'linux'):
+  ╰─▶ Because isaacsim-core==5.1.0.0 depends on packaging==23.0 and
+      packaging==26.3, we can conclude that isaacsim-core==5.1.0.0 cannot
+      be used.
+      And because isaacsim[all]==5.1.0.0 depends on isaacsim-core==5.1.0.0 and
+      your project depends on isaacsim[all]==5.1.0, we can conclude that your
+      project's requirements are unsatisfiable.
