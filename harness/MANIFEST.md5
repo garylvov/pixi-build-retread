@@ -19,7 +19,7 @@ c9302fafd5ee1123a695bfef4dfcaf72  inode-cleanup/install_v2.sbatch
 3d87f9e032fccf45383c9e7aa21211b9  instrumented/p6b_relock.b2.sh
 3d70e31e815daff7b8a42895fad59991  instrumented/p6b_relock.sh
 a2deab8ba099cc7a3055dc5e4f74da50  instrumented/p6b_stamp.py
-9a008aea227e1f6d84dab5110fa83645  phase_template/README.md
+e47b1d3172703de9e76ead27c87d45f3  phase_template/README.md
 ed155bdac121e36e9776d93491a333db  phase_template/cleanup.sh
 883d517a614357c59a463f8cdbd9ba4d  phase_template/expect_sha_gate_guard.sh
 992d975ad816f4b4b82a7056df2fa255  phase_template/leftover_check_guard.sh

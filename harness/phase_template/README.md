@@ -573,9 +573,12 @@ opposite of what it looked like.
 **The two "unexplained slow envs" were WIDTH, not link mode.** `5685818` ran
 alongside `5674559` (copy, `CERT_PARALLEL=1`) on the SAME node, the same day,
 against the same persistent cache, in the same dispatch order — so on the envs
-both have scored, the link mode is the only difference (8 of 26 as of 12:45;
-every env hl1 scores is added to this table as it lands, and the ratios have
-held from the first four):
+both have scored, the link mode is the only difference. This is FINAL at 8
+shared envs, not a snapshot: the copy job hit its 7 h wall clock at 12/26, and
+the hardlink job wedged on `robogen` at 8/26 (backend asleep holding its own
+job-scoped git-clone lock, prefix empty, CPU counters frozen -- upstream of
+anything a link mode controls, and it never reached wheel placement). The ratios
+held from the first four envs to the eighth:
 
 | env | hardlink N=1 | copy N=1 | wall | hardlink GB | copy GB | bytes |
 |---|---|---|---|---|---|---|
