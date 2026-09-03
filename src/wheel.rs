@@ -65,6 +65,38 @@ impl Drop for WheelStoreFillLock {
     }
 }
 
+/// Suffix of the per-entry first-fill lock created by
+/// [`acquire_wheel_store_fill_lock`].
+///
+/// The lock is created BEFORE the wheel exists -- that is the whole point of a
+/// first-fill lock -- so a store directory holding this file and no wheel is
+/// the ordinary in-flight state. It is a LOCK, never an artifact: nothing may
+/// ever select it as a wheel, and every store enumeration filters it out
+/// through [`is_wheel_store_fill_lock_name`]. Job 5688724 died opening a
+/// zero-byte one of these as if it were a wheel.
+pub(crate) const WHEEL_STORE_FILL_LOCK_SUFFIX: &str = ".retread-fill-v1.lock";
+
+/// The fill-lock filename for a wheel called `filename`.
+fn fill_lock_filename(filename: &str) -> String {
+    format!(".{filename}{WHEEL_STORE_FILL_LOCK_SUFFIX}")
+}
+
+/// Whether `name` is a first-fill lock sidecar rather than a store artifact.
+pub(crate) fn is_wheel_store_fill_lock_name(name: &str) -> bool {
+    name.starts_with('.') && name.ends_with(WHEEL_STORE_FILL_LOCK_SUFFIX)
+}
+
+/// The fill-lock path a store entry at `store_path` would use, so a reader can
+/// tell "nobody has filled this" from "somebody is filling this right now"
+/// without racing the filler.
+pub(crate) fn wheel_store_fill_lock_path(store_path: &Path) -> Option<PathBuf> {
+    let filename = store_path.file_name().and_then(|name| name.to_str())?;
+    if is_wheel_store_fill_lock_name(filename) {
+        return None;
+    }
+    Some(store_path.with_file_name(fill_lock_filename(filename)))
+}
+
 /// Serialize the first population of one content-addressed store entry across
 /// backend processes. The lock is intentionally per wheel, not global: sibling
 /// packs can still fetch different wheels concurrently, while contenders for a
@@ -81,7 +113,7 @@ async fn acquire_wheel_store_fill_lock(store_path: &Path) -> Result<WheelStoreFi
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| anyhow!("wheel store path has no UTF-8 filename"))?;
-    let lock_path = parent.join(format!(".{filename}.retread-fill-v1.lock"));
+    let lock_path = parent.join(fill_lock_filename(filename));
     tokio::task::spawn_blocking(move || {
         let file = std::fs::OpenOptions::new()
             .create(true)

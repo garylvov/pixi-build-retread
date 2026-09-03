@@ -9266,6 +9266,135 @@ fn cold_mismatch_recovery_disabled_for_ambiguous_identity() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// GUARD (iii) of p6i: a relaxation record that disagrees with the recomputed
+/// plan ONLY on the build string is a RECOMPUTE, not a refusal.
+///
+/// The fixture is job 5691063's and job 5698477-arm-A's exact shape, read off
+/// `c1-merged/a/artifacts/C1A-5698477.backend.log`:
+///
+/// ```text
+/// code=-32602: the current source plan has 0 exact matches for advertised
+/// output `protomotions-deps-pack`; refusing to build with a stale or
+/// ambiguous relaxation record.
+///   Requested: protomotions-deps-pack version=3.1
+///              build=`py311_hff66755995_loose_0` subdir=linux-64.
+///   Candidates considered: protomotions-deps-pack=3.1
+///              build=`py311_h62689b0ab4_loose_0` subdir=linux-64
+///              (identity differs)
+/// ```
+///
+/// Name, version and subdir all agree; only the build string moved -- and the
+/// build string is a digest over the resolution INPUTS, one of which is absent
+/// whenever the advertising `conda/outputs` came from a shared cache in
+/// another process. Before p6i that was reported as `identity differs`, which
+/// is the one verdict that skips Option D lock-parity recovery AND the
+/// recompute door, so it terminated in the `RpcError::invalid_params` that
+/// pixi's `build_dispatch.rs` panics on.
+///
+/// Falsifiable by mutation: fold the build string back into
+/// `output_identity_matches_ignoring_build` (the pre-p6i
+/// `output_matches_build_request`) and the `BuildStringDrift` assertion fails.
+#[test]
+fn a_build_string_only_drift_is_a_recompute_not_a_stale_relaxation_record() {
+    let (advertised_bundle, _) = advertised_and_drifted_bundles();
+    let output = emit_for_recovery(&advertised_bundle);
+
+    let exact = pixi_build_types::procedures::conda_build_v1::CondaBuildV1Output {
+        name: output.metadata.name.clone(),
+        version: Some(output.metadata.version.clone()),
+        build: Some(output.metadata.build.clone()),
+        subdir: output.metadata.subdir,
+        variant: output.metadata.variant.clone(),
+    };
+    assert_eq!(
+        cold_candidate_verdict(&output, &exact),
+        ColdCandidateVerdict::IdentityMatches,
+        "an identical output/request pair must still be an exact match",
+    );
+
+    // Same name, version and subdir; the build string moved, exactly as it did
+    // for protomotions-deps-pack=3.1.
+    let drifted_build = pixi_build_types::procedures::conda_build_v1::CondaBuildV1Output {
+        build: Some("py311_hff66755995_loose_0".to_string()),
+        ..exact.clone()
+    };
+    assert_ne!(
+        Some(&output.metadata.build),
+        drifted_build.build.as_ref(),
+        "the fixture must actually differ on the build string",
+    );
+    assert_eq!(
+        cold_candidate_verdict(&output, &drifted_build),
+        ColdCandidateVerdict::BuildStringDrift,
+        "a build-string-only drift must reach the recompute door, not `identity differs`",
+    );
+    assert!(
+        !output_matches_build_request(&output, &drifted_build),
+        "the exact gate itself is unchanged: a drifted build string is not a match",
+    );
+
+    // Non-vacuous: a genuinely different output must stay `IdentityDiffers`,
+    // so the split did not simply stop comparing identity.
+    let wrong_version = pixi_build_types::procedures::conda_build_v1::CondaBuildV1Output {
+        version: Some("999.0.0".parse::<rattler_conda_types::VersionWithSource>().unwrap()),
+        ..exact.clone()
+    };
+    assert_eq!(
+        cold_candidate_verdict(&output, &wrong_version),
+        ColdCandidateVerdict::IdentityDiffers,
+        "a version mismatch is a different package, never a recompute candidate",
+    );
+    let wrong_name = pixi_build_types::procedures::conda_build_v1::CondaBuildV1Output {
+        name: rattler_conda_types::PackageName::try_from("some-other-pack").unwrap(),
+        ..exact
+    };
+    assert_eq!(
+        cold_candidate_verdict(&output, &wrong_name),
+        ColdCandidateVerdict::IdentityDiffers,
+        "a name mismatch is a different package, never a recompute candidate",
+    );
+}
+
+/// The advertised-identity record's ADDRESS carries the relax rule, so a
+/// record written under one `retread-relax` policy can never answer a request
+/// resolved under another. `describes()` never compared the relax rule, so
+/// without this the stale record was adopted as authoritative for what the
+/// package emits.
+///
+/// Falsifiable by mutation: drop `relax_digest` from
+/// `advertised_identity::record_path`'s digest and the two paths become equal.
+#[test]
+fn the_advertised_identity_record_address_carries_the_relax_rule() {
+    use super::advertised_identity::{record_path, relax_digest};
+    let cache = std::path::Path::new("/tmp/retread-p6i-relax-cache");
+    let source = std::path::Path::new("/tmp/retread-p6i-relax-pack");
+    let mut patch = cfg();
+    patch.relax = crate::config::RelaxPolicy::Patch;
+    let mut minor = cfg();
+    minor.relax = crate::config::RelaxPolicy::Minor;
+    assert_ne!(relax_digest(&patch), relax_digest(&minor));
+    let under_patch = record_path(
+        cache,
+        source,
+        "protomotions-deps-pack",
+        "linux-64",
+        "py311_hff66755995_loose_0",
+        &relax_digest(&patch),
+    );
+    let under_minor = record_path(
+        cache,
+        source,
+        "protomotions-deps-pack",
+        "linux-64",
+        "py311_hff66755995_loose_0",
+        &relax_digest(&minor),
+    );
+    assert_ne!(
+        under_patch, under_minor,
+        "two relax rules must not share one record address",
+    );
+}
+
 // -----------------------------------------------------------------
 // fix/obs-rpc-errors: the JSON-RPC boundary must be LOUD.
 //
