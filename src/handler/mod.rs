@@ -5139,7 +5139,7 @@ impl Handler {
                     tracing::info!(
                         key = %key,
                         restored,
-                        "bench: built_output_store hit -- restored the adopted pass's advertised-identity records",
+                        "bench: built_output_store adopted -- restored the adopted pass's advertised-identity records",
                     );
                     self.invalidate_prepared_builds().await;
                     log_final_bundle_outputs(cached);
