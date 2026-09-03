@@ -92,7 +92,7 @@ retread_fast_env () {
     *) echo "retread_fast_env: REFUSING unexpected cache root $root" >&2; return 2;;
   esac
   local d
-  for d in uv rattler pixi verdicts built-outputs; do mkdir -p "$root/$d" || return 2; done
+  for d in uv rattler pixi verdicts built-outputs wheels; do mkdir -p "$root/$d" || return 2; done
 
   export PIXI_CACHE_DIR=$root/pixi
   export RATTLER_CACHE_DIR=$root/rattler
@@ -112,6 +112,41 @@ retread_fast_env () {
   # TRADE: an entry freezes the resolution that produced it, exactly as a lock
   # file does. Delete the directory to force fresh resolution; it is rebuildable.
   export RETREAD_BUILT_OUTPUT_STORE=$root/built-outputs
+
+  # THE IMPORT->DISTRIBUTION INDEX AUTHORITY. `courier::wheel_store_root_with`
+  # resolves RETREAD_WHEEL_STORE -> XDG_CACHE_HOME -> HOME/.cache, then joins
+  # "retread"/"wheels". Every harness on this campaign sets XDG_CACHE_HOME and
+  # HOME job-scoped, so the wheel store has started EMPTY in every job we have
+  # ever run and auto_imports naming ran on the curated map plus the fallback
+  # only. (The reason recorded in LANE-C-WARM-LOG section 7 -- "it lives under
+  # RETREAD_BUILD_ROOT / RETREAD_ARTIFACT_ROOT" -- was wrong twice over: those
+  # two names do not exist in the backend at all, and coverage was never 0.)
+  #
+  # MEASURED, section 9.4, one job, three arms over the same store:
+  #     arm OFF     store 0 entries before -> 225 after     8 of 309 indexed
+  #     arm ON      store 225 before       -> 233 after   222 of 411 indexed = 54%
+  # 222 of 411 against 5 of 317 in job 5655631. Names like evdev, hid,
+  # fast-simplification, alphashape and newton crossed from LEAD to INJECTABLE
+  # purely because the index could name them -- the lead/injectable partition
+  # is a function of the store's contents, not of the code.
+  #
+  # SAFE TO SHARE, and the reason is structural, not empirical: the store is a
+  # BLOB store keyed by content. Entries are <sha256>/<filename>, written
+  # temp+rename, so two jobs writing the same wheel write the same bytes to the
+  # same address and a partial write is never visible under a final name. The
+  # courier's own doc comment says blob stores stay shared. Nothing here is
+  # resolution state -- a wheel's sha256 does not depend on who fetched it.
+  #
+  # HELD until fix/p6d-digest-regression merged (that lane was root-causing the
+  # hermetic-toolchain failure and every harness sources this file, p6d's own
+  # confirmation relock included). p6d merged 2026-09-03; the hold is lifted.
+  #
+  # RESIDUAL, boarded not hidden (p6c's doc comment carries it too): the index
+  # is a genuine naming authority whose content is not knowable at cache-key
+  # time, so two injection-ON runs with differently warm stores can still share
+  # a decision key. It cannot cause ON/OFF confusion -- the gate is in the key --
+  # but it means an injection-ON verdict is a function of store warmth.
+  export RETREAD_WHEEL_STORE=$root/wheels
 
   # Measured as no help (805.0s -> 828.2s route-probe union). Opt-in only.
   if [ "${RETREAD_FAST_ENV_PARALLEL_PROBES:-0}" = 1 ]; then
