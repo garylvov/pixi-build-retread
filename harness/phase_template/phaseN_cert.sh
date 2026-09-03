@@ -190,11 +190,15 @@ LEFTOVER_RE='bfinal|BFP1|BFP2|bfp1|bfp2|b1c|b1-phase|b1b-phase|b2-phase|b2b-phas
 ### SUBSTITUTE: END
 
 ### LEFTOVER-CHECK BEGIN
+# The match runs INSIDE awk, on the LINE, never on "FILENAME:LNO: line". Piping
+# the annotated text to grep made the check match its own FILENAME: a harness in
+# a directory named after a previous batch failed against itself, on every line,
+# with the tokens nowhere in its body. A scan must not be able to match itself.
 LEFT=$(awk '
   /^### EVIDENCE BEGIN/       {e=1} /^### EVIDENCE END/       {e=0; next} e {next}
   /^### SUBSTITUTE: BEGIN/    {s=1} /^### SUBSTITUTE: END/    {s=0; next} s {next}
   /^### LEFTOVER-CHECK BEGIN/ {l=1} /^### LEFTOVER-CHECK END/ {l=0; next} l {next}
-  {print FILENAME ":" FNR ": " $0}' "$0" | grep -E "$LEFTOVER_RE")
+  $0 ~ re {print FILENAME ":" FNR ": " $0}' re="$LEFTOVER_RE" "$0")
 if [ -n "$LEFT" ]; then
   echo "### FATAL leftover-token self-check FAILED -- this harness still names a previous batch"
   printf '%s\n' "$LEFT"

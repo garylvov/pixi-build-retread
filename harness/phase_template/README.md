@@ -87,7 +87,14 @@ same node with the same manifest and the same binary.
    ```
    bash -n <newbatch>_relock.sh && bash -n <newbatch>_cert.sh
    bash tools/phase_template/expect_sha_gate_guard.sh    # after any gate edit
+   bash tools/phase_template/leftover_check_guard.sh     # after any check edit
    ```
+
+   > **The check matches the LINE, never "FILENAME:LNO: line".** It used to
+   > annotate first and pipe the annotated text to `grep`, so it matched its own
+   > FILENAME: a harness derived into `p6b-c3b/` failed against itself on every
+   > line, with the token nowhere in its body. Fixed 2026-09-03 by moving the
+   > match inside `awk`. A scan must not be able to match itself.
    Each script runs a leftover-token self-check as its *first* action and
    `exit 9`s on a hit. It strips three marked regions — `EVIDENCE` (the header),
    `SUBSTITUTE` (the constants), `LEFTOVER-CHECK` (itself) — and greps

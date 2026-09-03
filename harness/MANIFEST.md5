@@ -19,11 +19,12 @@ c9302fafd5ee1123a695bfef4dfcaf72  inode-cleanup/install_v2.sbatch
 3d87f9e032fccf45383c9e7aa21211b9  instrumented/p6b_relock.b2.sh
 3d70e31e815daff7b8a42895fad59991  instrumented/p6b_relock.sh
 a2deab8ba099cc7a3055dc5e4f74da50  instrumented/p6b_stamp.py
-8062b22d4c303a1a91fa423f4ee981b6  phase_template/README.md
+b3fcabac18c8a63f7e1cd81c1a53757d  phase_template/README.md
 ed155bdac121e36e9776d93491a333db  phase_template/cleanup.sh
 883d517a614357c59a463f8cdbd9ba4d  phase_template/expect_sha_gate_guard.sh
-ef2cbddee9846ac82635dae08fdffad0  phase_template/phaseN_cert.sh
-43e83fc8d78fe2288c0cccd4ada65a7c  phase_template/phaseN_relock.sh
+992d975ad816f4b4b82a7056df2fa255  phase_template/leftover_check_guard.sh
+e8eb290f8dddde37a5aaabf7b5376b4e  phase_template/phaseN_cert.sh
+199b531c513adb892d743b9600a537ce  phase_template/phaseN_relock.sh
 34f54e4d6fb24b3cc7b390669ce90993  tools/b2_attribute.sh
 7783cc47f9e8ad2503fd44950cd43013  tools/env_version_delta.py
 39e620e807735bdc65b09fb8078d8e82  tools/import_audit.py
