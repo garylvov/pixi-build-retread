@@ -383,6 +383,13 @@ fn built_output_store_key_for_outputs(
         .unwrap_or_else(|| "no-workspace".to_string());
     let source_manifest_digest = file_digest(&source_dir.join("pixi.toml"));
 
+    // The RESOLUTION POLICY. The stored payload is the POST-INJECTION
+    // `CondaOutputsResult`, so without this an injection-ON run publishes an
+    // injected `outputs.json` at exactly the address a later injection-OFF run
+    // computes, and the OFF run adopts it silently. See
+    // [`resolution_policy_fingerprint`].
+    let resolution_policy = resolution_policy_fingerprint();
+
     let mut hasher = Sha256::new();
     for part in [
         crate::built_output_store::SCHEMA,
@@ -391,6 +398,7 @@ fn built_output_store_key_for_outputs(
         &source_identity.to_string_lossy(),
         &workspace_manifest_digest,
         &source_manifest_digest,
+        &resolution_policy,
     ] {
         hasher.update((part.len() as u64).to_le_bytes());
         hasher.update(part.as_bytes());
@@ -8401,6 +8409,27 @@ impl Drop for BundleProbeGuard {
     }
 }
 
+/// The route-probe verdict cache's FILE-level validity key, as production
+/// computes it: the caller's policy fields plus the resolution-policy
+/// fingerprint.
+///
+/// The fingerprint is appended HERE, in the one function that builds this key,
+/// rather than at the call site, so there is a single place for the guard to
+/// hold: the entry key is the probe SPEC SET, and the auto-imports injection
+/// gate is exactly what changes that set, so an injection-ON run would
+/// otherwise write Sat/Unsat verdicts about injected names at an
+/// injection-OFF run's address. See [`resolution_policy_fingerprint`].
+fn verdict_cache_validity_key(
+    channels: &[String],
+    python: &str,
+    subdir: &str,
+    policy_fields: &[(&str, Vec<String>)],
+) -> String {
+    let mut fields: Vec<(&str, Vec<String>)> = policy_fields.to_vec();
+    fields.push(("resolution-policy", vec![resolution_policy_fingerprint()]));
+    crate::route_probe_cache::validity_key(channels, python, subdir, &fields)
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct CondaCoSolveContext {
     channels: Arc<[ChannelUrl]>,
@@ -8614,12 +8643,7 @@ impl CondaCoSolveContext {
                     .collect(),
             ),
         ];
-        let key = crate::route_probe_cache::validity_key(
-            &channels,
-            &self.python,
-            subdir,
-            &policy_fields,
-        );
+        let key = verdict_cache_validity_key(&channels, &self.python, subdir, &policy_fields);
         let path = crate::route_probe_cache::cache_path(
             cache_dir,
             self.bundle.as_str(),
@@ -13895,6 +13919,104 @@ fn checkout_root_for_entry(
 /// requirement is reported as `injected=false`.
 fn auto_imports_injection_enabled() -> bool {
     std::env::var("RETREAD_AUTO_IMPORTS").map(|v| v == "1").unwrap_or(false)
+}
+
+/// Revision tag for the resolve-time auto-imports BACK-OFF policy: what
+/// happens to the injected roots when the resolve they were injected into
+/// fails. Today that is "suppress injection for EVERY bundle in this request
+/// and retry once" (the [`AUTO_IMPORTS_SUPPRESS_ALL`] path). Two runs over
+/// the same manifest with the same gate state but different back-off policies
+/// can publish DIFFERENT resolved content, so this tag is folded into
+/// [`resolution_policy_fingerprint`] and must be bumped by hand whenever that
+/// behaviour changes.
+const AUTO_IMPORTS_BACKOFF_POLICY: &str = "v1-suppress-all-bundles-retry-once";
+
+/// Revision tag for the ordered screens in [`auto_imports_injection_verdict`]
+/// -- the decision procedure that turns a detected module into an injected
+/// root or a logged skip. Reordering or adding a screen changes what gets
+/// resolved without changing a single manifest byte, so it belongs in the
+/// fingerprint alongside the naming table. Bump by hand on any change to that
+/// function's screens.
+const AUTO_IMPORTS_VERDICT_POLICY: &str = "v1-own-sibling-abi-conda-curated-index";
+
+/// The RESOLUTION-POLICY FINGERPRINT that every persistent cache of a
+/// resolution DECISION must key on.
+///
+/// The defect this exists for (found by the Lane C warm-store run, recorded in
+/// `LANE-C-WARM-LOG.md`): two on-disk caches store post-injection decisions
+/// under keys derived from manifest bytes alone.
+///
+///   * the shared built-output store ([`built_output_store_key_for_outputs`])
+///     stores the post-injection `CondaOutputsResult`, so an injection-ON run
+///     publishes an INJECTED `outputs.json` under exactly the key a later
+///     injection-OFF run computes, and that run adopts it silently
+///     (`built_output_store hit -- adopting ...`);
+///   * the route-probe verdict cache ([`crate::route_probe_cache`]) stores
+///     Sat/Unsat verdicts whose ENTRY key is the probe spec set -- and the
+///     spec set is precisely what injection changes -- under a FILE-level
+///     validity key that never mentioned the gate.
+///
+/// Both are cross-contaminations in both directions. Folding this fingerprint
+/// into both keys puts ON and OFF at disjoint addresses, so neither arm can
+/// read or poison the other's entries.
+///
+/// WHAT IS IN IT, and why:
+///   * the gate state itself, always. This is the whole point.
+///   * with the gate ON only, a digest of everything that decides WHICH roots
+///     get injected without touching a manifest byte:
+///       - [`AUTO_IMPORTS_DISTRIBUTION_MAP`], the curated import->distribution
+///         table. It is consulted BEFORE the wheel-store index precisely so a
+///         verdict does not depend on cache warmth, which makes it the
+///         authoritative naming source; editing a row changes the injected
+///         root set for an unchanged manifest.
+///       - [`AUTO_IMPORTS_BACKOFF_POLICY`] and [`AUTO_IMPORTS_VERDICT_POLICY`],
+///         above.
+///     With the gate OFF nothing is injected, so none of these can move the
+///     result and folding them in would only invalidate OFF entries for free.
+///     That is what the `"off"` short-circuit is for: guard (ii) asserts two
+///     OFF runs agree.
+///
+/// WHAT WAS CONSIDERED AND DELIBERATELY LEFT OUT:
+///   * `RETREAD_PARALLEL_PROBES` -- scheduling only. It decides how many
+///     probe solves run at once, never which question is asked or what the
+///     answer is. Including it would split every cache in half for nothing.
+///   * [`AUTO_IMPORTS_NO_PYPI_DISTRIBUTION`] -- since the injection channel
+///     closed to unmapped guesses this list gates nothing; it only sharpens
+///     the REASON text in a skip log. Content is unaffected.
+///   * the user's `retread-name-map` / `retread-overrides` / `retread-python`
+///     -- these live in the manifest, whose bytes both keys already hash.
+///   * the wheel-store INDEX, screen (f) of the verdict. It is a genuine
+///     naming authority and its content is not knowable at key-computation
+///     time. It cannot cause the ON/OFF confusion this function fixes (with
+///     the gate OFF nothing is injected however warm the index is), but two
+///     injection-ON runs with differently-warm indexes remain able to share a
+///     key. Lane C measured index coverage at 0/264 rows in every job run so
+///     far, so nothing has been mis-shared through it yet; it is a residual,
+///     boarded rather than fixed here.
+///
+/// The value is a short, stable, human-readable string on purpose: it lands in
+/// the built-output key's hash input and in a route-probe policy field, and
+/// both are debugged by reading them.
+fn resolution_policy_fingerprint() -> String {
+    if !auto_imports_injection_enabled() {
+        return "auto-imports=off".to_string();
+    }
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"retread-resolution-policy-v1\0");
+    hasher.update(AUTO_IMPORTS_BACKOFF_POLICY.as_bytes());
+    hasher.update([0xffu8]);
+    hasher.update(AUTO_IMPORTS_VERDICT_POLICY.as_bytes());
+    hasher.update([0xffu8]);
+    for (module, distribution) in AUTO_IMPORTS_DISTRIBUTION_MAP {
+        hasher.update(module.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(distribution.as_bytes());
+        hasher.update([0u8]);
+    }
+    let digest = hasher.finalize();
+    let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    format!("auto-imports=on:{hex}")
 }
 
 /// Import names that provably have NO PyPI distribution of the same meaning:

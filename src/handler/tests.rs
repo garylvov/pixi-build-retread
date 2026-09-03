@@ -10623,3 +10623,105 @@ async fn built_output_store_hit_serves_the_same_result_a_cold_compute_produced()
         let _ = std::fs::remove_dir_all(dir);
     }
 }
+
+// -----------------------------------------------------------------
+// p6c: the auto-imports injection gate belongs in every persistent
+// DECISION key.
+//
+// Found by the Lane C warm-store run (LANE-C-WARM-LOG.md): both the
+// shared built-output store and the route-probe verdict cache stored
+// post-injection decisions under keys derived from manifest bytes
+// alone, so an injection-ON run published its results at exactly the
+// address an injection-OFF run computes -- and the OFF run adopted them
+// silently ("built_output_store hit -- adopting ...").
+// -----------------------------------------------------------------
+
+/// Guards (i) and (ii) together, over BOTH keys.
+///
+/// (i) One manifest, one workspace, one pack -- only the gate moves. The
+/// built-output store key and the route-probe validity key must BOTH change,
+/// so ON and OFF address disjoint entries in both caches and neither arm can
+/// read or poison the other's.
+///
+/// (ii) Two OFF runs must agree exactly. A fingerprint that folded in
+/// something volatile (a timestamp, a process id, the curated table even when
+/// nothing can be injected) would split the default arm's cache in half and
+/// cost every OFF run a cold compute -- an invalidation is only correct when a
+/// decision input actually moved.
+///
+/// This calls the REAL production key functions, and the route-probe half goes
+/// through `verdict_cache_validity_key`, the single function production uses to
+/// build that key -- so deleting the resolution-policy field from it fails
+/// here rather than passing against a re-declared local copy.
+#[test]
+fn p6c_persistent_decision_keys_separate_the_auto_imports_gate() {
+    const WS_MANIFEST: &str = "[workspace]\nname = \"p6c\"\n";
+    const PACK_MANIFEST: &str = "[package]\nname = \"p6c-pack\"\n";
+
+    let (ws, pack) = stage_store_key_workspace("p6c", WS_MANIFEST, PACK_MANIFEST, "packs/one");
+
+    let channels = vec!["https://prefix.dev/conda-forge/".to_string()];
+    let policy_fields: Vec<(&str, Vec<String>)> = vec![
+        ("channel-priority", vec!["Strict".to_string()]),
+        ("workspace-deps", vec!["numpy=>=1.26,<2".to_string()]),
+    ];
+    let validity = || verdict_cache_validity_key(&channels, "3.12", "linux-64", &policy_fields);
+
+    // Everything is measured under the lock and BEFORE any assert, so a
+    // failure cannot leave a developer's shell inheriting a clobbered switch.
+    let _env_guard = super::TEST_ENV_MUTEX.lock().unwrap();
+    let prior = std::env::var_os("RETREAD_AUTO_IMPORTS");
+
+    // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
+    unsafe { std::env::remove_var("RETREAD_AUTO_IMPORTS") };
+    let store_off_first = store_key_for(&ws, &pack);
+    let validity_off_first = validity();
+    let policy_off = resolution_policy_fingerprint();
+    let store_off_again = store_key_for(&ws, &pack);
+    let validity_off_again = validity();
+
+    // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
+    unsafe { std::env::set_var("RETREAD_AUTO_IMPORTS", "1") };
+    let store_on = store_key_for(&ws, &pack);
+    let validity_on = validity();
+    let policy_on = resolution_policy_fingerprint();
+
+    // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
+    match prior {
+        Some(value) => unsafe { std::env::set_var("RETREAD_AUTO_IMPORTS", value) },
+        None => unsafe { std::env::remove_var("RETREAD_AUTO_IMPORTS") },
+    }
+    let _ = std::fs::remove_dir_all(&ws);
+
+    // (ii) no spurious invalidation.
+    assert_eq!(
+        store_off_first, store_off_again,
+        "two gate-OFF runs over one manifest must compute ONE built-output store key"
+    );
+    assert_eq!(
+        validity_off_first, validity_off_again,
+        "two gate-OFF runs must compute ONE route-probe validity key"
+    );
+
+    // (i) the two arms are disjoint in both caches.
+    assert_ne!(
+        store_off_first, store_on,
+        "gate ON and gate OFF must not share a built-output store key: the stored \
+         payload is the POST-INJECTION outputs, so a shared key lets an OFF run \
+         adopt an injected result"
+    );
+    assert_ne!(
+        validity_off_first, validity_on,
+        "gate ON and gate OFF must not share a route-probe validity key: the entry \
+         key is the probe SPEC SET and injection is what changes it"
+    );
+
+    // The fingerprint itself stays legible -- it is read by hand out of a key
+    // input and a policy field when a hit is being explained.
+    assert_eq!(policy_off, "auto-imports=off");
+    assert!(
+        policy_on.starts_with("auto-imports=on:"),
+        "gate-ON fingerprint must name the gate and carry the policy digest, got {policy_on:?}"
+    );
+    assert_ne!(policy_off, policy_on);
+}
