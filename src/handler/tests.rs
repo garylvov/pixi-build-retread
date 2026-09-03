@@ -734,6 +734,8 @@ fn pythons_for_rejects_bare_major_variant() {
         pack_manifest_path: None,
         auto_imports: None,
         verify_snapshots: None,
+        path_source_metadata: None,
+        path_sources: Default::default(),
         parallel_probes: None,
     };
     let result = pythons_for(&cfg, Some(&variants));
@@ -790,6 +792,8 @@ fn pythons_for_accepts_dotted_variant() {
         pack_manifest_path: None,
         auto_imports: None,
         verify_snapshots: None,
+        path_source_metadata: None,
+        path_sources: Default::default(),
         parallel_probes: None,
     };
     let result = pythons_for(&cfg, Some(&variants));
@@ -846,6 +850,8 @@ fn pythons_for_filters_bare_major_keeps_dotted() {
         pack_manifest_path: None,
         auto_imports: None,
         verify_snapshots: None,
+        path_source_metadata: None,
+        path_sources: Default::default(),
         parallel_probes: None,
     };
     let result = pythons_for(&cfg, Some(&variants));
@@ -3621,6 +3627,8 @@ fn cfg() -> RetreadConfig {
         pack_manifest_path: None,
         auto_imports: None,
         verify_snapshots: None,
+        path_source_metadata: None,
+        path_sources: Default::default(),
         parallel_probes: None,
     }
 }
@@ -12013,4 +12021,113 @@ fn the_recompute_door_and_the_courier_build_gate_cannot_both_run() {
         Some(&reproducible_build),
     )
     .expect("the gate passes a build string that re-derives from the current inputs");
+/// p6m WIRING GUARD -- the one that fails when the call is deleted.
+///
+/// The materializer has its own unit guards in
+/// `crate::path_source_metadata::tests`, but a guard that only calls the
+/// helper stays green when production stops calling it -- exactly how p6k's
+/// first guard could not fail. This one drives the real `initialize` RPC and
+/// asserts against the file on disk, and it asserts BOTH directions: the
+/// declared source gains its `[project]` table, and with the gate absent the
+/// very same workspace is left untouched.
+#[tokio::test]
+async fn initialize_materializes_declared_path_source_metadata_and_the_gate_governs_it() {
+    fn fixture(label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "retread-p6m-init-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let rel = "third_party/pace-sim2real/source/pace_sim2real";
+        std::fs::create_dir_all(root.join(rel)).unwrap();
+        std::fs::write(
+            root.join("pixi.toml"),
+            format!(
+                "[workspace]\nchannels = []\n\n[pypi-dependencies]\npace_sim2real = {{ path = \"{rel}\", editable = true }}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(rel).join("pyproject.toml"),
+            "[build-system]\nrequires = [\"setuptools\", \"wheel\", \"toml\"]\nbuild-backend = \"setuptools.build_meta\"\n",
+        )
+        .unwrap();
+        let file = root.join(rel).join("pyproject.toml");
+        (root, file)
+    }
+
+    fn params(
+        root: &std::path::Path,
+        configuration: serde_json::Value,
+    ) -> pixi_build_types::procedures::initialize::InitializeParams {
+        pixi_build_types::procedures::initialize::InitializeParams {
+            manifest_path: root.join("pypi-packs/some-pack/pixi.toml"),
+            source_directory: Some(root.join("pypi-packs/some-pack")),
+            workspace_directory: Some(root.to_path_buf()),
+            cache_directory: Some(root.join("cache")),
+            project_model: None,
+            configuration: Some(configuration),
+            target_configuration: None,
+        }
+    }
+
+    let declared = serde_json::json!({
+        "retread-wheels": { "placeholder": { "version": "==1.0.0" } },
+        "retread-path-source-metadata": true,
+        "retread-path-sources": {
+            "pace_sim2real": {
+                "path": "third_party/pace-sim2real/source/pace_sim2real",
+                "version": "0.1.2",
+                "requires-python": ">=3.10",
+                "dependencies": ["psutil", "cmaes"],
+                "dynamic": ["description", "classifiers"],
+            }
+        },
+    });
+
+    // ON: initialize writes the overlay.
+    let (root, file) = fixture("on");
+    let before = std::fs::read_to_string(&file).unwrap();
+    Handler::new()
+        .initialize(params(&root, declared.clone()))
+        .await
+        .expect("initialize failed");
+    let after = std::fs::read_to_string(&file).unwrap();
+    assert!(
+        after.starts_with(&before),
+        "the overlay must be append-only, got:\n{after}"
+    );
+    let parsed: toml::Value = toml::from_str(&after).unwrap();
+    let project = parsed
+        .get("project")
+        .expect("initialize did not materialize the [project] table");
+    assert_eq!(project.get("version").unwrap().as_str().unwrap(), "0.1.2");
+    assert_eq!(
+        project.get("requires-python").unwrap().as_str().unwrap(),
+        ">=3.10"
+    );
+
+    // OFF (key absent): the same workspace is left byte-identical.
+    let (root_off, file_off) = fixture("off");
+    let untouched = std::fs::read_to_string(&file_off).unwrap();
+    let mut gate_off = declared.clone();
+    let obj = gate_off.as_object_mut().unwrap();
+    obj.remove("retread-path-source-metadata");
+    obj.remove("retread-path-sources");
+    Handler::new()
+        .initialize(params(&root_off, gate_off))
+        .await
+        .expect("initialize failed");
+    assert_eq!(
+        std::fs::read_to_string(&file_off).unwrap(),
+        untouched,
+        "the gate is off and the tree was still written"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&root_off);
 }

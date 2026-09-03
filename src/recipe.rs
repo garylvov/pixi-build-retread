@@ -1544,6 +1544,8 @@ mod tests {
             pack_manifest_path: None,
             auto_imports: None,
             verify_snapshots: None,
+            path_source_metadata: None,
+            path_sources: Default::default(),
             parallel_probes: None,
         }
     }

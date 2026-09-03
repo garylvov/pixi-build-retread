@@ -223,6 +223,51 @@ pub struct RetreadConfig {
     #[serde(default, rename = "retread-parallel-probes", alias = "parallel-probes")]
     pub parallel_probes: Option<bool>,
 
+    /// Materialize static PEP 621 metadata for the workspace's local PyPI
+    /// **path sources**, so pixi's own (frontend) resolver never runs a PEP
+    /// 517 metadata build for them.
+    ///
+    /// `None` (the key absent) is OFF, so merging this changes no existing
+    /// lock. There is deliberately no env var: the facts and the switch both
+    /// belong to the pack that declares them.
+    ///
+    /// ```toml
+    /// [build.config]
+    /// retread-path-source-metadata = true
+    /// ```
+    ///
+    /// See [`crate::path_source_metadata`] for what is written, where, and
+    /// the four refusals.
+    #[serde(
+        default,
+        rename = "retread-path-source-metadata",
+        alias = "path-source-metadata"
+    )]
+    pub path_source_metadata: Option<bool>,
+
+    /// The path sources this pack's workspace declares, keyed by
+    /// distribution name — the producer behind
+    /// `retread-path-source-metadata`.
+    ///
+    /// Each record is what a PEP 517 metadata build of that tree produces
+    /// today; retread cross-checks it against the tree's own
+    /// `*.egg-info/PKG-INFO` when one is present and refuses to write when
+    /// the two disagree.
+    ///
+    /// ```toml
+    /// [build.config]
+    /// retread-path-source-metadata = true
+    ///
+    /// [build.config.retread-path-sources.pace_sim2real]
+    /// path = "third_party/pace-sim2real/source/pace_sim2real"
+    /// version = "0.1.2"
+    /// requires-python = ">=3.10"
+    /// dependencies = ["psutil", "cmaes"]
+    /// dynamic = ["description", "classifiers", "keywords", "authors", "maintainers", "license"]
+    /// ```
+    #[serde(default, rename = "retread-path-sources", alias = "path-sources")]
+    pub path_sources: BTreeMap<String, crate::path_source_metadata::PathSourceEntry>,
+
     /// PyPI -> conda name mapping overrides on top of the built-in identity
     /// mapping. Use for the common drift cases (`opencv-python-headless` ->
     /// `py-opencv`, etc.).
