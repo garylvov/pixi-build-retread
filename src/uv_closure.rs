@@ -6430,6 +6430,119 @@ fn built_source_validation_key(
     Some(format!("{:x}", hasher.finalize()))
 }
 
+/// C12: how many built-wheel sources are validated at once. Each unit is one
+/// read-only strict read of one multi-gigabyte wheel, so the bound is the
+/// point where more readers stop buying throughput on one filesystem, not a
+/// CPU count. Kept a constant deliberately: it must not be settable per run,
+/// because a validation that behaves differently between two runs cannot be
+/// used to prove two locks identical.
+const BUILT_SOURCE_VALIDATION_PARALLELISM: usize = 4;
+
+/// One built-wheel source that passed every validation check, carrying exactly
+/// the three values the caller folds into the closure fingerprint plus the
+/// canonicalized path it writes back into the request.
+struct ValidatedBuiltSource {
+    canonical_name: String,
+    path: PathBuf,
+    path_text: String,
+    sha256: String,
+}
+
+/// Validate ONE built-wheel source. Extracted from `validate_built_wheel_sources`
+/// so the sources can be validated on a bounded pool; the body is the serial
+/// loop's body, unchanged, and it reads only the one file it is given.
+fn validate_one_built_wheel_source(
+    requested_name: &str,
+    path: &Path,
+    explicit_pin: Option<&str>,
+    target: &ResolutionTarget,
+) -> Result<ValidatedBuiltSource> {
+    if !path.is_absolute() {
+        bail!(
+            "built-wheel source `{requested_name}` must be an absolute path, got {}",
+            path.display(),
+        );
+    }
+    let path = std::fs::canonicalize(path).with_context(|| {
+        format!(
+            "canonicalizing built-wheel source `{requested_name}` at {}",
+            path.display(),
+        )
+    })?;
+    if !path.is_file() {
+        bail!(
+            "built-wheel source `{requested_name}` is missing or not a regular file: {}",
+            path.display()
+        );
+    }
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("built-wheel source path has no UTF-8 filename"))?;
+    if crate::pypi::score_wheel(filename, target.wheel_target()) < 0 {
+        bail!(
+            "built-wheel source `{requested_name}` has incompatible artifact `{filename}` for python {} on {}",
+            target.python_version(),
+            target.conda_subdir(),
+        );
+    }
+    let (filename_name, filename_version) = crate::pypi::wheel_filename_identity(filename)
+        .ok_or_else(|| anyhow!("built-wheel source has invalid PEP 427 filename `{filename}`"))?;
+    let requested_name_canonical = canonical_conda_name(requested_name);
+    if canonical_conda_name(&filename_name) != requested_name_canonical {
+        bail!(
+            "built-wheel source identity mismatch: request names `{requested_name_canonical}` but filename names `{filename_name}`"
+        );
+    }
+    // bench (measurement only): read_metadata_strict decompresses every ZIP
+    // member, so its cost tracks the wheel's on-disk size. Record both.
+    let source_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    let read_metadata_started = std::time::Instant::now();
+    let metadata = crate::wheel::read_metadata_strict(&path)
+        .with_context(|| format!("validating built-wheel source {}", path.display()))?;
+    tracing::info!(
+        source = %requested_name_canonical,
+        path = %path.display(),
+        bytes = source_bytes,
+        elapsed_ms = read_metadata_started.elapsed().as_millis() as u64,
+        "bench: built-wheel source metadata read",
+    );
+    if canonical_conda_name(&metadata.name) != requested_name_canonical {
+        bail!(
+            "built-wheel source identity mismatch: request names `{requested_name_canonical}` but METADATA names `{}`",
+            metadata.name,
+        );
+    }
+    let metadata_version = uv_pep508::uv_pep440::Version::from_str(&metadata.version)
+        .with_context(|| {
+            format!(
+                "invalid built-wheel METADATA version `{}`",
+                metadata.version
+            )
+        })?;
+    if metadata_version != filename_version {
+        bail!(
+            "built-wheel source version mismatch: filename has `{filename_version}` but METADATA has `{metadata_version}`"
+        );
+    }
+    if let Some(expected_version) = explicit_pin {
+        let expected_version = uv_pep508::uv_pep440::Version::from_str(expected_version)
+            .with_context(|| format!("invalid built-wheel pin `{expected_version}`"))?;
+        if expected_version != metadata_version {
+            bail!(
+                "built-wheel source `{requested_name_canonical}` is `{metadata_version}` but the explicit pin requires `{expected_version}`"
+            );
+        }
+    }
+    let path_text = path.to_string_lossy().into_owned();
+    Ok(ValidatedBuiltSource {
+        canonical_name: requested_name_canonical,
+        path,
+        path_text,
+        sha256: metadata.sha256,
+    })
+}
+
 fn validate_built_wheel_sources(
     req: &mut UvClosureRequest,
     target: &ResolutionTarget,
@@ -6456,99 +6569,94 @@ fn validate_built_wheel_sources(
     }
 
     let sources = std::mem::take(&mut req.built_wheel_sources);
+    // C12: every check below is read-only and touches exactly one source
+    // file, and `read_metadata_strict` -- which inflates every ZIP member --
+    // dominates all of them. The sources are therefore validated on a bounded
+    // pool instead of one after another. Nothing about the RESULT changes:
+    // the requested order is preserved end to end, the fingerprint is folded
+    // in that order after the pool joins, and the error returned is the one
+    // belonging to the FIRST failing source in that order -- which is exactly
+    // what the serial loop returned. No worker writes anything.
+    let ordered: Vec<(String, PathBuf)> = sources.into_iter().collect();
+    let pins: Vec<Option<String>> = ordered
+        .iter()
+        .map(|(requested_name, _)| {
+            req.explicit_pins
+                .get(&canonical_conda_name(requested_name))
+                .cloned()
+        })
+        .collect();
+    let workers = BUILT_SOURCE_VALIDATION_PARALLELISM.min(ordered.len());
+    let mut validated: Vec<(usize, Result<ValidatedBuiltSource>)> = if workers <= 1 {
+        ordered
+            .iter()
+            .enumerate()
+            .map(|(index, (requested_name, path))| {
+                (
+                    index,
+                    validate_one_built_wheel_source(
+                        requested_name,
+                        path,
+                        pins[index].as_deref(),
+                        target,
+                    ),
+                )
+            })
+            .collect()
+    } else {
+        let ordered_ref = &ordered;
+        let pins_ref = &pins;
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..workers)
+                .map(|worker| {
+                    scope.spawn(move || {
+                        // Static stride assignment: worker `w` owns indices
+                        // w, w+workers, ... Each index is owned by exactly one
+                        // worker, so no two workers ever touch one source.
+                        let mut local = Vec::new();
+                        let mut index = worker;
+                        while index < ordered_ref.len() {
+                            let (requested_name, path) = &ordered_ref[index];
+                            local.push((
+                                index,
+                                validate_one_built_wheel_source(
+                                    requested_name,
+                                    path,
+                                    pins_ref[index].as_deref(),
+                                    target,
+                                ),
+                            ));
+                            index += workers;
+                        }
+                        local
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|handle| {
+                    handle
+                        .join()
+                        .expect("built-wheel source validation worker panicked")
+                })
+                .collect()
+        })
+    };
+    validated.sort_by_key(|(index, _)| *index);
     let mut normalized_sources = BTreeMap::new();
     let mut fingerprint = Sha256::new();
     fingerprint.update(b"retread-built-wheel-sources-v1\0");
-    for (requested_name, path) in sources {
-        if !path.is_absolute() {
-            bail!(
-                "built-wheel source `{requested_name}` must be an absolute path, got {}",
-                path.display(),
-            );
-        }
-        let path = std::fs::canonicalize(&path).with_context(|| {
-            format!(
-                "canonicalizing built-wheel source `{requested_name}` at {}",
-                path.display(),
-            )
-        })?;
-        if !path.is_file() {
-            bail!(
-                "built-wheel source `{requested_name}` is missing or not a regular file: {}",
-                path.display()
-            );
-        }
-        let filename = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| anyhow!("built-wheel source path has no UTF-8 filename"))?;
-        if crate::pypi::score_wheel(filename, target.wheel_target()) < 0 {
-            bail!(
-                "built-wheel source `{requested_name}` has incompatible artifact `{filename}` for python {} on {}",
-                target.python_version(),
-                target.conda_subdir(),
-            );
-        }
-        let (filename_name, filename_version) = crate::pypi::wheel_filename_identity(filename)
-            .ok_or_else(|| {
-                anyhow!("built-wheel source has invalid PEP 427 filename `{filename}`")
-            })?;
-        let requested_name_canonical = canonical_conda_name(&requested_name);
-        if canonical_conda_name(&filename_name) != requested_name_canonical {
-            bail!(
-                "built-wheel source identity mismatch: request names `{requested_name_canonical}` but filename names `{filename_name}`"
-            );
-        }
-        // bench (measurement only): read_metadata_strict decompresses every ZIP
-        // member, so its cost tracks the wheel's on-disk size. Record both.
-        let source_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        let read_metadata_started = std::time::Instant::now();
-        let metadata = crate::wheel::read_metadata_strict(&path)
-            .with_context(|| format!("validating built-wheel source {}", path.display()))?;
-        tracing::info!(
-            source = %requested_name_canonical,
-            path = %path.display(),
-            bytes = source_bytes,
-            elapsed_ms = read_metadata_started.elapsed().as_millis() as u64,
-            "bench: built-wheel source metadata read",
-        );
-        if canonical_conda_name(&metadata.name) != requested_name_canonical {
-            bail!(
-                "built-wheel source identity mismatch: request names `{requested_name_canonical}` but METADATA names `{}`",
-                metadata.name,
-            );
-        }
-        let metadata_version = uv_pep508::uv_pep440::Version::from_str(&metadata.version)
-            .with_context(|| {
-                format!(
-                    "invalid built-wheel METADATA version `{}`",
-                    metadata.version
-                )
-            })?;
-        if metadata_version != filename_version {
-            bail!(
-                "built-wheel source version mismatch: filename has `{filename_version}` but METADATA has `{metadata_version}`"
-            );
-        }
-        if let Some(expected_version) = req.explicit_pins.get(&requested_name_canonical) {
-            let expected_version = uv_pep508::uv_pep440::Version::from_str(expected_version)
-                .with_context(|| format!("invalid built-wheel pin `{expected_version}`"))?;
-            if expected_version != metadata_version {
-                bail!(
-                    "built-wheel source `{requested_name_canonical}` is `{metadata_version}` but the explicit pin requires `{expected_version}`"
-                );
-            }
-        }
-        let path_text = path.to_string_lossy().into_owned();
+    for (index, outcome) in validated {
+        let source = outcome?;
         for value in [
-            requested_name_canonical.as_bytes(),
-            path_text.as_bytes(),
-            metadata.sha256.as_bytes(),
+            source.canonical_name.as_bytes(),
+            source.path_text.as_bytes(),
+            source.sha256.as_bytes(),
         ] {
             fingerprint.update((value.len() as u64).to_be_bytes());
             fingerprint.update(value);
         }
-        normalized_sources.insert(requested_name, path);
+        normalized_sources.insert(ordered[index].0.clone(), source.path);
     }
     req.built_wheel_sources = normalized_sources;
     let fingerprint = format!("{:x}", fingerprint.finalize());
@@ -7631,6 +7739,135 @@ isaaclab = { path = "wheels/isaaclab/isaaclab-2.0.0-py3-none-any.whl" }
         let target = ResolutionTarget::from_parts("3.12", "linux-64", None);
         let error = validate_built_wheel_sources(&mut req, &target).unwrap_err();
         assert!(format!("{error:#}").contains("identity mismatch"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// C12 guard. `validate_built_wheel_sources` validates its sources on a
+    /// bounded pool. The pool may not change one byte of what the serial loop
+    /// produced, so this runs FOUR sources -- more than the pool's own width
+    /// is allowed to collapse to one -- and compares both halves of the
+    /// result against a reference folded by hand, in request order, from the
+    /// same per-source function the workers call.
+    ///
+    /// Three non-vacuity arms, because a guard that cannot fail is a defect:
+    /// the pool must actually have been entered (>1 worker over >1 unit);
+    /// the comparison must be able to SEE a difference (one changed payload
+    /// moves the fingerprint); and order must survive failure (with two bad
+    /// sources, the error returned is the EARLIER one in request order,
+    /// exactly as the serial loop bailed).
+    #[test]
+    fn built_wheel_source_pool_is_byte_identical_to_the_serial_fold() {
+        use sha2::{Digest, Sha256};
+
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-uv-built-pool-{}-{}",
+            std::process::id(),
+            CLOSURE_META_TMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let target = ResolutionTarget::from_parts("3.12", "linux-64", None);
+        let names = ["alpha", "bravo", "charlie", "delta"];
+        let mut paths = Vec::new();
+        for (index, name) in names.iter().enumerate() {
+            let wheel = tmp.join(format!("{name}-1.0-py3-none-any.whl"));
+            write_built_source_test_wheel_with_payload(
+                &wheel,
+                name,
+                "1.0",
+                format!("payload-{index}").as_bytes(),
+            );
+            paths.push(wheel);
+        }
+
+        // NON-VACUITY 1: the pool branch is the one under test. With four
+        // units and a width above one, `workers` is above one, so the serial
+        // fallback inside the function is NOT what ran.
+        assert!(
+            BUILT_SOURCE_VALIDATION_PARALLELISM.min(names.len()) > 1,
+            "this guard is vacuous unless more than one worker runs",
+        );
+
+        // The reference: the same per-source function, called one at a time,
+        // in request (BTreeMap) order, folded exactly as the caller folds it.
+        let mut reference_fingerprint = Sha256::new();
+        reference_fingerprint.update(b"retread-built-wheel-sources-v1\0");
+        let mut reference_sources = BTreeMap::new();
+        for (name, path) in names.iter().zip(paths.iter()) {
+            let source =
+                validate_one_built_wheel_source(name, path, None, &target).expect("serial source");
+            for value in [
+                source.canonical_name.as_bytes(),
+                source.path_text.as_bytes(),
+                source.sha256.as_bytes(),
+            ] {
+                reference_fingerprint.update((value.len() as u64).to_be_bytes());
+                reference_fingerprint.update(value);
+            }
+            reference_sources.insert((*name).to_string(), source.path);
+        }
+        let reference_fingerprint = format!("{:x}", reference_fingerprint.finalize());
+
+        let mut pooled = sample_request();
+        pooled.built_wheel_sources.clear();
+        for (name, path) in names.iter().zip(paths.iter()) {
+            pooled
+                .built_wheel_sources
+                .insert((*name).to_string(), path.clone());
+        }
+        let pooled_fingerprint = validate_built_wheel_sources(&mut pooled, &target).unwrap();
+        assert_eq!(
+            pooled_fingerprint, reference_fingerprint,
+            "the pool must fold the same fingerprint as the serial reference",
+        );
+        assert_eq!(
+            pooled.built_wheel_sources, reference_sources,
+            "the pool must write back the same normalized sources",
+        );
+
+        // NON-VACUITY 2: the comparison can see a difference. Change one
+        // source's bytes and the same comparison must now FAIL to match the
+        // fingerprint recorded above.
+        write_built_source_test_wheel_with_payload(&paths[2], names[2], "1.0", b"moved payload");
+        let mut moved = sample_request();
+        moved.built_wheel_sources.clear();
+        for (name, path) in names.iter().zip(paths.iter()) {
+            moved
+                .built_wheel_sources
+                .insert((*name).to_string(), path.clone());
+        }
+        let moved_fingerprint = validate_built_wheel_sources(&mut moved, &target).unwrap();
+        assert_ne!(
+            moved_fingerprint, reference_fingerprint,
+            "a changed source payload must move the fingerprint; otherwise this guard proves nothing",
+        );
+
+        // NON-VACUITY 3: failure keeps request order. Two sources are wrong,
+        // and the error must name the EARLIER one -- `bravo`, not `delta`.
+        let bad_early = tmp.join("bravo-1.0-py3-none-any.whl");
+        write_built_source_test_wheel_with_payload(&bad_early, "notbravo", "1.0", b"x");
+        let bad_late = tmp.join("delta-1.0-py3-none-any.whl");
+        write_built_source_test_wheel_with_payload(&bad_late, "notdelta", "1.0", b"y");
+        let mut failing = sample_request();
+        failing.built_wheel_sources.clear();
+        for (name, path) in names.iter().zip(paths.iter()) {
+            failing
+                .built_wheel_sources
+                .insert((*name).to_string(), path.clone());
+        }
+        let error = format!(
+            "{:#}",
+            validate_built_wheel_sources(&mut failing, &target).unwrap_err()
+        );
+        assert!(
+            error.contains("notbravo"),
+            "the first failing source in request order must be the reported one, got: {error}",
+        );
+        assert!(
+            !error.contains("notdelta"),
+            "a later failure must not win over an earlier one, got: {error}",
+        );
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
