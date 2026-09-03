@@ -170,6 +170,23 @@ struct CanonicalGitTagState {
     refs: Vec<CanonicalGitTagRef>,
 }
 
+/// Identity of the FILE a strict wheel attestation was taken over.
+///
+/// Deliberately `dev`+`inode`+`size`+`mtime` and NOT `ctime`. A wheel here
+/// lives on shared, hardlinked storage: staging is `cp -al` out of a
+/// persistent mirror, so one inode is simultaneously the mirror's file and
+/// every concurrent job's workspace file. `ctime` moves whenever that inode's
+/// LINK COUNT moves, so any sibling job staging or tearing down its own
+/// workspace rewrites this field of a file it never opened -- an observation
+/// about other processes, not about the artifact. Job `5717348` died on
+/// exactly that: `isaacsim_extscache_kit-6.0.0.1` (5.9 GB, ~85 s of strict
+/// reading) was declared "changed while it was strictly validated" with size
+/// and mtime byte-identical across the window and only `ctime` moved, by
+/// `p18-depadd` (`5698573`) staging from the same mirror key at 14:25.
+///
+/// Rewrites are still caught: an in-place rewrite moves `mtime` (and normally
+/// `size`), and a replacement moves `inode`. The authoritative SHA-256 is
+/// computed inside the same window regardless.
 #[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -179,8 +196,6 @@ struct WheelFileFingerprint {
     size: u64,
     modified_seconds: i64,
     modified_nanoseconds: i64,
-    changed_seconds: i64,
-    changed_nanoseconds: i64,
 }
 
 #[cfg(unix)]
@@ -1057,8 +1072,8 @@ fn wheel_file_fingerprint(path: &Path) -> Result<WheelFileFingerprint> {
         size: metadata.size(),
         modified_seconds: metadata.mtime(),
         modified_nanoseconds: metadata.mtime_nsec(),
-        changed_seconds: metadata.ctime(),
-        changed_nanoseconds: metadata.ctime_nsec(),
+        // No `ctime`: see `WheelFileFingerprint`. A sibling job's hardlink
+        // moves it on a file nobody wrote.
     })
 }
 
@@ -1087,7 +1102,9 @@ fn raw_file_sha256(path: &Path) -> Result<String> {
 /// while the exact Unix inode/stat tuple remains unchanged. This avoids
 /// repeatedly inflating multi-gigabyte direct wheels while retaining the
 /// authoritative SHA/name/version/target checks. Any replacement or in-place
-/// mutation changes inode/ctime and forces a fresh strict scan.
+/// mutation changes the inode or the mtime and forces a fresh strict scan;
+/// a link/unlink by another job does not, because these wheels are hardlinked
+/// across jobs by design (see [`WheelFileFingerprint`]).
 pub(crate) async fn validate_pinned_wheel_for_target_async(
     path: &Path,
     target: &ResolutionTarget,
@@ -9464,6 +9481,113 @@ version = "0.1.0"
         assert!(
             wheel.is_file(),
             "semantic hash mismatch must preserve ingress bytes"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A sibling job linking or unlinking the wheel moves its `ctime` and
+    /// nothing else. That must not read as "the artifact changed": these
+    /// wheels are hardlinked across concurrent jobs by construction (staging
+    /// is `cp -al` out of a shared mirror). Job `5717348` died on this.
+    #[cfg(unix)]
+    #[test]
+    fn wheel_fingerprint_tracks_content_not_link_count() {
+        let base = unique_test_dir("wheel-fingerprint-links");
+        std::fs::create_dir_all(&base).unwrap();
+        let wheel = base.join("pkg-1.0.0-py3-none-any.whl");
+        write_test_wheel_with_payload(&wheel, "pkg", "1.0.0", b"payload-one");
+        let before = wheel_file_fingerprint(&wheel).unwrap();
+
+        let sibling = base.join("sibling-workspace.whl");
+        std::fs::hard_link(&wheel, &sibling).unwrap();
+        assert_eq!(
+            std::fs::metadata(&wheel).unwrap().len(),
+            std::fs::metadata(&sibling).unwrap().len(),
+        );
+        assert_eq!(
+            wheel_file_fingerprint(&wheel).unwrap(),
+            before,
+            "another job LINKING the wheel is not a change to the wheel",
+        );
+        std::fs::remove_file(&sibling).unwrap();
+        assert_eq!(
+            wheel_file_fingerprint(&wheel).unwrap(),
+            before,
+            "another job UNLINKING its copy is not a change to the wheel",
+        );
+
+        // Non-vacuity: a real rewrite of the bytes still moves the fingerprint.
+        write_test_wheel_with_payload(&wheel, "pkg", "1.0.0", b"payload-two-is-longer");
+        assert_ne!(
+            wheel_file_fingerprint(&wheel).unwrap(),
+            before,
+            "a rewritten wheel must still be seen as changed",
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The same defect end to end, through the production entry point, with a
+    /// sibling hammering the link count for the whole strict window instead of
+    /// once before it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pinned_wheel_validation_survives_a_sibling_linking_the_wheel() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+        let base = unique_test_dir("pinned-attestation-links");
+        std::fs::create_dir_all(&base).unwrap();
+        let wheel = base.join("pkg-1.0.0-py3-none-any.whl");
+        // Unique bytes so no earlier run's attestation can serve this one, and
+        // big enough that the strict window is real wall time to race with.
+        let mut payload = format!(
+            "sibling-link-{}-{}\n",
+            std::process::id(),
+            BUILD_TMP_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        )
+        .into_bytes();
+        payload.resize(16 * 1024 * 1024, 0x5a);
+        write_test_wheel_with_payload(&wheel, "pkg", "1.0.0", &payload);
+        let target =
+            ResolutionTarget::from_parts("3.11", crate::glibc::current_pixi_platform(), None);
+        let expected = ExpectedWheel::exact("pkg", "1.0.0");
+        let authoritative = crate::wheel::read_metadata(&wheel).unwrap().sha256;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let sibling_stop = Arc::clone(&stop);
+        let sibling_source = wheel.clone();
+        let sibling_link = base.join("sibling-workspace.whl");
+        let sibling = std::thread::spawn(move || {
+            let mut links: u64 = 0;
+            while !sibling_stop.load(AtomicOrdering::Relaxed) {
+                let _ = std::fs::remove_file(&sibling_link);
+                if std::fs::hard_link(&sibling_source, &sibling_link).is_ok() {
+                    links += 1;
+                }
+            }
+            let _ = std::fs::remove_file(&sibling_link);
+            links
+        });
+
+        let validated = validate_pinned_wheel_for_target_async(
+            &wheel,
+            &target,
+            &expected,
+            &authoritative,
+            "https://example.invalid/pkg-1.0.0.whl",
+        )
+        .await;
+        stop.store(true, AtomicOrdering::Relaxed);
+        let links = sibling.join().unwrap();
+
+        assert!(
+            links > 0,
+            "the sibling never linked the wheel; the guard would be vacuous",
+        );
+        assert_eq!(
+            validated.unwrap(),
+            authoritative,
+            "strict validation must survive {links} sibling links",
         );
         let _ = std::fs::remove_dir_all(&base);
     }
