@@ -10790,9 +10790,13 @@ async fn built_output_store_hit_serves_the_same_result_a_cold_compute_produced()
         outputs: Default::default(),
         input_globs: Default::default(),
     };
-    let payload =
-        crate::built_output_store::encode(&key_a.inputs_digest, backend_build_identity(), &result)
-            .unwrap();
+    let payload = crate::built_output_store::encode(
+        &key_a.inputs_digest,
+        backend_build_identity(),
+        &result,
+        &Vec::<AdvertisedIdentityRecord>::new(),
+    )
+    .unwrap();
     assert_eq!(
         store.get(&key_a.key).0,
         crate::built_output_store::Lookup::Miss,
@@ -10811,15 +10815,16 @@ async fn built_output_store_hit_serves_the_same_result_a_cold_compute_produced()
         crate::built_output_store::Lookup::Hit,
         "a fresh workspace with identical content must hit the shared store"
     );
-    let value = crate::built_output_store::decode(&bytes.unwrap(), &key_b.inputs_digest)
+    let accepted = crate::built_output_store::decode(&bytes.unwrap(), &key_b.inputs_digest)
         .expect("a record this backend wrote must be accepted by this backend");
-    let adopted: CondaOutputsResult = serde_json::from_value(value).unwrap();
+    let adopted: CondaOutputsResult = serde_json::from_value(accepted.payload).unwrap();
     assert_eq!(adopted.outputs.len(), result.outputs.len());
     assert_eq!(
         crate::built_output_store::encode(
             &key_b.inputs_digest,
             backend_build_identity(),
-            &adopted
+            &adopted,
+            &Vec::<AdvertisedIdentityRecord>::new(),
         )
         .unwrap(),
         payload,
@@ -11009,6 +11014,7 @@ fn c11_an_emission_schema_bump_is_a_miss() {
         &before.inputs_digest,
         backend_build_identity(),
         &serde_json::json!({"outputs": []}),
+        &serde_json::json!([]),
     )
     .unwrap();
     assert!(
@@ -11017,6 +11023,117 @@ fn c11_an_emission_schema_bump_is_a_miss() {
     );
 
     let _ = std::fs::remove_dir_all(ws);
+}
+
+/// C11 / p19 follow-on: a store ADOPTION must leave the same
+/// `advertised_identity` records a cold compute leaves.
+///
+/// `conda/build_v1`'s `validate_advertised_courier_build` reads exactly this
+/// record and can only `Err`. Job 5723770 (`p19-depadd`) adopted 14 of 14
+/// outputs from the shared store, wrote no record, and then refused to build:
+/// `courier inputs changed between conda/outputs and conda/build_v1 ... pixi
+/// requested build py311_h2cb6c52e99_loose_5, but current inputs ... require
+/// py311_h8ea3313da6_loose_5`. C11 makes adoptions reachable ACROSS binaries,
+/// so this stops being an occasional race and becomes the normal path.
+///
+/// Drives the real production writer through the real production restore
+/// function and reads back with the real production loader.
+#[tokio::test]
+async fn c11_an_adopted_output_restores_the_cold_passs_advertised_identity() {
+    let root = std::env::temp_dir().join(format!(
+        "retread-c11-adv-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    let cache_dir = root.join("cache");
+    let source_dir = root.join("pack");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    std::fs::create_dir_all(&source_dir).unwrap();
+    let config = cfg();
+
+    let record = AdvertisedIdentityRecord {
+        schema: advertised_identity::SCHEMA,
+        name: "isaaclab-2-3x-pack".to_string(),
+        version: "0.54.2".to_string(),
+        build: "py311_h2cb6c52e99_loose_5".to_string(),
+        subdir: "linux-64".to_string(),
+        target_identity: ResolutionTarget::for_subdir("3.11", "linux-64").resolution_identity(),
+        python_version: "3.11".to_string(),
+        workspace_fp: "the-producing-workspace-fingerprint".to_string(),
+        run_depends: vec!["python 3.11.*".to_string()],
+        run_constrains: vec![],
+    };
+
+    // The record travels inside the store record, exactly as production
+    // publishes and adopts it.
+    let bytes = crate::built_output_store::encode(
+        "digest",
+        backend_build_identity(),
+        &serde_json::json!({"outputs": []}),
+        &vec![record.clone()],
+    )
+    .unwrap();
+    let accepted = crate::built_output_store::decode(&bytes, "digest").unwrap();
+    let carried: Vec<AdvertisedIdentityRecord> =
+        serde_json::from_value(accepted.advertised).unwrap();
+    assert_eq!(carried, vec![record.clone()], "the record must survive the store");
+
+    // NON-VACUITY: before the restore, the loader finds nothing -- so a pass
+    // that skipped it really would leave `conda/build_v1` with no record.
+    let relax = advertised_identity::relax_digest(&config);
+    assert!(
+        advertised_identity::load_record(
+            &cache_dir,
+            &source_dir,
+            &record.name,
+            Some(&record.version),
+            &record.subdir,
+            &record.build,
+            &record.target_identity,
+            &record.python_version,
+            &relax,
+        )
+        .await
+        .is_none(),
+        "the fixture must start with no record, or the guard proves nothing"
+    );
+
+    let restored =
+        restore_advertised_identities(&cache_dir, &source_dir, &config, &carried).await;
+    assert_eq!(restored, 1);
+
+    let loaded = advertised_identity::load_record(
+        &cache_dir,
+        &source_dir,
+        &record.name,
+        Some(&record.version),
+        &record.subdir,
+        &record.build,
+        &record.target_identity,
+        &record.python_version,
+        &relax,
+    )
+    .await
+    .expect("an adopted output must leave the record conda/build_v1 reads");
+    assert_eq!(
+        loaded, record,
+        "the restored record must be the one the cold pass advertised"
+    );
+    assert!(
+        loaded.describes(
+            &record.name,
+            Some(&record.version),
+            &record.subdir,
+            &record.target_identity,
+            &record.python_version,
+        ),
+        "the restored record must satisfy the check conda/build_v1 applies"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 // -----------------------------------------------------------------

@@ -158,13 +158,35 @@ pub struct Record {
     /// used to buy by making the entry unreachable.
     pub produced_by: String,
     pub payload: serde_json::Value,
+    /// The `advertised_identity` records the COLD compute wrote as a side
+    /// effect of producing `payload`.
+    ///
+    /// A store hit returns before that loop runs, so without these an adopted
+    /// output leaves no record and `conda/build_v1` re-derives the build string
+    /// from the ADOPTING workspace's live inputs — job 5723770 (`p19-depadd`,
+    /// `hit=14 miss=0`) died exactly there, on `courier inputs changed between
+    /// conda/outputs and conda/build_v1`. Carrying them in the record is what
+    /// makes an adoption leave the same on-disk state a cold compute leaves.
+    /// `serde(default)` so the field is additive within this schema.
+    #[serde(default)]
+    pub advertised: serde_json::Value,
+}
+
+/// A record this reader accepted: the payload plus the cold pass's side
+/// effects, which the caller must restore before it can behave as if it had
+/// computed the payload itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Accepted {
+    pub payload: serde_json::Value,
+    pub advertised: serde_json::Value,
 }
 
 /// Wrap a payload for publication.
-pub fn encode<T: serde::Serialize>(
+pub fn encode<T: serde::Serialize, A: serde::Serialize>(
     inputs_digest: &str,
     produced_by: &str,
     payload: &T,
+    advertised: &A,
 ) -> Result<Vec<u8>, serde_json::Error> {
     let record = Record {
         schema: SCHEMA.to_string(),
@@ -172,13 +194,14 @@ pub fn encode<T: serde::Serialize>(
         inputs_digest: inputs_digest.to_string(),
         produced_by: produced_by.to_string(),
         payload: serde_json::to_value(payload)?,
+        advertised: serde_json::to_value(advertised)?,
     };
     serde_json::to_vec(&record)
 }
 
 /// Unwrap a stored record, refusing anything whose stamped identity does not
 /// match this reader. A refusal never yields the payload.
-pub fn decode(bytes: &[u8], expected_inputs_digest: &str) -> Result<serde_json::Value, Refusal> {
+pub fn decode(bytes: &[u8], expected_inputs_digest: &str) -> Result<Accepted, Refusal> {
     let record: Record = serde_json::from_slice(bytes).map_err(|_| Refusal::Undecodable)?;
     if record.schema != SCHEMA {
         return Err(Refusal::Schema {
@@ -195,7 +218,10 @@ pub fn decode(bytes: &[u8], expected_inputs_digest: &str) -> Result<serde_json::
             found: record.inputs_digest,
         });
     }
-    Ok(record.payload)
+    Ok(Accepted {
+        payload: record.payload,
+        advertised: record.advertised,
+    })
 }
 
 /// The payload filename inside an entry.
@@ -536,15 +562,28 @@ mod tests {
 
     #[test]
     fn a_record_from_another_schema_or_emission_or_input_set_is_refused() {
-        let good = encode("digest-a", "1.2.3+deadbeef", &serde_json::json!({"outputs": []}))
-            .unwrap();
+        let good = encode(
+            "digest-a",
+            "1.2.3+deadbeef",
+            &serde_json::json!({"outputs": []}),
+            &serde_json::json!([{"name": "pack", "build": "py311_hdeadbeef_loose_5"}]),
+        )
+        .unwrap();
 
         // Positive control first: the honest round trip must work, or every
         // refusal below is trivially satisfiable.
+        let accepted = decode(&good, "digest-a").unwrap();
         assert_eq!(
-            decode(&good, "digest-a").unwrap(),
+            accepted.payload,
             serde_json::json!({"outputs": []}),
             "a record this reader wrote must decode to exactly its payload"
+        );
+        // The cold pass's side effects travel with the payload, or an adoption
+        // is not equivalent to the compute it stands in for (job 5723770).
+        assert_eq!(
+            accepted.advertised,
+            serde_json::json!([{"name": "pack", "build": "py311_hdeadbeef_loose_5"}]),
+            "the advertised-identity records must survive the round trip"
         );
 
         let tamper = |field: &str, value: &str| {
@@ -594,8 +633,13 @@ mod tests {
     fn the_producing_binary_is_recorded_but_never_gates_acceptance() {
         // The git hash left the KEY; it must still be readable off an entry,
         // and it must not be able to refuse one -- that was the whole trade.
-        let bytes = encode("digest-a", "9.9.9+cafebabe", &serde_json::json!({"outputs": []}))
-            .unwrap();
+        let bytes = encode(
+            "digest-a",
+            "9.9.9+cafebabe",
+            &serde_json::json!({"outputs": []}),
+            &serde_json::json!([]),
+        )
+        .unwrap();
         let record: Record = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(record.produced_by, "9.9.9+cafebabe");
         assert!(

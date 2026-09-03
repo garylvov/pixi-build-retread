@@ -537,6 +537,30 @@ fn built_output_store_key_from_material(material: &[String]) -> BuiltOutputStore
     }
 }
 
+/// Re-write the `advertised_identity` records a cold compute would have left,
+/// after adopting that compute's result from the shared store.
+///
+/// The store hit returns from `conda_outputs` before the emission loop runs, so
+/// every side effect of that loop that a LATER RPC reads has to be restored
+/// here or the adoption is not equivalent to the compute. `conda/build_v1`'s
+/// `validate_advertised_courier_build` reads exactly this record and can only
+/// `Err`: job 5723770 adopted 14 of 14 outputs and then refused to build with
+/// `courier inputs changed between conda/outputs and conda/build_v1`, because
+/// it re-derived the build string from the ADOPTING workspace's live sibling
+/// locks. Returns how many records were restored so the caller can log it.
+async fn restore_advertised_identities(
+    cache_dir: &std::path::Path,
+    source_dir: &std::path::Path,
+    config: &RetreadConfig,
+    records: &[AdvertisedIdentityRecord],
+) -> usize {
+    let relax_digest = advertised_identity::relax_digest(config);
+    for record in records {
+        advertised_identity::write_record(cache_dir, source_dir, record, &relax_digest).await;
+    }
+    records.len()
+}
+
 /// Load a memoized [`CondaOutputsResult`] from disk. Returns `None` on
 /// any failure (missing file, unreadable, stale schema) so the caller
 /// always has a safe cold-compute fallback -- this is a pure speed
@@ -5054,15 +5078,29 @@ impl Handler {
             // anything else is a miss with a named reason. This is what makes
             // it safe for the key to have stopped folding the git hash.
             let mut refusal: Option<crate::built_output_store::Refusal> = None;
+            let mut adopted_advertised: Vec<AdvertisedIdentityRecord> = Vec::new();
             let cached = payload.as_deref().and_then(|bytes| {
                 match crate::built_output_store::decode(bytes, &store_key.inputs_digest) {
-                    Ok(value) => match serde_json::from_value::<CondaOutputsResult>(value) {
-                        Ok(result) => Some(result),
-                        Err(_) => {
-                            refusal = Some(crate::built_output_store::Refusal::Undecodable);
-                            None
+                    Ok(accepted) => {
+                        match serde_json::from_value::<CondaOutputsResult>(accepted.payload) {
+                            Ok(result) => {
+                                // The cold pass's side effects travel with the
+                                // payload; an adoption that skipped them would
+                                // be a hit that a later RPC refuses.
+                                adopted_advertised = serde_json::from_value::<
+                                    Vec<AdvertisedIdentityRecord>,
+                                >(
+                                    accepted.advertised
+                                )
+                                .unwrap_or_default();
+                                Some(result)
+                            }
+                            Err(_) => {
+                                refusal = Some(crate::built_output_store::Refusal::Undecodable);
+                                None
+                            }
                         }
-                    },
+                    }
                     Err(why) => {
                         refusal = Some(why);
                         None
@@ -5091,6 +5129,18 @@ impl Handler {
                                 requires_prepared_plan: false,
                             },
                         );
+                    let restored = restore_advertised_identities(
+                        &cache_dir,
+                        &source_dir,
+                        &config,
+                        &adopted_advertised,
+                    )
+                    .await;
+                    tracing::info!(
+                        key = %key,
+                        restored,
+                        "bench: built_output_store hit -- restored the adopted pass's advertised-identity records",
+                    );
                     self.invalidate_prepared_builds().await;
                     log_final_bundle_outputs(cached);
                     return Ok(cached.clone());
@@ -5213,6 +5263,10 @@ impl Handler {
         let mut outputs = Vec::new();
         let mut output_conflicts = Vec::new();
         let mut pending_output_relaxations = Vec::new();
+        // Every `advertised_identity` record this cold pass writes, so the
+        // shared built-output store can carry them and an adopting run can
+        // reproduce them. See `built_output_store::Record::advertised`.
+        let mut published_advertised_identities: Vec<AdvertisedIdentityRecord> = Vec::new();
         // Lane C ABI back-off state, shared across every python version and
         // emission in this request: a bundle suppressed once stays suppressed,
         // which is also the termination proof (the set only grows, and each
@@ -5785,10 +5839,7 @@ impl Handler {
                     // recomputes a different workspace fingerprint, gets a
                     // different build string, and refuses to build.
                     if courier_build_hash.is_some() {
-                        advertised_identity::write_record(
-                            &cache_dir,
-                            &source_dir,
-                            &AdvertisedIdentityRecord {
+                        let advertised_record = AdvertisedIdentityRecord {
                                 schema: advertised_identity::SCHEMA,
                                 name: output.metadata.name.as_normalized().to_string(),
                                 version: output.metadata.version.to_string(),
@@ -5808,13 +5859,25 @@ impl Handler {
                                     .iter()
                                     .map(format_package_spec_line)
                                     .collect(),
-                                run_constrains: output
-                                    .run_dependencies
-                                    .constraints
-                                    .iter()
-                                    .map(format_constraint_spec)
-                                    .collect(),
-                            },
+                            run_constrains: output
+                                .run_dependencies
+                                .constraints
+                                .iter()
+                                .map(format_constraint_spec)
+                                .collect(),
+                        };
+                        // Also carried into the shared built-output store, so
+                        // an ADOPTING run leaves the same record this cold pass
+                        // leaves. Without it `conda/build_v1` re-derives the
+                        // build string from the adopting workspace's live
+                        // inputs and refuses -- job 5723770, `hit=14 miss=0`,
+                        // `courier inputs changed between conda/outputs and
+                        // conda/build_v1`.
+                        published_advertised_identities.push(advertised_record.clone());
+                        advertised_identity::write_record(
+                            &cache_dir,
+                            &source_dir,
+                            &advertised_record,
                             &advertised_identity::relax_digest(&config),
                         )
                         .await;
@@ -5910,6 +5973,7 @@ impl Handler {
                     &store_key.inputs_digest,
                     backend_build_identity(),
                     &result,
+                    &published_advertised_identities,
                 ) {
                     Ok(bytes) => match store.publish(key, &bytes) {
                         Ok(true) => tracing::info!(
