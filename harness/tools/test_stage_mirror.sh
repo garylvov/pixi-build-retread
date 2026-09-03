@@ -38,6 +38,17 @@ head -c 300000 /dev/urandom           > "$P/wheels/.retread-wheel-fetch/v1/sha25
 echo 'stamp v1'                       > "$P/wheels/.retread-wheel-fetch/v1/sha256/cc/demo-1.0-py3-none-any.whl.retread-cache"
 head -c 200000 /dev/urandom           > "$P/wheels/demo/.retread-source-wheels/v12/aa/bb/demo-1.0.injected.whl"
 echo 'tp' > "$SRC/third_party/ProtoMotions/deep/er/file.txt"
+# The egg-info a relock rewrites IN PLACE. This is the shape of the seven files
+# that reached /oscar/data/stellex/glvov/imprint-data on 2026-09-02/03: an
+# editable path dependency's setuptools metadata, living inside third_party,
+# which the old stage_break_links PRUNED and the old stage_build_mirror
+# `cp -al`'d, so one inode was shared by the workspace, the mirror AND the
+# read-only canonical tree.
+mkdir -p "$SRC/third_party/ProtoMotions/protomotions.egg-info"
+EGG=third_party/ProtoMotions/protomotions.egg-info/SOURCES.txt
+printf 'setup.py\nprotomotions/__init__.py\n'   > "$SRC/$EGG"
+printf 'protomotions\n'                          > "$SRC/third_party/ProtoMotions/protomotions.egg-info/top_level.txt"
+head -c 2000000 /dev/urandom > "$SRC/third_party/ProtoMotions/deep/er/payload.bin"   # a large immutable blob
 echo 'gitobj' > "$SRC/.git/objects/pack/p.pack"
 echo 'srcfile' > "$SRC/src/mod.py"      # depth 2 -- the shallow-file regression
 echo 'rootfile' > "$SRC/AGENTS.md"     # depth 1 -- ditto
@@ -83,8 +94,14 @@ simulate_lock () {   # exactly the four in-place writers the source audit named
   # and one ATOMIC writer, which must be harmless even while hardlinked
   local t=$w/pypi-packs/demo-pack/wheels/demo/.retread-source-wheels/v12/aa/bb
   head -c 200000 /dev/urandom > "$t/.tmp.whl" && mv -f "$t/.tmp.whl" "$t/demo-1.0.injected.whl"
+  # AND the setuptools egg_info rewrite -- truncate-and-write THROUGH the inode,
+  # which is the write that reached imprint-data.
+  printf 'setup.py\nprotomotions/__init__.py\nprotomotions/new_module.py\n' > "$w/$EGG"
+  printf 'protomotions\n' > "$w/third_party/ProtoMotions/protomotions.egg-info/top_level.txt"
   echo 'lockfile' > "$w/pixi.lock"
 }
+EGG_ORIG='setup.py
+protomotions/__init__.py'
 
 echo "=== 1. mirror build + hit + break-links, then a simulated lock ==="
 run_stage break || { echo "FATAL: staging failed"; exit 2; }
@@ -105,6 +122,14 @@ check "progress log is NOT shared"         "$(stat -c %h "$WSB/pypi-packs/demo-p
 check "probe trace is NOT shared"          "$(stat -c %h "$WSB/pypi-packs/demo-pack/retread-probe-trace-demo-pack.json")" 1
 check "audit json is NOT shared"           "$(stat -c %h "$WSB/pypi-packs/demo-pack/retread-audit-demo-pack.json")" 1
 check ".retread-cache stamp is NOT shared" "$(stat -c %h "$WSB/pypi-packs/demo-pack/wheels/.retread-wheel-fetch/v1/sha256/cc/demo-1.0-py3-none-any.whl.retread-cache")" 1
+# --- the 2026-09-03 hardlink-write-through defect -------------------------------
+check "MIRROR egg-info is NOT shared with SOURCE" "$([ "$(stat -c %i "$MIR/$EGG")" != "$(stat -c %i "$SRC/$EGG")" ] && echo yes)" yes
+check "MIRROR big blob is NOT shared with SOURCE" "$([ "$(stat -c %i "$MIR/third_party/ProtoMotions/deep/er/payload.bin")" != "$(stat -c %i "$SRC/third_party/ProtoMotions/deep/er/payload.bin")" ] && echo yes)" yes
+check "WORKSPACE egg-info is NOT shared"          "$(stat -c %h "$WSB/$EGG")" 1
+check "WORKSPACE big blob IS still shared"        "$([ "$(stat -c %h "$WSB/third_party/ProtoMotions/deep/er/payload.bin")" -ge 2 ] && echo yes)" yes
+DJ=$( . "$FUNCS" >/dev/null 2>&1; SRC_WS=$SRC; stage_assert_mirror_disjoint "$MIR" )
+echo "$DJ" | sed 's/^/    /'
+check "stage_assert_mirror_disjoint passes"       "$(echo "$DJ" | grep -c 'shared 0 (want 0)')" 1
 
 simulate_lock "$WSB"
 OUT=$( . "$FUNCS" >/dev/null 2>&1; A=$ROOT/artifacts J=TEST$$ TAG=T; stage_verify_mirror "$MIR" )
@@ -115,6 +140,8 @@ check "mirror progress log still one line"     "$(wc -l < "$MIR/pypi-packs/demo-
 check "mirror was NOT quarantined"             "$([ -d "$MIR" ] && echo yes)" yes
 check "SOURCE tree untouched (probe trace)"    "$(cat "$SRC/pypi-packs/demo-pack/retread-probe-trace-demo-pack.json")" '{"probe":"old"}'
 check "SOURCE tree untouched (progress log)"   "$(wc -l < "$SRC/pypi-packs/demo-pack/retread-progress-demo-pack.log")" 1
+check "SOURCE egg-info byte-identical"         "$(cat "$SRC/$EGG")" "$EGG_ORIG"
+check "MIRROR egg-info byte-identical"         "$(cat "$MIR/$EGG")" "$EGG_ORIG"
 
 echo "=== 2. THE GUARD MUST BE ABLE TO FAIL: same run WITHOUT stage_break_links ==="
 run_stage nobreak || { echo "FATAL: staging failed"; exit 2; }
@@ -125,6 +152,12 @@ OUT2=$( . "$FUNCS" >/dev/null 2>&1; A=$ROOT/artifacts J=TEST$$ TAG=T; stage_veri
 echo "$OUT2" | sed 's/^/    /'
 check "verify DETECTS the poisoned mirror" "$(echo "$OUT2" | grep -c 'the mirror CHANGED under this job')" 1
 check "and QUARANTINES it"                 "$(ls -d "$MIR".DIRTY-* >/dev/null 2>&1 && echo yes)" yes
+# Even with the break sweep skipped, the SOURCE must survive: the mirror is a
+# real copy, so an unbroken workspace link can only reach the mirror. That is
+# the second layer, and it is the one that keeps imprint-data safe when the
+# write-set list is (as it was) incomplete.
+check "SOURCE egg-info STILL byte-identical after an UNBROKEN relock" "$(cat "$SRC/$EGG")" "$EGG_ORIG"
+check "SOURCE progress log STILL one line"                            "$(wc -l < "$SRC/pypi-packs/demo-pack/retread-progress-demo-pack.log")" 1
 
 echo
 if [ "$FAIL" = 0 ]; then echo "ALL GREEN"; else echo "SOME CHECKS FAILED"; fi

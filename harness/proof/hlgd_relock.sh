@@ -95,14 +95,14 @@ set -uo pipefail
 # Every campaign-specific constant in this harness lives here. Nothing below
 # this block names a previous batch; the self-check right after it enforces that.
 
-TAG=PHASEN                                   # short batch tag; roots become certPHASEN-<job> / ws.PHASEN-<job>
+TAG=HLGD                                     # short batch tag; roots become certHLGD-<job> / ws.HLGD-<job>
 T=/oscar/data/stellex/glvov/agrescap/tasks/retread-4-11
-D=$T/phase-template-example                  # THIS harness's own directory (artifacts land in $D/artifacts)
+D=$T/p18-hardlink-guard                      # THIS harness's own directory (artifacts land in $D/artifacts)
 
 # --- the manifest under test -------------------------------------------------
 SRC_WS=/oscar/data/stellex/glvov/imprint-data           # READ-ONLY canonical source tree
-CLEANED=$T/b1-scratch/pixi.toml.EXAMPLE                 # the scratch manifest this batch locks
-EXPECT_CLEANED_MD5=00000000000000000000000000000000     # md5sum of $CLEANED
+CLEANED=$D/pixi.toml.canonical                          # the CANONICAL manifest, byte-copied, nothing deleted
+EXPECT_CLEANED_MD5=9711eb990bfe211d498d1635a60e0d07     # md5sum of $CLEANED
 EXPECT_MANIFEST_LINES=1003                              # wc -l of $CLEANED
 EXPECT_DEL=0                                            # diff SRC_WS/pixi.toml CLEANED : '< ' lines
 EXPECT_ADD=0                                            # diff SRC_WS/pixi.toml CLEANED : '> ' lines
@@ -127,7 +127,7 @@ BASE_LOCK=$SRC_WS/pixi.lock                              # baseline for the occu
 
 # --- toolchain ---------------------------------------------------------------
 PIXI=/users/glvov/.pixi/bin/pixi.real                    # bypass the flock shim
-SNAP=$T/p4l-cert-p4k/artifacts/p4k-binsnap/pixi-build-retread
+SNAP=$T/binsnaps/p6d-afd87d6/pixi-build-retread
 # OPTIONAL pin. Leave EMPTY and the gate DERIVES the sha from $SNAP at run
 # time. Set it only to assert a specific binary, and then it MUST match.
 # It used to be a mandatory second constant beside SNAP, and on 2026-09-03 a
@@ -256,19 +256,6 @@ BACKEND=$SNAP
 # lock starts; stage_verify_mirror() re-walks the mirror manifest afterwards, so
 # a write that escaped the break-list is caught rather than silently poisoning
 # the mirror for the next batch. That pair is the reader for this writer.
-#
-# 2026-09-03. That was NOT ENOUGH, twice over, and both halves are now fixed.
-# (i) stage_build_mirror `cp -al`'d $SRC_WS/third_party into the mirror, so the
-#     mirror was not a copy of imprint-data, it WAS imprint-data, and every
-#     workspace hardlinked out of it wrote straight into the read-only canonical
-#     tree. The mirror is built with rsync now, and stage_assert_mirror_disjoint
-#     samples 50 files and refuses a mirror that shares an inode with $SRC_WS.
-# (ii) stage_break_links PRUNED third_party, and third_party is where the
-#     *.egg-info/*.txt files setuptools rewrites in place live. It no longer
-#     prunes it; STAGE_TP_WRITABLE is the pattern list.
-# The verify now runs BEFORE the lock as well as after, src_tp_fingerprint reads
-# $SRC_WS directly across the lock, and a job that trips either one exits 12 no
-# matter what the lock returned -- the old code printed FATAL-CLASS and exited 0.
 STAGE_METHOD=mirror
 STAGE_MIRROR_ROOT=/oscar/data/stellex/glvov/agrescap/cache/retread/stage-mirror
 STAGE_PAR=16          # cp -al here is NFS-RPC-latency bound, not CPU bound
