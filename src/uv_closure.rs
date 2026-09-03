@@ -5655,6 +5655,193 @@ impl LockRelaxations {
 
 const WORKSPACE_PROVIDER_DIR: &str = ".retread-workspace-providers";
 
+/// Directory (under the closure project) holding the metadata-only
+/// stand-ins that `[tool.uv.sources]` points at.
+///
+/// The wheels retread hands uv as path sources are its OWN built/fetched
+/// artifacts, and some of them are enormous: on the canonical manifest
+/// `isaac-pack-latest` carries 7.85 GB across three `isaacsim*` extscache
+/// wheels. uv reads every byte of a path source before it starts solving
+/// (it hashes the archive for `uv.lock` and unpacks it into its own
+/// cache), which on NFS measured 524.3 s of a 526.6 s child span in job
+/// 5697519 -- a window in which uv emits no row at any verbosity, because
+/// it is I/O, not resolution.
+///
+/// uv only ever needs the DIST-INFO out of those bytes: name, version,
+/// `Requires-Dist`, `Requires-Python`, `Provides-Extra`. The hash and the
+/// path it records for a local source are dropped on the way back in --
+/// [`parse_pylock_closure`] treats any `directory`/`vcs`/`archive` package
+/// as "pin only, no index wheel" and retread merges the real built wheel
+/// separately. So the resolver input and the resolver output are both
+/// satisfied by a wheel that carries the source's `.dist-info/` verbatim
+/// and nothing else.
+const BUILT_SOURCE_STUB_DIR: &str = ".retread-built-source-stubs";
+
+/// One materialized stand-in, for the bench row and the guards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BuiltSourceStub {
+    /// Canonical requested name of the built-wheel source.
+    pub(crate) name: String,
+    /// The real wheel retread validated and will merge.
+    pub(crate) source: PathBuf,
+    /// The metadata-only wheel handed to uv, same PEP 427 filename.
+    pub(crate) stub: PathBuf,
+    pub(crate) source_bytes: u64,
+    pub(crate) stub_bytes: u64,
+}
+
+/// Copy `source`'s `*.dist-info/` members into a metadata-only wheel under
+/// `stub_dir`, keeping the source's exact PEP 427 filename.
+///
+/// Only the ZIP central directory and the dist-info members are read, so
+/// the cost is independent of the wheel's size. `RECORD` is regenerated
+/// over exactly the members that survive, so the stub is a self-consistent
+/// wheel rather than one advertising payload it does not carry.
+fn write_built_source_stub_wheel(stub_dir: &Path, source: &Path) -> Result<PathBuf> {
+    use std::io::{Read, Write};
+
+    let filename = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("built-wheel source path has no UTF-8 filename"))?;
+    let destination = stub_dir.join(filename);
+    if destination.is_file() {
+        return Ok(destination);
+    }
+    static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let temporary = stub_dir.join(format!(
+        ".{filename}.{}.{}.tmp",
+        std::process::id(),
+        TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+    ));
+    let result = (|| -> Result<()> {
+        let reader = std::fs::File::open(source)
+            .with_context(|| format!("opening built-wheel source {}", source.display()))?;
+        let mut archive = zip::ZipArchive::new(std::io::BufReader::new(reader))
+            .with_context(|| format!("reading ZIP index of {}", source.display()))?;
+        let members: Vec<String> = archive
+            .file_names()
+            .filter(|name| is_dist_info_member(name))
+            .map(str::to_string)
+            .collect();
+        if members.is_empty() {
+            bail!(
+                "built-wheel source {} carries no `.dist-info/` member to stand in for",
+                source.display()
+            );
+        }
+        let mut dist_info_dirs: BTreeSet<&str> = BTreeSet::new();
+        for name in &members {
+            if let Some((dir, _)) = name.split_once('/') {
+                dist_info_dirs.insert(dir);
+            }
+        }
+        if dist_info_dirs.len() != 1 {
+            bail!(
+                "built-wheel source {} carries {} `.dist-info/` directories; expected exactly one",
+                source.display(),
+                dist_info_dirs.len(),
+            );
+        }
+        let dist_info = (*dist_info_dirs.iter().next().expect("one dir")).to_string();
+        let record_path = format!("{dist_info}/RECORD");
+
+        let file = std::fs::File::create(&temporary)
+            .with_context(|| format!("creating built-source stub `{filename}`"))?;
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored)
+            .last_modified_time(zip::DateTime::default());
+        let mut record = String::new();
+        for name in &members {
+            if *name == record_path {
+                // Regenerated below over the members that survive.
+                continue;
+            }
+            let mut member = archive
+                .by_name(name)
+                .with_context(|| format!("reading `{name}` from {}", source.display()))?;
+            if member.is_dir() {
+                continue;
+            }
+            let mut bytes = Vec::with_capacity(member.size() as usize);
+            member
+                .read_to_end(&mut bytes)
+                .with_context(|| format!("decompressing `{name}` from {}", source.display()))?;
+            drop(member);
+            zip.start_file(name.clone(), options)?;
+            zip.write_all(&bytes)?;
+            record.push_str(&format!(
+                "{name},sha256={},{}\n",
+                crate::wheel_inject::sha256_base64_urlsafe_nopad(&bytes),
+                bytes.len(),
+            ));
+        }
+        record.push_str(&format!("{record_path},,\n"));
+        zip.start_file(record_path, options)?;
+        zip.write_all(record.as_bytes())?;
+        let file = zip.finish()?;
+        file.sync_all()?;
+        if destination.is_file() {
+            std::fs::remove_file(&temporary)?;
+        } else {
+            std::fs::rename(&temporary, &destination).with_context(|| {
+                format!("publishing built-source stub `{filename}` atomically")
+            })?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result.map(|()| destination)
+}
+
+/// A wheel member that belongs to the distribution's `.dist-info/`.
+fn is_dist_info_member(name: &str) -> bool {
+    match name.split_once('/') {
+        Some((dir, rest)) => dir.ends_with(".dist-info") && !rest.is_empty(),
+        None => false,
+    }
+}
+
+/// Build the request uv actually sees: identical to `req` except that every
+/// `[tool.uv.sources]` path points at a metadata-only stand-in.
+///
+/// Returns `None` when there is nothing to stand in for, so the emitted
+/// project is byte-identical to the pre-stub one for every bundle without
+/// built-wheel sources. `req` itself is never mutated: validation, the
+/// built-source fingerprint, conflict attribution and the wheel merge all
+/// keep the real paths.
+pub(crate) fn built_wheel_source_stub_request(
+    req: &UvClosureRequest,
+    project_dir: &Path,
+) -> Result<Option<(UvClosureRequest, Vec<BuiltSourceStub>)>> {
+    if req.built_wheel_sources.is_empty() {
+        return Ok(None);
+    }
+    let stub_dir = project_dir.join(BUILT_SOURCE_STUB_DIR);
+    std::fs::create_dir_all(&stub_dir)
+        .with_context(|| format!("creating built-source stub dir {}", stub_dir.display()))?;
+    let mut stubbed = req.clone();
+    let mut report = Vec::new();
+    let mut sources = BTreeMap::new();
+    for (name, source) in &req.built_wheel_sources {
+        let stub = write_built_source_stub_wheel(&stub_dir, source)?;
+        report.push(BuiltSourceStub {
+            name: canonical_conda_name(name),
+            source: source.clone(),
+            stub: stub.clone(),
+            source_bytes: std::fs::metadata(source).map(|m| m.len()).unwrap_or(0),
+            stub_bytes: std::fs::metadata(&stub).map(|m| m.len()).unwrap_or(0),
+        });
+        sources.insert(name.clone(), stub);
+    }
+    stubbed.built_wheel_sources = sources;
+    Ok(Some((stubbed, report)))
+}
+
+
 fn write_workspace_provider_wheel(
     provider_dir: &Path,
     pypi_name: &PypiKey,
@@ -5769,6 +5956,44 @@ fn materialize_workspace_owned_providers(
         write_workspace_provider_wheel(&provider_dir, pypi_name, &version)?;
     }
     Ok(Some(provider_dir))
+}
+
+/// Synthesize the closure project's `pyproject.toml` and write it.
+///
+/// THE ONLY production path from a request to the file uv reads, so what it
+/// does with `[tool.uv.sources]` is observable by a guard without spawning uv.
+///
+/// uv reads every byte of a path-source wheel before it can start solving, and
+/// retread's built/fetched sources reach multi-gigabyte sizes on NFS
+/// (`isaac-pack-latest` carries 7.85 GB; job 5697519 measured 524.3 s of a
+/// 526.6 s child span in that read alone). So the file names a
+/// `.dist-info`-only stand-in per source instead: same PEP 427 filename, same
+/// METADATA bytes, and the archive path + hash uv records for a local source
+/// are dropped on the way back in by [`parse_pylock_closure`]. `req` keeps the
+/// real paths for validation, conflict attribution and the wheel merge.
+fn write_closure_pyproject(
+    req: &UvClosureRequest,
+    project_dir: &Path,
+) -> Result<(String, Option<Vec<BuiltSourceStub>>)> {
+    let stub_started = std::time::Instant::now();
+    let stubbed = built_wheel_source_stub_request(req, project_dir)?;
+    if let Some((_, report)) = stubbed.as_ref() {
+        let source_bytes: u64 = report.iter().map(|stub| stub.source_bytes).sum();
+        let stub_bytes: u64 = report.iter().map(|stub| stub.stub_bytes).sum();
+        tracing::info!(
+            bundle = %req.bundle,
+            sources = report.len(),
+            source_bytes,
+            stub_bytes,
+            elapsed_ms = stub_started.elapsed().as_millis() as u64,
+            "bench: built_source_stubs",
+        );
+    }
+    let uv_facing_req = stubbed.as_ref().map_or(req, |(stubbed, _)| stubbed);
+    let pyproject_text = synthesize_pyproject(uv_facing_req);
+    std::fs::write(project_dir.join("pyproject.toml"), &pyproject_text)
+        .context("writing synthesized pyproject.toml")?;
+    Ok((pyproject_text, stubbed.map(|(_, report)| report)))
 }
 
 /// Assemble the `uv lock` argument vector. COMMON args are single-sourced
@@ -6448,10 +6673,9 @@ pub(crate) async fn compute_closure_for_target(
     let workspace_provider_dir = materialize_workspace_owned_providers(req, project_dir)?;
     let resolved_constraints = effective_constraints(req);
     let no_emit_packages = effective_no_emit(req);
-    let pyproject_text = synthesize_pyproject(req);
-    tokio::fs::write(project_dir.join("pyproject.toml"), &pyproject_text)
-        .await
-        .context("writing synthesized pyproject.toml")?;
+    // Sync, like `materialize_workspace_owned_providers` just above: both write
+    // the same project directory and neither may race the other.
+    let (pyproject_text, _stubs) = write_closure_pyproject(req, project_dir)?;
     tokio::fs::write(
         project_dir.join(PROVENANCE_FILE),
         provenance_json(&resolved_constraints)?,
@@ -6912,6 +7136,288 @@ mod tests {
             Some(expected),
             "the closure resolver spawns uv against a shared cache and must own the lock wait",
         );
+    }
+
+
+    /// A wheel whose `.dist-info/` is tiny and whose PAYLOAD is not, which
+    /// is the shape of every `isaacsim*` extscache wheel: 7.85 GB of
+    /// payload behind ~100 KB of metadata.
+    fn write_heavy_test_wheel(
+        dir: &Path,
+        name: &str,
+        version: &str,
+        requires: &[&str],
+        payload_bytes: usize,
+    ) -> PathBuf {
+        use std::io::Write as _;
+        std::fs::create_dir_all(dir).unwrap();
+        let filename = format!("{name}-{version}-py3-none-any.whl");
+        let di = format!("{name}-{version}.dist-info");
+        let mut metadata = format!(
+            "Metadata-Version: 2.1\nName: {name}\nVersion: {version}\nRequires-Python: >=3.10\n"
+        );
+        for r in requires {
+            metadata.push_str(&format!("Requires-Dist: {r}\n"));
+        }
+        let path = dir.join(&filename);
+        let f = std::fs::File::create(&path).unwrap();
+        let mut zip = zip::ZipWriter::new(f);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        zip.start_file(format!("{name}/__init__.py"), opts).unwrap();
+        // Incompressible-ish payload so `Stored` really costs the bytes.
+        let mut payload = Vec::with_capacity(payload_bytes);
+        let mut state: u32 = 0x12345678;
+        while payload.len() < payload_bytes {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            payload.extend_from_slice(&state.to_le_bytes());
+        }
+        payload.truncate(payload_bytes);
+        zip.write_all(&payload).unwrap();
+        for (entry, body) in [
+            (format!("{di}/METADATA"), metadata.clone()),
+            (
+                format!("{di}/WHEEL"),
+                "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n".to_string(),
+            ),
+            (
+                format!("{di}/RECORD"),
+                format!("{name}/__init__.py,,\n{di}/METADATA,,\n{di}/WHEEL,,\n{di}/RECORD,,\n"),
+            ),
+        ] {
+            zip.start_file(&entry, opts).unwrap();
+            zip.write_all(body.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+        path
+    }
+
+    fn zip_member_bytes(wheel: &Path, member: &str) -> Vec<u8> {
+        use std::io::Read as _;
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(wheel).unwrap()).unwrap();
+        let mut entry = archive.by_name(member).unwrap();
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).unwrap();
+        bytes
+    }
+
+    fn stub_scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "retread-p6k-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// THE GUARD for p6k. The synthesized project must point uv at a
+    /// metadata-only stand-in, never at the multi-gigabyte source: uv reads
+    /// every byte of a path source before it starts solving, and that read
+    /// was 524.3 s of `isaac-pack-latest`'s 526.6 s closure child in job
+    /// 5697519.
+    #[test]
+    fn closure_project_points_uv_at_metadata_only_stubs_not_the_source_wheels() {
+        let scratch = stub_scratch("points-at-stub");
+        let source = write_heavy_test_wheel(
+            &scratch.join("store"),
+            "isaacsim_extscache_kit",
+            "6.0.0.1",
+            &["numpy>=1.26", "isaacsim-kernel==6.0.0.1"],
+            4 * 1024 * 1024,
+        );
+        let project = scratch.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut req = sample_request();
+        req.built_wheel_sources.clear();
+        req.built_wheel_sources
+            .insert("isaacsim-extscache-kit".to_string(), source.clone());
+
+        // Through the PRODUCTION path -- the same call `compute_closure_for_target`
+        // makes -- so reverting the wiring falsifies this guard.
+        let (written, report) = write_closure_pyproject(&req, &project).unwrap();
+        let report = report.expect("a request with built-wheel sources must produce stand-ins");
+        assert_eq!(report.len(), 1);
+        let stub = &report[0].stub;
+        assert_eq!(
+            written,
+            std::fs::read_to_string(project.join("pyproject.toml")).unwrap(),
+            "the returned text must be the text uv will read",
+        );
+        assert!(
+            written.contains(&stub.to_string_lossy().to_string()),
+            "the project uv reads must name the stand-in:\n{written}",
+        );
+
+        // 1. uv is pointed somewhere else, inside the project we own.
+        assert_ne!(
+            stub, &source,
+            "uv must not be handed the source wheel itself",
+        );
+        assert!(
+            stub.starts_with(&project),
+            "the stand-in must live under the closure project, got {}",
+            stub.display(),
+        );
+        // 2. and what it is pointed at is metadata, not payload.
+        let source_bytes = std::fs::metadata(&source).unwrap().len();
+        let stub_bytes = std::fs::metadata(stub).unwrap().len();
+        assert!(
+            stub_bytes * 50 < source_bytes,
+            "the stand-in is {stub_bytes} B against a {source_bytes} B source -- it is \
+             still carrying the payload uv would have to read",
+        );
+        // 3. the identity uv resolves on is unchanged.
+        assert_eq!(
+            stub.file_name(),
+            source.file_name(),
+            "the PEP 427 filename is part of the resolution (tags, name, version)",
+        );
+        let di = "isaacsim_extscache_kit-6.0.0.1.dist-info/METADATA";
+        assert_eq!(
+            zip_member_bytes(stub, di),
+            zip_member_bytes(&source, di),
+            "METADATA must reach uv byte-identical: it is the whole resolver input",
+        );
+        // 4. and the emitted project differs from the pre-stub one ONLY in
+        //    the source paths.
+        let with_stub = written.clone();
+        let with_source = synthesize_pyproject(&req);
+        assert_eq!(
+            with_stub.replace(&stub.to_string_lossy().to_string(), "<SRC>"),
+            with_source.replace(&source.to_string_lossy().to_string(), "<SRC>"),
+            "stubbing may move the `[tool.uv.sources]` path and nothing else",
+        );
+        assert!(
+            !with_stub.contains(&source.to_string_lossy().to_string()),
+            "the emitted project still names the source wheel",
+        );
+        // 5. the caller's request is untouched: validation, conflict
+        //    attribution and the wheel merge all keep the real path.
+        assert_eq!(req.built_wheel_sources["isaacsim-extscache-kit"], source);
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// The stand-in must be a self-consistent wheel: every `.dist-info`
+    /// member carried over, and a `RECORD` describing exactly those and not
+    /// the payload that was left behind.
+    #[test]
+    fn built_source_stub_carries_the_whole_dist_info_and_an_honest_record() {
+        let scratch = stub_scratch("honest-record");
+        let source = write_heavy_test_wheel(
+            &scratch.join("store"),
+            "isaacsim_extscache_physics",
+            "6.0.0.1",
+            &["numpy>=1.26"],
+            1024 * 1024,
+        );
+        let stub_dir = scratch.join("stubs");
+        std::fs::create_dir_all(&stub_dir).unwrap();
+        let stub = write_built_source_stub_wheel(&stub_dir, &source).unwrap();
+
+        let names: BTreeSet<String> =
+            zip::ZipArchive::new(std::fs::File::open(&stub).unwrap())
+                .unwrap()
+                .file_names()
+                .map(str::to_string)
+                .collect();
+        let di = "isaacsim_extscache_physics-6.0.0.1.dist-info";
+        assert_eq!(
+            names,
+            BTreeSet::from([
+                format!("{di}/METADATA"),
+                format!("{di}/WHEEL"),
+                format!("{di}/RECORD"),
+            ]),
+            "the stand-in must be exactly the dist-info, no payload and no gaps",
+        );
+        let record = String::from_utf8(zip_member_bytes(&stub, &format!("{di}/RECORD"))).unwrap();
+        assert!(
+            !record.contains("__init__.py"),
+            "RECORD advertises payload the stand-in does not carry:\n{record}",
+        );
+        for member in [format!("{di}/METADATA"), format!("{di}/WHEEL")] {
+            let bytes = zip_member_bytes(&stub, &member);
+            let line = format!(
+                "{member},sha256={},{}\n",
+                crate::wheel_inject::sha256_base64_urlsafe_nopad(&bytes),
+                bytes.len(),
+            );
+            assert!(
+                record.contains(&line),
+                "RECORD is missing the regenerated line for {member}:\n{record}",
+            );
+        }
+        // retread's own reader must accept it as the same distribution.
+        let from_source = crate::wheel::read_metadata(&source).unwrap();
+        let from_stub = crate::wheel::read_metadata(&stub).unwrap();
+        assert_eq!(
+            (from_stub.name, from_stub.version, from_stub.requires_dist),
+            (
+                from_source.name,
+                from_source.version,
+                from_source.requires_dist
+            ),
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// Stubbing is invisible to the child: same argv, same tracing mode,
+    /// and a bundle with no built-wheel sources emits no stand-in at all.
+    #[test]
+    fn built_source_stubs_change_neither_the_child_argv_nor_bundles_without_sources() {
+        let scratch = stub_scratch("argv");
+        let project = scratch.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut bare = sample_request();
+        bare.built_wheel_sources.clear();
+        assert!(
+            built_wheel_source_stub_request(&bare, &project)
+                .unwrap()
+                .is_none(),
+            "a bundle with no path sources must not grow a stub directory",
+        );
+        assert!(
+            !project.join(BUILT_SOURCE_STUB_DIR).exists(),
+            "nothing to stand in for must mean nothing written",
+        );
+
+        // The lock argv is built from the project dir, not from the source
+        // paths, so it must be identical either way -- and the child must
+        // still be spawned Traced with the p6f filter.
+        let args = build_lock_args(
+            &project,
+            "3.12",
+            &["https://pypi.org/simple".to_string()],
+            None,
+            false,
+            LockRelaxations::PASS_A,
+        );
+        let command = build_uv_closure_command_with(
+            Path::new("uv"),
+            &args,
+            &project,
+            &scratch.join("uv-cache"),
+            UvChildTracing::Traced,
+            None,
+        );
+        let command = command.as_std();
+        let argv: Vec<String> = command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(argv.first().map(String::as_str), Some(UV_CHILD_VERBOSITY_FLAG));
+        assert_eq!(argv.get(1).map(String::as_str), Some("lock"));
+        assert!(
+            !argv.iter().any(|a| a.contains(BUILT_SOURCE_STUB_DIR)),
+            "the stand-in directory is a project detail and must never reach the argv: {argv:?}",
+        );
+        assert_eq!(
+            uv_env_value(command, UV_CHILD_LOG_ENV).as_deref(),
+            Some(OsStr::new(UV_CHILD_LOG_DEFAULT)),
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 
     fn target(py: &str, subdir: &str) -> WheelTarget {
