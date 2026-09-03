@@ -573,7 +573,9 @@ opposite of what it looked like.
 **The two "unexplained slow envs" were WIDTH, not link mode.** `5685818` ran
 alongside `5674559` (copy, `CERT_PARALLEL=1`) on the SAME node, the same day,
 against the same persistent cache, in the same dispatch order — so on the envs
-both have scored, the link mode is the only difference:
+both have scored, the link mode is the only difference (8 of 26 as of 12:45;
+every env hl1 scores is added to this table as it lands, and the ratios have
+held from the first four):
 
 | env | hardlink N=1 | copy N=1 | wall | hardlink GB | copy GB | bytes |
 |---|---|---|---|---|---|---|
@@ -583,7 +585,9 @@ both have scored, the link mode is the only difference:
 | `hover-gpu` | 1 350 s | 1 655 s | 0.82x | 24.01 | 24.35 | 0.99x |
 | `groot-sonic-gpu` | **1 424 s** | 1 529 s | 0.93x | 3.40 | 14.79 | 0.23x |
 | `pace` | **553 s** | 1 216 s | 0.45x | 0.78 | 12.59 | 0.06x |
-| **6 envs** | **8 986 s** | **14 329 s** | **0.63x** | **79.79** | **126.46** | **0.63x** |
+| `viral-gpu` | 1 336 s | 1 541 s | 0.87x | 1.24 | 24.79 | 0.05x |
+| `sage` | 676 s | 844 s | 0.80x | 6.49 | 11.52 | 0.56x |
+| **8 envs** | **10 998 s** | **16 714 s** | **0.66x** | **87.52** | **162.77** | **0.54x** |
 
 `pace` and `groot-sonic-gpu` are the two envs the fan-out run accused. At N=1
 they are the FASTEST of all four corners — `pace` 553 s against 1 216 s (copy
@@ -603,7 +607,7 @@ vs 13.49) while running 2.7x faster. Unexplained, and named here rather than
 smoothed over.
 
 **Gates at N=1 are clean.** Every env `5685818` has scored is identical to copy
-at the same width on the same node the same day — `cert_verdict.sh` over the
+at the same width on the same node the same day — `cert_verdict.sh` over the 8
 common rows: **0 differing, EXIT 0** — and identical to hardlink at N=4 on the
 same rows (**0 differing, EXIT 0**). `install_rc=0` throughout, and the race scan
 over every install log at BOTH widths finds zero `hardlink|EXDEV|Text file
@@ -623,15 +627,15 @@ rewrote a prefix file IN PLACE still could, so re-run that census if one appears
 
 | | copy | hardlink |
 |---|---|---|
-| **N=1** | `5597694` 20 477 s walls / 307.3 GB / 1.48 GB RSS; `5674559` today | `5685818` **0.63x wall and 0.63x bytes** of copy N=1 on shared envs |
+| **N=1** | `5597694` 20 477 s walls / 307.3 GB / 1.48 GB RSS; `5674559` today | `5685818` **0.66x wall and 0.54x bytes** of copy N=1 over 8 shared envs |
 | **N=4** | `5658928` span 13 111 s / walls 46 233 s / 302 GB / 1.25 GB RSS | `5685816` span **9 057 s** / walls 32 421 s / **128 GB** / 0.97 GB RSS |
 
 Two independent levers, and **both ship**:
 
-* **`CERT_UV_LINK_MODE=hardlink`** — it wins at BOTH widths (0.63x wall at N=1,
+* **`CERT_UV_LINK_MODE=hardlink`** — it wins at BOTH widths (0.66x wall at N=1,
   0.69x span at N=4), the gates are identical to copy at both, and the byte drop
-  is 2.35x at N=4 and 1.6x at N=1. Well clear of the 527 s noise floor: 5 343 s
-  saved on six envs at N=1, 4 054 s of span at N=4.
+  is 2.35x at N=4 and 1.86x at N=1. Well clear of the 527 s noise floor: 5 716 s
+  and 75.2 GB saved over eight envs at N=1, 4 054 s of span at N=4.
 * **`CERT_PARALLEL=4`** — width is still worth more than the link mode. Hardlink
   at N=1 spent **11 144 s on 6 of 26 envs**, where hardlink at N=4 finished all
   26 inside a **9 057 s** span. N=4 already wins by >2 000 s with 20 envs still
