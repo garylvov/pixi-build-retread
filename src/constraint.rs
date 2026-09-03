@@ -111,6 +111,62 @@ impl ConstraintOriginId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// The kind and semantic components this origin was built from, recovered
+    /// from the length-prefixed encoding.
+    ///
+    /// Emission policy has to tell "this bound came from the pack's own uv
+    /// closure" apart from "this bound came from a wheel's `Requires-Dist`",
+    /// and [`Constraint::source`] is diagnostic prose that must never be
+    /// matched on. The parts are the structured half of the identity, so they
+    /// are the half a policy decision may read.
+    pub fn parts(&self) -> Vec<&str> {
+        let mut parts = Vec::new();
+        let mut rest = self.0.as_str();
+        while !rest.is_empty() {
+            let Some((len, tail)) = rest.split_once(':') else {
+                break;
+            };
+            let Ok(len) = len.parse::<usize>() else {
+                break;
+            };
+            let Some(part) = tail.get(..len) else {
+                break;
+            };
+            parts.push(part);
+            rest = &tail[len..];
+        }
+        parts
+    }
+
+    /// The stable KIND this origin was constructed with.
+    pub fn kind(&self) -> Option<&str> {
+        self.parts().into_iter().next()
+    }
+
+    /// Whether one of this origin's semantic components is exactly `part`.
+    pub fn has_part(&self, part: &str) -> bool {
+        self.parts().contains(&part)
+    }
+}
+
+#[cfg(test)]
+mod origin_id_parts_tests {
+    use super::ConstraintOriginId;
+
+    #[test]
+    fn parts_round_trip_the_length_prefixed_encoding() {
+        let id = ConstraintOriginId::from_parts("auto-route", ["fsspec", "2024.6.1", ":weird:5"]);
+        assert_eq!(id.kind(), Some("auto-route"));
+        assert_eq!(
+            id.parts(),
+            vec!["auto-route", "fsspec", "2024.6.1", ":weird:5"],
+        );
+        assert!(id.has_part("2024.6.1"));
+        // A component that merely APPEARS inside another component's text is
+        // not a part: this is why policy reads `has_part`, never `contains`.
+        assert!(!id.has_part("weird"));
+    }
 }
 
 impl fmt::Display for ConstraintOriginId {
