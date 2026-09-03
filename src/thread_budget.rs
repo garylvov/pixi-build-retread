@@ -29,7 +29,6 @@ use std::sync::atomic::AtomicBool;
 const COMPRESSION_THREADS_ENV: &str = "RETREAD_COMPRESSION_THREADS";
 const COMPRESSION_BUDGET_ENV: &str = "RETREAD_COMPRESSION_BUDGET";
 const THREAD_LEASE_DIR_ENV: &str = "RETREAD_THREAD_LEASE_DIR";
-const PARALLEL_PROBES_ENV: &str = "RETREAD_PARALLEL_PROBES";
 const FALLBACK_AVAILABLE_PARALLELISM: usize = 4;
 const REGISTRY_LOCK_FILE: &str = "registry.lock";
 const LEASE_FILE_PREFIX: &str = "lease-";
@@ -45,18 +44,25 @@ static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 static FORCE_REGISTRY_LOCK_FAILURE: AtomicBool = AtomicBool::new(false);
 
-fn parse_parallel_probes(value: Option<&str>) -> bool {
-    value == Some("1")
-}
-
 /// Parallel resolvo probes are an experimental opt-in.
 ///
 /// v4.10.46 enabled this fan-out by default. Some pack resolutions then ended
 /// with a silent process exit while several full solver states were live. Keep
 /// the shared repodata and bisection improvements, but make solver fan-out
 /// serial unless the operator explicitly accepts the risk.
-pub(crate) fn parallel_probes_enabled() -> bool {
-    parse_parallel_probes(std::env::var(PARALLEL_PROBES_ENV).ok().as_deref())
+///
+/// The control surface is the workspace's `retread-parallel-probes` key; the
+/// `RETREAD_PARALLEL_PROBES` env var remains a legacy override that wins when
+/// set to a recognised spelling, and the deciding source is logged.
+pub(crate) fn parallel_probes_enabled(effective: &crate::config::RetreadConfig) -> bool {
+    let env_value = std::env::var(crate::config::PARALLEL_PROBES_ENV).ok();
+    crate::config::effective_gate_flag(
+        crate::config::PARALLEL_PROBES_ENV,
+        crate::config::PARALLEL_PROBES_KEY,
+        effective.parallel_probes,
+        env_value.as_deref(),
+    )
+    .0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1389,15 +1395,37 @@ mod tests {
         NonZeroUsize::new(value).unwrap()
     }
 
+    /// The gate's control surface, pinned at the pure function so no process
+    /// env is touched. What must hold: the manifest key alone can turn the
+    /// fan-out on; the key absent is OFF; a recognised env value WINS over the
+    /// key in BOTH directions; and `true` is no longer the silent no-op it was
+    /// when this compared against the exact string `1`.
     #[test]
-    fn parallel_probe_opt_in_is_strict() {
-        for disabled in [None, Some(""), Some("0"), Some("true"), Some(" 1 ")] {
-            assert!(
-                !parse_parallel_probes(disabled),
-                "only RETREAD_PARALLEL_PROBES=1 may enable solver fan-out",
+    fn parallel_probe_opt_in_reads_key_then_env() {
+        use crate::config::{GateFlagSource, PARALLEL_PROBES_ENV, PARALLEL_PROBES_KEY, effective_gate_flag};
+        let flag = |configured, env| {
+            effective_gate_flag(PARALLEL_PROBES_ENV, PARALLEL_PROBES_KEY, configured, env)
+        };
+
+        assert_eq!(flag(None, None), (false, GateFlagSource::Default));
+        assert_eq!(flag(Some(true), None), (true, GateFlagSource::ManifestKey));
+        assert_eq!(flag(Some(false), None), (false, GateFlagSource::ManifestKey));
+
+        for on in ["1", "true", "TRUE", "yes", " 1 "] {
+            assert_eq!(
+                flag(None, Some(on)),
+                (true, GateFlagSource::Env),
+                "{on:?} must enable fan-out; the exact-`1` match made it a silent no-op",
             );
         }
-        assert!(parse_parallel_probes(Some("1")));
+        for off in ["0", "false", "NO"] {
+            assert_eq!(flag(Some(true), Some(off)), (false, GateFlagSource::Env));
+        }
+        assert_eq!(flag(Some(false), Some("1")), (true, GateFlagSource::Env));
+
+        // An unrecognised spelling decides nothing and falls through.
+        assert_eq!(flag(Some(true), Some("01")), (true, GateFlagSource::ManifestKey));
+        assert_eq!(flag(None, Some("01")), (false, GateFlagSource::Default));
     }
 
     #[test]

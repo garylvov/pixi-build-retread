@@ -732,6 +732,8 @@ fn pythons_for_rejects_bare_major_variant() {
         deps_from: Default::default(),
         ledger_overrides: Default::default(),
         pack_manifest_path: None,
+        auto_imports: None,
+        parallel_probes: None,
     };
     let result = pythons_for(&cfg, Some(&variants));
     assert_eq!(
@@ -785,6 +787,8 @@ fn pythons_for_accepts_dotted_variant() {
         deps_from: Default::default(),
         ledger_overrides: Default::default(),
         pack_manifest_path: None,
+        auto_imports: None,
+        parallel_probes: None,
     };
     let result = pythons_for(&cfg, Some(&variants));
     assert_eq!(result, vec!["3.11".to_string()]);
@@ -838,6 +842,8 @@ fn pythons_for_filters_bare_major_keeps_dotted() {
         deps_from: Default::default(),
         ledger_overrides: Default::default(),
         pack_manifest_path: None,
+        auto_imports: None,
+        parallel_probes: None,
     };
     let result = pythons_for(&cfg, Some(&variants));
     assert_eq!(result, vec!["3.11".to_string(), "3.12".to_string()]);
@@ -3610,6 +3616,8 @@ fn cfg() -> RetreadConfig {
         deps_from: Default::default(),
         ledger_overrides: Default::default(),
         pack_manifest_path: None,
+        auto_imports: None,
+        parallel_probes: None,
     }
 }
 
@@ -8089,60 +8097,96 @@ fn resolve_backoff_fires_once_and_suppresses_every_bundle() {
     assert!(gate(true, &one), "a per-bundle suppression does not consume the resolve retry");
 }
 
-/// The Lane C master switch is an ENV BINDING, and until now no test bound it.
-/// The sibling gate tests above re-declare the predicate as a LOCAL CLOSURE,
-/// which pins the shape of the gate but never the variable it reads: renaming
-/// `RETREAD_AUTO_IMPORTS`, or loosening the `== "1"` comparison into a truthy
-/// parse, leaves every one of them green while silently changing which locks a
-/// merge of this code can move. This test calls the REAL
-/// `auto_imports_injection_enabled`, so the var's NAME and the EXACTNESS of the
-/// match are both load-bearing here.
+/// The Lane C master switch has TWO sources now — the `retread-auto-imports`
+/// manifest key and the legacy `RETREAD_AUTO_IMPORTS` env var — and this test
+/// binds both through the REAL `auto_imports_injection_enabled`, so the key's
+/// NAME, the var's NAME and the precedence between them are all load-bearing
+/// here. The sibling gate tests re-declare the predicate as a local closure,
+/// which pins the shape of the gate but never the sources it reads.
 ///
-/// The negative cases are the ones that matter. `"true"` and `"01"` are what a
-/// person types when they assume a truthy parse; `" 1"` is what a shell here-doc
-/// or a trailing-space export produces. All three must read as OFF, because the
-/// documented contract is "OFF unless `RETREAD_AUTO_IMPORTS=1` exactly" and a
-/// half-on switch would inject roots into a lock nobody opted in for.
+/// Four rows, each of which fails if the wiring is wrong:
+///   * key on  + env unset -> ENABLED  (fails if the key is not read at all)
+///   * key absent + env unset -> DISABLED (merging Lane C moves no lock)
+///   * env `true` + key absent -> ENABLED, with the WARN naming the spelling
+///     (this is the exact-`1` silent no-op that motivated the change)
+///   * key off + env `1` -> ENABLED, because the legacy override wins
 ///
 /// Serialised on the house `TEST_ENV_MUTEX` (handler/mod.rs) like every other
 /// env-mutating test in this file, and the prior value is restored on exit so a
 /// developer running with the switch on in their own shell does not inherit a
 /// clobbered environment.
 #[test]
-fn auto_imports_env_var_binds_the_master_switch() {
+fn auto_imports_switch_reads_the_config_key_with_env_as_legacy_override() {
     let _env_guard = super::TEST_ENV_MUTEX.lock().unwrap();
     let prior = std::env::var_os("RETREAD_AUTO_IMPORTS");
+
+    let with_key = |value: Option<bool>| {
+        let mut c = cfg();
+        c.auto_imports = value;
+        c
+    };
 
     // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
     unsafe { std::env::remove_var("RETREAD_AUTO_IMPORTS") };
     assert!(
-        !auto_imports_injection_enabled(),
-        "unset must leave Lane C OFF -- that is what makes merging this code \
-         change no existing lock"
+        auto_imports_injection_enabled(&with_key(Some(true))),
+        "`retread-auto-imports = true` alone must turn Lane C ON -- the whole \
+         point of the key is that no env var is needed"
+    );
+    assert!(
+        !auto_imports_injection_enabled(&with_key(None)),
+        "key absent and var unset must leave Lane C OFF -- that is what makes \
+         merging this code change no existing lock"
+    );
+    assert!(!auto_imports_injection_enabled(&with_key(Some(false))));
+
+    // `true` used to be a SILENT no-op. Now it enables, and it says so.
+    // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
+    unsafe { std::env::set_var("RETREAD_AUTO_IMPORTS", "true") };
+    let (enabled, warnings) =
+        capture_warn_logs(|| auto_imports_injection_enabled(&with_key(None)));
+    assert!(enabled, "RETREAD_AUTO_IMPORTS=true must enable injection");
+    assert!(
+        warnings.contains("RETREAD_AUTO_IMPORTS") && warnings.contains("true"),
+        "the non-`1` spelling must be reported, naming variable and value; got: {warnings:?}"
     );
 
+    // The legacy override wins over an explicit key.
     // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
     unsafe { std::env::set_var("RETREAD_AUTO_IMPORTS", "1") };
     assert!(
-        auto_imports_injection_enabled(),
-        "exactly \"1\" is the documented opt-in"
+        auto_imports_injection_enabled(&with_key(Some(false))),
+        "an exported RETREAD_AUTO_IMPORTS=1 must win over `retread-auto-imports = false` \
+         so existing harnesses keep working unchanged"
     );
-
-    // Everything else is OFF: an exact match, never a truthy parse.
-    for off in ["true", "0", "01", " 1", ""] {
-        // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
-        unsafe { std::env::set_var("RETREAD_AUTO_IMPORTS", off) };
-        assert!(
-            !auto_imports_injection_enabled(),
-            "RETREAD_AUTO_IMPORTS={off:?} must NOT enable injection"
-        );
-    }
+    // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
+    unsafe { std::env::set_var("RETREAD_AUTO_IMPORTS", "0") };
+    assert!(
+        !auto_imports_injection_enabled(&with_key(Some(true))),
+        "and it must win in the OFF direction too"
+    );
 
     // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
     match prior {
         Some(value) => unsafe { std::env::set_var("RETREAD_AUTO_IMPORTS", value) },
         None => unsafe { std::env::remove_var("RETREAD_AUTO_IMPORTS") },
     }
+}
+
+fn capture_warn_logs<T>(body: impl FnOnce() -> T) -> (T, String) {
+    let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer({
+            let logs = std::sync::Arc::clone(&logs);
+            move || SharedLogWriter(std::sync::Arc::clone(&logs))
+        })
+        .finish();
+    let value = tracing::subscriber::with_default(subscriber, body);
+    let text = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    (value, text)
 }
 
 /// The back-off's re-resolve must differ from the failed attempt by EXACTLY
