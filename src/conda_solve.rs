@@ -1054,6 +1054,23 @@ fn missing_hermetic_pairs(channels: &[ChannelUrl], consulted: &[String]) -> Vec<
         .collect()
 }
 
+/// The channel list every hermetic toolchain solve resolves against.
+///
+/// Shared with [`hermetic_repodata_pairs`] so the set of cached documents a
+/// stale-snapshot recovery drops can never drift from the set the solve read.
+pub(crate) fn hermetic_channels() -> Vec<ChannelUrl> {
+    vec![ChannelUrl::from(
+        url::Url::parse("https://prefix.dev/conda-forge")
+            .expect("the built-in conda-forge channel URL is valid"),
+    )]
+}
+
+/// The `(channel_url, subdir)` repodata documents a hermetic toolchain solve
+/// reads, in the form [`crate::repodata::invalidate_pairs`] consumes.
+pub(crate) fn hermetic_repodata_pairs() -> Vec<(String, String)> {
+    crate::repodata::channel_subdir_pairs(&hermetic_channels(), "linux-64")
+}
+
 /// Solve the compiler environment against conda-forge's sparse repodata.
 ///
 /// Stage one loads all candidate roots and selects the newest compatible
@@ -1064,10 +1081,7 @@ pub(crate) async fn solve_hermetic_build_environment(
     python_minor: &str,
     cuda_version: Option<&str>,
 ) -> std::result::Result<HermeticBuildSolve, Vec<String>> {
-    let channels = vec![ChannelUrl::from(
-        url::Url::parse("https://prefix.dev/conda-forge")
-            .expect("the built-in conda-forge channel URL is valid"),
-    )];
+    let channels = hermetic_channels();
     let mut roots = vec![
         "gcc_linux-64".to_string(),
         "gxx_linux-64".to_string(),
