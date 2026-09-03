@@ -52,7 +52,12 @@ use std::path::{Path, PathBuf};
 
 /// Bumped whenever the payload's meaning or serialization changes. Folded
 /// into every key, so an old entry is invisible rather than misread.
-pub const SCHEMA: &str = "retread-built-output-store-v1";
+///
+/// v2 (fix p6c): the key gained the resolution-policy fingerprint (the
+/// auto-imports injection gate). Every v1 entry may hold a POST-INJECTION
+/// payload stored at an injection-OFF address, so all of them are invalidated
+/// once.
+pub const SCHEMA: &str = "retread-built-output-store-v2";
 
 /// The payload filename inside an entry.
 const PAYLOAD: &str = "outputs.json";

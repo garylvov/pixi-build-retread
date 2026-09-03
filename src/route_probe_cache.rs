@@ -22,7 +22,9 @@
 //!   * the target python / platform subdir,
 //!   * a policy fingerprint (channel priority, system requirements,
 //!     detected virtual packages, workspace deps, workspace PyPI
-//!     providers).
+//!     providers, and the RESOLUTION POLICY -- the auto-imports
+//!     injection gate, which decides the spec set the question is asked
+//!     about; see `crate::handler::resolution_policy_fingerprint`).
 //! A hit skips the probe entirely. Any change to the key invalidates the
 //! whole file (it is rewritten from empty), so a stale verdict can never
 //! be replayed against a universe it was not learned in.
@@ -41,7 +43,12 @@ use sha2::{Digest, Sha256};
 
 /// Bumped whenever the on-disk shape or the key inputs change, so an old
 /// file is discarded rather than misread.
-const SCHEMA: &str = "v2-route-probe-verdicts";
+///
+/// v3 (fix p6c): the file-level validity key gained a resolution-policy field
+/// carrying the auto-imports injection gate, so every v2 file -- any of which
+/// may hold verdicts learned with injection ON, written at an OFF run's
+/// address -- is invalidated once.
+const SCHEMA: &str = "v3-route-probe-verdicts";
 
 /// Directory under the retread cache root holding one file per
 /// (bundle, python minor, subdir).
@@ -260,27 +267,79 @@ impl RouteProbeCache {
         self.entries.lock().expect("route probe cache mutex").len()
     }
 
+    /// Write `entries` back to disk WITHOUT dropping entries another writer
+    /// learned in the meantime.
+    ///
+    /// The previous version rewrote the whole file from this handle's
+    /// in-memory snapshot. Two processes probing the same (bundle, python,
+    /// subdir) -- which is the normal shape of a relock, one bundle per
+    /// worker over a shared cache dir -- each rendered the file from the
+    /// entries THEY had, and whoever renamed last silently erased the other's
+    /// verdicts. The loss is invisible: the next run just re-probes.
+    ///
+    /// So the write is: take an exclusive advisory lock on a sidecar `.lock`
+    /// file, re-read what is on disk under it, UNION the two entry sets
+    /// (ours wins on a shared digest -- same question, same universe, so the
+    /// verdicts agree), write a temp file and rename it into place. A file
+    /// whose schema or validity key does not match ours is not merged: it
+    /// belongs to a different question universe and is replaced, which is the
+    /// invalidation [`RouteProbeCache::open`] already performs.
+    ///
+    /// The lock is advisory and best-effort: if it cannot be taken the write
+    /// still happens. Worst case is the old behaviour (a lost entry, a re-probe
+    /// next run), never a wrong verdict.
     fn persist(&self, entries: BTreeMap<String, CachedVerdict>) {
-        let file = VerdictFile {
-            schema: SCHEMA.to_string(),
-            key: self.key.clone(),
-            entries,
-        };
-        let Ok(text) = serde_json::to_string(&file) else {
-            return;
-        };
         if let Some(parent) = self.path.parent() {
             if std::fs::create_dir_all(parent).is_err() {
                 return;
             }
         }
-        let tmp = self
-            .path
-            .with_extension(format!("tmp{}", std::process::id()));
-        if std::fs::write(&tmp, text.as_bytes()).is_ok() {
-            let _ = std::fs::rename(&tmp, &self.path);
+
+        // Held for the read-modify-write below; dropped (unlocking) on return.
+        let lock_path = self.path.with_extension("lock");
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .ok();
+        if let Some(lock) = lock.as_ref() {
+            let _ = fs4::fs_std::FileExt::lock_exclusive(lock);
         }
-        let _ = std::fs::remove_file(&tmp);
+
+        let mut merged = match std::fs::read_to_string(&self.path) {
+            Ok(text) => match serde_json::from_str::<VerdictFile>(&text) {
+                Ok(file) if file.schema == SCHEMA && file.key == self.key => file.entries,
+                _ => BTreeMap::new(),
+            },
+            Err(_) => BTreeMap::new(),
+        };
+        let recovered = merged.len();
+        merged.extend(entries);
+
+        let file = VerdictFile {
+            schema: SCHEMA.to_string(),
+            key: self.key.clone(),
+            entries: merged,
+        };
+        if let Ok(text) = serde_json::to_string(&file) {
+            let tmp = self
+                .path
+                .with_extension(format!("tmp{}", std::process::id()));
+            if std::fs::write(&tmp, text.as_bytes()).is_ok()
+                && std::fs::rename(&tmp, &self.path).is_ok()
+            {
+                tracing::trace!(
+                    path = %self.path.display(), recovered,
+                    "route probe cache: persisted (merged with on-disk entries)",
+                );
+            }
+            let _ = std::fs::remove_file(&tmp);
+        }
+
+        if let Some(lock) = lock.as_ref() {
+            let _ = fs4::fs_std::FileExt::unlock(lock);
+        }
     }
 }
 
@@ -483,5 +542,81 @@ mod tests {
             key_a, key_b,
             "the workspace path must not reach the validity key",
         );
+    }
+    /// Guard (iii): two writers of the SAME verdict file, each holding
+    /// entries the other never saw, must both survive.
+    ///
+    /// This is the shape a relock actually takes -- one worker per bundle
+    /// over a shared cache dir, several of them probing the same
+    /// (bundle, python, subdir) file. `persist` used to render the whole
+    /// file from the writing handle's own in-memory snapshot, so whoever
+    /// renamed last erased the other's verdicts, invisibly: the only
+    /// symptom is a re-probe next run.
+    ///
+    /// Part 1 is the deterministic interleave (B opened before A wrote, so
+    /// B's snapshot cannot contain A's entry). Part 2 is a real thread
+    /// storm, which additionally exercises the advisory lock: with the lock
+    /// removed the read-modify-write races and entries go missing.
+    #[test]
+    fn concurrent_persists_of_disjoint_entries_all_survive() {
+        let dir = tmp_dir("concurrent-persist");
+        let path = cache_path(&dir, "isaac-pack-latest", "3.12", "linux-64");
+        let _ = std::fs::remove_file(&path);
+        let key = key_for("strict");
+        let question = |n: usize| {
+            probe_digest(
+                "auto_route_joint_solve",
+                "universe-rev-1",
+                [format!("absl-py=={n}.0")].iter(),
+            )
+        };
+
+        // --- Part 1: deterministic interleave. ---
+        let writer_a = RouteProbeCache::open(path.clone(), key.clone());
+        let writer_b = RouteProbeCache::open(path.clone(), key.clone());
+        writer_a.record(&question(1), CachedVerdict::Sat);
+        // B's snapshot still holds nothing of A's; the old persist rendered
+        // the file from exactly that snapshot.
+        writer_b.record(&question(2), CachedVerdict::Unsat(vec!["no".to_string()]));
+
+        let reader = RouteProbeCache::open(path.clone(), key.clone());
+        assert_eq!(
+            reader.lookup(&question(1)),
+            Some(CachedVerdict::Sat),
+            "the first writer's verdict was erased by the second writer's persist",
+        );
+        assert_eq!(
+            reader.lookup(&question(2)),
+            Some(CachedVerdict::Unsat(vec!["no".to_string()])),
+            "the second writer's own verdict must be on disk",
+        );
+
+        // --- Part 2: eight concurrent writers, five entries each. ---
+        let _ = std::fs::remove_file(&path);
+        std::thread::scope(|scope| {
+            for writer in 0..8usize {
+                let path = path.clone();
+                let key = key.clone();
+                scope.spawn(move || {
+                    let cache = RouteProbeCache::open(path, key);
+                    for entry in 0..5usize {
+                        cache.record(&question(100 + writer * 5 + entry), CachedVerdict::Sat);
+                    }
+                });
+            }
+        });
+
+        let reader = RouteProbeCache::open(path.clone(), key.clone());
+        let missing: Vec<usize> = (0..40)
+            .map(|i| 100 + i)
+            .filter(|n| reader.lookup(&question(*n)).is_none())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{} of 40 concurrently written verdicts were lost: {missing:?}",
+            missing.len(),
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
