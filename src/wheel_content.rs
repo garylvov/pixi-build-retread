@@ -242,6 +242,9 @@ fn is_lowercase_sha256(value: &str) -> bool {
 /// This is what keeps `.retread-wheel-fetch/v1/url/<url hash>/<file>` — whose
 /// parent is also 64 hex characters, of a URL and not of the bytes — out.
 pub(crate) fn content_addressed_sha256(path: &Path) -> Option<String> {
+    if !is_plain_wheel_filename(path.file_name()?.to_str()?) {
+        return None;
+    }
     if let Some(sha) = crate::wheel_rewrite::sha256_from_store_path(path) {
         return Some(sha);
     }
@@ -251,6 +254,35 @@ pub(crate) fn content_addressed_sha256(path: &Path) -> Option<String> {
     }
     let marker_sha = crate::wheel::store_integrity_marker_sha256(path)?;
     (marker_sha == sha).then(|| sha.to_string())
+}
+
+/// A wheel filename as a store or fetch entry is NAMED, as opposed to one
+/// retread derived from it in the same directory.
+///
+/// This matters because a digest read off the directory is used to REFUSE a
+/// wheel whose bytes disagree with it, and `handler`'s phase-2 relax writes
+/// `with_data_path.with_extension("relaxed.whl")` -- a sibling of the entry,
+/// inside the entry's own `<sha256>` directory, whose bytes are deliberately
+/// NOT the ones that directory names. Reading the parent's digest for that file
+/// would turn every relaxed wheel into a false refusal.
+///
+/// `with_extension` replaces the last component, so every derived name puts a
+/// `.` inside what would be the platform tag (`…-py3-none-any.relaxed.whl`).
+/// Requiring a PEP 427 name whose last field carries no `.` excludes them.
+/// It also excludes the rare genuine multi-platform tag
+/// (`…-macosx_10_9_x86_64.macosx_11_0_arm64.whl`), which merely gives up the
+/// fast path for that wheel: conservative in the direction that costs seconds
+/// rather than correctness.
+fn is_plain_wheel_filename(filename: &str) -> bool {
+    let Some(stem) = filename.strip_suffix(".whl") else {
+        return false;
+    };
+    if crate::pypi::wheel_filename_identity(&crate::emit_pypi::standard_wheel_filename(filename))
+        .is_none()
+    {
+        return false;
+    }
+    stem.rsplit('-').next().is_some_and(|tag| !tag.contains('.'))
 }
 
 /// SHA-256 over the ZIP central directory as parsed, plus the root

@@ -9626,6 +9626,37 @@ version = "0.1.0"
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// The phase-2 relax writes `<entry>.relaxed.whl` INSIDE the entry's own
+    /// `<sha256>` directory, and its bytes are deliberately not the ones that
+    /// directory names. Reading the parent's digest for that file would turn
+    /// every relaxed wheel into a false refusal, so the recogniser must not
+    /// claim it.
+    #[test]
+    fn a_derived_wheel_beside_a_store_entry_is_not_content_addressed() {
+        let base = unique_test_dir("c10-derived-sibling");
+        let dir = base
+            .join(".retread-wheel-fetch")
+            .join("v1")
+            .join("sha256")
+            .join("a".repeat(64));
+        std::fs::create_dir_all(&dir).unwrap();
+        let entry = dir.join("pkg-1.0.0-py3-none-any.whl");
+        let derived = dir.join("pkg-1.0.0-py3-none-any.relaxed.whl");
+        write_content_addressed_test_wheel(&entry, 0x01, 16);
+        write_content_addressed_test_wheel(&derived, 0x02, 16);
+        assert_eq!(
+            crate::wheel_content::content_addressed_sha256(&entry),
+            Some("a".repeat(64)),
+            "the entry itself is content-addressed",
+        );
+        assert_eq!(
+            crate::wheel_content::content_addressed_sha256(&derived),
+            None,
+            "a derived sibling is NOT, or phase-2 relax becomes a false refusal",
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// The recogniser must not treat a 64-hex directory that names something
     /// OTHER than the bytes as content-addressed. `.retread-wheel-fetch/v1/url/`
     /// entries are keyed by a hash of the URL, and reading a digest off one of
