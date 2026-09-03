@@ -3791,6 +3791,52 @@ where
 /// Attribution is already joined to constraint provenance; this layer arms
 /// only for precise Rule-1 facts and only when the opposing upstream pin is
 /// provably exact and excludes the conda-selected version.
+/// Drop the child uv's own tracing lines before ANY classification reads the
+/// text.
+///
+/// p6f gave the child uv `-v` plus a `RUST_LOG` filter so its work could be put
+/// on the backend's timeline. That was the right call and it stays. But uv's
+/// fmt layer writes those rows to the SAME stderr stream as its resolver error,
+/// and everything downstream of a closure failure classifies that stream by
+/// substring: `installer::is_platform_tag_conflict`,
+/// `conflict_says_no_such_version`, `uv_reason_sentence`. Log noise is not
+/// error text, and letting it be read as error text made the classifiers
+/// answer questions about uv's debug chatter.
+///
+/// Measured on job 5683236 (`retread-conflict.json`, bundle `isaaclab-2.3x-pack`):
+/// 3,774 lines, of which **3,762 were `DEBUG`**, 776,511 bytes in; 696 bytes of
+/// real prose out. In the raw text `"platform tag"` appears (once, as
+/// `DEBUG Unknown platform tag in wheel tag: win_ia64`) and `manylinux` appears
+/// 61 times, so the loose platform-tag test fired and the closure `bail!`ed
+/// before the fact-yield recovery could drop the offending sibling pin. In the
+/// stripped text both counts are ZERO and the actual error is legible:
+///
+///     x No solution found when resolving dependencies for split (...):
+///     `-> Because isaacsim-core==5.1.0.0 depends on packaging==23.0 and
+///        packaging==26.3, we can conclude that isaacsim-core==5.1.0.0 cannot
+///        be used.
+///
+/// uv's fmt layer prints no timestamp and no target, so a tracing row is
+/// recognised by its leading level token alone. `warning:` / `error:` lines are
+/// uv's own diagnostics in prose and are KEPT; so is every unprefixed line,
+/// including the box-drawing continuation lines that carry the conflict body.
+///
+/// The RAW text is still what `retread-conflict.json` records and what the
+/// backend log echoes -- forensics keep everything, classification sees only
+/// the error.
+pub(crate) fn strip_child_log_lines(stderr: &str) -> String {
+    stderr
+        .lines()
+        .filter(|line| {
+            !matches!(
+                line.trim_start().split(' ').next(),
+                Some("DEBUG") | Some("TRACE")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn workspace_fact_override_needed(
     req: &UvClosureRequest,
     attributions: &[ConflictAttribution],
@@ -4266,6 +4312,17 @@ where
                             names.insert(needed.pypi_name.clone())
                         };
                         if !inserted {
+                            // Law 9: the recovery gives up here. Say so, and
+                            // name the criterion -- a silent give-up in this
+                            // arm is indistinguishable from the yield never
+                            // having been reached at all, which is exactly the
+                            // ambiguity that cost this campaign a night.
+                            tracing::warn!(
+                                pypi_name = %needed.pypi_name,
+                                "uv closure: learned-fact yield EXHAUSTED -- this name was \
+                                 already yielded once in this closure and the re-lock failed \
+                                 again, so the original error stands"
+                            );
                             return Err(anyhow!(original_error));
                         }
                         // One warning for every yield class: the label says
@@ -4378,6 +4435,13 @@ where
                             .filter_map(|line| override_name(line))
                             .any(|existing| existing == name)
                         {
+                            tracing::warn!(
+                                pypi_name = %name,
+                                "uv closure: workspace-fact override REFUSED -- an explicit \
+                                 manual/drop override for this name is already present and \
+                                 hand-written intent is never stacked on; the original error \
+                                 stands"
+                            );
                             return Err(anyhow!(original_error));
                         }
                         let inserted = {
@@ -4390,6 +4454,12 @@ where
                             }
                         };
                         if !inserted {
+                            tracing::warn!(
+                                pypi_name = %name,
+                                "uv closure: workspace-fact override EXHAUSTED -- this fact was \
+                                 already applied in this closure and the re-lock failed again, \
+                                 so the original error stands"
+                            );
                             return Err(anyhow!(original_error));
                         }
                         tracing::info!(
@@ -6560,7 +6630,20 @@ pub(crate) async fn compute_closure_for_target(
     let lock_out = run(lock_args).await?;
     if !lock_out.status.success() {
         let stderr = String::from_utf8_lossy(&lock_out.stderr).into_owned();
-        let attributions = attribute_conflict(&stderr, &resolved_constraints.provenance);
+        // CLASSIFY ON THE ERROR, NOT ON THE LOG. `stderr` still holds every
+        // byte the child wrote (p6f) and that is what the record below keeps;
+        // `stderr_error` is the same text with the child's own DEBUG/TRACE rows
+        // removed. Every classifier below reads `stderr_error`.
+        let stderr_error = strip_child_log_lines(&stderr);
+        if stderr_error.len() != stderr.len() {
+            tracing::debug!(
+                bundle = %req.bundle,
+                raw_bytes = stderr.len(),
+                error_bytes = stderr_error.len(),
+                "uv closure failure: classifying on the child's error text with its DEBUG/TRACE rows removed"
+            );
+        }
+        let attributions = attribute_conflict(&stderr_error, &resolved_constraints.provenance);
         // Machine-readable record next to the project (spec §4a).
         let record = serde_json::json!({
             "bundle": req.bundle,
@@ -6573,7 +6656,7 @@ pub(crate) async fn compute_closure_for_target(
             project_dir.join(CONFLICT_FILE),
             serde_json::to_string_pretty(&record).unwrap_or_default(),
         );
-        let original_error = format_lock_failure(req, &stderr, &attributions);
+        let original_error = format_lock_failure(req, &stderr_error, &attributions);
 
         // The manylinux platform-tag ceiling is a DIFFERENT recovery
         // layer's job (glibc relaxation, `installer::is_platform_tag_
@@ -6581,7 +6664,20 @@ pub(crate) async fn compute_closure_for_target(
         // (Pass B could "heal" it by building an sdist for a package that
         // publishes wheels for other platforms, stealing the glibc-relax
         // path's ownership).
-        if crate::installer::is_platform_tag_conflict(&stderr) {
+        if crate::installer::is_platform_tag_conflict(&stderr_error) {
+            // Law 9: this arm REFUSES a closure and hands it to a different
+            // recovery layer. It used to do so silently, which is how it went
+            // unnoticed that p6f's child tracing had made it fire on every
+            // failure. Name the criterion and the layer that owns it.
+            tracing::warn!(
+                bundle = %req.bundle,
+                python = %req.python_version,
+                platform = %req.conda_subdir,
+                "uv closure: classified as a manylinux PLATFORM-TAG rejection, so the \
+                 workspace-fact override and learned-fact yield are DELIBERATELY skipped \
+                 -- glibc relaxation owns this failure (installer::is_platform_tag_conflict). \
+                 If that is wrong, this closure never gets its fact yields."
+            );
             bail!("{original_error}");
         }
 
@@ -14246,4 +14342,116 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
             ("bar", "2.5")
         );
     }
+
+    /// The VERBATIM stderr the child uv wrote in job 5683236 (C1 arm A,
+    /// binsnap `integration-e048562`, bundle `isaaclab-2.3x-pack`), taken from
+    /// that run's own `retread-conflict.json`. Every non-DEBUG line is present
+    /// in place; the DEBUG noise is sampled, and the sample deliberately keeps
+    /// the decisive `Unknown platform tag in wheel tag: win_ia64` row and
+    /// several routine `manylinux` rows, because those are the two substrings
+    /// that made the old classifier fire.
+    const C1_5683236_UV_STDERR: &str =
+        include_str!("testdata/c1_5683236_isaaclab_uv_stderr.txt");
+
+    /// p6h (i): the child's own DEBUG rows must not be able to make a closure
+    /// failure look like a manylinux platform-tag rejection.
+    ///
+    /// This is the whole of why `integration/4.12` @ e048562 could not lock the
+    /// canonical manifest: p6f gave the child uv `-v`, its DEBUG rows landed in
+    /// the SAME stderr the classifiers read, and the loose
+    /// `("platform tag" AND "manylinux")` test matched log noise. The closure
+    /// then `bail!`ed before the learned-fact yield that drops the offending
+    /// sibling pin.
+    #[test]
+    fn p6h_child_debug_rows_do_not_make_a_closure_failure_a_platform_tag_conflict() {
+        let raw = C1_5683236_UV_STDERR;
+        // The fixture really does contain both trigger substrings -- if it did
+        // not, this test would pass for the wrong reason.
+        assert!(
+            raw.contains("Unknown platform tag"),
+            "fixture must carry the DEBUG row that triggered the misclassification"
+        );
+        assert!(raw.contains("manylinux"), "fixture must carry manylinux rows");
+
+        let clean = strip_child_log_lines(raw);
+
+        // 1. Stripping removes the log and keeps the error.
+        assert!(
+            clean.len() < raw.len() / 2,
+            "the child's DEBUG rows dominate the stream; got {} of {} bytes",
+            clean.len(),
+            raw.len()
+        );
+        assert!(
+            !clean.contains("DEBUG "),
+            "no DEBUG row may survive into the classified text"
+        );
+        assert!(
+            clean.contains("No solution found when resolving dependencies"),
+            "uv's actual error must survive stripping; got: {clean}"
+        );
+        assert!(
+            clean.contains("packaging==23.0") && clean.contains("packaging==26.3"),
+            "the real conflict -- two exact pins for one name -- must survive"
+        );
+        // uv's own prose diagnostics are not log rows and are kept.
+        assert!(clean.contains("warning: The `if-necessary-or-explicit`"));
+
+        // 2. The classifier's verdict flips, which is the defect and the fix.
+        assert!(
+            !crate::installer::is_platform_tag_conflict(raw),
+            "the classifier must not be satisfiable by the child's DEBUG rows: this text \
+             carries `Unknown platform tag in wheel tag: win_ia64` and {} manylinux \
+             mentions, and the loose (\"platform tag\" AND \"manylinux\") disjunct \
+             accepted it",
+            raw.matches("manylinux").count()
+        );
+        assert!(
+            !crate::installer::is_platform_tag_conflict(&clean),
+            "the CLEAN text is a version conflict, not a platform-tag rejection"
+        );
+    }
+
+    /// p6h (ii): a genuine platform-tag rejection must still be recognised --
+    /// the fix must not have been "return false".
+    #[test]
+    fn p6h_a_real_platform_tag_rejection_is_still_recognised_through_stripping() {
+        let real = "DEBUG Solving with target Python version: ==3.11.*\n\
+             DEBUG Found no wheels for isaacsim\n  \
+             × No solution found when resolving dependencies:\n  \
+             Because isaacsim[all]==6.0.0.1 has no wheels with a matching platform \
+             tag (e.g., `manylinux_2_34_x86_64`) and isaac-pack depends on \
+             isaacsim[all]==6.0.0.1, we can conclude that the requirements are \
+             unsatisfiable.";
+        let clean = strip_child_log_lines(real);
+        assert!(!clean.contains("DEBUG "));
+        assert!(
+            crate::installer::is_platform_tag_conflict(&clean),
+            "uv's real rejection phrase must still classify after stripping"
+        );
+    }
+
+    /// p6h (iii): stripping is line-oriented and must not eat the conflict
+    /// body. uv draws the body with box characters and indents continuations;
+    /// none of those lines carry a level token.
+    #[test]
+    fn p6h_stripping_keeps_every_line_that_is_not_a_level_row() {
+        let text = "DEBUG a\nTRACE b\n  × No solution found\n  │ because x\n  \
+                    ╰─▶ depends on y\nwarning: deprecated\nerror: boom\n\
+                    DEBUGGING is not a level token\n";
+        let clean = strip_child_log_lines(text);
+        for kept in [
+            "× No solution found",
+            "│ because x",
+            "╰─▶ depends on y",
+            "warning: deprecated",
+            "error: boom",
+            "DEBUGGING is not a level token",
+        ] {
+            assert!(clean.contains(kept), "stripping dropped {kept:?}");
+        }
+        assert!(!clean.contains("DEBUG a"));
+        assert!(!clean.contains("TRACE b"));
+    }
+
 }
