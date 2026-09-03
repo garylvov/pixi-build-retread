@@ -88,6 +88,7 @@ same node with the same manifest and the same binary.
    bash -n <newbatch>_relock.sh && bash -n <newbatch>_cert.sh
    bash tools/phase_template/expect_sha_gate_guard.sh    # after any gate edit
    bash tools/phase_template/leftover_check_guard.sh     # after any check edit
+   bash tools/phase_template/wedge_triage_guard.sh       # after any triage edit
    ```
 
    > **The check matches the LINE, never "FILENAME:LNO: line".** It used to
@@ -645,3 +646,42 @@ Two independent levers, and **both ship**:
   to run, four times the noise floor. Take both levers; they do not overlap.
 
 The relock keeps `copy`, unchanged: the split is by phase, and that phase builds.
+
+## Before you call anything wedged: `wedge_triage.sh <pid> [<jobid>]`
+
+Read-only, signals nothing, and refuses to say `WEDGED` until it has ruled out
+the two states that look identical to one. It prints in order and stops at the
+first verdict that applies: **(a)** `dmesg -T | grep -i lockd` — if the last line
+is `not responding` with no later `OK`, `NFS-LOCK-OUTAGE (since <time>)`, and the
+answer is WAIT, because the mount is hard and the process resumes on its own;
+**(b)** every `pipe:` fd of the pid and its threads resolved to the holder of the
+other end — a `pipe_read` thread whose write end is held by a live ancestor or
+child is `IDLE-ON-RPC-CHANNEL`, the pixi→backend build-RPC stdin with no request
+in flight, which is what a correct idle backend looks like; **(c)** `/proc/locks`
+for the pid family with READ/WRITE, where a READ row is retread's documented
+shared clone lease (`source_build.rs`, `process_clone_locks`) and blocks nobody;
+**(d)** two samples 120 s apart of `utime+stime`, `rchar/wchar`, the wchan
+histogram and the newest file under the job's artifact dir — only if every
+counter AND the output are flat, and neither (a) nor (b) fired, does it print
+`WEDGED` together with the exact `kill -TERM <pid>` line, which it never runs.
+Exit codes 10/11/12/0. Guard: `wedge_triage_guard.sh`, which drives the real
+script against real processes (a `coproc` pipe, an idle `sleep`) and substitutes
+only `WT_DMESG_CMD` and `WT_SAMPLE_SECS`. It exists because on 2026-09-03 a
+44 m 53 s site NLM outage on node2347 was diagnosed as a backend hang and a
+healthy 60-minute install came within five minutes of being SIGTERMed — while on
+2026-09-02 the same two symptoms twice meant a real wedge where killing was
+right. Pass `WT_ARTIFACT_DIR` for a cert job: `scontrol` WorkDir is the task
+directory, not the per-env `artifacts/` the install log grows in.
+
+Two facts that belong next to it. **uv takes a per-sdist flock on the shared
+persistent uv cache**, so concurrent jobs building the same path source
+(`protomotions`, `pace-sim2real`) serialize on
+`…/uv-cache/sdists-v9/path/<hash>/.lock` by design — expected, not a defect. But
+that lock lives on the same NFS, so **under a lockd outage the ordinary wait
+becomes a 3 600 s timeout that kills the job**: that is exactly how `hlgd-proof`
+`5688009` died on 2026-09-03. And **`lockd` is server-side** — when
+`hpcnfs.ccv.brown.edu` stops answering it stalls NLM locks on EVERY node at once
+(measured the same afternoon on node2347, node2407, node1936 and node1827), so
+the outage explaining a uv lock timeout may only be visible from a different host
+than the job's. When a uv "waiting for lock" row is the last thing in a log,
+`wedge_triage.sh` prints the lockd view for you.
