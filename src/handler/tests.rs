@@ -10198,9 +10198,11 @@ fn a_calver_ceded_bound_builds_and_records_the_calver_relaxation() {
             parent: "torch".to_string(),
             child: "fsspec".to_string(),
         });
-    bundle
-        .workspace_locked_pypi
-        .insert("fsspec".to_string(), "2026.7.0".to_string());
+    if std::env::var("P6J_NOLOCK").is_err() {
+        bundle
+            .workspace_locked_pypi
+            .insert("fsspec".to_string(), "2026.7.0".to_string());
+    }
 
     let (output, relaxations) = produce_output_pending_relaxations(
         &bundle,
@@ -10998,3 +11000,132 @@ fn p6g_a_single_owner_name_keeps_its_declared_constrains_bound_with_the_gate_on(
 /// Gate-OFF emission of the p6g fixture as produced by `integration/4.12` @
 /// 44233cf, captured in a detached worktree at that commit.
 const P6G_GATE_OFF_GOLDEN_44233CF: &str = "depends=[\"python 3.11.*\", \"fsspec >=2024.6.1,<2025\"]\nconstrains=[]";
+
+// p6j -- THE ORIGIN p6g's PROJECTION NEVER REACHED.
+//
+// Job 5707112 (LANE-C-WARM-LOG §12), arm ONCERT, on p6g's OWN merged binary
+// (`integration/4.12` @ e1e7065, which contains d98e881), certified 994-line
+// manifest, gate ON. It is the first ONCERT run that reached `pm-isaaclab` on
+// that binary, and it died on the clause p6g was written to remove:
+//
+//   isaaclab-2.3x-pack 0.54.2 would constrain fsspec >=2023.5.0,==2024.6.1
+//   protomotions-deps-pack 3.1 would require   fsspec ==2026.7.0
+//
+// 1127 `retread-constrains-discipline` rows fired in that run, and not one of
+// them was for `fsspec`. Measured from `P6GOC-5707112-ONCERT.backend.log`, the
+// surviving exact does NOT come from the auto-route at all:
+//
+//   wheel `isaacsim-core==5.1.0.0`   Requires-Dist `fsspec==2024.6.1`    x162
+//   wheel `huggingface_hub==0.36.2`  Requires-Dist `fsspec>=2023.5.0`     x30
+//
+// p6g projected the route's own picks out exactly as designed. The clause left
+// standing is an origin of kind `wheel-requires-dist` on a wheel this pack
+// BUNDLES -- a shape `closure_derived_route_origins` was never built to match.
+// A bundled wheel's exact pin is the pack's own closure content wearing a
+// different origin kind, and in a `constrains_only` group -- where the name is
+// one the WORKSPACE provides and another pack legitimately resolves it
+// elsewhere -- advertising that point makes the shared environment unsolvable.
+//
+// Modelled here as the cold relock it was: `workspace_locked_pypi` is EMPTY,
+// because a relock that regenerates `pixi.lock` has no prior pypi entry to
+// read. That is what keeps the F26 CalVer cede (which needs a declared-pypi
+// owner version) out of the picture and lets the raw `==` reach emission,
+// exactly as it did in 5707112.
+// -----------------------------------------------------------------
+
+/// The 5707112 shape: a wheel the pack BUNDLES pins the shared name to an
+/// exact, while another wheel in the same bundle declares the compatibility
+/// band that must survive.
+fn p6j_pack(pack: &str, closure_pick: &str, bundled_wheel: &str, counterparties: &[&str]) -> Bundle {
+    // `">=2023.5.0"` becomes the PRIMARY wheel's `Requires-Dist` -- the
+    // `huggingface_hub==0.36.2` role in the measured run.
+    let mut bundle = p6g_pack(pack, closure_pick, ">=2023.5.0", true, counterparties);
+    bundle.extras.push(rw(
+        bundled_wheel,
+        meta(
+            bundled_wheel,
+            "5.1.0.0",
+            vec![&format!("fsspec=={closure_pick}")],
+            true,
+        ),
+    ));
+    bundle
+}
+
+/// (p6j) A bundled wheel's exact `Requires-Dist` is not a workspace contract.
+///
+/// FAILS on `e1e7065` (p6g merged): there the discipline drops only the
+/// auto-route's two bounds, the bundled wheel's `==` survives, and the emitted
+/// line is `fsspec >=2023.5.0,==2024.6.1` -- byte-for-byte the clause in
+/// 5707112's solver error.
+#[test]
+fn p6j_a_bundled_wheels_exact_requires_dist_is_not_advertised_as_a_constrains_pin() {
+    let counterparties = ["2024.6.1", "2026.7.0"];
+    for (pack, closure_pick, bundled_wheel) in [
+        ("isaaclab-2-3x-pack", "2024.6.1", "isaacsim-core"),
+        ("protomotions-deps-pack", "2026.7.0", "protomotions-core"),
+    ] {
+        let bundle = p6j_pack(pack, closure_pick, bundled_wheel, &counterparties);
+        let (constrains, logs) = capture_warn_logs(|| p6g_constrains(&bundle));
+        let fsspec: Vec<&String> = constrains
+            .iter()
+            .filter(|line| line.split(' ').next() == Some("fsspec"))
+            .collect();
+        assert!(
+            !fsspec.iter().any(|line| line.contains("==")),
+            "{pack}: the exact `{closure_pick}` pinned by the BUNDLED wheel \
+             `{bundled_wheel}` reached the emitted constrains -- that clause is what \
+             made pm-isaaclab unsolvable in job 5707112: {constrains:?}",
+        );
+        assert!(
+            fsspec.iter().any(|line| line.contains(">=2023.5.0")),
+            "{pack}: a `Requires-Dist` that states a BAND is a real compatibility \
+             statement and must survive; only the point is dropped: {constrains:?}",
+        );
+        assert!(
+            logs.contains("retread-constrains-discipline"),
+            "{pack}: the drop must be loud -- 5707112 had 1127 of these rows and not \
+             one for fsspec: {logs}",
+        );
+        assert!(
+            logs.contains(bundled_wheel),
+            "{pack}: the row must name the WHEEL whose pin was projected out; without \
+             `{bundled_wheel}` in it the row is p6g's row about the auto-route, not this \
+             one: {logs}",
+        );
+        for counterparty in counterparties {
+            assert!(
+                logs.contains(counterparty),
+                "{pack}: the row must NAME the counterparties ({counterparty} missing): {logs}",
+            );
+        }
+    }
+}
+
+/// (p6j) The band half of the same origin kind is untouched.
+///
+/// Keying the widened projection on the origin KIND alone would delete
+/// `huggingface_hub`'s `>=2023.5.0` too and leave the entry stating nothing.
+/// This is the mutation that must stay red, and it is why the projection reads
+/// the OPERATOR and not just the kind.
+#[test]
+fn p6j_a_bundled_wheels_range_requires_dist_survives_the_widened_projection() {
+    let bundle = p6j_pack(
+        "isaaclab-2-3x-pack",
+        "2024.6.1",
+        "isaacsim-core",
+        &["2024.6.1", "2026.7.0"],
+    );
+    let constrains = p6g_constrains(&bundle);
+    let line = constrains
+        .iter()
+        .find(|line| line.split(' ').next() == Some("fsspec"))
+        .unwrap_or_else(|| {
+            panic!("dropping the bundled exact must not delete the entry: {constrains:?}")
+        });
+    assert_eq!(
+        line, "fsspec >=2023.5.0",
+        "exactly the declared band, nothing more and nothing less: {constrains:?}",
+    );
+}
+
