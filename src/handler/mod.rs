@@ -9599,6 +9599,49 @@ fn precise_env_solve_specs(
 /// Names the pack ships itself (`[retread-wheels]` entries and closure
 /// members it bundles) are NOT a contribution to the environment's conda
 /// side and are never folded in.
+/// p6n-b. The exact version a pack override contributes to the conda side,
+/// or `None` when the override is not an exact pin.
+///
+/// THE DEFECT THIS CLOSES (job 5727660, `LANE-C-WARM-LOG.md` §16). p6n folded
+/// every non-empty override into the consuming environments' conda solve
+/// verbatim, INCLUDING open-ended ones. `effective.overrides` is not the
+/// pack manifest's hand pins alone: `pack_overrides::merge_ledger_overrides`
+/// REPLACES a manifest pin with the repair ledger's entry, and those are
+/// routinely floors. In `imprint-data/.retread/auto-overrides.json`,
+/// `pypi-packs/protomotions-deps-pack` carries `sentry-sdk = ">=2.0.0"`
+/// (provenance `DepsFromPin`), which supersedes the manifest's
+/// `sentry-sdk = "==2.29.1"`. Folded as a conda spec into every precise
+/// consuming environment and solved with `SolveStrategy::Highest`, `>=2.0.0`
+/// INVENTED conda `sentry-sdk 2.68.1` -- a package `pm-isaaclab` does not
+/// install at all (it gets sentry-sdk 2.29.1 as a WHEEL, because
+/// `isaacsim-kernel==5.1.0.0` exact-pins it). `facts_from_solved_records`
+/// then published 2.68.1 as a workspace conda fact, emission attached it to
+/// the `sentry-sdk` group next to the co-activated sibling pin
+/// `sentry-sdk==2.29.1` from `isaaclab-2.3x-pack`, and the group became
+/// mutually unsatisfiable. The same manifest resolved `pm-isaaclab` fine in
+/// job 5720294 without p6n.
+///
+/// A FLOOR IS NOT A CONTRIBUTION. `>=2.0.0` says nothing about the version
+/// the workspace's prefix will hold; it is a bound on the pack's WHEEL
+/// closure. Only `==<version>` states "this environment will hold exactly
+/// this", which is the premise the whole fold rests on. Folding a floor does
+/// not add a fact -- it drags the name into a solve that then makes one up.
+/// The motivating instance is untouched: `ray = "==2.49.1"` is exact, and
+/// every pass-2 auto-route contribution is built as `==<conda_version>`.
+fn exact_contribution_version(spec: &str) -> Option<&str> {
+    let spec = spec.trim();
+    let version = spec.strip_prefix("==")?.trim();
+    if version.is_empty()
+        || version.contains(',')
+        || version.contains('*')
+        || version.contains(char::is_whitespace)
+    {
+        return None;
+    }
+    uv_pep508::uv_pep440::Version::from_str(version).ok()?;
+    Some(spec)
+}
+
 fn bundle_conda_contribution(
     effective: &RetreadConfig,
     closure: Option<&crate::uv_closure::UvClosure>,
@@ -9610,10 +9653,17 @@ fn bundle_conda_contribution(
         .map(|name| canonical_conda_name(name))
         .collect();
     for (pypi, spec) in &effective.overrides {
-        let spec = spec.trim();
-        if spec.is_empty() || spec == "*" {
+        // p6n-b. Only an EXACT pin is a conda-side contribution; a floor or a
+        // range is a bound on this pack's wheel closure and must never reach
+        // the fact solve. See `exact_contribution_version`.
+        let Some(spec) = exact_contribution_version(spec) else {
+            tracing::debug!(
+                override_name = %pypi,
+                spec = %spec,
+                "p6n: override is not an exact pin; not a conda-side contribution",
+            );
             continue;
-        }
+        };
         if shipped.contains(&canonical_conda_name(pypi)) {
             continue;
         }
@@ -12201,6 +12251,82 @@ gpu = { features = ["gpu"], no-default-feature = true }
             "the closure's own conda routes join the fold on pass 2",
         );
         assert_ne!(pass1, pass2, "pass 2 must have something new to fold, or it is not a pass");
+    }
+
+    /// p6n-b GUARD. The live fixture is job 5727660 / `LANE-C-WARM-LOG.md`
+    /// §16, reproduced from the two files it actually read:
+    /// `pypi-packs/protomotions-deps-pack/pixi.toml` pins
+    /// `sentry-sdk = "==2.29.1"`, and `.retread/auto-overrides.json`
+    /// SUPERSEDES it for that pack with `sentry-sdk = ">=2.0.0"`
+    /// (provenance `DepsFromPin`). Folded verbatim as a conda spec and
+    /// solved `Highest`, that floor invented conda `sentry-sdk 2.68.1` for
+    /// `pm-isaaclab` -- an environment whose sentry-sdk is a WHEEL at
+    /// 2.29.1 -- and the invented fact then collided at emission with the
+    /// co-activated sibling pin from `isaaclab-2.3x-pack`. A floor
+    /// contributes no version, so it must not reach the fact solve at all.
+    ///
+    /// RED on f69f41a: the fold's only spec filter there is
+    /// `spec.is_empty() || spec == "*"`, so `>=2.0.0` folds and this
+    /// assertion fails.
+    #[test]
+    fn p6n_b_an_open_ended_override_is_not_a_conda_contribution() {
+        let mut config: crate::config::RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-wheels": {},
+            "retread-overrides": {
+                // The repair-ledger entry as `merge_ledger_overrides` leaves
+                // it: the manifest's `==2.29.1` is GONE, replaced by a floor.
+                "sentry-sdk": ">=2.0.0",
+                // Ranges and non-`==` operators are the same class.
+                "attrs": ">=25.1.0,<26",
+                "packaging": "!=24.0",
+                "cycler": "~=0.11.0",
+                // The motivating p6n instance, which must SURVIVE.
+                "ray": "==2.49.1",
+            },
+        }))
+        .unwrap();
+        config.name_map = name_map(&[
+            ("ray", "ray-core"),
+            ("sentry-sdk", "sentry-sdk"),
+            ("attrs", "attrs"),
+            ("packaging", "packaging"),
+            ("cycler", "cycler"),
+        ]);
+
+        let contribution = super::bundle_conda_contribution(&config, None);
+
+        assert_eq!(
+            contribution,
+            BTreeMap::from([("ray-core".to_string(), "==2.49.1".to_string())]),
+            "only the exact pin is a conda-side contribution; got {contribution:?}",
+        );
+
+        // The decisive consequence, at the seam that actually failed: the
+        // floor must not reach the consuming environment's spec list, where
+        // `SolveStrategy::Highest` would turn it into a version.
+        let deps = BTreeMap::from([("isaaclab-2.3x-pack".to_string(), "*".to_string())]);
+        let specs = super::precise_env_solve_specs(
+            &deps,
+            &PypiKey::from_pypi("protomotions-deps-pack"),
+            &contribution,
+            "3.11",
+        );
+        let rendered: Vec<String> = specs.iter().map(|spec| spec.to_string()).collect();
+        assert!(
+            !rendered.iter().any(|spec| spec.starts_with("sentry-sdk")),
+            "a floor must never reach the fact solve; got {rendered:?}",
+        );
+
+        // NON-VACUITY: the same helper still accepts the shapes the fold is
+        // FOR, so this guard cannot pass by refusing everything.
+        assert_eq!(super::exact_contribution_version("==2.49.1"), Some("==2.49.1"));
+        assert_eq!(super::exact_contribution_version("  ==1.26.0 "), Some("==1.26.0"));
+        assert_eq!(super::exact_contribution_version(">=2.0.0"), None);
+        assert_eq!(super::exact_contribution_version("==2.*"), None);
+        assert_eq!(super::exact_contribution_version("==1.0,<2"), None);
+        assert_eq!(super::exact_contribution_version("==not-a-version"), None);
+        assert_eq!(super::exact_contribution_version("*"), None);
+        assert_eq!(super::exact_contribution_version(""), None);
     }
 
     /// The decisive assertion: the learned fact for the second name is the
