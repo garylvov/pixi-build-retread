@@ -4674,13 +4674,120 @@ impl Drop for ClosureUvProcessGroupGuard {
     }
 }
 
+/// Whether retread instruments the uv child it is about to spawn.
+///
+/// `Traced` is what production uses: the child gets a verbosity flag and a
+/// `RUST_LOG` filter of its own, so its resolver and registry decisions
+/// arrive on retread's log with retread's timestamps. `Bare` spawns the
+/// program exactly as asked and is for fixtures that are not uv (a shell
+/// script would choke on uv's flags). Both stream stderr.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UvChildTracing {
+    Traced,
+    Bare,
+}
+
+/// Env var uv reads for its own tracing filter.
+pub const UV_CHILD_LOG_ENV: &str = "RUST_LOG";
+
+/// Verbosity flag retread passes a traced uv child.
+///
+/// Global, so it precedes the subcommand.
+pub const UV_CHILD_VERBOSITY_FLAG: &str = "-v";
+
+/// Filter retread stamps on a traced uv child when the caller declared none.
+///
+/// Measured on uv 0.12.5 over a three-package closure (`uv lock`, cold
+/// cache): with this filter the child prints 24 stderr rows carrying both
+/// halves of the question the 497 s `isaac-pack-latest` closure could not
+/// answer — the resolver's decisions (`Adding direct dependency`,
+/// `Searching for a compatible version of`, `Selecting:`, `Tried N
+/// versions`) and the registry traffic that separates FETCHING from
+/// THINKING (`No cache entry for`, `Sending fresh GET request for`). The
+/// same run with `-vv` and no filter prints 108 rows of TRACE, so retread
+/// never asks for that. uv honours `RUST_LOG` over the template its own
+/// verbosity flag builds, so `-v` only decides what a child sees if this
+/// filter is ever emptied.
+pub const UV_CHILD_LOG_DEFAULT: &str = "uv_resolver=debug,uv_client=debug,uv_distribution=debug";
+
+/// Bounds on what retread echoes from one child's stderr. The CAPTURED copy
+/// the conflict parser reads is never bounded — only the echo is, so a uv
+/// that prints a hundred megabytes cannot drown the backend log, and the
+/// child is never blocked either way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct UvChildStreamCaps {
+    /// Longest single line copied onto retread's log, in bytes.
+    line_bytes: usize,
+    /// Most lines echoed per call; past it the echo stops and the dropped
+    /// count is logged once.
+    lines: usize,
+}
+
+impl UvChildStreamCaps {
+    /// uv can print a whole resolution error as one line, and a `-v` closure
+    /// of the isaac shape printed tens of thousands of rows, so the budget
+    /// is set well above a healthy run and only fires on a runaway.
+    const DEFAULT: Self = Self {
+        line_bytes: 2_000,
+        lines: 200_000,
+    };
+}
+
+/// Bytes of the child's final stderr line kept on the bench row.
+const UV_CHILD_LAST_LINE_BYTES: usize = 200;
+
+/// The `RUST_LOG` a traced uv child runs with: the caller's when they
+/// declared a non-empty one, otherwise [`UV_CHILD_LOG_DEFAULT`].
+fn uv_child_log_filter(inherited: Option<OsString>) -> OsString {
+    inherited
+        .filter(|declared| !declared.is_empty())
+        .unwrap_or_else(|| OsString::from(UV_CHILD_LOG_DEFAULT))
+}
+
+/// Truncate `line` to `cap` bytes on a char boundary, naming what was cut.
+fn clamp_child_log_line(line: &str, cap: usize) -> std::borrow::Cow<'_, str> {
+    if line.len() <= cap {
+        return std::borrow::Cow::Borrowed(line);
+    }
+    let mut end = cap;
+    while end > 0 && !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    let dropped = line.len() - end;
+    std::borrow::Cow::Owned(format!("{}… [+{dropped} bytes]", &line[..end]))
+}
+
 fn build_uv_closure_command(
     uv_bin: &Path,
     args: &[String],
     project_dir: &Path,
     uv_cache_dir: &Path,
+    tracing_mode: UvChildTracing,
+) -> tokio::process::Command {
+    build_uv_closure_command_with(
+        uv_bin,
+        args,
+        project_dir,
+        uv_cache_dir,
+        tracing_mode,
+        std::env::var_os(UV_CHILD_LOG_ENV),
+    )
+}
+
+fn build_uv_closure_command_with(
+    uv_bin: &Path,
+    args: &[String],
+    project_dir: &Path,
+    uv_cache_dir: &Path,
+    tracing_mode: UvChildTracing,
+    inherited_log: Option<OsString>,
 ) -> tokio::process::Command {
     let mut command = tokio::process::Command::new(uv_bin);
+    if tracing_mode == UvChildTracing::Traced {
+        // uv's verbosity flag is global, so it goes before the subcommand
+        // `args` opens with.
+        command.arg(UV_CHILD_VERBOSITY_FLAG);
+    }
     command
         .args(args)
         .current_dir(project_dir)
@@ -4690,6 +4797,9 @@ fn build_uv_closure_command(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    if tracing_mode == UvChildTracing::Traced {
+        command.env(UV_CHILD_LOG_ENV, uv_child_log_filter(inherited_log));
+    }
     // Siblings share `uv_cache_dir`; without a budget of our own, uv's 300 s
     // default aborts the lock whenever a cold sdist build outlasts it.
     apply_uv_lock_budget(&mut command);
@@ -4698,29 +4808,165 @@ fn build_uv_closure_command(
     command
 }
 
+/// What one child's stderr pump produced.
+struct UvChildStderr {
+    /// Every byte the child wrote, unmodified — this is what the conflict
+    /// parser and the `retread-conflict.json` record read.
+    captured: Vec<u8>,
+    /// Lines echoed onto retread's log.
+    streamed: usize,
+    /// Lines the budget dropped from the echo (never from `captured`).
+    suppressed: usize,
+    /// First [`UV_CHILD_LAST_LINE_BYTES`] bytes of the last non-blank line.
+    last_line: String,
+}
+
+/// Spawn one uv child, echoing its stderr line by line onto retread's log as
+/// it arrives.
+///
+/// uv's own output carries no timestamps, so collecting it at exit — what
+/// this did before — could say WHAT a call did and never WHEN. A single
+/// `isaac-pack-latest` closure call that took 499.2 s produced not one
+/// datable row anywhere (LANE-SPEED-LOG 2026-09-03, job 5656622); each line
+/// now lands as a `debug` event stamped by retread's subscriber.
 async fn run_uv_closure_command(
     uv_bin: &Path,
     args: &[String],
     project_dir: &Path,
     uv_cache_dir: &Path,
+    tracing_mode: UvChildTracing,
+    bundle: &str,
 ) -> Result<std::process::Output> {
-    let mut command = build_uv_closure_command(uv_bin, args, project_dir, uv_cache_dir);
-    let child = command
+    run_uv_closure_command_with_caps(
+        uv_bin,
+        args,
+        project_dir,
+        uv_cache_dir,
+        tracing_mode,
+        bundle,
+        UvChildStreamCaps::DEFAULT,
+    )
+    .await
+}
+
+async fn run_uv_closure_command_with_caps(
+    uv_bin: &Path,
+    args: &[String],
+    project_dir: &Path,
+    uv_cache_dir: &Path,
+    tracing_mode: UvChildTracing,
+    bundle: &str,
+    caps: UvChildStreamCaps,
+) -> Result<std::process::Output> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+
+    let started = std::time::Instant::now();
+    let mut command =
+        build_uv_closure_command(uv_bin, args, project_dir, uv_cache_dir, tracing_mode);
+    let mut child = command
         .spawn()
         .with_context(|| format!("spawning `{} {}`", uv_bin.display(), args.join(" ")))?;
+    let pid = child
+        .id()
+        .context("spawned uv closure process has no operating-system pid")?;
     #[cfg(unix)]
-    let mut process_group = ClosureUvProcessGroupGuard::new(
-        child
-            .id()
-            .context("spawned uv closure process has no operating-system pid")?,
-    )?;
-    let output = child
-        .wait_with_output()
+    let mut process_group = ClosureUvProcessGroupGuard::new(pid)?;
+
+    let mut stdout_pipe = child
+        .stdout
+        .take()
+        .context("spawned uv closure process has no stdout pipe")?;
+    let stderr_pipe = child
+        .stderr
+        .take()
+        .context("spawned uv closure process has no stderr pipe")?;
+
+    // Both pipes are drained CONCURRENTLY with the child running: a child
+    // that fills either kernel buffer while we wait on the other deadlocks.
+    let read_stdout = async move {
+        let mut buffer = Vec::new();
+        stdout_pipe.read_to_end(&mut buffer).await.map(|_| buffer)
+    };
+    let prefix = format!("uv[bundle={bundle} pid={pid}]");
+    let pump_stderr = async move {
+        let mut reader = tokio::io::BufReader::new(stderr_pipe);
+        let mut pumped = UvChildStderr {
+            captured: Vec::new(),
+            streamed: 0,
+            suppressed: 0,
+            last_line: String::new(),
+        };
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            if reader.read_until(b'\n', &mut line).await? == 0 {
+                break;
+            }
+            pumped.captured.extend_from_slice(&line);
+            let text = String::from_utf8_lossy(&line);
+            let text = text.trim_end_matches(['\n', '\r']);
+            if text.is_empty() {
+                continue;
+            }
+            pumped.last_line = clamp_child_log_line(text, UV_CHILD_LAST_LINE_BYTES).into_owned();
+            if pumped.streamed < caps.lines {
+                pumped.streamed += 1;
+                tracing::debug!("{prefix}: {}", clamp_child_log_line(text, caps.line_bytes));
+            } else {
+                pumped.suppressed += 1;
+            }
+        }
+        Ok::<UvChildStderr, std::io::Error>(pumped)
+    };
+    let (stdout, stderr) = tokio::join!(read_stdout, pump_stderr);
+    let stdout = stdout.with_context(|| {
+        format!(
+            "reading stdout of `{} {}`",
+            uv_bin.display(),
+            args.join(" ")
+        )
+    })?;
+    let stderr = stderr.with_context(|| {
+        format!(
+            "reading stderr of `{} {}`",
+            uv_bin.display(),
+            args.join(" ")
+        )
+    })?;
+    let status = child
+        .wait()
         .await
         .with_context(|| format!("waiting for `{} {}`", uv_bin.display(), args.join(" ")))?;
     #[cfg(unix)]
     process_group.disarm();
-    Ok(output)
+
+    if stderr.suppressed > 0 {
+        tracing::warn!(
+            bundle = %bundle,
+            pid,
+            suppressed = stderr.suppressed,
+            budget = caps.lines,
+            "uv closure: child stderr echo hit its per-call budget; the captured \
+             text is still complete",
+        );
+    }
+    tracing::info!(
+        bundle = %bundle,
+        pid,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        lines = stderr.streamed + stderr.suppressed,
+        streamed = stderr.streamed,
+        suppressed = stderr.suppressed,
+        exit_code = status.code().unwrap_or(-1),
+        last_stderr = %stderr.last_line,
+        "bench: uv_closure_child",
+    );
+
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr: stderr.captured,
+    })
 }
 
 /// Warn (do NOT error) when the uv on PATH differs from a previously
@@ -6147,7 +6393,18 @@ pub(crate) async fn compute_closure_for_target(
         let uv_bin = uv_bin.clone();
         let project_dir = project_dir.to_path_buf();
         let uv_cache_dir = uv_cache_dir.to_path_buf();
-        async move { run_uv_closure_command(&uv_bin, &args, &project_dir, &uv_cache_dir).await }
+        let bundle = req.bundle.clone();
+        async move {
+            run_uv_closure_command(
+                &uv_bin,
+                &args,
+                &project_dir,
+                &uv_cache_dir,
+                UvChildTracing::Traced,
+                &bundle,
+            )
+            .await
+        }
     };
 
     // -- uv lock (Pass A) --------------------------------------------------
@@ -6549,6 +6806,7 @@ mod tests {
             &["lock".to_string()],
             Path::new("/tmp"),
             Path::new("/tmp/uv-cache"),
+            UvChildTracing::Traced,
         );
         let expected = std::env::var_os(UV_LOCK_TIMEOUT_ENV)
             .filter(|declared| !declared.is_empty())
@@ -6914,7 +7172,14 @@ isaaclab = { path = "wheels/isaaclab/isaaclab-2.0.0-py3-none-any.whl" }
 
         let output = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            run_uv_closure_command(Path::new("/bin/sh"), &args, &project, &cache),
+            run_uv_closure_command(
+                Path::new("/bin/sh"),
+                &args,
+                &project,
+                &cache,
+                UvChildTracing::Bare,
+                "test-bundle",
+            ),
         )
         .await
         .expect("uv command hung waiting for inherited stdin")
@@ -6946,7 +7211,14 @@ isaaclab = { path = "wheels/isaaclab/isaaclab-2.0.0-py3-none-any.whl" }
 
         let output = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            run_uv_closure_command(Path::new("/bin/sh"), &args, &project, &cache),
+            run_uv_closure_command(
+                Path::new("/bin/sh"),
+                &args,
+                &project,
+                &cache,
+                UvChildTracing::Bare,
+                "test-bundle",
+            ),
         )
         .await
         .expect("failed uv command did not return")
@@ -6962,6 +7234,370 @@ isaaclab = { path = "wheels/isaaclab/isaaclab-2.0.0-py3-none-any.whl" }
         assert!(crate::installer::is_platform_tag_conflict(
             String::from_utf8_lossy(&output.stderr).as_ref()
         ));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // -- child-uv tracing (p6f) ------------------------------------------
+    //
+    // The 499.2 s `isaac-pack-latest` closure call of job 5656622 wrote not
+    // one datable row: the child's output was piped and read only at exit.
+    // These guards hold the two properties that made it readable — the
+    // child's stderr reaches retread's log AS IT IS WRITTEN, and the
+    // conflict parser still receives every byte of it.
+
+    fn uv_child_test_dir(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "retread-{label}-{}-{}",
+            std::process::id(),
+            CLOSURE_META_TMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
+    }
+
+    /// Write an executable stand-in for uv whose stderr the test controls.
+    #[cfg(unix)]
+    fn write_fake_uv(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("fake-uv.sh");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// Log writer that keeps the moment retread wrote each row, so a test can
+    /// tell "streamed as it arrived" from "flushed in one burst at exit".
+    #[cfg(unix)]
+    struct StampedLogWriter(std::sync::Arc<std::sync::Mutex<Vec<(std::time::Instant, String)>>>);
+
+    #[cfg(unix)]
+    impl std::io::Write for StampedLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().push((
+                std::time::Instant::now(),
+                String::from_utf8_lossy(bytes).into_owned(),
+            ));
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Drive `body` on a current-thread runtime under a DEBUG subscriber that
+    /// stamps rows the way the production one does, returning every row with
+    /// the instant retread emitted it.
+    #[cfg(unix)]
+    fn with_stamped_debug_log<F: std::future::Future>(
+        body: F,
+    ) -> (F::Output, Vec<(std::time::Instant, String)>) {
+        let rows = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer({
+                let rows = std::sync::Arc::clone(&rows);
+                move || StampedLogWriter(std::sync::Arc::clone(&rows))
+            })
+            .finish();
+        let value = tracing::subscriber::with_default(subscriber, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("building the test runtime")
+                .block_on(body)
+        });
+        let rows = rows.lock().unwrap().clone();
+        (value, rows)
+    }
+
+    #[cfg(unix)]
+    fn prefixed_rows<'a>(
+        rows: &'a [(std::time::Instant, String)],
+        bundle: &str,
+    ) -> Vec<&'a (std::time::Instant, String)> {
+        let prefix = format!("uv[bundle={bundle} pid=");
+        rows.iter().filter(|(_, t)| t.contains(&prefix)).collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uv_child_stderr_reaches_the_backend_log_as_the_child_writes_it() {
+        let tmp = uv_child_test_dir("uv-child-stream");
+        let project = tmp.join("project");
+        let cache = tmp.join("cache");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        // Five rows spread over ~1 s, then the conflict line the installer's
+        // classifier reads, then a non-zero exit.
+        let fake_uv = write_fake_uv(
+            &tmp,
+            "i=1\n\
+             while [ $i -le 5 ]; do echo \"DEBUG fake-uv row $i\" >&2; sleep 0.2; i=$((i+1)); done\n\
+             echo 'x has no wheels with a matching platform tag (e.g., manylinux_2_34_x86_64)' >&2\n\
+             exit 3\n",
+        );
+
+        let project_for_child = project.clone();
+        let cache_for_child = cache.clone();
+        let (output, rows) = with_stamped_debug_log(async move {
+            run_uv_closure_command(
+                &fake_uv,
+                &["lock".to_string()],
+                &project_for_child,
+                &cache_for_child,
+                UvChildTracing::Traced,
+                "fake-bundle",
+            )
+            .await
+            .expect("the fake uv child must be waited on cleanly")
+        });
+
+        assert_eq!(output.status.code(), Some(3));
+
+        // 1. The error path still sees the COMPLETE stderr.
+        let stderr = String::from_utf8(output.stderr.clone()).unwrap();
+        for row in 1..=5 {
+            assert!(
+                stderr.contains(&format!("DEBUG fake-uv row {row}")),
+                "streaming must not consume the captured stderr the conflict \
+                 parser reads; row {row} is missing from {stderr:?}",
+            );
+        }
+        assert!(
+            crate::installer::is_platform_tag_conflict(&stderr),
+            "the conflict classifier must still receive the child's full stderr",
+        );
+
+        // 2. Every line reached retread's log, prefixed and timestamped.
+        let streamed = prefixed_rows(&rows, "fake-bundle");
+        assert_eq!(
+            streamed.len(),
+            6,
+            "every child stderr line must be echoed once; got {:#?}",
+            streamed.iter().map(|(_, t)| t).collect::<Vec<_>>(),
+        );
+        for (_, text) in &streamed {
+            let stamp = text.split_whitespace().next().unwrap_or_default();
+            assert!(
+                stamp.contains('T') && stamp.contains('-'),
+                "each echoed row must carry retread's own timestamp (uv prints \
+                 none of its own); row was {text:?}",
+            );
+        }
+
+        // 3. The stamps are monotone AND spread across the child's lifetime.
+        //    Reading the pipe at exit would land all six inside one burst.
+        for pair in streamed.windows(2) {
+            assert!(
+                pair[1].0 >= pair[0].0,
+                "echoed rows must be non-decreasing in time",
+            );
+        }
+        let spread = streamed
+            .last()
+            .unwrap()
+            .0
+            .duration_since(streamed.first().unwrap().0);
+        assert!(
+            spread >= std::time::Duration::from_millis(500),
+            "the child spent ~1 s writing these rows, so they must reach the \
+             log ~1 s apart; a {spread:?} spread means the stderr was buffered \
+             to exit and the WHEN is lost again",
+        );
+
+        // 4. The bench row names the call.
+        let bench = rows
+            .iter()
+            .find(|(_, t)| t.contains("bench: uv_closure_child"))
+            .map(|(_, t)| t.clone())
+            .expect("the child call must emit its bench span");
+        assert!(bench.contains("exit_code=3"), "bench row was {bench:?}");
+        assert!(bench.contains("lines=6"), "bench row was {bench:?}");
+        assert!(bench.contains("elapsed_ms="), "bench row was {bench:?}");
+        assert!(
+            bench.contains("last_stderr=x has no wheels"),
+            "the bench row must carry the child's last stderr line; was {bench:?}",
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uv_child_stderr_echo_is_capped_per_line_and_per_call() {
+        let tmp = uv_child_test_dir("uv-child-caps");
+        let project = tmp.join("project");
+        let cache = tmp.join("cache");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        let long = "x".repeat(300);
+        let fake_uv = write_fake_uv(
+            &tmp,
+            &format!(
+                "echo '{long}' >&2\n\
+                 i=2\n\
+                 while [ $i -le 5 ]; do echo \"row $i\" >&2; i=$((i+1)); done\n",
+            ),
+        );
+
+        let project_for_child = project.clone();
+        let cache_for_child = cache.clone();
+        let (output, rows) = with_stamped_debug_log(async move {
+            run_uv_closure_command_with_caps(
+                &fake_uv,
+                &["lock".to_string()],
+                &project_for_child,
+                &cache_for_child,
+                UvChildTracing::Traced,
+                "capped-bundle",
+                UvChildStreamCaps {
+                    line_bytes: 32,
+                    lines: 2,
+                },
+            )
+            .await
+            .expect("the fake uv child must be waited on cleanly")
+        });
+
+        // The CAPTURE is never capped: all five lines, the long one whole.
+        let stderr = String::from_utf8(output.stderr.clone()).unwrap();
+        assert!(
+            stderr.contains(&long),
+            "the per-line cap must bound the ECHO only; the captured stderr \
+             the parser reads must keep the whole line",
+        );
+        for row in 2..=5 {
+            assert!(stderr.contains(&format!("row {row}")), "stderr {stderr:?}");
+        }
+
+        let streamed = prefixed_rows(&rows, "capped-bundle");
+        assert_eq!(
+            streamed.len(),
+            2,
+            "the per-call budget must stop the echo at 2 rows; got {:#?}",
+            streamed.iter().map(|(_, t)| t).collect::<Vec<_>>(),
+        );
+        assert!(
+            !streamed[0].1.contains(&long) && streamed[0].1.contains("… [+268 bytes]"),
+            "the long row must be truncated to the cap and say what was cut; \
+             row was {:?}",
+            streamed[0].1,
+        );
+        let overflow = rows
+            .iter()
+            .find(|(_, t)| t.contains("child stderr echo hit its per-call budget"))
+            .map(|(_, t)| t.clone())
+            .expect("dropping echo rows silently is the defect this cap creates");
+        assert!(
+            overflow.contains("suppressed=3") && overflow.contains("budget=2"),
+            "the overflow notice must count what it dropped; was {overflow:?}",
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn traced_uv_child_gets_a_verbosity_flag_and_a_log_filter() {
+        let argv = |command: &tokio::process::Command| -> Vec<String> {
+            command
+                .as_std()
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        let build = |mode, inherited| {
+            build_uv_closure_command_with(
+                Path::new("uv"),
+                &["lock".to_string()],
+                Path::new("/tmp"),
+                Path::new("/tmp/uv-cache"),
+                mode,
+                inherited,
+            )
+        };
+
+        // No caller filter -> retread's own, and the flag before the
+        // subcommand (uv's verbosity flag is global).
+        let default = build(UvChildTracing::Traced, None);
+        assert_eq!(
+            argv(&default),
+            vec![UV_CHILD_VERBOSITY_FLAG.to_string(), "lock".to_string()],
+        );
+        let filter = uv_env_value(default.as_std(), UV_CHILD_LOG_ENV)
+            .expect("a traced child must carry a log filter of its own");
+        let filter = filter.to_string_lossy().into_owned();
+        for target in ["uv_resolver=debug", "uv_client=debug", "uv_distribution=debug"] {
+            assert!(
+                filter.contains(target),
+                "the filter must name {target} -- uv_client's request rows are \
+                 what separate FETCHING from THINKING; was {filter:?}",
+            );
+        }
+
+        // A caller who declared one keeps it, verbatim.
+        let declared = build(
+            UvChildTracing::Traced,
+            Some(OsString::from("uv_client=trace")),
+        );
+        assert_eq!(
+            uv_env_value(declared.as_std(), UV_CHILD_LOG_ENV),
+            Some(OsString::from("uv_client=trace")),
+        );
+
+        // An empty declaration is not a declaration.
+        let emptied = build(UvChildTracing::Traced, Some(OsString::new()));
+        assert_eq!(
+            uv_env_value(emptied.as_std(), UV_CHILD_LOG_ENV),
+            Some(OsString::from(UV_CHILD_LOG_DEFAULT)),
+        );
+
+        // A bare child is spawned exactly as asked.
+        let bare = build(UvChildTracing::Bare, Some(OsString::from("uv_client=trace")));
+        assert_eq!(argv(&bare), vec!["lock".to_string()]);
+        assert_eq!(uv_env_value(bare.as_std(), UV_CHILD_LOG_ENV), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_spawned_child_process_really_runs_with_the_uv_log_filter() {
+        let tmp = uv_child_test_dir("uv-child-env");
+        let project = tmp.join("project");
+        let cache = tmp.join("cache");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        let fake_uv = write_fake_uv(&tmp, "echo \"RUST_LOG=$RUST_LOG argv=$*\" >&2\n");
+        // Whatever this test process inherited is what the child must get,
+        // and retread's default only when there is nothing to inherit.
+        let expected = uv_child_log_filter(std::env::var_os(UV_CHILD_LOG_ENV))
+            .to_string_lossy()
+            .into_owned();
+
+        let project_for_child = project.clone();
+        let cache_for_child = cache.clone();
+        let (output, _rows) = with_stamped_debug_log(async move {
+            run_uv_closure_command(
+                &fake_uv,
+                &["lock".to_string()],
+                &project_for_child,
+                &cache_for_child,
+                UvChildTracing::Traced,
+                "env-bundle",
+            )
+            .await
+            .expect("the fake uv child must be waited on cleanly")
+        });
+
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains(&format!("RUST_LOG={expected}")),
+            "the child process env must carry the filter; it printed {stderr:?}",
+        );
+        assert!(
+            stderr.contains("argv=-v lock"),
+            "the child must be invoked with the verbosity flag first; it \
+             printed {stderr:?}",
+        );
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -6994,6 +7630,8 @@ isaaclab = { path = "wheels/isaaclab/isaaclab-2.0.0-py3-none-any.whl" }
                 &args,
                 &project_for_task,
                 &cache_for_task,
+                UvChildTracing::Bare,
+                "test-bundle",
             )
             .await
         });
