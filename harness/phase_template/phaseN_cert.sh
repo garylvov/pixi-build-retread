@@ -1,0 +1,470 @@
+#!/usr/bin/env bash
+### EVIDENCE BEGIN
+# phaseN_cert.sh -- TEMPLATE for the CERT half of a two-phase retread batch.
+# Chains off phaseN_relock.sh via the stamp that script writes only on lock rc=0.
+#
+# DERIVED BY SUBSTITUTION from the phase-2 harness that ran job 5597694. Deltas:
+#
+#   1. PERSISTENT CACHES. Sources tools/retread_fast_env.sh and calls
+#      retread_fast_env "$WS" after the job-scoped env block. An install phase
+#      does not re-solve, so the 41x that job 5598763 measured on a relock is
+#      NOT claimed here -- what it buys the cert is the conda/pypi PACKAGE
+#      downloads, already on disk from the relock. Treat it as a download
+#      saving of unmeasured size, not a solve saving.
+#
+#   2. CLEANUP MOVED OFF THE CRITICAL PATH ENTIRELY. This script removes
+#      nothing itself. After the verdict is computed and printed it submits
+#      cleanup.sh with --dependency=afterany:<this job> and exits. An `rm -rf`
+#      of a job-scoped root inside the job cost 5152s (86 min) on job 5596128
+#      against a 3679s lock, and 4795s + 2552s on job 5598763 -- while holding
+#      16 CPUs and 100-160G of a per-user QOS capped at cpu 64 / mem 492G.
+#      afterany (not afterok) so a RED cert still gets its disk back; the roots
+#      a failed run needs for diagnosis are named in the cleanup job's log
+#      before it touches them.
+#
+#   3. /usr/bin/time -v PER ENV, to its own file. Each install writes
+#      $A/<env>.cert-install.time.txt, and the memory ledger reads peak RSS from
+#      THAT file rather than grepping it back out of the install log. Measured
+#      worst cert env: 1,475,216 K (env `gpu`, job 5597694 ledger) and
+#      1,446,432 K (env `gpu`, job 5594284). sacct MaxRSS is unusable here --
+#      it reports ~100% of the cgroup cap for every job regardless of phase.
+#
+#   4. THE ENV LOOP RUNS N-WIDE, LONGEST-FIRST (CERT_PARALLEL, default 4).
+#      The pre-2026-09-02 loop was `for ENV in ...; do run_env "$ENV"; done` --
+#      26 installs strictly one after another. Measured on the two certified
+#      pairs (INEFFICIENCY-AUDIT-20260902.md section 1.4): the sum of the 26
+#      install walls is 20,477s of a 22,247s phase (92.0%, job 5597694) and
+#      19,332s of 21,288s (90.8%, job 5594284), while the 16-CPU node it holds
+#      runs at TotalCPU/(16*wall) = 2.1% and 1.8% and the mean per-env
+#      `Percent of CPU this job got` is 18.7% of ONE core. An LPT
+#      (longest-processing-time-first) schedule over those same 26 measured
+#      walls gives makespans of 20,477 / 10,241 / 5,123 / 4,773s at N =
+#      1 / 2 / 4 / 6. Above N=6 the makespan is pinned by isaaclab-gpu-latest
+#      alone (4,773s on 5597694), so N=6 is the floor and N=4 is the first
+#      honest step. The installs are I/O bound (318 GB written per cert at
+#      18.7% of a core), so NFS write bandwidth, not CPU or RAM, is the real
+#      ceiling -- treat the LPT table as an upper bound.
+#
+#      WHAT IS AND IS NOT SHARED ACROSS THE N SUBSHELLS.
+#        per env, already:  $A/<env>.cert-{install,probe,verify,state}.log,
+#                           $A/<env>.cert-install.time.txt, $WS/.pixi/envs/<env>
+#        per env, NEW:      $TMPDIR ($G/tmp/<env>), and the result/ledger rows,
+#                           which are written to $A/rows.$J/<env>.{row,led,span}
+#                           and concatenated in DECLARATION order at the end.
+#                           So cert_results.tsv is byte-comparable with what the
+#                           serial loop produced, whatever order the envs ran in.
+#        shared, on purpose: PIXI_CACHE_DIR / RATTLER_CACHE_DIR / UV_CACHE_DIR
+#                           (persistent, retread_fast_env) and the job-scoped
+#                           RETREAD_BUILD_ROOT / _ARTIFACT_ROOT / _META_ROOT /
+#                           _CACHE_DIR / _SHARED_CACHE_DIR / RETREAD_FAST_TMP_ROOT.
+#                           Giving each env its own package cache would multiply
+#                           108 GB of reads and 318 GB of writes by N and blow
+#                           the inode quota, so they stay shared and the
+#                           concurrency safety is: UV_LINK_MODE=copy (set below;
+#                           the 5547450 NFS hardlink race), pixi's own
+#                           multi-env installs already share one cache inside a
+#                           single process, and the backend carries guard tests
+#                           for exactly this (`built_output_store::tests::
+#                           concurrent_publishers_of_one_key_leave_exactly_one_entry`,
+#                           `wheel::tests::concurrent_store_misses_coalesce_to_one_download`).
+#                           This is a LEAD, not a proof: the proof is that a
+#                           parallel run scores identical to a serial one under
+#                           cert_verdict.sh. Do not raise CERT_PARALLEL on a new
+#                           binary without re-running that comparison.
+#        NOT shared:        no `cd` anywhere in this script -- the workspace is
+#                           addressed only by --manifest-path.
+#      CERT_PARALLEL=1 restores the old behaviour exactly.
+#
+# ---- MEMORY: 32G for the cert, 24G for the relock. Measured, not quoted. ----
+#   worst cert env peak RSS  1,475,216 K  (job 5597694)   = 1.48 GB / 1.41 GiB
+#   worst cert env peak RSS  1,446,432 K  (job 5594284)   = 1.45 GB / 1.38 GiB
+#   relock peak, for scale   8,854,172 K  (job 5597671)   = 8.85 GB / 8.44 GiB
+#   Every one of those is `/usr/bin/time -v` Maximum resident set size, from the
+#   memory ledgers named above. At CERT_PARALLEL=6 the worst case is a SUM of
+#   the six largest envs, and on the 5597694 ledger that is 1,475,216 +
+#   1,355,544 + 1,343,420 + 1,333,200 + 1,221,588 + 1,034,344 = 7,763,312 K =
+#   7.8 GB. 32G is >4x that, and leaves ~24 GB of page cache for a phase that
+#   reads 108 GB and writes 318 GB. 24G on the relock is ~2.7x its 8.85 GB peak.
+#   NEVER size either from sacct MaxRSS: it reports ~ReqMem for every job here
+#   (a 160G job reports 167,772,480 K, a 100G job 104,858,688 K) because that is
+#   reclaimable cgroup page cache, not demand. The binding constraint is the
+#   per-user QOS cap (normal = cpu 64, mem 492G for the WHOLE user): at 160G we
+#   fit 3 jobs, at 32G we fit ~15, and a 160G request is why job 5597889 pended
+#   behind QOSMaxMemoryPerUser with a node sitting idle. Raise it only against a
+#   /usr/bin/time -v row.
+#
+#       env -u SLURM_JOB_ID sbatch --partition=batch --qos=normal \
+#           --cpus-per-task=16 --mem=32G --time=04:00:00 \
+#           --job-name=<tag>-p2 --dependency=afterok:<relock job> \
+#           --output=<shared path>/slurm-%j.out ./phaseN_cert.sh
+#
+# NEVER edit this file while a job is running it -- copy it aside first.
+### EVIDENCE END
+set -uo pipefail
+
+### SUBSTITUTE: BEGIN -- MANIFEST, PROBES, EXPECT_*  (edit ONLY between these markers)
+TAG=PHASEN                                   # MUST match the relock harness's TAG
+T=/oscar/data/stellex/glvov/agrescap/tasks/retread-4-11
+D=$T/phase-template-example                  # THIS harness's own directory
+P1D=$T/phase-template-example                # the RELOCK harness's directory (stamp + arm probes)
+                                             # set it to the relock dir when the two phases are split
+
+# --- gates carried over from the relock phase --------------------------------
+EXPECT_MANIFEST_LINES=1003
+EXPECT_JETSON_ROWS=1
+RESIDUAL_PATTERNS=()                         # same list the relock phase used; each must be 0
+DELETED_FAMILIES="openmesh networkx pillow sentry-sdk numpy"   # informational lock occurrence rows
+
+# --- probes ------------------------------------------------------------------
+PROBES_CANON=$T/p1e-certify-lock/artifacts/probes.tsv
+PROBES=$PROBES_CANON                         # the arm's copy -- MUST be the same file the relock gated
+PROBE_TOKENS=()                              # module tokens that must be GONE from $PROBES
+EXPECT_PROBE_ROWS=26
+
+# --- the environments to certify ---------------------------------------------
+# jetson is aarch64-only and is deliberately excluded; any manifest line that
+# only binds jetson is therefore CERT-BLIND and relock rc=0 is its only evidence.
+CERT_ENVS="pm-newton-gpu sage default cpu test tensorboard-tools gpu test-gpu \
+unitree-rl-gym holosoma unitree-rl-lab-gpu groot-sonic-gpu viral-gpu uwlab-gpu \
+flashsac-gpu hover-gpu robogen ros2-humble-gpu ros2-humble-cpu ros2-jazzy-gpu \
+ros2-jazzy-cpu isaaclab-gpu-latest newton-gpu pm-isaaclab pm-mujoco pace"
+
+# --- how wide to run the env loop, and in what order --------------------------
+# CERT_PARALLEL   how many installs run at once. 1 = the pre-2026-09-02 serial
+#                 loop, exactly. 4 is the measured first step; 6 is the LPT
+#                 floor for this env set. Overridable from the environment so an
+#                 A/B needs no edit:  CERT_PARALLEL=1 ./<harness>.sh
+# CERT_WALL_TABLE a memory ledger from the last GREEN cert of this shape --
+#                 columns env, install_rc, peak_rss_kb, wall_s. Used only to
+#                 order the run longest-first (LPT), never to score anything.
+#                 Empty or unreadable -> declaration order, and the schedule is
+#                 then whatever the declaration happens to be, which on this env
+#                 set costs ~1,000s against LPT. An env absent from the table
+#                 sorts FIRST (unknown is treated as long, the safe side).
+CERT_PARALLEL=${CERT_PARALLEL:-4}
+CERT_WALL_TABLE=                             # e.g. $T/<lastgreen>/artifacts/memory_ledger.<job>.tsv
+
+# --- optional SECOND verdict gate --------------------------------------------
+# A results file from a previous run of THIS SAME LOCK, when one exists (an
+# A/B of the harness itself, a re-cert of a lock already certified). Scored by
+# the same cert_verdict.sh, and its exit is ANDed into the job's exit. Empty =
+# the campaign baseline is the only gate, which is the normal case for a new
+# batch whose lock has never been certified before.
+CERT_SERIAL_KEY=
+
+# --- toolchain + verdict gate ------------------------------------------------
+PIXI=/users/glvov/.pixi/bin/pixi.real
+SNAPDIR=$T/p4l-cert-p4k/artifacts/p4k-binsnap
+SNAP=$SNAPDIR/pixi-build-retread
+EXPECT_SHA=2cfec88df6f181ff4ff505f879e31eabeb2b2c1edfa60360dce3bccaa9bd156c
+UVBIN=/oscar/data/stellex/glvov/tasks/retread-cold-solve/verify_fixes/artifacts/uvbin
+VERDICT=$T/p4l-cert-p4k/artifacts/cert_verdict.sh
+CERT_BASELINE=$T/p4l-cert-p4k/artifacts/cert_results.5175534.att_corrected.tsv
+FAST_ENV=$(dirname "$0")/../retread_fast_env.sh
+[ -f "$FAST_ENV" ] || FAST_ENV=$T/tools/retread_fast_env.sh
+CLEANUP=$(dirname "$0")/cleanup.sh
+[ -f "$CLEANUP" ] || CLEANUP=$T/tools/phase_template/cleanup.sh
+CLEANUP_SBATCH_ARGS="--partition=batch --qos=normal --cpus-per-task=1 --mem=4G --time=06:00:00"
+
+# --- leftover-token self-check ------------------------------------------------
+LEFTOVER_RE='bfinal|BFP1|BFP2|bfp1|bfp2|b1c|b1-phase|b1b-phase|b2-phase|b2b-phase|b3-phase|ctl-phase|eff-phase|/b1_|/b2_|/b3_|/ctl_|p5sab|P5SAB|p5t_abc|P5TABC|certB3P1|2cfec88d|57105d38'
+### SUBSTITUTE: END
+
+### LEFTOVER-CHECK BEGIN
+LEFT=$(awk '
+  /^### EVIDENCE BEGIN/       {e=1} /^### EVIDENCE END/       {e=0; next} e {next}
+  /^### SUBSTITUTE: BEGIN/    {s=1} /^### SUBSTITUTE: END/    {s=0; next} s {next}
+  /^### LEFTOVER-CHECK BEGIN/ {l=1} /^### LEFTOVER-CHECK END/ {l=0; next} l {next}
+  {print FILENAME ":" FNR ": " $0}' "$0" | grep -E "$LEFTOVER_RE")
+if [ -n "$LEFT" ]; then
+  echo "### FATAL leftover-token self-check FAILED -- this harness still names a previous batch"
+  printf '%s\n' "$LEFT"
+  exit 9
+fi
+echo "### leftover-token self-check: clean"
+### LEFTOVER-CHECK END
+
+J=${SLURM_JOB_ID:?missing Slurm job id}
+A=$D/artifacts
+STAMP=$P1D/artifacts/relock_env.sh
+[ -f "$STAMP" ] || { echo "### FATAL relock handoff stamp missing: $STAMP (the relock phase did not reach lock rc=0)"; exit 2; }
+# shellcheck disable=SC1090
+. "$STAMP"
+: "${WS:?stamp did not define WS}"; : "${LOCK:?stamp did not define LOCK}"
+: "${EXPECT_LOCK_MD5:?stamp did not define EXPECT_LOCK_MD5}"
+echo "### relock handoff: P1_JOB=${P1_JOB:-?} WS=$WS LOCK=$LOCK md5=$EXPECT_LOCK_MD5 P1_CACHE_ROOT=${P1_CACHE_ROOT:-unset}"
+C=/oscar/data/stellex/glvov/retread/cert${TAG}P2-$J
+RES=$A/cert_results.$J.tsv
+COMPARE=$A/cert_results_vs_baseline.$J.tsv
+LEDGER=$A/memory_ledger.$J.tsv
+BLOG=$A/${TAG}P2-$J.backend.log
+
+CQ=/oscar/runtime/bin/checkquota          # NOT on a batch job's default PATH: job 5611846 printed
+[ -x "$CQ" ] || CQ=$(command -v checkquota 2>/dev/null || echo true)   # two EMPTY quota rows because of it
+mkdir -p "$A"
+exec > >(tee -a "$A/cert_${TAG}.$J.log") 2>&1
+hostname; date -Is
+echo "### ${TAG} CERT job=$J  envs=$(echo $CERT_ENVS | wc -w)  CERT_PARALLEL=$CERT_PARALLEL"
+echo "### inode quota BEFORE:"; "$CQ" 2>/dev/null | grep -E 'data\+stellex|^Name' | head -4
+printf '' > "$RES"
+printf 'env\tinstall_rc\tpeak_rss_kb\twall_s\n' > "$LEDGER"
+
+# ---- cheap gates BEFORE any install work ----
+for f in "$SNAP" "$LOCK" "$PROBES" "$PROBES_CANON" "$VERDICT" "$CERT_BASELINE" "$FAST_ENV" "$WS/pixi.toml" "$WS/pixi.lock"; do
+  [ -e "$f" ] || { echo "### FATAL missing required path: $f"; exit 2; }
+done
+GOT_SHA=$(sha256sum "$SNAP" | awk '{print $1}')
+[ "$GOT_SHA" = "$EXPECT_SHA" ] || { echo "### FATAL backend snapshot sha mismatch got=$GOT_SHA want=$EXPECT_SHA"; exit 2; }
+GOT_MD5=$(md5sum "$LOCK" | awk '{print $1}')
+[ "$GOT_MD5" = "$EXPECT_LOCK_MD5" ] || { echo "### FATAL lock md5 mismatch got=$GOT_MD5 want=$EXPECT_LOCK_MD5"; exit 2; }
+echo "### gates OK: snapshot sha + lock md5 + all required paths"
+if [ "${#RESIDUAL_PATTERNS[@]}" -gt 0 ]; then
+  echo "### manifest residual pin rows (want 0 each):"
+  for pat in "${RESIDUAL_PATTERNS[@]}"; do printf '  %-40s %s\n' "$pat" "$(grep -c "$pat" "$WS/pixi.toml")"; done
+fi
+echo "### manifest lines (want $EXPECT_MANIFEST_LINES): $(wc -l < "$WS/pixi.toml")"
+echo "### jetson LIVE rows (want $EXPECT_JETSON_ROWS): $(grep -c '^jetson = ' "$WS/pixi.toml")"
+echo "### probes file IN USE: $PROBES"
+echo "### probes rows (want $EXPECT_PROBE_ROWS): $(wc -l < "$PROBES")"
+if [ "${#PROBE_TOKENS[@]}" -gt 0 ]; then
+  for tok in "${PROBE_TOKENS[@]}"; do
+    printf '  probe token %-20s arm=%s canonical=%s (arm must be 0)\n' "$tok" "$(grep -c "$tok" "$PROBES")" "$(grep -c "$tok" "$PROBES_CANON")"
+  done
+fi
+echo "### lock occurrences for the deleted families (informational -- a family may legitimately survive at a different version):"
+for p in $DELETED_FAMILIES; do
+  printf '  %-12s %s   versions: %s\n' "$p" \
+    "$(grep -cE "/${p}-[0-9]|name: ${p}$" "$LOCK")" \
+    "$(grep -oE "/${p}-[0-9][^/]*" "$LOCK" | sort -u | tr '\n' ' ')"
+done
+echo "### baseline rows: $(wc -l < "$CERT_BASELINE")"
+
+collect_artifacts() {
+  set +e
+  echo "### unconditional artifact collection $(date -Is)"
+  [ -f "$SNAP" ] && sha256sum "$SNAP" > "$A/snapshot_sha256.$J.txt"
+  [ -f "$LOCK" ] && sha256sum "$LOCK" > "$A/lock_sha256.$J.txt"
+  [ -f "$RES" ] && sha256sum "$RES" > "$A/results_sha256.$J.txt"
+  [ -f "$BLOG" ] && sed -r 's/\x1B\[[0-?]*[ -\/]*[@-~]//g' "$BLOG" > "$A/backend.$J.ansi_stripped.log"
+  grep 'bench: conda_outputs total' "$A/backend.$J.ansi_stripped.log" > "$A/conda_outputs.$J.tsv" 2>/dev/null || true
+  if [ -f "$RES" ]; then
+    : > "$COMPARE"
+    for baseline in "$CERT_BASELINE"; do
+      printf 'baseline\t%s\n' "$baseline" >> "$COMPARE"
+      awk -F'\t' 'NR==FNR { b[$1]=$0; next }
+        { seen[$1]=1; if (!($1 in b)) { print $1 "\tNEW_ROW\tcurrent=" $0; next }
+          n=split(b[$1],x,"\t"); status=(($2==x[2] && $4==x[4] && $5==x[5] && $6==x[6] && $7==x[7] && $8==x[8]) ? "MATCH_OUTCOME" : "OUTCOME_DIFF");
+          if ($1=="hover-gpu" && $4==1 && x[4]==1) status=status "_KNOWN_HOVER_TIERA";
+          print $1 "\t" status "\tcurrent=" $0 "\tbaseline=" b[$1] }
+        END { for (e in b) if (!seen[e]) print e "\tNOT_RUN\tbaseline=" b[e] }' "$baseline" "$RES" | sort >> "$COMPARE"
+    done
+  fi
+  sstat -j "$J.batch" --format=JobID,AveCPU,MaxRSS,MaxDiskRead,MaxDiskWrite > "$A/sstat_final.$J.txt" 2>&1 || true
+}
+trap collect_artifacts EXIT
+
+cp "$LOCK" "$WS/pixi.lock"
+
+########## ENV BLOCK -- job-scoped BUILD state, SHARED download+solve caches ##########
+G=$C/install
+for d in pixi rattler uv xdg-cache xdg-data retread-build retread-artifacts retread-meta retread-cache retread-shared pixi-home; do mkdir -p "$C/$d"; done
+for d in home tmp scratch fast-tmp xdg-state xdg-config; do mkdir -p "$G/$d"; done
+export PIXI_CACHE_DIR=$C/pixi RATTLER_CACHE_DIR=$C/rattler UV_CACHE_DIR=$C/uv PIXI_HOME=$C/pixi-home
+export XDG_CACHE_HOME=$C/xdg-cache XDG_DATA_HOME=$C/xdg-data XDG_STATE_HOME=$G/xdg-state XDG_CONFIG_HOME=$G/xdg-config
+export RETREAD_BUILD_ROOT=$C/retread-build RETREAD_ARTIFACT_ROOT=$C/retread-artifacts RETREAD_META_ROOT=$C/retread-meta RETREAD_CACHE_DIR=$C/retread-cache RETREAD_SHARED_CACHE_DIR=$C/retread-shared
+export HOME=$G/home TMPDIR=$G/tmp RETREAD_SCRATCH_ROOT=$G/scratch RETREAD_FAST_TMP_ROOT=$G/fast-tmp
+export PATH=/users/glvov/.pixi/bin:$UVBIN:/users/glvov/.local/bin:/usr/bin:/bin
+export RETREAD_UV=$UVBIN/uv CONDA_OVERRIDE_CUDA=12 CONDA_OVERRIDE_GLIBC=2.35 UV_LOCK_TIMEOUT=3600 RETREAD_MAX_CONCURRENT_BUILDS=6 TOKIO_WORKER_THREADS=8 RAYON_NUM_THREADS=8
+export UV_LINK_MODE=copy   # job 5547450: NFS hardlink race under concurrent uv builds
+export PIXI_BUILD_RETREAD_LOG=pixi_build_retread=debug,warn RUST_BACKTRACE=1 PIXI_BUILD_BACKEND_OVERRIDE="pixi-build-retread=$SNAP"
+unset RUST_LOG
+
+# PERSISTENT CACHES -- after the job-scoped block (it overrides the three cache
+# dirs) and after RETREAD_FAST_TMP_ROOT + SLURM_JOB_ID exist.
+# shellcheck source=/dev/null
+. "$FAST_ENV"
+retread_fast_env "$WS" || { echo "### FATAL retread_fast_env refused"; exit 2; }
+
+# Every env writes its OWN row files here; the driver concatenates them in
+# DECLARATION order after the last one finishes. Nothing appends to a shared
+# file while installs are in flight, so the parallel loop cannot interleave a
+# row and cert_results.tsv stays byte-comparable with the serial format.
+ROWD=$A/rows.$J
+mkdir -p "$ROWD"
+
+run_env() {
+  ENV=$1
+  ILOG=$A/$ENV.cert-install.log; PLOG=$A/$ENV.cert-probe.log; VLOG=$A/$ENV.cert-verify.log; SLOG=$A/$ENV.cert-state.log
+  ITIME=$A/$ENV.cert-install.time.txt
+  : > "$ILOG"; : > "$PLOG"; : > "$VLOG"; : > "$SLOG"; : > "$ITIME"
+  # Own TMPDIR per env: the only env var this loop changes for parallelism.
+  # $G/tmp was shared by all 26 serial installs; under fan-out a shared TMPDIR
+  # is the classic collision site, and a per-env one costs nothing.
+  export TMPDIR=$G/tmp/$ENV; mkdir -p "$TMPDIR"
+  S=$(date +%s)
+  timeout --foreground --kill-after=30s 25200s \
+    /usr/bin/time -v -o "$ITIME" "$PIXI" install --manifest-path "$WS/pixi.toml" -e "$ENV" --frozen > "$ILOG" 2>&1
+  IRC=$?; W=$(( $(date +%s)-S )); PREFIX=$WS/.pixi/envs/$ENV; SHR=$PREFIX/share/retread
+  RSS=$(awk -F': ' '/Maximum resident set size/{print $2}' "$ITIME")
+  { echo "env=$ENV install_rc=$IRC wall=${W}s peak_rss_kb=${RSS:-unknown}"; find "$SHR" -maxdepth 1 -type f -printf '%f\n' 2>/dev/null | sort; } > "$SLOG" 2>&1
+  BROKEN=$(find "$SHR" -maxdepth 1 -name '*.broken' -type f 2>/dev/null | wc -l); STATEF=$(find "$SHR" -maxdepth 1 -name '*.state' -type f 2>/dev/null | wc -l); INSTM=$(find "$SHR" -maxdepth 1 -name '*.installed' -type f 2>/dev/null | wc -l)
+  ARC=99; BRC=99; VRC=99
+  MODS=$(awk -F'\t' -v e="$ENV" '$1==e{print $2}' "$PROBES"); TIERB=$(awk -F'\t' -v e="$ENV" '$1==e{print $3}' "$PROBES")
+  if [ "$IRC" = 0 ] && [ -n "$MODS" ]; then
+    timeout --foreground --kill-after=15s 2400s "$PIXI" run --manifest-path "$WS/pixi.toml" -e "$ENV" --frozen python -c 'import importlib.util as u,sys; bad=[n for n in sys.argv[1].split() if u.find_spec(n) is None]; print("MISSING:",bad); sys.exit(1 if bad else 0)' "$MODS" >> "$PLOG" 2>&1; ARC=$?
+    timeout --foreground --kill-after=15s 2400s "$PIXI" run --manifest-path "$WS/pixi.toml" -e "$ENV" --frozen python -c "$TIERB
+print('TIERB_OK')" >> "$PLOG" 2>&1; BRC=$?
+    RB=$PREFIX/bin/retread; VRC=0; SEEN=0
+    if [ -x "$RB" ]; then for LJ in "$SHR"/retread-*.lock.json; do [ -e "$LJ" ] || continue; SEEN=$((SEEN+1)); timeout --foreground --kill-after=15s 2400s "$RB" verify --lock "$LJ" --prefix "$PREFIX" >> "$VLOG" 2>&1; R=$?; [ "$R" = 0 ] || VRC=$R; done; [ "$SEEN" = 0 ] && VRC=97; else [ "$INSTM" = 0 ] || VRC=98; fi
+  else echo "SKIP install_rc=$IRC probes=$([ -n "$MODS" ] && echo present || echo missing)" >> "$PLOG"; fi
+  # Count repair ATTEMPTS, not lines mentioning one: the section header
+  # '=== attempt N <ts> ===' is emitted exactly once per attempt, while the
+  # older pattern also matched the inline '(repair attempt #N)' and so read
+  # roughly DOUBLE. Verified on job 5168525: 2 matches, 1 actual attempt.
+  ATT=$(find "$SHR" -maxdepth 1 -name '*.repair.log' -type f -exec cat {} + 2>/dev/null | grep -cE '^=== attempt [0-9]+ ' || true)
+  # A successful repair DELETES the evidence for why it fired, so capture the
+  # marker CONTENTS while they may still exist.
+  for M in "$SHR"/*.broken "$SHR"/*.state; do
+    [ -e "$M" ] || continue
+    { echo "--- marker $(basename "$M") ---"; cat "$M"; } >> "$SLOG" 2>&1
+  done
+  find "$SHR" -maxdepth 1 -name '*.repair.log' -type f -exec sed -n '1,20p' {} + >> "$SLOG" 2>/dev/null || true
+  if [ "$IRC" != 0 ]; then V=RED-install; elif [ "$BROKEN" != 0 ]; then V=RED-broken-marker; elif [ "$STATEF" != 0 ]; then V=RED-stale-state; elif [ "$ARC" != 0 ]; then V=RED-tierA; elif [ "$BRC" != 0 ]; then V=RED-tierB; elif [ "$VRC" != 0 ]; then V=RED-verify; elif [ "$ATT" != 0 ]; then V=AMBER-repaired; else V=GREEN; fi
+  # Atomic-ish row emission: write the row to a per-env temp file and rename it
+  # into place, so a killed env leaves NO row rather than half a row (a missing
+  # row is NOT_RUN under cert_verdict.sh, which is loud; a truncated row would
+  # parse as something else).
+  printf '%s\t%s\t%ss\t%s\t%s\t%s\t%s\t%s\n' "$ENV" "$IRC" "$W" "$ARC" "$BRC" "$VRC" "$ATT" "$V" > "$ROWD/$ENV.row.tmp"
+  mv -f "$ROWD/$ENV.row.tmp" "$ROWD/$ENV.row"
+  printf '%s\t%s\t%s\t%s\n' "$ENV" "$IRC" "${RSS:-unknown}" "$W" > "$ROWD/$ENV.led.tmp"
+  mv -f "$ROWD/$ENV.led.tmp" "$ROWD/$ENV.led"
+  # start/end epoch, so the concurrency ACTUALLY achieved is measurable after
+  # the fact instead of assumed from CERT_PARALLEL.
+  printf '%s\t%s\t%s\n' "$ENV" "$S" "$(( S + W ))" > "$ROWD/$ENV.span"
+  echo "### $ENV install_rc=$IRC wall=${W}s peak_rss_kb=${RSS:-unknown} verdict=$V"
+}
+
+# Longest-first (LPT) over $CERT_WALL_TABLE. Ties break on name so the order is
+# reproducible; an env the table does not name sorts first.
+cert_run_order() {
+  if [ -n "${CERT_WALL_TABLE:-}" ] && [ -r "$CERT_WALL_TABLE" ]; then
+    for e in $CERT_ENVS; do
+      w=$(awk -F'\t' -v e="$e" '$1==e && $4 ~ /^[0-9]+$/ {print $4; exit}' "$CERT_WALL_TABLE")
+      printf '%s\t%s\n' "${w:-99999999}" "$e"
+    done | sort -k1,1nr -k2,2 | cut -f2
+  else
+    printf '%s\n' $CERT_ENVS
+  fi
+}
+
+if [ "${DRY_RUN:-0}" = 1 ]; then
+  echo "### DRY_RUN=1 -- gates, env block and persistent caches are DONE; no env will be installed."
+  echo "### CERT_PARALLEL=$CERT_PARALLEL  wall table=${CERT_WALL_TABLE:-<none, declaration order>}"
+  echo "### envs that WOULD run, in DISPATCH order (longest-first):"; cert_run_order | sed 's/^/  /'
+  echo "### rows would be concatenated back in DECLARATION order:"; for ENV in $CERT_ENVS; do echo "  $ENV"; done
+  echo "### verdict gate that WOULD score them: $VERDICT against $CERT_BASELINE"
+  echo "### cleanup that WOULD be submitted: $CLEANUP with --dependency=afterany:$J on $C ${P1_CACHE_ROOT:-} $WS"
+  exit 0
+fi
+
+########## THE ENV LOOP -- $CERT_PARALLEL wide, longest-first ##########
+case "$CERT_PARALLEL" in ''|*[!0-9]*|0) echo "### FATAL CERT_PARALLEL must be a positive integer, got '$CERT_PARALLEL'"; exit 2;; esac
+LOOP_S=$(date +%s)
+echo "### env loop: CERT_PARALLEL=$CERT_PARALLEL wall_table=${CERT_WALL_TABLE:-<none, declaration order>} start $(date -Is)"
+echo "### dispatch order: $(cert_run_order | tr '\n' ' ')"
+RUNNING=0
+for ENV in $(cert_run_order); do
+  while [ "$RUNNING" -ge "$CERT_PARALLEL" ]; do wait -n; RUNNING=$((RUNNING-1)); done
+  ( run_env "$ENV" ) &
+  RUNNING=$((RUNNING+1))
+  echo "### dispatched $ENV (in flight $RUNNING/$CERT_PARALLEL) $(date -Is)"
+done
+wait
+LOOP_W=$(( $(date +%s) - LOOP_S ))
+echo "### env loop DONE wall=${LOOP_W}s $(date -Is)"
+
+# Reassemble in DECLARATION order. A missing row means that env's subshell died
+# without finishing; it is left MISSING on purpose, so cert_verdict.sh reports
+# NOT_RUN and exits 1 rather than a short file passing quietly.
+MISSING=0
+for ENV in $CERT_ENVS; do
+  if [ -f "$ROWD/$ENV.row" ]; then cat "$ROWD/$ENV.row" >> "$RES"; else echo "### MISSING ROW for env $ENV -- its subshell produced none"; MISSING=$((MISSING+1)); fi
+  [ -f "$ROWD/$ENV.led" ] && cat "$ROWD/$ENV.led" >> "$LEDGER"
+done
+echo "### rows assembled: $(wc -l < "$RES") of $(echo $CERT_ENVS | wc -w) (missing=$MISSING)"
+
+# Concurrency ACTUALLY achieved, from the per-env start/end stamps -- not from
+# CERT_PARALLEL, which is only what was asked for.
+cat "$ROWD"/*.span 2>/dev/null | sort -k2,2n > "$A/env_spans.$J.tsv"
+awk -F'\t' -v loop="$LOOP_W" '
+  { s[NR]=$2; e[NR]=$3; sum+=$3-$2; if(!lo||$2<lo)lo=$2; if($3>hi)hi=$3; n=NR }
+  END {
+    if (!n) { print "### spans: none"; exit }
+    peak=0
+    for (i=1;i<=n;i++) { c=0; for (j=1;j<=n;j++) if (s[j]<=s[i] && e[j]>s[i]) c++; if (c>peak) peak=c }
+    printf "### concurrency: peak=%d  mean=%.2f (sum of env walls %ds / span %ds)  loop wall %ds\n", peak, sum/(hi-lo), sum, hi-lo, loop }
+' "$A/env_spans.$J.tsv"
+
+# Evidence is collected BEFORE the gate. No green claim is made merely because
+# an older baseline also contained a failure.
+collect_artifacts
+
+echo "### memory ledger (peak RSS per env, from /usr/bin/time -v):"
+sort -t$'\t' -k3,3n "$LEDGER" | tail -5
+if awk -F'\t' '$1=="hover-gpu" && $4==1 {ok=1} END{exit !ok}' "$RES"; then echo '### hover-gpu TierA rc=1 is the known pre-existing neural_wbc result'; fi
+
+# Verdict via cert_verdict.sh. Typed exits: 0 identical, 1 a row differs or is
+# missing, 2 SETUP FAILURE. A setup failure must never read as a pass -- the
+# older `rg` gate did exactly that (rg is not on the PATH this script exports,
+# so the `if` was command-not-found and fell through to success).
+if [ ! -x "$VERDICT" ]; then
+  echo "### FATAL verdict script missing or not executable: $VERDICT"
+  VRC=2
+else
+  "$VERDICT" "$RES" "$CERT_BASELINE" | tee "$A/cert_verdict.$J.txt"
+  VRC=${PIPESTATUS[0]}
+fi
+case "$VRC" in
+  0) echo "### RESULT identical to certified baseline $CERT_BASELINE" ;;
+  1) echo "### RESULT differs from certified baseline; inspect $A/cert_verdict.$J.txt; release decision reopens" ;;
+  *) echo "### RESULT verdict could not be computed (rc=$VRC); this is NOT a pass" ;;
+esac
+
+# Second gate: the same lock's previous results, when the harness names one.
+if [ -n "${CERT_SERIAL_KEY:-}" ]; then
+  if [ -r "$CERT_SERIAL_KEY" ] && [ -x "$VERDICT" ]; then
+    "$VERDICT" "$RES" "$CERT_SERIAL_KEY" | tee "$A/cert_verdict_vs_prior.$J.txt"
+    KRC=${PIPESTATUS[0]}
+  else
+    echo "### FATAL second-gate key unreadable or verdict script missing: $CERT_SERIAL_KEY"
+    KRC=2
+  fi
+  echo "### SECOND GATE vs $CERT_SERIAL_KEY -> exit $KRC"
+  [ "$KRC" = 0 ] || { echo "### this run is NOT identical to the prior run of the same lock"; [ "$VRC" = 0 ] && VRC=$KRC; }
+fi
+
+########## CLEANUP -- SUBMITTED, NOT RUN. This is the last job of the chain. ##########
+# afterany, so a RED cert still returns its disk. The roots are named here first
+# so a diagnostician can hold them by cancelling the cleanup job before it runs.
+ROOTS="$C ${P1_CACHE_ROOT:-} $WS"
+echo "### cleanup roots: $ROOTS"
+if [ -x "$CLEANUP" ]; then
+  # shellcheck disable=SC2086
+  CLJ=$(env -u SLURM_JOB_ID sbatch --parsable $CLEANUP_SBATCH_ARGS \
+        --job-name=${TAG}-cleanup --dependency=afterany:$J \
+        --output=$A/slurm-cleanup-%j.out "$CLEANUP" $ROOTS 2>&1)
+  CLRC=$?
+  if [ "$CLRC" = 0 ]; then
+    echo "### cleanup job submitted: $CLJ (--dependency=afterany:$J) -- this job exits WITHOUT unlinking anything"
+  else
+    echo "### CLEANUP SUBMIT FAILED rc=$CLRC output: $CLJ"
+    echo "### RUN THIS BY HAND, it is the only thing that returns the inodes:"
+    echo "    env -u SLURM_JOB_ID sbatch $CLEANUP_SBATCH_ARGS --job-name=${TAG}-cleanup $CLEANUP $ROOTS"
+  fi
+else
+  echo "### CLEANUP SCRIPT MISSING OR NOT EXECUTABLE: $CLEANUP -- roots left on disk, clean them by hand:"
+  echo "    $ROOTS"
+fi
+echo "### inode quota AFTER (pre-cleanup):"; "$CQ" 2>/dev/null | grep -E 'data\+stellex' | head -2
+echo "### ${TAG} CERT DONE verdict_rc=$VRC $(date -Is)"
+exit "$VRC"
