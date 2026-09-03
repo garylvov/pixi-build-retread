@@ -264,6 +264,45 @@ fn solved_records_digest(
     Ok(provisioned_records_digest(&build, &host))
 }
 
+/// Collapse an error chain to one whitespace-normalised line so a spec that
+/// `rattler-build` wrapped across lines still matches as a contiguous string.
+fn normalize_failure_text(rendered: &str) -> String {
+    rendered.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Does `rendered` say the channel offers no candidate for one of the exact
+/// `name ==version build` triples WE pinned into the recipe?
+///
+/// This is the split-brain signature, and only this. retread pins those
+/// triples out of its own repodata cache (`repodata::REPODATA_TTL` old at
+/// worst); `rattler-build debug setup` re-resolves them against a channel it
+/// fetches into a cold private scratch on every provision, so it always sees
+/// the current index. When conda-forge supersedes a build inside that window
+/// the recipe becomes unsatisfiable and rattler-build can only report our own
+/// pin back at us.
+///
+/// A resolver failure that names a spec we did NOT pin -- notably the
+/// `No candidates were found for gcc_linux-64 13.*` shape a TRUNCATED
+/// repodata document produces -- is a different defect and must not be
+/// classified here: those specs carry no `==<version> <build>` and so match
+/// no identity.
+fn superseded_pin_in_failure(
+    rendered: &str,
+    build: &BTreeSet<ProvisionedRecordIdentity>,
+    host: &BTreeSet<ProvisionedRecordIdentity>,
+) -> Option<String> {
+    let normalized = normalize_failure_text(rendered);
+    build.iter().chain(host.iter()).find_map(|identity| {
+        let pin = format!(
+            "{} =={} {}",
+            identity.name, identity.version, identity.build
+        );
+        normalized
+            .contains(&format!("No candidates were found for {pin}"))
+            .then_some(pin)
+    })
+}
+
 /// Provision or reuse a conda-forge compiler environment for one compatibility
 /// tuple. `cuda_version = None` omits NVCC; `Some("")` requests an unpinned
 /// NVCC, and numeric `Some("12.9")` requests that CUDA release line.
@@ -273,10 +312,75 @@ pub(crate) async fn provision(
     cuda_version: Option<&str>,
 ) -> Result<HermeticBuildEnvironment> {
     let python_minor = crate::pypi::normalized_python_minor(python)?.version();
-    let mut cuda_version = normalize_cuda_version(cuda_version)?;
+    let requested_cuda = normalize_cuda_version(cuda_version)?;
+    // At most two attempts. The second exists only for the ONE recoverable
+    // condition below: our repodata snapshot pinned a build that the channel
+    // rattler-build resolves against no longer offers. Anything else fails on
+    // the first attempt exactly as before.
+    let mut refetched = false;
+    loop {
+        let (solved, effective_cuda) = solve_hermetic_with_cuda_fallback(
+            target_floor,
+            &python_minor,
+            requested_cuda.clone(),
+        )
+        .await?;
+        let (recipe_build, recipe_host) =
+            solved_recipe_records(&solved, effective_cuda.is_some())?;
+        let error = match provision_for_solve(
+            target_floor,
+            &python_minor,
+            effective_cuda,
+            &solved,
+        )
+        .await
+        {
+            Ok(environment) => return Ok(environment),
+            Err(error) => error,
+        };
+        let Some(pin) =
+            superseded_pin_in_failure(&format!("{error:#}"), &recipe_build, &recipe_host)
+        else {
+            return Err(error);
+        };
+        if refetched {
+            return Err(error.context(format!(
+                "hermetic toolchain pin `{pin}` is still absent from the channel \
+                 rattler-build resolves against after a forced repodata refetch; \
+                 this is an upstream channel state, not a stale local snapshot"
+            )));
+        }
+        tracing::warn!(
+            pin = %pin,
+            "hermetic toolchain pin is absent from the channel rattler-build \
+             resolves against; retread's repodata snapshot and rattler-build's \
+             fresh fetch disagree (upstream superseded this build). Dropping the \
+             cached snapshot and re-solving once."
+        );
+        if !crate::repodata::invalidate_pairs(&crate::conda_solve::hermetic_repodata_pairs()).await
+        {
+            return Err(error.context(format!(
+                "hermetic toolchain pin `{pin}` is absent from the channel \
+                 rattler-build resolves against, and no cached repodata document \
+                 could be dropped to force a re-solve"
+            )));
+        }
+        refetched = true;
+    }
+}
+
+/// Solve the hermetic toolchain, falling back to a CPU-only toolchain when the
+/// workspace CUDA line predates the packaged `cuda-nvcc_linux-64` builds.
+/// Returns the solve together with the CUDA line it was actually solved for.
+async fn solve_hermetic_with_cuda_fallback(
+    target_floor: (u32, u32),
+    python_minor: &str,
+    cuda_version: Option<String>,
+) -> Result<(crate::conda_solve::HermeticBuildSolve, Option<String>)> {
+    let mut cuda_version = cuda_version;
     let mut solve_result = crate::conda_solve::solve_hermetic_build_environment(
         target_floor,
-        &python_minor,
+        python_minor,
         cuda_version.as_deref(),
     )
     .await;
@@ -299,14 +403,24 @@ pub(crate) async fn provision(
         );
         cuda_version = None;
         solve_result =
-            crate::conda_solve::solve_hermetic_build_environment(target_floor, &python_minor, None)
+            crate::conda_solve::solve_hermetic_build_environment(target_floor, python_minor, None)
                 .await;
     }
     let solved = solve_result.map_err(|reasons| anyhow!(reasons.join("; ")))?;
-    let toolchain_digest = solved_records_digest(&solved, cuda_version.is_some())?;
+    Ok((solved, cuda_version))
+}
+
+/// Provision (or reuse) the tuple identified by one already-completed solve.
+async fn provision_for_solve(
+    target_floor: (u32, u32),
+    python_minor: &str,
+    cuda_version: Option<String>,
+    solved: &crate::conda_solve::HermeticBuildSolve,
+) -> Result<HermeticBuildEnvironment> {
+    let toolchain_digest = solved_records_digest(solved, cuda_version.is_some())?;
     let request = ProvisionRequest {
         target_floor,
-        python_minor,
+        python_minor: python_minor.to_string(),
         cuda_version,
         toolchain_digest,
     };
@@ -365,7 +479,7 @@ pub(crate) async fn provision(
         .with_context(|| format!("creating hermetic cache {}", cache_dir.display()))?;
 
     let result = async {
-        let marker = provision_uncached(&cache_dir, &request, &solved).await?;
+        let marker = provision_uncached(&cache_dir, &request, solved).await?;
         let environment = validate_marker(&cache_dir, &request, &marker)?;
         write_completion_marker(&marker_path, &marker).await?;
         Ok::<_, anyhow::Error>(environment)
@@ -3312,6 +3426,96 @@ mod tests {
             },
             records,
         }
+    }
+
+    /// The exact stderr `rattler-build debug setup` produced on 2026-09-02
+    /// (job 5656484, entry `isaaclab`), wrapped across lines the way it was
+    /// captured. The pin is retread's OWN, rendered out of a repodata
+    /// snapshot up to `repodata::REPODATA_TTL` older than the channel
+    /// rattler-build fetched for itself.
+    const REAL_SUPERSEDED_PIN_STDERR: &str = "\
+Error:   × Failed to resolve dependencies\n\
+  ╰─▶ Cannot solve the request because of: No candidates were found for\n\
+      libpython ==3.12.14 h0c77377_2_cpython.\n";
+
+    /// The shape a TRUNCATED repodata document produces. Same resolver, same
+    /// sentence, but the spec is a ROOT we never exact-pin -- classifying it
+    /// as a supersede would send a different defect down the refetch path.
+    const TRUNCATED_REPODATA_STDERR: &str = "\
+Error:   × Failed to resolve dependencies\n\
+  ╰─▶ Cannot solve the request because of: No candidates were found for\n\
+      gcc_linux-64 13.*.\n";
+
+    fn identity(name: &str, version: &str, build: &str) -> ProvisionedRecordIdentity {
+        ProvisionedRecordIdentity {
+            channel: "https://prefix.dev/conda-forge/linux-64".to_string(),
+            subdir: "linux-64".to_string(),
+            name: name.to_string(),
+            version: version.to_string(),
+            build: build.to_string(),
+        }
+    }
+
+    /// A superseded exact pin is recognised from the REAL captured stderr,
+    /// and the string handed back is the pin verbatim.
+    #[test]
+    fn superseded_exact_pin_is_recognised_in_the_real_rattler_failure() {
+        let host = BTreeSet::from([
+            identity("libpython", "3.12.14", "h0c77377_2_cpython"),
+            identity("python", "3.12.14", "h5f976f7_2_cpython"),
+        ]);
+        assert_eq!(
+            superseded_pin_in_failure(
+                REAL_SUPERSEDED_PIN_STDERR,
+                &BTreeSet::new(),
+                &host,
+            ),
+            Some("libpython ==3.12.14 h0c77377_2_cpython".to_string()),
+        );
+    }
+
+    /// The pin the classifier matches on must be the SAME text the recipe
+    /// pins, or the two drift and the recovery stops firing. Round-trip it
+    /// through the real renderer rather than restating the format.
+    #[test]
+    fn classified_pin_matches_what_the_recipe_actually_renders() {
+        let solved = test_hermetic_solve();
+        let (build, host) = solved_recipe_records(&solved, false).unwrap();
+        let rendered = String::from_utf8(render_debug_recipe(&solved, false).unwrap())
+            .expect("the rendered recipe is UTF-8");
+        let python = host
+            .iter()
+            .find(|identity| identity.name == "python")
+            .expect("the hermetic host environment pins python");
+        let spec = python.exact_match_spec();
+        assert!(
+            rendered.contains(&spec),
+            "renderer no longer emits `{spec}`:\n{rendered}"
+        );
+        let pin = spec
+            .split_once("::")
+            .expect("an exact pin is channel-qualified")
+            .1
+            .to_string();
+        let failure = format!(
+            "Error:   × Failed to resolve dependencies\n  \
+             ╰─▶ Cannot solve the request because of: No candidates were found for\n      {pin}.\n"
+        );
+        assert_eq!(
+            superseded_pin_in_failure(&failure, &build, &host),
+            Some(pin),
+        );
+    }
+
+    /// A root spec we never exact-pin is a DIFFERENT defect (truncated
+    /// repodata) and must not be routed to the refetch-and-re-solve path.
+    #[test]
+    fn an_unpinned_root_spec_is_not_classified_as_a_supersede() {
+        let build = BTreeSet::from([identity("gcc_linux-64", "13.4.0", "h5174b15_28")]);
+        assert_eq!(
+            superseded_pin_in_failure(TRUNCATED_REPODATA_STDERR, &build, &BTreeSet::new()),
+            None,
+        );
     }
 
     fn test_elf(machine: u16) -> Vec<u8> {

@@ -586,3 +586,60 @@ mod tests {
         }
     }
 }
+
+/// Drop every cached view of `(channel_url, subdir)` so the next
+/// [`sparse`] call refetches the document from the network.
+///
+/// Two layers hold repodata: the per-process `SPARSE_CACHE` memo (built at
+/// most once per process, by design) and the on-disk document under
+/// `<cache root>/retread-repodata/`, fresh for [`REPODATA_TTL`]. Both must
+/// go, or a re-solve inside the same process returns exactly the snapshot
+/// that was just proved stale.
+///
+/// This exists because retread and `rattler-build` resolve the SAME hermetic
+/// recipe against TWO different snapshots: retread pins exact
+/// `name ==version build` triples out of this cache (up to `REPODATA_TTL`
+/// old), and `rattler-build` re-resolves those pins against a channel it
+/// fetches into a cold private scratch on every single provision, i.e.
+/// always current. When upstream supersedes a build inside that window the
+/// recipe is unsatisfiable and rattler-build reports only "No candidates
+/// were found for <our own pin>". Forcing a refetch here makes the two
+/// snapshots converge instead of dead-ending the build.
+///
+/// Returns `true` when a disk document was actually removed.
+pub(crate) async fn invalidate(channel_url: &str, subdir: &str) -> bool {
+    if let Some(map) = SPARSE_CACHE.get() {
+        map.lock()
+            .unwrap()
+            .remove(&(channel_url.to_string(), subdir.to_string()));
+    }
+    let path = disk_cache_path(channel_url, subdir);
+    match tokio::fs::remove_file(&path).await {
+        Ok(()) => {
+            tracing::warn!(
+                channel = %channel_url,
+                subdir = %subdir,
+                cache = %path.display(),
+                "repodata: dropped the cached snapshot; the next solve refetches",
+            );
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            tracing::warn!(
+                cache = %path.display(), error = %error,
+                "repodata: could not drop the cached snapshot",
+            );
+            false
+        }
+    }
+}
+
+/// Drop the cached snapshot of every `(channel, subdir)` pair in `pairs`.
+pub(crate) async fn invalidate_pairs(pairs: &[(String, String)]) -> bool {
+    let mut dropped = false;
+    for (channel_url, subdir) in pairs {
+        dropped |= invalidate(channel_url, subdir).await;
+    }
+    dropped
+}
