@@ -15941,6 +15941,11 @@ const AUTO_ROUTE_CONDA_SELECTION_PART: &str = "conda-selection";
 /// selection (`==<picked>`, [`Provenance::PriorSelection`]).
 const AUTO_ROUTE_PRIOR_SELECTION_PART: &str = "prior-selection";
 
+/// The origin KIND stamped on every bound lifted out of a wheel's
+/// `Requires-Dist` (see the `wheel-requires-dist` origin at the wheel
+/// requirement boundary).
+const WHEEL_REQUIRES_DIST_ORIGIN_KIND: &str = "wheel-requires-dist";
+
 /// Origins of the bounds an emission group derived from THIS PACK'S OWN uv
 /// closure pick, rather than from anything declared.
 ///
@@ -15967,6 +15972,56 @@ fn closure_derived_route_origins(constraints: &[Constraint]) -> BTreeSet<Constra
         })
         .map(|constraint| constraint.origin_id.clone())
         .collect()
+}
+
+/// Whether these specifiers pin a single point rather than state a band.
+///
+/// `==1.2.3` and `===1.2.3` are points; `>=1.2`, `<2`, `!=1.4`, `~=1.2` and
+/// `==1.2.*` all still admit a range and are ordinary compatibility statements.
+fn states_an_exact_point(specifiers: &VersionSpecifiers) -> bool {
+    specifiers
+        .iter()
+        .any(|specifier| matches!(*specifier.operator(), Operator::Equal | Operator::ExactEqual))
+}
+
+/// Every origin in this group whose bound is THIS PACK'S OWN closure content
+/// hardened into a single point.
+///
+/// Two shapes reach the `constrains` slot carrying a pack's own resolved
+/// version, and p6g only removed the first:
+///
+///   1. the auto-route's own picks (`closure_derived_route_origins`);
+///   2. an EXACT `Requires-Dist` on a wheel this pack BUNDLES.
+///
+/// Shape 2 is what job 5707112 measured and p6g's binary still emitted: for
+/// `isaaclab-2.3x-pack` the killing clause was
+/// `wheel `isaacsim-core==5.1.0.0` Requires-Dist `fsspec==2024.6.1``, an
+/// origin of kind `wheel-requires-dist`, which `closure_derived_route_origins`
+/// never matched. The auto-route's own pick for that pack was `2024.10.0` and
+/// WAS projected out correctly -- the emitted `==2024.6.1` came from the
+/// bundled wheel all along, so the discipline's row never fired for `fsspec`.
+///
+/// A bundled wheel's exact pin is a fact about what this pack ships together,
+/// not a contract the rest of the workspace agreed to. In a `constrains_only`
+/// group the name is one the WORKSPACE provides, so another pack legitimately
+/// resolves it elsewhere; advertising the point makes the shared environment
+/// unsolvable. Only the point is dropped. A `Requires-Dist` that states a BAND
+/// (`fsspec>=2023.5.0` from `huggingface_hub==0.36.2`, in the same group, in
+/// the same run) is a real compatibility statement and survives untouched --
+/// which is the whole reason this keys on the OPERATOR and not on the origin
+/// kind alone.
+fn closure_derived_exact_origins(constraints: &[Constraint]) -> BTreeSet<ConstraintOriginId> {
+    let mut origins = closure_derived_route_origins(constraints);
+    origins.extend(
+        constraints
+            .iter()
+            .filter(|constraint| {
+                constraint.origin_id.kind() == Some(WHEEL_REQUIRES_DIST_ORIGIN_KIND)
+                    && states_an_exact_point(&constraint.specifiers)
+            })
+            .map(|constraint| constraint.origin_id.clone()),
+    );
+    origins
 }
 
 /// Every workspace counterparty this bundle knows of that states a version for
@@ -18773,7 +18828,7 @@ fn produce_output_with_conflicts(
             && !has_manual_override
             && native_conda_override.is_none()
         {
-            let closure_exacts = closure_derived_route_origins(&constraints);
+            let closure_exacts = closure_derived_exact_origins(&constraints);
             let newly_projected_out: BTreeSet<ConstraintOriginId> = closure_exacts
                 .into_iter()
                 .filter(|origin| !validation_only_origins.contains(origin))
