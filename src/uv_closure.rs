@@ -138,6 +138,65 @@ pub struct ConstraintSet {
     pub auto_route_constraint_indices: BTreeSet<usize>,
 }
 
+impl ConstraintSet {
+    /// p6n. Swap the LEARNED workspace-conda-fact half of this set for a
+    /// freshly derived one, leaving every other line (declared facts,
+    /// sibling pins, CUDA family, deps-from floors) exactly where it is.
+    ///
+    /// A learned fact is a `name==version` line, so a second pass cannot
+    /// simply ADD its version: `protobuf==7.35.1` and `protobuf==5.29.3`
+    /// together are unsatisfiable. The stale line has to come out, and it is
+    /// identified by provenance (`LEARNED_WORKSPACE_FACT_SOURCE`), never by
+    /// re-parsing the line text.
+    ///
+    /// `auto_route_constraint_indices` indexes INTO `constraints`, so it is
+    /// remapped rather than cleared: dropping it would let a routed package's
+    /// stabilizing pin be mistaken for an authoritative requirement.
+    pub fn replace_learned_workspace_facts(&mut self, relearned: ConstraintSet) {
+        let stale: BTreeSet<String> = self
+            .provenance
+            .iter()
+            .filter(|(_, prov)| prov.source == LEARNED_WORKSPACE_FACT_SOURCE)
+            .map(|(name, _)| name.clone())
+            .collect();
+        let stale_lines: BTreeSet<String> = stale
+            .iter()
+            .filter_map(|name| self.provenance.get(name))
+            .map(|prov| prov.constraint.clone())
+            .collect();
+        let mut index_map: BTreeMap<usize, usize> = BTreeMap::new();
+        let mut kept: Vec<String> = Vec::with_capacity(self.constraints.len());
+        for (old_index, line) in self.constraints.iter().enumerate() {
+            if stale_lines.contains(line) {
+                continue;
+            }
+            index_map.insert(old_index, kept.len());
+            kept.push(line.clone());
+        }
+        self.auto_route_constraint_indices = self
+            .auto_route_constraint_indices
+            .iter()
+            .filter_map(|old| index_map.get(old).copied())
+            .collect();
+        self.constraints = kept;
+        for name in &stale {
+            self.provenance.remove(name);
+        }
+        for (name, prov) in relearned.provenance {
+            if self.provenance.contains_key(&name) {
+                // A declared fact or an operator pin already owns this name;
+                // a learned float never overwrites intent (same rule
+                // `learned_fact_constraints` applies through `already`).
+                continue;
+            }
+            if !self.constraints.contains(&prov.constraint) {
+                self.constraints.push(prov.constraint.clone());
+            }
+            self.provenance.insert(name, prov);
+        }
+    }
+}
+
 /// Precise conda-side provider eligible to satisfy one PyPI dependency before
 /// uv's first lock. Construction requires a typed workspace fact; routing
 /// aliases and prior selections are never ownership authority.

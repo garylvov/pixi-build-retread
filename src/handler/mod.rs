@@ -9524,6 +9524,175 @@ fn apply_deps_from_conda_floors(
     Ok(())
 }
 
+/// p6n. How many times one bundle's closure may be resolved while the
+/// workspace conda facts are being corrected. TWO: pass 1 gathers facts
+/// without the bundle (the pack does not exist yet), pass 2 folds the
+/// bundle's own conda-side contribution back in and re-closes if any learned
+/// version moved. A third pass has never been observed to move anything and
+/// would cost a full uv lock to prove it.
+const P6N_MAX_FACT_PASSES: usize = 2;
+
+/// p6n. The conda specs each precise consuming environment is solved with,
+/// for the fact-gathering solve.
+///
+/// The bundle under construction is removed (it does not exist yet, so it
+/// cannot be a spec) -- that exclusion is pre-p6n behavior and unchanged.
+/// What p6n adds is `contribution`: the conda-side specs the bundle will
+/// itself put into that environment. Without them the facts describe a
+/// prefix the workspace never builds. Measured instance (job 5720294,
+/// `LANE-C-WARM-LOG.md` §14): `isaaclab-viral-pack` hand-pins
+/// `ray = "==2.49.1"`, which routes to conda `ray-core 2.49.1 -> libgrpc
+/// 1.71.0 -> libprotobuf >=5.29.3,<5.29.4.0a0`, so `viral-gpu` resolves
+/// `protobuf 5.29.3`. With the pack removed the same environment solves
+/// FREE to `protobuf 7.35.1`, and that is the version the closure learned --
+/// so it resolved `tensorboard 2.21.0` (`protobuf>=6.31.1,<8`) and emitted a
+/// `constrains` floor the real environment can never satisfy.
+///
+/// A contribution spec for the bundle's own name is ignored: the exclusion
+/// above is not negotiable.
+fn precise_env_solve_specs(
+    deps: &BTreeMap<String, String>,
+    bundle_key: &PypiKey,
+    contribution: &BTreeMap<String, String>,
+    python_version: &str,
+) -> Vec<crate::relax::CondaMatchSpec> {
+    let mut specs = deps
+        .iter()
+        .filter_map(|(name, spec)| {
+            let name = CondaName::new(name.as_str());
+            if name.key() == *bundle_key {
+                return None;
+            }
+            Some(name.match_spec(spec))
+        })
+        .collect::<Vec<_>>();
+    // Folded AFTER the environment's own declarations and never in place of
+    // them: both specs reach the solver and the solver intersects them, which
+    // is what a real prefix holding both does.
+    for (name, spec) in contribution {
+        let name = CondaName::new(name.as_str());
+        if name.key() == *bundle_key {
+            continue;
+        }
+        if name.as_spec() == "python" {
+            continue;
+        }
+        specs.push(name.match_spec(spec));
+    }
+    specs.push(CondaName::new("python").match_spec(&format!("{python_version}.*")));
+    specs
+}
+
+/// p6n. The bundle's own conda-side contribution to its consuming
+/// environments, as far as it is knowable at the point of use.
+///
+/// Two producers, both of which the pack owns:
+///
+/// * `retread-overrides` -- hand pins in the pack's own manifest, mapped to
+///   their conda spelling through the effective name map (which already
+///   carries the parselmouth table, see `effective_name_map`). This is the
+///   producer of the live instance: `ray = "==2.49.1"` -> `ray-core ==2.49.1`.
+/// * the resolved closure's auto-routes -- every PyPI member the closure
+///   moved to the conda side, at the conda version it picked. These are only
+///   available on the SECOND pass, which is exactly why there is one.
+///
+/// Names the pack ships itself (`[retread-wheels]` entries and closure
+/// members it bundles) are NOT a contribution to the environment's conda
+/// side and are never folded in.
+fn bundle_conda_contribution(
+    effective: &RetreadConfig,
+    closure: Option<&crate::uv_closure::UvClosure>,
+) -> BTreeMap<String, String> {
+    let mut contribution: BTreeMap<String, String> = BTreeMap::new();
+    let shipped: BTreeSet<String> = effective
+        .retread_wheels
+        .keys()
+        .map(|name| canonical_conda_name(name))
+        .collect();
+    for (pypi, spec) in &effective.overrides {
+        let spec = spec.trim();
+        if spec.is_empty() || spec == "*" {
+            continue;
+        }
+        if shipped.contains(&canonical_conda_name(pypi)) {
+            continue;
+        }
+        if effective
+            .drop_deps
+            .iter()
+            .any(|dropped| canonical_conda_name(dropped) == canonical_conda_name(pypi))
+        {
+            continue;
+        }
+        // A name the pack deliberately keeps on the PyPI side is not a conda
+        // contribution, whatever the override says.
+        if effective
+            .keep_pypi
+            .iter()
+            .any(|kept| canonical_conda_name(kept) == canonical_conda_name(pypi))
+        {
+            continue;
+        }
+        let conda = match effective.name_map.get(&PypiKey::from_pypi(pypi)) {
+            Some(target) => match target.mapped_name() {
+                Some(name) => name.as_spec().to_string(),
+                // `retread-name-map = { x = false }` is an explicit refusal
+                // to give this name a conda side.
+                None => continue,
+            },
+            None => canonical_conda_name(pypi),
+        };
+        contribution.insert(conda, spec.to_string());
+    }
+    if let Some(closure) = closure {
+        for route in &closure.auto_routed {
+            if closure.auto_dropped.contains(&route.pypi_name) {
+                continue;
+            }
+            contribution
+                .entry(route.conda_name.clone())
+                .or_insert_with(|| format!("=={}", route.conda_version));
+        }
+    }
+    contribution
+}
+
+/// p6n. Which learned conda versions moved between two fact passes, as
+/// `name old->new` rows (`(none)` for a name the earlier pass never learned).
+///
+/// Restricted to names the closure actually resolved plus names the earlier
+/// pass learned: a name that neither side of the closure touches is noise,
+/// and re-closing on it would burn a uv lock for nothing.
+fn p6n_learned_moves(
+    before: &BTreeMap<String, String>,
+    after: &BTreeMap<String, String>,
+    closure_names: &BTreeSet<String>,
+) -> Vec<String> {
+    let mut moves = Vec::new();
+    for (name, new_version) in after {
+        let old = before.get(name);
+        if old == Some(new_version) {
+            continue;
+        }
+        if old.is_none() && !closure_names.contains(&canonical_conda_name(name)) {
+            continue;
+        }
+        moves.push(format!(
+            "{name} {}->{new_version}",
+            old.map(String::as_str).unwrap_or("(none)")
+        ));
+    }
+    // A name the earlier pass learned and the folded pass did NOT select is
+    // a real move too: the constraint has to come back out.
+    for name in before.keys() {
+        if !after.contains_key(name) {
+            moves.push(format!("{name} {}->(none)", before[name]));
+        }
+    }
+    moves.sort();
+    moves
+}
+
 /// Solve each precise consuming environment independently. Destructive
 /// behavior is enabled only when the workspace can map this source package to
 /// concrete active environments and every environment solve succeeds.
@@ -9535,6 +9704,10 @@ async fn solve_workspace_conda_facts(
     conda_channels: &[ChannelUrl],
     name_map: &NameMap,
     bundle_name: &str,
+    // p6n. The bundle's own conda-side contribution, folded into every
+    // precise consuming environment's spec list. EMPTY on the first pass,
+    // which reproduces the pre-p6n solve exactly.
+    bundle_conda_contribution: &BTreeMap<String, String>,
 ) -> WorkspaceCondaFacts {
     let Some(inputs) =
         precise_consumer_inputs_for_target(manifest, workspace_dir, source_dir, target)
@@ -9574,18 +9747,12 @@ async fn solve_workspace_conda_facts(
             let env = &input.env;
             let deps = &input.conda_deps;
             let channels = precise_consumer_solve_channels(conda_channels, input);
-            let mut specs = deps
-                .iter()
-                .filter_map(|(name, spec)| {
-                    let name = CondaName::new(name.as_str());
-                    if name.key() == bundle_key {
-                        return None;
-                    }
-                    Some(name.match_spec(spec))
-                })
-                .collect::<Vec<_>>();
-            specs
-                .push(CondaName::new("python").match_spec(&format!("{}.*", target.python_version)));
+            let specs = precise_env_solve_specs(
+                deps,
+                &bundle_key,
+                bundle_conda_contribution,
+                &target.python_version,
+            );
             let sysreqs = workspace_effective_system_requirements(manifest, env, target);
             async move {
                 let result = crate::conda_solve::solve_selected_records_for_target(
@@ -9739,6 +9906,10 @@ async fn uv_group_closure(
     // immutable parameters that the loop does not touch, so moving the call
     // changes WHEN it runs, never WHAT it returns. Nothing between the old and
     // new position feeds it (the deps-from block only extends `roots`).
+    // p6n PASS 1. The bundle's conda-side contribution is not yet knowable
+    // beyond its hand pins, so the fold is the overrides only; the closure's
+    // own routes join it on pass 2, after the closure exists.
+    let p6n_pass1_contribution = bundle_conda_contribution(effective, None);
     let mut workspace_facts = match (manifest_opt.as_ref(), workspace_dir) {
         (Some(manifest), Some(ws_dir)) => {
             solve_workspace_conda_facts(
@@ -9749,11 +9920,19 @@ async fn uv_group_closure(
                 conda_channels,
                 fact_name_map,
                 group_name,
+                &p6n_pass1_contribution,
             )
             .await
         }
         _ => WorkspaceCondaFacts::default(),
     };
+    tracing::info!(
+        bundle = %group_name,
+        pass = 1,
+        folded = p6n_pass1_contribution.len(),
+        learned = workspace_facts.common_selected_versions.len(),
+        "p6n pass=1 workspace conda facts",
+    );
     // Names the CONDA side of this workspace already provides. Lane C exists
     // to surface MISSING dependencies; a conda-provided module is not
     // missing, and injecting it re-routes the solve toward a PyPI wheel whose
@@ -10065,27 +10244,34 @@ async fn uv_group_closure(
         .keys()
         .map(|name| canonical_conda_name(name))
         .collect();
+    // A name the pack overrides, explicitly keeps on the PyPI side, or ships
+    // itself must never receive a learned conda `==` pin.
+    // p6n: HOISTED out of the match arm below so the second fact pass can
+    // re-derive the learned constraints under exactly the same exclusions.
+    // Nothing in it depends on the facts, so hoisting cannot change it.
+    let p6n_learned_excluded: BTreeSet<String> = {
+        let mut learned_excluded = manual.clone();
+        learned_excluded.extend(
+            effective
+                .keep_pypi
+                .iter()
+                .map(|name| canonical_conda_name(name)),
+        );
+        learned_excluded.extend(uv_retry_keep_names.iter().cloned());
+        learned_excluded.extend(
+            group_entries
+                .iter()
+                .map(|(name, _)| canonical_conda_name(name)),
+        );
+        learned_excluded
+    };
+    let p6n_manual_names = manual.clone();
     let mut constraints = match effective.route_policy {
         crate::config::RoutePolicy::PreferCondaValidated | crate::config::RoutePolicy::Minimal => {
-            // A name the pack overrides, explicitly keeps on the PyPI side,
-            // or ships itself must never receive a learned conda `==` pin.
-            let mut learned_excluded = manual.clone();
-            learned_excluded.extend(
-                effective
-                    .keep_pypi
-                    .iter()
-                    .map(|name| canonical_conda_name(name)),
-            );
-            learned_excluded.extend(uv_retry_keep_names.iter().cloned());
-            learned_excluded.extend(
-                group_entries
-                    .iter()
-                    .map(|(name, _)| canonical_conda_name(name)),
-            );
             workspace_fact_constraints(
                 &workspace_facts,
                 &manual,
-                &learned_excluded,
+                &p6n_learned_excluded,
                 fact_name_map,
                 load_pypi_to_conda_map().await.as_ref(),
                 target.python_version(),
@@ -10571,6 +10757,57 @@ async fn uv_group_closure(
         workspace_fact_fingerprint: workspace_facts.fingerprint.clone(),
     };
 
+    // Seed the heal ledgers from facts persisted by a previous run (issue
+    // #10 perf): with these present, the FIRST Pass A already carries the
+    // learned overrides / pins / built-wheel path-sources, so a warm rerun
+    // resolves in a single lock (and the pyproject fingerprint matches the
+    // recorded meta, letting uv reuse the healed uv.lock instead of
+    // re-resolving).
+    // Stale built-wheel entries (store pruned) are dropped on load.
+    // Facts are only replayable under the manifest/routing state they were
+    // learned from (B1): stamp over the BASE request + routing options; a
+    // mismatch discards the file (fresh heal), never a stale replay.
+    let facts_stamp = crate::uv_closure::heal_facts_stamp_for_target(
+        &req,
+        &auto_route_opts,
+        effective.sdist_build,
+        target,
+    );
+    let persisted_facts =
+        crate::uv_closure::load_heal_facts_for_target(&heal_facts_path, &facts_stamp, target)
+            .await?;
+    if !persisted_facts.is_empty() {
+        tracing::info!(
+            bundle = %group_name,
+            routed = persisted_facts.routed.len(),
+            built = persisted_facts.built.len(),
+            prereleased = persisted_facts.prereleased.len(),
+            workspace_overrides = persisted_facts.workspace_overrides.len(),
+            "uv closure: seeding heal ledgers from persisted facts (warm reuse path)",
+        );
+    }
+    let workspace_overrides = Arc::new(std::sync::Mutex::new(persisted_facts.workspace_overrides));
+    let persisted_routes = seed_persisted_routes(persisted_facts.routed, &uv_retry_keep_names);
+    let sdist_routed = Arc::new(std::sync::Mutex::new(persisted_routes));
+    let sdist_built = Arc::new(std::sync::Mutex::new(persisted_facts.built));
+    // Transitive-prerelease repairs surface naturally in the closure's
+    // pins/wheels (the offender keeps its own index wheel); collected here
+    // only for logging/audit parity with the route/build ledgers.
+    let sdist_prereleased = Arc::new(std::sync::Mutex::new(persisted_facts.prereleased));
+    // Innermost: a LEARNED workspace conda fact that a hard requirement in
+    // the closure excludes is dropped and the lock retried (F13 turn 2). It
+    // wraps `raw_solve` so the outer heal/override wrappers only ever see a
+    // constraint set the closure's own requirements can accept.
+    let yielded_learned_facts = Arc::new(std::sync::Mutex::new(BTreeSet::new()));
+    // p6n. The fixpoint driver's three closures are built HERE, in a macro,
+    // because p6n may close this bundle TWICE: `auto_route_fixpoint_checked`
+    // consumes `solve`/`probe`/`co_solve` by value, so a second pass needs a
+    // second set. Everything they capture is cloned per build (a uv
+    // subprocess dwarfs the clones) and the shared heal ledgers above are
+    // Arc'd, so pass 2 inherits pass 1's learned routes and built wheels
+    // exactly as a warm rerun would.
+    macro_rules! p6n_build_solvers {
+        () => {{
     // `'static` closures for the fixpoint driver: clone the inputs each
     // solve/probe needs. Cheap relative to a uv subprocess / repodata hit.
     let raw_solve = {
@@ -10668,48 +10905,6 @@ async fn uv_group_closure(
                 as futures::future::BoxFuture<'static, Result<crate::uv_closure::BuiltSdistWheel>>
         }
     });
-    // Seed the heal ledgers from facts persisted by a previous run (issue
-    // #10 perf): with these present, the FIRST Pass A already carries the
-    // learned overrides / pins / built-wheel path-sources, so a warm rerun
-    // resolves in a single lock (and the pyproject fingerprint matches the
-    // recorded meta, letting uv reuse the healed uv.lock instead of
-    // re-resolving).
-    // Stale built-wheel entries (store pruned) are dropped on load.
-    // Facts are only replayable under the manifest/routing state they were
-    // learned from (B1): stamp over the BASE request + routing options; a
-    // mismatch discards the file (fresh heal), never a stale replay.
-    let facts_stamp = crate::uv_closure::heal_facts_stamp_for_target(
-        &req,
-        &auto_route_opts,
-        effective.sdist_build,
-        target,
-    );
-    let persisted_facts =
-        crate::uv_closure::load_heal_facts_for_target(&heal_facts_path, &facts_stamp, target)
-            .await?;
-    if !persisted_facts.is_empty() {
-        tracing::info!(
-            bundle = %group_name,
-            routed = persisted_facts.routed.len(),
-            built = persisted_facts.built.len(),
-            prereleased = persisted_facts.prereleased.len(),
-            workspace_overrides = persisted_facts.workspace_overrides.len(),
-            "uv closure: seeding heal ledgers from persisted facts (warm reuse path)",
-        );
-    }
-    let workspace_overrides = Arc::new(std::sync::Mutex::new(persisted_facts.workspace_overrides));
-    let persisted_routes = seed_persisted_routes(persisted_facts.routed, &uv_retry_keep_names);
-    let sdist_routed = Arc::new(std::sync::Mutex::new(persisted_routes));
-    let sdist_built = Arc::new(std::sync::Mutex::new(persisted_facts.built));
-    // Transitive-prerelease repairs surface naturally in the closure's
-    // pins/wheels (the offender keeps its own index wheel); collected here
-    // only for logging/audit parity with the route/build ledgers.
-    let sdist_prereleased = Arc::new(std::sync::Mutex::new(persisted_facts.prereleased));
-    // Innermost: a LEARNED workspace conda fact that a hard requirement in
-    // the closure excludes is dropped and the lock retried (F13 turn 2). It
-    // wraps `raw_solve` so the outer heal/override wrappers only ever see a
-    // constraint set the closure's own requirements can accept.
-    let yielded_learned_facts = Arc::new(std::sync::Mutex::new(BTreeSet::new()));
     let raw_solve =
         crate::uv_closure::with_learned_fact_yields(raw_solve, Arc::clone(&yielded_learned_facts));
     let solve = crate::uv_closure::with_workspace_fact_overrides(
@@ -10744,34 +10939,125 @@ async fn uv_group_closure(
                 as futures::future::BoxFuture<'static, crate::uv_closure::CoInstallVerdict>
         }
     };
+            (solve, probe, co_solve)
+        }};
+    }
     // Harmonization shares Rule 3's precise authority: exact conda names
     // selected identically in every concrete consumer. Ambiguous ownership,
     // failed solves, transitive-only names, or disagreement leave the map
     // empty and the fixpoint abstains to its un-route fallback.
     let mut auto_route_opts = auto_route_opts;
     auto_route_opts.workspace_conda_versions = workspace_facts.common_conda_versions.clone();
-    let mut closure = match crate::uv_closure::auto_route_fixpoint_checked(
-        &req,
-        &auto_route_opts,
-        solve,
-        probe,
-        co_solve,
-    )
-    .await
-    {
-        Ok(c) => c,
-        Err(e) => {
-            // B1: a genuine resolution/heal failure may have been poisoned by
-            // stale persisted facts (or is about to change the manifest state
-            // via a repair loop), so the facts file is dropped to force a
-            // clean re-heal next run. A merely TRANSIENT failure (io/network/
-            // backend crash) leaves the facts valid and keeps them -- see
-            // `discard_facts_on_solve_failure` for the transient-vs-resolution
-            // classification and why "when unsure, delete" stays wedge-safe.
-            discard_facts_on_solve_failure(&heal_facts_path, &e);
-            return Err(e);
+    // p6n. Bounded fact fixpoint, at most `P6N_MAX_FACT_PASSES` closes.
+    // Pass 1 is today's behavior byte for byte. Pass 2 exists because pass
+    // 1's facts were gathered from a solve of each consuming environment
+    // with THIS bundle removed, so every version the bundle itself decides
+    // was learned free or not learned at all; once the closure exists, its
+    // conda-side routes are folded back in and the facts are re-learned.
+    let mut closure;
+    let mut pass: usize = 1;
+    loop {
+        let (solve, probe, co_solve) = p6n_build_solvers!();
+        closure = match crate::uv_closure::auto_route_fixpoint_checked(
+            &req,
+            &auto_route_opts,
+            solve,
+            probe,
+            co_solve,
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                // B1: a genuine resolution/heal failure may have been poisoned by
+                // stale persisted facts (or is about to change the manifest state
+                // via a repair loop), so the facts file is dropped to force a
+                // clean re-heal next run. A merely TRANSIENT failure (io/network/
+                // backend crash) leaves the facts valid and keeps them -- see
+                // `discard_facts_on_solve_failure` for the transient-vs-resolution
+                // classification and why "when unsure, delete" stays wedge-safe.
+                discard_facts_on_solve_failure(&heal_facts_path, &e);
+                return Err(e);
+            }
+        };
+        if pass >= P6N_MAX_FACT_PASSES {
+            break;
         }
-    };
+        let (Some(manifest), Some(ws_dir)) = (manifest_opt.as_ref(), workspace_dir) else {
+            break;
+        };
+        let contribution = bundle_conda_contribution(effective, Some(&closure));
+        if contribution == p6n_pass1_contribution {
+            tracing::debug!(
+                bundle = %group_name,
+                "p6n pass=2 skipped: the closure added no conda-side contribution",
+            );
+            break;
+        }
+        let refolded = solve_workspace_conda_facts(
+            manifest,
+            ws_dir,
+            source_dir,
+            target,
+            conda_channels,
+            fact_name_map,
+            group_name,
+            &contribution,
+        )
+        .await;
+        // A pass that could not solve every consuming environment abstains
+        // (`WorkspaceCondaFacts::default`). Its emptiness is not a fact about
+        // this workspace, so pass 1's premise stands and nothing is re-closed.
+        if refolded.common_selected_versions.is_empty() {
+            tracing::info!(
+                bundle = %group_name,
+                folded = contribution.len(),
+                "p6n pass=2 learned_moved=[] (the folded solve abstained; pass 1 facts stand)",
+            );
+            break;
+        }
+        let closure_names: BTreeSet<String> = closure
+            .pins
+            .keys()
+            .map(|name| canonical_conda_name(name))
+            .collect();
+        let moves = p6n_learned_moves(
+            &workspace_facts.common_selected_versions,
+            &refolded.common_selected_versions,
+            &closure_names,
+        );
+        tracing::info!(
+            bundle = %group_name,
+            pass = 2,
+            folded = contribution.len(),
+            learned = refolded.common_selected_versions.len(),
+            learned_moved = ?moves,
+            "p6n pass=2 workspace conda facts",
+        );
+        if moves.is_empty() {
+            break;
+        }
+        // Only the VERSION-bearing half of the facts is adopted. Ownership
+        // (`owned_pypi`, `owned_conda_pypi`, `declared_pypi`) is about which
+        // manifest declares a name, which the fold cannot change, and it has
+        // already driven the drop/protection decisions above.
+        workspace_facts.common_selected_versions = refolded.common_selected_versions;
+        workspace_facts.common_conda_versions = refolded.common_conda_versions;
+        workspace_facts.selected_conda_packages = refolded.selected_conda_packages;
+        workspace_facts.fingerprint = refolded.fingerprint;
+        let relearned = workspace_fact_constraints(
+            &workspace_facts,
+            &p6n_manual_names,
+            &p6n_learned_excluded,
+            fact_name_map,
+            load_pypi_to_conda_map().await.as_ref(),
+            target.python_version(),
+        );
+        req.constraints.replace_learned_workspace_facts(relearned);
+        auto_route_opts.workspace_conda_versions = workspace_facts.common_conda_versions.clone();
+        auto_route_opts.workspace_fact_fingerprint = workspace_facts.fingerprint.clone();
+        pass += 1;
+    }
     // Splice in the sdist-only self-heal's discoveries (mirrors
     // `uv_closure::auto_route_fixpoint_with_sdist_heal`'s own splice,
     // which this call site can't use directly -- production also needs
@@ -11811,6 +12097,307 @@ gpu = { features = ["gpu"], no-default-feature = true }
             BTreeMap::from([("numpy".to_string(), "==2.1".to_string())]),
         ]);
         assert_eq!(intersection, BTreeSet::from(["numpy".to_string()]));
+    }
+
+    // ---------------------------------------------------------------------
+    // p6n GUARDS. The live fixture is job 5720294 / `LANE-C-WARM-LOG.md` §14:
+    // `viral-gpu` + `isaaclab-viral-pack`, whose hand pin `ray = "==2.49.1"`
+    // routes to conda `ray-core 2.49.1 -> libgrpc 1.71.0 ->
+    // libprotobuf >=5.29.3,<5.29.4.0a0`, holding conda `protobuf` at 5.29.3.
+    // Solved WITHOUT the pack the same environment goes to `protobuf 7.35.1`
+    // and never selects `tensorboard` at all, which is what the closure
+    // learned -- so it took `tensorboard 2.21.0` and emitted
+    // `protobuf >=6.31.1,<8`, a floor the environment cannot satisfy.
+    // ---------------------------------------------------------------------
+
+    /// The pack's hand pin must reach the fact-gathering solve under its
+    /// CONDA spelling, while the bundle under construction stays excluded.
+    #[test]
+    fn p6n_the_packs_hand_pin_reaches_the_precise_environment_solve() {
+        let deps = BTreeMap::from([
+            ("isaaclab-viral-pack".to_string(), "*".to_string()),
+            ("onnxruntime".to_string(), ">=1.20,<2".to_string()),
+        ]);
+        let bundle_key = PypiKey::from_pypi("isaaclab-viral-pack");
+        let contribution = BTreeMap::from([("ray-core".to_string(), "==2.49.1".to_string())]);
+
+        let specs = super::precise_env_solve_specs(&deps, &bundle_key, &contribution, "3.11");
+        let rendered: Vec<String> = specs.iter().map(|spec| spec.to_string()).collect();
+
+        assert!(
+            rendered.iter().any(|spec| spec == "ray-core ==2.49.1"),
+            "the pack's own conda-side contribution must be folded into the \
+             consuming environment's spec list; got {rendered:?}",
+        );
+        assert!(
+            !rendered
+                .iter()
+                .any(|spec| spec.starts_with("isaaclab-viral-pack")),
+            "the bundle under construction is still excluded; got {rendered:?}",
+        );
+        assert!(
+            rendered.iter().any(|spec| spec == "python 3.11.*"),
+            "the target python spec survives the fold; got {rendered:?}",
+        );
+
+        // NON-VACUITY: with no contribution the spec list is what it always
+        // was, so pass 1 cannot have changed.
+        let unfolded =
+            super::precise_env_solve_specs(&deps, &bundle_key, &BTreeMap::new(), "3.11");
+        let unfolded: Vec<String> = unfolded.iter().map(|spec| spec.to_string()).collect();
+        assert_eq!(
+            unfolded,
+            vec!["onnxruntime >=1.20,<2".to_string(), "python 3.11.*".to_string()],
+            "an empty contribution must reproduce the pre-p6n spec list exactly",
+        );
+    }
+
+    /// `retread-overrides ray = "==2.49.1"` is conda-side intent; the
+    /// closure's own auto-routes join it on the second pass.
+    #[test]
+    fn p6n_the_conda_contribution_is_the_packs_overrides_plus_its_routes() {
+        // Shaped like `isaaclab-viral-pack`'s own manifest: a hand pin that
+        // routes to conda, a hand pin on a name the pack SHIPS, and a `*`
+        // that is not a bound at all.
+        let mut config: crate::config::RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-wheels": { "aiodns": { "version": "==3.6.1" } },
+            "retread-overrides": {
+                "ray": "==2.49.1",
+                "aiodns": "==3.6.1",
+                "pandas": "*",
+            },
+        }))
+        .unwrap();
+        config.name_map = name_map(&[("ray", "ray-core"), ("aiodns", "aiodns")]);
+
+        let pass1 = super::bundle_conda_contribution(&config, None);
+        assert_eq!(
+            pass1,
+            BTreeMap::from([("ray-core".to_string(), "==2.49.1".to_string())]),
+            "only real, conda-mapped, non-shipped bounds are folded",
+        );
+
+        let closure = crate::uv_closure::UvClosure {
+            wheels: Vec::new(),
+            pins: BTreeMap::new(),
+            uv_version: "test".to_string(),
+            auto_routed: vec![crate::uv_closure::AutoRoutedPackage {
+                pypi_name: "numpy".to_string(),
+                conda_name: "numpy".to_string(),
+                pypi_version: "1.26.0".to_string(),
+                conda_version: "1.26.0".to_string(),
+                channel: "https://prefix.dev/conda-forge/linux-64".to_string(),
+                input_requirements: Vec::new(),
+                origin: crate::uv_closure::RouteOrigin::default(),
+            }],
+            auto_dropped: BTreeSet::new(),
+            effective_input_requirements: None,
+            dependency_graph: crate::uv_closure::UvDependencyGraph::default(),
+        };
+        let pass2 = super::bundle_conda_contribution(&config, Some(&closure));
+        assert_eq!(
+            pass2.get("numpy").map(String::as_str),
+            Some("==1.26.0"),
+            "the closure's own conda routes join the fold on pass 2",
+        );
+        assert_ne!(pass1, pass2, "pass 2 must have something new to fold, or it is not a pass");
+    }
+
+    /// The decisive assertion: the learned fact for the second name is the
+    /// WITH-pack version, and the constraint handed to the re-close carries
+    /// it INSTEAD OF -- not alongside -- the free one.
+    #[test]
+    fn p6n_the_refolded_pass_relearns_protobuf_at_the_with_pack_version() {
+        let env = "viral-gpu".to_string();
+        let declared = BTreeMap::from([("onnxruntime".to_string(), ">=1.20,<2".to_string())]);
+
+        // Pass 1: the pack is removed, so nothing holds libprotobuf down and
+        // nothing pulls tensorboard in at all.
+        let free = facts_from_solved_records(
+            BTreeMap::from([(
+                env.clone(),
+                vec![
+                    repo_record("onnxruntime", "1.28.0", &["protobuf >=3.20.3"]),
+                    repo_record("protobuf", "7.35.1", &["libprotobuf 7.35.1"]),
+                    repo_record("libprotobuf", "7.35.1", &[]),
+                ],
+            )]),
+            BTreeMap::from([(env.clone(), declared.clone())]),
+            BTreeSet::new(),
+            &name_map(&[]),
+            "isaaclab-viral-pack",
+        );
+        assert_eq!(
+            free.common_selected_versions.get("protobuf").map(String::as_str),
+            Some("7.35.1"),
+            "the free premise is the one the campaign actually learned",
+        );
+
+        // Pass 2: the pack's `ray-core ==2.49.1` is folded in and the whole
+        // ABI chain moves.
+        let folded = facts_from_solved_records(
+            BTreeMap::from([(
+                env.clone(),
+                vec![
+                    repo_record("onnxruntime", "1.28.0", &["protobuf >=3.20.3"]),
+                    repo_record("ray-core", "2.49.1", &["libgrpc >=1.71.0,<1.72.0a0"]),
+                    repo_record("libgrpc", "1.71.0", &["libprotobuf >=5.29.3,<5.29.4.0a0"]),
+                    repo_record("libprotobuf", "5.29.3", &[]),
+                    repo_record("protobuf", "5.29.3", &["libprotobuf 5.29.3"]),
+                    repo_record("tensorboard", "2.20.0", &["protobuf >=3.19.6"]),
+                ],
+            )]),
+            BTreeMap::from([(env.clone(), declared)]),
+            BTreeSet::new(),
+            &name_map(&[]),
+            "isaaclab-viral-pack",
+        );
+
+        let closure_names: BTreeSet<String> =
+            ["protobuf", "tensorboard", "onnxruntime", "numpy"]
+                .iter()
+                .map(|name| name.to_string())
+                .collect();
+        let moves = super::p6n_learned_moves(
+            &free.common_selected_versions,
+            &folded.common_selected_versions,
+            &closure_names,
+        );
+        assert!(
+            moves.contains(&"protobuf 7.35.1->5.29.3".to_string()),
+            "the second pass must report protobuf moving to the with-pack \
+             version; got {moves:?}",
+        );
+        assert!(
+            moves.contains(&"tensorboard (none)->2.20.0".to_string()),
+            "a name the pack drags in was learned by NO pass before p6n; \
+             got {moves:?}",
+        );
+
+        // And the constraint set the re-close is handed must SWAP the line,
+        // not stack a second one: `protobuf==7.35.1` and `protobuf==5.29.3`
+        // together are unsatisfiable.
+        let mut constraints = workspace_fact_constraints(
+            &free,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &name_map(&[]),
+            &PypiToCondaMap::new(),
+            "3.11",
+        );
+        assert!(
+            constraints.constraints.contains(&"protobuf==7.35.1".to_string()),
+            "the pre-p6n constraint set is the RED reference; got {:?}",
+            constraints.constraints,
+        );
+        let relearned = workspace_fact_constraints(
+            &folded,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &name_map(&[]),
+            &PypiToCondaMap::new(),
+            "3.11",
+        );
+        constraints.replace_learned_workspace_facts(relearned);
+        assert!(
+            constraints.constraints.contains(&"protobuf==5.29.3".to_string()),
+            "the re-close must carry the with-pack version; got {:?}",
+            constraints.constraints,
+        );
+        assert!(
+            !constraints.constraints.contains(&"protobuf==7.35.1".to_string()),
+            "the free version must be REMOVED, not stacked; got {:?}",
+            constraints.constraints,
+        );
+        assert!(
+            constraints.constraints.contains(&"tensorboard==2.20.0".to_string()),
+            "the name the pack drags in becomes a constraint uv can honor, \
+             which is what stops it resolving tensorboard 2.21.0; got {:?}",
+            constraints.constraints,
+        );
+    }
+
+    /// A line that is NOT a learned workspace fact survives the swap, and
+    /// `auto_route_constraint_indices` still points at the same lines.
+    #[test]
+    fn p6n_replacing_learned_facts_preserves_every_other_line_and_its_index() {
+        let mut set = crate::uv_closure::ConstraintSet::default();
+        set.constraints = vec![
+            "torch==2.5.1".to_string(),
+            "protobuf==7.35.1".to_string(),
+            "numpy==1.26.0".to_string(),
+        ];
+        set.provenance.insert(
+            "torch".to_string(),
+            crate::uv_closure::ConstraintProvenance {
+                constraint: "torch==2.5.1".to_string(),
+                conda_name: "pytorch".to_string(),
+                conda_version: "2.5.1".to_string(),
+                source: "workspace-solved".to_string(),
+                env: "viral-gpu".to_string(),
+                provenance: Provenance::WorkspaceCondaFact("viral-gpu".to_string()),
+            },
+        );
+        set.provenance.insert(
+            "protobuf".to_string(),
+            crate::uv_closure::ConstraintProvenance {
+                constraint: "protobuf==7.35.1".to_string(),
+                conda_name: "protobuf".to_string(),
+                conda_version: "7.35.1".to_string(),
+                source: crate::uv_closure::LEARNED_WORKSPACE_FACT_SOURCE.to_string(),
+                env: "viral-gpu".to_string(),
+                provenance: Provenance::UvConstraint,
+            },
+        );
+        set.provenance.insert(
+            "numpy".to_string(),
+            crate::uv_closure::ConstraintProvenance {
+                constraint: "numpy==1.26.0".to_string(),
+                conda_name: "numpy".to_string(),
+                conda_version: "1.26.0".to_string(),
+                source: "auto-route".to_string(),
+                env: "viral-gpu".to_string(),
+                provenance: Provenance::PriorSelection,
+            },
+        );
+        set.auto_route_constraint_indices = BTreeSet::from([2]);
+
+        let mut relearned = crate::uv_closure::ConstraintSet::default();
+        relearned.constraints = vec!["protobuf==5.29.3".to_string()];
+        relearned.provenance.insert(
+            "protobuf".to_string(),
+            crate::uv_closure::ConstraintProvenance {
+                constraint: "protobuf==5.29.3".to_string(),
+                conda_name: "protobuf".to_string(),
+                conda_version: "5.29.3".to_string(),
+                source: crate::uv_closure::LEARNED_WORKSPACE_FACT_SOURCE.to_string(),
+                env: "viral-gpu".to_string(),
+                provenance: Provenance::UvConstraint,
+            },
+        );
+
+        set.replace_learned_workspace_facts(relearned);
+
+        assert_eq!(
+            set.constraints,
+            vec![
+                "torch==2.5.1".to_string(),
+                "numpy==1.26.0".to_string(),
+                "protobuf==5.29.3".to_string(),
+            ],
+        );
+        assert_eq!(
+            set.auto_route_constraint_indices,
+            BTreeSet::from([1]),
+            "the auto-route index must follow its line, not its old position",
+        );
+        assert_eq!(
+            set.constraints[*set.auto_route_constraint_indices.first().unwrap()],
+            "numpy==1.26.0",
+            "and it must still name the same line",
+        );
+        assert_eq!(set.provenance["torch"].source, "workspace-solved");
+        assert_eq!(set.provenance["protobuf"].conda_version, "5.29.3");
     }
 }
 
