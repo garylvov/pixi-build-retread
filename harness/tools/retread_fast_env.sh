@@ -146,7 +146,30 @@ retread_fast_env () {
   # time, so two injection-ON runs with differently warm stores can still share
   # a decision key. It cannot cause ON/OFF confusion -- the gate is in the key --
   # but it means an injection-ON verdict is a function of store warmth.
-  export RETREAD_WHEEL_STORE=$root/wheels
+  # DISABLED 2026-09-03 07:30 -- the shared store is a self-poisoning
+  # writer/reader pair and this export put it in EVERY harness.
+  #   writer: `wheel::acquire_wheel_store_fill_lock` creates a zero-byte
+  #           `.<wheel>.whl.retread-fill-v1.lock` in `<sha256>/` BEFORE the
+  #           wheel exists, so a lock-without-wheel is the normal in-flight
+  #           state -- and a crash or a slow fill leaves it there.
+  #   reader: the PyPI index chain opens the store path and treats ENOENT as
+  #           "the failure was not a package miss", so it ABORTS the whole
+  #           chain instead of falling through and re-fetching.
+  # Measured 2026-09-03: 6 abandoned entries from a job that died at 01:43-01:44
+  # killed jobs 5685024 and BOTH arms of bisect 5686431 hours later; job 5688724
+  # then died on an entry whose lock it had created itself 8 minutes earlier,
+  # with the store growing 198 -> 428 entries mid-run. A job can poison itself.
+  # Reclaiming the debris (tools/wheel_store_reclaim.sh) does not fix it,
+  # because it is produced continuously while lanes run.
+  #
+  # RE-ENABLE AFTER p6i: the fill must be temp+rename with the placeholder
+  # never openable as a wheel, and the reader must treat a fill-lock/partial
+  # entry as a MISS and wait or fall through -- never abort the index chain.
+  # Until then, a harness that wants index warmth sets a JOB-SCOPED store
+  # itself (see p6h-proof2), which cannot be poisoned by another lane.
+  # The measured prize this gives up, for when it comes back: index authority
+  # 222/411 = 54% with a warm store against 5/317 without (LANE-C-WARM-LOG 9.4).
+  # export RETREAD_WHEEL_STORE=$root/wheels
 
   # Measured as no help (805.0s -> 828.2s route-probe union). Opt-in only.
   if [ "${RETREAD_FAST_ENV_PARALLEL_PROBES:-0}" = 1 ]; then

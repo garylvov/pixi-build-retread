@@ -17,7 +17,7 @@
 #      <root>/wheels/retread/wheels and coverage would go back to ~2 %.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
-SRC=${1:-/oscar/data/stellex/glvov/agrescap/worktrees/merge-4-12-c/src/courier.rs}
+SRC=${1:-/oscar/data/stellex/glvov/retread-integration-4-12/src/courier.rs}
 # retread_fast_env allowlists its cache root, so the guard must run under a
 # real subdirectory of that root rather than /tmp.
 W=$(mktemp -d /oscar/data/stellex/glvov/agrescap/cache/retread-guard.XXXXXX)
@@ -27,6 +27,36 @@ trap 'rm -rf "$W"' EXIT
 FAIL=0
 say() { printf '%s\n' "$*"; }
 bad() { say "  FAIL  $*"; FAIL=1; }
+
+# --- which contract is in force? ---------------------------------------------
+# The export was DISABLED on 2026-09-03 pending p6i (the store is a
+# self-poisoning writer/reader pair). While it is disabled this guard asserts
+# that it is disabled ON PURPOSE and that the note says what has to land before
+# it comes back -- a guard that simply cannot pass would be a defect, and so
+# would a disable that quietly becomes permanent.
+if grep -qE '^[[:space:]]*export RETREAD_WHEEL_STORE=' "$HERE/retread_fast_env.sh"; then
+  MODE=enabled
+else
+  MODE=disabled
+fi
+say "wheel-store export MODE=$MODE"
+
+if [ "$MODE" = disabled ]; then
+  grep -qE '^[[:space:]]*#[[:space:]]*export RETREAD_WHEEL_STORE=\$root/wheels' "$HERE/retread_fast_env.sh" \
+    || bad "the export must remain present-but-commented, so re-enabling is one character"
+  grep -q 'RE-ENABLE AFTER p6i' "$HERE/retread_fast_env.sh" \
+    || bad "a disabled export must name what has to land before it returns (p6i)"
+  OUT=$(
+    export RETREAD_PERSIST_CACHE_ROOT="$ROOT/persistd"
+    unset RETREAD_WHEEL_STORE
+    # shellcheck disable=SC1090
+    . "$HERE/retread_fast_env.sh" >/dev/null 2>&1
+    retread_fast_env "$W/ws" >/dev/null 2>&1
+    printf '%s\n' "${RETREAD_WHEEL_STORE:-<UNSET>}"
+  )
+  [ "$OUT" = "<UNSET>" ] || bad "with the export disabled, sourcing must leave RETREAD_WHEEL_STORE unset, got [$OUT]"
+  say "  PASS  the export is disabled on purpose and the note names p6i"
+else
 
 # --- half 1: the WRITER -------------------------------------------------------
 OUT=$(
@@ -51,6 +81,7 @@ EXPORTED=$(
   env | grep -c '^RETREAD_WHEEL_STORE='
 )
 [ "$EXPORTED" = 1 ] || bad "RETREAD_WHEEL_STORE must reach a CHILD's environment (env| grep = $EXPORTED)"
+fi
 
 # --- half 2: the READER -------------------------------------------------------
 [ -f "$SRC" ] || { say "  SKIP  reader half: $SRC not readable"; [ "$FAIL" = 0 ] && exit 0 || exit 1; }
