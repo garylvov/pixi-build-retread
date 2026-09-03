@@ -13,6 +13,14 @@ use crate::relax::{CondaName, CondaTarget, NameMap, PypiKey};
 
 pub(crate) const HERMETIC_BUILDS_ENV: &str = "RETREAD_HERMETIC_BUILDS";
 
+/// Legacy env override for the Lane C master switch, and the manifest key
+/// that supersedes it.
+pub(crate) const AUTO_IMPORTS_ENV: &str = "RETREAD_AUTO_IMPORTS";
+pub(crate) const AUTO_IMPORTS_KEY: &str = "retread-auto-imports";
+/// Legacy env override for experimental probe fan-out, and its manifest key.
+pub(crate) const PARALLEL_PROBES_ENV: &str = "RETREAD_PARALLEL_PROBES";
+pub(crate) const PARALLEL_PROBES_KEY: &str = "retread-parallel-probes";
+
 fn deserialize_name_map<'de, D>(deserializer: D) -> std::result::Result<NameMap, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -168,6 +176,36 @@ pub struct RetreadConfig {
     /// PyPI name -> conda match-spec (e.g. `"*"`, `">=2.7"`).
     #[serde(default, rename = "retread-overrides", alias = "overrides")]
     pub overrides: BTreeMap<String, String>,
+
+    /// Lane C master switch: inject import-scan-detected roots into the uv
+    /// resolve, instead of only LOGGING them as a dry run.
+    ///
+    /// `None` (the key absent) is OFF, which is what makes merging Lane C
+    /// change no existing lock. The legacy `RETREAD_AUTO_IMPORTS` env var is
+    /// still read and still WINS when set to a recognised spelling — see
+    /// [`effective_gate_flag`] — so harnesses that export it keep working.
+    ///
+    /// ```toml
+    /// [build.config]
+    /// retread-auto-imports = true
+    /// ```
+    #[serde(default, rename = "retread-auto-imports", alias = "auto-imports")]
+    pub auto_imports: Option<bool>,
+
+    /// Experimental: run the conda co-solve's resolvo probes on a thread pool
+    /// instead of serially.
+    ///
+    /// `None` (the key absent) is OFF. v4.10.46 enabled this fan-out by
+    /// default and some pack resolutions then ended in a silent process exit
+    /// with several full solver states live, so it is opt-in. The legacy
+    /// `RETREAD_PARALLEL_PROBES` env var still wins when set.
+    ///
+    /// ```toml
+    /// [build.config]
+    /// retread-parallel-probes = true
+    /// ```
+    #[serde(default, rename = "retread-parallel-probes", alias = "parallel-probes")]
+    pub parallel_probes: Option<bool>,
 
     /// PyPI -> conda name mapping overrides on top of the built-in identity
     /// mapping. Use for the common drift cases (`opencv-python-headless` ->
@@ -819,6 +857,113 @@ pub(crate) fn effective_hermetic_builds(configured: bool, env_value: Option<&str
         }
     };
     configured && env_enabled
+}
+
+/// Where a legacy-overridable boolean gate's value came from. Reported on
+/// every decision so a run's log names the deciding source rather than
+/// leaving an operator to guess between a manifest key and a stale export.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GateFlagSource {
+    /// The legacy environment variable was set to a recognised spelling.
+    Env,
+    /// The `[build.config]` manifest key decided it.
+    ManifestKey,
+    /// Neither source spoke; the gate's compiled-in default stands.
+    Default,
+}
+
+impl GateFlagSource {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Env => "env",
+            Self::ManifestKey => "manifest-key",
+            Self::Default => "default",
+        }
+    }
+}
+
+/// Accepted spellings for a boolean gate's legacy environment override.
+///
+/// Historically these gates compared against the exact string `1`, which made
+/// `RETREAD_AUTO_IMPORTS=true` a SILENT no-op: the operator saw an export, the
+/// backend saw OFF, and nothing said so. Case-insensitive `1|true|yes` (and
+/// their negatives) are accepted now, surrounding whitespace trimmed, and
+/// anything else is refused LOUDLY instead of being coerced to a default.
+pub(crate) const GATE_FLAG_TRUTHY: [&str; 3] = ["1", "true", "yes"];
+pub(crate) const GATE_FLAG_FALSEY: [&str; 3] = ["0", "false", "no"];
+
+fn parse_gate_flag(value: &str) -> Option<bool> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if GATE_FLAG_TRUTHY.contains(&normalized.as_str()) {
+        Some(true)
+    } else if GATE_FLAG_FALSEY.contains(&normalized.as_str()) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Resolve a boolean gate from its manifest key and its legacy environment
+/// override, without reading process state (the caller reads the variable, so
+/// this stays a pure function a test can drive).
+///
+/// Precedence, and the operator rule behind it: config keys are the intended
+/// control surface ("args and config over env vars"), but a harness that
+/// already exports the variable must keep working unchanged, so **a
+/// recognised env value WINS over the manifest key**. An UNRECOGNISED env
+/// value decides nothing: it warns naming the accepted spellings and falls
+/// through to the key, because coercing a typo into either answer is exactly
+/// the silent failure this change exists to remove.
+pub(crate) fn effective_gate_flag(
+    variable: &str,
+    key: &str,
+    configured: Option<bool>,
+    env_value: Option<&str>,
+) -> (bool, GateFlagSource) {
+    let from_env = match env_value {
+        None => None,
+        Some(raw) => match parse_gate_flag(raw) {
+            Some(enabled) => {
+                let trimmed = raw.trim();
+                if trimmed != "1" && trimmed != "0" {
+                    tracing::warn!(
+                        variable,
+                        value = raw,
+                        accepted_as = enabled,
+                        truthy = ?GATE_FLAG_TRUTHY,
+                        falsey = ?GATE_FLAG_FALSEY,
+                        "legacy env override accepted a non-`1` spelling; before this \
+                         change that spelling was a SILENT no-op. Prefer the manifest key.",
+                    );
+                }
+                Some(enabled)
+            }
+            None => {
+                tracing::warn!(
+                    variable,
+                    value = raw,
+                    truthy = ?GATE_FLAG_TRUTHY,
+                    falsey = ?GATE_FLAG_FALSEY,
+                    "unrecognised legacy env override; it decides nothing -- falling \
+                     through to the manifest key",
+                );
+                None
+            }
+        },
+    };
+    let (enabled, source) = match (from_env, configured) {
+        (Some(enabled), _) => (enabled, GateFlagSource::Env),
+        (None, Some(enabled)) => (enabled, GateFlagSource::ManifestKey),
+        (None, None) => (false, GateFlagSource::Default),
+    };
+    tracing::debug!(
+        key,
+        variable,
+        enabled,
+        source = source.as_str(),
+        "gate flag decided",
+    );
+    (enabled, source)
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]

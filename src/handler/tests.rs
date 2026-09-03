@@ -732,6 +732,8 @@ fn pythons_for_rejects_bare_major_variant() {
         deps_from: Default::default(),
         ledger_overrides: Default::default(),
         pack_manifest_path: None,
+        auto_imports: None,
+        parallel_probes: None,
     };
     let result = pythons_for(&cfg, Some(&variants));
     assert_eq!(
@@ -785,6 +787,8 @@ fn pythons_for_accepts_dotted_variant() {
         deps_from: Default::default(),
         ledger_overrides: Default::default(),
         pack_manifest_path: None,
+        auto_imports: None,
+        parallel_probes: None,
     };
     let result = pythons_for(&cfg, Some(&variants));
     assert_eq!(result, vec!["3.11".to_string()]);
@@ -838,6 +842,8 @@ fn pythons_for_filters_bare_major_keeps_dotted() {
         deps_from: Default::default(),
         ledger_overrides: Default::default(),
         pack_manifest_path: None,
+        auto_imports: None,
+        parallel_probes: None,
     };
     let result = pythons_for(&cfg, Some(&variants));
     assert_eq!(result, vec!["3.11".to_string(), "3.12".to_string()]);
@@ -3610,6 +3616,8 @@ fn cfg() -> RetreadConfig {
         deps_from: Default::default(),
         ledger_overrides: Default::default(),
         pack_manifest_path: None,
+        auto_imports: None,
+        parallel_probes: None,
     }
 }
 
@@ -8089,60 +8097,96 @@ fn resolve_backoff_fires_once_and_suppresses_every_bundle() {
     assert!(gate(true, &one), "a per-bundle suppression does not consume the resolve retry");
 }
 
-/// The Lane C master switch is an ENV BINDING, and until now no test bound it.
-/// The sibling gate tests above re-declare the predicate as a LOCAL CLOSURE,
-/// which pins the shape of the gate but never the variable it reads: renaming
-/// `RETREAD_AUTO_IMPORTS`, or loosening the `== "1"` comparison into a truthy
-/// parse, leaves every one of them green while silently changing which locks a
-/// merge of this code can move. This test calls the REAL
-/// `auto_imports_injection_enabled`, so the var's NAME and the EXACTNESS of the
-/// match are both load-bearing here.
+/// The Lane C master switch has TWO sources now — the `retread-auto-imports`
+/// manifest key and the legacy `RETREAD_AUTO_IMPORTS` env var — and this test
+/// binds both through the REAL `auto_imports_injection_enabled`, so the key's
+/// NAME, the var's NAME and the precedence between them are all load-bearing
+/// here. The sibling gate tests re-declare the predicate as a local closure,
+/// which pins the shape of the gate but never the sources it reads.
 ///
-/// The negative cases are the ones that matter. `"true"` and `"01"` are what a
-/// person types when they assume a truthy parse; `" 1"` is what a shell here-doc
-/// or a trailing-space export produces. All three must read as OFF, because the
-/// documented contract is "OFF unless `RETREAD_AUTO_IMPORTS=1` exactly" and a
-/// half-on switch would inject roots into a lock nobody opted in for.
+/// Four rows, each of which fails if the wiring is wrong:
+///   * key on  + env unset -> ENABLED  (fails if the key is not read at all)
+///   * key absent + env unset -> DISABLED (merging Lane C moves no lock)
+///   * env `true` + key absent -> ENABLED, with the WARN naming the spelling
+///     (this is the exact-`1` silent no-op that motivated the change)
+///   * key off + env `1` -> ENABLED, because the legacy override wins
 ///
 /// Serialised on the house `TEST_ENV_MUTEX` (handler/mod.rs) like every other
 /// env-mutating test in this file, and the prior value is restored on exit so a
 /// developer running with the switch on in their own shell does not inherit a
 /// clobbered environment.
 #[test]
-fn auto_imports_env_var_binds_the_master_switch() {
+fn auto_imports_switch_reads_the_config_key_with_env_as_legacy_override() {
     let _env_guard = super::TEST_ENV_MUTEX.lock().unwrap();
     let prior = std::env::var_os("RETREAD_AUTO_IMPORTS");
+
+    let with_key = |value: Option<bool>| {
+        let mut c = cfg();
+        c.auto_imports = value;
+        c
+    };
 
     // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
     unsafe { std::env::remove_var("RETREAD_AUTO_IMPORTS") };
     assert!(
-        !auto_imports_injection_enabled(),
-        "unset must leave Lane C OFF -- that is what makes merging this code \
-         change no existing lock"
+        auto_imports_injection_enabled(&with_key(Some(true))),
+        "`retread-auto-imports = true` alone must turn Lane C ON -- the whole \
+         point of the key is that no env var is needed"
+    );
+    assert!(
+        !auto_imports_injection_enabled(&with_key(None)),
+        "key absent and var unset must leave Lane C OFF -- that is what makes \
+         merging this code change no existing lock"
+    );
+    assert!(!auto_imports_injection_enabled(&with_key(Some(false))));
+
+    // `true` used to be a SILENT no-op. Now it enables, and it says so.
+    // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
+    unsafe { std::env::set_var("RETREAD_AUTO_IMPORTS", "true") };
+    let (enabled, warnings) =
+        capture_warn_logs(|| auto_imports_injection_enabled(&with_key(None)));
+    assert!(enabled, "RETREAD_AUTO_IMPORTS=true must enable injection");
+    assert!(
+        warnings.contains("RETREAD_AUTO_IMPORTS") && warnings.contains("true"),
+        "the non-`1` spelling must be reported, naming variable and value; got: {warnings:?}"
     );
 
+    // The legacy override wins over an explicit key.
     // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
     unsafe { std::env::set_var("RETREAD_AUTO_IMPORTS", "1") };
     assert!(
-        auto_imports_injection_enabled(),
-        "exactly \"1\" is the documented opt-in"
+        auto_imports_injection_enabled(&with_key(Some(false))),
+        "an exported RETREAD_AUTO_IMPORTS=1 must win over `retread-auto-imports = false` \
+         so existing harnesses keep working unchanged"
     );
-
-    // Everything else is OFF: an exact match, never a truthy parse.
-    for off in ["true", "0", "01", " 1", ""] {
-        // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
-        unsafe { std::env::set_var("RETREAD_AUTO_IMPORTS", off) };
-        assert!(
-            !auto_imports_injection_enabled(),
-            "RETREAD_AUTO_IMPORTS={off:?} must NOT enable injection"
-        );
-    }
+    // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
+    unsafe { std::env::set_var("RETREAD_AUTO_IMPORTS", "0") };
+    assert!(
+        !auto_imports_injection_enabled(&with_key(Some(true))),
+        "and it must win in the OFF direction too"
+    );
 
     // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
     match prior {
         Some(value) => unsafe { std::env::set_var("RETREAD_AUTO_IMPORTS", value) },
         None => unsafe { std::env::remove_var("RETREAD_AUTO_IMPORTS") },
     }
+}
+
+fn capture_warn_logs<T>(body: impl FnOnce() -> T) -> (T, String) {
+    let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer({
+            let logs = std::sync::Arc::clone(&logs);
+            move || SharedLogWriter(std::sync::Arc::clone(&logs))
+        })
+        .finish();
+    let value = tracing::subscriber::with_default(subscriber, body);
+    let text = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    (value, text)
 }
 
 /// The back-off's re-resolve must differ from the failed attempt by EXACTLY
@@ -10439,6 +10483,7 @@ fn store_key_params() -> pixi_build_types::procedures::conda_outputs::CondaOutpu
 fn store_key_for(
     workspace_dir: &std::path::Path,
     source_dir: &std::path::Path,
+    effective: &RetreadConfig,
 ) -> String {
     let target = ResolutionTarget::for_subdir("3.11", "linux-64");
     // Production's workspace solve fingerprint carries ABSOLUTE paths:
@@ -10459,6 +10504,7 @@ fn store_key_for(
         &solve_fingerprint,
         Some(workspace_dir),
         source_dir,
+        effective,
     )
 }
 
@@ -10474,8 +10520,8 @@ fn built_output_store_key_is_workspace_path_and_mtime_free() {
     std::thread::sleep(std::time::Duration::from_millis(20));
     let (ws_b, pack_b) = stage_store_key_workspace("b", WS_MANIFEST, PACK_MANIFEST, "packs/one");
 
-    let key_a = store_key_for(&ws_a, &pack_a);
-    let key_b = store_key_for(&ws_b, &pack_b);
+    let key_a = store_key_for(&ws_a, &pack_a, &cfg());
+    let key_b = store_key_for(&ws_b, &pack_b, &cfg());
     assert_eq!(
         key_a, key_b,
         "two workspaces at different paths holding byte-identical manifests must produce ONE store key"
@@ -10513,7 +10559,7 @@ fn built_output_store_key_is_workspace_path_and_mtime_free() {
     );
     assert_ne!(
         key_a,
-        store_key_for(&ws_c, &pack_c),
+        store_key_for(&ws_c, &pack_c, &cfg()),
         "a changed workspace manifest must change the key"
     );
     let (ws_d, pack_d) = stage_store_key_workspace(
@@ -10524,14 +10570,14 @@ fn built_output_store_key_is_workspace_path_and_mtime_free() {
     );
     assert_ne!(
         key_a,
-        store_key_for(&ws_d, &pack_d),
+        store_key_for(&ws_d, &pack_d, &cfg()),
         "a changed pack manifest must change the key"
     );
     let (ws_e, pack_e) =
         stage_store_key_workspace("e", WS_MANIFEST, PACK_MANIFEST, "packs/two");
     assert_ne!(
         key_a,
-        store_key_for(&ws_e, &pack_e),
+        store_key_for(&ws_e, &pack_e, &cfg()),
         "two sibling packs in one workspace must not share a store key"
     );
 
@@ -10569,7 +10615,7 @@ async fn built_output_store_hit_serves_the_same_result_a_cold_compute_produced()
 
     // Job 1: a cold compute in workspace A publishes its result.
     let (ws_a, pack_a) = stage_store_key_workspace("hit-a", WS_MANIFEST, PACK_MANIFEST, "packs/one");
-    let key_a = store_key_for(&ws_a, &pack_a);
+    let key_a = store_key_for(&ws_a, &pack_a, &cfg());
     let result = CondaOutputsResult {
         outputs: Default::default(),
         input_globs: Default::default(),
@@ -10586,7 +10632,7 @@ async fn built_output_store_hit_serves_the_same_result_a_cold_compute_produced()
     // a full cold relock today. It must hit, and adopt the identical result.
     std::thread::sleep(std::time::Duration::from_millis(20));
     let (ws_b, pack_b) = stage_store_key_workspace("hit-b", WS_MANIFEST, PACK_MANIFEST, "packs/one");
-    let key_b = store_key_for(&ws_b, &pack_b);
+    let key_b = store_key_for(&ws_b, &pack_b, &cfg());
     let (lookup, bytes) = store.get(&key_b);
     assert_eq!(
         lookup,
@@ -10665,7 +10711,12 @@ fn p6c_persistent_decision_keys_separate_the_auto_imports_gate() {
         ("channel-priority", vec!["Strict".to_string()]),
         ("workspace-deps", vec!["numpy=>=1.26,<2".to_string()]),
     ];
-    let validity = || verdict_cache_validity_key(&channels, "3.12", "linux-64", &policy_fields);
+    // The config key is absent here on purpose: this guard drives the gate
+    // through the LEGACY env var, which `config::effective_gate_flag` still
+    // lets win, so it exercises the same production readers p6e rewired.
+    let gate_config = cfg();
+    let validity =
+        || verdict_cache_validity_key(&channels, "3.12", "linux-64", &policy_fields, &gate_config);
 
     // Everything is measured under the lock and BEFORE any assert, so a
     // failure cannot leave a developer's shell inheriting a clobbered switch.
@@ -10674,17 +10725,31 @@ fn p6c_persistent_decision_keys_separate_the_auto_imports_gate() {
 
     // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
     unsafe { std::env::remove_var("RETREAD_AUTO_IMPORTS") };
-    let store_off_first = store_key_for(&ws, &pack);
+    let store_off_first = store_key_for(&ws, &pack, &gate_config);
     let validity_off_first = validity();
-    let policy_off = resolution_policy_fingerprint();
-    let store_off_again = store_key_for(&ws, &pack);
+    let policy_off = resolution_policy_fingerprint(&gate_config);
+    let store_off_again = store_key_for(&ws, &pack, &gate_config);
     let validity_off_again = validity();
 
     // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
     unsafe { std::env::set_var("RETREAD_AUTO_IMPORTS", "1") };
-    let store_on = store_key_for(&ws, &pack);
+    let store_on = store_key_for(&ws, &pack, &gate_config);
     let validity_on = validity();
-    let policy_on = resolution_policy_fingerprint();
+    let policy_on = resolution_policy_fingerprint(&gate_config);
+
+    // (iii) THE CONFIG KEY, with the env var absent. p6e made
+    // `retread-auto-imports` the declared switch and left the env var as a
+    // legacy override; p6c's fingerprint must read the SAME effective gate, or
+    // a workspace that turns injection on by config alone goes on sharing the
+    // OFF arm's addresses -- silently, which is the whole defect p6c closed.
+    // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
+    unsafe { std::env::remove_var("RETREAD_AUTO_IMPORTS") };
+    let mut key_config = cfg();
+    key_config.auto_imports = Some(true);
+    let store_key_on = store_key_for(&ws, &pack, &key_config);
+    let validity_key_on =
+        verdict_cache_validity_key(&channels, "3.12", "linux-64", &policy_fields, &key_config);
+    let policy_key_on = resolution_policy_fingerprint(&key_config);
 
     // SAFETY: serialised by TEST_ENV_MUTEX; no concurrent env access.
     match prior {
@@ -10724,4 +10789,23 @@ fn p6c_persistent_decision_keys_separate_the_auto_imports_gate() {
         "gate-ON fingerprint must name the gate and carry the policy digest, got {policy_on:?}"
     );
     assert_ne!(policy_off, policy_on);
+
+    // (iii) the config key alone -- no env var anywhere -- must move both keys,
+    // and must land on the SAME arm the env var reaches. If the effective
+    // config stops being threaded into resolution_policy_fingerprint, these
+    // three are the assertions that fail.
+    assert_eq!(
+        policy_key_on, policy_on,
+        "`retread-auto-imports = true` and RETREAD_AUTO_IMPORTS=1 are the same \
+         gate state, so they must produce the same resolution-policy fingerprint"
+    );
+    assert_ne!(
+        store_off_first, store_key_on,
+        "the config key alone must separate the built-output store key -- if it \
+         does not, a config-gated ON run adopts an OFF run's stored outputs"
+    );
+    assert_ne!(
+        validity_off_first, validity_key_on,
+        "the config key alone must separate the route-probe validity key"
+    );
 }

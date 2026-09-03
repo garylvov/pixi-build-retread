@@ -1542,6 +1542,8 @@ mod tests {
             deps_from: Default::default(),
             ledger_overrides: Default::default(),
             pack_manifest_path: None,
+            auto_imports: None,
+            parallel_probes: None,
         }
     }
 

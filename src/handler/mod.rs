@@ -327,6 +327,7 @@ fn built_output_store_key_for_outputs(
     workspace_solve_fingerprint: &str,
     workspace_dir: Option<&std::path::Path>,
     source_dir: &std::path::Path,
+    effective: &RetreadConfig,
 ) -> String {
     use sha2::{Digest, Sha256};
 
@@ -388,7 +389,7 @@ fn built_output_store_key_for_outputs(
     // injected `outputs.json` at exactly the address a later injection-OFF run
     // computes, and the OFF run adopts it silently. See
     // [`resolution_policy_fingerprint`].
-    let resolution_policy = resolution_policy_fingerprint();
+    let resolution_policy = resolution_policy_fingerprint(effective);
 
     let mut hasher = Sha256::new();
     for part in [
@@ -4817,6 +4818,7 @@ impl Handler {
                 &cache_workspace_solve_fingerprint,
                 pre_key_workspace_dir.as_deref(),
                 &pre_key_source_dir,
+                &pre_key_config,
             )
         });
         let memory_cached = {
@@ -5112,7 +5114,7 @@ impl Handler {
                 match resolve_attempt {
                     Ok(resolved) => resolved,
                     Err(error)
-                        if auto_imports_injection_enabled()
+                        if auto_imports_injection_enabled(&config)
                             && !abi_backoff_suppressed
                                 .contains(AUTO_IMPORTS_SUPPRESS_ALL) =>
                     {
@@ -8424,9 +8426,13 @@ fn verdict_cache_validity_key(
     python: &str,
     subdir: &str,
     policy_fields: &[(&str, Vec<String>)],
+    effective: &RetreadConfig,
 ) -> String {
     let mut fields: Vec<(&str, Vec<String>)> = policy_fields.to_vec();
-    fields.push(("resolution-policy", vec![resolution_policy_fingerprint()]));
+    fields.push((
+        "resolution-policy",
+        vec![resolution_policy_fingerprint(effective)],
+    ));
     crate::route_probe_cache::validity_key(channels, python, subdir, &fields)
 }
 
@@ -8602,7 +8608,12 @@ impl CondaCoSolveContext {
     /// (`crate::conda_solve::reachable_universe_digest_shared`), so a
     /// re-fetched-but-unchanged repodata document, or an upload of a
     /// package this question cannot reach, no longer discards the file.
-    fn with_verdict_cache(mut self, cache_dir: &Path, subdir: &str) -> Self {
+    fn with_verdict_cache(
+        mut self,
+        cache_dir: &Path,
+        subdir: &str,
+        effective: &RetreadConfig,
+    ) -> Self {
         let channels: Vec<String> = self.channels.iter().map(|c| c.to_string()).collect();
         let policy_fields: Vec<(&str, Vec<String>)> = vec![
             (
@@ -8643,7 +8654,8 @@ impl CondaCoSolveContext {
                     .collect(),
             ),
         ];
-        let key = verdict_cache_validity_key(&channels, &self.python, subdir, &policy_fields);
+        let key =
+            verdict_cache_validity_key(&channels, &self.python, subdir, &policy_fields, effective);
         let path = crate::route_probe_cache::cache_path(
             cache_dir,
             self.bundle.as_str(),
@@ -9952,8 +9964,8 @@ async fn uv_group_closure(
         &effective.name_map,
     )
     .with_probe_metrics(probe_metrics)
-    .with_verdict_cache(cache_dir, target.conda_subdir());
-    let conda_co_solve = if crate::thread_budget::parallel_probes_enabled() {
+    .with_verdict_cache(cache_dir, target.conda_subdir(), effective);
+    let conda_co_solve = if crate::thread_budget::parallel_probes_enabled(effective) {
         const PROBE_POOL_CAP: usize = 4;
         let requested_probe_threads = std::num::NonZeroUsize::new(
             crate::concurrency::max_concurrent_builds().clamp(1, PROBE_POOL_CAP),
@@ -9962,11 +9974,15 @@ async fn uv_group_closure(
         let probe_pool = crate::thread_budget::acquire_probe_pool(requested_probe_threads).await;
         tracing::warn!(
             threads = probe_pool.threads().get(),
-            "experimental parallel probe solves enabled by RETREAD_PARALLEL_PROBES=1",
+            "experimental parallel probe solves enabled by \
+             `retread-parallel-probes` or RETREAD_PARALLEL_PROBES",
         );
         conda_co_solve.with_probe_pool(probe_pool)
     } else {
-        tracing::debug!("parallel probe solves disabled; set RETREAD_PARALLEL_PROBES=1 to opt in");
+        tracing::debug!(
+            "parallel probe solves disabled; set `retread-parallel-probes = true` under \
+             [build.config] (or RETREAD_PARALLEL_PROBES=1) to opt in"
+        );
         conda_co_solve
     };
 
@@ -13913,12 +13929,27 @@ fn checkout_root_for_entry(
 /// The cost of that choice is real -- a vendored `six.py` in the tree would
 /// suppress a genuine `six` requirement -- and is accepted only because this
 /// is log-only.
-/// Lane C master switch. OFF unless `RETREAD_AUTO_IMPORTS=1` exactly, so a
-/// merge of this code changes no existing lock: with the var unset the scan
-/// still runs and still logs (the dry run is unchanged), but every detected
-/// requirement is reported as `injected=false`.
-fn auto_imports_injection_enabled() -> bool {
-    std::env::var("RETREAD_AUTO_IMPORTS").map(|v| v == "1").unwrap_or(false)
+/// Lane C master switch. OFF unless the workspace sets
+/// `retread-auto-imports = true` under `[build.config]`, or the legacy
+/// `RETREAD_AUTO_IMPORTS` env var is exported — so a merge of this code
+/// changes no existing lock: with neither source speaking, the scan still runs
+/// and still logs (the dry run is unchanged), but every detected requirement
+/// is reported as `injected=false`.
+///
+/// The env var is a LEGACY OVERRIDE and WINS when set to a recognised
+/// spelling. It used to require the exact string `1`, which made
+/// `RETREAD_AUTO_IMPORTS=true` a silent no-op; `crate::config::
+/// effective_gate_flag` now accepts `1|true|yes` case-insensitively and warns
+/// on the non-`1` spellings, and every decision logs the source that made it.
+fn auto_imports_injection_enabled(effective: &RetreadConfig) -> bool {
+    let env_value = std::env::var(crate::config::AUTO_IMPORTS_ENV).ok();
+    crate::config::effective_gate_flag(
+        crate::config::AUTO_IMPORTS_ENV,
+        crate::config::AUTO_IMPORTS_KEY,
+        effective.auto_imports,
+        env_value.as_deref(),
+    )
+    .0
 }
 
 /// Revision tag for the resolve-time auto-imports BACK-OFF policy: what
@@ -13997,8 +14028,8 @@ const AUTO_IMPORTS_VERDICT_POLICY: &str = "v1-own-sibling-abi-conda-curated-inde
 /// The value is a short, stable, human-readable string on purpose: it lands in
 /// the built-output key's hash input and in a route-probe policy field, and
 /// both are debugged by reading them.
-fn resolution_policy_fingerprint() -> String {
-    if !auto_imports_injection_enabled() {
+fn resolution_policy_fingerprint(effective: &RetreadConfig) -> String {
+    if !auto_imports_injection_enabled(effective) {
         return "auto-imports=off".to_string();
     }
     use sha2::{Digest, Sha256};
@@ -14542,7 +14573,7 @@ async fn auto_imports_dry_run(
         index,
     );
     drop(checkout_lease);
-    let inject = auto_imports_injection_enabled();
+    let inject = auto_imports_injection_enabled(effective);
     let mut conditional_count = 0usize;
     let mut skipped_count = 0usize;
     // Subset of `skipped_count`: rows refused only because no source could
