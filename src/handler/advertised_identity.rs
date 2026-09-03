@@ -27,7 +27,21 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped whenever the recorded field set changes meaning. A record with a
 /// different schema is ignored, which degrades to today's recompute.
-pub(crate) const SCHEMA: u32 = 2;
+pub(crate) const SCHEMA: u32 = 3;
+
+/// Short digest of the RELAX RULE in force, folded into every record address.
+///
+/// `config.relax` is what decides which metadata relaxations the advertising
+/// pass applied, and it is already part of the build string's own inputs hash
+/// (`RetreadLock::compute_inputs_hash_for_target` takes `format!("{:?}",
+/// config.relax)`). Folding the same spelling here keeps the record's address
+/// a function of the same rule, so a record written under one relax policy can
+/// never answer a request resolved under another.
+pub(crate) fn relax_digest(config: &crate::config::RetreadConfig) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("{:?}", config.relax).as_bytes());
+    digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
+}
 
 /// The resolution inputs one advertised output identity was computed from.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,16 +99,34 @@ impl AdvertisedIdentityRecord {
 /// The build string is already content-addressed over the resolution inputs;
 /// the digest additionally separates packs (source dir), outputs (name) and
 /// subdirs so two packs can never collide on one file.
+///
+/// p6i: the digest also folds [`SCHEMA`] and the RELAX RULE
+/// ([`relax_digest`]). Without the schema, a record written by an older field
+/// set occupies the address a newer one computes and is only rejected after
+/// being read (`describes`), which costs a read and leaves the old file to be
+/// re-read forever. Without the relax rule, changing `retread-relax` -- which
+/// changes what the metadata pass ADVERTISED -- leaves the old record at the
+/// same address, and `describes` does not compare it, so a stale relaxation
+/// record is adopted as authoritative for what the package emits.
 pub(crate) fn record_path(
     cache_dir: &Path,
     source_dir: &Path,
     name: &str,
     subdir: &str,
     build: &str,
+    relax_digest: &str,
 ) -> PathBuf {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
-    for part in [source_dir.to_string_lossy().as_ref(), name, subdir, build] {
+    let schema = SCHEMA.to_string();
+    for part in [
+        schema.as_str(),
+        source_dir.to_string_lossy().as_ref(),
+        name,
+        subdir,
+        build,
+        relax_digest,
+    ] {
         hasher.update(part.as_bytes());
         hasher.update(b"\0");
     }
@@ -112,6 +144,7 @@ pub(crate) async fn write_record(
     cache_dir: &Path,
     source_dir: &Path,
     record: &AdvertisedIdentityRecord,
+    relax_digest: &str,
 ) {
     let path = record_path(
         cache_dir,
@@ -119,6 +152,7 @@ pub(crate) async fn write_record(
         &record.name,
         &record.subdir,
         &record.build,
+        relax_digest,
     );
     let Some(parent) = path.parent() else {
         return;
@@ -165,8 +199,9 @@ pub(crate) async fn load_record(
     build: &str,
     target_identity: &str,
     python_version: &str,
+    relax_digest: &str,
 ) -> Option<AdvertisedIdentityRecord> {
-    let path = record_path(cache_dir, source_dir, name, subdir, build);
+    let path = record_path(cache_dir, source_dir, name, subdir, build, relax_digest);
     let bytes = tokio::fs::read(&path).await.ok()?;
     let record: AdvertisedIdentityRecord = serde_json::from_slice(&bytes).ok()?;
     let record = record
@@ -269,6 +304,9 @@ pub(crate) fn workspace_fp_for_build(
 mod tests {
     use super::*;
 
+    /// Any stable relax digest: these tests are about the record, not the rule.
+    const TEST_RELAX: &str = "relax-test-digest";
+
     fn tempdir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "retread-advertised-identity-{label}-{}-{}",
@@ -311,7 +349,7 @@ mod tests {
         let cache = dir.join("cache");
         let source = dir.join("pack");
         let record = record();
-        write_record(&cache, &source, &record).await;
+        write_record(&cache, &source, &record, TEST_RELAX).await;
         let loaded = load_record(
             &cache,
             &source,
@@ -321,6 +359,7 @@ mod tests {
             &record.build,
             &record.target_identity,
             &record.python_version,
+            TEST_RELAX,
         )
         .await
         .expect("record must load");
@@ -349,7 +388,14 @@ mod tests {
 
         // The path must live under the cache root and carry no trace of
         // either phase's work directory...
-        let path = record_path(&cache, &source, &record.name, &record.subdir, &record.build);
+        let path = record_path(
+            &cache,
+            &source,
+            &record.name,
+            &record.subdir,
+            &record.build,
+            TEST_RELAX,
+        );
         assert!(
             path.starts_with(cache.join("retread-advertised-identity")),
             "{path:?}"
@@ -362,7 +408,7 @@ mod tests {
         // ...and a record the metadata phase wrote must load for the build
         // phase, which passes a different `work_directory` for the same
         // (source_dir, name, subdir, build).
-        write_record(&cache, &source, &record).await;
+        write_record(&cache, &source, &record, TEST_RELAX).await;
         let loaded = load_record(
             &cache,
             &source,
@@ -372,6 +418,7 @@ mod tests {
             &record.build,
             &record.target_identity,
             &record.python_version,
+            TEST_RELAX,
         )
         .await;
         assert_eq!(loaded.as_ref(), Some(&record));
@@ -389,6 +436,7 @@ mod tests {
                 &record.build,
                 &record.target_identity,
                 &record.python_version,
+                TEST_RELAX,
             )
             .await
             .is_none()
@@ -404,7 +452,7 @@ mod tests {
         let cache = dir.join("cache");
         let source = dir.join("pack");
         let record = record();
-        write_record(&cache, &source, &record).await;
+        write_record(&cache, &source, &record, TEST_RELAX).await;
         let loaded = load_record(
             &cache,
             &source,
@@ -414,6 +462,7 @@ mod tests {
             &record.build,
             &record.target_identity,
             &record.python_version,
+            TEST_RELAX,
         )
         .await;
         assert_eq!(loaded.as_ref(), Some(&record));
@@ -447,7 +496,7 @@ mod tests {
         let cache = dir.join("cache");
         let source = dir.join("pack");
         let record = record();
-        write_record(&cache, &source, &record).await;
+        write_record(&cache, &source, &record, TEST_RELAX).await;
         assert!(
             load_record(
                 &cache,
@@ -458,6 +507,7 @@ mod tests {
                 &record.build,
                 "linux-64-cuda-13-glibc-2-35",
                 &record.python_version,
+                TEST_RELAX,
             )
             .await
             .is_none()
@@ -472,6 +522,7 @@ mod tests {
                 &record.build,
                 &record.target_identity,
                 &record.python_version,
+                TEST_RELAX,
             )
             .await
             .is_none()
@@ -486,6 +537,7 @@ mod tests {
                 "py311_h0a4ba3c452_loose_0",
                 &record.target_identity,
                 &record.python_version,
+                TEST_RELAX,
             )
             .await
             .is_none()

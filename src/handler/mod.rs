@@ -5660,6 +5660,7 @@ impl Handler {
                                     .map(format_constraint_spec)
                                     .collect(),
                             },
+                            &advertised_identity::relax_digest(&config),
                         )
                         .await;
                     }
@@ -5973,6 +5974,7 @@ impl Handler {
                     build,
                     &target.resolution_identity(),
                     target.python_version(),
+                    &advertised_identity::relax_digest(&config),
                 )
                 .await
             }
@@ -6537,6 +6539,27 @@ impl Handler {
         let advertised_output = cold_emission_authority(advertised_identity_record.as_ref());
         let mut matching_bundles = Vec::new();
         let mut rejected_candidates: Vec<String> = Vec::new();
+        // p6i: candidates that agree with the advertisement on name, version
+        // and subdir and on the run dependencies, and disagree ONLY on the
+        // build string. That is not a stale relaxation record: the build
+        // string is a digest over the resolution INPUTS
+        // (`courier_inputs_hash_with_workspace_fp`), one of which -- the
+        // workspace fingerprint -- folds the on-disk locks of co-activated
+        // sibling packs, and another -- the advertised-identity record -- is
+        // simply ABSENT whenever the advertising `conda/outputs` was served
+        // from a shared cache in another process. Refusing here is what killed
+        // jobs 5691063 and 5698477 and what pixi's `build_dispatch.rs`
+        // converts into a panic. The recomputed candidate is the right
+        // content; it is emitted under the ADVERTISED build string (`build_one`
+        // already takes `params.output.build`), and the drift is announced
+        // loudly instead of being fatal.
+        let mut build_string_drift: Vec<(
+            usize,
+            Bundle,
+            RetreadConfig,
+            Vec<auto_bundle::WheelMetadataRelaxation>,
+            String,
+        )> = Vec::new();
         // Option D lock-parity recovery (docs/RETREAD_DETERMINISM_FIX_DESIGN.md):
         // retain the identity-matched-but-deps-drifted candidate so the failure
         // arm below can ask the committed lock whether it vouches for the
@@ -6581,7 +6604,9 @@ impl Handler {
                     bundle.conda_name
                 ))
             })?;
-            let identity_matches = output_matches_build_request(&candidate, &params.output);
+            let verdict = cold_candidate_verdict(&candidate, &params.output);
+            let identity_matches = verdict == ColdCandidateVerdict::IdentityMatches;
+            let build_string_only_drift = verdict == ColdCandidateVerdict::BuildStringDrift;
             let dependencies_match =
                 cold_dependencies_gate(advertised_output, &candidate, run_override.as_deref())
                     .map_err(|error| {
@@ -6593,6 +6618,15 @@ impl Handler {
             if identity_matches && dependencies_match {
                 matching_bundles.push((bundle_index, bundle, effective, emission_relaxations));
             } else {
+                if build_string_only_drift && dependencies_match {
+                    build_string_drift.push((
+                        bundle_index,
+                        bundle.clone(),
+                        effective.clone(),
+                        emission_relaxations.clone(),
+                        candidate.metadata.build.clone(),
+                    ));
+                }
                 // Record why each candidate was rejected. Without this the
                 // caller only ever sees "0 exact matches", which names no
                 // delta and leaves no way to tell a genuinely stale record
@@ -6624,11 +6658,18 @@ impl Handler {
                                 &bundle
                             )
                         )
+                    } else if build_string_only_drift {
+                        format!(
+                            "build string differs only (advertised `{}`, recomputed `{}`); \
+                             name, version and subdir agree",
+                            params.output.build.as_deref().unwrap_or(""),
+                            candidate.metadata.build,
+                        )
                     } else {
                         "identity differs".to_string()
                     },
                 ));
-                if identity_matches {
+                if identity_matches || build_string_only_drift {
                     if identity_mismatch.is_some() {
                         // Cannot happen today (identity includes the package
                         // name), but ambiguity must never pick a lock.
@@ -6642,6 +6683,36 @@ impl Handler {
                     }
                 }
             }
+        }
+        // p6i: the recompute. Nothing matched exactly, but exactly one
+        // candidate agreed on everything except the build string and its run
+        // dependencies passed the same gate a full match would have passed.
+        // Adopt the freshly recomputed candidate rather than refusing: the
+        // package is emitted under the ADVERTISED build string, so pixi gets
+        // the artifact it locked, built from the plan this process actually
+        // resolved. One row, at WARN and on the terminal, so a run that took
+        // this door is never mistaken for one that reproduced.
+        if matching_bundles.is_empty() && build_string_drift.len() == 1 {
+            let (bundle_index, bundle, effective, emission_relaxations, recomputed_build) =
+                build_string_drift.remove(0);
+            tracing::warn!(
+                bundle = %bundle.conda_name,
+                advertised_build = %params.output.build.as_deref().unwrap_or(""),
+                recomputed_build = %recomputed_build,
+                "advertised identity: the build string drifted between the metadata and build \
+                 passes (shared decision cache / sibling-lock workspace fingerprint). Run \
+                 dependencies agree, so the recomputed plan is built and emitted under the \
+                 ADVERTISED build string instead of refusing.",
+            );
+            crate::status::tty(&format!(
+                "building '{}': the advertised build string ({}) differs from the recomputed one \
+                 ({}); run dependencies agree, so this build recomputes and emits under the \
+                 advertised identity.",
+                bundle.conda_name,
+                params.output.build.as_deref().unwrap_or("<none>"),
+                recomputed_build,
+            ));
+            matching_bundles.push((bundle_index, bundle, effective, emission_relaxations));
         }
         let [(bundle_index, bundle, effective, emission_relaxations)] = matching_bundles.as_slice()
         else {
@@ -12254,6 +12325,106 @@ fn apply_emission(
     (bundle, base_config.clone())
 }
 
+/// What a non-miss index failure turned out to be once the wheel store was
+/// consulted (`wheel_store_second_chance`).
+enum StoreRaceOutcome<T> {
+    /// The entry filled while we waited and the retry succeeded.
+    Retried(T),
+    /// A wheel-store race, classified as a MISS. The string is the diagnostic
+    /// to record against this index so the chain can fall through to the next.
+    Miss(String),
+    /// Not a wheel-store race. The chain aborts, exactly as before.
+    Fatal(anyhow::Error),
+}
+
+/// Reclassify a "not a package miss" failure that is really a shared
+/// wheel-store race.
+///
+/// The wheel store is machine-global and written concurrently
+/// (`courier::retread_wheel_store_root`). Three states are ordinary, not
+/// fatal: the entry is absent (never filled, or evicted between a reader's
+/// `stat` and its `open`), the entry is a zero-length placeholder, or a
+/// sibling holds the entry's `.<wheel>.retread-fill-v1.lock` and is filling it
+/// right now. Job 5688724 and job 5697525 both died because a reader met one
+/// of those and aborted the whole PyPI index chain: "the failure was not a
+/// package miss: opening .../wheels/<sha>/<name>.whl: No such file or
+/// directory". An absent store entry is a MISS -- the bytes are still on the
+/// index -- so the chain must fall through, never abort.
+///
+/// Bounded: at most `pypi::WHEEL_STORE_FILL_WAIT_SECS` of waiting for the
+/// in-flight fill, then one retry of this index, then a miss. Every branch
+/// logs exactly one row.
+async fn wheel_store_second_chance<T, XF>(
+    index: &str,
+    phase: Option<&'static str>,
+    error: anyhow::Error,
+    store_root: &Path,
+    wait: std::time::Duration,
+    retry: impl FnOnce() -> XF,
+) -> StoreRaceOutcome<T>
+where
+    XF: std::future::Future<Output = Result<T>>,
+{
+    let Some((store_path, state)) = pypi::wheel_store_race(&error, store_root) else {
+        return StoreRaceOutcome::Fatal(error);
+    };
+    tracing::warn!(
+        index = %index,
+        artifact_phase = phase.unwrap_or("any"),
+        path = %store_path.display(),
+        state = %state.label(),
+        wait_secs = wait.as_secs(),
+        error = %format!("{error:#}"),
+        "wheel store: raced a shared entry; this is a package MISS, not a chain abort",
+    );
+    if !pypi::await_wheel_store_fill(&store_path, wait).await {
+        tracing::warn!(
+            index = %index,
+            artifact_phase = phase.unwrap_or("any"),
+            path = %store_path.display(),
+            state = %state.label(),
+            wait_secs = wait.as_secs(),
+            "wheel store: entry never filled within the bounded wait; falling through to the next index",
+        );
+        return StoreRaceOutcome::Miss(format!(
+            "wheel-store miss ({}, waited {}s, never filled): {error:#}",
+            state.label(),
+            wait.as_secs(),
+        ));
+    }
+    match retry().await {
+        Ok(value) => {
+            tracing::info!(
+                index = %index,
+                artifact_phase = phase.unwrap_or("any"),
+                path = %store_path.display(),
+                "wheel store: sibling fill completed during the bounded wait; this index now hits",
+            );
+            StoreRaceOutcome::Retried(value)
+        }
+        Err(retry_error) if pypi::is_pypi_index_miss(&retry_error) => {
+            tracing::warn!(
+                index = %index,
+                artifact_phase = phase.unwrap_or("any"),
+                path = %store_path.display(),
+                "wheel store: entry filled but this index has no usable artifact; ordinary miss",
+            );
+            StoreRaceOutcome::Miss(format!("{retry_error:#}"))
+        }
+        Err(retry_error) if pypi::wheel_store_race(&retry_error, store_root).is_some() => {
+            tracing::warn!(
+                index = %index,
+                artifact_phase = phase.unwrap_or("any"),
+                path = %store_path.display(),
+                error = %format!("{retry_error:#}"),
+                "wheel store: still racing after the refill retry; classifying as a miss",
+            );
+            StoreRaceOutcome::Miss(format!("wheel-store miss (raced twice): {retry_error:#}"))
+        }
+        Err(retry_error) => StoreRaceOutcome::Fatal(retry_error),
+    }
+}
+
 /// Fetch one PyPI-form BFS item from its complete ordered index chain.
 ///
 /// The callback performs the existing single-index wheel-then-sdist operation;
@@ -12271,7 +12442,8 @@ where
 {
     let mut misses = Vec::new();
     for index in indexes {
-        match fetch(index.clone()).await {
+        let attempt = fetch(index.clone()).await;
+        match attempt {
             Ok(value) => return Ok(value),
             Err(error) if pypi::is_pypi_index_miss(&error) => {
                 tracing::debug!(
@@ -12282,11 +12454,28 @@ where
                 misses.push((index.clone(), format!("{error:#}")));
             }
             Err(error) => {
-                return Err(error).with_context(|| {
-                    format!(
-                        "PyPI index chain aborted on `{index}` because the failure was not a package miss"
-                    )
-                });
+                match wheel_store_second_chance(
+                    index,
+                    None,
+                    error,
+                    &crate::courier::retread_wheel_store_root(),
+                    std::time::Duration::from_secs(pypi::WHEEL_STORE_FILL_WAIT_SECS),
+                    || fetch(index.clone()),
+                )
+                .await
+                {
+                    StoreRaceOutcome::Retried(value) => return Ok(value),
+                    StoreRaceOutcome::Miss(diagnostic) => {
+                        misses.push((index.clone(), diagnostic));
+                    }
+                    StoreRaceOutcome::Fatal(error) => {
+                        return Err(error).with_context(|| {
+                            format!(
+                                "PyPI index chain aborted on `{index}` because the failure was not a package miss"
+                            )
+                        });
+                    }
+                }
             }
         }
     }
@@ -12350,7 +12539,8 @@ where
             continue;
         }
         for index in indexes {
-            match fetch(index.clone(), phase, prefer_version.clone()).await {
+            let attempt = fetch(index.clone(), phase, prefer_version.clone()).await;
+            match attempt {
                 Ok(value) => return Ok(value),
                 Err(error) if pypi::is_pypi_index_miss(&error) => {
                     tracing::debug!(
@@ -12362,12 +12552,29 @@ where
                     misses.push((phase.label(), index.clone(), format!("{error:#}")));
                 }
                 Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!(
-                            "PyPI {} index chain aborted on `{index}` because the failure was not a package miss",
-                            phase.label(),
-                        )
-                    });
+                    match wheel_store_second_chance(
+                        index,
+                        Some(phase.label()),
+                        error,
+                        &crate::courier::retread_wheel_store_root(),
+                        std::time::Duration::from_secs(pypi::WHEEL_STORE_FILL_WAIT_SECS),
+                        || fetch(index.clone(), phase, prefer_version.clone()),
+                    )
+                    .await
+                    {
+                        StoreRaceOutcome::Retried(value) => return Ok(value),
+                        StoreRaceOutcome::Miss(diagnostic) => {
+                            misses.push((phase.label(), index.clone(), diagnostic));
+                        }
+                        StoreRaceOutcome::Fatal(error) => {
+                            return Err(error).with_context(|| {
+                                format!(
+                                    "PyPI {} index chain aborted on `{index}` because the failure was not a package miss",
+                                    phase.label(),
+                                )
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -14466,10 +14673,17 @@ fn auto_imports_store_wheels(store_root: &Path) -> Vec<PathBuf> {
         let Ok(inner) = std::fs::read_dir(shard.path()) else { continue };
         for f in inner.flatten() {
             let p = f.path();
-            // Skip the `.<name>.retread-integrity-v1.json` sidecars.
-            if p.extension().and_then(|e| e.to_str()) == Some("whl")
-                && !p.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.'))
-            {
+            // Skip every sidecar: the `.<name>.retread-integrity-v1.json`
+            // markers and -- p6i -- the `.<name>.retread-fill-v1.lock`
+            // placeholder, which exists BEFORE its wheel does and is a lock,
+            // never an artifact. A zero-length entry is a torn or placeholder
+            // write and is likewise never selectable as a wheel.
+            let name = p.file_name().map(|n| n.to_string_lossy().into_owned());
+            let is_sidecar = name.as_deref().is_some_and(|n| {
+                n.starts_with('.') || crate::wheel::is_wheel_store_fill_lock_name(n)
+            });
+            let is_empty = f.metadata().is_ok_and(|m| m.len() == 0);
+            if p.extension().and_then(|e| e.to_str()) == Some("whl") && !is_sidecar && !is_empty {
                 wheels.push(p);
             }
         }
@@ -19187,15 +19401,76 @@ fn output_matches_build_request(
     output: &CondaOutput,
     requested: &pixi_build_types::procedures::conda_build_v1::CondaBuildV1Output,
 ) -> bool {
+    output_identity_matches_ignoring_build(output, requested)
+        && requested
+            .build
+            .as_ref()
+            .is_none_or(|build| output.metadata.build == *build)
+}
+
+/// How one recomputed candidate stands against the output pixi advertised.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColdCandidateVerdict {
+    /// Name, version, subdir AND build string all agree.
+    IdentityMatches,
+    /// Name, version and subdir agree; ONLY the build string differs. Job
+    /// 5691063 and job 5698477's arm A both died here
+    /// (`protomotions-deps-pack=3.1`, advertised `py311_hff66755995_loose_0`,
+    /// recomputed `py311_h62689b0ab4_loose_0`, same subdir `linux-64`), and
+    /// before p6i this was reported as a bare "identity differs".
+    BuildStringDrift,
+    /// A genuinely different output.
+    IdentityDiffers,
+}
+
+/// Classify a recomputed candidate against the advertised output.
+///
+/// The gate itself is unchanged -- only `IdentityMatches` may pass it. The
+/// split exists so a build-string-only drift, which is a moved INPUT and not a
+/// different package, reaches the recompute door and Option D lock-parity
+/// recovery instead of being folded into "identity differs" and terminating in
+/// the `RpcError::invalid_params` that pixi turns into a panic.
+fn cold_candidate_verdict(
+    candidate: &CondaOutput,
+    requested: &pixi_build_types::procedures::conda_build_v1::CondaBuildV1Output,
+) -> ColdCandidateVerdict {
+    if output_matches_build_request(candidate, requested) {
+        ColdCandidateVerdict::IdentityMatches
+    } else if output_identity_matches_ignoring_build(candidate, requested) {
+        ColdCandidateVerdict::BuildStringDrift
+    } else {
+        ColdCandidateVerdict::IdentityDiffers
+    }
+}
+
+/// The same identity comparison as [`output_matches_build_request`], MINUS the
+/// build string.
+///
+/// The build string is `py311_h<hash>_<variant>_<n>`, and `<hash>` is
+/// `courier_inputs_hash_with_workspace_fp` -- a digest over the resolution
+/// INPUTS, one of which (`workspace_solve_fingerprint`) reads the on-disk
+/// locks of co-activated sibling packs, and one of which (the
+/// advertised-identity record that pins the fingerprint the metadata pass
+/// resolved under) is absent whenever the advertising `conda/outputs` was
+/// served from a shared cache in a different process. So a candidate that
+/// agrees on name, version and subdir and disagrees only on the build string
+/// is a DRIFTED INPUT, not a different package -- and folding the build string
+/// into "identity" made that case indistinguishable from a genuine
+/// name/version mismatch, which is why it fell straight past Option D
+/// lock-parity recovery to the `RpcError::invalid_params` that pixi's
+/// `build_dispatch.rs` panics on (jobs 5691063 and 5698477).
+///
+/// Used for recovery eligibility and for the build-string-drift recompute.
+/// The exact gate (`matching_bundles`) still requires the full match.
+fn output_identity_matches_ignoring_build(
+    output: &CondaOutput,
+    requested: &pixi_build_types::procedures::conda_build_v1::CondaBuildV1Output,
+) -> bool {
     output.metadata.name.as_normalized() == requested.name.as_normalized()
         && requested
             .version
             .as_ref()
             .is_none_or(|version| output.metadata.version.to_string() == version.to_string())
-        && requested
-            .build
-            .as_ref()
-            .is_none_or(|build| output.metadata.build == *build)
         && output.metadata.subdir == requested.subdir
 }
 
@@ -30297,3 +30572,144 @@ mod incremental_add_tests {
 
 #[cfg(test)]
 mod tests;
+
+/// p6i guards for the shared wheel store's reader side.
+///
+/// Falsifiable by mutation: replace `StoreRaceOutcome::Miss`/`Retried` in
+/// `wheel_store_second_chance` with `StoreRaceOutcome::Fatal(error)` -- the
+/// pre-p6i behaviour on `integration/4.12` = `e1e7065` -- and every case here
+/// fails.
+#[cfg(test)]
+mod wheel_store_reader_guards {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    fn store(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "retread-p6i-reader-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn opening_enoent(path: &std::path::Path) -> anyhow::Error {
+        anyhow::Error::new(std::io::Error::from_raw_os_error(2))
+            .context(format!("opening {}", path.display()))
+    }
+
+    /// GUARD (i): one entry read while a sibling is filling it -- MISS, then
+    /// HIT once the fill lands. Never an abort of the index chain.
+    ///
+    /// This is job 5688724's and job 5697525's shape: the reader met a store
+    /// directory holding a `.retread-fill-v1.lock` and no wheel and killed the
+    /// whole lock ("PyPI exact wheel index chain aborted ... because the
+    /// failure was not a package miss").
+    #[tokio::test]
+    async fn a_concurrent_fill_is_a_miss_then_a_hit_never_an_abort() {
+        let root = store("concurrent");
+        let wheel = root
+            .join("949452be97a8")
+            .join("nvidia_cudnn_cu12-9.10.2.21-py3-none-manylinux_2_27_x86_64.whl");
+        std::fs::create_dir_all(wheel.parent().unwrap()).unwrap();
+        // The in-flight state: the fill lock exists, the wheel does not.
+        let lock = crate::wheel::wheel_store_fill_lock_path(&wheel).unwrap();
+        std::fs::write(&lock, b"").unwrap();
+
+        let filling = wheel.clone();
+        let lock_to_clear = lock.clone();
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            tokio::fs::write(&filling, b"PK\x03\x04 real wheel bytes")
+                .await
+                .unwrap();
+            let _ = tokio::fs::remove_file(&lock_to_clear).await;
+        });
+
+        let attempts = AtomicUsize::new(0);
+        let outcome = wheel_store_second_chance(
+            "https://pypi.nvidia.com",
+            Some("exact wheel"),
+            opening_enoent(&wheel),
+            &root,
+            Duration::from_secs(5),
+            || async {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Ok::<&str, anyhow::Error>("resolved from the now-filled store entry")
+            },
+        )
+        .await;
+        writer.await.unwrap();
+        match outcome {
+            StoreRaceOutcome::Retried(value) => {
+                assert_eq!(value, "resolved from the now-filled store entry")
+            }
+            StoreRaceOutcome::Miss(diagnostic) => {
+                panic!("the fill completed; this had to retry, got miss: {diagnostic}")
+            }
+            StoreRaceOutcome::Fatal(error) => {
+                panic!("a raced store entry must never abort the chain: {error:#}")
+            }
+        }
+        assert_eq!(attempts.load(Ordering::SeqCst), 1, "exactly one retry");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// GUARD (ii): a zero-byte placeholder that never becomes a wheel is a
+    /// MISS after the bounded wait -- the chain falls through to the next
+    /// index instead of aborting on it.
+    #[tokio::test]
+    async fn a_zero_byte_placeholder_that_never_fills_is_a_miss() {
+        let root = store("placeholder");
+        let wheel = root.join("8c6cb23f").join("isaacsim_extscache_kit-5.1.0.0-cp311-none-manylinux_2_35_x86_64.whl");
+        std::fs::create_dir_all(wheel.parent().unwrap()).unwrap();
+        std::fs::write(&wheel, b"").unwrap();
+
+        let outcome = wheel_store_second_chance(
+            "https://pypi.nvidia.com",
+            Some("exact wheel"),
+            opening_enoent(&wheel),
+            &root,
+            Duration::from_millis(400),
+            || async { Ok::<&str, anyhow::Error>("must not be reached") },
+        )
+        .await;
+        match outcome {
+            StoreRaceOutcome::Miss(diagnostic) => {
+                assert!(diagnostic.contains("zero-length"), "{diagnostic}");
+                assert!(diagnostic.contains("never filled"), "{diagnostic}");
+            }
+            StoreRaceOutcome::Retried(_) => panic!("an empty file is never a wheel"),
+            StoreRaceOutcome::Fatal(error) => {
+                panic!("a zero-byte placeholder must be a miss, not an abort: {error:#}")
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Non-vacuous: an error that names no raced store wheel stays FATAL, so
+    /// the two cases above are not "everything became a miss".
+    #[tokio::test]
+    async fn an_unrelated_failure_still_aborts_the_chain() {
+        let root = store("unrelated");
+        let outcome: StoreRaceOutcome<&str> = wheel_store_second_chance(
+            "https://pypi.org/simple",
+            None,
+            anyhow!("TLS handshake failed"),
+            &root,
+            Duration::from_millis(50),
+            || async { Ok::<&str, anyhow::Error>("must not be reached") },
+        )
+        .await;
+        assert!(
+            matches!(outcome, StoreRaceOutcome::Fatal(_)),
+            "a transport failure is not a package miss",
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

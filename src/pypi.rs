@@ -110,6 +110,130 @@ pub(crate) fn is_pypi_index_miss(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| cause.is::<PypiIndexMiss>())
 }
 
+/// Bounded wait, in seconds, for a sibling process's in-flight fill of one
+/// shared wheel-store entry before a reader gives up and calls the race a
+/// package miss.
+///
+/// The wheel store is a machine-global content-addressed cache written
+/// concurrently by sibling retread processes and by unrelated jobs
+/// (`courier::retread_wheel_store_root`). `wheel::acquire_wheel_store_fill_lock`
+/// creates `.<wheel>.retread-fill-v1.lock` BEFORE the wheel exists -- correctly,
+/// because that is what serialises the first fill -- so a directory holding a
+/// lock and no wheel is the NORMAL in-flight state, not corruption. A reader
+/// that meets that state has missed; it has not met a fatal error.
+pub(crate) const WHEEL_STORE_FILL_WAIT_SECS: u64 = 30;
+
+/// Poll interval inside [`WHEEL_STORE_FILL_WAIT_SECS`].
+const WHEEL_STORE_FILL_POLL_MS: u64 = 250;
+
+/// Why a wheel-store path counts as a miss rather than a fatal failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WheelStoreRace {
+    /// Nothing at the path: either never filled, or evicted between a
+    /// reader's `stat` and its `open`.
+    Absent,
+    /// A zero-length file at the wheel's own name. A wheel is never legally
+    /// empty, so this is a torn or placeholder write and must never be
+    /// selectable as a wheel.
+    ZeroLength,
+    /// A sibling's fill lock exists, so some process is filling this entry
+    /// right now.
+    FillInProgress,
+}
+
+impl WheelStoreRace {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::ZeroLength => "zero-length",
+            Self::FillInProgress => "fill-in-progress",
+        }
+    }
+}
+
+/// Classify one store path's CURRENT filesystem state.
+///
+/// Decided by looking at the filesystem, never by matching error text: the
+/// same three states are reported with different wording by every reader
+/// (`wheel::read_metadata_with_sha`, `wheel::atomic_owned_copy`, and the child
+/// `uv` reading a synthesized `path = "<store>/<sha>/<file>.whl"` source), and
+/// the state is the thing that decides, not the sentence.
+pub(crate) fn classify_wheel_store_path(path: &std::path::Path) -> Option<WheelStoreRace> {
+    let fill_lock_present = crate::wheel::wheel_store_fill_lock_path(path)
+        .is_some_and(|lock| lock.exists());
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && metadata.len() == 0 => {
+            Some(WheelStoreRace::ZeroLength)
+        }
+        Ok(_) if fill_lock_present => Some(WheelStoreRace::FillInProgress),
+        Ok(_) => None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Some(if fill_lock_present {
+                WheelStoreRace::FillInProgress
+            } else {
+                WheelStoreRace::Absent
+            })
+        }
+        Err(_) => None,
+    }
+}
+
+/// If `error` (rendered with its whole context chain) names a `.whl` path
+/// under `store_root` that is currently absent, zero-length, or being filled
+/// by a sibling, return that path and its state.
+///
+/// Deliberately narrow: the token must end in `.whl`, must not be a fill-lock
+/// sidecar, must live under the store root, and the path's live state must be
+/// one of the three race states. An unrelated ENOENT -- a missing config file,
+/// a wheel outside the store -- is untouched and stays fatal.
+pub(crate) fn wheel_store_race(
+    error: &anyhow::Error,
+    store_root: &std::path::Path,
+) -> Option<(std::path::PathBuf, WheelStoreRace)> {
+    if store_root.as_os_str().is_empty() {
+        return None;
+    }
+    let text = format!("{error:#}");
+    text.split(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '`' || c == ',')
+        .map(|token| token.trim_end_matches([':', ';', '.', ')']))
+        .filter(|token| token.ends_with(".whl"))
+        .filter(|token| {
+            std::path::Path::new(token)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| !crate::wheel::is_wheel_store_fill_lock_name(name))
+        })
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.starts_with(store_root))
+        .find_map(|path| classify_wheel_store_path(&path).map(|state| (path, state)))
+}
+
+/// Wait up to [`WHEEL_STORE_FILL_WAIT_SECS`] for the concurrent fill of
+/// `path` to finish. `true` means the entry became a real, non-empty file
+/// with no fill lock left behind, i.e. it is worth retrying this index.
+///
+/// A zero-length file is never treated as filled: the placeholder shape and a
+/// torn write must both keep waiting rather than be adopted as a wheel.
+pub(crate) async fn await_wheel_store_fill(
+    path: &std::path::Path,
+    wait: std::time::Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        if classify_wheel_store_path(path).is_none()
+            && tokio::fs::metadata(path)
+                .await
+                .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+        {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(WHEEL_STORE_FILL_POLL_MS)).await;
+    }
+}
+
 /// Extract the artifact hash a PEP 503 index declares in a wheel URL's
 /// fragment (`#sha256=<64 hex>`).
 ///
@@ -3295,5 +3419,117 @@ platforms = [{ platform = "linux-64", glibc = "2.35" }]
 
         assert_eq!(version, Version::from_str("3.0").unwrap());
         assert_eq!(picked.filename, "mylib-3.0.tar.gz");
+    }
+}
+
+#[cfg(test)]
+mod wheel_store_race_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn store(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "retread-p6i-store-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn enoent_error(path: &std::path::Path) -> anyhow::Error {
+        // The exact shape every reader produces: `anyhow` context "opening
+        // <path>" over an io ENOENT (wheel::read_metadata_with_sha,
+        // wheel::atomic_owned_copy, and the child uv's own message).
+        anyhow::Error::new(std::io::Error::from_raw_os_error(2))
+            .context(format!("opening {}", path.display()))
+    }
+
+    /// GUARD (ii) of p6i: the fill-lock placeholder and a zero-length entry
+    /// are NEVER selectable as a wheel -- they are misses.
+    ///
+    /// `wheel::acquire_wheel_store_fill_lock` creates
+    /// `.<wheel>.retread-fill-v1.lock` BEFORE the wheel exists, so a directory
+    /// holding a lock and no wheel is the normal in-flight state (job 5688724:
+    /// lock written 06:37, read fatal 06:45).
+    #[test]
+    fn a_fill_lock_placeholder_and_a_zero_length_entry_are_misses_not_wheels() {
+        let root = store("classify");
+        let entry = root.join("deadbeef");
+        std::fs::create_dir_all(&entry).unwrap();
+        let wheel = entry.join("nvidia_cudnn_cu12-9.10.2.21-py3-none-manylinux_2_27_x86_64.whl");
+        let lock = crate::wheel::wheel_store_fill_lock_path(&wheel).unwrap();
+        assert!(crate::wheel::is_wheel_store_fill_lock_name(
+            lock.file_name().unwrap().to_str().unwrap()
+        ));
+
+        // 1. lock present, wheel absent -- a fill is in flight.
+        std::fs::write(&lock, b"").unwrap();
+        assert_eq!(
+            classify_wheel_store_path(&wheel),
+            Some(WheelStoreRace::FillInProgress),
+        );
+        // 2. the wheel's own name exists but is zero-length -- a torn or
+        //    placeholder write; a wheel is never legally empty.
+        std::fs::write(&wheel, b"").unwrap();
+        assert_eq!(
+            classify_wheel_store_path(&wheel),
+            Some(WheelStoreRace::ZeroLength),
+        );
+        // 3. a real wheel with the lock cleared is not a race at all.
+        std::fs::write(&wheel, b"PK\x03\x04 real wheel bytes").unwrap();
+        std::fs::remove_file(&lock).unwrap();
+        assert_eq!(classify_wheel_store_path(&wheel), None);
+        // 4. nothing at all -- absent, still a miss.
+        std::fs::remove_file(&wheel).unwrap();
+        assert_eq!(classify_wheel_store_path(&wheel), Some(WheelStoreRace::Absent));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A `.whl` ENOENT under the store root is detected; the same error
+    /// outside the store, and a non-race error inside it, are not.
+    #[test]
+    fn only_a_raced_store_wheel_is_reclassified() {
+        let root = store("detect");
+        let wheel = root.join("cafe").join("x-1.0-py3-none-any.whl");
+        assert_eq!(
+            wheel_store_race(&enoent_error(&wheel), &root).map(|(path, state)| (path, state)),
+            Some((wheel.clone(), WheelStoreRace::Absent)),
+        );
+        // Outside the store root: untouched, stays fatal.
+        let elsewhere = std::env::temp_dir().join("not-the-store/x-1.0-py3-none-any.whl");
+        assert!(wheel_store_race(&enoent_error(&elsewhere), &root).is_none());
+        // Inside the store, but the file is really there: not a race.
+        std::fs::create_dir_all(wheel.parent().unwrap()).unwrap();
+        std::fs::write(&wheel, b"real bytes").unwrap();
+        assert!(wheel_store_race(&enoent_error(&wheel), &root).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The bounded wait observes a sibling's fill completing, and never
+    /// accepts a zero-length placeholder as filled.
+    #[tokio::test]
+    async fn the_bounded_wait_sees_a_concurrent_fill_and_refuses_a_placeholder() {
+        let root = store("wait");
+        let wheel = root.join("beef").join("y-1.0-py3-none-any.whl");
+        std::fs::create_dir_all(wheel.parent().unwrap()).unwrap();
+        // A zero-length placeholder never counts as filled.
+        std::fs::write(&wheel, b"").unwrap();
+        assert!(!await_wheel_store_fill(&wheel, Duration::from_millis(400)).await);
+        // A sibling finishes the fill mid-wait.
+        let filling = wheel.clone();
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            tokio::fs::write(&filling, b"PK\x03\x04 real wheel bytes")
+                .await
+                .unwrap();
+        });
+        assert!(await_wheel_store_fill(&wheel, Duration::from_secs(5)).await);
+        writer.await.unwrap();
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
