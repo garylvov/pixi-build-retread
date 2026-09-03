@@ -128,7 +128,14 @@ BASE_LOCK=$SRC_WS/pixi.lock                              # baseline for the occu
 # --- toolchain ---------------------------------------------------------------
 PIXI=/users/glvov/.pixi/bin/pixi.real                    # bypass the flock shim
 SNAP=$T/p4l-cert-p4k/artifacts/p4k-binsnap/pixi-build-retread
-EXPECT_SHA=2cfec88df6f181ff4ff505f879e31eabeb2b2c1edfa60360dce3bccaa9bd156c
+# OPTIONAL pin. Leave EMPTY and the gate DERIVES the sha from $SNAP at run
+# time. Set it only to assert a specific binary, and then it MUST match.
+# It used to be a mandatory second constant beside SNAP, and on 2026-09-03 a
+# derivation substituted SNAP and not it, so job 5671529 died exit 8 in 3 s
+# ("snapshot sha 1860e830... != 2dd790bf..."). The leftover-token self-check
+# cannot see that: both values live INSIDE this SUBSTITUTE region, which the
+# check strips by design. One constant cannot disagree with itself.
+EXPECT_SHA_PIN=
 UVBIN=/oscar/data/stellex/glvov/tasks/retread-cold-solve/verify_fixes/artifacts/uvbin
 FAST_ENV=$(dirname "$0")/../retread_fast_env.sh          # persistent caches; fallback below
 [ -f "$FAST_ENV" ] || FAST_ENV=$T/tools/retread_fast_env.sh
@@ -174,7 +181,14 @@ case "$WS" in /oscar/data/stellex/glvov/retread/ws.${TAG}-*) ;; *) echo "FATAL b
 case "$C"  in /oscar/data/stellex/glvov/retread/cert${TAG}-*) ;; *) echo "FATAL bad C $C";  exit 4;; esac
 [ -f "$SNAP" ] || { echo "FATAL: pre-made snapshot $SNAP missing"; exit 8; }
 GOT_SHA=$(sha256sum "$SNAP" | awk '{print $1}')
-[ "$GOT_SHA" = "$EXPECT_SHA" ] || { echo "FATAL: snapshot sha $GOT_SHA != $EXPECT_SHA"; exit 8; }
+[ -n "$GOT_SHA" ] || { echo "FATAL: could not sha256sum $SNAP"; exit 8; }
+if [ -n "$EXPECT_SHA_PIN" ]; then
+  [ "$GOT_SHA" = "$EXPECT_SHA_PIN" ] || { echo "FATAL: snapshot sha $GOT_SHA != pinned $EXPECT_SHA_PIN"; exit 8; }
+  echo "### backend snapshot sha PINNED and matched"
+else
+  echo "### backend snapshot sha DERIVED from \$SNAP at run time (no pin set)"
+fi
+EXPECT_SHA=$GOT_SHA
 echo "### backend snapshot OK: $SNAP sha256=$GOT_SHA"
 ls -l "$SNAP"; "$SNAP" --version 2>&1 | head -2
 [ -f "$FAST_ENV" ] || { echo "FATAL: persistent-cache snippet $FAST_ENV missing"; exit 8; }

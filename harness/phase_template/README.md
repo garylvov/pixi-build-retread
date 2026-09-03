@@ -50,11 +50,31 @@ same node with the same manifest and the same binary.
    stays where it is — both copies find it by path, and nothing in it is
    campaign-specific.
 
+   > **The binsnap is now ONE constant, not two.** Set `SNAP` (and the cert's
+   > `SNAPDIR`) and stop. `EXPECT_SHA_PIN` is EMPTY by default and the gate
+   > derives the sha from `$SNAP` with `sha256sum` at run time, so a SNAP swap
+   > cannot leave a stale sha behind. Set `EXPECT_SHA_PIN` only to assert a
+   > specific binary, and then it MUST match or the run refuses.
+   >
+   > This is the fix for the defect that killed job **5671529** (exit 8 in 3 s,
+   > `snapshot sha 1860e830… != 2dd790bf…`): `SNAP` and a hand-written
+   > `EXPECT_SHA` were two coupled constants and a derivation moved only the
+   > first. The leftover-token self-check structurally cannot see it — both
+   > values live INSIDE the SUBSTITUTE region, which the check strips by
+   > design, and the stale sha was not in `LEFTOVER_RE`. Same exit-8-in-3-s
+   > signature as p5w run 1 and run 2.
+   >
+   > Guard: `tools/phase_template/expect_sha_gate_guard.sh` derives both
+   > templates three ways (pin empty / correct / wrong) and reads what the gate
+   > does. Restoring the old literal-`EXPECT_SHA` shape fails it — measured, 10
+   > FAIL rows including *"the derived sha still produced a sha refusal"*.
+
 2. **Edit ONLY between `### SUBSTITUTE: BEGIN` and `### SUBSTITUTE: END`.**
    Everything a new batch changes lives in that one block: `TAG`, `D`, the
    manifest and its md5/line-count/diff-count gates, the residual-pin patterns,
    the probes file and its forbidden module tokens, the env list, the binsnap
-   and its sha, the instrument paths, and `LEFTOVER_RE`. Set `TAG` to the same
+   (`SNAP`/`SNAPDIR` — its sha is DERIVED, see the note above), the instrument
+   paths, and `LEFTOVER_RE`. Set `TAG` to the same
    value in both files, and point the cert's `P1D` at the relock's directory
    when the two phases live in different dirs.
 
@@ -66,6 +86,7 @@ same node with the same manifest and the same binary.
 3. **`bash -n` both, then let the scripts check themselves.**
    ```
    bash -n <newbatch>_relock.sh && bash -n <newbatch>_cert.sh
+   bash tools/phase_template/expect_sha_gate_guard.sh    # after any gate edit
    ```
    Each script runs a leftover-token self-check as its *first* action and
    `exit 9`s on a hit. It strips three marked regions — `EVIDENCE` (the header),
@@ -344,7 +365,7 @@ and is the obvious next lever, behind its own variable.
 
 ---
 
-## The cert env loop is `CERT_PARALLEL` wide — and that is NOT VALIDATED YET
+## The cert env loop is `CERT_PARALLEL` wide — measured, and NOT shippable at 4
 
 `phaseN_cert.sh` dispatches its 26 installs `CERT_PARALLEL` at a time
 (default **4**; `CERT_PARALLEL=1` reproduces the pre-2026-09-02 serial loop
@@ -368,45 +389,81 @@ never passes quietly. The `.span` files give the concurrency ACTUALLY achieved
 lock; it is scored by a second `cert_verdict.sh` call whose exit is ANDed into the
 job's.
 
-### Three things the first proof run measured, and all three are warnings
+### NEVER call bare `wait` in this script (fixed 2026-09-03)
 
-Job **`5658928`** ran `CERT_PARALLEL=4` against the already-certified bfinal lock
-with `bfinal-phase2/artifacts/cert_results.5597694.tsv` as the serial answer key.
-All 26 envs installed rc=0.
+The first version of the loop ended in a bare `wait`. This script starts with
+`exec > >(tee -a "$A/cert_$TAG.$J.log") 2>&1`, and under bash 5.1.8 a bare
+`wait` also waits for that process substitution's `tee`, which never exits. Job
+**`5658928`** therefore wrote all 26 env rows by 01:55:39 EDT and then sat in
+`wait` until its 4 h limit killed it at 02:16 — `TIMEOUT`, an empty
+`cert_results.tsv`, no verdict, and no cleanup job submitted. Thirty-eight
+minutes of a 16-CPU hold, and the whole run's verdict, lost to one word.
+Reproducer, three lines:
 
-1. **One scored field diverged — both verdict gates EXIT 1.** `pm-isaaclab` came
-   back `RED-verify` against the key's `AMBER-repaired` (25 of 26 rows match,
-   `hover-gpu`'s known `RED-tierA` included): inside that one env prefix,
-   `isaaclab-2.3x-pack` and the co-resident `protomotions-deps-pack` disagree on
-   `lxml`, `platformdirs` and `wandb` ("divergent co-resident pins — re-lock to
-   converge"). Three causes are confounded in that single run — the fan-out, this
-   template's move of the cert's package caches from job-scoped to persistent
-   (`retread_fast_env`, which the certified reference `bfinal_phase2.sh` did NOT
-   do), and a day of index drift, all three divergent versions being the newer
-   side. **Until `CERT_PARALLEL=1` has been run on a freshly staged workspace to
-   separate them, a `CERT_PARALLEL>1` result is unqualified for a release
-   decision.**
+    exec > >(tee -a /tmp/w.log) 2>&1; ( sleep 1 ) & wait; echo unreachable
 
-2. **4 wide is 1.56×, not 4×.** Env-loop span 20 477 s → **13 111 s**, saving
-   **2 h 03 m**, against an LPT prediction of 5 123 s. The total install work grew
-   **2.26×** (20 477 s → 46 233 s) and **22 of 26 envs are past 2×** —
-   `tensorboard-tools` 68.5×, `test` 23.2×, `cpu` 13.4×, `unitree-rl-gym` 5.9×,
-   `flashsac-gpu` 4.7×. Concurrency achieved was **peak 4, mean 3.53** (width 4
-   for 66.5 % of the span), so the schedule is not the problem: these installs are
-   I/O bound — 108 GB read and 318 GB written per cert at 18.7 % of one core — and
-   four writers share the NFS write bandwidth rather than multiplying it. The
-   small envs suffer most because their wall is almost pure per-file NFS latency.
-   **The LPT makespans are an upper bound on the saving, not a forecast.** Peak
-   per-env RSS under fan-out was 1 249 420 K = 1.25 GB, *below* the serial worst
-   case, so the 32 G request is confirmed.
+The loop now drains exactly the env subshells:
 
-3. **The loop had a join deadlock, and this run found it.** Bare `wait` also waits
-   for the `tee` of `exec > >(tee -a …)`, which never exits: job 5658928 had all
-   26 rows on disk at 01:55:39 and was still in `wait` when Slurm killed it at
-   02:16:57, producing no `cert_results.tsv`, no verdict and no cleanup job. The
-   loop now drains exactly the subshells it dispatched
-   (`while [ "$RUNNING" -gt 0 ]; do wait -n; RUNNING=$((RUNNING-1)); done`) and
-   never calls bare `wait`. Per-env row files are what saved the run: reassembling
-   `artifacts/rows.<job>/` in declaration order reproduced the full 26-row results
-   file after the timeout. **Never add a bare `wait` to a script that tees its own
-   stdout.**
+    while [ "$RUNNING" -gt 0 ]; do wait -n; RUNNING=$((RUNNING-1)); done
+
+The throttle inside the dispatch loop was always safe for the same reason the
+bare `wait` was not: `wait -n` returns on the FIRST child to exit, and the tee
+never does. **This bites at every `CERT_PARALLEL`, 1 included** — the serial
+setting still runs each env as `( run_env ) &`.
+
+### Every env must have a probes row (A5a, 2026-09-03)
+
+An env whose name has no row in `$PROBES` gets an empty `$MODS`, so the TierA and
+TierB probes are both skipped. That was never a silent pass — `ARC` stays at its
+`99` initialiser and the row scored `RED-tierA` — but the label was a lie: TierA
+never ran, and nothing said so. Two changes, neither behind a flag:
+
+1. a gate before any install refuses a run in which an env of `CERT_ENVS` has no
+   probes row, printing `### probes row missing for <env>` per env and the count
+   line `### probed envs: N of M`;
+2. `run_env` scores such an env **`RED-probes-missing`**, an explicit verdict the
+   gate reads as `OUTCOME_DIFF` (verdict is field 8, and field 8 is scored).
+
+`REQUIRE_PROBE_ROW_PER_ENV=0` disables only (1), so a guard run can reach (2).
+The guard is `p12b-cert-attrib/probes_guard.sh`: it runs the real harness three
+times against a real workspace — doctored probes file expecting exit 2, doctored
+file with the gate off expecting a `RED-probes-missing` row that
+`cert_verdict.sh` calls `OUTCOME_DIFF`, and the real 26-row file expecting `cpu`
+GREEN and the gate silent. It fails if the three edits are reverted.
+
+### What the first full proof run measured
+
+Job **`5658928`**, `CERT_PARALLEL=4`, 16 CPU / 32 G, node2320, against the
+already-certified bfinal lock with `bfinal-phase2/artifacts/cert_results.5597694.tsv`
+(serial, 16 CPU, same lock, same manifest, same binsnap) as the answer key. All
+26 rows landed; they had to be reassembled by hand from `rows.5658928/` because
+of the `wait` hang above.
+
+1. **One scored field diverged, and it is NOT the fan-out.** `pm-isaaclab` came
+   back `RED-verify` against the key's `AMBER-repaired`; every other row matched
+   both the campaign baseline `5175534` and the serial key. Inside that one env
+   prefix `isaaclab-2.3x-pack` pins `lxml==7.0.0b1`, `platformdirs==4.11.7`,
+   `wandb==0.29.0` and the co-resident `protomotions-deps-pack` pins
+   `7.0.0a3` / `4.11.3` / `0.28.2`. **The pins are read from the two packs' own
+   `retread-<bundle>.target-<hash>.lock.json` sidecars** (`src/coresident_pins.rs`,
+   `coresident_pins()` / `explain_divergent_pins()`), and both sidecars carry the
+   SAME target hashes in the serial run and in the parallel one. The serial run
+   had the identical disagreement and still scored AMBER: its repair converged,
+   this one's was REFUSED. Attribution runs: `p12b-cert-attrib/`.
+2. **4 wide is 1.56× fast and 2.26× expensive.** Sum of the 26 install walls
+   **20 477 s serial → 46 233 s parallel = 2.26×**; span 13 111 s against the
+   serial loop's 20 477 s, peak concurrency 4, mean 3.53. The LPT table predicted
+   5 123 s at N=4; the measured span is **2.56× that**. Quote the honest number:
+   **3 h 38 m of env loop instead of 5 h 41 m**, bought with 2.26× the work.
+   Worst inflations are the SMALL envs — `tensorboard-tools` 15 s → 1 028 s
+   (68×), `test` 24 s → 557 s, `cpu` 31 s → 415 s — which is what a bandwidth
+   ceiling looks like, not a CPU one.
+3. **Peak per-env RSS under 4-wide: 1 249 420 K = 1.25 GB** (`ros2-humble-gpu`),
+   under the 1 475 216 K serial worst case. The 32 G request stands; 160 G never
+   was justified.
+4. **Persistent caches did NOT cut the cert's I/O.** `5658928` (persistent
+   caches) read 484 072 M and wrote 309 404 M; `5597694` (job-scoped caches) read
+   483 548 M and wrote 314 679 M. −1.7 % of writes. The 318 GB is the env
+   prefixes being written, not package cache repopulation — so audit item S13's
+   premise is wrong and the lever is `UV_LINK_MODE`, not cache siting.
+

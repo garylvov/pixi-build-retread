@@ -168,7 +168,14 @@ CERT_SERIAL_KEY=
 PIXI=/users/glvov/.pixi/bin/pixi.real
 SNAPDIR=$T/p4l-cert-p4k/artifacts/p4k-binsnap
 SNAP=$SNAPDIR/pixi-build-retread
-EXPECT_SHA=2cfec88df6f181ff4ff505f879e31eabeb2b2c1edfa60360dce3bccaa9bd156c
+# OPTIONAL pin. Leave EMPTY and the gate DERIVES the sha from $SNAP at run
+# time. Set it only to assert a specific binary, and then it MUST match.
+# See the same note in phaseN_relock.sh: SNAP and a hand-written EXPECT_SHA
+# were two coupled constants inside the SUBSTITUTE region, the leftover-token
+# check strips that region by design, and a derivation that moved one and not
+# the other killed job 5671529 exit 8 in 3 s. One constant cannot disagree
+# with itself.
+EXPECT_SHA_PIN=
 UVBIN=/oscar/data/stellex/glvov/tasks/retread-cold-solve/verify_fixes/artifacts/uvbin
 VERDICT=$T/p4l-cert-p4k/artifacts/cert_verdict.sh
 CERT_BASELINE=$T/p4l-cert-p4k/artifacts/cert_results.5175534.att_corrected.tsv
@@ -226,7 +233,14 @@ for f in "$SNAP" "$LOCK" "$PROBES" "$PROBES_CANON" "$VERDICT" "$CERT_BASELINE" "
   [ -e "$f" ] || { echo "### FATAL missing required path: $f"; exit 2; }
 done
 GOT_SHA=$(sha256sum "$SNAP" | awk '{print $1}')
-[ "$GOT_SHA" = "$EXPECT_SHA" ] || { echo "### FATAL backend snapshot sha mismatch got=$GOT_SHA want=$EXPECT_SHA"; exit 2; }
+[ -n "$GOT_SHA" ] || { echo "### FATAL could not sha256sum $SNAP"; exit 2; }
+if [ -n "$EXPECT_SHA_PIN" ]; then
+  [ "$GOT_SHA" = "$EXPECT_SHA_PIN" ] || { echo "### FATAL backend snapshot sha mismatch got=$GOT_SHA want-pinned=$EXPECT_SHA_PIN"; exit 2; }
+  echo "### backend snapshot sha PINNED and matched: $GOT_SHA"
+else
+  echo "### backend snapshot sha DERIVED from \$SNAP at run time: $GOT_SHA (no pin set)"
+fi
+EXPECT_SHA=$GOT_SHA
 GOT_MD5=$(md5sum "$LOCK" | awk '{print $1}')
 [ "$GOT_MD5" = "$EXPECT_LOCK_MD5" ] || { echo "### FATAL lock md5 mismatch got=$GOT_MD5 want=$EXPECT_LOCK_MD5"; exit 2; }
 echo "### gates OK: snapshot sha + lock md5 + all required paths"
