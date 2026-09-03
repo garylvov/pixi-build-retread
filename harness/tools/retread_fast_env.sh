@@ -176,14 +176,33 @@ retread_fast_env () {
   # Reclaiming the debris (tools/wheel_store_reclaim.sh) does not fix it,
   # because it is produced continuously while lanes run.
   #
-  # RE-ENABLE AFTER p6i: the fill must be temp+rename with the placeholder
-  # never openable as a wheel, and the reader must treat a fill-lock/partial
-  # entry as a MISS and wait or fall through -- never abort the index chain.
-  # Until then, a harness that wants index warmth sets a JOB-SCOPED store
-  # itself (see p6h-proof2), which cannot be poisoned by another lane.
-  # The measured prize this gives up, for when it comes back: index authority
-  # 222/411 = 54% with a warm store against 5/317 without (LANE-C-WARM-LOG 9.4).
-  # export RETREAD_WHEEL_STORE=$root/wheels
+  # RE-ENABLED 2026-09-03 15:35 -- p6i merged, and BOTH conditions the disable
+  # named are met by `fix/p6i-shared-cache-atomicity-b` @ 4b3103b, now in
+  # integration/4.12 = c0a87d3:
+  #   writer: publication was ALREADY temp-in-the-same-dir + flush + sync_all +
+  #           rename (`wheel::atomic_owned_copy`); what was missing is that the
+  #           fill-lock placeholder is now UNSELECTABLE as a wheel --
+  #           `wheel::WHEEL_STORE_FILL_LOCK_SUFFIX` /
+  #           `is_wheel_store_fill_lock_name` own the name, and
+  #           `handler::auto_imports_store_wheels` filters the sidecar AND any
+  #           zero-length entry.
+  #   reader: `pypi::classify_wheel_store_path` decides Absent / ZeroLength /
+  #           FillInProgress from the FILESYSTEM, and
+  #           `handler::wheel_store_second_chance` waits <=30 s
+  #           (`pypi::WHEEL_STORE_FILL_WAIT_SECS`), retries the index ONCE, then
+  #           records a MISS and falls through. An error naming no raced store
+  #           wheel is still fatal, so "everything became a miss" is excluded.
+  # THE PROOF, and it is a lock and not a unit test: job 5719938 (`ME2`) relocked
+  # the canonical 27-env manifest from a FRESH workspace against THIS store while
+  # it held 696 top-level entries and 487 fill-lock sidecars, including the two
+  # lock-without-wheel entries that killed jobs 5685024, 5686431 (both arms) and
+  # 5688724. rc=0, wall 1764 s, 27/27 envs, `not a package miss` = 0,
+  # `wheel store: entry never filled` = 0, and its lock is BYTE-IDENTICAL
+  # (md5 4bcddf2e0819b61c66f983ae642dbad5) to job 5719937's, which locked the
+  # same manifest with a JOB-SCOPED store.
+  # The prize this buys back: index authority 222/411 = 54% with a warm store
+  # against 5/317 without (LANE-C-WARM-LOG 9.4).
+  export RETREAD_WHEEL_STORE=$root/wheels
 
   # Measured as no help (805.0s -> 828.2s route-probe union). Opt-in only.
   if [ "${RETREAD_FAST_ENV_PARALLEL_PROBES:-0}" = 1 ]; then
