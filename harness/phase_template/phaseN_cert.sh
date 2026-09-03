@@ -45,6 +45,25 @@
 #      18.7% of a core), so NFS write bandwidth, not CPU or RAM, is the real
 #      ceiling -- treat the LPT table as an upper bound.
 #
+#      MEASURED 2026-09-03, and the LPT table is a BAD forecast. Job 5658928 ran
+#      all 26 envs at N=4 against the serial key 5597694: the sum of the install
+#      walls went 20,477s -> 46,233s (2.26x the WORK) for a span of 13,111s
+#      against the serial loop's 20,477s -- 1.56x wall, peak concurrency 4, mean
+#      3.53, and 2.56x the 5,123s the table predicted. The worst inflations are
+#      the SMALLEST envs (tensorboard-tools 15s -> 1,028s = 68x; test 24s ->
+#      557s; cpu 31s -> 415s), which is what a write-bandwidth ceiling looks
+#      like. Quote 3h38m of env loop instead of 5h41m, never "4x". The real
+#      lever is UV_LINK_MODE, not width: on env `pace` with a warm uv cache,
+#      copy = 1,062s / 23.78 GB written and hardlink = 397s / 0.75 GB (2.68x,
+#      31.5x). The default here stays `copy` until that is re-measured under
+#      fan-out; see README.md.
+#      Correctness at N=4 is CLEARED: the single row that diverged in 5658928
+#      (pm-isaaclab RED-verify vs AMBER-repaired) reproduces at CERT_PARALLEL=1
+#      under BOTH cache sitings (jobs 5674557, 5674558), so the fan-out is not
+#      its cause. It is a staged-vs-relocked workspace difference -- which also
+#      means a CERT_SERIAL_KEY from a relocked workspace does not score a staged
+#      one.
+#
 #      WHAT IS AND IS NOT SHARED ACROSS THE N SUBSHELLS.
 #        per env, already:  $A/<env>.cert-{install,probe,verify,state}.log,
 #                           $A/<env>.cert-install.time.txt, $WS/.pixi/envs/<env>
@@ -154,6 +173,42 @@ ros2-jazzy-cpu isaaclab-gpu-latest newton-gpu pm-isaaclab pm-mujoco pace"
 #                 set costs ~1,000s against LPT. An env absent from the table
 #                 sorts FIRST (unknown is treated as long, the safe side).
 CERT_PARALLEL=${CERT_PARALLEL:-4}
+
+# --- how uv puts wheels into the env prefixes -------------------------------
+# CERT_UV_LINK_MODE  copy (default) | hardlink. This is exported AFTER
+#                 retread_fast_env, which sets UV_LINK_MODE=copy and used to be
+#                 the last word on it, so an A/B needs no edit:
+#                   CERT_UV_LINK_MODE=hardlink ./<harness>.sh
+#
+# WHAT `copy` IS INSURANCE AGAINST, precisely. Job 5547450 died on
+# "failed to hardlink file from <uv cache>/builds-v0/.tmp4QiHoL/lib/python3.11/
+# site-packages/... to <uv cache>/archive-v0/...: No such file or directory"
+# while uv-BUILDING the gym sdist with six concurrent builds: the tree that
+# vanished was `builds-v0/.tmpXXXX`, a per-build ephemeral build environment a
+# sibling reclaimed mid-link. uv documents UV_LINK_MODE as "the method to use
+# when installing packages FROM THE GLOBAL CACHE" (uv 0.12.5, `uv help pip
+# install`), and a cert installs a frozen lock: its source is `archive-v0`,
+# content-addressed, and NOTHING in this campaign runs `uv cache clean|prune`
+# (zero call sites in tools/ or any harness). The persistent cache's own
+# buckets say the same -- archive-v0 4796 entries, builds-v0 and sdists-v9
+# EMPTY. So the cert's install hardlinks cannot point at a reclaimable tree.
+# The RELOCK is the phase that builds, and it keeps `copy` for that reason.
+#
+# MEASURED at fan-out, job 5685816 (26 envs, CERT_PARALLEL=4, hardlink, staged
+# workspace, persistent caches) against 5658928 (same everything, copy):
+#   env-loop span 13,111s -> 9,057s (-31%), sum of env walls 46,233s -> 32,421s,
+#   writes 301.39 GB -> 128.03 GB by /usr/bin/time (302 GB -> 131.8 GB by sacct),
+#   `pace` prefix 156,275 of 161,609 files at st_nlink>1 (it really hardlinked),
+#   ZERO hardlink/EXDEV/busy/builds-v0 lines in all 26 install logs, and
+#   cert_verdict.sh scores the two runs IDENTICAL: 26 rows, 0 differing, EXIT 0.
+# The default is STILL `copy`, on purpose: the win is 2.35x on bytes, not the
+# order of magnitude the single-env test predicted; two envs got ~2x SLOWER
+# (`pace` 1,290s -> 2,734s, `groot-sonic-gpu` 1,779s -> 3,440s) with no named
+# cause; the hardlink N=1 corner is still unmeasured; and hardlinking couples
+# every env prefix to the SHARED persistent uv cache, so any writer that
+# rewrites a prefix file IN PLACE would write through into the cache every
+# future job reads. Flip it per-run until those are answered. See README.md.
+CERT_UV_LINK_MODE=${CERT_UV_LINK_MODE:-copy}
 CERT_WALL_TABLE=                             # e.g. $T/<lastgreen>/artifacts/memory_ledger.<job>.tsv
 
 # --- optional SECOND verdict gate --------------------------------------------
@@ -324,7 +379,7 @@ export RETREAD_BUILD_ROOT=$C/retread-build RETREAD_ARTIFACT_ROOT=$C/retread-arti
 export HOME=$G/home TMPDIR=$G/tmp RETREAD_SCRATCH_ROOT=$G/scratch RETREAD_FAST_TMP_ROOT=$G/fast-tmp
 export PATH=/users/glvov/.pixi/bin:$UVBIN:/users/glvov/.local/bin:/usr/bin:/bin
 export RETREAD_UV=$UVBIN/uv CONDA_OVERRIDE_CUDA=12 CONDA_OVERRIDE_GLIBC=2.35 UV_LOCK_TIMEOUT=3600 RETREAD_MAX_CONCURRENT_BUILDS=6 TOKIO_WORKER_THREADS=8 RAYON_NUM_THREADS=8
-export UV_LINK_MODE=copy   # job 5547450: NFS hardlink race under concurrent uv builds
+export UV_LINK_MODE=copy   # provisional; CERT_UV_LINK_MODE decides, after retread_fast_env
 export PIXI_BUILD_RETREAD_LOG=pixi_build_retread=debug,warn RUST_BACKTRACE=1 PIXI_BUILD_BACKEND_OVERRIDE="pixi-build-retread=$SNAP"
 unset RUST_LOG
 
@@ -333,6 +388,13 @@ unset RUST_LOG
 # shellcheck source=/dev/null
 . "$FAST_ENV"
 retread_fast_env "$WS" || { echo "### FATAL retread_fast_env refused"; exit 2; }
+
+# LINK MODE -- last word, because retread_fast_env exports UV_LINK_MODE=copy.
+case "$CERT_UV_LINK_MODE" in
+  copy|hardlink) export UV_LINK_MODE=$CERT_UV_LINK_MODE ;;
+  *) echo "### FATAL CERT_UV_LINK_MODE must be copy|hardlink, got '$CERT_UV_LINK_MODE'"; exit 2 ;;
+esac
+echo "### UV_LINK_MODE=$UV_LINK_MODE (CERT_UV_LINK_MODE=$CERT_UV_LINK_MODE) UV_CACHE_DIR=$UV_CACHE_DIR"
 
 # Every env writes its OWN row files here; the driver concatenates them in
 # DECLARATION order after the last one finishes. Nothing appends to a shared
@@ -413,6 +475,7 @@ cert_run_order() {
 if [ "${DRY_RUN:-0}" = 1 ]; then
   echo "### DRY_RUN=1 -- gates, env block and persistent caches are DONE; no env will be installed."
   echo "### CERT_PARALLEL=$CERT_PARALLEL  wall table=${CERT_WALL_TABLE:-<none, declaration order>}"
+  echo "### link mode AT THE POINT OF USE: UV_LINK_MODE=$UV_LINK_MODE (asked for CERT_UV_LINK_MODE=$CERT_UV_LINK_MODE)"
   echo "### envs that WOULD run, in DISPATCH order (longest-first):"; cert_run_order | sed 's/^/  /'
   echo "### rows would be concatenated back in DECLARATION order:"; for ENV in $CERT_ENVS; do echo "  $ENV"; done
   echo "### verdict gate that WOULD score them: $VERDICT against $CERT_BASELINE"
@@ -423,28 +486,53 @@ fi
 ########## THE ENV LOOP -- $CERT_PARALLEL wide, longest-first ##########
 case "$CERT_PARALLEL" in ''|*[!0-9]*|0) echo "### FATAL CERT_PARALLEL must be a positive integer, got '$CERT_PARALLEL'"; exit 2;; esac
 LOOP_S=$(date +%s)
-echo "### env loop: CERT_PARALLEL=$CERT_PARALLEL wall_table=${CERT_WALL_TABLE:-<none, declaration order>} start $(date -Is)"
+echo "### env loop: UV_LINK_MODE=$UV_LINK_MODE CERT_PARALLEL=$CERT_PARALLEL wall_table=${CERT_WALL_TABLE:-<none, declaration order>} start $(date -Is)"
 echo "### dispatch order: $(cert_run_order | tr '\n' ' ')"
 RUNNING=0
+PIDS=()
 for ENV in $(cert_run_order); do
   while [ "$RUNNING" -ge "$CERT_PARALLEL" ]; do wait -n; RUNNING=$((RUNNING-1)); done
   ( run_env "$ENV" ) &
+  PIDS+=($!)
   RUNNING=$((RUNNING+1))
   echo "### dispatched $ENV (in flight $RUNNING/$CERT_PARALLEL) $(date -Is)"
 done
-# `wait` with NO arguments also waits for the `tee` of the
-# `exec > >(tee -a ...)` process substitution at the top of this script. That
-# tee never exits, so a bare `wait` here hangs forever: MEASURED on job 5658928
-# (bash 5.1.8, node2320) -- all 26 env rows were on disk at 01:55:39 EDT and the
-# job was still sitting in `wait` when its 4 h limit killed it at 02:16, with no
-# cert_results.tsv, no verdict and no cleanup submitted. Reproducer:
-#   exec > >(tee -a /tmp/w.log) 2>&1; ( sleep 1 ) & wait; echo unreachable
-# The THROTTLE above is safe for the same reason the bare wait is not: `wait -n`
-# returns on the FIRST child to exit, and the tee never does. So drain exactly
-# the $RUNNING env subshells, one `wait -n` each, and never call bare `wait`.
-while [ "$RUNNING" -gt 0 ]; do wait -n; RUNNING=$((RUNNING-1)); done
+# NEVER `wait` (bare) and NEVER `wait -n` here. This script starts with
+# `exec > >(tee -a ...)`; under bash 5.1.8 that tee is a child that never exits,
+# and BOTH forms then block on it forever:
+#   * bare `wait` waits for ALL children -> job 5658928 wrote all 26 rows by
+#     01:55:39 EDT and sat here until its 4 h limit killed it at 02:16 (TIMEOUT,
+#     empty cert_results.tsv, no verdict, no cleanup submitted);
+#   * `while [ $RUNNING -gt 0 ]; do wait -n; ... done` fails the same way once
+#     the env subshells have ALREADY exited -- job 5674557 (one env, done
+#     03:59:05) was still in it at 04:13 with `tee` as its only live child.
+# Waiting on an EXPLICIT pid returns immediately for an exited child and 127 for
+# one the throttle already reaped, so it can neither hang nor lose a status.
+# The throttle above keeps `wait -n` on purpose: there it blocks until a real
+# env completion, which is exactly what it is for.
+for P in ${PIDS[@]+"${PIDS[@]}"}; do wait "$P" 2>/dev/null; done
 LOOP_W=$(( $(date +%s) - LOOP_S ))
 echo "### env loop DONE wall=${LOOP_W}s $(date -Is)"
+
+# The 5547450 signature, hunted in EVERY install log. Cheap, and it is the only
+# thing standing between a hardlink run and a silent bad link.
+RACE=$(grep -nE 'failed to hardlink|EXDEV|Text file busy|builds-v0' "$A"/*.cert-install.log 2>/dev/null)
+if [ -n "$RACE" ]; then
+  echo "### HARDLINK RACE SIGNATURE PRESENT in an install log -- do not ship this link mode:"
+  printf '%s\n' "$RACE" | head -60
+  printf '%s\n' "$RACE" > "$A/hardlink_race.$J.txt"
+else
+  echo "### no hardlink/EXDEV/busy/builds-v0 line in any install log (link mode $UV_LINK_MODE)"
+fi
+
+# Bytes the installs actually wrote: /usr/bin/time -v "File system outputs", in
+# 512-byte blocks, per env and totalled. Attributable, and independent of sacct.
+: > "$A/fs_outputs.$J.tsv"
+for ENV in $CERT_ENVS; do
+  FSO=$(awk -F": " '/File system outputs/{print $2}' "$A/$ENV.cert-install.time.txt" 2>/dev/null)
+  printf '%s\t%s\n' "$ENV" "${FSO:-na}" >> "$A/fs_outputs.$J.tsv"
+done
+awk -F'\t' '$2 ~ /^[0-9]+$/ { t+=$2 } END { printf "### install writes: %d blocks = %.2f GB (UV_LINK_MODE=%s)\n", t, t*512/1e9, mode }' mode="$UV_LINK_MODE" "$A/fs_outputs.$J.tsv"
 
 # Reassemble in DECLARATION order. A missing row means that env's subshell died
 # without finishing; it is left MISSING on purpose, so cert_verdict.sh reports

@@ -601,7 +601,13 @@ echo "### uv: $RETREAD_UV -> $("$RETREAD_UV" --version 2>&1)  (command -v uv: $(
 export CONDA_OVERRIDE_CUDA=12
 export CONDA_OVERRIDE_GLIBC=2.35
 export UV_LOCK_TIMEOUT=3600
-export UV_LINK_MODE=copy   # job 5547450: NFS hardlink race under concurrent uv builds
+# job 5547450: the failing hardlink's SOURCE was <uv cache>/builds-v0/.tmpXXXX,
+# a per-build ephemeral build environment that one of six concurrent uv BUILDS
+# reclaimed while another linked out of it. THIS phase is the one that builds,
+# so `copy` stays here and is not up for the CERT's argument: the cert installs
+# a frozen lock and links out of the content-addressed `archive-v0` instead
+# (CERT_UV_LINK_MODE in phaseN_cert.sh, measured under fan-out 2026-09-03).
+export UV_LINK_MODE=copy
 export OMNI_KIT_ACCEPT_EULA=YES
 export PRIVACY_CONSENT=Y
 export PIXI_BUILD_RETREAD_LOG=pixi_build_retread=debug,warn

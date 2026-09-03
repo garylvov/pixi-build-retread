@@ -67,9 +67,23 @@
 #   experiment:  RETREAD_FAST_ENV_PARALLEL_PROBES=1 retread_fast_env "$WS"
 #
 # HAZARDS
-#   * Concurrent jobs share these directories. Keep UV_LINK_MODE=copy (the
-#     5547450 NFS hardlink race); sharing one uv cache across jobs makes that
-#     race MORE likely, not less. This function sets it for you.
+#   * Concurrent jobs share these directories. This function sets
+#     UV_LINK_MODE=copy, which is the right DEFAULT but not a law -- read this
+#     before overriding it. Job 5547450's race was a uv BUILD: six concurrent
+#     builds, and the link that failed had its SOURCE in
+#     `<uv cache>/builds-v0/.tmpXXXX`, a per-build ephemeral build environment a
+#     sibling reclaimed mid-link. uv documents UV_LINK_MODE as the method used
+#     "when installing packages FROM THE GLOBAL CACHE"; an INSTALL of a frozen
+#     lock links out of `archive-v0`, which is content-addressed, which nothing
+#     in this campaign prunes (`uv cache clean|prune`: zero call sites), and
+#     which the cert never leaves -- the persistent cache's builds-v0 and
+#     sdists-v9 are EMPTY after every relock and cert we have run. So: keep
+#     `copy` for any phase that BUILDS (the relock), and decide the CERT's mode
+#     with the harness knob CERT_UV_LINK_MODE, which is exported after this
+#     function precisely because this line used to be the last word. Measured
+#     under fan-out, job 5685816 vs 5658928: hardlink is 1.45x on the env loop
+#     and 2.35x on bytes with identical cert_verdict.sh rows and zero race
+#     lines. Default unchanged; see tools/phase_template/README.md.
 #   * INODES. One cold relock leaves ~36 GB here on a filesystem whose soft
 #     quota is ~95M/100M inodes. The tree is rebuildable, so deleting it is
 #     always safe and only ever slow:  rm -rf /oscar/data/stellex/glvov/agrescap/cache/retread
@@ -97,7 +111,7 @@ retread_fast_env () {
   export PIXI_CACHE_DIR=$root/pixi
   export RATTLER_CACHE_DIR=$root/rattler
   export UV_CACHE_DIR=$root/uv
-  export UV_LINK_MODE=copy          # NFS hardlink race, job 5547450
+  export UV_LINK_MODE=copy          # safe default; a CERT overrides it AFTER this call
 
   # SHARED BUILT-OUTPUT STORE (retread >= the p5w commit; older binaries ignore
   # this variable entirely, so setting it here is safe for every harness).

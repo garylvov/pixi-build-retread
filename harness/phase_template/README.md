@@ -203,7 +203,8 @@ prefix by construction and is never touched by it.
 halves after the job-scoped env block) repoints `PIXI_CACHE_DIR`,
 `RATTLER_CACHE_DIR` and `UV_CACHE_DIR` at
 `/oscar/data/stellex/glvov/agrescap/cache/retread/{pixi,rattler,uv}`, sets
-`UV_LINK_MODE=copy`, and places a symlink for the route-probe verdict cache at
+`UV_LINK_MODE=copy` (a default the CERT half may override AFTER this call —
+see "`UV_LINK_MODE`" below), and places a symlink for the route-probe verdict cache at
 the path `fasttmp::namespace()` computes —
 `$RETREAD_FAST_TMP_ROOT/retread-$USER/<sha256(realpath ws)[:12]>/job-$SLURM_JOB_ID/caches/retread/retread-route-probe-verdicts`
 — which is the only way to persist verdicts without turning fast-tmp off.
@@ -396,27 +397,38 @@ never passes quietly. The `.span` files give the concurrency ACTUALLY achieved
 lock; it is scored by a second `cert_verdict.sh` call whose exit is ANDed into the
 job's.
 
-### NEVER call bare `wait` in this script (fixed 2026-09-03)
+### NEVER `wait` and NEVER `wait -n` after the dispatch loop (fixed 2026-09-03)
 
-The first version of the loop ended in a bare `wait`. This script starts with
-`exec > >(tee -a "$A/cert_$TAG.$J.log") 2>&1`, and under bash 5.1.8 a bare
-`wait` also waits for that process substitution's `tee`, which never exits. Job
-**`5658928`** therefore wrote all 26 env rows by 01:55:39 EDT and then sat in
-`wait` until its 4 h limit killed it at 02:16 — `TIMEOUT`, an empty
-`cert_results.tsv`, no verdict, and no cleanup job submitted. Thirty-eight
-minutes of a 16-CPU hold, and the whole run's verdict, lost to one word.
-Reproducer, three lines:
+This script starts with `exec > >(tee -a "$A/cert_$TAG.$J.log") 2>&1`. Under
+bash 5.1.8 that `tee` is a child of the script that never exits, and every
+argument-less wait then blocks on it forever. Both forms were measured failing:
 
-    exec > >(tee -a /tmp/w.log) 2>&1; ( sleep 1 ) & wait; echo unreachable
+* the original bare `wait` waits for ALL children — job **`5658928`** wrote all
+  26 env rows by 01:55:39 EDT and sat in it until its 4 h limit killed it at
+  02:16: `TIMEOUT`, an empty `cert_results.tsv`, no verdict, no cleanup job
+  submitted, and 38 minutes of a 16-CPU hold spent doing nothing;
+* the first fix, `while [ $RUNNING -gt 0 ]; do wait -n; RUNNING=$((RUNNING-1)); done`,
+  fails the same way when the env subshells have ALREADY exited — job
+  **`5674557`** (one env, finished 03:59:05) was still sitting in it at 04:13
+  with `tee` as its only live child.
 
-The loop now drains exactly the env subshells:
+The loop now records each subshell's pid and waits on it by name:
 
-    while [ "$RUNNING" -gt 0 ]; do wait -n; RUNNING=$((RUNNING-1)); done
+    PIDS=()
+    ( run_env "$ENV" ) & PIDS+=($!)
+    ...
+    for P in ${PIDS[@]+"${PIDS[@]}"}; do wait "$P" 2>/dev/null; done
 
-The throttle inside the dispatch loop was always safe for the same reason the
-bare `wait` was not: `wait -n` returns on the FIRST child to exit, and the tee
-never does. **This bites at every `CERT_PARALLEL`, 1 included** — the serial
-setting still runs each env as `( run_env ) &`.
+`wait <pid>` returns immediately for an exited child and 127 for one the
+throttle already reaped, so it can neither hang nor lose a status. The throttle
+inside the dispatch loop keeps `wait -n` deliberately: there it blocks until a
+real env completion, which is what it is for. **This bites at every
+`CERT_PARALLEL`, 1 included** — the serial setting still runs each env as
+`( run_env ) &`.
+
+When a run does hang this way its rows are all on disk: reassemble
+`cert_results.tsv` by `cat`-ing `artifacts/rows.<job>/<env>.row` in
+`CERT_ENVS` declaration order and score it with `cert_verdict.sh` by hand.
 
 ### Every env must have a probes row (A5a, 2026-09-03)
 
@@ -474,3 +486,93 @@ of the `wait` hang above.
    prefixes being written, not package cache repopulation — so audit item S13's
    premise is wrong and the lever is `UV_LINK_MODE`, not cache siting.
 
+
+
+---
+
+## `UV_LINK_MODE` — what `copy` is actually insurance against, and what it costs
+
+`retread_fast_env` exports `UV_LINK_MODE=copy` and, until 2026-09-03, that was
+the last word on it for every phase. The rule came from job **`5547450`**, and
+the rule was a generalisation of something narrower than anyone had written down.
+
+**What `5547450` actually hit.** From its own backend log, the failure is a
+source BUILD, not an install:
+
+    uv-building wheel from sdist .../gym-0.26.2.tar.gz for gym: uv ["build", ...] failed
+      Caused by: Failed to install requirements from `build-system.requires`
+      Caused by: Failed to install build dependencies
+      Caused by: Failed to install: setuptools-80.10.2-py3-none-any.whl
+      Caused by: failed to hardlink file from
+        <job uv cache>/builds-v0/.tmp4QiHoL/lib/python3.11/site-packages/pkg_resources/tests/test_working_set.py
+        to <job uv cache>/archive-v0/2Xwd2LTx6I0HEYJm/pkg_resources/tests/test_working_set.py
+        : No such file or directory (os error 2)
+
+Both endpoints are uv cache buckets, and the one that vanished is
+`builds-v0/.tmp4QiHoL` — a per-build ephemeral build environment, created and
+reclaimed by one of the six concurrent builds
+(`RETREAD_MAX_CONCURRENT_BUILDS=6`). **Builds hardlinked out of a reclaimable
+temp tree.** That is the whole hazard, and it belongs to the phase that builds.
+
+**Installs do not link from there.** uv documents the flag (uv 0.12.5,
+`uv help pip install`) as *"The method to use when installing packages from the
+global cache"*, and warns that clearing the cache breaks installed packages —
+i.e. the source is the cache. A cert installs a FROZEN lock: it resolves
+nothing and builds nothing, so its source is `archive-v0`, content-addressed.
+Nothing reclaims it: **`uv cache clean` and `uv cache prune` have zero call
+sites** in `tools/` or in any harness in the task tree, and the persistent
+cache's own buckets show the shape plainly — `archive-v0` 4 796 entries,
+`builds-v0` and `sdists-v9` **empty** after every relock and cert run against it.
+
+**So the split is by PHASE, and it is now expressed that way.**
+
+* `phaseN_relock.sh` keeps `UV_LINK_MODE=copy`, hard, with the reason in the
+  line above it. That phase builds, concurrently; it is the phase `5547450` was.
+* `phaseN_cert.sh` gets **`CERT_UV_LINK_MODE`** (`copy` default | `hardlink`),
+  exported AFTER `retread_fast_env` and printed twice — once where it is decided
+  and once at the point of use, in the `### env loop:` line — because a knob
+  exported before the fast env would be a silent no-op. The loop then greps
+  every install log for `failed to hardlink|EXDEV|Text file busy|builds-v0` and
+  says so out loud either way, and totals the installs' `File system outputs`.
+  Guard: `link_mode_guard.sh`, which drives the REAL template to `DRY_RUN=1`
+  three times (hardlink survives a copy-setting fast env; default is copy;
+  `symlink` refuses with exit 2). Falsified twice by mutation when it landed.
+
+### What `hardlink` measured under fan-out (job `5685816`, 2026-09-03)
+
+26 envs, `CERT_PARALLEL=4`, persistent caches, staged workspace, the certified
+994-line manifest and `ae312ea0…` lock, against job `5658928` which is the same
+run in every respect except the link mode.
+
+| | copy `5658928` | hardlink `5685816` |
+|---|---|---|
+| env-loop span | 13 111 s | **9 057 s** (−31 %) |
+| sum of env walls | 46 233 s | **32 421 s** (−30 %) |
+| install writes (`/usr/bin/time -v`) | 301.39 GB | **128.03 GB** (2.35×) |
+| job MaxDiskWrite (sacct) | 302 GB | **131.8 GB** |
+| peak / mean concurrency | 4 / 3.53 | 4 / 3.58 |
+| worst per-env RSS | 1.25 GB | 0.97 GB |
+| `pace` prefix files at `st_nlink>1` | ~72 k | **156 275 of 161 609** |
+| race lines in 26 install logs | — | **0** |
+| `cert_verdict.sh` hardlink vs copy | | **26 rows, 0 differing, EXIT 0** |
+
+Both runs score the same single `OUTCOME_DIFF` against the campaign baseline and
+the `5597694` serial key — `pm-isaaclab` `RED-verify` vs `AMBER-repaired` — which
+is the staged-vs-relocked pack-ownership residue the attribution lane isolated,
+reproduces at `CERT_PARALLEL=1`, and has nothing to do with the link mode.
+
+**The default is still `copy`, deliberately.** The bar for flipping it was a
+clean pair of gates AND an order-of-magnitude drop in writes. The gates are
+cleaner than asked; the writes dropped 2.35×, because the single-env test that
+predicted 31.5× measured only ONE pypi-heavy env's install bytes, and a cert also
+writes conda extractions, 14 pack builds and their replayed payloads, which no
+link mode touches. Two envs also got ~2× SLOWER (`pace` 1 290 s → 2 734 s,
+`groot-sonic-gpu` 1 779 s → 3 440 s) with no named cause, `pace` being the very
+env the concurrency-1 test was built on. And hardlinking couples every env prefix
+to the SHARED persistent uv cache: uv installs by unlink-and-create so uv cannot
+corrupt it, but any writer that rewrites a prefix file IN PLACE would write
+through into the cache every later job reads.
+
+To flip the default, bring: the hardlink `CERT_PARALLEL=1` corner (job `5685818`,
+queued), a named cause for the two slow envs, and a check that no cache inode's
+content changed across a cert.
