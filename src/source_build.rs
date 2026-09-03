@@ -9498,11 +9498,33 @@ version = "0.1.0"
         write_test_wheel_with_payload(&wheel, "pkg", "1.0.0", b"payload-one");
         let before = wheel_file_fingerprint(&wheel).unwrap();
 
+        // The link has to actually MOVE `ctime`, or this guard proves nothing:
+        // it would pass on the very code it exists to reject. Link and unlink
+        // until the kernel's `ctime` differs from the one taken above, and
+        // fail outright if a whole second of that never moves it.
+        use std::os::unix::fs::MetadataExt as _;
+        let raw_ctime = |path: &Path| {
+            let metadata = std::fs::symlink_metadata(path).unwrap();
+            (metadata.ctime(), metadata.ctime_nsec())
+        };
+        let ctime_before = raw_ctime(&wheel);
         let sibling = base.join("sibling-workspace.whl");
-        std::fs::hard_link(&wheel, &sibling).unwrap();
-        assert_eq!(
-            std::fs::metadata(&wheel).unwrap().len(),
-            std::fs::metadata(&sibling).unwrap().len(),
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let mut links: u64 = 0;
+        while raw_ctime(&wheel) == ctime_before && std::time::Instant::now() < deadline {
+            let _ = std::fs::remove_file(&sibling);
+            std::fs::hard_link(&wheel, &sibling).unwrap();
+            links += 1;
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            std::fs::symlink_metadata(&sibling).unwrap().len()
+                == std::fs::metadata(&wheel).unwrap().len(),
+        );
+        assert_ne!(
+            raw_ctime(&wheel),
+            ctime_before,
+            "{links} links never moved ctime; this guard would be vacuous",
         );
         assert_eq!(
             wheel_file_fingerprint(&wheel).unwrap(),
