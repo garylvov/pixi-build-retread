@@ -517,8 +517,26 @@ echo "### backend shim: $SHIM -> $BACKEND ; stderr tee -> $BLOG"
 echo "### pixi.real --version: $($PIXI --version)"
 echo "### PIXI_BUILD_BACKEND_OVERRIDE=$PIXI_BUILD_BACKEND_OVERRIDE"
 env | grep -E '^(HOME|PIXI_|RATTLER_|UV_|XDG_|TMPDIR|RETREAD_|CONDA_OVERRIDE)' | sort
-echo "### persistent cache sizes BEFORE the lock:"
-du -sh "${RETREAD_PERSIST_CACHE_ROOT:-/oscar/data/stellex/glvov/agrescap/cache/retread}"/* 2>/dev/null
+# --- persistent-cache census (NEVER `du` this tree) ----------------------------
+# `du -sh <persist cache root>/*` walks the uv cache and the 69 GB stage mirror
+# over NFS. Job 5678087 sat in it for 26+ minutes in D-state BEFORE its lock
+# started -- half an hour of a 3 h wall spent on a diagnostic. Audit item C6
+# already ruled "no `du` over the store in harnesses"; the template still had
+# two calls. What the lane logs actually quote off these lines is the ENTRY
+# COUNT ("store entries before 0 / after 225"), never the byte total, so count
+# the top-level entries and never descend.
+cache_census() {
+  local root=${RETREAD_PERSIST_CACHE_ROOT:-/oscar/data/stellex/glvov/agrescap/cache/retread}
+  local d n
+  for d in "$root"/*; do
+    [ -e "$d" ] || continue
+    n=$(ls -1U "$d" 2>/dev/null | wc -l)
+    printf '  %8s top-level entries  %s\n' "$n" "$d"
+  done
+}
+
+echo "### persistent cache census BEFORE the lock (entry counts; du is banned here):"
+cache_census
 
 ########## 3. LOCK ($EXPECT_ENVS envs, no pre-existing pixi.lock) ##########
 cd "$WS" || exit 5
@@ -541,8 +559,8 @@ echo "### /usr/bin/time -v (lock) -> $LTIME"
 grep -E 'Elapsed \(wall|Maximum resident set size|User time|System time|Percent of CPU' "$LTIME" | sed 's/^/  /'
 LRSS=$(awk -F': ' '/Maximum resident set size/{print $2}' "$LTIME")
 echo "### lock peak RSS: ${LRSS:-UNKNOWN} kbytes  (72G request = $( [ -n "$LRSS" ] && awk -v r="$LRSS" 'BEGIN{printf "%.0fx", 72*1024*1024/r}' || echo '?') headroom)"
-echo "### persistent cache sizes AFTER the lock:"
-du -sh "${RETREAD_PERSIST_CACHE_ROOT:-/oscar/data/stellex/glvov/agrescap/cache/retread}"/* 2>/dev/null
+echo "### persistent cache census AFTER the lock (entry counts; du is banned here):"
+cache_census
 
 ########## 4. FIRST-CUT EVIDENCE ##########
 if [ -f "$WS/pixi.lock" ]; then
