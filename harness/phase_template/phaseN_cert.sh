@@ -20,7 +20,9 @@
 #      afterok cert, the cleanup's dependency never releases, and both roots are
 #      stranded forever: C18A/C18B, job 5759225). Better still, and what the
 #      launcher should do, is submit ONE gated cleanup at DISPATCH with that
-#      same dependency and set CLEANUP_AT_DISPATCH=1 here. An `rm -rf`
+#      same dependency and record its JOB ID -- as CLEANUP_JOB= in the handoff
+#      stamp, or as CLEANUP_AT_DISPATCH=<that job id> here -- so this script
+#      DEFERS instead of becoming a second owner of the same roots. An `rm -rf`
 #      of a job-scoped root inside the job cost 5152s (86 min) on job 5596128
 #      against a 3679s lock, and 4795s + 2552s on job 5598763 -- while holding
 #      16 CPUs and 100-160G of a per-user QOS capped at cpu 64 / mem 492G.
@@ -128,6 +130,27 @@
 #           --job-name=<tag>-p2 --dependency=afterok:<relock job> \
 #           --output=<shared path>/slurm-%j.out ./phaseN_cert.sh
 #
+#
+# ---- EXACTLY ONE CLEANUP OWNER PER ROOT (measured 2026-09-04, tag AFINAL2) ---
+#   The roots /oscar/data/stellex/glvov/retread/certAFINAL2-5769426 and
+#   ws.AFINAL2-5769426 were handed to TWO cleanup jobs at once: the
+#   dispatch-time gated cleanup 5770508, submitted by the launcher on
+#   `--dependency=afterany:<p1>:<p2>`, and this script's OWN self-submitted
+#   cleanup 5776646. Both released on the same dependency, both started
+#   08:39:44 on node2343, and both walked the same two trees.
+#   Two concurrent `rm -rf` walks of one tree unlink entries out from under
+#   each other, so each one's rmdir of a parent finds children it cannot see.
+#   BOTH returned rc=1 with pages of "Directory not empty"; 5776646 also hit
+#   `rm: fts_read failed: Stale file handle`, which only a second walker can
+#   produce. Both logged `exists_after=YES` for both roots. 590028 + 668715
+#   entries were LEFT ON DISK after 2864 s and 3941 s of wall, and both jobs
+#   still reported `CLEANUP DONE rc=0`.
+#   THE RULE: one owner per root, chosen from a fact RECORDED ON DISK, and
+#   named in the log by both branches. phaseN_relock.sh writes `CLEANUP_JOB=`
+#   into the handoff stamp; `cleanup_owner` here reads it and returns
+#   "dispatch <id>" or "self -", and `cleanup_submit_or_defer` either submits
+#   exactly one cleanup or submits nothing and says whose job it defers to.
+#   Guarded by phase_template/cleanup_owner_guard.sh.
 # NEVER edit this file while a job is running it -- copy it aside first.
 ### EVIDENCE END
 set -uo pipefail
@@ -287,6 +310,76 @@ if [ -n "$LEFT" ]; then
 fi
 echo "### leftover-token self-check: clean"
 ### LEFTOVER-CHECK END
+
+########## EXACTLY ONE CLEANUP OWNER PER ROOT ##########
+# Two cleanup jobs were once handed the same two job-scoped roots and their
+# `rm -rf` walks raced: both returned rc=1 "Directory not empty" and both roots
+# were left on disk. The incident, with job ids and counts, is in the EVIDENCE
+# header above. These two functions are the fix, and they decide from a RECORDED
+# FACT -- the CLEANUP_JOB= line phaseN_relock.sh writes into the handoff stamp --
+# rather than from anything about this job's environment.
+#
+# Both branches PRINT WHO OWNS THE ROOTS. A reader of the log never has to infer
+# whether a cleanup exists.
+
+cleanup_owner () {
+  # Echoes two words: "<who> <jobid>". `dispatch <id>` means a cleanup job
+  # already exists and owns these roots, so this cert job must submit nothing.
+  # `self -` means nobody owns them yet and this cert job is the owner.
+  #
+  # Sources, in order:
+  #   1. CLEANUP_JOB, from the phase-1 -> phase-2 handoff stamp
+  #      ($P1D/artifacts/relock_env.sh), sourced below. The launcher submits
+  #      the gated cleanup after both phases are queued, so the relock phase
+  #      records the id there and it is on disk before this job starts.
+  #   2. CLEANUP_AT_DISPATCH in this job's environment, for the operator who
+  #      sets it directly. Set it to the cleanup's JOB ID. The legacy value
+  #      `1` still defers, but can only print `unrecorded-id` -- a worse log
+  #      line, and the reason the stamp is the preferred channel.
+  # Unset, empty, 0 or `none` in both means NO dispatch cleanup is recorded.
+  local id=""
+  case "${CLEANUP_JOB:-}" in
+    ''|0|none|NONE|unset) ;;
+    *) id=$CLEANUP_JOB ;;
+  esac
+  if [ -z "$id" ]; then
+    case "${CLEANUP_AT_DISPATCH:-0}" in
+      ''|0|none|NONE) ;;
+      1) id=unrecorded-id ;;
+      *) id=$CLEANUP_AT_DISPATCH ;;
+    esac
+  fi
+  if [ -n "$id" ]; then echo "dispatch $id"; else echo "self -"; fi
+}
+
+cleanup_submit_or_defer () {   # $1=dependency spec  $2..=roots
+  local dep=$1; shift
+  local owner who id clj clrc
+  owner=$(cleanup_owner); who=${owner%% *}; id=${owner#* }
+  if [ "$who" = dispatch ]; then
+    echo "### CLEANUP OWNER: job $id (submitted at dispatch) -- roots: $*"
+    echo "### cleanup NOT submitted here: exactly one cleanup owner per root; this cert job ${J:-?} defers to job $id"
+    return 0
+  fi
+  if [ ! -x "$CLEANUP" ]; then
+    echo "### CLEANUP OWNER: NOBODY -- $CLEANUP is missing or not executable; roots left on disk, clean them by hand:"
+    echo "    $*"
+    return 1
+  fi
+  # shellcheck disable=SC2086
+  clj=$(env -u SLURM_JOB_ID sbatch --parsable $CLEANUP_SBATCH_ARGS \
+        --job-name=${TAG}-cleanup --dependency=$dep \
+        --output=$A/slurm-cleanup-%j.out "$CLEANUP" "$@" 2>&1); clrc=$?
+  if [ "$clrc" = 0 ]; then
+    echo "### CLEANUP OWNER: job $clj (submitted by this cert job ${J:-?}; no cleanup was recorded at dispatch) -- roots: $*"
+    echo "### cleanup job submitted: $clj (--dependency=$dep) -- this job exits WITHOUT unlinking anything"
+  else
+    echo "### CLEANUP OWNER: NOBODY -- submit failed rc=$clrc output: $clj"
+    echo "### RUN THIS BY HAND, it is the only thing that returns the inodes:"
+    echo "    env -u SLURM_JOB_ID sbatch $CLEANUP_SBATCH_ARGS --job-name=${TAG}-cleanup $CLEANUP $*"
+  fi
+  return 0
+}
 
 J=${SLURM_JOB_ID:?missing Slurm job id}
 A=$D/artifacts
@@ -505,7 +598,8 @@ if [ "${DRY_RUN:-0}" = 1 ]; then
   echo "### envs that WOULD run, in DISPATCH order (longest-first):"; cert_run_order | sed 's/^/  /'
   echo "### rows would be concatenated back in DECLARATION order:"; for ENV in $CERT_ENVS; do echo "  $ENV"; done
   echo "### verdict gate that WOULD score them: $VERDICT against $CERT_BASELINE"
-  echo "### cleanup that WOULD be submitted: $CLEANUP with --dependency=afterany:${P1_JOB:-<p1>}:$J on $C ${P1_CACHE_ROOT:-} $WS (CLEANUP_AT_DISPATCH=${CLEANUP_AT_DISPATCH:-0})"
+  echo "### cleanup that WOULD be submitted: $CLEANUP with --dependency=afterany:${P1_JOB:-<p1>}:$J on $C ${P1_CACHE_ROOT:-} $WS"
+  echo "### cleanup owner resolves to: $(cleanup_owner) (CLEANUP_JOB=${CLEANUP_JOB:-unset} CLEANUP_AT_DISPATCH=${CLEANUP_AT_DISPATCH:-0})"
   exit 0
 fi
 
@@ -638,25 +732,10 @@ echo "### cleanup roots: $ROOTS"
 # dependency too, so the same job also covers a relock that never handed off.
 CLEANUP_DEP=afterany:$J
 [ -n "${P1_JOB:-}" ] && CLEANUP_DEP=afterany:${P1_JOB}:$J
-if [ "${CLEANUP_AT_DISPATCH:-0}" = 1 ]; then
-  echo "### cleanup NOT submitted here: CLEANUP_AT_DISPATCH=1 -- the launcher owns one gated cleanup on --dependency=afterany:${P1_JOB:-<p1>}:$J over $ROOTS"
-elif [ -x "$CLEANUP" ]; then
-  # shellcheck disable=SC2086
-  CLJ=$(env -u SLURM_JOB_ID sbatch --parsable $CLEANUP_SBATCH_ARGS \
-        --job-name=${TAG}-cleanup --dependency=$CLEANUP_DEP \
-        --output=$A/slurm-cleanup-%j.out "$CLEANUP" $ROOTS 2>&1)
-  CLRC=$?
-  if [ "$CLRC" = 0 ]; then
-    echo "### cleanup job submitted: $CLJ (--dependency=$CLEANUP_DEP) -- this job exits WITHOUT unlinking anything"
-  else
-    echo "### CLEANUP SUBMIT FAILED rc=$CLRC output: $CLJ"
-    echo "### RUN THIS BY HAND, it is the only thing that returns the inodes:"
-    echo "    env -u SLURM_JOB_ID sbatch $CLEANUP_SBATCH_ARGS --job-name=${TAG}-cleanup $CLEANUP $ROOTS"
-  fi
-else
-  echo "### CLEANUP SCRIPT MISSING OR NOT EXECUTABLE: $CLEANUP -- roots left on disk, clean them by hand:"
-  echo "    $ROOTS"
-fi
+# ONE owner. Defers when the stamp names a dispatch cleanup, submits exactly one
+# when it does not, and names the owning job id either way.
+# shellcheck disable=SC2086
+cleanup_submit_or_defer "$CLEANUP_DEP" $ROOTS
 echo "### inode quota AFTER (pre-cleanup):"; "$CQ" 2>/dev/null | grep -E 'data\+stellex' | head -2
 echo "### ${TAG} CERT DONE verdict_rc=$VRC $(date -Is)"
 exit "$VRC"

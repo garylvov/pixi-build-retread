@@ -92,6 +92,7 @@ same node with the same manifest and the same binary.
    bash tools/phase_template/wedge_triage_guard.sh       # after any triage edit
    bash tools/phase_template/census_collation_guard.sh   # after any stage-census edit
    bash tools/phase_template/wheel_store_census_guard.sh # after any wheel-store edit
+   bash tools/phase_template/cleanup_owner_guard.sh     # after any cleanup-ownership edit
    ```
 
    > **The stage census is C-sorted at both ends, and that is load-bearing.**
@@ -119,6 +120,37 @@ same node with the same manifest and the same binary.
    > does rather than reading back the variable the harness set — so a seed that
    > silently failed to take effect prints `SHARED`.
    > Guard: `wheel_store_census_guard.sh`.
+
+   > **Exactly ONE cleanup owner per root, and the log names it.** A cleanup
+   > submitted at dispatch and the cert phase's own self-submitted cleanup are
+   > two owners of the same job-scoped roots, and they run at the same instant
+   > because they hang on the same dependency. Two concurrent `rm -rf` walks of
+   > one tree unlink entries out from under each other, so each one's rmdir of a
+   > parent finds children it cannot see. **Measured 2026-09-04, tag AFINAL2:**
+   > the dispatch-time gated cleanup **5770508** and the cert's self-submitted
+   > **5776646** both released on `afterany:5769426:5769500`, both started
+   > 08:39:44 on node2343, and both walked
+   > `/oscar/data/stellex/glvov/retread/certAFINAL2-5769426` (590,028 entries)
+   > and `ws.AFINAL2-5769426` (668,715 entries). **Both returned `rc=1` with
+   > pages of `Directory not empty`**; 5776646 also logged
+   > `rm: fts_read failed: Stale file handle`, which only a second walker can
+   > produce. Both logged `exists_after=YES` for both roots, both still printed
+   > `CLEANUP DONE rc=0`, and **both roots were left on disk** after 2864 s and
+   > 3941 s of wall.
+   > The owner is now a recorded fact, not an environment guess.
+   > `phaseN_relock.sh` resolves it from `CLEANUP_AT_DISPATCH` or from the
+   > dispatch note `<artifacts>/cleanup_at_dispatch.jobid` and writes
+   > `CLEANUP_JOB=<id>` into the phase-1 → phase-2 handoff stamp
+   > (`relock_env.sh`, alongside `P1_JOB=`/`WS=`/`LOCK=`/`EXPECT_LOCK_MD5=`).
+   > `phaseN_cert.sh`'s `cleanup_owner` reads it and returns `dispatch <id>` or
+   > `self -`, and `cleanup_submit_or_defer` either submits **nothing** and
+   > prints
+   > `### CLEANUP OWNER: job <id> (submitted at dispatch) -- roots: …`, or
+   > submits **exactly one** and prints
+   > `### CLEANUP OWNER: job <id> (submitted by this cert job <J>; no cleanup was recorded at dispatch) -- roots: …`.
+   > Neither branch is silent: a reader of the log can name the owning job
+   > without inferring anything.
+   > Guard: `cleanup_owner_guard.sh`.
 
    > **The check matches the LINE, never "FILENAME:LNO: line".** It used to
    > annotate first and pipe the annotated text to `grep`, so it matched its own
@@ -160,9 +192,14 @@ same node with the same manifest and the same binary.
    ```
    **Submit all THREE, and the third one now, not later.** The cleanup is
    `afterany` on *both* phases, so it also reclaims the roots of a relock that
-   failed its own lock — the case that stranded C18A/C18B. Then export
-   `CLEANUP_AT_DISPATCH=1` into the cert (or set it in the copied script) so the
-   cert prints its roots and submits nothing. See "Hazard 2".
+   failed its own lock — the case that stranded C18A/C18B. Then **record that
+   cleanup's job id** so the cert phase defers to it instead of becoming a
+   second owner: either `echo <cleanup job id> > <p1 artifacts>/cleanup_at_dispatch.jobid`
+   before the relock reaches its handoff, or export
+   `CLEANUP_AT_DISPATCH=<cleanup job id>` into the relock and the cert. The
+   legacy `CLEANUP_AT_DISPATCH=1` still defers but logs `unrecorded-id`, which
+   is strictly worse to read. Record NOTHING and the cert submits and owns one
+   itself, which is correct — what is never correct is both. See "Hazard 2".
    **24G relock / 32G cert, and the cert asks for 4 hours, not 8** — both changed
    2026-09-02 with the parallel env loop (next section). Sizing, all of it
    `/usr/bin/time -v` `Maximum resident set size`, never `sacct`: worst relock
@@ -245,10 +282,13 @@ the second one cost us two 450k-entry roots:
 
 Who submits it. Preferred, and what p6mbc and b4u do (job 5769783 shows
 `afterany:5769781,afterany:5769782`): the **launcher** submits one *gated*
-cleanup at dispatch, right after it has both job ids, and sets
-`CLEANUP_AT_DISPATCH=1` for the cert so the cert only prints the roots. Fallback:
-the cert submits it, and includes `$P1_JOB` from the relock stamp in the
-dependency. Either way the roots are printed before the cleanup job exists, so a
+cleanup at dispatch, right after it has both job ids, and **records that
+cleanup's job id** — as `CLEANUP_AT_DISPATCH=<id>` or in
+`<p1 artifacts>/cleanup_at_dispatch.jobid` — so the relock stamps `CLEANUP_JOB=`
+and the cert defers, printing the owning job id and submitting nothing.
+Fallback: the cert submits it, and includes `$P1_JOB` from the relock stamp in
+the dependency. **Never both** — jobs 5770508 and 5776646 both owned the AFINAL2
+roots, raced, and left them on disk. Either way the roots are printed before the cleanup job exists, so a
 diagnostician who wants to keep them can hold them by cancelling it.
 
     env -u SLURM_JOB_ID sbatch --partition=batch --qos=normal \

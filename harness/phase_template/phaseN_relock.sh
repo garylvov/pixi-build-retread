@@ -87,6 +87,23 @@
 #           --job-name=<tag>-p1 --output=<shared path>/slurm-%j.out \
 #           ./phaseN_relock.sh
 #
+#
+# ---- EXACTLY ONE CLEANUP OWNER PER ROOT (measured 2026-09-04, tag AFINAL2) ---
+#   The roots /oscar/data/stellex/glvov/retread/certAFINAL2-5769426 and
+#   ws.AFINAL2-5769426 were cleaned by TWO jobs at once: the dispatch-time
+#   gated cleanup 5770508 and the cert phase's OWN self-submitted cleanup
+#   5776646. Both released on the same dependency, both started 08:39:44 on
+#   node2343, and both walked the same trees. Two concurrent `rm -rf` walks of
+#   one tree unlink entries out from under each other: BOTH returned rc=1 with
+#   pages of "Directory not empty" (5776646 also logged `rm: fts_read failed:
+#   Stale file handle`), both logged `exists_after=YES`, and 590028 + 668715
+#   entries were LEFT ON DISK after 2864 s and 3941 s of wall.
+#   Nothing on disk told the cert phase that an owner already existed. Section 6
+#   now records one: `CLEANUP_JOB=` in the handoff stamp names the dispatch
+#   cleanup's job id, and phaseN_cert.sh's `cleanup_owner` defers to it instead
+#   of submitting a second owner. Empty means nobody owns them and the cert
+#   phase submits and owns exactly one, as it always did.
+#   Guarded by phase_template/cleanup_owner_guard.sh.
 # NEVER edit this file while a job is running it -- copy it aside first.
 ### EVIDENCE END
 set -uo pipefail
@@ -881,6 +898,35 @@ echo "  arm copy  $PROBES_ARM"
 LC_ALL=C diff "$PROBES_CANON" "$PROBES_ARM" | sed 's/^/  /'
 
 ########## 6. HANDOFF TO THE CERT PHASE ##########
+# WHO OWNS THE JOB-SCOPED ROOTS, recorded here so the cert phase never guesses.
+# Two cleanup jobs once raced on the same two roots and left both on disk; the
+# measurement is in the EVIDENCE header above. The rule is one owner per root,
+# and this is where the owner is written down.
+#
+# Two sources, in order, both facts rather than environment guesses:
+#   1. CLEANUP_AT_DISPATCH in THIS relock job's environment -- set it to the
+#      cleanup's JOB ID. The legacy value `1` is honoured but records only
+#      `unrecorded-id`, which makes for a worse cert log line.
+#   2. $A/cleanup_at_dispatch.jobid, the dispatch note. The launcher submits the
+#      gated cleanup only AFTER both phases are queued, so the id cannot be in
+#      this job's environment; it writes the id into that file instead, any time
+#      before this job reaches the handoff.
+# Nothing recorded => CLEANUP_JOB= is written empty, and the cert phase submits
+# and owns its own cleanup exactly as it did before this rule existed.
+CLEANUP_JOB_RECORD=""
+case "${CLEANUP_AT_DISPATCH:-0}" in
+  ''|0|none|NONE) ;;
+  1) CLEANUP_JOB_RECORD=unrecorded-id ;;
+  *) CLEANUP_JOB_RECORD=$CLEANUP_AT_DISPATCH ;;
+esac
+if [ -z "$CLEANUP_JOB_RECORD" ] && [ -r "$A/cleanup_at_dispatch.jobid" ]; then
+  CLEANUP_JOB_RECORD=$(tr -dc '0-9_' < "$A/cleanup_at_dispatch.jobid" | head -c 32)
+fi
+if [ -n "$CLEANUP_JOB_RECORD" ]; then
+  echo "### CLEANUP OWNER AT DISPATCH: job $CLEANUP_JOB_RECORD -- recorded in the handoff stamp; the cert phase will DEFER to it"
+else
+  echo "### CLEANUP OWNER AT DISPATCH: NONE RECORDED -- the cert phase will submit and own exactly one cleanup"
+fi
 if [ "$LRC" = 0 ] && [ -f "$A/pixi.lock.cert" ] && [ "$MIRROR_DIRTY" = 0 ] && [ "$SRC_WRITTEN" = 0 ]; then
   {
     echo "# written by phaseN_relock.sh (${TAG}) job $J $(date -Is)"
@@ -889,6 +935,7 @@ if [ "$LRC" = 0 ] && [ -f "$A/pixi.lock.cert" ] && [ "$MIRROR_DIRTY" = 0 ] && [ 
     echo "P1_CACHE_ROOT=$C"
     echo "LOCK=$A/pixi.lock.cert"
     echo "EXPECT_LOCK_MD5=$(md5sum < "$A/pixi.lock.cert" | awk '{print $1}')"
+    echo "CLEANUP_JOB=$CLEANUP_JOB_RECORD"
   } > "$A/relock_env.sh"
   echo "### cert-phase handoff written:"; cat "$A/relock_env.sh"
 else
@@ -899,8 +946,10 @@ fi
 # See the EVIDENCE header: an `rm -rf` of a job-scoped root on the afterok path
 # cost job 5596128 5152s of held QOS. Cleanup is a separate 1-CPU job hung on
 # `--dependency=afterany:<this job>:<cert job>` -- BOTH phases, `afterany` on
-# both. Submitted at DISPATCH by the launcher (CLEANUP_AT_DISPATCH=1) or, failing
-# that, by the cert phase with the relock job included in the dependency.
+# both. Submitted at DISPATCH by the launcher, whose job id section 6 records
+# as CLEANUP_JOB= in the handoff stamp, or -- when nothing is recorded -- by
+# the cert phase with the relock job included in the dependency. EXACTLY ONE
+# of the two, never both: two owners racing on one root leaves it on disk.
 #
 # NEVER behind the cert alone. When this relock fails its own lock the block
 # above writes no handoff, Slurm cancels the afterok cert, and a cleanup that
