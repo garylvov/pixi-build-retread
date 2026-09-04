@@ -5203,6 +5203,13 @@ impl Handler {
             resolved_workspace_target.as_ref(),
             &cache_workspace_solve_fingerprint,
         );
+        // C13: the `retread-verify-snapshots` config key, read in the same
+        // place and the same way as the built-output store's key. A config key
+        // rather than an environment variable, so a misspelling is a load
+        // error instead of a silent no-op.
+        crate::source_build::set_verify_snapshots_full(
+            pre_key_config.verify_snapshots.unwrap_or(false),
+        );
         // The SHARED built-output store, if the pack opted into one. Keyed on
         // content alone, so a workspace staged at a new path can adopt this
         // result instead of recomputing it. Unset = the store does not exist.
