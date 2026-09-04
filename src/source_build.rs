@@ -1714,6 +1714,11 @@ where
     F: FnMut(PathBuf, SourceBuildEnvironment) -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
+    // bench (measurement only): C12. Every wheel built from a git or path
+    // source passes through here, and until C12 the whole call emitted
+    // nothing -- a cache hit and a full `uv build --wheel` were
+    // indistinguishable from the log. `span_path` says which one ran.
+    let cached_build_started = std::time::Instant::now();
     let hermetic_candidate = hermetic_build_may_engage(target);
     let hermetic_environment = if hermetic_candidate {
         let target_floor = target
@@ -1805,7 +1810,23 @@ where
                 }
             }
             if !rebuild_hermetically {
-                return materialize_validated_wheel(&wheel, &materialized_out).await;
+                let wheel_bytes = std::fs::metadata(&wheel.path).map(|m| m.len()).unwrap_or(0);
+                let materialize_started = std::time::Instant::now();
+                let materialized = materialize_validated_wheel(&wheel, &materialized_out).await;
+                tracing::info!(
+                    kind,
+                    wheel = %wheel.marker.filename,
+                    bytes = wheel_bytes,
+                    elapsed_ms = materialize_started.elapsed().as_millis() as u64,
+                    "bench: materialize_validated_wheel",
+                );
+                tracing::info!(
+                    kind,
+                    span_path = "cache-hit",
+                    elapsed_ms = cached_build_started.elapsed().as_millis() as u64,
+                    "bench: cached_build",
+                );
+                return materialized;
             }
         }
         Ok(None) => {}
@@ -2000,7 +2021,29 @@ where
         path: cache_dir.join(&marker.filename),
         marker,
     };
-    materialize_validated_wheel(&published, &materialized_out).await
+    let wheel_bytes = std::fs::metadata(&published.path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let materialize_started = std::time::Instant::now();
+    let materialized = materialize_validated_wheel(&published, &materialized_out).await;
+    tracing::info!(
+        kind,
+        wheel = %published.marker.filename,
+        bytes = wheel_bytes,
+        elapsed_ms = materialize_started.elapsed().as_millis() as u64,
+        "bench: materialize_validated_wheel",
+    );
+    tracing::info!(
+        kind,
+        span_path = if retried_hermetically {
+            "built-hermetic"
+        } else {
+            "built-host"
+        },
+        elapsed_ms = cached_build_started.elapsed().as_millis() as u64,
+        "bench: cached_build",
+    );
+    materialized
 }
 
 async fn lookup_cached_build(
@@ -2821,8 +2864,19 @@ fn prepare_source_snapshot(
     out_dir: &Path,
     additional_excluded_roots: &[PathBuf],
 ) -> Result<PreparedSourceSnapshot> {
+    // bench (measurement only): C12. This is a full byte-for-byte tree copy
+    // that also hashes every file it writes, and it runs at least twice per
+    // path-source build (pristine + disposable). It emitted no row before.
+    let snapshot_started = std::time::Instant::now();
     let mut visit_hook = |_: &Path, _: SnapshotVisitPhase| Ok(());
-    prepare_source_snapshot_with_hook(source, out_dir, additional_excluded_roots, &mut visit_hook)
+    let prepared =
+        prepare_source_snapshot_with_hook(source, out_dir, additional_excluded_roots, &mut visit_hook);
+    tracing::info!(
+        tree = %source.display(),
+        elapsed_ms = snapshot_started.elapsed().as_millis() as u64,
+        "bench: source_snapshot",
+    );
+    prepared
 }
 
 #[cfg(target_os = "linux")]
@@ -3630,7 +3684,8 @@ pub(crate) async fn build_wheel_from_path_for_target(
                     environment.python_argument(&python.identity())
                 );
                 let out_arg = format!("--out-dir={}", private_out.display());
-                run_capturing_uv_in(
+                let uv_build_started = std::time::Instant::now();
+                let built = run_capturing_uv_in(
                     &[
                         "build",
                         "--wheel",
@@ -3644,7 +3699,14 @@ pub(crate) async fn build_wheel_from_path_for_target(
                     build_epoch,
                     static_cpp_runtime,
                 )
-                .await
+                .await;
+                tracing::info!(
+                    kind = "path",
+                    project = %build_source.display(),
+                    elapsed_ms = uv_build_started.elapsed().as_millis() as u64,
+                    "bench: uv_build_wheel",
+                );
+                built
             }
         },
     )
@@ -5430,6 +5492,12 @@ async fn ensure_canonical_git_snapshot(
     ref_state: &str,
     submodules: Option<GitSubmodules>,
 ) -> Result<CanonicalGitSnapshot> {
+    // bench (measurement only): C12 -- this span and the `cached_build` span
+    // below are the only two terms in the git-source materialization chain
+    // that ever emitted no row at all. The 404 s block in the p6m cold proof
+    // (job 5723774) was inferred from gaps between unrelated rows because of
+    // it; measure it directly instead.
+    let snapshot_started = std::time::Instant::now();
     let repository_identity =
         canonical_git_repository_identity(upstream_url, resolved_sha, submodules);
     let cache_dir = crate::courier::retread_cache_root()
@@ -5468,7 +5536,7 @@ async fn ensure_canonical_git_snapshot(
             // Published canonical trees are never self-healed or replaced
             // while a reader could be using them. Corruption is therefore a
             // fail-closed error rather than a delete/rebuild race.
-            return validate_canonical_git_snapshot(
+            let validated = validate_canonical_git_snapshot(
                 &cache_dir,
                 &repository_identity,
                 resolved_sha,
@@ -5477,6 +5545,14 @@ async fn ensure_canonical_git_snapshot(
                 true,
             )
             .await;
+            tracing::info!(
+                repository = %repository_identity,
+                commit = %resolved_sha,
+                span_path = "cache-hit",
+                elapsed_ms = snapshot_started.elapsed().as_millis() as u64,
+                "bench: canonical_git_snapshot",
+            );
+            return validated;
         }
     }
 
@@ -5517,7 +5593,14 @@ async fn ensure_canonical_git_snapshot(
         clone.arg(shared_checkout);
     }
     clone.arg(&repo);
+    let clone_started = std::time::Instant::now();
     run_silent(&mut clone, "git clone canonical source").await?;
+    tracing::info!(
+        repository = %repository_identity,
+        promisor = promisor_checkout,
+        elapsed_ms = clone_started.elapsed().as_millis() as u64,
+        "bench: canonical_git_clone",
+    );
     if let Some(shared_tags) = &shared_tags {
         let mut required_objects = vec![resolved_sha.to_string()];
         required_objects.extend(shared_tags.refs.iter().map(|tag| tag.object_id.clone()));
@@ -5607,6 +5690,7 @@ async fn ensure_canonical_git_snapshot(
         );
     }
     let repo_for_normalize = repo.clone();
+    let normalize_started = std::time::Instant::now();
     tokio::task::spawn_blocking(move || {
         sanitize_canonical_git_metadata(&repo_for_normalize)?;
         // `git status` runs clean filters. Git LFS writes a transient file to
@@ -5620,6 +5704,11 @@ async fn ensure_canonical_git_snapshot(
     })
     .await
     .context("canonical Git source normalization task panicked")??;
+    tracing::info!(
+        repository = %repository_identity,
+        elapsed_ms = normalize_started.elapsed().as_millis() as u64,
+        "bench: canonical_git_normalize",
+    );
     let marker = CanonicalGitSourceMarker {
         schema: CANONICAL_GIT_SOURCE_SCHEMA.to_string(),
         repository_identity: repository_identity.clone(),
@@ -5639,7 +5728,7 @@ async fn ensure_canonical_git_snapshot(
     })?;
     std::fs::rename(&staging.0, &cache_dir)
         .with_context(|| format!("publishing canonical Git source {}", cache_dir.display()))?;
-    validate_canonical_git_snapshot(
+    let published = validate_canonical_git_snapshot(
         &cache_dir,
         &repository_identity,
         resolved_sha,
@@ -5647,7 +5736,15 @@ async fn ensure_canonical_git_snapshot(
         submodules,
         true,
     )
-    .await
+    .await;
+    tracing::info!(
+        repository = %repository_identity,
+        commit = %resolved_sha,
+        span_path = "clone",
+        elapsed_ms = snapshot_started.elapsed().as_millis() as u64,
+        "bench: canonical_git_snapshot",
+    );
+    published
 }
 
 /// Derive a disposable, writable SCM checkout from an immutable canonical Git
@@ -5976,9 +6073,15 @@ async fn build_wheel_from_git_inner(
             .await?;
     let project_root = confined_git_source_dir(&canonical.root, &subdirectory)?;
     let pyproject = pyproject_from_directory(&project_root)?;
+    let build_requirements_started = std::time::Instant::now();
     let build_requirements =
         resolve_build_requirements(pyproject.as_deref(), &base_source_identity, target, false)
             .await?;
+    tracing::info!(
+        kind = "git",
+        elapsed_ms = build_requirements_started.elapsed().as_millis() as u64,
+        "bench: resolve_build_requirements",
+    );
     let source_identity = hash_fields(
         b"retread-git-wheel-build-inputs-v1\0",
         &[
@@ -6017,6 +6120,11 @@ async fn build_wheel_from_git_inner(
             let subdirectory_for_build = subdirectory_for_build.clone();
             let build_requirements = build_requirements_for_build.clone();
             async move {
+                // bench (measurement only): C12 splits the previously silent
+                // git build into its two real terms -- the disposable
+                // `git clone --shared` of the canonical snapshot, and the
+                // PEP 517 `uv build --wheel` itself.
+                let tree_started = std::time::Instant::now();
                 let private_project_root = prepare_private_git_build_tree(
                     &canonical_for_build,
                     &upstream_url_for_build,
@@ -6024,11 +6132,17 @@ async fn build_wheel_from_git_inner(
                     &private_out,
                 )
                 .await?;
+                tracing::info!(
+                    project = %private_project_root.display(),
+                    elapsed_ms = tree_started.elapsed().as_millis() as u64,
+                    "bench: private_git_build_tree",
+                );
                 let py_arg = format!(
                     "--python={}",
                     environment.python_argument(&python.identity())
                 );
                 let out_arg = format!("--out-dir={}", private_out.display());
+                let uv_build_started = std::time::Instant::now();
                 run_capturing_uv_in(
                     &[
                         "build",
@@ -6044,6 +6158,13 @@ async fn build_wheel_from_git_inner(
                     static_cpp_runtime,
                 )
                 .await?;
+                tracing::info!(
+                    kind = "git",
+                    project = %private_project_root.display(),
+                    elapsed_ms = uv_build_started.elapsed().as_millis() as u64,
+                    "bench: uv_build_wheel",
+                );
+                let validate_started = std::time::Instant::now();
                 let cache_dir = canonical_for_build
                     .root
                     .parent()
@@ -6057,6 +6178,11 @@ async fn build_wheel_from_git_inner(
                     true,
                 )
                 .await?;
+                tracing::info!(
+                    repository = %canonical_for_build.repository_identity,
+                    elapsed_ms = validate_started.elapsed().as_millis() as u64,
+                    "bench: revalidate_canonical_git_snapshot",
+                );
                 Ok(())
             }
         },

@@ -15523,6 +15523,11 @@ async fn materialize_and_rewrite_with_abi_aliases(
     abi_aliases: &AbiAliasGraph,
 ) -> Result<(ResolvedWheel, Vec<String>)> {
     let pypi_name = canonical_conda_name(entry_name);
+    // bench (measurement only): C12. Phase 1 is where a git or path entry
+    // pays its clone + PEP 517 build; nothing bracketed it, so in the p6m
+    // cold proof its cost was only visible as unexplained gaps between two
+    // unrelated rows.
+    let phase1_started = std::time::Instant::now();
     let persisted_auto_data = persist_git_auto_data(auto_data.as_ref())?;
 
     // Phase 1: get the raw wheel onto disk. For source-built wheels
@@ -15867,6 +15872,24 @@ async fn materialize_and_rewrite_with_abi_aliases(
         }
     };
 
+    tracing::info!(
+        entry = %entry_name,
+        form = if entry.from.is_some() {
+            "named-git"
+        } else if entry.url.is_some() {
+            "url"
+        } else if entry.path.is_some() {
+            "path"
+        } else if entry.git.is_some() {
+            "inline-git"
+        } else {
+            "pypi"
+        },
+        bytes = std::fs::metadata(&raw_path).map(|m| m.len()).unwrap_or(0),
+        elapsed_ms = phase1_started.elapsed().as_millis() as u64,
+        "bench: materialize_phase1",
+    );
+
     // Phase 1.5: for source-built wheels, top up the wheel with any
     // files the upstream's setup.py forgot to ship. Common breakage:
     // `packages=["isaaclab"]` without find_packages() emits a wheel
@@ -15889,6 +15912,10 @@ async fn materialize_and_rewrite_with_abi_aliases(
                 source = %root.display(),
                 "auto-injecting missing source-root files into wheel",
             );
+            // bench (measurement only): C12. Phase 1.5 rewrites the whole
+            // wheel archive to add the files the PEP 517 backend forgot, so
+            // its cost tracks the wheel's size, not the injected file count.
+            let inject_started = std::time::Instant::now();
             crate::wheel_inject::inject(&raw_path, &out, &root).with_context(|| {
                 format!(
                     "phase 1.5 source-root inject for entry `{entry_name}` \
@@ -15898,6 +15925,12 @@ async fn materialize_and_rewrite_with_abi_aliases(
                     out.display(),
                 )
             })?;
+            tracing::info!(
+                entry = %entry_name,
+                bytes = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0),
+                elapsed_ms = inject_started.elapsed().as_millis() as u64,
+                "bench: wheel_inject",
+            );
         }
         out
     } else {
@@ -15973,6 +16006,11 @@ async fn materialize_and_rewrite_with_abi_aliases(
                 skip_subdirs = ?cfg.skip_subdirs,
                 "phase 1.6: injecting checkout-root tree as wheel .data/data/lib/* (lands at $PREFIX/lib/*)",
             );
+            // bench (measurement only): C12. Phase 1.6 walks the whole
+            // checkout root and re-writes the wheel with every non-ignored
+            // file as `.data/data/lib/*`; isaaclab alone moved 1376 files
+            // here in the p6m cold proof and no row bracketed it.
+            let inject_data_started = std::time::Instant::now();
             let n = crate::wheel_inject_data::inject_checkout_root_data(
                 &injected_path,
                 &out,
@@ -15989,6 +16027,13 @@ async fn materialize_and_rewrite_with_abi_aliases(
                     out.display(),
                 )
             })?;
+            tracing::info!(
+                entry = %entry_name,
+                files = n,
+                bytes = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0),
+                elapsed_ms = inject_data_started.elapsed().as_millis() as u64,
+                "bench: wheel_inject_data",
+            );
             auto_data_file_count = Some(n);
         }
         out
