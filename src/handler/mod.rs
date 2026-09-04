@@ -357,6 +357,230 @@ fn conda_outputs_disk_cache_path(
         .join(format!("{hex}.json"))
 }
 
+/// Shape version of [`workspace_manifest_projection`]. A change to WHICH
+/// manifest content the projection selects is a different key: bump this in
+/// the same commit that changes the selection, or two binaries disagree about
+/// what an address means while both believe it.
+const WORKSPACE_MANIFEST_PROJECTION: &str = "proj-v1";
+
+/// Canonical, formatting-independent rendering of one TOML value.
+///
+/// Keys are emitted in sorted order and every leaf is emitted as a full
+/// `path=value` line, so two loads of the same manifest render identically
+/// regardless of the map order the parser happened to hand back, and a
+/// comment or a re-indent renders to nothing at all. That is deliberate: a
+/// comment cannot change what `conda/outputs` emits, and the whole-file
+/// digest this replaces treated one as a full store invalidation.
+fn canonical_toml_lines(prefix: &str, value: &toml::Value, out: &mut Vec<String>) {
+    match value {
+        toml::Value::Table(table) => {
+            if table.is_empty() {
+                out.push(format!("{prefix}={{}}"));
+                return;
+            }
+            let mut keys: Vec<&String> = table.keys().collect();
+            keys.sort();
+            for key in keys {
+                canonical_toml_lines(&format!("{prefix}.{key}"), &table[key], out);
+            }
+        }
+        toml::Value::Array(items) => {
+            if items.is_empty() {
+                out.push(format!("{prefix}=[]"));
+                return;
+            }
+            for (index, item) in items.iter().enumerate() {
+                canonical_toml_lines(&format!("{prefix}[{index}]"), item, out);
+            }
+        }
+        other => out.push(format!("{prefix}={other}")),
+    }
+}
+
+/// The digest of exactly the workspace-manifest content that can reach THIS
+/// pack's `conda/outputs`, and the one-word reason when it could not be
+/// narrowed and fell back to the whole file.
+///
+/// **The defect.** Component 5 of [`built_output_store_key_material`] was
+/// `file_digest(workspace_dir/"pixi.toml")` — one sha256 over the whole file,
+/// identical for all 14 packs of the canonical manifest. Measured
+/// (`p19c-depadd` 5733263): every single-dependency-add step read
+/// `built_output_store hit=0 miss=14`, because one added line in one feature
+/// moved one digest that every pack's address folds. Not a race and not a
+/// cache bug — it is what the function does.
+///
+/// **What replaces it.** The whole manifest MINUS exactly the parts that
+/// cannot reach this pack, plus the two derived views that genuinely are
+/// workspace-wide. Subtraction, not selection, is the load-bearing choice: a
+/// key built by listing the tables that matter fails SILENTLY when pixi grows
+/// a new one, while a key built by removing the tables that provably do not
+/// matter degrades to today's behaviour — a miss — for anything unforeseen.
+///
+/// Kept, in full:
+///
+/// * every top-level table except `[feature]` and `[environments]` —
+///   `[workspace]` (channels, platforms, build-variants, conda-pypi-map,
+///   channel-priority), `[pypi-options]`, `[dependencies]`,
+///   `[pypi-dependencies]`, `[system-requirements]`, `[target.*]`, and
+///   anything this backend does not model yet;
+/// * the `[feature.<F>.*]` tables of every feature activated by an env that
+///   consumes this pack, as reported by `workspace_precise_consuming_envs` —
+///   the SAME producer [`workspace_solve_fingerprint`] scopes itself with, so
+///   the two cannot disagree about which envs reach the pack;
+/// * the `[environments]` entry of each consuming env, so a change to its
+///   feature list moves the key;
+/// * `WorkspaceManifest::resolution_pypi_index_urls()`, which unions the
+///   `pypi-options` indexes of EVERY feature, active or not, and is read on
+///   the outputs path (`compute_bundles`' `workspace_pypi_indexes`). This is
+///   a real coupling `workspace_solve_fingerprint` does not carry — it folds
+///   only `effective_pypi_index_urls(env)` — and it is folded here rather
+///   than skipped;
+/// * `WorkspaceManifest::declared_pypi_specs_anywhere()`, which unions the
+///   `[pypi-dependencies]` of every feature and every target selector, and
+///   reaches emission through `Bundle::workspace_declared_pypi_specs`.
+///   Filtered to exactly what its two consumers read: both
+///   `injected_constraint_for` and the diagnostics builder drop a spec that
+///   is empty or `"*"` before using it, so a bare `name = "*"` — which is
+///   also how a path/url/git declaration is spelled in this map — cannot
+///   change an emitted byte and is not in the projection.
+///
+/// Dropped, and this is the whole win: the dependency, channel,
+/// system-requirement, activation and task tables of features NO consuming
+/// env activates, and the `[environments]` entries of envs that do not
+/// consume this pack.
+///
+/// **Fail-closed.** Every case where the projection cannot be shown to be
+/// complete returns the whole-file digest instead, tagged with its reason so
+/// the fallback is visible in the key material and greppable in a log:
+/// no workspace, an unreadable or unparsable manifest, a manifest the model
+/// would not load, an empty consuming-env set (which is also the state in
+/// which `consuming_env_dependencies_for_target`'s tier-4 branch widens to
+/// every feature), a consuming env with no `[environments]` entry, and any
+/// `solve-group` anywhere in `[environments]` — pixi solves a solve group as
+/// one unit, so a group member that does not consume this pack still reaches
+/// its resolution, and this backend's manifest model does not carry the
+/// group. A fallback costs a miss, which is today's measured behaviour.
+///
+/// The failure mode being designed against is the other direction: a WRONG
+/// HIT, the class p6c and p6i were both spent on. Nothing is dropped here
+/// without a named producer showing it cannot reach the pack.
+fn workspace_manifest_projection(
+    workspace_dir: Option<&std::path::Path>,
+    source_dir: &std::path::Path,
+    target: &ResolutionTarget,
+) -> (String, &'static str) {
+    use sha2::{Digest, Sha256};
+
+    let Some(workspace_dir) = workspace_dir else {
+        return ("no-workspace".to_string(), "no-workspace");
+    };
+    let manifest_path = workspace_dir.join("pixi.toml");
+    let Ok(bytes) = std::fs::read(&manifest_path) else {
+        return ("absent".to_string(), "absent");
+    };
+    let whole = format!("{:x}", Sha256::digest(&bytes));
+    let fallback = |reason: &'static str| (format!("whole:{reason}:{whole}"), reason);
+
+    let Some(manifest) = crate::workspace::WorkspaceManifest::load(workspace_dir) else {
+        return fallback("manifest-unparsed");
+    };
+    let Ok(source) = std::str::from_utf8(&bytes) else {
+        return fallback("manifest-not-utf8");
+    };
+    let Ok(document) = source.parse::<toml::Value>() else {
+        return fallback("toml-unparsed");
+    };
+    let Some(document) = document.as_table() else {
+        return fallback("toml-not-a-table");
+    };
+
+    // A solve group makes a non-consuming env's dependencies part of this
+    // pack's solve, and the model does not carry solve groups. Refuse to
+    // narrow rather than guess.
+    if let Some(envs) = document.get("environments").and_then(toml::Value::as_table)
+        && envs.values().any(|env| {
+            env.as_table()
+                .is_some_and(|table| table.contains_key("solve-group"))
+        })
+    {
+        return fallback("solve-group");
+    }
+
+    let consuming_envs =
+        workspace_precise_consuming_envs(&manifest, workspace_dir, source_dir, target)
+            .unwrap_or_default();
+    if consuming_envs.is_empty() {
+        return fallback("no-consuming-env");
+    }
+
+    let mut envs: Vec<String> = consuming_envs;
+    envs.sort();
+    envs.dedup();
+    let mut features: BTreeSet<String> = BTreeSet::new();
+    for env in &envs {
+        let Some(def) = manifest.environments.get(env) else {
+            return fallback("env-not-declared");
+        };
+        for feature in &def.features {
+            features.insert(feature.clone());
+        }
+    }
+
+    let mut parts: Vec<String> = vec![
+        format!("projection={WORKSPACE_MANIFEST_PROJECTION}"),
+        format!("consuming-envs={}", envs.join(",")),
+        format!(
+            "reaching-features={}",
+            features.iter().cloned().collect::<Vec<_>>().join(",")
+        ),
+    ];
+
+    // Everything that is not per-feature or per-env, verbatim.
+    let mut top: Vec<&String> = document.keys().collect();
+    top.sort();
+    for key in top {
+        if key == "feature" || key == "environments" {
+            continue;
+        }
+        canonical_toml_lines(key, &document[key], &mut parts);
+    }
+
+    // The features a consuming env activates, in full.
+    if let Some(table) = document.get("feature").and_then(toml::Value::as_table) {
+        for name in &features {
+            if let Some(value) = table.get(name.as_str()) {
+                canonical_toml_lines(&format!("feature.{name}"), value, &mut parts);
+            }
+        }
+    }
+
+    // The consuming envs' own entries.
+    if let Some(table) = document.get("environments").and_then(toml::Value::as_table) {
+        for env in &envs {
+            if let Some(value) = table.get(env.as_str()) {
+                canonical_toml_lines(&format!("environments.{env}"), value, &mut parts);
+            }
+        }
+    }
+
+    // The two derived views that are workspace-wide by construction.
+    for url in manifest.resolution_pypi_index_urls() {
+        parts.push(format!("resolution-index:{url}"));
+    }
+    for (name, specs) in manifest.declared_pypi_specs_anywhere() {
+        for spec in specs {
+            let spec = spec.trim();
+            if spec.is_empty() || spec == "*" {
+                continue;
+            }
+            parts.push(format!("declared-pypi-spec:{name}={spec}"));
+        }
+    }
+
+    let digest = format!("{:x}", Sha256::digest(parts.join("\n").as_bytes()));
+    (format!("proj:{digest}"), "projected")
+}
+
 /// Key for the SHARED built-output store (`retread-built-output-store`).
 ///
 /// [`conda_outputs_disk_cache_path`]'s key cannot be reused: it folds the
@@ -369,9 +593,15 @@ fn conda_outputs_disk_cache_path(
 /// So this key restates the same inputs with those two removed:
 ///
 /// * the mtime is dropped (the key is computed with the `None` sentinel) and
-///   replaced by the sha256 of the workspace manifest's BYTES — a rollback
+///   replaced by a digest of the workspace manifest's CONTENT — a rollback
 ///   restores the old bytes and must restore the old key, the same reasoning
-///   [`auto_overrides_fingerprint`] already applies to the override ledger;
+///   [`auto_overrides_fingerprint`] already applies to the override ledger.
+///   **C14**: that digest is [`workspace_manifest_projection`], the manifest
+///   projected onto THIS pack, not `file_digest` over the whole file. The
+///   whole-file form was identical for all 14 packs of the canonical
+///   manifest, so one added dependency line in one feature re-addressed the
+///   entire store — measured as `hit=0 miss=14` on every dep-add step of
+///   `p19c-depadd` 5733263;
 /// * every occurrence of the workspace directory and of the pack's own
 ///   directory is rewritten to a fixed token before hashing, so a path that
 ///   leaks in from any producer (a sibling-lock discovery inside the workspace
@@ -460,9 +690,17 @@ fn built_output_store_key_material(
         .or_else(|| source_dir.file_name().map(std::path::PathBuf::from))
         .unwrap_or_default();
 
-    let workspace_manifest_digest = workspace_dir
-        .map(|dir| file_digest(&dir.join("pixi.toml")))
-        .unwrap_or_else(|| "no-workspace".to_string());
+    // C14: the workspace manifest PROJECTED onto this pack, not a digest of
+    // the whole file. See [`workspace_manifest_projection`] for what is kept,
+    // what is dropped, and every case that falls back to the whole file.
+    let (workspace_manifest_digest, projection_scope) =
+        workspace_manifest_projection(workspace_dir, source_dir, target);
+    if projection_scope != "projected" {
+        tracing::debug!(
+            reason = projection_scope,
+            "bench: built_output_store key -- workspace manifest projection fell back to the whole file",
+        );
+    }
     let source_manifest_digest = file_digest(&source_dir.join("pixi.toml"));
 
     // The RESOLUTION POLICY. The stored payload is the POST-INJECTION

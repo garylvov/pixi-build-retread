@@ -11593,3 +11593,297 @@ fn p6j_a_bundled_wheels_range_requires_dist_survives_the_widened_projection() {
     );
 }
 
+
+// -----------------------------------------------------------------
+// C14: component 5 of the built-output store key is a PER-PACK PROJECTION
+// of the workspace manifest, not a digest of the whole file.
+//
+// The measured defect (`p19c-depadd` 5733263): every single-dependency-add
+// step read `built_output_store hit=0 miss=14`. One added line in one
+// feature moved `file_digest(workspace_dir/"pixi.toml")`, and every pack's
+// address folded that one digest. These guards pin the replacement's two
+// halves: what must STILL move a key (or the store serves a stale
+// resolution), and what must now stop moving it (or the store is worthless
+// for a dep-add).
+// -----------------------------------------------------------------
+
+/// A workspace holding four packs. `pack-a`, `pack-b` and `pack-c` are
+/// declared by ONE feature that ONE env activates; `pack-d` is declared by a
+/// feature of its own; `unrelated` is activated by an env that consumes no
+/// pack at all.
+const C14_WS: &str = r#"
+[workspace]
+name = "c14"
+channels = ["https://prefix.dev/conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+python = "==3.11"
+
+[pypi-options]
+extra-index-urls = ["https://pypi.org/simple"]
+
+[system-requirements]
+libc = "2.34"
+
+[feature.shared.dependencies]
+"pack-a" = { path = "./packs/a" }
+"pack-b" = { path = "./packs/b" }
+"pack-c" = { path = "./packs/c" }
+
+[feature.solo.dependencies]
+"pack-d" = { path = "./packs/d" }
+
+[feature.extra.dependencies]
+zlib = ">=1.2"
+
+[feature.unrelated.dependencies]
+ripgrep = ">=14"
+
+[feature.unrelated.pypi-dependencies]
+tabulate = "*"
+
+[environments]
+main = { features = ["shared", "extra"] }
+solo = { features = ["solo"] }
+side = { features = ["unrelated"] }
+"#;
+
+const C14_PACK: &str = "[package]\nname = \"c14-pack\"\n";
+
+/// Stage the four-pack workspace and return (workspace_dir, [pack dirs in
+/// a,b,c,d order]).
+fn c14_stage(tag: &str, ws_manifest: &str) -> (std::path::PathBuf, Vec<std::path::PathBuf>) {
+    let ws = std::env::temp_dir().join(format!(
+        "retread-c14-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::write(ws.join("pixi.toml"), ws_manifest).unwrap();
+    let mut packs = Vec::new();
+    for name in ["a", "b", "c", "d"] {
+        let pack = ws.join("packs").join(name);
+        std::fs::create_dir_all(&pack).unwrap();
+        std::fs::write(pack.join("pixi.toml"), C14_PACK).unwrap();
+        packs.push(pack);
+    }
+    (ws, packs)
+}
+
+/// The four packs' store addresses under `ws_manifest`, and an assertion that
+/// every one of them was actually PROJECTED. Without that assertion a
+/// fixture that fails to declare a consuming env would fall back to the
+/// whole-file digest and every guard below would pass for the wrong reason.
+fn c14_keys(tag: &str, ws_manifest: &str) -> Vec<String> {
+    let (ws, packs) = c14_stage(tag, ws_manifest);
+    let target = ResolutionTarget::for_subdir("3.11", "linux-64");
+    let keys = packs
+        .iter()
+        .map(|pack| {
+            let (_, scope) = workspace_manifest_projection(Some(&ws), pack, &target);
+            assert_eq!(
+                scope,
+                "projected",
+                "fixture pack {} fell back to the whole-file digest ({scope}); the guard would be vacuous",
+                pack.display()
+            );
+            store_key_for(&ws, pack, &cfg())
+        })
+        .collect();
+    std::fs::remove_dir_all(&ws).ok();
+    keys
+}
+
+/// Which of the four addresses moved between two manifests.
+fn c14_moved(tag: &str, edited: &str) -> Vec<usize> {
+    let base = c14_keys(&format!("{tag}-base"), C14_WS);
+    let after = c14_keys(&format!("{tag}-edit"), edited);
+    assert_eq!(base.len(), 4);
+    (0..4).filter(|i| base[*i] != after[*i]).collect()
+}
+
+#[test]
+fn c14_a_dep_added_to_a_feature_that_reaches_one_pack_moves_only_that_packs_key() {
+    let edited = C14_WS.replace(
+        "[feature.solo.dependencies]",
+        "[feature.solo.dependencies]\nsqlite = \">=3.45\"",
+    );
+    assert_ne!(edited, C14_WS, "the edit must actually change the manifest");
+    assert_eq!(
+        c14_moved("one", &edited),
+        vec![3],
+        "a dependency added to `solo` -- the only feature that declares pack-d -- must move pack-d's address and NOTHING else"
+    );
+}
+
+#[test]
+fn c14_a_dep_added_to_a_feature_that_reaches_three_packs_moves_exactly_three_keys() {
+    let edited = C14_WS.replace(
+        "[feature.shared.dependencies]",
+        "[feature.shared.dependencies]\nsqlite = \">=3.45\"",
+    );
+    assert_ne!(edited, C14_WS);
+    assert_eq!(
+        c14_moved("three", &edited),
+        vec![0, 1, 2],
+        "a dependency added to `shared` must move exactly the three packs that feature declares"
+    );
+}
+
+#[test]
+fn c14_a_workspace_level_table_change_moves_every_key() {
+    for edited in [
+        C14_WS.replace(
+            "channels = [\"https://prefix.dev/conda-forge\"]",
+            "channels = [\"https://prefix.dev/conda-forge\", \"https://prefix.dev/pytorch\"]",
+        ),
+        C14_WS.replace("platforms = [\"linux-64\"]", "platforms = [\"linux-64\", \"osx-64\"]"),
+        C14_WS.replace("libc = \"2.34\"", "libc = \"2.35\""),
+        C14_WS.replace("python = \"==3.11\"", "python = \"==3.11.9\""),
+    ] {
+        assert_ne!(edited, C14_WS);
+        assert_eq!(
+            c14_moved("ws", &edited),
+            vec![0, 1, 2, 3],
+            "a workspace-level table reaches every pack and must move every address"
+        );
+    }
+}
+
+#[test]
+fn c14_a_dep_added_to_a_feature_no_consuming_env_activates_moves_no_key() {
+    // This is the whole win, and it is the assertion most likely to become a
+    // WRONG HIT if the projection is ever widened by accident: `unrelated` is
+    // activated only by env `side`, which declares no pack, so its conda
+    // dependency table cannot reach any pack's `conda/outputs`.
+    let edited = C14_WS.replace(
+        "[feature.unrelated.dependencies]",
+        "[feature.unrelated.dependencies]\nsqlite = \">=3.45\"",
+    );
+    assert_ne!(edited, C14_WS);
+    assert!(
+        c14_moved("unrelated", &edited).is_empty(),
+        "a dependency in a feature no consuming env activates must move NO pack address -- this is the dep-add case the whole-file digest broke"
+    );
+}
+
+#[test]
+fn c14_a_star_pypi_spec_moves_no_key_but_a_real_one_moves_every_key() {
+    // `declared_pypi_specs_anywhere` unions EVERY feature's
+    // `[pypi-dependencies]` and reaches emission through
+    // `Bundle::workspace_declared_pypi_specs`, so it is workspace-wide by
+    // construction and is in the projection. Both of its consumers drop a
+    // spec that is empty or `*` before using it, so a bare `name = "*"` --
+    // which is also how a path/url/git declaration is spelled in that map --
+    // cannot change an emitted byte, and the projection must not move on one.
+    let star = C14_WS.replace(
+        "[feature.unrelated.pypi-dependencies]",
+        "[feature.unrelated.pypi-dependencies]\nrich = \"*\"",
+    );
+    assert_ne!(star, C14_WS);
+    assert!(
+        c14_moved("star", &star).is_empty(),
+        "a `*` pypi declaration is filtered out by every consumer and must not move an address"
+    );
+
+    let real = C14_WS.replace(
+        "[feature.unrelated.pypi-dependencies]",
+        "[feature.unrelated.pypi-dependencies]\nrich = \">=13\"",
+    );
+    assert_ne!(real, C14_WS);
+    assert_eq!(
+        c14_moved("real", &real),
+        vec![0, 1, 2, 3],
+        "a CONSTRAINED pypi declaration anywhere can become an injected root's emitted constraint in any pack, so it must move every address"
+    );
+}
+
+#[test]
+fn c14_a_feature_index_url_anywhere_moves_every_key() {
+    // `resolution_pypi_index_urls` folds every feature's `pypi-options`,
+    // active or not, and `compute_bundles` reads it on the outputs path.
+    let edited = C14_WS.replace(
+        "[feature.unrelated.pypi-dependencies]",
+        "[feature.unrelated.pypi-options]\nextra-index-urls = [\"https://example.invalid/simple\"]\n\n[feature.unrelated.pypi-dependencies]",
+    );
+    assert_ne!(edited, C14_WS);
+    assert_eq!(
+        c14_moved("index", &edited),
+        vec![0, 1, 2, 3],
+        "an index declared by ANY feature joins every resolution chain and must move every address"
+    );
+}
+
+#[test]
+fn c14_the_projection_is_deterministic_and_path_free() {
+    // Two workspaces, same bytes, different absolute paths and different
+    // mtimes -- and a second read of the first, which also exercises the
+    // manifest model's own mtime-keyed memo.
+    let one = c14_keys("det-1", C14_WS);
+    let two = c14_keys("det-2", C14_WS);
+    let three = c14_keys("det-3", C14_WS);
+    assert_eq!(one, two, "the projection must not depend on the workspace path or the manifest's mtime");
+    assert_eq!(one, three);
+    assert_eq!(
+        one.iter().collect::<std::collections::BTreeSet<_>>().len(),
+        4,
+        "four packs must have four distinct addresses"
+    );
+
+    // Comment and whitespace are not resolution inputs: the projection is
+    // canonical, so they render to nothing.
+    let commented = format!("# a comment the whole-file digest would have charged for\n{C14_WS}");
+    assert!(
+        c14_moved("comment", &commented).is_empty(),
+        "a comment cannot change what conda/outputs emits and must not move an address"
+    );
+}
+
+#[test]
+fn c14_a_solve_group_refuses_to_narrow_and_falls_back_to_the_whole_file() {
+    // pixi solves a solve group as ONE unit, so a group member that declares
+    // no pack still reaches this pack's resolution -- and this backend's
+    // manifest model does not carry solve groups. The projection must refuse
+    // to narrow rather than guess; a fallback costs a miss, which is the
+    // behaviour that ships today.
+    let edited = C14_WS.replace(
+        "side = { features = [\"unrelated\"] }",
+        "side = { features = [\"unrelated\"], solve-group = \"g\" }",
+    );
+    assert_ne!(edited, C14_WS);
+    let (ws, packs) = c14_stage("solvegroup", &edited);
+    let target = ResolutionTarget::for_subdir("3.11", "linux-64");
+    let (digest, scope) = workspace_manifest_projection(Some(&ws), &packs[0], &target);
+    assert_eq!(scope, "solve-group", "a solve group must refuse the narrowing");
+    assert!(
+        digest.starts_with("whole:solve-group:"),
+        "the fallback must be the whole-file digest, tagged with its reason: {digest}"
+    );
+
+    // Non-vacuity: without the solve group the SAME fixture does narrow.
+    let (ws2, packs2) = c14_stage("solvegroup-control", C14_WS);
+    let (_, scope2) = workspace_manifest_projection(Some(&ws2), &packs2[0], &target);
+    assert_eq!(scope2, "projected");
+    std::fs::remove_dir_all(&ws).ok();
+    std::fs::remove_dir_all(&ws2).ok();
+}
+
+#[test]
+fn c14_a_pack_no_env_consumes_falls_back_to_the_whole_file() {
+    // The empty consuming-env set is also the state in which
+    // `consuming_env_dependencies_for_target` widens to every feature, so
+    // narrowing there would be unsound.
+    let (ws, _) = c14_stage("orphan", C14_WS);
+    let orphan = ws.join("packs").join("orphan");
+    std::fs::create_dir_all(&orphan).unwrap();
+    std::fs::write(orphan.join("pixi.toml"), C14_PACK).unwrap();
+    let target = ResolutionTarget::for_subdir("3.11", "linux-64");
+    let (digest, scope) = workspace_manifest_projection(Some(&ws), &orphan, &target);
+    assert_eq!(scope, "no-consuming-env");
+    assert!(digest.starts_with("whole:no-consuming-env:"));
+    std::fs::remove_dir_all(&ws).ok();
+}
