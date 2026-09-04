@@ -1544,6 +1544,7 @@ mod tests {
             pack_manifest_path: None,
             auto_imports: None,
             verify_snapshots: None,
+            git_snapshot_store: None,
             parallel_probes: None,
         }
     }

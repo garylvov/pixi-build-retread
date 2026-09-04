@@ -67,6 +67,56 @@ pub(crate) fn set_verify_snapshots_full(verify: bool) {
 fn verify_snapshots_full() -> bool {
     VERIFY_SNAPSHOTS_FULL.load(std::sync::atomic::Ordering::Relaxed)
 }
+
+/// C18. Where sealed canonical Git snapshots live. `None` — the default —
+/// means `courier::retread_cache_root()`, which is what every job on this
+/// campaign used and which `fasttmp` redirects into a JOB-SCOPED namespace.
+///
+/// Set from the `retread-git-snapshot-store` config key (an argument, not an
+/// ambient environment variable), with `RETREAD_GIT_SNAPSHOT_STORE` as the
+/// harness-side fallback for exactly the reason the built-output store has
+/// one: naming the store in a pack manifest moves that pack's build hash, so a
+/// harness that wants to point the store somewhere cannot use the manifest
+/// without changing the thing it is measuring.
+static GIT_SNAPSHOT_STORE: std::sync::RwLock<Option<std::path::PathBuf>> =
+    std::sync::RwLock::new(None);
+
+/// Wire the `retread-git-snapshot-store` config key into the snapshot store.
+/// Called once per pack from the handler, next to the built-output store's own
+/// config read and `set_verify_snapshots_full`.
+pub(crate) fn set_git_snapshot_store(configured: Option<&Path>) {
+    let resolved = git_snapshot_store_with(configured, &|key| std::env::var(key).ok());
+    if let Ok(mut slot) = GIT_SNAPSHOT_STORE.write() {
+        *slot = resolved;
+    }
+}
+
+/// Testable core of [`set_git_snapshot_store`]: config key first, then the
+/// `RETREAD_GIT_SNAPSHOT_STORE` fallback, then `None` — which means "keep the
+/// `retread_cache_root()` behaviour", never an invented path.
+pub(crate) fn git_snapshot_store_with(
+    configured: Option<&Path>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Option<std::path::PathBuf> {
+    if let Some(path) = configured {
+        return Some(path.to_path_buf());
+    }
+    env("RETREAD_GIT_SNAPSHOT_STORE")
+        .filter(|value| !value.trim().is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// The one formula for the canonical Git snapshot store root. One writer, two
+/// readers: the production wrapper below and the C18 guards, which pass a store
+/// root explicitly so a test never has to mutate a process-global.
+pub(crate) fn canonical_git_snapshot_store_root() -> std::path::PathBuf {
+    if let Ok(slot) = GIT_SNAPSHOT_STORE.read()
+        && let Some(root) = slot.as_ref()
+    {
+        return root.clone();
+    }
+    crate::courier::retread_cache_root()
+}
 const SDIST_BUILD_CONSTRAINTS: &str = "setuptools<81\ncmake<4\n";
 static BUILD_TMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -6037,6 +6087,28 @@ async fn ensure_canonical_git_snapshot(
     ref_state: &str,
     submodules: Option<GitSubmodules>,
 ) -> Result<CanonicalGitSnapshot> {
+    ensure_canonical_git_snapshot_in(
+        &canonical_git_snapshot_store_root(),
+        shared_checkout,
+        upstream_url,
+        resolved_sha,
+        ref_state,
+        submodules,
+    )
+    .await
+}
+
+/// C18. The store root is a parameter, not an ambient lookup, so that "job A
+/// published it, job B hit it" is a thing a guard can state directly: two calls
+/// that agree on `store_root` and on nothing else must land on one tree.
+async fn ensure_canonical_git_snapshot_in(
+    store_root: &Path,
+    shared_checkout: &Path,
+    upstream_url: &str,
+    resolved_sha: &str,
+    ref_state: &str,
+    submodules: Option<GitSubmodules>,
+) -> Result<CanonicalGitSnapshot> {
     // bench (measurement only): C12 -- this span and the `cached_build` span
     // below are the only two terms in the git-source materialization chain
     // that ever emitted no row at all. The 404 s block in the p6m cold proof
@@ -6045,7 +6117,7 @@ async fn ensure_canonical_git_snapshot(
     let snapshot_started = std::time::Instant::now();
     let repository_identity =
         canonical_git_repository_identity(upstream_url, resolved_sha, submodules);
-    let cache_dir = crate::courier::retread_cache_root()
+    let cache_dir = store_root
         .join("canonical-git-sources")
         .join("v3")
         .join(&repository_identity)
@@ -13666,5 +13738,385 @@ version = "0.1.0"
                 (entry.relative, (metadata.dev(), metadata.ino()))
             })
             .collect()
+    }
+
+    // ------------------------------------------------------------------ C18
+    //
+    // The canonical Git snapshot store has been JOB-SCOPED in every job of this
+    // campaign, and not by a decision anyone made about Git snapshots:
+    // `ensure_canonical_git_snapshot` built its cache directory from
+    // `courier::retread_cache_root()`, `retread_cache_root` consults
+    // `fasttmp::backend_env_override("RETREAD_CACHE_DIR")` first, and
+    // `RETREAD_CACHE_DIR` is on fasttmp's scratch-cache redirect list. So the
+    // clone, the normalize and the publish were paid in full by every relock,
+    // warm or cold (C17.1), and C13's seal and C15's lock-free hit only ever
+    // helped WITHIN one job.
+    //
+    // These four guards are about the one thing that changes: the store root is
+    // now a parameter, so a tree published under it by one job is a hit for the
+    // next. Each takes the store root explicitly rather than mutating the
+    // process-global, so they cannot race the other snapshot tests.
+
+    /// The resolution order, which is the whole contract of the new key:
+    /// config key first, then the harness fallback, then `None` — meaning
+    /// "keep `retread_cache_root()`", never an invented path.
+    #[test]
+    fn the_git_snapshot_store_is_a_config_key_first_and_an_env_fallback_second() {
+        let configured = PathBuf::from("/from/config");
+        assert_eq!(
+            git_snapshot_store_with(Some(&configured), &|_| Some("/from/env".to_string())),
+            Some(configured.clone()),
+            "the config key must win over the environment",
+        );
+        assert_eq!(
+            git_snapshot_store_with(None, &|key| {
+                (key == "RETREAD_GIT_SNAPSHOT_STORE").then(|| "/from/env".to_string())
+            }),
+            Some(PathBuf::from("/from/env")),
+            "the harness fallback must be read when no key is set",
+        );
+        assert_eq!(
+            git_snapshot_store_with(None, &|_| Some("   ".to_string())),
+            None,
+            "a blank value must not become a store path",
+        );
+        assert_eq!(
+            git_snapshot_store_with(None, &|_| None),
+            None,
+            "unset must mean the retread_cache_root() fallback, not a guess",
+        );
+    }
+
+    /// THE LEVER. Two jobs — different shared checkouts, different job-scoped
+    /// caches, nothing in common but the persistent store — and the second
+    /// one must ADOPT the first one's sealed tree instead of re-cloning it.
+    /// The negative arm is in the same test: a third job pointed at a
+    /// DIFFERENT store root gets its own tree, which is exactly the
+    /// job-scoping this fix removes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_canonical_tree_published_by_one_job_is_adopted_by_another_that_shares_only_the_store()
+    {
+        use std::os::unix::fs::MetadataExt;
+        let fixture = git_checkout_fixture("c18-cross-job");
+        let store = fixture.base.join("persistent-store");
+
+        // Job A: its own job-scoped checkout cache, publishing into the store.
+        let job_a_cache = fixture.base.join("job-a-cache");
+        std::fs::create_dir_all(&job_a_cache).expect("job A cache");
+        let checkout_a = ensure_git_checkout(&fixture.url, &fixture.rev2, &job_a_cache)
+            .await
+            .expect("job A checkout");
+        let ref_state = canonical_git_ref_state(checkout_a.root()).await.unwrap();
+        let published = ensure_canonical_git_snapshot_in(
+            &store,
+            checkout_a.root(),
+            &fixture.url,
+            &fixture.rev2,
+            &ref_state,
+            None,
+        )
+        .await
+        .expect("job A publishes the canonical tree");
+        assert!(
+            published.root.starts_with(&store),
+            "the tree must land in the store the caller named: {}",
+            published.root.display(),
+        );
+        let marker = published.root.parent().unwrap().join("source.json");
+        assert!(marker.is_file(), "a published tree carries its marker");
+        let sealed_marker: CanonicalGitSourceMarker =
+            serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
+        assert!(
+            sealed_marker.seal.is_some(),
+            "the publish must seal the tree, or a cross-job hit still walks it",
+        );
+        let identity_before = {
+            let file = std::fs::symlink_metadata(published.root.join("base.txt")).unwrap();
+            (file.dev(), file.ino())
+        };
+
+        // Job B: a DIFFERENT job-scoped checkout cache of the same upstream at
+        // the same commit. The only thing it shares with job A is the store.
+        let job_b_cache = fixture.base.join("job-b-cache");
+        std::fs::create_dir_all(&job_b_cache).expect("job B cache");
+        let checkout_b = ensure_git_checkout(&fixture.url, &fixture.rev2, &job_b_cache)
+            .await
+            .expect("job B checkout");
+        assert_ne!(
+            checkout_a.root(),
+            checkout_b.root(),
+            "the two jobs must not share their checkout caches, or this proves nothing",
+        );
+        let adopted = ensure_canonical_git_snapshot_in(
+            &store,
+            checkout_b.root(),
+            &fixture.url,
+            &fixture.rev2,
+            &ref_state,
+            None,
+        )
+        .await
+        .expect("job B adopts the published tree");
+        assert_eq!(
+            adopted.root, published.root,
+            "job B must land on job A's tree, not on one of its own",
+        );
+        let identity_after = {
+            let file = std::fs::symlink_metadata(adopted.root.join("base.txt")).unwrap();
+            (file.dev(), file.ino())
+        };
+        assert_eq!(
+            identity_after, identity_before,
+            "a re-clone would replace the inode; a hit must leave the bytes alone",
+        );
+
+        // NEGATIVE ARM, in the same test: point job C at its own store root and
+        // the sharing is gone. This is the pre-C18 shape — a fasttmp-redirected
+        // `RETREAD_CACHE_DIR` per job — and it must produce a different tree.
+        let other_store = fixture.base.join("job-c-store");
+        let separate = ensure_canonical_git_snapshot_in(
+            &other_store,
+            checkout_b.root(),
+            &fixture.url,
+            &fixture.rev2,
+            &ref_state,
+            None,
+        )
+        .await
+        .expect("job C publishes into its own store");
+        assert_ne!(
+            separate.root, published.root,
+            "a job-scoped store must NOT share, or the positive arm above is vacuous",
+        );
+        let separate_identity = {
+            let file = std::fs::symlink_metadata(separate.root.join("base.txt")).unwrap();
+            (file.dev(), file.ino())
+        };
+        assert_ne!(
+            separate_identity, identity_before,
+            "the inode comparison must be able to see a fresh clone",
+        );
+
+        make_staging_tree_removable(&published.root);
+        make_staging_tree_removable(&separate.root);
+        let _ = std::fs::remove_dir_all(&fixture.base);
+    }
+
+    /// The entry's writer lock is derived from the cache directory
+    /// (`artifact_cache_lock_path`), so moving the store moves the lock with it
+    /// and it keeps deduplicating clones ACROSS jobs. Two jobs racing the same
+    /// key must leave one sealed tree and no staging debris.
+    #[tokio::test]
+    async fn two_jobs_publishing_one_key_into_a_shared_store_leave_one_sealed_tree() {
+        let fixture = git_checkout_fixture("c18-race");
+        let store = fixture.base.join("persistent-store");
+        let mut checkouts = Vec::new();
+        for job in ["job-a", "job-b"] {
+            let cache = fixture.base.join(format!("{job}-cache"));
+            std::fs::create_dir_all(&cache).expect("job cache");
+            checkouts.push(
+                ensure_git_checkout(&fixture.url, &fixture.rev2, &cache)
+                    .await
+                    .expect("job checkout"),
+            );
+        }
+        let ref_state = canonical_git_ref_state(checkouts[0].root()).await.unwrap();
+        let (first, second) = tokio::join!(
+            ensure_canonical_git_snapshot_in(
+                &store,
+                checkouts[0].root(),
+                &fixture.url,
+                &fixture.rev2,
+                &ref_state,
+                None,
+            ),
+            ensure_canonical_git_snapshot_in(
+                &store,
+                checkouts[1].root(),
+                &fixture.url,
+                &fixture.rev2,
+                &ref_state,
+                None,
+            ),
+        );
+        let first = first.expect("one racer publishes");
+        let second = second.expect("the other adopts");
+        assert_eq!(
+            first.root, second.root,
+            "both racers must end on one tree",
+        );
+        let entry = first.root.parent().unwrap();
+        let leftovers: Vec<String> = std::fs::read_dir(entry.parent().unwrap())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("staging") || name.contains(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "a lost race must leave no staging directory behind: {leftovers:?}",
+        );
+        let marker: CanonicalGitSourceMarker =
+            serde_json::from_slice(&std::fs::read(entry.join("source.json")).unwrap()).unwrap();
+        assert!(marker.seal.is_some(), "the surviving tree must be sealed");
+
+        // THE REASON THE RACE RESOLVES AT ALL, and the reason it keeps
+        // resolving once the store is shared between jobs:
+        // `acquire_artifact_cache_lock` derives the lock path from the CACHE
+        // DIRECTORY (`parent.join(format!(".{file_name}.lock"))`), so moving
+        // the store moves the writer lock with it. A lock left behind in a
+        // job-scoped root would dedupe nothing across jobs.
+        let lock_name = format!(
+            ".{}.lock",
+            entry.file_name().unwrap().to_str().unwrap()
+        );
+        let lock_path = entry.parent().unwrap().join(&lock_name);
+        assert!(
+            lock_path.is_file() && lock_path.starts_with(&store),
+            "the writer lock must live WITH the store at {}, or cross-job publishes do not dedupe",
+            lock_path.display(),
+        );
+
+        make_staging_tree_removable(&first.root);
+        let _ = std::fs::remove_dir_all(&fixture.base);
+    }
+
+    /// A persistent store outlives the job that filled it, so "somebody edited
+    /// a tree in it" is a case that now has to be REFUSED rather than trusted.
+    /// Flip one byte of a SAMPLED file and the next job must fail closed —
+    /// never self-heal, because a reader could be holding the tree.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_tampered_tree_in_the_persistent_store_is_refused_not_repaired() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = git_checkout_fixture("c18-tamper");
+        let store = fixture.base.join("persistent-store");
+        let cache = fixture.base.join("job-a-cache");
+        std::fs::create_dir_all(&cache).expect("job cache");
+        let checkout = ensure_git_checkout(&fixture.url, &fixture.rev2, &cache)
+            .await
+            .expect("job checkout");
+        let ref_state = canonical_git_ref_state(checkout.root()).await.unwrap();
+        let published = ensure_canonical_git_snapshot_in(
+            &store,
+            checkout.root(),
+            &fixture.url,
+            &fixture.rev2,
+            &ref_state,
+            None,
+        )
+        .await
+        .expect("publish into the persistent store");
+
+        // NON-VACUITY: unmolested, a second job hits it.
+        ensure_canonical_git_snapshot_in(
+            &store,
+            checkout.root(),
+            &fixture.url,
+            &fixture.rev2,
+            &ref_state,
+            None,
+        )
+        .await
+        .expect("a clean persistent tree must be adopted");
+
+        let marker: CanonicalGitSourceMarker =
+            serde_json::from_slice(&std::fs::read(published.root.parent().unwrap().join("source.json")).unwrap())
+                .unwrap();
+        let seal = marker.seal.expect("the publish sealed the tree");
+        let victim = published.root.join(
+            &seal
+                .sample
+                .iter()
+                .find(|entry| entry.path == "base.txt" || entry.path == "extra.txt")
+                .expect("the fixture's tracked files must be sampled")
+                .path,
+        );
+        let mut bytes = std::fs::read(&victim).unwrap();
+        *bytes.last_mut().unwrap() ^= 0x01;
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::write(&victim, &bytes).unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let refused = ensure_canonical_git_snapshot_in(
+            &store,
+            checkout.root(),
+            &fixture.url,
+            &fixture.rev2,
+            &ref_state,
+            None,
+        )
+        .await
+        .expect_err("a tampered persistent tree must be refused");
+        assert!(
+            published.root.join("base.txt").exists(),
+            "a refusal must not delete the tree a reader could be holding: {refused:#}",
+        );
+
+        make_staging_tree_removable(&published.root);
+        let _ = std::fs::remove_dir_all(&fixture.base);
+    }
+
+    /// A job killed mid-publish leaves a tree with no marker in a store that
+    /// now outlives it. That is an INCOMPLETE publish, not a published tree
+    /// with readers, so the next job must discard and re-publish it rather than
+    /// adopt it or fail.
+    #[tokio::test]
+    async fn a_markerless_tree_in_the_persistent_store_is_discarded_and_republished() {
+        let fixture = git_checkout_fixture("c18-partial");
+        let store = fixture.base.join("persistent-store");
+        let cache = fixture.base.join("job-a-cache");
+        std::fs::create_dir_all(&cache).expect("job cache");
+        let checkout = ensure_git_checkout(&fixture.url, &fixture.rev2, &cache)
+            .await
+            .expect("job checkout");
+        let ref_state = canonical_git_ref_state(checkout.root()).await.unwrap();
+        let published = ensure_canonical_git_snapshot_in(
+            &store,
+            checkout.root(),
+            &fixture.url,
+            &fixture.rev2,
+            &ref_state,
+            None,
+        )
+        .await
+        .expect("publish into the persistent store");
+        let entry = published.root.parent().unwrap().to_path_buf();
+        let marker = entry.join("source.json");
+        assert!(marker.is_file());
+        std::fs::remove_file(&marker).expect("simulate a publish killed before its marker");
+
+        let republished = ensure_canonical_git_snapshot_in(
+            &store,
+            checkout.root(),
+            &fixture.url,
+            &fixture.rev2,
+            &ref_state,
+            None,
+        )
+        .await
+        .expect("a markerless tree must be re-published, not adopted and not fatal");
+        assert_eq!(
+            republished.root, published.root,
+            "the re-publish must land on the same key",
+        );
+        assert!(
+            marker.is_file(),
+            "the re-publish must restore the marker the partial publish never wrote",
+        );
+        let restored: CanonicalGitSourceMarker =
+            serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
+        assert!(
+            restored.seal.is_some(),
+            "the re-published tree must be sealed, so the NEXT job takes the cheap path",
+        );
+        assert_eq!(
+            std::fs::read_to_string(republished.root.join("base.txt")).unwrap(),
+            "base\n",
+        );
+
+        make_staging_tree_removable(&republished.root);
+        let _ = std::fs::remove_dir_all(&fixture.base);
     }
 }
