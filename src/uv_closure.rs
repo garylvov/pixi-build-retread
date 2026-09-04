@@ -4262,6 +4262,18 @@ pub fn attribute_auto_imports_failure(
     // by the same level-prefix rule `uv_conflict_report` already applies on
     // its no-marker path. Both are needed: the banner cut alone still leaves
     // any trace uv wrote after its own report.
+    // p6z. A `Requires-Dist` PARSE failure can never be attributed to a
+    // detection, and this is checked FIRST because the text is full of
+    // distribution names that look like accusations. The measured holosoma
+    // failure quotes `PyYAML (>=5.1.*)`, and `pyyaml` is one of the 26 roots
+    // that request injected -- so the single-mention rule below would have
+    // blamed `pyyaml` for a line `omegaconf` published. The clause did not
+    // fail because some root was requested; it failed because a distribution
+    // shipped metadata retread could not read, and
+    // `attribution_failure_detail` says exactly that.
+    if requires_dist_parse_failure(error_text).is_some() {
+        return Vec::new();
+    }
     let primary = error_text
         .split_once(PASS_B_BANNER)
         .map_or(error_text, |(pass_a, _)| pass_a);
@@ -4341,9 +4353,289 @@ pub fn attribute_auto_imports_failure(
     // empty, and empty means the caller says "attribution named nobody"
     // rather than guessing.
     if !error_text.contains('\u{d7}') && out.len() > 1 {
-        return Vec::new();
+        // p6z. Before p6w's blanket refusal, ASK THE ARITHMETIC. A non-uv text
+        // that mentions several roots is not evidence against any of them --
+        // but retread's own reconciler diagnostic is structured, and
+        // `reconciler_sole_culprits` decides by removing one carrier's clauses
+        // and re-intersecting, not by counting mentions. A conflict that
+        // genuinely turns on ONE detection is named; anything else still
+        // returns empty, and the caller says so with the carriers named.
+        let attributed: Vec<AttributedRootDrop> =
+            read_reconciler_conflicts(error_text, injected_by_bundle)
+                .into_iter()
+                .flat_map(|conflict| {
+                    let bundle = conflict.bundle.clone();
+                    reconciler_sole_culprits(&conflict)
+                        .into_iter()
+                        .map(move |(root, clause)| AttributedRootDrop {
+                            bundle: bundle.clone(),
+                            name: root_distribution_name(&root),
+                            root,
+                            clause,
+                            remedy: RootDropRemedy::ManifestFinding,
+                        })
+                })
+                .collect();
+        return attributed;
     }
     out
+}
+
+/// p6z. What the fallback row should say when nothing was attributed.
+///
+/// p6w's fallback said "uv's conflict report named none of the injected
+/// roots". For `flashsac-pack` and `holosoma-pack` that sentence was TRUE and
+/// USELESS: uv never ran. This names what actually refused -- the reconciler
+/// and its carriers, or the distribution whose `Requires-Dist` would not
+/// parse -- so a whole-request drop is readable without opening a 137 MB log.
+pub fn attribution_failure_detail(
+    error_text: &str,
+    injected_by_bundle: &BTreeMap<String, Vec<String>>,
+) -> Option<String> {
+    if let Some(parse_failure) = requires_dist_parse_failure(error_text) {
+        return Some(parse_failure);
+    }
+    let conflicts = read_reconciler_conflicts(error_text, injected_by_bundle);
+    let named = conflicts
+        .iter()
+        .map(ReconcilerConflict::naming_sentence)
+        .collect::<Vec<_>>();
+    (!named.is_empty()).then(|| named.join(" | "))
+}
+
+/// p6z / boarded p6w-1. A `Requires-Dist` line retread's own reader refused,
+/// with the distribution that published it when the text carries one.
+///
+/// The 26 `holosoma-pack` roots were dropped for this text and nothing else:
+///
+/// ```text
+/// computing uv closure for bundle `holosoma-pack`: parsing requirement
+/// `PyYAML (>=5.1.*)`: Operator >= cannot be used with a wildcard version
+/// specifier
+/// ```
+///
+/// The lenient reader in [`crate::pep508_lenient`] means a line uv accepts no
+/// longer reaches here at all. A line uv ALSO refuses still can, and then this
+/// is what the row must say.
+pub fn requires_dist_parse_failure(error_text: &str) -> Option<String> {
+    static PARSE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"parsing (?:extra )?requirement `([^`]+)`: ([^\n]+)")
+            .expect("static requires-dist parse-failure regex")
+    });
+    static OWNER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"reading `Requires-Dist` of wheel `([^`]+)`")
+            .expect("static requires-dist owner regex")
+    });
+    let captures = PARSE.captures(error_text)?;
+    let clause = captures.get(1)?.as_str();
+    let reason = captures.get(2)?.as_str().trim();
+    let owner = OWNER
+        .captures(error_text)
+        .and_then(|captures| captures.get(1))
+        .map(|owner| format!("wheel `{}`", owner.as_str()))
+        .unwrap_or_else(|| "an unnamed distribution".to_string());
+    Some(format!(
+        "a `Requires-Dist` clause could not be parsed: {owner} declares `{clause}` ({reason}). \
+         No Lane C detection is its cause; the distribution that published the clause is."
+    ))
+}
+
+/// p6z / boarded p6w-2. One clause of retread's OWN reconciler conflict, with
+/// the distribution that carries it and whether that distribution is a Lane C
+/// detection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconcilerClause {
+    /// The distribution that states the clause, as the text spells it, or
+    /// empty when the clause comes from a constraint rather than a wheel.
+    pub carrier: String,
+    /// The version specifier, verbatim (`<=65`, `==84.0.0`, `*`).
+    pub spec: String,
+    /// The provenance sentence, verbatim, so a row can quote it.
+    pub source: String,
+    /// The injected root (as injected) this clause's carrier IS, if any.
+    pub injected_root: Option<String>,
+    /// True when the clause is a LEARNED workspace fact -- what some earlier
+    /// solve happened to pick, not operator intent
+    /// ([`is_yieldable_advisory_source`]).
+    pub learned: bool,
+}
+
+/// p6z. Retread's own `requirements are mutually unsatisfiable` failure, read
+/// structurally instead of by mention-counting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconcilerConflict {
+    pub bundle: String,
+    /// The package whose requirements do not intersect (`setuptools`).
+    pub package: String,
+    pub clauses: Vec<ReconcilerClause>,
+}
+
+impl ReconcilerConflict {
+    /// A sentence naming the carriers, for the row that says nobody was
+    /// attributed. p6w's fallback said only "uv's conflict report named none
+    /// of the injected roots" -- true, and useless, because the failure was
+    /// never uv's. This names the distributions actually in contradiction.
+    pub fn naming_sentence(&self) -> String {
+        let clauses = self
+            .clauses
+            .iter()
+            .map(|clause| {
+                let who = if clause.carrier.is_empty() {
+                    clause.source.clone()
+                } else {
+                    format!("`{}`", clause.carrier)
+                };
+                let tag = match (clause.injected_root.is_some(), clause.learned) {
+                    (true, _) => " [Lane C detection]",
+                    (_, true) => " [LEARNED workspace fact, not operator intent]",
+                    _ => "",
+                };
+                format!("`{}` from {who}{tag}", clause.spec)
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        format!(
+            "retread's own constraint reconciler refused `{}` in bundle `{}`: {clauses}",
+            self.package, self.bundle
+        )
+    }
+}
+
+/// Carrier of one reconciler clause: `wheel `dm_control==1.0.45` ...`.
+fn reconciler_clause_carrier(source: &str) -> String {
+    static CARRIER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"^wheel `([^`=<>!~\s]+)").expect("static reconciler carrier regex")
+    });
+    CARRIER
+        .captures(source.trim())
+        .and_then(|captures| captures.get(1))
+        .map(|carrier| carrier.as_str().to_string())
+        .unwrap_or_default()
+}
+
+/// p6z. Read retread's OWN reconciler conflict out of an error text.
+///
+/// Reuses [`crate::solve::parse::RegexConflictParser::parse_retread_conflicts`]
+/// -- the single structured reader for this diagnostic, which its own doc
+/// comment says must not be duplicated -- and adds only the question this lane
+/// asks: which clause is carried by an injected Lane C root, and which by a
+/// LEARNED workspace fact.
+pub fn read_reconciler_conflicts(
+    error_text: &str,
+    injected_by_bundle: &BTreeMap<String, Vec<String>>,
+) -> Vec<ReconcilerConflict> {
+    let parser = crate::solve::parse::RegexConflictParser::new();
+    parser
+        .parse_retread_conflicts(error_text)
+        .into_iter()
+        .map(|conflict| {
+            let injected = injected_by_bundle
+                .get(&conflict.bundle)
+                .cloned()
+                .unwrap_or_default();
+            let clauses = conflict
+                .requirements
+                .iter()
+                .map(|requirement| {
+                    let carrier = reconciler_clause_carrier(&requirement.source);
+                    // Same spelling fold p6w needed: a root is injected as
+                    // `dm-control` and quoted by the reconciler as
+                    // `dm_control==1.0.45`.
+                    let injected_root = (!carrier.is_empty())
+                        .then(|| {
+                            injected.iter().find(|root| {
+                                let name = root_distribution_name(root);
+                                root_name_spellings(&name)
+                                    .iter()
+                                    .any(|spelling| spelling.eq_ignore_ascii_case(&carrier))
+                            })
+                        })
+                        .flatten()
+                        .cloned();
+                    ReconcilerClause {
+                        carrier,
+                        spec: requirement.spec.clone(),
+                        source: requirement.source.clone(),
+                        injected_root,
+                        learned: is_yieldable_advisory_source(&requirement.source)
+                            || requirement.source.contains(LEARNED_WORKSPACE_FACT_SOURCE),
+                    }
+                })
+                .collect();
+            ReconcilerConflict {
+                bundle: conflict.bundle,
+                package: conflict.package,
+                clauses,
+            }
+        })
+        .collect()
+}
+
+/// p6z. Which injected root, if any, is the SOLE reason a reconciler conflict
+/// is unsatisfiable.
+///
+/// The rule is a measurement, not a mention count. p6w refused to trust a
+/// non-uv text that mentioned several roots, and it was right to for the
+/// reason it gave -- but "mentioned" was the wrong question. The right one is
+/// arithmetic: remove one carrier's clauses and ask whether the rest still
+/// fails to intersect. `flashsac-pack` answers NO for every one of its three
+/// mentioned roots, because its real contradiction is `FlashRL==0.1.0`'s
+/// declared `setuptools<=65` against a LEARNED `setuptools==84.0.0` -- and
+/// that is now settled before this point, by the learned-fact yield in
+/// `constraint::finalize_impl`. A conflict that reaches here and DOES turn on
+/// one detection names it.
+fn reconciler_sole_culprits(conflict: &ReconcilerConflict) -> Vec<(String, String)> {
+    let parse = |spec: &str| {
+        let spec = spec.trim();
+        if spec.is_empty() || spec == "*" {
+            return Some(uv_pep508::uv_pep440::VersionSpecifiers::empty());
+        }
+        uv_pep508::uv_pep440::VersionSpecifiers::from_str(spec).ok()
+    };
+    let mut parsed = Vec::new();
+    for clause in &conflict.clauses {
+        let Some(specifiers) = parse(&clause.spec) else {
+            // A clause this reader cannot parse means the arithmetic below is
+            // not decidable, so nothing is blamed.
+            return Vec::new();
+        };
+        parsed.push((clause, specifiers));
+    }
+    let intersect_all = |skip: Option<usize>| {
+        let mut clauses = Vec::new();
+        for (index, (_, specifiers)) in parsed.iter().enumerate() {
+            if Some(index) == skip {
+                continue;
+            }
+            clauses.extend(specifiers.iter().cloned());
+        }
+        uv_pep508::uv_pep440::VersionSpecifiers::from_iter(clauses)
+    };
+    if !crate::constraint::specifiers_unsatisfiable(&intersect_all(None)) {
+        return Vec::new();
+    }
+    let mut culprits = Vec::new();
+    for (index, (clause, _)) in parsed.iter().enumerate() {
+        let Some(root) = clause.injected_root.as_ref() else {
+            continue;
+        };
+        if !crate::constraint::specifiers_unsatisfiable(&intersect_all(Some(index))) {
+            culprits.push((root.clone(), clause.clone()));
+        }
+    }
+    culprits
+        .into_iter()
+        .map(|(root, clause)| {
+            (
+                root,
+                format!(
+                    "retread's constraint reconciler: `{}` {} required by {} is the only clause \\
+                     that makes `{}` unsatisfiable in bundle `{}`",
+                    conflict.package, clause.spec, clause.source, conflict.package, conflict.bundle
+                ),
+            )
+        })
+        .collect()
 }
 
 /// `name==version`-shaped root whose exact pin uv says the index cannot serve.

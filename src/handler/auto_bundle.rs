@@ -707,7 +707,7 @@ fn closure_dependency_edges(
     for wheel in bundle.all_wheels() {
         for raw_requirement in &wheel.metadata.requires_dist {
             let requirement: uv_pep508::Requirement =
-                uv_pep508::Requirement::from_str(raw_requirement).ok()?;
+                crate::pep508_lenient::parse_requirement_lenient(raw_requirement).ok()?;
             if !requirement.marker.evaluate(&marker_env, &[]) {
                 continue;
             }
@@ -1896,7 +1896,22 @@ where
         let mut loose_candidates: Vec<(String, VersionSpecifiers)> = Vec::new();
         for wheel in bundle.all_wheels().skip(processed_wheel_count) {
             for raw in &wheel.metadata.requires_dist {
-                if let Some((name, version)) = pep508_exact_base_dep(raw, &marker_env)? {
+                // p6w-1: NAME THE DISTRIBUTION. The holosoma failure that cost
+                // 26 detected roots said only ``parsing requirement
+                // `PyYAML (>=5.1.*)` `` -- with no owner, so the back-off could
+                // not tell the one culprit from its 25 bystanders, and neither
+                // could an operator reading the row. Every metadata parse
+                // failure in this walk now carries the wheel that published the
+                // clause.
+                let owner = |e: anyhow::Error| {
+                    e.context(format!(
+                        "reading `Requires-Dist` of wheel `{}=={}`",
+                        wheel.metadata.name, wheel.metadata.version
+                    ))
+                };
+                if let Some((name, version)) =
+                    pep508_exact_base_dep(raw, &marker_env).map_err(owner)?
+                {
                     let specifiers = VersionSpecifiers::from_str(&format!("=={version}"))
                         .with_context(|| {
                             format!("parsing exact auto-bundle requirement `{name}=={version}`")
@@ -1915,7 +1930,9 @@ where
                         continue;
                     }
                     candidates.push((name, version));
-                } else if let Some((name, specs)) = pep508_loose_base_dep(raw, &marker_env)? {
+                } else if let Some((name, specs)) =
+                    pep508_loose_base_dep(raw, &marker_env).map_err(owner)?
+                {
                     observe_requirement(
                         &mut observed_requirements,
                         &name,
@@ -3238,8 +3255,8 @@ fn pep508_exact_base_dep(
     raw: &str,
     marker_env: &MarkerEnvironment,
 ) -> Result<Option<(String, String)>> {
-    let req: uv_pep508::Requirement = uv_pep508::Requirement::from_str(raw)
-        .map_err(|e| anyhow!("parsing requirement `{raw}`: {e}"))?;
+    let req: uv_pep508::Requirement =
+        crate::pep508_lenient::parse_requirement_lenient(raw).map_err(|e| anyhow!("{e}"))?;
     if !req.marker.evaluate(marker_env, &[]) {
         return Ok(None);
     }
@@ -3265,8 +3282,8 @@ fn pep508_loose_base_dep(
     raw: &str,
     marker_env: &MarkerEnvironment,
 ) -> Result<Option<(String, VersionSpecifiers)>> {
-    let req: uv_pep508::Requirement = uv_pep508::Requirement::from_str(raw)
-        .map_err(|e| anyhow!("parsing requirement `{raw}`: {e}"))?;
+    let req: uv_pep508::Requirement =
+        crate::pep508_lenient::parse_requirement_lenient(raw).map_err(|e| anyhow!("{e}"))?;
     if !req.marker.evaluate(marker_env, &[]) {
         return Ok(None);
     }
@@ -3494,8 +3511,8 @@ fn extra_dep_source_to_pending(src: ExtraDepSource, indexes: &[String]) -> Pendi
 /// starts with `prefix`. Used to bundle sibling sub-packages like
 /// `isaacsim-kernel` that the metapackage depends on unconditionally.
 fn pep508_base_dep_in_prefix(raw: &str, prefix: &str) -> Result<Option<ExtraDep>> {
-    let req: uv_pep508::Requirement = uv_pep508::Requirement::from_str(raw)
-        .map_err(|e| anyhow!("parsing requirement `{raw}`: {e}"))?;
+    let req: uv_pep508::Requirement =
+        crate::pep508_lenient::parse_requirement_lenient(raw).map_err(|e| anyhow!("{e}"))?;
 
     // Base dep: marker (if any) satisfied with empty extras.
     let env = default_marker_env(DEFAULT_PYTHON)?;
@@ -3755,8 +3772,8 @@ pub(crate) enum ExtraDepSource {
 /// repack at all). Any specifier set is accepted; range resolution
 /// happens at the index-fetch layer in pypi::resolve.
 pub(crate) fn pep508_extra_dep(raw: &str, extra: &str) -> Result<Option<ExtraDep>> {
-    let req: uv_pep508::Requirement = uv_pep508::Requirement::from_str(raw)
-        .map_err(|e| anyhow!("parsing extra requirement `{raw}`: {e}"))?;
+    let req: uv_pep508::Requirement = crate::pep508_lenient::parse_requirement_lenient(raw)
+        .map_err(|e| anyhow!("parsing extra requirement: {e}"))?;
 
     let extra_name = uv_normalize::ExtraName::from_owned(extra.to_string())
         .map_err(|e| anyhow!("invalid extra name `{extra}`: {e}"))?;

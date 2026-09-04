@@ -12932,15 +12932,39 @@ PyYAML (>=5.1.*)
 /// MENTIONS three injected roots — none of which is individually unsatisfiable
 /// against `setuptools==84.0.0`. The real contradiction is a declared
 /// `FlashRL<=65` against a conda fact, and neither side is a detected root.
+/// p6z CORRECTION. p6w transcribed this fixture WITHOUT its last clause, and
+/// the omission mattered: `<=65` required by wheel `FlashRL==0.1.0` is the
+/// clause that makes the set unsatisfiable at all. Without it the four
+/// remaining clauses intersect fine, so the fixture could not distinguish "no
+/// injected root is the culprit" from "there is no conflict". Re-read from job
+/// 5776669 line 250906 and the `retread-relax`/`retread-overrides`/
+/// `retread-drop-deps` tail restored, because
+/// `RegexConflictParser::retread_mutually_unsatisfiable` anchors on it.
 const P6W_RECONCILER_FAILURE: &str = "\
 computing uv closure for bundle `flashsac-pack`: dependency conflict in \
-environment 'flashsac-gpu' for bundle 'flashsac-pack': `setuptools` requirements \
-are mutually unsatisfiable: `==84.0.0` required by uv constraint \
-`setuptools==84.0.0` from workspace conda fact `precise-consuming-envs`; \
+environment 'flashsac-gpu' for bundle 'flashsac-pack' (target profile \
+'linux-64-cuda-12-glibc-2-35', platform linux-64, python 3.11): `setuptools` \
+requirements are mutually unsatisfiable: `==84.0.0` required by uv constraint \
+`setuptools==84.0.0` from workspace conda fact (learned: selected by every \
+consuming env's conda solve) `precise-consuming-envs` (conda \
+`setuptools==84.0.0`); \
 `!=50.0.0` required by wheel `dm_control==1.0.45` Requires-Dist \
 `setuptools!=50.0.0`; `>=41.0.0` required by wheel `tensorboard==2.21.0` \
 Requires-Dist `setuptools>=41.0.0`; `*` required by wheel `sapien==3.0.3` \
-Requires-Dist `setuptools`.
+Requires-Dist `setuptools`; `<=65` required by wheel `FlashRL==0.1.0` \
+Requires-Dist `setuptools<=65`. Resolve by pinning one side, or use \
+`retread-relax`, `retread-overrides`, or `retread-drop-deps` in the pack \
+manifest (see README).
+";
+
+/// p6z. The SAME parse failure as [`P6W_PARSE_FAILURE`], as the code now
+/// produces it: the wheel whose `Requires-Dist` refused is named. p6w-1's
+/// second half was exactly this absence -- 25 bystanders went with one culprit
+/// because no row said whose metadata failed.
+const P6Z_PARSE_FAILURE_WITH_OWNER: &str = "\
+computing uv closure for bundle `holosoma-pack`: reading `Requires-Dist` of \
+wheel `omegaconf==2.0.6`: parsing requirement `PyYAML (>=5.1.*)`: Operator >= \
+cannot be used with a wildcard version specifier
 ";
 
 /// ARM 5772100's ACTUAL error text, and the reason p6w has a second guard for
@@ -13124,9 +13148,12 @@ fn p6w_b_a_failure_that_names_no_injected_root_falls_back_and_says_so() {
     else {
         panic!("nothing in a parse error attributes it to a detection");
     };
+    // p6z: the fallback no longer settles for "uv named nobody" -- true, and
+    // useless, since uv never ran. It names the CLAUSE that refused.
     assert!(
-        why.contains("named none of the injected roots"),
-        "the fallback must say attribution found nobody: {why}",
+        why.contains("`Requires-Dist` clause could not be parsed")
+            && why.contains("PyYAML (>=5.1.*)"),
+        "the fallback must name the clause that refused: {why}",
     );
 
     // (ii) THE HARDER CASE, and why this guard is not a formality. retread's
@@ -13174,6 +13201,202 @@ fn p6w_b_a_failure_that_names_no_injected_root_falls_back_and_says_so() {
         panic!("no injected roots means no attributable cause");
     };
     assert!(why.contains("injected no Lane C roots"), "{why}");
+}
+
+/// p6z guard (a). Boarded p6w-1.
+///
+/// `holosoma-pack`'s 26 detected roots were dropped in FOUR arms
+/// (5764452/5764453, 5776669/5776671) for one reason: retread's own PEP 508
+/// reader refused `omegaconf==2.0.6`'s real `Requires-Dist` value
+/// `PyYAML (>=5.1.*)`. uv never ran.
+///
+/// MEASURED with uv 0.11.29 on this box before deciding anything: a project
+/// whose only dependency is `omegaconf==2.0.6` resolves, picking pyyaml 6.0.3,
+/// and pinned against `pyyaml==5.0.1` uv names its own reading in its own
+/// prose -- "omegaconf==2.0.6 depends on pyyaml>=5.1". uv normalizes the
+/// clause; the distribution is not defective; retread's reader was.
+#[test]
+fn p6z_a_a_legacy_wildcard_in_requires_dist_costs_no_roots() {
+    // (i) The clause uv accepts, retread now accepts -- with uv's semantics,
+    // not a guess. `>=5.1`, so pyyaml 6.0.3 is in and 5.0.1 is out.
+    let requirement = crate::pep508_lenient::parse_requirement_lenient(
+        "PyYAML (>=5.1.*)",
+    )
+    .expect("uv accepts this line, so retread must");
+    assert_eq!(requirement.name.to_string(), "pyyaml");
+
+    // (ii) NOTHING IS ATTRIBUTED TO A DETECTION BY A PARSE FAILURE, and the
+    // row names the distribution that published the clause. All 26 roots stay
+    // requested: a `FallBackToAll` carries no root drops at all.
+    let holosoma_roots: Vec<String> = [
+        "absl-py", "etils==1.13.0", "flask", "glfw", "hydra-core", "imageio",
+        "jax", "matplotlib", "mediapy", "mujoco", "numpy", "omegaconf",
+        "onnxruntime", "opencv-python", "pandas", "pillow", "pyyaml",
+        "rich", "scipy", "tqdm", "trimesh", "typeguard", "warp-lang",
+        "wandb", "yourdfpy", "zmq",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    assert_eq!(holosoma_roots.len(), 26, "the measured request size");
+    let holosoma = BTreeMap::from([("holosoma-pack".to_string(), holosoma_roots)]);
+
+    let decision =
+        attributed_backoff_decision(0, P6Z_PARSE_FAILURE_WITH_OWNER, &holosoma, &BTreeMap::new());
+    let AttributedBackoffDecision::FallBackToAll(why) = decision else {
+        panic!("a metadata parse failure blames no detection: {decision:?}");
+    };
+    assert!(
+        why.contains("omegaconf==2.0.6") && why.contains("PyYAML (>=5.1.*)"),
+        "the row must name the DISTRIBUTION and the CLAUSE: {why}",
+    );
+    for root in ["etils==1.13.0", "pyyaml", "omegaconf"] {
+        assert!(
+            !why.contains(&format!("root={root}")),
+            "no root may be blamed for a parse failure: {why}",
+        );
+    }
+
+    // NON-VACUITY 1: with no owner in the text the row still refuses to guess
+    // a distribution, and says so rather than inventing one.
+    let AttributedBackoffDecision::FallBackToAll(anonymous) =
+        attributed_backoff_decision(0, P6W_PARSE_FAILURE, &holosoma, &BTreeMap::new())
+    else {
+        panic!("still a fallback");
+    };
+    assert!(
+        anonymous.contains("an unnamed distribution")
+            && anonymous.contains("PyYAML (>=5.1.*)"),
+        "{anonymous}",
+    );
+
+    // NON-VACUITY 2: the strict reader really did refuse this line, so (i)
+    // passes because of the lenient reader and not because the line was
+    // always fine.
+    assert!(
+        <uv_pep508::Requirement as std::str::FromStr>::from_str("PyYAML (>=5.1.*)").is_err(),
+        "the strict reader must still refuse the line the lenient one repairs",
+    );
+
+    // NON-VACUITY 3: a line NO reader can repair still fails, and the row
+    // still names it. A lenient reader that swallowed everything would be the
+    // same defect pointing the other way.
+    assert!(
+        crate::pep508_lenient::parse_requirement_lenient("=== nonsense ===")
+            .is_err(),
+        "leniency is a repair ladder, not a shrug",
+    );
+}
+
+/// p6z guard (b), the attribution half. Boarded p6w-2.
+///
+/// The full measured `flashsac-pack` text -- with the `FlashRL<=65` clause
+/// p6w's fixture dropped -- read STRUCTURALLY: every clause with its carrier,
+/// which carriers are Lane C detections, and which clause is a LEARNED
+/// workspace fact rather than operator intent.
+#[test]
+fn p6z_b_the_reconciler_conflict_names_its_carrier_not_thirteen_bystanders() {
+    let flashsac = BTreeMap::from([(
+        "flashsac-pack".to_string(),
+        vec![
+            "brax".to_string(),
+            "dm-control".to_string(),
+            "mani-skill".to_string(),
+            "tensorboard".to_string(),
+            "tqdm".to_string(),
+        ],
+    )]);
+
+    let conflicts = crate::uv_closure::read_reconciler_conflicts(
+        P6W_RECONCILER_FAILURE,
+        &flashsac,
+    );
+    let conflict = conflicts
+        .first()
+        .unwrap_or_else(|| panic!("the reconciler diagnostic must parse: {conflicts:?}"));
+    assert_eq!(conflict.package, "setuptools");
+    assert_eq!(conflict.bundle, "flashsac-pack");
+
+    let flashrl = conflict
+        .clauses
+        .iter()
+        .find(|clause| clause.carrier == "FlashRL")
+        .unwrap_or_else(|| panic!("FlashRL carries the cap: {:?}", conflict.clauses));
+    assert_eq!(flashrl.spec, "<=65");
+    assert!(
+        flashrl.injected_root.is_none(),
+        "FlashRL is the pack's own wheel, not a Lane C detection",
+    );
+    assert!(!flashrl.learned, "a wheel's Requires-Dist is not a learned fact");
+
+    let learned = conflict
+        .clauses
+        .iter()
+        .find(|clause| clause.learned)
+        .unwrap_or_else(|| panic!("the conda fact is LEARNED: {:?}", conflict.clauses));
+    assert_eq!(learned.spec, "==84.0.0");
+
+    // The spelling fold still holds on this path: the root is injected as
+    // `dm-control` and quoted as `dm_control==1.0.45`.
+    assert!(
+        conflict
+            .clauses
+            .iter()
+            .any(|clause| clause.carrier == "dm_control"
+                && clause.injected_root.as_deref() == Some("dm-control")),
+        "{:?}",
+        conflict.clauses,
+    );
+    // ...and a carrier that is NOT an injected root is not made one. `sapien`
+    // reaches the closure through `mani-skill`; the text names `sapien`, and
+    // guessing `mani-skill` from it is exactly the inference this lane refuses.
+    assert!(
+        conflict
+            .clauses
+            .iter()
+            .any(|clause| clause.carrier == "sapien" && clause.injected_root.is_none()),
+        "{:?}",
+        conflict.clauses,
+    );
+
+    // AND THE DECISION: none of the five detections is the culprit, so none is
+    // dropped, and the fallback row NAMES the two clauses that actually
+    // contradict instead of "uv named nobody".
+    let decision =
+        attributed_backoff_decision(0, P6W_RECONCILER_FAILURE, &flashsac, &BTreeMap::new());
+    let AttributedBackoffDecision::FallBackToAll(why) = decision else {
+        panic!("no detection carries this contradiction: {decision:?}");
+    };
+    assert!(
+        why.contains("constraint reconciler")
+            && why.contains("`<=65`")
+            && why.contains("FlashRL")
+            && why.contains("LEARNED"),
+        "the row must name the carriers: {why}",
+    );
+
+    // NON-VACUITY: the arithmetic is a real discrimination. Give the same
+    // bundle a text whose ONLY unsatisfiable clause IS carried by an injected
+    // root, and that root is named -- so the empty answer above is a
+    // measurement, not a refusal to answer.
+    let sole = P6W_RECONCILER_FAILURE
+        .replace(
+            "`<=65` required by wheel `FlashRL==0.1.0` Requires-Dist `setuptools<=65`",
+            "`<=65` required by wheel `dm_control==1.0.45` Requires-Dist `setuptools<=65`",
+        )
+        .replace(
+            "`!=50.0.0` required by wheel `dm_control==1.0.45` Requires-Dist \
+             `setuptools!=50.0.0`; ",
+            "",
+        );
+    let conflicts = crate::uv_closure::read_reconciler_conflicts(&sole, &flashsac);
+    assert!(
+        conflicts
+            .first()
+            .is_some_and(|conflict| conflict.clauses.iter().any(|clause| clause.spec == "<=65"
+                && clause.injected_root.as_deref() == Some("dm-control"))),
+        "the rewritten fixture must put the decisive clause on a detection: {conflicts:?}",
+    );
 }
 
 #[test]

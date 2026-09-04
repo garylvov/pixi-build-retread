@@ -26,6 +26,7 @@ pub mod installer;
 pub mod lock;
 pub mod pack_overrides;
 pub mod panic_hook;
+pub mod pep508_lenient;
 pub mod probe;
 pub mod pypi;
 pub mod recipe;

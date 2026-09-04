@@ -5,7 +5,7 @@ mod driver;
 mod error;
 pub mod lock;
 mod manifest;
-mod parse;
+pub(crate) mod parse;
 mod repair;
 mod smoke;
 

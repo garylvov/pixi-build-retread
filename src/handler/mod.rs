@@ -5742,7 +5742,7 @@ impl Handler {
                         );
                         emit_auto_imports_attribution_fallback_row(
                             &request_label,
-                            why,
+                            &why,
                             &injected_observed,
                         );
                         abi_backoff_suppressed.insert(AUTO_IMPORTS_SUPPRESS_ALL.to_string());
@@ -16658,7 +16658,13 @@ enum AttributedBackoffDecision {
     /// Attribution produced nothing to act on. Take the whole-request
     /// back-off, and SAY WHY -- a fallback that reads like the attributed
     /// path is how p6u shipped 51 dropped roots looking like a clean pass.
-    FallBackToAll(&'static str),
+    ///
+    /// p6z widened this from a `&'static str` to an owned reason so the row
+    /// can NAME what actually refused: p6w's fixed sentence ("uv's conflict
+    /// report named none of the injected roots") was true of `flashsac-pack`
+    /// and `holosoma-pack` and told an operator nothing, because uv never ran
+    /// on either.
+    FallBackToAll(String),
 }
 
 /// p6w. The pure decision the ladder turns on, kept out of the async resolve
@@ -16676,12 +16682,13 @@ fn attributed_backoff_decision(
 ) -> AttributedBackoffDecision {
     if round >= AUTO_IMPORTS_ATTRIBUTED_BACKOFF_MAX_ROUNDS {
         return AttributedBackoffDecision::FallBackToAll(
-            "the attributed retry ladder reached its bound without resolving",
+            "the attributed retry ladder reached its bound without resolving".to_string(),
         );
     }
     if injected_by_bundle.values().all(Vec::is_empty) {
         return AttributedBackoffDecision::FallBackToAll(
-            "the failing pass injected no Lane C roots, so no detection can be its cause",
+            "the failing pass injected no Lane C roots, so no detection can be its cause"
+                .to_string(),
         );
     }
     let fresh: Vec<crate::uv_closure::AttributedRootDrop> =
@@ -16694,10 +16701,16 @@ fn attributed_backoff_decision(
             })
             .collect();
     if fresh.is_empty() {
-        return AttributedBackoffDecision::FallBackToAll(
-            "uv's conflict report named none of the injected roots, so nothing attributes \
-             the failure to a detection",
-        );
+        // p6z: the generic sentence is the FALLBACK for the fallback. When the
+        // text is retread's own -- a reconciler conflict or a `Requires-Dist`
+        // parse refusal -- the row names the carriers or the distribution.
+        let detail = crate::uv_closure::attribution_failure_detail(error_text, injected_by_bundle)
+            .unwrap_or_else(|| {
+                "uv's conflict report named none of the injected roots, so nothing attributes \
+                 the failure to a detection"
+                    .to_string()
+            });
+        return AttributedBackoffDecision::FallBackToAll(detail);
     }
     AttributedBackoffDecision::DropRoots(fresh)
 }

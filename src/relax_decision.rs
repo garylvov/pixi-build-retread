@@ -322,6 +322,7 @@ fn decide_with_search_limit_and_projection(
         }
         Ok(FinalizeSuccess::AdvisoryFloorSoftened {
             specifiers,
+            kind: _,
             unsoftened_conflict,
         }) => {
             if is_anchor {
