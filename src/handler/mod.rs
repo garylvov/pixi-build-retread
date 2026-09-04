@@ -6692,9 +6692,15 @@ impl Handler {
         // the artifact it locked, built from the plan this process actually
         // resolved. One row, at WARN and on the terminal, so a run that took
         // this door is never mistaken for one that reproduced.
+        // p6p: set by the adoption below and read by the courier build-string
+        // gate further down. Without it that gate re-derives the very build
+        // string this door just decided to tolerate and refuses anyway, so the
+        // WARN above was a decision with no consumer.
+        let mut adopted_build_string_drift = false;
         if matching_bundles.is_empty() && build_string_drift.len() == 1 {
             let (bundle_index, bundle, effective, emission_relaxations, recomputed_build) =
                 build_string_drift.remove(0);
+            adopted_build_string_drift = true;
             tracing::warn!(
                 bundle = %bundle.conda_name,
                 advertised_build = %params.output.build.as_deref().unwrap_or(""),
@@ -6864,16 +6870,28 @@ impl Handler {
         );
 
         if config.courier {
-            validate_advertised_courier_build(
-                &config,
-                &input_bundle_name,
-                &target,
-                cold_workspace_manifest,
-                workspace_dir.as_deref(),
-                &source_dir,
-                cold_workspace_fp,
-                params.output.build.as_deref(),
-            )?;
+            // p6p: the recompute door above already decided this drift is
+            // tolerable -- one candidate, name/version/subdir agree, run
+            // dependencies agree -- and committed to emitting under the
+            // ADVERTISED build string. This gate asks the same question a
+            // second time (does the build string re-derive from today's
+            // inputs?) and can only answer "no", because "no" is the door's
+            // entry condition. Running it here made the tolerance unreachable:
+            // job 5733324 arm B logged the adoption WARN and the -32602
+            // refusal 13.6 ms apart on protomotions-deps-pack=3.1. The version
+            // gate below is a different question and still runs.
+            if !adopted_build_string_drift {
+                validate_advertised_courier_build(
+                    &config,
+                    &input_bundle_name,
+                    &target,
+                    cold_workspace_manifest,
+                    workspace_dir.as_deref(),
+                    &source_dir,
+                    cold_workspace_fp,
+                    params.output.build.as_deref(),
+                )?;
+            }
             validate_advertised_courier_version(
                 bundle,
                 advertised_output_version.as_deref(),

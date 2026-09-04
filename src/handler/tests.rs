@@ -11258,3 +11258,126 @@ fn p6j_a_bundled_wheels_range_requires_dist_survives_the_widened_projection() {
     );
 }
 
+
+// -----------------------------------------------------------------
+// p6p: the recompute door and the courier build-string gate ask the
+// SAME question and cannot both run.
+// -----------------------------------------------------------------
+
+/// Job 5733324 arm B, `protomotions-deps-pack=3.1`, backend log
+/// `C3B-5733324.backend.log`. Two rows, 13.6 ms apart, from one
+/// `conda/build_v1`:
+///
+/// ```text
+/// 23:54:00.835765 WARN  advertised identity: the build string drifted between the
+///   metadata and build passes (shared decision cache / sibling-lock workspace
+///   fingerprint). Run dependencies agree, so the recomputed plan is built and
+///   emitted under the ADVERTISED build string instead of refusing.
+///   advertised_build=py311_hff66755995_loose_0 recomputed_build=py311_h62689b0ab4_loose_0
+/// 23:54:00.849339 ERROR retread rpc error: ... code=-32602: courier inputs changed
+///   between conda/outputs and conda/build_v1: pixi requested build
+///   `py311_hff66755995_loose_0`, but current inputs for source bundle
+///   `protomotions-deps-pack` require `py311_h62689b0ab4_loose_0`
+/// ```
+///
+/// The p6i recompute door decided not to refuse; `validate_advertised_courier_build`
+/// then refused anyway, and pixi's `build_dispatch.rs` panicked on it. The door
+/// was a decision with no consumer.
+///
+/// This test pins WHY the two are incompatible rather than merely inconvenient:
+/// the door's entry condition (`ColdCandidateVerdict::BuildStringDrift` -- name,
+/// version and subdir agree, the build string does not) is exactly the condition
+/// under which the gate can only return `courier inputs changed`. So on every
+/// path the door opens, the gate refuses; running both makes the door
+/// unreachable by construction.
+///
+/// Falsifiable by mutation, both halves:
+///   * widen `cold_candidate_verdict` so a drifted build string is an exact
+///     match and the first assertion fails;
+///   * make `validate_advertised_courier_build` tolerate a build-string
+///     difference and the second fails.
+#[test]
+fn the_recompute_door_and_the_courier_build_gate_cannot_both_run() {
+    let (advertised_bundle, _) = advertised_and_drifted_bundles();
+    let output = emit_for_recovery(&advertised_bundle);
+
+    // Half 1 -- the door opens on a build-string-only drift. This is the state
+    // arm B was in when it logged the adoption WARN.
+    let drifted_request = pixi_build_types::procedures::conda_build_v1::CondaBuildV1Output {
+        name: output.metadata.name.clone(),
+        version: Some(output.metadata.version.clone()),
+        build: Some("py311_hff66755995_loose_0".to_string()),
+        subdir: output.metadata.subdir,
+        variant: output.metadata.variant.clone(),
+    };
+    assert_ne!(
+        Some(&output.metadata.build),
+        drifted_request.build.as_ref(),
+        "the fixture must actually differ on the build string",
+    );
+    assert_eq!(
+        cold_candidate_verdict(&output, &drifted_request),
+        ColdCandidateVerdict::BuildStringDrift,
+        "the recompute door's entry condition is a build-string-only drift",
+    );
+
+    // Half 2 -- for a request in exactly that state, and with no record for the
+    // advertised build (a shared built-output-store hit returns a cached
+    // conda/outputs result without writing one, which is how arm B got here),
+    // the courier gate has no answer but refusal.
+    let mut config = cfg();
+    config.courier = true;
+    config
+        .retread_wheels
+        .insert("protomotions-deps-pack".to_string(), WheelEntry::default());
+    let target = ResolutionTarget::for_subdir("3.11", "linux-64");
+    let source = Path::new("/source");
+    let ws = Path::new("/ws");
+    let live_fp = EffectiveWorkspaceFp::resolve(None, None, ws, source, &target);
+    let error = validate_advertised_courier_build(
+        &config,
+        "protomotions-deps-pack",
+        &target,
+        None,
+        None,
+        source,
+        &live_fp,
+        drifted_request.build.as_deref(),
+    )
+    .expect_err(
+        "a build string the current inputs do not re-derive is precisely what this gate \
+         refuses -- and it is precisely the door's entry condition",
+    );
+    assert!(
+        format!("{error:?}").contains("courier inputs changed"),
+        "{error:?}",
+    );
+
+    // Non-vacuous: the gate is not simply always-refuse. Hand it the build
+    // string the current inputs DO re-derive and it passes, so the refusal
+    // above is about the drift and nothing else.
+    let reproducible_build = courier_build_string_for_target(
+        &target,
+        &courier_inputs_hash_with_workspace_fp(
+            &config,
+            "protomotions-deps-pack",
+            &target,
+            &[],
+            None,
+            live_fp.as_str(),
+        ),
+        config.build_number,
+        config.bundle_mode == crate::config::BundleMode::Loose,
+    );
+    validate_advertised_courier_build(
+        &config,
+        "protomotions-deps-pack",
+        &target,
+        None,
+        None,
+        source,
+        &live_fp,
+        Some(&reproducible_build),
+    )
+    .expect("the gate passes a build string that re-derives from the current inputs");
+}
