@@ -4085,6 +4085,251 @@ pub fn attribute_conflict(
     out
 }
 
+// ---------------------------------------------------------------------------
+// p6w: attributing a resolve failure to the injected roots that caused it
+// ---------------------------------------------------------------------------
+
+/// p6w. What the operator must DO about one dropped auto-imports root, decided
+/// from uv's own clause rather than from the fact that a resolve failed.
+///
+/// p6u's per-ENV row already carried a remedy, but it could only ever choose
+/// between "declare the platform" and "manifest finding" for a whole
+/// environment at once, because the resolve-time back-off had no per-root
+/// attribution to hang a remedy on. Three roots dropped together got one
+/// answer; here each root gets its own, from the sentence uv wrote about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RootDropRemedy {
+    /// uv rejected every distribution because the only wheels published are
+    /// above this workspace's manylinux ceiling. The remedy is a DECLARED
+    /// platform fact, not a dropped detection (the 5.1.0.0 kit-sdk case).
+    PlatformFact { major: u32, minor: u32 },
+    /// The index publishes NO distribution matching the root at all for this
+    /// python/platform. No declaration makes it satisfiable; the import is
+    /// real and its distribution is not on this index.
+    UpstreamAbsence,
+    /// uv named the root in a genuine version conflict with something this
+    /// request already declares. A manifest decision, not a platform one.
+    ManifestFinding,
+}
+
+impl RootDropRemedy {
+    /// The token the `auto_imports_root_dropped` row prints, so the row, the
+    /// strict refusal and the guards all say one word.
+    pub fn token(&self) -> &'static str {
+        match self {
+            Self::PlatformFact { .. } => "platform-fact",
+            Self::UpstreamAbsence => "upstream-absence",
+            Self::ManifestFinding => "manifest-finding",
+        }
+    }
+}
+
+impl std::fmt::Display for RootDropRemedy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PlatformFact { major, minor } => write!(
+                f,
+                "platform-fact: the only distributions published are above this target's \
+                 manylinux ceiling; declare `[system-requirements] libc = \"{major}.{minor}\"` \
+                 (or the pixi >= 0.71 `platforms` form) so the ceiling admits them"
+            ),
+            Self::UpstreamAbsence => f.write_str(
+                "upstream-absence: the index publishes no distribution matching this root for \
+                 this python and platform; no declaration makes it satisfiable, so the import \
+                 needs a different distribution or a `retread-name-map` entry",
+            ),
+            Self::ManifestFinding => f.write_str(
+                "manifest-finding: uv named this root in a genuine conflict with a requirement \
+                 this request already states; declare the version this workspace intends, or \
+                 relax the pin that excludes it",
+            ),
+        }
+    }
+}
+
+/// p6w. One injected root uv's own conflict report names, with the clause it
+/// was named in and the remedy that clause implies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttributedRootDrop {
+    /// Canonical conda name of the bundle whose resolve failed.
+    pub bundle: String,
+    /// The root exactly as it was injected (`etils==1.13.0`, `tqdm`).
+    pub root: String,
+    /// The distribution name the root names, normalized PEP 503-style.
+    pub name: String,
+    /// uv's OWN sentence about this root, verbatim. Never paraphrased: the
+    /// whole reason this is trustworthy is that it is uv's conclusion and not
+    /// retread's re-derivation of one.
+    pub clause: String,
+    pub remedy: RootDropRemedy,
+}
+
+/// The distribution name an injected root names: everything before the first
+/// specifier, extra, marker or whitespace character, lowercased with `_`/`.`
+/// folded to `-` (PEP 503).
+///
+/// Injected roots come from `NamingAuthority::root_specifier`, which emits
+/// either `name` or `name==version` -- but this must not assume that shape,
+/// because a root that ever gains an extra or a marker would otherwise be
+/// matched under a name that contains a bracket and never attributed.
+pub fn root_distribution_name(root: &str) -> String {
+    let cut = root
+        .find(|c: char| "=<>!~[; \t".contains(c))
+        .unwrap_or(root.len());
+    root[..cut]
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['_', '.'], "-")
+}
+
+/// The spellings one normalized distribution name appears under in resolver
+/// prose: PEP 503 folds `-`, `_` and `.` together, so a text may carry any of
+/// them and a matcher that knows only one of them silently misses the rest.
+fn root_name_spellings(name: &str) -> Vec<String> {
+    let mut out = vec![name.to_string()];
+    for sep in ['_', '.'] {
+        let spelled = name.replace('-', &sep.to_string());
+        if spelled != name {
+            out.push(spelled);
+        }
+    }
+    out
+}
+
+/// True when uv's prose says the index holds no versions of `name` at all.
+///
+/// The `==`-pinned case is [`conflict_says_no_such_version`], which needs a
+/// parsed version to decide whether uv's specifier covers the pin. A BARE
+/// injected root has no version to check, so this is its sibling: uv naming
+/// `no versions of <name>` with no specifier at all is upstream absence.
+/// Measured on jobs 5764452/5764453 (`robojudo-pack`): the failure that made
+/// the request-wide back-off drop 12 roots was uv saying
+/// `Because unitree-sdk2py was not found in the package registry and your
+/// project depends on unitree-sdk2py, we can conclude that your project's
+/// requirements are unsatisfiable.` -- an absence sentence uv writes in a
+/// SECOND shape, with no "no versions of" in it at all. Matching only the
+/// first shape classified that root as a manifest finding and told the
+/// operator to declare a dependency for a distribution no index carries.
+fn report_says_no_versions_of(prose: &str, name: &str) -> bool {
+    let name = regex::escape(name);
+    let pattern = format!(
+        r"(?i)(?:\bno versions? of\s+{name}(?:\[[^\]]*\])?(?:[^A-Za-z0-9._-]|$))|(?:\b{name}(?:\[[^\]]*\])?\s+was not found in the package registry)"
+    );
+    regex::Regex::new(&pattern)
+        .expect("static bare no-such-version regex")
+        .is_match(prose)
+}
+
+/// p6w. Which injected roots did uv actually blame?
+///
+/// THE DEFECT THIS EXISTS FOR (boarded p6u-1). The resolve-time back-off had
+/// no per-bundle -- let alone per-root -- attribution, so ONE unsatisfiable
+/// root made it drop every detected root in the request: 51 of them across
+/// three packs in jobs 5764452/5764453, including `etils==1.13.0`, a correctly
+/// pinned detection that resolves perfectly well. Dropping 51 detections to
+/// learn that at least one is unsatisfiable is not auto-detection.
+///
+/// uv already answers the question. `format_lock_failure` embeds uv's stderr
+/// VERBATIM in the error, and [`uv_conflict_report`] slices uv's own
+/// CONCLUSION out of the surrounding `-v` exploration trace -- the same slice
+/// p6r made `attribute_conflict` read, for the same reason: a name that
+/// appears only in the trace is a candidate uv considered and rejected, not a
+/// cause. So attribution here is a lookup of each injected root in uv's
+/// conclusion, and a root uv never mentions is never blamed.
+///
+/// Returns one entry per (bundle, root) uv named. EMPTY is a meaningful
+/// answer and the caller must handle it: it means uv's report blamed none of
+/// the injected roots, and the honest response is the whole-request back-off
+/// with that fact stated, not a guess at which root to drop.
+pub fn attribute_auto_imports_failure(
+    error_text: &str,
+    injected_by_bundle: &BTreeMap<String, Vec<String>>,
+) -> Vec<AttributedRootDrop> {
+    let report = uv_conflict_report(error_text);
+    let report: &str = report.as_ref();
+    let prose = flatten_conflict_prose(report);
+    let mut out = Vec::new();
+    for (bundle, roots) in injected_by_bundle {
+        for root in roots {
+            let name = root_distribution_name(root);
+            if name.is_empty() {
+                continue;
+            }
+            // BOTH SPELLINGS, and this is not cosmetic. Injected roots carry
+            // the PEP 503-normalized name (`dm-control`), while uv and
+            // retread quote the distribution as the wheel spells it
+            // (`dm_control==1.0.45`, job 5764452 line 247282). Searching only
+            // the normalized form found `tensorboard` and missed
+            // `dm_control` in that very failure -- which left ONE apparent
+            // culprit where there were two, and so turned a text that
+            // attributes nothing into one that confidently blamed a root.
+            let Some(clause) = root_name_spellings(&name)
+                .into_iter()
+                .find_map(|spelling| uv_reason_sentence(report, &spelling))
+            else {
+                continue;
+            };
+            // The remedy is read from the clause uv wrote about THIS root,
+            // then from the whole report -- never the other way round, or one
+            // root's manylinux ceiling would be pinned on every sibling in the
+            // same failure.
+            let remedy = if let Some((major, minor)) =
+                crate::glibc::extract_manylinux_floor(&clause)
+                    .filter(|_| crate::installer::is_platform_tag_conflict(&clause))
+            {
+                RootDropRemedy::PlatformFact { major, minor }
+            } else if root_name_spellings(&name).into_iter().any(|spelling| {
+                report_says_no_versions_of(&prose, &spelling)
+                    || pinned_version_absent(report, root, &spelling)
+            }) {
+                RootDropRemedy::UpstreamAbsence
+            } else {
+                RootDropRemedy::ManifestFinding
+            };
+            out.push(AttributedRootDrop {
+                bundle: bundle.clone(),
+                root: root.clone(),
+                name,
+                clause,
+                remedy,
+            });
+        }
+    }
+    // NOT EVERY RESOLVE FAILURE IS A UV RESOLUTION FAILURE, and this is where
+    // that matters. Measured on jobs 5764452/5764453: of the three
+    // request-wide back-offs, only `robojudo-pack`'s came from uv (its report
+    // carries the `x` marker). `flashsac-pack`'s was retread's OWN constraint
+    // reconciler refusing a mutually unsatisfiable `setuptools`, and
+    // `holosoma-pack`'s was a PEP 508 metadata PARSE error -- uv never ran.
+    //
+    // Those texts still MENTION injected roots, because retread's reconciler
+    // lists every requirement's provenance: flashsac's names `dm_control`,
+    // `tensorboard` and (through `sapien`) `mani-skill`, none of which is
+    // individually unsatisfiable -- the actual contradiction is a declared
+    // `FlashRL<=65` against a conda fact `setuptools==84.0.0`, and neither
+    // side is a detected root. Dropping the three mentioned roots would spend
+    // three full re-resolves to arrive at the same failure.
+    //
+    // So a mention is only trusted as an ACCUSATION when it came out of uv's
+    // own conclusion block, or when the text names exactly one injected root
+    // and therefore cannot be pointing anywhere else. Anything else returns
+    // empty, and empty means the caller says "attribution named nobody"
+    // rather than guessing.
+    if !error_text.contains('\u{d7}') && out.len() > 1 {
+        return Vec::new();
+    }
+    out
+}
+
+/// `name==version`-shaped root whose exact pin uv says the index cannot serve.
+fn pinned_version_absent(report: &str, root: &str, name: &str) -> bool {
+    let Some((_, version)) = root.split_once("==") else {
+        return false;
+    };
+    uv_pep508::uv_pep440::Version::from_str(version.trim())
+        .is_ok_and(|version| conflict_says_no_such_version(report, name, &version))
+}
+
 fn apply_workspace_fact_overrides(req: &mut UvClosureRequest, facts: &[WorkspaceFactOverride]) {
     for fact in facts {
         if req

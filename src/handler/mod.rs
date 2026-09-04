@@ -5569,6 +5569,14 @@ impl Handler {
         // bundle can trigger at most one re-resolve).
         let mut abi_backoff_suppressed: BTreeSet<String> = BTreeSet::new();
         let mut abi_backoff_count = 0usize;
+        // p6w: the ATTRIBUTED plan -- canonical conda name -> the normalized
+        // root names uv's conflict report blamed. Shared across every python
+        // in the request for the same reason `abi_backoff_suppressed` is: it
+        // only ever grows, which is the termination proof, and a root uv
+        // blamed under one python is not going to become satisfiable under
+        // the next one in the same resolve.
+        let mut auto_imports_attributed_roots: BTreeMap<String, BTreeSet<String>> =
+            BTreeMap::new();
         // p6t: every Lane C root DROPPED anywhere in this request, keyed by
         // bundle. The summary row below names them and publishes a counter,
         // because a `suppressed_all=true` request that also produced a lock
@@ -5623,42 +5631,118 @@ impl Handler {
             // retry suppresses injection for every bundle in this request
             // rather than one. Bounded to a single extra resolve by the
             // sentinel, and loud, so it is a reported finding either way.
-            let resolve_attempt = resolve_all(
-                &config,
-                &target,
-                &download_dir,
-                &source_dir,
-                &cache_dir,
-                &params.channels,
-                workspace_dir.as_deref(),
-                &abi_backoff_suppressed,
-            )
-            .await;
+            // p6w: THE ATTRIBUTED LADDER. Each turn resolves, and on failure
+            // asks uv's own conflict report which of the injected roots it
+            // blamed. Named roots are dropped -- only those -- and the resolve
+            // is retried with every sibling detection still in. The
+            // whole-request drop below is now the FALLBACK, taken only when
+            // attribution names nothing, and it says so when it is taken.
+            let request_label = format!(
+                "conda/outputs {} python={python_version}",
+                params.work_directory.display(),
+            );
+            let mut attributed_round = 0usize;
             let (
                 materialized,
                 base_config,
                 restore_relaxations,
                 auto_imports_injected,
                 auto_imports_suppressed_by_bundle,
-            ) = match resolve_attempt {
-                    Ok(resolved) => resolved,
-                    Err(error)
-                        if auto_imports_injection_enabled(&config)
-                            && !abi_backoff_suppressed
-                                .contains(AUTO_IMPORTS_SUPPRESS_ALL) =>
-                    {
+            ) = loop {
+                let mut injected_observed: BTreeMap<String, Vec<String>> = BTreeMap::new();
+                let resolve_attempt = resolve_all(
+                    &config,
+                    &target,
+                    &download_dir,
+                    &source_dir,
+                    &cache_dir,
+                    &params.channels,
+                    workspace_dir.as_deref(),
+                    &abi_backoff_suppressed,
+                    &auto_imports_attributed_roots,
+                    &mut injected_observed,
+                )
+                .await;
+                let error = match resolve_attempt {
+                    Ok(resolved) => break resolved,
+                    Err(error) => error,
+                };
+                // Injection off, or the whole-request back-off already spent:
+                // there is nothing left to drop, so this is a real failure and
+                // must not be retried into a second identical resolve.
+                if !auto_imports_injection_enabled(&config)
+                    || abi_backoff_suppressed.contains(AUTO_IMPORTS_SUPPRESS_ALL)
+                {
+                    return Err(RpcError::invalid_params(format!(
+                        "resolving wheels for python {python_version}: {error:#}"
+                    )));
+                }
+                let error_text = format!("{error:#}");
+                match attributed_backoff_decision(
+                    attributed_round,
+                    &error_text,
+                    &injected_observed,
+                    &auto_imports_attributed_roots,
+                ) {
+                    AttributedBackoffDecision::DropRoots(drops) => {
+                        attributed_round += 1;
+                        abi_backoff_count += 1;
+                        emit_auto_imports_root_dropped_rows(&request_label, &drops);
+                        for drop in &drops {
+                            auto_imports_attributed_roots
+                                .entry(drop.bundle.clone())
+                                .or_default()
+                                .insert(drop.name.clone());
+                            auto_imports_suppression_reasons.insert(
+                                drop.bundle.clone(),
+                                format!(
+                                    "{AUTO_IMPORTS_REASON_ATTRIBUTED_BACKOFF}: uv named \
+                                     `{}` -- {} -- {}",
+                                    drop.root, drop.clause, drop.remedy,
+                                ),
+                            );
+                        }
                         tracing::warn!(
                             python = %python_version,
-                            error = %format!("{error:#}"),
-                            "auto_imports: RESOLVE BACK-OFF -- wheel resolution failed with                              Lane C roots injected; retrying with injection suppressed for                              every bundle in this request. The error above is a FINDING: a                              detected dependency this workspace cannot resolve.",
+                            round = attributed_round,
+                            dropped = drops.len(),
+                            roots = %drops
+                                .iter()
+                                .map(|d| format!("{}={}", d.bundle, d.root))
+                                .collect::<Vec<_>>()
+                                .join(","),
+                            "auto_imports: ATTRIBUTED RESOLVE BACK-OFF -- uv's conflict report \
+                             named these roots as the cause, so exactly these are withheld and \
+                             every other detection is re-resolved WITH its roots. This is the \
+                             p6u-1 remedy: a request no longer drops all of its detections to \
+                             learn that one of them is unsatisfiable.",
                         );
-                        abi_backoff_suppressed
-                            .insert(AUTO_IMPORTS_SUPPRESS_ALL.to_string());
+                        continue;
+                    }
+                    AttributedBackoffDecision::FallBackToAll(why) => {
+                        tracing::warn!(
+                            python = %python_version,
+                            round = attributed_round,
+                            attribution = %why,
+                            error = %error_text,
+                            "auto_imports: RESOLVE BACK-OFF -- wheel resolution failed with \
+                             Lane C roots injected and ATTRIBUTION DID NOT NAME A CULPRIT \
+                             ({why}); falling back to suppressing injection for every bundle \
+                             in this request. The error above is a FINDING: a detected \
+                             dependency this workspace cannot resolve.",
+                        );
+                        emit_auto_imports_attribution_fallback_row(
+                            &request_label,
+                            why,
+                            &injected_observed,
+                        );
+                        abi_backoff_suppressed.insert(AUTO_IMPORTS_SUPPRESS_ALL.to_string());
                         auto_imports_suppression_reasons.insert(
                             AUTO_IMPORTS_SUPPRESS_ALL.to_string(),
-                            format!("{AUTO_IMPORTS_REASON_RESOLVE_BACKOFF}: {error:#}"),
+                            format!("{AUTO_IMPORTS_REASON_RESOLVE_BACKOFF}: {why}: {error_text}"),
                         );
                         abi_backoff_count += 1;
+                        let mut retried_injected: BTreeMap<String, Vec<String>> = BTreeMap::new();
                         let retried = resolve_all(
                             &config,
                             &target,
@@ -5668,6 +5752,8 @@ impl Handler {
                             &params.channels,
                             workspace_dir.as_deref(),
                             &abi_backoff_suppressed,
+                            &auto_imports_attributed_roots,
+                            &mut retried_injected,
                         )
                         .await
                         .map_err(|e| {
@@ -5679,14 +5765,10 @@ impl Handler {
                             python = %python_version,
                             "auto_imports: RESOLVE BACK-OFF SUCCEEDED -- resolved without                              injected roots",
                         );
-                        retried
+                        break retried;
                     }
-                    Err(e) => {
-                        return Err(RpcError::invalid_params(format!(
-                            "resolving wheels for python {python_version}: {e:#}"
-                        )));
-                    }
-                };
+                }
+            };
             for (bundle, roots) in auto_imports_suppressed_by_bundle {
                 auto_imports_suppressed_all_bundles
                     .entry(bundle)
@@ -6095,6 +6177,8 @@ impl Handler {
                                 &params.channels,
                                 workspace_dir.as_deref(),
                                 &abi_backoff_suppressed,
+                                &auto_imports_attributed_roots,
+                                &mut BTreeMap::new(),
                             )
                             .await
                             .map_err(|e| {
@@ -6253,6 +6337,17 @@ impl Handler {
                                 &auto_imports_suppressed_all_bundles,
                                 &auto_imports_suppression_reasons,
                             ),
+                            // p6w: the ATTRIBUTED plan, so build_v1 withholds
+                            // exactly the roots uv named and re-injects the
+                            // rest -- the coarse field above cannot express
+                            // "this bundle, minus one root".
+                            auto_imports_suppressed_roots: auto_imports_attributed_roots
+                                .iter()
+                                .map(|(env, roots)| advertised_identity::SuppressedRoots {
+                                    env: env.clone(),
+                                    roots: roots.iter().cloned().collect(),
+                                })
+                                .collect(),
                         };
                         // Also carried into the shared built-output store, so
                         // an ADOPTING run leaves the same record this cold pass
@@ -7117,6 +7212,31 @@ impl Handler {
             .as_ref()
             .map(AdvertisedIdentityRecord::carried_auto_imports_suppression)
             .unwrap_or_default();
+        // p6w: the finer half of the same carry. Without it a bundle whose
+        // culprit root alone was withheld looks unsuppressed to build_v1,
+        // which re-injects the very root uv refused -- the p6t-4 failure
+        // reproduced one root at a time.
+        let carried_auto_imports_suppression_roots: BTreeMap<String, BTreeSet<String>> =
+            advertised_identity_record
+                .as_ref()
+                .map(AdvertisedIdentityRecord::carried_auto_imports_suppression_roots)
+                .unwrap_or_default();
+        if !carried_auto_imports_suppression_roots.is_empty() {
+            tracing::warn!(
+                output = %params.output.name.as_normalized(),
+                attributed = %carried_auto_imports_suppression_roots
+                    .iter()
+                    .map(|(env, roots)| format!(
+                        "{env}={}",
+                        roots.iter().cloned().collect::<Vec<_>>().join("+")
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(";"),
+                "auto_imports: CARRYING the advertising pass's ATTRIBUTED root drops into \
+                 conda/build_v1 -- exactly the roots uv named stay out, and every other \
+                 detection is re-injected here as it was there",
+            );
+        }
         if !carried_auto_imports_suppression.is_empty() {
             tracing::warn!(
                 output = %params.output.name.as_normalized(),
@@ -7140,6 +7260,8 @@ impl Handler {
                 &params.channels,
                 workspace_dir.as_deref(),
                 &carried_auto_imports_suppression,
+                &carried_auto_imports_suppression_roots,
+                &mut BTreeMap::new(),
             )
             .await
             .map_err(|e| RpcError::internal(format!("resolving wheels: {e:#}")))?;
@@ -8138,6 +8260,16 @@ async fn resolve_all(
     // for this pass. Grows by one bundle per ABI back-off; empty on the
     // first pass, so the default path is byte-identical to before.
     suppress_auto_imports: &BTreeSet<String>,
+    // p6w. The ATTRIBUTED plan: canonical conda name -> the PEP 503-normalized
+    // root names uv's conflict report blamed for that bundle. A bundle in here
+    // and NOT in `suppress_auto_imports` keeps every root uv did not name.
+    // Empty on the first pass, so the default path is unchanged.
+    suppress_auto_imports_roots: &BTreeMap<String, BTreeSet<String>>,
+    // p6w OUT-PARAMETER. Filled bundle by bundle as the resolve proceeds, so
+    // that when it FAILS the caller still holds the roots the failing pass
+    // injected -- including the failing bundle's own, which the Ok tuple below
+    // would have carried had there been an Ok. Attribution reads this.
+    injected_observed: &mut BTreeMap<String, Vec<String>>,
 ) -> Result<(
     Vec<Bundle>,
     RetreadConfig,
@@ -8154,6 +8286,9 @@ async fn resolve_all(
 )> {
     let mut auto_imports_injected_by_bundle: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut auto_imports_suppressed_by_bundle: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    // p6w: the "this bundle has no attributed drops" case, borrowed rather
+    // than allocated per bundle.
+    let empty_suppressed_roots: BTreeSet<String> = BTreeSet::new();
     // Bind the pack-level policy to the target used by every source-build
     // branch in this resolution. Resolution/cache identity intentionally does
     // not change: the policy controls how an exact cache miss is produced,
@@ -8316,6 +8451,9 @@ async fn resolve_all(
         // Packaging / courier / lock-write downstream are unchanged.
         // `Ok(None)` = no uv-resolvable roots (all source-built entries);
         // the materialization path then runs unpinned.
+        // p6w: filled by `uv_group_closure` the moment injection is decided,
+        // read by both arms of the call below.
+        let mut injected_this_bundle: Vec<String> = Vec::new();
         let (
             uv_closure,
             deps_from_root_names,
@@ -8355,9 +8493,30 @@ async fn resolve_all(
             ),
             suppress_auto_imports.contains(AUTO_IMPORTS_SUPPRESS_ALL)
                 || suppress_auto_imports.contains(&canonical_conda_name(&group_name)),
+            suppress_auto_imports_roots
+                .get(&canonical_conda_name(&group_name))
+                .unwrap_or(&empty_suppressed_roots),
+            &mut injected_this_bundle,
         )
         .await
+        .inspect_err(|_| {
+            // p6w: the roots are recorded on the FAILURE path too. Without
+            // this the attributed back-off has nothing to attribute, which is
+            // exactly the state p6u-1 boarded.
+            if !injected_this_bundle.is_empty() {
+                injected_observed.insert(
+                    canonical_conda_name(&group_name),
+                    std::mem::take(&mut injected_this_bundle),
+                );
+            }
+        })
         .with_context(|| format!("computing uv closure for bundle `{group_name}`"))?;
+        if !injected_this_bundle.is_empty() {
+            injected_observed.insert(
+                canonical_conda_name(&group_name),
+                std::mem::take(&mut injected_this_bundle),
+            );
+        }
         if !auto_imports_injected.is_empty() {
             auto_imports_injected_by_bundle.insert(
                 canonical_conda_name(&group_name),
@@ -10796,6 +10955,21 @@ async fn uv_group_closure(
     // invariant rejection so the retry differs from the failed attempt by
     // exactly the injected-roots delta and nothing else.
     suppress_auto_imports: bool,
+    // p6w. The NAMED roots withheld from this bundle -- PEP 503-normalized
+    // distribution names, as `uv_closure::root_distribution_name` produces
+    // them. This is the ATTRIBUTED back-off: uv's conflict report named these
+    // roots as the cause, so exactly these are dropped and every sibling
+    // detection is still injected. Empty on the first pass and whenever
+    // attribution found nothing, in which case the coarse `suppress_auto_
+    // imports` flag above is the only lever and the whole bundle goes.
+    suppress_auto_imports_roots: &BTreeSet<String>,
+    // p6w OUT-PARAMETER, and the reason it exists: the roots this bundle
+    // injected are returned in the Ok tuple below, so a FAILING resolve threw
+    // them away -- and the attributed back-off cannot name a culprit among
+    // roots it cannot see. Written the moment injection is decided, before
+    // anything fallible runs after it, so the caller has the failed pass's
+    // root set whichever way this function returns.
+    injected_observed: &mut Vec<String>,
 ) -> Result<(
     Option<crate::uv_closure::UvClosure>,
     std::collections::BTreeSet<String>,
@@ -11089,6 +11263,30 @@ async fn uv_group_closure(
             "auto_imports: BACK-OFF ACTIVE -- detected roots NOT injected for this              bundle because a previous emission failed the ABI invariant",
         );
         auto_imports_roots.clear();
+    } else if !suppress_auto_imports_roots.is_empty() && !auto_imports_roots.is_empty() {
+        // p6w: the ATTRIBUTED back-off. uv's report named these roots, so only
+        // these go. Every other detection this bundle made is still injected,
+        // which is the entire difference from the whole-request drop that took
+        // 51 roots to learn that at least one was unsatisfiable.
+        auto_imports_roots.sort();
+        auto_imports_roots.dedup();
+        let (dropped, kept) =
+            partition_attributed_roots(&auto_imports_roots, suppress_auto_imports_roots);
+        if !dropped.is_empty() {
+            tracing::warn!(
+                bundle = %group_name,
+                dropped = dropped.len(),
+                kept = kept.len(),
+                dropped_roots = %dropped.join(","),
+                kept_roots = %kept.join(","),
+                "auto_imports: ATTRIBUTED BACK-OFF -- uv's conflict report named these roots \
+                 as the cause, so ONLY these are withheld; every sibling detection is still \
+                 injected. See the per-root `auto_imports_root_dropped` rows for each \
+                 culprit clause and its remedy.",
+            );
+        }
+        auto_imports_suppressed = dropped;
+        auto_imports_roots = kept;
     }
     let mut auto_imports_injected: Vec<String> = Vec::new();
     if !auto_imports_roots.is_empty() {
@@ -11106,6 +11304,10 @@ async fn uv_group_closure(
         auto_imports_roots.extend(std::mem::take(&mut roots));
         roots = dedupe_roots_last_wins(auto_imports_roots);
     }
+    // p6w. Publish the failed pass's root set BEFORE anything fallible runs on
+    // it. Everything below this line can `?`, and the Ok tuple is the only
+    // other channel these roots have.
+    *injected_observed = auto_imports_injected.clone();
     // retread-deps-from: fetch + parse each configured source and append
     // its PEP 508 lines as additional roots. A pure deps-from bundle (no
     // uv-resolvable `[retread-wheels]` entries at all) is exactly why this
@@ -15936,7 +16138,7 @@ fn auto_imports_strict_decision(
 /// [`resolution_policy_fingerprint`] and must be bumped by hand whenever that
 /// behaviour changes.
 const AUTO_IMPORTS_BACKOFF_POLICY: &str =
-    "v2-suppress-all-bundles-retry-once-carried-into-build-v1";
+    "v3-attribute-then-drop-named-roots-fallback-suppress-all-carried-into-build-v1";
 
 /// Revision tag for the ordered screens in [`auto_imports_injection_verdict`]
 /// -- the decision procedure that turns a detected module into an injected
@@ -16423,6 +16625,140 @@ fn build_v1_abi_refusal(
 /// the strict refusal and the tests all say the same word.
 const AUTO_IMPORTS_REASON_ABI_BACKOFF: &str = "abi-backoff";
 const AUTO_IMPORTS_REASON_RESOLVE_BACKOFF: &str = "resolve-backoff";
+/// p6w. The THIRD way, and the one the operator asked for: uv's report named
+/// this root, so it -- and not its 50 siblings -- was withheld.
+const AUTO_IMPORTS_REASON_ATTRIBUTED_BACKOFF: &str = "attributed-resolve-backoff";
+
+/// p6w. How many attributed retries one request may take before it gives up
+/// and falls back to the whole-request drop.
+///
+/// The ladder terminates on its own -- `auto_imports_attributed_roots` only
+/// grows and `attributed_backoff_decision` refuses to re-name a root already
+/// in it, so the worst case is one round per injected root. That bound is the
+/// number of detections, which is exactly the runaway this must not have: 51
+/// roots would be 51 full resolves. Three rounds catches the realistic case
+/// (a handful of genuinely unsatisfiable detections) and hands anything worse
+/// to the coarse back-off with the reason stated.
+const AUTO_IMPORTS_ATTRIBUTED_BACKOFF_MAX_ROUNDS: usize = 3;
+
+/// p6w. What the resolve back-off does with ONE failed attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AttributedBackoffDecision {
+    /// uv's report named these roots. Withhold exactly them and re-resolve.
+    DropRoots(Vec<crate::uv_closure::AttributedRootDrop>),
+    /// Attribution produced nothing to act on. Take the whole-request
+    /// back-off, and SAY WHY -- a fallback that reads like the attributed
+    /// path is how p6u shipped 51 dropped roots looking like a clean pass.
+    FallBackToAll(&'static str),
+}
+
+/// p6w. The pure decision the ladder turns on, kept out of the async resolve
+/// loop so it can be guarded without an RPC.
+///
+/// Reads uv's error text, the roots the FAILING pass actually injected (the
+/// out-parameter `resolve_all` fills), and what has already been dropped.
+/// Returns only roots that are NEW, so a root uv keeps naming after it has
+/// been withheld cannot spin the ladder.
+fn attributed_backoff_decision(
+    round: usize,
+    error_text: &str,
+    injected_by_bundle: &BTreeMap<String, Vec<String>>,
+    already_dropped: &BTreeMap<String, BTreeSet<String>>,
+) -> AttributedBackoffDecision {
+    if round >= AUTO_IMPORTS_ATTRIBUTED_BACKOFF_MAX_ROUNDS {
+        return AttributedBackoffDecision::FallBackToAll(
+            "the attributed retry ladder reached its bound without resolving",
+        );
+    }
+    if injected_by_bundle.values().all(Vec::is_empty) {
+        return AttributedBackoffDecision::FallBackToAll(
+            "the failing pass injected no Lane C roots, so no detection can be its cause",
+        );
+    }
+    let fresh: Vec<crate::uv_closure::AttributedRootDrop> =
+        crate::uv_closure::attribute_auto_imports_failure(error_text, injected_by_bundle)
+            .into_iter()
+            .filter(|drop| {
+                !already_dropped
+                    .get(&drop.bundle)
+                    .is_some_and(|dropped| dropped.contains(&drop.name))
+            })
+            .collect();
+    if fresh.is_empty() {
+        return AttributedBackoffDecision::FallBackToAll(
+            "uv's conflict report named none of the injected roots, so nothing attributes \
+             the failure to a detection",
+        );
+    }
+    AttributedBackoffDecision::DropRoots(fresh)
+}
+
+/// p6w. Split a bundle's detected roots into (withheld, still injected).
+///
+/// The whole claim of this lane lives here: given three detections of which
+/// uv named one, exactly one is withheld and two are still injected. Pure, so
+/// that claim is a unit guard rather than a three-hour arm. Matching is on the
+/// PEP 503-normalized distribution name, so a withheld `etils` covers the
+/// injected `etils==1.13.0` and an injected `etils-extras` is untouched.
+fn partition_attributed_roots(
+    detected: &[String],
+    withheld_names: &BTreeSet<String>,
+) -> (Vec<String>, Vec<String>) {
+    detected.iter().cloned().partition(|root| {
+        withheld_names.contains(&crate::uv_closure::root_distribution_name(root))
+    })
+}
+
+/// p6w. ONE row per ROOT withheld by the attributed back-off, naming uv's own
+/// clause and the remedy that clause implies.
+///
+/// p6u's per-ENV row is still emitted and still the summary; this is the
+/// resolution of it. `holosoma-pack roots=[26 names] reason=resolve-backoff`
+/// tells an operator that 26 detections vanished; it does not tell them which
+/// one to fix. These rows do.
+fn emit_auto_imports_root_dropped_rows(
+    request: &str,
+    drops: &[crate::uv_closure::AttributedRootDrop],
+) {
+    for drop in drops {
+        tracing::warn!(
+            request = %request,
+            env = %drop.bundle,
+            root = %drop.root,
+            culprit = %drop.clause,
+            remedy = %drop.remedy.token(),
+            remedy_detail = %drop.remedy,
+            "auto_imports_root_dropped env={} root={} culprit={} remedy={} -- uv named this \
+             root in its own conflict, so it alone is withheld and this bundle's other \
+             detections are re-resolved with their roots.",
+            drop.bundle,
+            drop.root,
+            drop.clause,
+            drop.remedy.token(),
+        );
+    }
+}
+
+/// p6w. The row the fallback owes, so a whole-request drop can never again be
+/// read as an attributed one.
+fn emit_auto_imports_attribution_fallback_row(
+    request: &str,
+    why: &str,
+    injected_by_bundle: &BTreeMap<String, Vec<String>>,
+) {
+    let total: usize = injected_by_bundle.values().map(Vec::len).sum();
+    tracing::warn!(
+        request = %request,
+        reason = %why,
+        injected_roots = total,
+        bundles = injected_by_bundle.len(),
+        roots_by_bundle = %auto_imports_suppression_roots_by_bundle(injected_by_bundle),
+        "auto_imports_root_dropped env=* root=* culprit=<none attributed> \
+         remedy=attribution-unavailable -- {why}. Every root named above is about to be \
+         dropped TOGETHER, which is the coarse behaviour p6w exists to avoid; that it \
+         happened here is itself the finding.",
+    );
+}
 
 /// The reason recorded for one bundle's suppression.
 ///
@@ -16459,8 +16795,32 @@ fn auto_imports_suppression_reason_for(
 ///
 /// When the detail names no manylinux floor there is no platform fact that
 /// helps, and saying so is the honest answer: the root is a MANIFEST finding.
+/// p6w FIX, measured rather than reasoned. §22 asserted that none of the three
+/// `resolve-backoff` reasons carried a manylinux floor, so all three would
+/// print the manifest remedy. One did not: `robojudo-pack`'s row in BOTH arms
+/// (5764452 and 5764453) printed
+/// `declare the platform fact ... glibc = "2.28"` for a failure whose actual
+/// cause is `unitree-sdk2py was not found in the package registry`. No glibc
+/// declaration makes a distribution that no index carries appear.
+///
+/// The cause is this function reading `extract_manylinux_floor` over the WHOLE
+/// detail, which for a resolve back-off is the entire error text and routinely
+/// contains a `manylinux_2_28` somewhere in unrelated prose. A floor is only a
+/// remedy when the distribution EXISTS and its published wheels sit above the
+/// ceiling, so an absence sentence -- uv's `was not found in the package
+/// registry`, or a `no versions of` -- now settles the question before the
+/// floor is even looked for.
 fn auto_imports_suppression_resolution(detail: &str, conda_subdir: &str) -> String {
-    match crate::glibc::extract_manylinux_floor(detail) {
+    // ABSENCE IS DECIDED FIRST, and the order is the whole fix. A resolve
+    // back-off's detail is the entire error text, and `manylinux_2_28` shows
+    // up in unrelated prose all the time, so "does a manylinux token appear"
+    // is not the question. "Did the index have the distribution at all" is,
+    // and when the answer is no, no ceiling declaration can change it.
+    let absent = detail.contains("was not found in the package registry")
+        || regex::Regex::new(r"(?i)\bno versions? of\b")
+            .expect("static absence phrase")
+            .is_match(detail);
+    match crate::glibc::extract_manylinux_floor(detail).filter(|_| !absent) {
         Some((major, minor)) => format!(
             "declare the platform fact -- `[workspace] platforms = [{{ platform = \
              \"{conda_subdir}\", glibc = \"{major}.{minor}\" }}]` (pixi >= 0.71) or \
@@ -29756,6 +30116,7 @@ mod courier_build_string_tests {
             run_constrains: Vec::new(),
             auto_imports_suppressed_bundles: Vec::new(),
             auto_imports_suppressed: Vec::new(),
+            auto_imports_suppressed_roots: Vec::new(),
         };
         let from_record = build_for(&workspace_fp_for_build(
             Some(&record),

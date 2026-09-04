@@ -7449,6 +7449,7 @@ fn the_advertised_courier_build_gate_resolves_under_the_recorded_fingerprint() {
         run_constrains: Vec::new(),
         auto_imports_suppressed_bundles: Vec::new(),
         auto_imports_suppressed: Vec::new(),
+        auto_imports_suppressed_roots: Vec::new(),
     };
     let advertising_fp = EffectiveWorkspaceFp::resolve(Some(&record), None, ws, source, &target);
     assert_eq!(
@@ -9707,6 +9708,7 @@ fn advertised_output_record(
         run_constrains: constrains,
         auto_imports_suppressed_bundles: Vec::new(),
         auto_imports_suppressed: Vec::new(),
+        auto_imports_suppressed_roots: Vec::new(),
     }
 }
 
@@ -11181,6 +11183,7 @@ async fn c11_an_adopted_output_restores_the_cold_passs_advertised_identity() {
         run_constrains: vec![],
         auto_imports_suppressed_bundles: Vec::new(),
         auto_imports_suppressed: Vec::new(),
+        auto_imports_suppressed_roots: Vec::new(),
     };
 
     // The record travels inside the store record, exactly as production
@@ -12873,4 +12876,291 @@ fn p6u_e_strict_defaults_on_with_injection_and_follows_the_key_when_set() {
     // editing the manifest it is certifying.
     assert!(!decide(None, Some("0"), true), "the env override wins over the default");
     assert!(decide(Some(false), Some("1"), true), "and over the manifest key");
+}
+
+// ---------------------------------------------------------------------------
+// p6w — the resolve-time back-off attributes before it drops
+// ---------------------------------------------------------------------------
+//
+// THE DEFECT (boarded p6u-1). Jobs 5764452/5764453 dropped 51 detected roots
+// across three packs — `flashsac-pack` 13, `holosoma-pack` 26, `robojudo-pack`
+// 12 — every one of them `reason=resolve-backoff`, because ONE resolve failure
+// suppressed injection for every bundle in the request. Reading both arms'
+// backend logs, only FIVE of those 51 roots are named anywhere in the three
+// failure texts, and only TWO are genuine culprits. `etils==1.13.0` — a
+// correctly pinned detection that resolves — was dropped as collateral, which
+// is the whole argument for attributing first.
+//
+// The fixtures below are the measured texts, not invented ones.
+
+/// uv's own report from `robojudo-pack`, job 5764452 line 60234 (identical in
+/// arm B at line 47685). The `×` marker is uv's, and it is what tells
+/// attribution this failure came out of the resolver rather than out of
+/// retread's own reconciler.
+const P6W_UV_ROBOJUDO_REPORT: &str = "\
+uv lock failed for bundle `robojudo-pack` (python 3.12, linux-64):
+
+Using CPython 3.12.14
+  \u{d7} No solution found when resolving dependencies for split (markers:
+  \u{2502} python_full_version == '3.12.*' and platform_machine == 'x86_64' and
+  \u{2502} sys_platform == 'linux'):
+  \u{2570}\u{2500}\u{25b6} Because unitree-sdk2py was not found in the package registry and your
+      project depends on unitree-sdk2py, we can conclude that your project's
+      requirements are unsatisfiable.
+
+no generated conda constraint was named in uv's message; the conflict may be
+intrinsic to the PyPI requirements.
+";
+
+/// `holosoma-pack`, job 5764452 line 264706 (arm B line 291302). A PEP 508
+/// metadata PARSE failure in retread's own reader: uv never ran, there is no
+/// report, and NONE of the 26 injected roots is named. Attribution must say
+/// so rather than pick one.
+const P6W_PARSE_FAILURE: &str = "\
+computing uv closure for bundle `holosoma-pack`: parsing requirement \
+`PyYAML (>=5.1.*)`: Operator >= cannot be used with a wildcard version specifier
+PyYAML (>=5.1.*)
+        ^^^^^^^
+";
+
+/// `flashsac-pack`, job 5764452 line 247282 (arm B line 310381). retread's OWN
+/// constraint reconciler, which lists every requirement's provenance and so
+/// MENTIONS three injected roots — none of which is individually unsatisfiable
+/// against `setuptools==84.0.0`. The real contradiction is a declared
+/// `FlashRL<=65` against a conda fact, and neither side is a detected root.
+const P6W_RECONCILER_FAILURE: &str = "\
+computing uv closure for bundle `flashsac-pack`: dependency conflict in \
+environment 'flashsac-gpu' for bundle 'flashsac-pack': `setuptools` requirements \
+are mutually unsatisfiable: `==84.0.0` required by uv constraint \
+`setuptools==84.0.0` from workspace conda fact `precise-consuming-envs`; \
+`!=50.0.0` required by wheel `dm_control==1.0.45` Requires-Dist \
+`setuptools!=50.0.0`; `>=41.0.0` required by wheel `tensorboard==2.21.0` \
+Requires-Dist `setuptools>=41.0.0`; `*` required by wheel `sapien==3.0.3` \
+Requires-Dist `setuptools`.
+";
+
+fn p6w_robojudo_injected() -> BTreeMap<String, Vec<String>> {
+    // Three of robojudo-pack's twelve measured roots: one uv named, two it
+    // did not. The claim under test is about the two.
+    BTreeMap::from([(
+        "robojudo-pack".to_string(),
+        vec![
+            "pydantic".to_string(),
+            "tqdm".to_string(),
+            "unitree-sdk2py".to_string(),
+        ],
+    )])
+}
+
+#[test]
+fn p6w_a_one_named_root_is_dropped_and_its_two_siblings_are_kept() {
+    let injected = p6w_robojudo_injected();
+    let decision = attributed_backoff_decision(
+        0,
+        P6W_UV_ROBOJUDO_REPORT,
+        &injected,
+        &BTreeMap::new(),
+    );
+    let AttributedBackoffDecision::DropRoots(drops) = decision else {
+        panic!("uv named a root; the ladder must drop it, not fall back: {decision:?}");
+    };
+    // EXACTLY ONE. On 26ac32b there is no attribution at all and all three go.
+    assert_eq!(drops.len(), 1, "exactly one culprit, got {drops:?}");
+    assert_eq!(drops[0].root, "unitree-sdk2py");
+    assert_eq!(drops[0].bundle, "robojudo-pack");
+    // The culprit is named with uv's OWN sentence, verbatim, not a paraphrase.
+    assert!(
+        drops[0].clause.contains("was not found in the package registry"),
+        "the clause must be uv's sentence: {}",
+        drops[0].clause,
+    );
+    // And the remedy is the one that is true: no declaration conjures a
+    // distribution no index carries. Before p6w this failure's per-env row
+    // told the operator to declare `glibc = \"2.28\"`.
+    assert_eq!(
+        drops[0].remedy,
+        crate::uv_closure::RootDropRemedy::UpstreamAbsence,
+        "an absent distribution is not a platform-fact problem",
+    );
+    assert_eq!(drops[0].remedy.token(), "upstream-absence");
+    assert!(
+        !format!("{}", drops[0].remedy).contains("glibc"),
+        "the upstream-absence remedy must not offer a glibc declaration",
+    );
+
+    // THE OTHER HALF OF THE CLAIM: the two siblings are still injected.
+    let withheld: BTreeSet<String> = drops.iter().map(|d| d.name.clone()).collect();
+    let (dropped, kept) =
+        partition_attributed_roots(&injected["robojudo-pack"], &withheld);
+    assert_eq!(dropped, vec!["unitree-sdk2py".to_string()]);
+    assert_eq!(
+        kept,
+        vec!["pydantic".to_string(), "tqdm".to_string()],
+        "every root uv did not name must still be injected",
+    );
+
+    // NON-VACUITY 1: a root already withheld is not re-named, so the ladder
+    // cannot spin on the same culprit.
+    let already = BTreeMap::from([(
+        "robojudo-pack".to_string(),
+        BTreeSet::from(["unitree-sdk2py".to_string()]),
+    )]);
+    assert!(
+        matches!(
+            attributed_backoff_decision(1, P6W_UV_ROBOJUDO_REPORT, &injected, &already),
+            AttributedBackoffDecision::FallBackToAll(_),
+        ),
+        "re-naming an already-withheld root must not produce another round",
+    );
+    // NON-VACUITY 2: the ladder is bounded, and the bound is its own reason.
+    let AttributedBackoffDecision::FallBackToAll(why) = attributed_backoff_decision(
+        AUTO_IMPORTS_ATTRIBUTED_BACKOFF_MAX_ROUNDS,
+        P6W_UV_ROBOJUDO_REPORT,
+        &injected,
+        &BTreeMap::new(),
+    ) else {
+        panic!("the ladder must be bounded");
+    };
+    assert!(why.contains("bound"), "the bound must name itself: {why}");
+}
+
+#[test]
+fn p6w_b_a_failure_that_names_no_injected_root_falls_back_and_says_so() {
+    // (i) The parse failure: uv never ran and no root is named anywhere.
+    let holosoma = BTreeMap::from([(
+        "holosoma-pack".to_string(),
+        vec![
+            "etils==1.13.0".to_string(),
+            "omegaconf".to_string(),
+            "tqdm".to_string(),
+        ],
+    )]);
+    let AttributedBackoffDecision::FallBackToAll(why) =
+        attributed_backoff_decision(0, P6W_PARSE_FAILURE, &holosoma, &BTreeMap::new())
+    else {
+        panic!("nothing in a parse error attributes it to a detection");
+    };
+    assert!(
+        why.contains("named none of the injected roots"),
+        "the fallback must say attribution found nobody: {why}",
+    );
+
+    // (ii) THE HARDER CASE, and why this guard is not a formality. retread's
+    // own reconciler text MENTIONS three injected roots while the actual
+    // contradiction is between a declared package and a conda fact. Believing
+    // those mentions would spend three re-resolves reaching the same failure.
+    let flashsac = BTreeMap::from([(
+        "flashsac-pack".to_string(),
+        vec![
+            "dm-control".to_string(),
+            "mani-skill".to_string(),
+            "tensorboard".to_string(),
+            "tqdm".to_string(),
+        ],
+    )]);
+    assert!(
+        matches!(
+            attributed_backoff_decision(0, P6W_RECONCILER_FAILURE, &flashsac, &BTreeMap::new()),
+            AttributedBackoffDecision::FallBackToAll(_),
+        ),
+        "a non-uv failure mentioning several roots accuses none of them",
+    );
+    // NON-VACUITY: the same non-uv text naming exactly ONE injected root CAN
+    // be trusted -- it cannot be pointing anywhere else. So the rule above is
+    // a discrimination, not a blanket refusal of every non-uv failure.
+    let single = BTreeMap::from([(
+        "flashsac-pack".to_string(),
+        vec!["dm-control".to_string(), "tqdm".to_string()],
+    )]);
+    let decision =
+        attributed_backoff_decision(0, P6W_RECONCILER_FAILURE, &single, &BTreeMap::new());
+    let AttributedBackoffDecision::DropRoots(drops) = decision else {
+        panic!("a lone named root is attributable: {decision:?}");
+    };
+    assert_eq!(drops.len(), 1);
+    assert_eq!(drops[0].root, "dm-control");
+
+    // NON-VACUITY: a pass that injected nothing cannot blame a detection.
+    let AttributedBackoffDecision::FallBackToAll(why) = attributed_backoff_decision(
+        0,
+        P6W_UV_ROBOJUDO_REPORT,
+        &BTreeMap::from([("robojudo-pack".to_string(), Vec::new())]),
+        &BTreeMap::new(),
+    ) else {
+        panic!("no injected roots means no attributable cause");
+    };
+    assert!(why.contains("injected no Lane C roots"), "{why}");
+}
+
+#[test]
+fn p6w_c_a_correctly_pinned_sibling_survives_the_culprit_beside_it() {
+    // `etils==1.13.0` is the measured case: holosoma-pack's naming authority
+    // determined it from a request fact, it is satisfiable, and p6u dropped it
+    // anyway because a SIBLING root made the request-wide resolve fail. It is
+    // never named in either arm's failure text.
+    let injected = BTreeMap::from([(
+        "holosoma-pack".to_string(),
+        vec![
+            "etils==1.13.0".to_string(),
+            "tqdm".to_string(),
+            "unitree-sdk2py".to_string(),
+        ],
+    )]);
+    let decision =
+        attributed_backoff_decision(0, P6W_UV_ROBOJUDO_REPORT, &injected, &BTreeMap::new());
+    let AttributedBackoffDecision::DropRoots(drops) = decision else {
+        panic!("the sibling culprit is named and must be dropped: {decision:?}");
+    };
+    assert_eq!(drops.len(), 1, "only the culprit: {drops:?}");
+    assert!(
+        !drops.iter().any(|d| d.name == "etils"),
+        "a correctly pinned, satisfiable root must never be dropped for a sibling's failure",
+    );
+
+    let withheld: BTreeSet<String> = drops.iter().map(|d| d.name.clone()).collect();
+    let (dropped, kept) = partition_attributed_roots(&injected["holosoma-pack"], &withheld);
+    assert_eq!(dropped, vec!["unitree-sdk2py".to_string()]);
+    assert!(
+        kept.contains(&"etils==1.13.0".to_string()),
+        "the VERSION must survive with the root: {kept:?}",
+    );
+
+    // NON-VACUITY: the withheld set matches on the normalized NAME, so a
+    // withheld `etils` really would take `etils==1.13.0` with it -- the guard
+    // above passes because uv did not name it, not because the matcher is
+    // broken.
+    let (dropped, kept) = partition_attributed_roots(
+        &injected["holosoma-pack"],
+        &BTreeSet::from(["etils".to_string()]),
+    );
+    assert_eq!(dropped, vec!["etils==1.13.0".to_string()]);
+    assert_eq!(kept.len(), 2);
+    // And a name that merely STARTS with a withheld name is not withheld.
+    let (dropped, _) = partition_attributed_roots(
+        &["etils-extras==1.0.0".to_string()],
+        &BTreeSet::from(["etils".to_string()]),
+    );
+    assert!(dropped.is_empty(), "prefix is not identity");
+
+    // NON-VACUITY: p6w's remedy classifier no longer routes an upstream
+    // absence into the platform-fact branch. This is the row both arms got
+    // wrong for robojudo-pack.
+    let robojudo_detail = format!("resolve-backoff: {P6W_UV_ROBOJUDO_REPORT} manylinux_2_28");
+    let resolution = auto_imports_suppression_resolution(&robojudo_detail, "linux-64");
+    assert!(
+        resolution.contains("MANIFEST finding"),
+        "a stray manylinux token in unrelated prose must not become a platform remedy: \
+         {resolution}",
+    );
+    assert!(
+        !resolution.contains("glibc = \"2.28\""),
+        "and must not tell the operator to declare a glibc that cannot help: {resolution}",
+    );
+    // ... while a REAL platform-tag rejection still gets the platform fact.
+    let platform_detail = "resolve-backoff: no wheels with a matching platform tag; only \
+                           manylinux_2_35 wheels are published";
+    assert!(
+        auto_imports_suppression_resolution(platform_detail, "linux-64").contains("2.35"),
+        "the platform-fact remedy must still fire when uv really rejected on the tag",
+    );
 }

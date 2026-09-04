@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped whenever the recorded field set changes meaning. A record with a
 /// different schema is ignored, which degrades to today's recompute.
-pub(crate) const SCHEMA: u32 = 4;
+pub(crate) const SCHEMA: u32 = 5;
 
 /// Short digest of the RELAX RULE in force, folded into every record address.
 ///
@@ -93,6 +93,28 @@ pub(crate) struct AdvertisedIdentityRecord {
     /// store hit as a clean pass.
     #[serde(default)]
     pub auto_imports_suppressed: Vec<SuppressedEnv>,
+    /// p6w. The ATTRIBUTED half of the same plan: per environment, the
+    /// normalized root NAMES uv's conflict report blamed, which the resolve
+    /// withheld one at a time instead of dropping the whole request's
+    /// detections.
+    ///
+    /// `auto_imports_suppressed_bundles` above can only say "this bundle
+    /// injected nothing". Once the back-off withholds SOME of a bundle's
+    /// roots, that is no longer the plan `conda/build_v1` must reproduce --
+    /// it would re-inject the culprit and be refused exactly as p6t-4 was.
+    /// So the finer plan crosses the boundary too, in the shape
+    /// `resolve_all` takes it.
+    #[serde(default)]
+    pub auto_imports_suppressed_roots: Vec<SuppressedRoots>,
+}
+
+/// One environment's ATTRIBUTED drops: the roots uv named, by normalized name.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SuppressedRoots {
+    /// Canonical conda name of the bundle.
+    pub env: String,
+    /// PEP 503-normalized distribution names withheld from that bundle.
+    pub roots: Vec<String>,
 }
 
 /// One environment's dropped Lane C detections.
@@ -122,6 +144,21 @@ impl AdvertisedIdentityRecord {
         self.auto_imports_suppressed_bundles
             .iter()
             .cloned()
+            .collect()
+    }
+
+    /// p6w: the ATTRIBUTED plan, in the shape `resolve_all` takes it.
+    ///
+    /// A reader for the finer field, for the same reason
+    /// `carried_auto_imports_suppression` is a reader for the coarse one: a
+    /// plan the build pass cannot load is a plan it re-derives, and
+    /// re-deriving this one re-injects the exact root uv refused.
+    pub(crate) fn carried_auto_imports_suppression_roots(
+        &self,
+    ) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
+        self.auto_imports_suppressed_roots
+            .iter()
+            .map(|entry| (entry.env.clone(), entry.roots.iter().cloned().collect()))
             .collect()
     }
 
@@ -393,6 +430,10 @@ mod tests {
                 reason: "abi-backoff: ABI invariant: wheel `contourpy` embeds \
                          `numpy >=1.0.0` (bare-major)"
                     .to_string(),
+            }],
+            auto_imports_suppressed_roots: vec![SuppressedRoots {
+                env: "protomotions-deps-pack".to_string(),
+                roots: vec!["viser".to_string()],
             }],
         }
     }
