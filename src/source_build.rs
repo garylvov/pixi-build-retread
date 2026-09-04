@@ -822,6 +822,24 @@ fn closure_sdist_platform_error(package: &str, filename: &str) -> anyhow::Error 
     )
 }
 
+/// Where the exclusive lock for one artifact-cache entry lives. One writer of
+/// this formula and, since C15, one reader that is not `acquire_artifact_cache_lock`
+/// itself: the guard that proves the canonical publish gives the lock back at
+/// the rename has to be able to take it.
+pub(crate) fn artifact_cache_lock_path(cache_dir: &Path) -> Result<PathBuf> {
+    let parent = cache_dir.parent().ok_or_else(|| {
+        anyhow!(
+            "built-wheel cache path has no parent: {}",
+            cache_dir.display()
+        )
+    })?;
+    let file_name = cache_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("built-wheel cache path has no UTF-8 filename"))?;
+    Ok(parent.join(format!(".{file_name}.lock")))
+}
+
 pub(crate) async fn acquire_artifact_cache_lock(cache_dir: &Path) -> Result<ArtifactCacheLock> {
     let parent = cache_dir.parent().ok_or_else(|| {
         anyhow!(
@@ -832,11 +850,7 @@ pub(crate) async fn acquire_artifact_cache_lock(cache_dir: &Path) -> Result<Arti
     tokio::fs::create_dir_all(parent)
         .await
         .with_context(|| format!("creating built-wheel cache parent {}", parent.display()))?;
-    let file_name = cache_dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| anyhow!("built-wheel cache path has no UTF-8 filename"))?;
-    let lock_path = parent.join(format!(".{file_name}.lock"));
+    let lock_path = artifact_cache_lock_path(cache_dir)?;
     tokio::task::spawn_blocking(move || {
         let file = std::fs::OpenOptions::new()
             .create(true)
@@ -5878,6 +5892,68 @@ async fn validate_canonical_git_snapshot_sealed(
     ))
 }
 
+/// C15 lever (a). The cheap path of C13 still queued behind the expensive one:
+/// `ensure_canonical_git_snapshot` took the EXCLUSIVE artifact-cache lock
+/// before it so much as looked for a marker, so every entry that shares a
+/// repository+commit+ref-state with a clone in flight — fifteen of them, for
+/// one `isaaclab` monorepo — waited out that clone before discovering it had a
+/// sealed tree sitting there all along. In the C13 proof relock 5741341 that
+/// was 19 of 42 hits at 23–58 s each, against 23 hits at 69 ms–1.5 s, and it
+/// was the whole remaining term.
+///
+/// A published canonical tree does not need a lock to be READ. It is renamed
+/// into place whole (`rename(staging, cache_dir)`), its marker is renamed into
+/// place whole (`write_canonical_git_marker`), it is made read-only before
+/// either rename, and it is NEVER replaced or self-healed while a reader could
+/// hold it — corruption fails closed instead. So a reader either sees a
+/// complete marker describing an immutable tree, or it sees nothing.
+///
+/// This returns `None` — never an error — for every case that is not a plain
+/// sealed hit: no marker, an unparsable marker, a marker with no usable seal
+/// (which has to take the full walk and then seal FORWARD, and that write
+/// belongs under the lock), the `retread-verify-snapshots` escape hatch, and a
+/// seal check that did not pass. Falling through re-runs the same check under
+/// the cache lock, which refuses there, so a torn read costs milliseconds and a
+/// real mutation still fails closed.
+async fn try_unlocked_sealed_canonical_git_hit(
+    cache_dir: &Path,
+    repository_identity: &str,
+    resolved_sha: &str,
+    ref_state: &str,
+    submodules: Option<GitSubmodules>,
+) -> Option<CanonicalGitSnapshot> {
+    if verify_snapshots_full() {
+        return None;
+    }
+    let marker_bytes = std::fs::read(cache_dir.join("source.json")).ok()?;
+    let marker: CanonicalGitSourceMarker = serde_json::from_slice(&marker_bytes).ok()?;
+    let seal = marker.seal.as_ref()?;
+    if seal.schema != CANONICAL_GIT_SEAL_SCHEMA {
+        return None;
+    }
+    match validate_canonical_git_snapshot_sealed(
+        cache_dir,
+        repository_identity,
+        resolved_sha,
+        ref_state,
+        submodules,
+        SnapshotVerification::Sealed,
+    )
+    .await
+    {
+        Ok((snapshot, true)) => Some(snapshot),
+        Ok((_, false)) => None,
+        Err(error) => {
+            tracing::debug!(
+                cache = %cache_dir.display(),
+                error = %error,
+                "unlocked canonical Git snapshot check did not pass; re-checking under the cache lock",
+            );
+            None
+        }
+    }
+}
+
 async fn ensure_canonical_git_snapshot(
     shared_checkout: &Path,
     upstream_url: &str,
@@ -5898,7 +5974,33 @@ async fn ensure_canonical_git_snapshot(
         .join("v3")
         .join(&repository_identity)
         .join(ref_state);
-    let _lock = acquire_artifact_cache_lock(&cache_dir).await?;
+    // C15: the sealed hit, with no lock at all. See
+    // `try_unlocked_sealed_canonical_git_hit` for why an immutable, atomically
+    // published tree is safe to read unlocked, and for every case that falls
+    // through to the locked path below.
+    if let Some(snapshot) = try_unlocked_sealed_canonical_git_hit(
+        &cache_dir,
+        &repository_identity,
+        resolved_sha,
+        ref_state,
+        submodules,
+    )
+    .await
+    {
+        tracing::info!(
+            repository = %repository_identity,
+            commit = %resolved_sha,
+            sealed = true,
+            span_path = "unlocked-hit",
+            elapsed_ms = snapshot_started.elapsed().as_millis() as u64,
+            "bench: canonical_git_snapshot",
+        );
+        return Ok(snapshot);
+    }
+    // The lock still serialises WRITERS, and deliberately so: it is what stops
+    // twelve entries of one monorepo cloning the same tree twelve times. What
+    // C15 removes is readers waiting in that same queue.
+    let cache_lock = acquire_artifact_cache_lock(&cache_dir).await?;
     if cache_dir.try_exists().with_context(|| {
         format!(
             "checking canonical Git source cache {}",
@@ -6207,8 +6309,19 @@ async fn ensure_canonical_git_snapshot(
     })?;
     std::fs::rename(&staging.0, &cache_dir)
         .with_context(|| format!("publishing canonical Git source {}", cache_dir.display()))?;
-    // The publish path always takes the FULL walk: it is the walk that earns
-    // the seal the cheap path will trust.
+    // C15 lever (a), second half: THE LOCK ENDS AT THE RENAME. Everything the
+    // lock protects — deduplicating the clone, discarding a markerless tree,
+    // and owning the staging directory until it is renamed in — is now behind
+    // us. What follows is the full `git status` walk that EARNS the seal, and
+    // it is read-only against a tree that is already published, already
+    // read-only and never replaced. Holding the lock across it made every
+    // sibling entry of the same repository+commit wait out the walk as well as
+    // the clone: in the C15.0 proof 5744482 the 20 hits that still took the
+    // locked path cost 820.2 s against 265.2 s of clone span, and the
+    // difference is this walk. The walk still runs, and its refusal is still
+    // fatal — it is only no longer in anyone else's way.
+    drop(cache_lock);
+    let publish_verify_started = std::time::Instant::now();
     let published = validate_canonical_git_snapshot(
         &cache_dir,
         &repository_identity,
@@ -6218,6 +6331,13 @@ async fn ensure_canonical_git_snapshot(
         SnapshotVerification::Full,
     )
     .await;
+    // bench (measurement only): C15 -- how much of the `clone` span is the
+    // post-rename walk, now that it is outside the lock.
+    tracing::info!(
+        repository = %repository_identity,
+        elapsed_ms = publish_verify_started.elapsed().as_millis() as u64,
+        "bench: canonical_git_publish_verify",
+    );
     tracing::info!(
         repository = %repository_identity,
         commit = %resolved_sha,
@@ -6367,6 +6487,12 @@ async fn prepare_private_git_build_tree(
     // first wheel classifies the project as native, and the second rebuilds it
     // with the pinned sysroot. Both trees are Retread-owned and disposable.
     remove_owned_cache_entry(&private_repo)?;
+    // bench (measurement only): C15 -- C13 boarded this. `private_git_build_tree`
+    // was 523.3 s over 48 builds in the C13 proof relock 5741341 and nobody knew
+    // which of its sub-steps that was. These rows split it. They are deliberately
+    // NOT prefixes of `bench: private_git_build_tree`, nor it of them: the relock
+    // and dep-add harnesses count that row with prefix-matching greps (C12.3).
+    let clone_started = std::time::Instant::now();
     run_silent(
         Command::new("git")
             .args(["clone", "--shared", "--no-checkout", "--"])
@@ -6375,6 +6501,12 @@ async fn prepare_private_git_build_tree(
         "git clone private build source",
     )
     .await?;
+    tracing::info!(
+        canonical = %canonical.root.display(),
+        elapsed_ms = clone_started.elapsed().as_millis() as u64,
+        "bench: private_git_clone_shared",
+    );
+    let materialize_started = std::time::Instant::now();
     // C13 lever (b). `git checkout --detach --force` re-materialized the whole
     // canonical worktree out of the object store for EVERY entry: 590.6 s over
     // 48 builds in the C12 proof relock 5731815, decompressing bytes that were
@@ -6410,11 +6542,6 @@ async fn prepare_private_git_build_tree(
     // bytes. Deliberately NOT named `bench: private_git_build_tree …`: that row
     // is counted by prefix-matching greps in the relock and dep-add harnesses,
     // and a second row sharing its prefix would double every total.
-    tracing::info!(
-        canonical = %canonical.root.display(),
-        span_path = if farmed { "hardlink" } else { "checkout" },
-        "bench: git_build_tree_materialization",
-    );
     if farmed {
         run_silent(
             Command::new("git")
@@ -6439,13 +6566,39 @@ async fn prepare_private_git_build_tree(
         )
         .await?;
     }
-    run_silent(
-        Command::new("git")
-            .args(["clean", "-ffdx"])
-            .current_dir(&private_repo),
-        "git clean private build source",
-    )
-    .await?;
+    tracing::info!(
+        canonical = %canonical.root.display(),
+        span_path = if farmed { "hardlink" } else { "checkout" },
+        elapsed_ms = materialize_started.elapsed().as_millis() as u64,
+        "bench: git_build_tree_materialization",
+    );
+    // C15 lever (b), the one sub-step that is provably a no-op on the farmed
+    // path. `git clean -ffdx` walks the whole worktree against the index to
+    // find untracked and ignored files to delete. On the hardlink path there
+    // cannot be any: `remove_owned_cache_entry` above deleted any previous
+    // tree, `git clone --no-checkout` writes only `.git`, and the farm then
+    // materializes EXACTLY the canonical tree — which was itself
+    // `clean -ffdx`'d and proved `git status --porcelain --untracked-files=all`
+    // empty before it was sealed and published. Deleting nothing is still a
+    // full-tree walk, and this NFS store charges a metadata round trip per
+    // file for it. The checkout fallback keeps the clean: there the worktree
+    // comes out of the object store and nothing has proved it bare.
+    let clean_started = std::time::Instant::now();
+    if !farmed {
+        run_silent(
+            Command::new("git")
+                .args(["clean", "-ffdx"])
+                .current_dir(&private_repo),
+            "git clean private build source",
+        )
+        .await?;
+    }
+    tracing::info!(
+        canonical = %canonical.root.display(),
+        span_path = if farmed { "skipped" } else { "ran" },
+        elapsed_ms = clean_started.elapsed().as_millis() as u64,
+        "bench: private_git_clean",
+    );
     run_silent(
         Command::new("git")
             .args(["remote", "set-url", "origin"])
@@ -11827,6 +11980,438 @@ version = "0.1.0"
 
         make_staging_tree_removable(&canonical);
         let _ = std::fs::remove_dir_all(canonical.parent().unwrap());
+    }
+
+    // ---------------------------------------------------------------- C15 (a)
+    /// The `retread-verify-snapshots` knob is process-global, so the two arms
+    /// of the lock-granularity guard must not run at the same time as each
+    /// other. Nothing else in this suite reads it.
+    static VERIFY_SNAPSHOTS_ARM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Hold the canonical entry's artifact-cache lock — exactly the way a
+    /// concurrent `span_path="clone"` of that same repository+commit+ref-state
+    /// holds it — and report how long a hit took and whether it came back
+    /// while the lock was still held.
+    async fn time_a_hit_against_a_held_cache_lock(
+        cache_dir: &Path,
+        warm: &Path,
+        url: &str,
+        rev: &str,
+        ref_state: &str,
+        hold: std::time::Duration,
+    ) -> (std::time::Duration, bool) {
+        let holder_dir = cache_dir.to_path_buf();
+        let (acquired_tx, acquired_rx) = tokio::sync::oneshot::channel::<()>();
+        let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let released_in_holder = released.clone();
+        let holder = tokio::spawn(async move {
+            let lock = acquire_artifact_cache_lock(&holder_dir)
+                .await
+                .expect("hold the canonical cache lock");
+            acquired_tx.send(()).expect("signal that the lock is held");
+            tokio::time::sleep(hold).await;
+            released_in_holder.store(true, Ordering::SeqCst);
+            drop(lock);
+        });
+        acquired_rx.await.expect("the holder acquired the lock");
+        let started = std::time::Instant::now();
+        ensure_canonical_git_snapshot(warm, url, rev, ref_state, None)
+            .await
+            .expect("the canonical snapshot hit");
+        let elapsed = started.elapsed();
+        let while_held = !released.load(Ordering::SeqCst);
+        holder.await.expect("holder task");
+        (elapsed, while_held)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_sealed_canonical_git_hit_does_not_wait_for_a_concurrent_clone_of_the_same_tree() {
+        let _arm = VERIFY_SNAPSHOTS_ARM_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let fixture = git_checkout_fixture("c15-unlocked-hit");
+        let checkout = ensure_git_checkout(&fixture.url, &fixture.rev2, &fixture.cache)
+            .await
+            .expect("publish warm checkout");
+        let warm = checkout.root().to_path_buf();
+        let ref_state = canonical_git_ref_state(&warm).await.unwrap();
+        let published = ensure_canonical_git_snapshot(
+            &warm,
+            &fixture.url,
+            &fixture.rev2,
+            &ref_state,
+            None,
+        )
+        .await
+        .expect("publish the canonical snapshot");
+        let cache_dir = published.root.parent().unwrap().to_path_buf();
+
+        // NON-VACUITY 1: the entry this test is about really is SEALED. An
+        // unsealed marker takes the locked path by design, and then the green
+        // arm below would be measuring nothing.
+        let marker: CanonicalGitSourceMarker = serde_json::from_slice(
+            &std::fs::read(cache_dir.join("source.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            marker.seal.as_ref().map(|seal| seal.schema.as_str()),
+            Some(CANONICAL_GIT_SEAL_SCHEMA),
+            "the fixture entry must be sealed for this guard to mean anything",
+        );
+
+        const HOLD: std::time::Duration = std::time::Duration::from_millis(1_500);
+
+        // GREEN: a reader of a sealed, immutable, already-published tree comes
+        // back while a writer still holds the entry's exclusive lock.
+        set_verify_snapshots_full(false);
+        let (fast, fast_while_held) = time_a_hit_against_a_held_cache_lock(
+            &cache_dir,
+            &warm,
+            &fixture.url,
+            &fixture.rev2,
+            &ref_state,
+            HOLD,
+        )
+        .await;
+        assert!(
+            fast_while_held,
+            "the hit must return BEFORE the lock holder releases, not after it",
+        );
+        assert!(
+            fast < HOLD / 3,
+            "a sealed hit must not wait out a concurrent clone: {fast:?} of a {HOLD:?} hold",
+        );
+
+        // CONTROL: reinstate the global lock on the hit path — which is what
+        // `retread-verify-snapshots` does — and the same hit now waits out the
+        // whole hold. Without this arm the assertions above could pass on a
+        // machine where nothing ever contends.
+        set_verify_snapshots_full(true);
+        let (slow, slow_while_held) = time_a_hit_against_a_held_cache_lock(
+            &cache_dir,
+            &warm,
+            &fixture.url,
+            &fixture.rev2,
+            &ref_state,
+            HOLD,
+        )
+        .await;
+        set_verify_snapshots_full(false);
+        assert!(
+            !slow_while_held,
+            "under the reinstated lock the hit must NOT come back while the lock is held",
+        );
+        assert!(
+            slow >= HOLD - std::time::Duration::from_millis(150),
+            "the control must actually block: {slow:?} of a {HOLD:?} hold",
+        );
+        assert!(
+            slow > fast * 3,
+            "the lock-free hit must be ordinally faster than the locked one: {fast:?} vs {slow:?}",
+        );
+
+        let _ = std::fs::remove_dir_all(&fixture.base);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_concurrent_publishes_of_one_canonical_tree_leave_one_sealed_marker() {
+        let _arm = VERIFY_SNAPSHOTS_ARM_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        set_verify_snapshots_full(false);
+        let fixture = git_checkout_fixture("c15-race-publish");
+        let checkout = ensure_git_checkout(&fixture.url, &fixture.rev2, &fixture.cache)
+            .await
+            .expect("publish warm checkout");
+        let warm = checkout.root().to_path_buf();
+        let ref_state = canonical_git_ref_state(&warm).await.unwrap();
+        let identity = canonical_git_repository_identity(&fixture.url, &fixture.rev2, None);
+        let cache_dir = crate::courier::retread_cache_root()
+            .join("canonical-git-sources")
+            .join("v3")
+            .join(&identity)
+            .join(&ref_state);
+
+        // NON-VACUITY: both racers must take the PUBLISH path, so the entry
+        // has to be absent when they start.
+        let _ = remove_owned_cache_entry(&cache_dir);
+        assert!(
+            !cache_dir.exists(),
+            "this guard is about two concurrent PUBLISHES, so the cache must start cold",
+        );
+
+        let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let mut racers = Vec::new();
+        for _ in 0..2 {
+            let gate = gate.clone();
+            let warm = warm.clone();
+            let url = fixture.url.clone();
+            let rev = fixture.rev2.clone();
+            let ref_state = ref_state.clone();
+            racers.push(tokio::spawn(async move {
+                gate.wait().await;
+                ensure_canonical_git_snapshot(&warm, &url, &rev, &ref_state, None).await
+            }));
+        }
+        let mut roots = Vec::new();
+        for racer in racers {
+            let snapshot = racer
+                .await
+                .expect("racer task")
+                .expect("both racers must succeed: one publishes, the other adopts");
+            roots.push(snapshot.root);
+        }
+        assert_eq!(
+            roots[0], roots[1],
+            "the loser must ADOPT the winner's tree, not publish a second one",
+        );
+
+        // No torn marker: it parses, it carries a seal, and the tree it
+        // describes verifies against that seal on the cheap path.
+        let marker: CanonicalGitSourceMarker = serde_json::from_slice(
+            &std::fs::read(cache_dir.join("source.json")).expect("the marker exists"),
+        )
+        .expect("the marker parses");
+        let seal = marker.seal.as_ref().expect("the published marker is sealed");
+        assert_eq!(seal.schema, CANONICAL_GIT_SEAL_SCHEMA);
+        verify_canonical_git_seal(&roots[0], seal)
+            .expect("the published tree matches the marker that was written for it");
+        assert!(
+            std::fs::read_dir(cache_dir.join("source.json.retread-tmp")).is_err(),
+            "a half-written marker must never survive",
+        );
+
+        // And the loser left no staging tree behind in the family directory.
+        let leftovers: Vec<String> = std::fs::read_dir(cache_dir.parent().unwrap())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "a losing publish must not leave a staging tree: {leftovers:?}",
+        );
+
+        let _ = remove_owned_cache_entry(&cache_dir);
+        let _ = std::fs::remove_dir_all(&fixture.base);
+    }
+
+    /// [`git_checkout_fixture`], plus `bulk` extra tracked files, so the
+    /// post-rename `git status` walk this guard is about takes long enough to
+    /// be observed at all.
+    fn git_checkout_fixture_bulk(label: &str, bulk: usize) -> GitCheckoutFixture {
+        let mut fixture = git_checkout_fixture(label);
+        let repo = fixture.base.join("repo");
+        std::fs::create_dir_all(repo.join("bulk")).unwrap();
+        for index in 0..bulk {
+            std::fs::write(
+                repo.join("bulk").join(format!("file{index:05}.txt")),
+                format!("bulk-{index:05}\n"),
+            )
+            .unwrap();
+        }
+        run_fixture_git(&["add", "."], &repo);
+        run_fixture_git(&["commit", "-m", "bulk"], &repo);
+        fixture.rev2 = run_fixture_git(&["rev-parse", "HEAD"], &repo);
+        fixture
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_canonical_publish_releases_its_lock_at_the_rename_not_after_the_walk() {
+        let _arm = VERIFY_SNAPSHOTS_ARM_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        set_verify_snapshots_full(false);
+        let fixture = git_checkout_fixture_bulk("c15-publish-lock", 1_500);
+        let checkout = ensure_git_checkout(&fixture.url, &fixture.rev2, &fixture.cache)
+            .await
+            .expect("publish warm checkout");
+        let warm = checkout.root().to_path_buf();
+        let ref_state = canonical_git_ref_state(&warm).await.unwrap();
+        let identity = canonical_git_repository_identity(&fixture.url, &fixture.rev2, None);
+        let cache_dir = crate::courier::retread_cache_root()
+            .join("canonical-git-sources")
+            .join("v3")
+            .join(&identity)
+            .join(&ref_state);
+        let lock_path = artifact_cache_lock_path(&cache_dir).unwrap();
+
+        // NON-VACUITY: the entry must be cold, so the publish path is what runs.
+        let _ = remove_owned_cache_entry(&cache_dir);
+        assert!(!cache_dir.exists(), "the publish path needs a cold entry");
+
+        let returned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let returned_in_publisher = returned.clone();
+        let publisher = {
+            let warm = warm.clone();
+            let url = fixture.url.clone();
+            let rev = fixture.rev2.clone();
+            let ref_state = ref_state.clone();
+            tokio::spawn(async move {
+                let result =
+                    ensure_canonical_git_snapshot(&warm, &url, &rev, &ref_state, None).await;
+                returned_in_publisher.store(true, Ordering::SeqCst);
+                result
+            })
+        };
+
+        // Sample, without ever blocking, for the first instant the entry's lock
+        // is free AND the tree is published. Under C15 that instant is the
+        // rename; the publisher is still walking the tree it just published.
+        let mut free_before_the_publisher_returned = false;
+        loop {
+            let published = cache_dir.join("source.json").is_file();
+            let done_first = returned.load(Ordering::SeqCst);
+            if published {
+                if let Ok(file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .read(true)
+                    .write(true)
+                    .open(&lock_path)
+                {
+                    if fs4::fs_std::FileExt::try_lock_exclusive(&file).unwrap_or(false) {
+                        free_before_the_publisher_returned = !returned.load(Ordering::SeqCst);
+                        let _ = fs4::fs_std::FileExt::unlock(&file);
+                        break;
+                    }
+                }
+            }
+            if done_first {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+
+        let snapshot = publisher
+            .await
+            .expect("publisher task")
+            .expect("the canonical publish succeeds");
+        assert!(
+            free_before_the_publisher_returned,
+            "the publish must hand the lock back at the rename, not after the walk",
+        );
+
+        // The walk it did after releasing is still the walk that earns the
+        // seal, and it still earned one.
+        let marker: CanonicalGitSourceMarker =
+            serde_json::from_slice(&std::fs::read(cache_dir.join("source.json")).unwrap()).unwrap();
+        let seal = marker.seal.as_ref().expect("the published marker is sealed");
+        verify_canonical_git_seal(&snapshot.root, seal)
+            .expect("the tree matches the seal the publish earned");
+
+        let _ = remove_owned_cache_entry(&cache_dir);
+        let _ = std::fs::remove_dir_all(&fixture.base);
+    }
+
+    // ---------------------------------------------------------------- C15 (b)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_farmed_private_build_tree_has_nothing_for_git_clean_to_remove() {
+        let _arm = VERIFY_SNAPSHOTS_ARM_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        set_verify_snapshots_full(false);
+        let fixture = git_checkout_fixture("c15-no-clean");
+        let checkout = ensure_git_checkout(&fixture.url, &fixture.rev2, &fixture.cache)
+            .await
+            .expect("publish warm checkout");
+        let warm = checkout.root().to_path_buf();
+        let ref_state = canonical_git_ref_state(&warm).await.unwrap();
+        let canonical = ensure_canonical_git_snapshot(
+            &warm,
+            &fixture.url,
+            &fixture.rev2,
+            &ref_state,
+            None,
+        )
+        .await
+        .expect("publish the canonical snapshot");
+
+        // The farm needs the private tree on the SAME filesystem as the
+        // canonical entry: `link(2)` returns EXDEV otherwise and the code falls
+        // back to the checkout, which is not the path this guard is about.
+        // Production satisfies that by construction — the private staging tree
+        // and the canonical snapshot both live under the retread cache root —
+        // and the fixture has to say so out loud. (It did not, at first, and
+        // the guard caught its own fixture: dev 36 against dev 48.)
+        let staging = crate::courier::retread_cache_root()
+            .join(format!(".c15-private-build-fixture-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&staging);
+        std::fs::create_dir_all(&staging).unwrap();
+        let private_out = staging.join("wheel-out");
+        let source_root =
+            prepare_private_git_build_tree(&canonical, &fixture.url, Path::new("."), &private_out)
+                .await
+                .expect("prepare the private build tree");
+        // `staging` may reach the cache root through a symlinked home, so the
+        // comparison is on the resolved paths.
+        let private_repo = source_root.clone();
+        assert_eq!(
+            private_repo.canonicalize().unwrap(),
+            staging.join("git-build-source").canonicalize().unwrap(),
+        );
+
+        // NON-VACUITY 1: the farm, not the checkout fallback, is what ran —
+        // otherwise this says nothing about the path C15 stopped cleaning.
+        use std::os::unix::fs::MetadataExt;
+        let canonical_file = std::fs::symlink_metadata(canonical.root.join("base.txt")).unwrap();
+        let private_file = std::fs::symlink_metadata(private_repo.join("base.txt")).unwrap();
+        assert_eq!(
+            (private_file.dev(), private_file.ino()),
+            (canonical_file.dev(), canonical_file.ino()),
+            "the private tree must be the hardlink farm, not a checkout",
+        );
+
+        // THE CUT: `git clean -ffdx` had nothing to delete, and the tree it
+        // would have walked is clean by every measure Git has.
+        let dry_run = run_output(
+            Command::new("git")
+                .args(["clean", "-ffdxn"])
+                .env("GIT_OPTIONAL_LOCKS", "0")
+                .current_dir(&private_repo),
+            "git clean dry run",
+        )
+        .await
+        .unwrap();
+        assert!(
+            dry_run.trim().is_empty(),
+            "the farmed tree must have nothing for `git clean` to remove: {dry_run}",
+        );
+        let status = run_output(
+            Command::new("git")
+                .args(["status", "--porcelain=v1", "--untracked-files=all"])
+                .env("GIT_OPTIONAL_LOCKS", "0")
+                .current_dir(&private_repo),
+            "git status of the farmed tree",
+        )
+        .await
+        .unwrap();
+        assert!(
+            status.trim().is_empty(),
+            "the farmed tree must be clean without ever being cleaned: {status}",
+        );
+
+        // NON-VACUITY 2: the dry run above can SEE something. Drop one stray
+        // file in and it must name it.
+        std::fs::write(private_repo.join("stray.txt"), b"stray").unwrap();
+        let dirty = run_output(
+            Command::new("git")
+                .args(["clean", "-ffdxn"])
+                .env("GIT_OPTIONAL_LOCKS", "0")
+                .current_dir(&private_repo),
+            "git clean dry run over a dirtied tree",
+        )
+        .await
+        .unwrap();
+        assert!(
+            dirty.contains("stray.txt"),
+            "the dry run must be able to report something: {dirty}",
+        );
+
+        let _ = remove_owned_cache_entry(&staging);
+        let _ = remove_owned_cache_entry(canonical.root.parent().unwrap());
+        let _ = std::fs::remove_dir_all(&fixture.base);
     }
 
     #[cfg(unix)]
