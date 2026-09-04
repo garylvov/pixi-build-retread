@@ -822,6 +822,24 @@ fn closure_sdist_platform_error(package: &str, filename: &str) -> anyhow::Error 
     )
 }
 
+/// Where the exclusive lock for one artifact-cache entry lives. One writer of
+/// this formula and, since C15, one reader that is not `acquire_artifact_cache_lock`
+/// itself: the guard that proves the canonical publish gives the lock back at
+/// the rename has to be able to take it.
+pub(crate) fn artifact_cache_lock_path(cache_dir: &Path) -> Result<PathBuf> {
+    let parent = cache_dir.parent().ok_or_else(|| {
+        anyhow!(
+            "built-wheel cache path has no parent: {}",
+            cache_dir.display()
+        )
+    })?;
+    let file_name = cache_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("built-wheel cache path has no UTF-8 filename"))?;
+    Ok(parent.join(format!(".{file_name}.lock")))
+}
+
 pub(crate) async fn acquire_artifact_cache_lock(cache_dir: &Path) -> Result<ArtifactCacheLock> {
     let parent = cache_dir.parent().ok_or_else(|| {
         anyhow!(
@@ -832,11 +850,7 @@ pub(crate) async fn acquire_artifact_cache_lock(cache_dir: &Path) -> Result<Arti
     tokio::fs::create_dir_all(parent)
         .await
         .with_context(|| format!("creating built-wheel cache parent {}", parent.display()))?;
-    let file_name = cache_dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| anyhow!("built-wheel cache path has no UTF-8 filename"))?;
-    let lock_path = parent.join(format!(".{file_name}.lock"));
+    let lock_path = artifact_cache_lock_path(cache_dir)?;
     tokio::task::spawn_blocking(move || {
         let file = std::fs::OpenOptions::new()
             .create(true)
@@ -5986,7 +6000,7 @@ async fn ensure_canonical_git_snapshot(
     // The lock still serialises WRITERS, and deliberately so: it is what stops
     // twelve entries of one monorepo cloning the same tree twelve times. What
     // C15 removes is readers waiting in that same queue.
-    let _lock = acquire_artifact_cache_lock(&cache_dir).await?;
+    let cache_lock = acquire_artifact_cache_lock(&cache_dir).await?;
     if cache_dir.try_exists().with_context(|| {
         format!(
             "checking canonical Git source cache {}",
@@ -6295,8 +6309,19 @@ async fn ensure_canonical_git_snapshot(
     })?;
     std::fs::rename(&staging.0, &cache_dir)
         .with_context(|| format!("publishing canonical Git source {}", cache_dir.display()))?;
-    // The publish path always takes the FULL walk: it is the walk that earns
-    // the seal the cheap path will trust.
+    // C15 lever (a), second half: THE LOCK ENDS AT THE RENAME. Everything the
+    // lock protects — deduplicating the clone, discarding a markerless tree,
+    // and owning the staging directory until it is renamed in — is now behind
+    // us. What follows is the full `git status` walk that EARNS the seal, and
+    // it is read-only against a tree that is already published, already
+    // read-only and never replaced. Holding the lock across it made every
+    // sibling entry of the same repository+commit wait out the walk as well as
+    // the clone: in the C15.0 proof 5744482 the 20 hits that still took the
+    // locked path cost 820.2 s against 265.2 s of clone span, and the
+    // difference is this walk. The walk still runs, and its refusal is still
+    // fatal — it is only no longer in anyone else's way.
+    drop(cache_lock);
+    let publish_verify_started = std::time::Instant::now();
     let published = validate_canonical_git_snapshot(
         &cache_dir,
         &repository_identity,
@@ -6306,6 +6331,13 @@ async fn ensure_canonical_git_snapshot(
         SnapshotVerification::Full,
     )
     .await;
+    // bench (measurement only): C15 -- how much of the `clone` span is the
+    // post-rename walk, now that it is outside the lock.
+    tracing::info!(
+        repository = %repository_identity,
+        elapsed_ms = publish_verify_started.elapsed().as_millis() as u64,
+        "bench: canonical_git_publish_verify",
+    );
     tracing::info!(
         repository = %repository_identity,
         commit = %resolved_sha,
@@ -12160,6 +12192,114 @@ version = "0.1.0"
             leftovers.is_empty(),
             "a losing publish must not leave a staging tree: {leftovers:?}",
         );
+
+        let _ = remove_owned_cache_entry(&cache_dir);
+        let _ = std::fs::remove_dir_all(&fixture.base);
+    }
+
+    /// [`git_checkout_fixture`], plus `bulk` extra tracked files, so the
+    /// post-rename `git status` walk this guard is about takes long enough to
+    /// be observed at all.
+    fn git_checkout_fixture_bulk(label: &str, bulk: usize) -> GitCheckoutFixture {
+        let mut fixture = git_checkout_fixture(label);
+        let repo = fixture.base.join("repo");
+        std::fs::create_dir_all(repo.join("bulk")).unwrap();
+        for index in 0..bulk {
+            std::fs::write(
+                repo.join("bulk").join(format!("file{index:05}.txt")),
+                format!("bulk-{index:05}\n"),
+            )
+            .unwrap();
+        }
+        run_fixture_git(&["add", "."], &repo);
+        run_fixture_git(&["commit", "-m", "bulk"], &repo);
+        fixture.rev2 = run_fixture_git(&["rev-parse", "HEAD"], &repo);
+        fixture
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_canonical_publish_releases_its_lock_at_the_rename_not_after_the_walk() {
+        let _arm = VERIFY_SNAPSHOTS_ARM_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        set_verify_snapshots_full(false);
+        let fixture = git_checkout_fixture_bulk("c15-publish-lock", 1_500);
+        let checkout = ensure_git_checkout(&fixture.url, &fixture.rev2, &fixture.cache)
+            .await
+            .expect("publish warm checkout");
+        let warm = checkout.root().to_path_buf();
+        let ref_state = canonical_git_ref_state(&warm).await.unwrap();
+        let identity = canonical_git_repository_identity(&fixture.url, &fixture.rev2, None);
+        let cache_dir = crate::courier::retread_cache_root()
+            .join("canonical-git-sources")
+            .join("v3")
+            .join(&identity)
+            .join(&ref_state);
+        let lock_path = artifact_cache_lock_path(&cache_dir).unwrap();
+
+        // NON-VACUITY: the entry must be cold, so the publish path is what runs.
+        let _ = remove_owned_cache_entry(&cache_dir);
+        assert!(!cache_dir.exists(), "the publish path needs a cold entry");
+
+        let returned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let returned_in_publisher = returned.clone();
+        let publisher = {
+            let warm = warm.clone();
+            let url = fixture.url.clone();
+            let rev = fixture.rev2.clone();
+            let ref_state = ref_state.clone();
+            tokio::spawn(async move {
+                let result =
+                    ensure_canonical_git_snapshot(&warm, &url, &rev, &ref_state, None).await;
+                returned_in_publisher.store(true, Ordering::SeqCst);
+                result
+            })
+        };
+
+        // Sample, without ever blocking, for the first instant the entry's lock
+        // is free AND the tree is published. Under C15 that instant is the
+        // rename; the publisher is still walking the tree it just published.
+        let mut free_before_the_publisher_returned = false;
+        loop {
+            let published = cache_dir.join("source.json").is_file();
+            let done_first = returned.load(Ordering::SeqCst);
+            if published {
+                if let Ok(file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .read(true)
+                    .write(true)
+                    .open(&lock_path)
+                {
+                    if fs4::fs_std::FileExt::try_lock_exclusive(&file).unwrap_or(false) {
+                        free_before_the_publisher_returned = !returned.load(Ordering::SeqCst);
+                        let _ = fs4::fs_std::FileExt::unlock(&file);
+                        break;
+                    }
+                }
+            }
+            if done_first {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+
+        let snapshot = publisher
+            .await
+            .expect("publisher task")
+            .expect("the canonical publish succeeds");
+        assert!(
+            free_before_the_publisher_returned,
+            "the publish must hand the lock back at the rename, not after the walk",
+        );
+
+        // The walk it did after releasing is still the walk that earns the
+        // seal, and it still earned one.
+        let marker: CanonicalGitSourceMarker =
+            serde_json::from_slice(&std::fs::read(cache_dir.join("source.json")).unwrap()).unwrap();
+        let seal = marker.seal.as_ref().expect("the published marker is sealed");
+        verify_canonical_git_seal(&snapshot.root, seal)
+            .expect("the tree matches the seal the publish earned");
 
         let _ = remove_owned_cache_entry(&cache_dir);
         let _ = std::fs::remove_dir_all(&fixture.base);
