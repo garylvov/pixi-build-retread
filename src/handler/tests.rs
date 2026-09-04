@@ -733,6 +733,7 @@ fn pythons_for_rejects_bare_major_variant() {
         ledger_overrides: Default::default(),
         pack_manifest_path: None,
         auto_imports: None,
+        auto_imports_strict: None,
         verify_snapshots: None,
         parallel_probes: None,
     };
@@ -789,6 +790,7 @@ fn pythons_for_accepts_dotted_variant() {
         ledger_overrides: Default::default(),
         pack_manifest_path: None,
         auto_imports: None,
+        auto_imports_strict: None,
         verify_snapshots: None,
         parallel_probes: None,
     };
@@ -845,6 +847,7 @@ fn pythons_for_filters_bare_major_keeps_dotted() {
         ledger_overrides: Default::default(),
         pack_manifest_path: None,
         auto_imports: None,
+        auto_imports_strict: None,
         verify_snapshots: None,
         parallel_probes: None,
     };
@@ -3620,6 +3623,7 @@ fn cfg() -> RetreadConfig {
         ledger_overrides: Default::default(),
         pack_manifest_path: None,
         auto_imports: None,
+        auto_imports_strict: None,
         verify_snapshots: None,
         parallel_probes: None,
     }
@@ -7443,6 +7447,8 @@ fn the_advertised_courier_build_gate_resolves_under_the_recorded_fingerprint() {
         workspace_fp: "sibling-locks-as-of-the-metadata-pass".to_string(),
         run_depends: vec!["python 3.11.*".to_string()],
         run_constrains: Vec::new(),
+        auto_imports_suppressed_bundles: Vec::new(),
+        auto_imports_suppressed: Vec::new(),
     };
     let advertising_fp = EffectiveWorkspaceFp::resolve(Some(&record), None, ws, source, &target);
     assert_eq!(
@@ -9699,6 +9705,8 @@ fn advertised_output_record(
         workspace_fp: "metadata-pass-fp".to_string(),
         run_depends: depends,
         run_constrains: constrains,
+        auto_imports_suppressed_bundles: Vec::new(),
+        auto_imports_suppressed: Vec::new(),
     }
 }
 
@@ -11171,6 +11179,8 @@ async fn c11_an_adopted_output_restores_the_cold_passs_advertised_identity() {
         workspace_fp: "the-producing-workspace-fingerprint".to_string(),
         run_depends: vec!["python 3.11.*".to_string()],
         run_constrains: vec![],
+        auto_imports_suppressed_bundles: Vec::new(),
+        auto_imports_suppressed: Vec::new(),
     };
 
     // The record travels inside the store record, exactly as production
@@ -12612,4 +12622,255 @@ fn p6t4_build_v1_refusal_names_the_abi_invariant_not_the_relaxation_record() {
         format!("{abi}").contains("bare-major"),
         "the refusal quotes the violation verbatim: {abi}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// p6u — the back-off decision crosses the RPC boundary, and a dropped
+// detection is a refusal rather than a footnote.
+//
+// Arm `oncert-p6tb` 5757174 is the whole reason: `conda/outputs` logged
+// `ABI BACK-OFF SUCCEEDED bundle=protomotions-deps-pack`, `conda/build_v1`
+// re-ran the same emission with the roots back in, and the request died
+// `-32603 reconstructing final relaxation record`. Arm `oncert-p6ta` 5757173
+// produced its 27/27 lock while dropping 51 detected roots across three
+// requests, and nothing refused it.
+// ---------------------------------------------------------------------------
+
+/// p6u GUARD (b). `conda/build_v1`'s ABI refusal states a DELTA against the
+/// plan the advertising pass reached — which of the three distinguishable
+/// situations this is — and never blames the relaxation record.
+#[test]
+fn p6u_b_build_v1_abi_refusal_states_the_delta_against_the_carried_plan() {
+    let violation = AbiInvariantViolation {
+        violations: vec!["wheel `contourpy` embeds `numpy >=1.0.0` (bare-major)".to_string()],
+    };
+    let suppressing_record = || {
+        let mut record = advertised_output_record(
+            vec!["python 3.11.*".to_string()],
+            Vec::new(),
+        );
+        record.auto_imports_suppressed_bundles = vec!["protomotions-deps-pack".to_string()];
+        record.auto_imports_suppressed = vec![advertised_identity::SuppressedEnv {
+            env: "protomotions-deps-pack".to_string(),
+            roots: vec!["isaacsim-extscache-kit-sdk".to_string(), "viser".to_string()],
+            reason: "abi-backoff: ABI invariant: wheel `contourpy` embeds `numpy >=1.0.0`"
+                .to_string(),
+        }];
+        record
+    };
+
+    // (1) The carry was made and DID NOT TAKE: roots are still injected here.
+    // That is the loud refusal p6t asked for, and the delta is the root list.
+    let record = suppressing_record();
+    let delta = build_v1_abi_refusal(
+        "protomotions-deps-pack",
+        Some(&record),
+        &["usd-core".to_string(), "warp-lang".to_string()],
+        &violation,
+    );
+    assert!(delta.contains("DELTA"), "{delta}");
+    assert!(delta.contains("usd-core,warp-lang"), "the delta names the difference: {delta}");
+    assert!(
+        delta.contains("isaacsim-extscache-kit-sdk"),
+        "and what the advertising pass had dropped: {delta}"
+    );
+    assert!(delta.contains("bare-major"), "the violation is quoted verbatim: {delta}");
+    assert!(
+        !delta.contains("reconstructing final relaxation record"),
+        "an ABI violation must never be reported as a relaxation-record failure: {delta}"
+    );
+
+    // (2) The carry TOOK — nothing injected here — so the violation is not
+    // about injection at all, and the refusal says so instead of blaming it.
+    let carried = build_v1_abi_refusal(
+        "protomotions-deps-pack",
+        Some(&record),
+        &[],
+        &violation,
+    );
+    assert!(carried.contains("WAS carried"), "{carried}");
+    assert!(carried.contains("NOT about injection"), "{carried}");
+    assert!(!carried.contains("DELTA"), "nothing differed, so there is no delta: {carried}");
+
+    // (3) NO record: nothing could be carried, and the absence is the finding.
+    let none = build_v1_abi_refusal(
+        "protomotions-deps-pack",
+        None,
+        &["usd-core".to_string()],
+        &violation,
+    );
+    assert!(none.contains("NO advertised-identity record"), "{none}");
+    assert!(none.contains("usd-core"), "{none}");
+
+    // NON-VACUITY: the three messages are genuinely different verdicts, not
+    // one template with the same text.
+    assert_ne!(delta, carried);
+    assert_ne!(delta, none);
+    assert_ne!(carried, none);
+}
+
+/// p6u GUARD (c). A suppressed root that is UNSATISFIABLE on this platform:
+/// strict refuses and names the reason; non-strict emits the row and proceeds.
+/// This is the 5.1.0.0 kit-sdk case — the only wheels it publishes are
+/// `manylinux_2_35` — and its resolution is a DECLARED PLATFORM FACT, not a
+/// silent drop.
+#[test]
+fn p6u_c_an_unsatisfiable_root_refuses_under_strict_and_only_warns_without_it() {
+    let mut suppressed: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    suppressed.insert(
+        "protomotions-deps-pack".to_string(),
+        vec!["isaacsim-extscache-kit-sdk".to_string()],
+    );
+    let mut reasons: BTreeMap<String, String> = BTreeMap::new();
+    reasons.insert(
+        "protomotions-deps-pack".to_string(),
+        "resolve-backoff: no wheel of isaacsim-extscache-kit-sdk==5.1.0.0 is usable: the \
+         only distributions are manylinux_2_35 and this target admits less"
+            .to_string(),
+    );
+    let subdir = "linux-64-cuda-12-glibc-2-35";
+
+    // STRICT: a refusal, naming the env, the root, the reason, and the
+    // declaration that would restore it.
+    let refusal = auto_imports_strict_verdict(true, &suppressed, false, &reasons, subdir)
+        .expect_err("strict must refuse a lock that dropped a detected import");
+    assert!(refusal.contains("auto_imports_suppressed_roots=1"), "{refusal}");
+    assert!(refusal.contains("env=protomotions-deps-pack"), "{refusal}");
+    assert!(refusal.contains("isaacsim-extscache-kit-sdk"), "{refusal}");
+    assert!(refusal.contains("manylinux_2_35"), "the reason is quoted: {refusal}");
+    // THE DECLARED PLATFORM FACT, spelled out. Not "we dropped it".
+    assert!(refusal.contains("glibc = \"2.35\""), "{refusal}");
+    assert!(refusal.contains(subdir), "on the platform actually being built: {refusal}");
+    assert!(
+        refusal.contains(crate::config::AUTO_IMPORTS_STRICT_KEY),
+        "and it names the key that turns it off: {refusal}"
+    );
+
+    // NON-STRICT: the same inputs proceed, and the per-env row still names
+    // everything the refusal would have.
+    let (verdict, logs) = capture_warn_logs(|| {
+        let rows = emit_auto_imports_suppressed_rows(
+            "conda/outputs fixture",
+            &suppressed,
+            &reasons,
+            subdir,
+        );
+        (
+            auto_imports_strict_verdict(false, &suppressed, false, &reasons, subdir),
+            rows,
+        )
+    });
+    assert!(verdict.0.is_ok(), "non-strict must proceed: {:?}", verdict.0);
+    assert_eq!(verdict.1, 1, "one environment shipped short");
+    assert!(
+        logs.contains("auto_imports_suppressed env=protomotions-deps-pack"),
+        "the first-class per-env row: {logs}"
+    );
+    assert!(logs.contains("roots=[isaacsim-extscache-kit-sdk]"), "{logs}");
+    assert!(logs.contains("reason=resolve-backoff"), "{logs}");
+    assert!(logs.contains("glibc = \\\"2.35\\\"") || logs.contains("glibc = \"2.35\""), "the row carries the platform fact: {logs}");
+
+    // NON-VACUITY: strict with nothing suppressed is not a refusal, so the
+    // gate is not simply "always fail".
+    assert!(
+        auto_imports_strict_verdict(true, &BTreeMap::new(), false, &reasons, subdir).is_ok(),
+        "a clean request must pass strict"
+    );
+    // ...but `suppressed_all` with no attributed roots STILL refuses: every
+    // bundle in the request lost its injection, which is the p6s/5748915
+    // shape, and a zero root count there is missing attribution, not innocence.
+    assert!(
+        auto_imports_strict_verdict(true, &BTreeMap::new(), true, &reasons, subdir).is_err(),
+        "suppressed_all is a refusal even when no roots were attributed"
+    );
+    // A root with no manylinux floor gets the MANIFEST remedy, not a bogus
+    // platform declaration -- the remedy must be about this root, not a
+    // template.
+    let mut plain = BTreeMap::new();
+    plain.insert("robojudo-pack".to_string(), vec!["viser".to_string()]);
+    let mut plain_reasons = BTreeMap::new();
+    plain_reasons.insert(
+        "robojudo-pack".to_string(),
+        "abi-backoff: ABI invariant: wheel `viser` embeds `numpy >=1.0.0` (bare-major)"
+            .to_string(),
+    );
+    let plain_refusal =
+        auto_imports_strict_verdict(true, &plain, false, &plain_reasons, subdir).unwrap_err();
+    assert!(plain_refusal.contains("MANIFEST finding"), "{plain_refusal}");
+    assert!(!plain_refusal.contains("glibc = "), "{plain_refusal}");
+}
+
+/// p6u GUARD (d). The suppression findings survive the trip into the
+/// advertised-identity record and back out, so an ADOPTING `conda/outputs` --
+/// which runs no back-off of its own -- republishes the same rows and takes
+/// the same strict verdict instead of reading a store hit as a clean pass.
+#[test]
+fn p6u_d_an_adopted_store_hit_re_publishes_the_suppression_it_inherited() {
+    let mut suppressed: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    suppressed.insert("holosoma-pack".to_string(), vec!["etils".to_string()]);
+    suppressed.insert(
+        "flashsac-pack".to_string(),
+        vec!["viser".to_string(), "wandb".to_string()],
+    );
+    let mut reasons: BTreeMap<String, String> = BTreeMap::new();
+    reasons.insert(
+        AUTO_IMPORTS_SUPPRESS_ALL.to_string(),
+        "resolve-backoff: resolution failed with Lane C roots injected".to_string(),
+    );
+    let envs = auto_imports_suppressed_envs(&suppressed, &reasons);
+    assert_eq!(envs.len(), 2);
+    // Every env inherits the request-wide reason when it has none of its own:
+    // a dropped root with no reason is a silent drop wearing a number.
+    assert!(envs.iter().all(|e| e.reason.starts_with("resolve-backoff:")));
+
+    let mut record =
+        advertised_output_record(vec!["python 3.11.*".to_string()], Vec::new());
+    record.auto_imports_suppressed = envs;
+    let (roots_back, reasons_back) =
+        auto_imports_suppression_from_records(std::slice::from_ref(&record));
+    assert_eq!(roots_back, suppressed, "the adopting run sees the same roots");
+    assert_eq!(
+        auto_imports_suppression_reason_for(&reasons_back, "holosoma-pack"),
+        auto_imports_suppression_reason_for(&reasons, "holosoma-pack"),
+    );
+    // And it takes the same verdict -- this is the reader that makes the
+    // carried field load-bearing rather than decoration.
+    assert!(
+        auto_imports_strict_verdict(true, &roots_back, false, &reasons_back, "linux-64").is_err(),
+        "an adopted result that shipped short must refuse under strict too"
+    );
+
+    // NON-VACUITY: a record that suppressed nothing yields nothing, so an
+    // adopting run of a clean result is not gated on a phantom.
+    let clean = advertised_output_record(vec!["python 3.11.*".to_string()], Vec::new());
+    let (none_back, _) = auto_imports_suppression_from_records(std::slice::from_ref(&clean));
+    assert!(none_back.is_empty());
+    assert!(auto_imports_strict_verdict(true, &none_back, false, &BTreeMap::new(), "linux-64").is_ok());
+}
+
+/// p6u GUARD (e). Strict is ON BY DEFAULT whenever injection is on. A gate
+/// that ships off is a gate nobody turns on, and the failure it catches is
+/// silent by construction.
+#[test]
+fn p6u_e_strict_defaults_on_with_injection_and_follows_the_key_when_set() {
+    // The pure decision, so this guard does not depend on whatever
+    // `RETREAD_AUTO_IMPORTS_STRICT` the surrounding shell happens to export.
+    let decide = auto_imports_strict_decision;
+    assert!(
+        decide(None, None, true),
+        "injection on and no key: strict is the default"
+    );
+    assert!(
+        !decide(Some(false), None, true),
+        "the manifest key is how an operator accepts a short lock"
+    );
+    assert!(decide(Some(true), None, true));
+    // Injection OFF detects nothing, so there is nothing to drop and strict is
+    // vacuous: it follows injection to off rather than refusing every run.
+    assert!(!decide(None, None, false));
+    // The env override is the harness door: a measurement arm must be able to
+    // land the lock and then READ what strict would have refused, without
+    // editing the manifest it is certifying.
+    assert!(!decide(None, Some("0"), true), "the env override wins over the default");
+    assert!(decide(Some(false), Some("1"), true), "and over the manifest key");
 }

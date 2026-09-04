@@ -1543,6 +1543,7 @@ mod tests {
             ledger_overrides: Default::default(),
             pack_manifest_path: None,
             auto_imports: None,
+            auto_imports_strict: None,
             verify_snapshots: None,
             parallel_probes: None,
         }

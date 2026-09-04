@@ -5396,6 +5396,47 @@ impl Handler {
                         restored,
                         "bench: built_output_store adopted -- restored the adopted pass's advertised-identity records",
                     );
+                    // p6u. An adoption runs no back-off, so without this it
+                    // publishes no suppression rows and takes no strict
+                    // verdict -- a request that ships exactly the same
+                    // partially-suppressed content as the cold pass reads as a
+                    // clean pass. The findings travel in the adopted records;
+                    // republish them and apply the same gate to them.
+                    let (adopted_suppressed, adopted_reasons) =
+                        auto_imports_suppression_from_records(&adopted_advertised);
+                    let adopted_total =
+                        emit_auto_imports_suppression_counter(
+                            &format!(
+                                "conda/outputs ADOPTED work_directory={}",
+                                params.work_directory.display()
+                            ),
+                            &adopted_suppressed,
+                            false,
+                            0,
+                        );
+                    emit_auto_imports_suppressed_rows(
+                        &format!(
+                            "conda/outputs ADOPTED {}",
+                            params.work_directory.display()
+                        ),
+                        &adopted_suppressed,
+                        &adopted_reasons,
+                        params.host_platform.as_str(),
+                    );
+                    if let Err(refusal) = auto_imports_strict_verdict(
+                        auto_imports_strict_enabled(&config),
+                        &adopted_suppressed,
+                        false,
+                        &adopted_reasons,
+                        params.host_platform.as_str(),
+                    ) {
+                        tracing::error!(
+                            key = %key,
+                            suppressed_roots = adopted_total,
+                            "auto_imports: LANE C STRICT REFUSAL on an ADOPTED result -- {refusal}",
+                        );
+                        return Err(RpcError::invalid_params(refusal));
+                    }
                     self.invalidate_prepared_builds().await;
                     log_final_bundle_outputs(cached);
                     return Ok(cached.clone());
@@ -5535,6 +5576,17 @@ impl Handler {
         // 5748915's 27/27 was read before anyone counted the dropped roots.
         let mut auto_imports_suppressed_all_bundles: BTreeMap<String, Vec<String>> =
             BTreeMap::new();
+        // p6u: WHY each suppression happened, keyed the same way, so the
+        // per-env row can say `reason=abi-backoff` / `reason=resolve-backoff`
+        // and quote the violation that caused it. A dropped root with no
+        // reason is a silent drop wearing a number.
+        let mut auto_imports_suppression_reasons: BTreeMap<String, String> = BTreeMap::new();
+        // The subdir the suppression rows quote when they name the platform
+        // fact a dropped root needs. Starts as the request's host platform and
+        // is replaced by the RESOLUTION target's subdir (a named rich platform
+        // such as `linux-64-cuda-12-glibc-2-35`) as soon as one exists, because
+        // that is the platform the operator would have to declare on.
+        let mut target_conda_subdir_for_suppression = params.host_platform.as_str().to_string();
         // v4.2.0: the per-env pre-emission solve check (and its
         // bookkeeping / fail gate) was deleted with the legacy
         // mirror-solver; outputs ship unvalidated and `retread solve`
@@ -5552,6 +5604,7 @@ impl Handler {
                 ))
             })?;
             let python_version = target.python_version();
+            target_conda_subdir_for_suppression = target.conda_subdir().to_string();
             // Phase 1: materialize wheels + auto-bundle. Env-agnostic;
             // results reused across all per-env emissions.
             let t_materialize = std::time::Instant::now();
@@ -5601,6 +5654,10 @@ impl Handler {
                         );
                         abi_backoff_suppressed
                             .insert(AUTO_IMPORTS_SUPPRESS_ALL.to_string());
+                        auto_imports_suppression_reasons.insert(
+                            AUTO_IMPORTS_SUPPRESS_ALL.to_string(),
+                            format!("{AUTO_IMPORTS_REASON_RESOLVE_BACKOFF}: {error:#}"),
+                        );
                         abi_backoff_count += 1;
                         let retried = resolve_all(
                             &config,
@@ -6024,6 +6081,10 @@ impl Handler {
                                 "auto_imports: ABI BACK-OFF -- emission failed the ABI                                  invariant with Lane C roots injected; re-resolving this                                  bundle WITHOUT them. The dropped names are a FINDING:                                  each is a detected dependency this workspace cannot                                  satisfy under its current ABI anchors.",
                             );
                             abi_backoff_suppressed.insert(base_bundle.conda_name.clone());
+                            auto_imports_suppression_reasons.insert(
+                                base_bundle.conda_name.clone(),
+                                format!("{AUTO_IMPORTS_REASON_ABI_BACKOFF}: {violation}"),
+                            );
                             abi_backoff_count += 1;
                             let (retry_materialized, retry_config, _, _, _) = resolve_all(
                                 &config,
@@ -6177,6 +6238,21 @@ impl Handler {
                                 .iter()
                                 .map(format_constraint_spec)
                                 .collect(),
+                            // p6u: the Lane C back-off decision AS IT STOOD
+                            // when this identity was advertised. conda/build_v1
+                            // re-runs this very emission and has no back-off of
+                            // its own; without these two fields it re-derives a
+                            // plan this pass had already rejected and the ABI
+                            // invariant refuses the same emission a second time
+                            // (arm oncert-p6tb 5757174, `-32603`).
+                            auto_imports_suppressed_bundles: abi_backoff_suppressed
+                                .iter()
+                                .cloned()
+                                .collect(),
+                            auto_imports_suppressed: auto_imports_suppressed_envs(
+                                &auto_imports_suppressed_all_bundles,
+                                &auto_imports_suppression_reasons,
+                            ),
                         };
                         // Also carried into the shared built-output store, so
                         // an ADOPTING run leaves the same record this cold pass
@@ -6333,6 +6409,15 @@ impl Handler {
             suppressed_all_fired,
             abi_backoff_count,
         );
+        // p6u: the per-ENV rows. The counter above is the number a harness
+        // gates on; these are the rows a person acts on -- which environment
+        // shipped short, which roots, why, and what declaration would fix it.
+        let suppressed_envs = emit_auto_imports_suppressed_rows(
+            &format!("conda/outputs {}", params.work_directory.display()),
+            &auto_imports_suppressed_all_bundles,
+            &auto_imports_suppression_reasons,
+            &target_conda_subdir_for_suppression,
+        );
         let suppressed_named = auto_imports_suppression_roots_by_bundle(
             &auto_imports_suppressed_all_bundles,
         );
@@ -6345,6 +6430,24 @@ impl Handler {
                 roots_by_bundle = %suppressed_named,
                 "auto_imports: LANE C BACK-OFF SUMMARY -- these bundles emitted WITHOUT their detected roots, because injecting them either contradicted a workspace ABI anchor or made resolution fail. Every dropped root is a FINDING for manifest work, not a resolved issue. A `*` entry means the resolve-time back-off suppressed every bundle in the request.",
             );
+        }
+        // p6u: THE ZERO-GATE, in the backend rather than only in a harness
+        // grep. A harness gate can only refuse a lock that already exists;
+        // this refuses before one is advertised, and it names every dropped
+        // root and the declaration that would restore it.
+        if let Err(refusal) = auto_imports_strict_verdict(
+            auto_imports_strict_enabled(&config),
+            &auto_imports_suppressed_all_bundles,
+            suppressed_all_fired,
+            &auto_imports_suppression_reasons,
+            &target_conda_subdir_for_suppression,
+        ) {
+            tracing::error!(
+                suppressed_envs,
+                suppressed_roots = suppressed_root_total,
+                "auto_imports: LANE C STRICT REFUSAL -- {refusal}",
+            );
+            return Err(RpcError::invalid_params(refusal));
         }
         Ok(result)
     }
@@ -6999,9 +7102,35 @@ impl Handler {
             params.output.name.as_normalized(),
         )?;
 
+        // p6u. THE CARRY. `conda/build_v1` re-does the emission
+        // `conda/outputs` already made, and it has no Lane C back-off of its
+        // own -- so before p6u it re-derived a plan the back-off had already
+        // rejected, the ABI invariant refused the same emission a second time,
+        // and the request died `-32603 reconstructing final relaxation record`
+        // (arm oncert-p6tb 5757174). The advertising pass's decision travels in
+        // the advertised-identity record, which is loaded above and is
+        // ALREADY the authority for this request's workspace fingerprint and
+        // emitted run-deps; the suppression set is the same kind of fact and
+        // now rides the same door. An adopted store hit leaves the same record
+        // (`restore_advertised_identities`), so a warm run carries it too.
+        let carried_auto_imports_suppression: BTreeSet<String> = advertised_identity_record
+            .as_ref()
+            .map(AdvertisedIdentityRecord::carried_auto_imports_suppression)
+            .unwrap_or_default();
+        if !carried_auto_imports_suppression.is_empty() {
+            tracing::warn!(
+                output = %params.output.name.as_normalized(),
+                suppressed_bundles = %carried_auto_imports_suppression
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(","),
+                "auto_imports: CARRYING the advertising pass's Lane C back-off into                  conda/build_v1 -- this emission is reconstructed under the plan                  conda/outputs actually reached, not a fresh one the back-off had                  already rejected",
+            );
+        }
         // Re-resolve materialized bundles, then autodiscover emissions
         // and pick the one matching the requested output name.
-        let (materialized, base_config, restore_relaxations, _auto_imports_injected, _) =
+        let (materialized, base_config, restore_relaxations, build_auto_imports_injected, _) =
             resolve_all(
                 &config,
                 &target,
@@ -7010,7 +7139,7 @@ impl Handler {
                 &cache_dir,
                 &params.channels,
                 workspace_dir.as_deref(),
-                &BTreeSet::new(),
+                &carried_auto_imports_suppression,
             )
             .await
             .map_err(|e| RpcError::internal(format!("resolving wheels: {e:#}")))?;
@@ -7175,14 +7304,14 @@ impl Handler {
                 // that must never wait, because a failure that reaches an actor
                 // under the wrong name has not reached an actor.
                 if let Some(violation) = error.downcast_ref::<AbiInvariantViolation>() {
-                    let refusal = format!(
-                        "ABI invariant rejected `{}` while conda/build_v1 reconstructed its \
-                         final emission. This is NOT a relaxation-record failure. \
-                         conda/build_v1 re-runs the emission conda/outputs already made and \
-                         does not carry conda/outputs' Lane C back-off across the RPC \
-                         boundary, so a bundle that was emitted there WITHOUT its detected \
-                         roots is emitted here WITH them and refused again. Violation: {violation}",
-                        bundle.conda_name,
+                    let refusal = build_v1_abi_refusal(
+                        &bundle.conda_name,
+                        advertised_identity_record.as_ref(),
+                        build_auto_imports_injected
+                            .get(&base_bundle.conda_name)
+                            .map(Vec::as_slice)
+                            .unwrap_or_default(),
+                        violation,
                     );
                     tracing::error!(
                         bundle = %bundle.conda_name,
@@ -15759,6 +15888,45 @@ fn auto_imports_injection_enabled(effective: &RetreadConfig) -> bool {
     .0
 }
 
+/// p6u. Is the zero-gate on dropped detections in force for this request?
+///
+/// Precedence, and why: the env var wins (the harness override, so a
+/// measurement arm can land a lock and then read what strict would have
+/// refused), then the manifest key, then — and this is the part that differs
+/// from every other gate in this file — the DEFAULT is
+/// [`auto_imports_injection_enabled`] rather than `false`. A gate that ships
+/// off is a gate nobody turns on, and the failure it exists to catch (job
+/// 5748915: a 27/27 lock with 51 detected roots dropped, read as a clean pass)
+/// is silent by construction. Injection off means nothing is detected to drop,
+/// so strict is vacuous there and follows it to off.
+fn auto_imports_strict_enabled(effective: &RetreadConfig) -> bool {
+    let env_value = std::env::var(crate::config::AUTO_IMPORTS_STRICT_ENV).ok();
+    auto_imports_strict_decision(
+        effective.auto_imports_strict,
+        env_value.as_deref(),
+        auto_imports_injection_enabled(effective),
+    )
+}
+
+/// The decision itself, with both sources passed in. Split out so it can be
+/// exercised without the ambient environment deciding the test's answer.
+fn auto_imports_strict_decision(
+    configured: Option<bool>,
+    env_value: Option<&str>,
+    injection_enabled: bool,
+) -> bool {
+    let (enabled, source) = crate::config::effective_gate_flag(
+        crate::config::AUTO_IMPORTS_STRICT_ENV,
+        crate::config::AUTO_IMPORTS_STRICT_KEY,
+        configured,
+        env_value,
+    );
+    match source {
+        crate::config::GateFlagSource::Default => injection_enabled,
+        _ => enabled,
+    }
+}
+
 /// Revision tag for the resolve-time auto-imports BACK-OFF policy: what
 /// happens to the injected roots when the resolve they were injected into
 /// fails. Today that is "suppress injection for EVERY bundle in this request
@@ -15767,7 +15935,8 @@ fn auto_imports_injection_enabled(effective: &RetreadConfig) -> bool {
 /// can publish DIFFERENT resolved content, so this tag is folded into
 /// [`resolution_policy_fingerprint`] and must be bumped by hand whenever that
 /// behaviour changes.
-const AUTO_IMPORTS_BACKOFF_POLICY: &str = "v1-suppress-all-bundles-retry-once";
+const AUTO_IMPORTS_BACKOFF_POLICY: &str =
+    "v2-suppress-all-bundles-retry-once-carried-into-build-v1";
 
 /// Revision tag for the ordered screens in [`auto_imports_injection_verdict`]
 /// -- the decision procedure that turns a detected module into an injected
@@ -16124,6 +16293,289 @@ fn auto_imports_suppression_roots_by_bundle(
         .map(|(bundle, roots)| format!("{bundle}={}", roots.join("+")))
         .collect::<Vec<_>>()
         .join(";")
+}
+
+/// p6u. The per-env suppression findings in the shape the advertised-identity
+/// record carries them, so `conda/build_v1` and an ADOPTING `conda/outputs`
+/// read the same facts this pass measured instead of re-deriving none.
+fn auto_imports_suppressed_envs(
+    suppressed_by_bundle: &BTreeMap<String, Vec<String>>,
+    reasons: &BTreeMap<String, String>,
+) -> Vec<advertised_identity::SuppressedEnv> {
+    suppressed_by_bundle
+        .iter()
+        .filter(|(_, roots)| !roots.is_empty())
+        .map(|(bundle, roots)| advertised_identity::SuppressedEnv {
+            env: bundle.clone(),
+            roots: roots.clone(),
+            reason: auto_imports_suppression_reason_for(reasons, bundle),
+        })
+        .collect()
+}
+
+/// The inverse: the roots-by-env map and the reason map, rebuilt from records.
+/// Used by the adoption path, which never ran a back-off and would otherwise
+/// have nothing to publish and nothing to gate on.
+fn auto_imports_suppression_from_records(
+    records: &[AdvertisedIdentityRecord],
+) -> (BTreeMap<String, Vec<String>>, BTreeMap<String, String>) {
+    let mut roots: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut reasons: BTreeMap<String, String> = BTreeMap::new();
+    for record in records {
+        for env in &record.auto_imports_suppressed {
+            let entry = roots.entry(env.env.clone()).or_default();
+            for root in &env.roots {
+                if !entry.contains(root) {
+                    entry.push(root.clone());
+                }
+            }
+            reasons
+                .entry(env.env.clone())
+                .or_insert_with(|| env.reason.clone());
+        }
+    }
+    for list in roots.values_mut() {
+        list.sort();
+    }
+    (roots, reasons)
+}
+
+/// p6u. `conda/build_v1`'s refusal when the ABI invariant rejects an emission
+/// it reconstructed — stated as a DELTA against the plan the advertising pass
+/// reached, never as a relaxation-record failure.
+///
+/// Three distinguishable situations, and the operator needs to know which:
+///
+///   * NO RECORD. The advertising pass left nothing to carry, so this pass
+///     resolved fresh and may well have re-derived a plan the back-off had
+///     already rejected. The remedy is the record, and its absence is the
+///     finding.
+///   * A RECORD THAT SUPPRESSED THIS BUNDLE, and roots are STILL injected here
+///     anyway. The carry was made and did not take: the inputs at build time
+///     genuinely differ from the ones the advertising pass saw, and the roots
+///     named are exactly the difference. That is the loud refusal p6t asked
+///     for, with the delta in it.
+///   * A RECORD, the carry took, and the invariant refused anyway. Then the
+///     violation is not about Lane C at all and the roots list is empty —
+///     said plainly instead of blamed on injection.
+fn build_v1_abi_refusal(
+    bundle: &str,
+    record: Option<&AdvertisedIdentityRecord>,
+    still_injected: &[String],
+    violation: &AbiInvariantViolation,
+) -> String {
+    let delta = match record {
+        None => format!(
+            "NO advertised-identity record was found for this build request, so \
+             conda/outputs' Lane C back-off could not be carried and this pass resolved \
+             from scratch. Roots injected here: [{}].",
+            still_injected.join(","),
+        ),
+        Some(record) => {
+            let carried = record.carried_auto_imports_suppression();
+            let dropped: Vec<String> = record
+                .auto_imports_suppressed
+                .iter()
+                .map(|env| format!("{}=[{}]", env.env, env.roots.join(",")))
+                .collect();
+            if carried.contains(bundle) || carried.contains(AUTO_IMPORTS_SUPPRESS_ALL) {
+                if still_injected.is_empty() {
+                    format!(
+                        "The advertising pass's back-off WAS carried (suppressed=[{}]) and this \
+                         bundle injected no Lane C roots here, so the violation is NOT about \
+                         injection: the ABI contract refuses this emission on its own terms. \
+                         Roots the advertising pass dropped: {}.",
+                        carried.iter().cloned().collect::<Vec<_>>().join(","),
+                        if dropped.is_empty() { "none recorded".to_string() } else { dropped.join(" ") },
+                    )
+                } else {
+                    format!(
+                        "DELTA: the advertising pass emitted this bundle WITHOUT its detected \
+                         roots (suppressed=[{}], dropped {}), that decision WAS carried into \
+                         this pass, and yet [{}] are injected here. The inputs at build time \
+                         differ from the ones conda/outputs resolved under; those roots are \
+                         the difference and are what the invariant rejected.",
+                        carried.iter().cloned().collect::<Vec<_>>().join(","),
+                        if dropped.is_empty() { "nothing recorded".to_string() } else { dropped.join(" ") },
+                        still_injected.join(","),
+                    )
+                }
+            } else {
+                format!(
+                    "The advertising pass recorded NO suppression for this bundle \
+                     (suppressed=[{}]), so nothing was carried and the roots injected here \
+                     — [{}] — are this pass's own. Either the advertising pass never hit the \
+                     invariant and this one does (its inputs differ), or the record describes \
+                     a different resolution than the one just run.",
+                    carried.iter().cloned().collect::<Vec<_>>().join(","),
+                    still_injected.join(","),
+                )
+            }
+        }
+    };
+    format!(
+        "ABI invariant rejected `{bundle}` while conda/build_v1 reconstructed its final \
+         emission. This is NOT a relaxation-record failure. {delta} Violation: {violation}"
+    )
+}
+
+/// p6u. The two ways Lane C injection gets dropped, spelled once so the row,
+/// the strict refusal and the tests all say the same word.
+const AUTO_IMPORTS_REASON_ABI_BACKOFF: &str = "abi-backoff";
+const AUTO_IMPORTS_REASON_RESOLVE_BACKOFF: &str = "resolve-backoff";
+
+/// The reason recorded for one bundle's suppression.
+///
+/// A bundle with its own entry backed off on its own emission. With no entry
+/// of its own it was carried out by the request-wide resolve back-off, whose
+/// reason is filed under the [`AUTO_IMPORTS_SUPPRESS_ALL`] sentinel. Never
+/// "unknown" when something really was dropped: a reason nobody wrote is a
+/// silent drop.
+fn auto_imports_suppression_reason_for(
+    reasons: &BTreeMap<String, String>,
+    bundle: &str,
+) -> String {
+    reasons
+        .get(bundle)
+        .or_else(|| reasons.get(AUTO_IMPORTS_SUPPRESS_ALL))
+        .cloned()
+        .unwrap_or_else(|| {
+            format!("{AUTO_IMPORTS_REASON_ABI_BACKOFF}: reason not recorded by the back-off")
+        })
+}
+
+/// p6u. What the operator must DECLARE for a suppressed root to stop being
+/// suppressed — never "nothing, we dropped it".
+///
+/// The 5.1.0.0 kit-sdk case is the worked example: the only wheels the index
+/// publishes for it are `manylinux_2_35`, this workspace's target admits a
+/// lower manylinux ceiling, so uv rejects every candidate and the root is
+/// unsatisfiable AS THE REQUEST IS DECLARED. That is not a reason to drop the
+/// detection; it is a reason to declare the platform. `manylinux_ceiling`
+/// reads exactly one declaration for this, and
+/// [`crate::glibc::undeclared_glibc_error_for_target`] is the long form of the
+/// same remedy already shipped for the installer path — this is its one-line
+/// sibling, for a log row.
+///
+/// When the detail names no manylinux floor there is no platform fact that
+/// helps, and saying so is the honest answer: the root is a MANIFEST finding.
+fn auto_imports_suppression_resolution(detail: &str, conda_subdir: &str) -> String {
+    match crate::glibc::extract_manylinux_floor(detail) {
+        Some((major, minor)) => format!(
+            "declare the platform fact -- `[workspace] platforms = [{{ platform = \
+             \"{conda_subdir}\", glibc = \"{major}.{minor}\" }}]` (pixi >= 0.71) or \
+             `[system-requirements] libc = \"{major}.{minor}\"` -- so the manylinux ceiling \
+             admits the only wheels this distribution publishes. The declaration is \
+             load-bearing: retread audits GLIBC symbols at install time against it. \
+             Dropping the root instead ships a lock that silently lacks a detected \
+             dependency."
+        ),
+        None => format!(
+            "no platform declaration makes this satisfiable as written: this is a MANIFEST \
+             finding. Declare the distribution the import needs (an explicit dependency, or \
+             a `retread-name-map` entry when the import name and the distribution name \
+             differ), or relax the ABI anchor the emission contradicted. Target subdir \
+             {conda_subdir}. A silent drop is not a resolution."
+        ),
+    }
+}
+
+/// p6u. ONE row per ENVIRONMENT (bundle) whose Lane C roots were dropped,
+/// naming the roots, the reason and the declaration that would fix it.
+///
+/// The p6t counter publishes a request-wide TOTAL, which is what a harness
+/// zero-gate needs and is not what a person needs: arm A's
+/// `auto_imports_suppressed_roots=26` named 26 nothing-in-particulars. The
+/// operator asked for auto-detect, not for detections dropped quietly, so each
+/// dropped set gets its own addressable row. Returns the number of rows, which
+/// is the number of environments that shipped short.
+fn emit_auto_imports_suppressed_rows(
+    request: &str,
+    suppressed_by_bundle: &BTreeMap<String, Vec<String>>,
+    reasons: &BTreeMap<String, String>,
+    conda_subdir: &str,
+) -> usize {
+    for (bundle, roots) in suppressed_by_bundle {
+        if roots.is_empty() {
+            continue;
+        }
+        let detail = auto_imports_suppression_reason_for(reasons, bundle);
+        let reason = detail
+            .split_once(':')
+            .map(|(head, _)| head.to_string())
+            .unwrap_or_else(|| detail.clone());
+        tracing::warn!(
+            request = %request,
+            env = %bundle,
+            roots = %format!("[{}]", roots.join(",")),
+            reason = %reason,
+            detail = %detail,
+            resolution = %auto_imports_suppression_resolution(&detail, conda_subdir),
+            "auto_imports_suppressed env={bundle} roots=[{}] reason={reason} -- these detected \
+             imports are NOT in the lock this request produced",
+            roots.join(","),
+        );
+    }
+    suppressed_by_bundle
+        .values()
+        .filter(|roots| !roots.is_empty())
+        .count()
+}
+
+/// p6u. The strict verdict: with `retread-auto-imports-strict` in force, a
+/// request that dropped ANY detected root fails, naming every one of them.
+///
+/// The operator asked for auto-detect. A lock produced with injection
+/// partially suppressed is not that lock, and job 5748915's 27/27 -- shipped
+/// with `suppressed_all=true` twice -- is the reason this is a refusal and not
+/// a note. Strict is the DEFAULT whenever injection is on, because a default
+/// that has to be switched on is a gate nobody switches on.
+///
+/// `Ok(())` when nothing was dropped, or when strict is off (the row is still
+/// emitted, and the request proceeds -- that is the measurement mode).
+fn auto_imports_strict_verdict(
+    strict: bool,
+    suppressed_by_bundle: &BTreeMap<String, Vec<String>>,
+    suppressed_all: bool,
+    reasons: &BTreeMap<String, String>,
+    conda_subdir: &str,
+) -> Result<(), String> {
+    let total: usize = suppressed_by_bundle.values().map(Vec::len).sum();
+    if !strict || (total == 0 && !suppressed_all) {
+        return Ok(());
+    }
+    let mut lines = Vec::new();
+    for (bundle, roots) in suppressed_by_bundle {
+        if roots.is_empty() {
+            continue;
+        }
+        let detail = auto_imports_suppression_reason_for(reasons, bundle);
+        lines.push(format!(
+            "  env={bundle} roots=[{}] reason={detail}\n    resolution: {}",
+            roots.join(","),
+            auto_imports_suppression_resolution(&detail, conda_subdir),
+        ));
+    }
+    if lines.is_empty() {
+        lines.push(format!(
+            "  env=* roots=[] reason={}\n    resolution: {}",
+            auto_imports_suppression_reason_for(reasons, AUTO_IMPORTS_SUPPRESS_ALL),
+            auto_imports_suppression_resolution(
+                &auto_imports_suppression_reason_for(reasons, AUTO_IMPORTS_SUPPRESS_ALL),
+                conda_subdir,
+            ),
+        ));
+    }
+    Err(format!(
+        "auto_imports_suppressed_roots={total} auto_imports_suppressed_all={suppressed_all}: \
+         `{}` is in force and this request dropped detected imports rather than resolving \
+         them. Auto-detection that silently drops its detections is not auto-detection. \
+         Either declare the fact each dropped root needs, or set `{} = false` under \
+         `[build.config]` to accept a lock that ships without them.\n{}",
+        crate::config::AUTO_IMPORTS_STRICT_KEY,
+        crate::config::AUTO_IMPORTS_STRICT_KEY,
+        lines.join("\n"),
+    ))
 }
 
 /// p6t: publish this request's suppressed-root counter and return the total.
@@ -29302,6 +29754,8 @@ mod courier_build_string_tests {
             workspace_fp: metadata_pass_fp.to_string(),
             run_depends: vec!["python 3.11.*".to_string()],
             run_constrains: Vec::new(),
+            auto_imports_suppressed_bundles: Vec::new(),
+            auto_imports_suppressed: Vec::new(),
         };
         let from_record = build_for(&workspace_fp_for_build(
             Some(&record),

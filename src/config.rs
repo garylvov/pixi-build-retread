@@ -17,6 +17,14 @@ pub(crate) const HERMETIC_BUILDS_ENV: &str = "RETREAD_HERMETIC_BUILDS";
 /// that supersedes it.
 pub(crate) const AUTO_IMPORTS_ENV: &str = "RETREAD_AUTO_IMPORTS";
 pub(crate) const AUTO_IMPORTS_KEY: &str = "retread-auto-imports";
+/// p6u. Zero-gate on dropped detections: with this in force, a request whose
+/// Lane C back-off suppressed ANY detected root refuses instead of shipping a
+/// lock without it. Default ON whenever [`AUTO_IMPORTS_KEY`] is on -- see
+/// `handler::auto_imports_strict_enabled`. The env var is the harness
+/// override, for measurement arms that must land the lock in order to READ
+/// what strict would have refused.
+pub(crate) const AUTO_IMPORTS_STRICT_ENV: &str = "RETREAD_AUTO_IMPORTS_STRICT";
+pub(crate) const AUTO_IMPORTS_STRICT_KEY: &str = "retread-auto-imports-strict";
 /// Legacy env override for experimental probe fan-out, and its manifest key.
 pub(crate) const PARALLEL_PROBES_ENV: &str = "RETREAD_PARALLEL_PROBES";
 pub(crate) const PARALLEL_PROBES_KEY: &str = "retread-parallel-probes";
@@ -191,6 +199,26 @@ pub struct RetreadConfig {
     /// ```
     #[serde(default, rename = "retread-auto-imports", alias = "auto-imports")]
     pub auto_imports: Option<bool>,
+
+    /// p6u: refuse a lock that dropped detected imports.
+    ///
+    /// `None` (the key absent) follows [`Self::auto_imports`]: strict is ON
+    /// whenever injection is on. That default is deliberate — the whole point
+    /// of auto-detection is that detections reach the lock, and job 5748915
+    /// shipped a 27/27 lock with 51 detected roots silently dropped. Set it
+    /// `false` to accept such a lock; the per-env
+    /// `auto_imports_suppressed env=… roots=[…]` rows are emitted either way.
+    ///
+    /// ```toml
+    /// [build.config]
+    /// retread-auto-imports-strict = false
+    /// ```
+    #[serde(
+        default,
+        rename = "retread-auto-imports-strict",
+        alias = "auto-imports-strict"
+    )]
+    pub auto_imports_strict: Option<bool>,
 
     /// C13: force the FULL `git status --untracked-files=all` walk on every
     /// canonical Git snapshot check, instead of verifying the seal a publish
