@@ -449,7 +449,7 @@ fn shadow_cache_key_for_target(
     let dep_names: HashSet<String> = requires_dist
         .iter()
         .filter_map(|line| {
-            let req: Requirement = Requirement::from_str(line).ok()?;
+            let req: Requirement = crate::pep508_lenient::parse_requirement_lenient(line).ok()?;
             Some(req.name.to_string())
         })
         .collect();

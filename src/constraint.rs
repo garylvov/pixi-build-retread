@@ -717,7 +717,7 @@ fn finalize_impl(
     let (learned, hard): (Vec<&Constraint>, Vec<&Constraint>) = active
         .iter()
         .copied()
-        .partition(|constraint| crate::uv_closure::is_yieldable_advisory_source(&constraint.source));
+        .partition(|constraint| crate::uv_closure::is_learned_advisory_sentence(&constraint.source));
     if !learned.is_empty() && !hard.is_empty() {
         let without_learned = intersect(&hard);
         if !specifiers_unsatisfiable(&without_learned) {
@@ -896,13 +896,29 @@ mod tests {
     /// for this pack's own env: `flashsac-gpu` locks setuptools 59.8.0.
     #[test]
     fn p6z_b_a_learned_workspace_fact_yields_to_a_wheels_declared_cap() {
+        // THE SOURCE AS A CONSTRAINT ACTUALLY CARRIES IT, measured off arm
+        // 5784994: the RENDERED sentence, which CONTAINS the constant and is
+        // not equal to it. p6z pair 1 built this guard on the bare constant,
+        // the yield fired in the test and never fired in the arm, and
+        // flashsac-pack dropped its 13 roots again. The fixture is now the
+        // real string.
         let learned = || {
             let mut constraint = constraint(
                 "==84.0.0",
                 Provenance::UvConstraint,
                 "uv constraint `setuptools==84.0.0` from workspace conda fact",
             );
-            constraint.source = crate::uv_closure::LEARNED_WORKSPACE_FACT_SOURCE.to_string();
+            constraint.source = format!(
+                "uv constraint `setuptools==84.0.0` from {} `precise-consuming-envs` \
+                 (conda `setuptools==84.0.0`)",
+                crate::uv_closure::LEARNED_WORKSPACE_FACT_SOURCE,
+            );
+            assert_ne!(
+                constraint.source,
+                crate::uv_closure::LEARNED_WORKSPACE_FACT_SOURCE,
+                "non-vacuity: the rendered sentence must NOT equal the constant, or this \
+                 guard cannot catch the equality-vs-substring defect it exists for",
+            );
             constraint
         };
         let flashrl = || {
@@ -983,7 +999,7 @@ mod tests {
         let hard_only: Vec<Constraint> = constraints
             .iter()
             .filter(|constraint| {
-                !crate::uv_closure::is_yieldable_advisory_source(&constraint.source)
+                !crate::uv_closure::is_learned_advisory_sentence(&constraint.source)
             })
             .cloned()
             .chain(std::iter::once(constraint(

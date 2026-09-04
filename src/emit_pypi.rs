@@ -256,7 +256,7 @@ pub fn plan(
     let mut drop_url: std::collections::HashSet<String> = std::collections::HashSet::new();
     for w in wheels {
         for line in &w.requires_dist {
-            let req: uv_pep508::Requirement = match uv_pep508::Requirement::from_str(line) {
+            let req: uv_pep508::Requirement = match crate::pep508_lenient::parse_requirement_lenient(line) {
                 Ok(r) => r,
                 Err(_) => continue,
             };
@@ -316,7 +316,7 @@ pub fn plan(
     let mut lowest: BTreeMap<String, Version> = BTreeMap::new();
     for w in wheels {
         for line in &w.requires_dist {
-            let req: uv_pep508::Requirement = match uv_pep508::Requirement::from_str(line) {
+            let req: uv_pep508::Requirement = match crate::pep508_lenient::parse_requirement_lenient(line) {
                 Ok(r) => r,
                 Err(_) => continue,
             };
@@ -505,7 +505,7 @@ pub fn override_line_map<'a>(
 ) -> impl Fn(&str) -> crate::wheel_rewrite::LineAction + 'a {
     use crate::wheel_rewrite::LineAction;
     move |line: &str| {
-        let Ok(req) = uv_pep508::Requirement::from_str(line) else {
+        let Ok(req) = crate::pep508_lenient::parse_requirement_lenient(line) else {
             return LineAction::Keep;
         };
         let name = req.name.to_string();

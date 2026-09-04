@@ -664,7 +664,7 @@ fn active_input_requirement(
     raw: &str,
     target: &uv_pep508::MarkerEnvironment,
 ) -> Result<Option<(String, String)>> {
-    let requirement: Requirement = Requirement::from_str(raw)
+    let requirement: Requirement = crate::pep508_lenient::parse_requirement_lenient(raw)
         .with_context(|| format!("parsing authoritative uv input requirement `{raw}`"))?;
     if !requirement.marker.evaluate(target, &[]) {
         return Ok(None);
@@ -739,7 +739,7 @@ fn effective_auto_route_input_requirements(
     };
 
     for raw in &req.dependencies {
-        let provenance = Requirement::from_str(raw)
+        let provenance = crate::pep508_lenient::parse_requirement_lenient(raw)
             .ok()
             .and_then(|requirement: Requirement| {
                 req.dependency_provenance
@@ -763,7 +763,7 @@ fn effective_auto_route_input_requirements(
         {
             continue;
         }
-        let recorded_provenance = Requirement::from_str(raw)
+        let recorded_provenance = crate::pep508_lenient::parse_requirement_lenient(raw)
             .ok()
             .and_then(|requirement: Requirement| {
                 effective_constraints
@@ -2926,6 +2926,29 @@ pub(crate) fn is_yieldable_advisory_source(source: &str) -> bool {
         || source.starts_with(COACTIVATED_SIBLING_PIN_SOURCE_PREFIX)
 }
 
+/// The same question asked of a RENDERED provenance sentence rather than the
+/// bare `ConstraintProvenance::source`.
+///
+/// p6z pair 1 found this the hard way. `is_yieldable_advisory_source` compares
+/// for EQUALITY, which is right where it is called: those callers hold the
+/// provenance record and its `source` IS the constant. A `Constraint` reaching
+/// `constraint::finalize` carries the sentence a human reads --
+///
+/// ```text
+/// uv constraint `setuptools==84.0.0` from workspace conda fact (learned:
+/// selected by every consuming env's conda solve) `precise-consuming-envs`
+/// (conda `setuptools==84.0.0`)
+/// ```
+///
+/// -- which CONTAINS the constant and is not equal to it, so the learned-fact
+/// yield never fired in arm 5784994 and `flashsac-pack` still dropped its 13
+/// roots. Substring, not equality, and only for the rendered form.
+pub(crate) fn is_learned_advisory_sentence(sentence: &str) -> bool {
+    is_yieldable_advisory_source(sentence)
+        || sentence.contains(LEARNED_WORKSPACE_FACT_SOURCE)
+        || sentence.contains(COACTIVATED_SIBLING_PIN_SOURCE_PREFIX)
+}
+
 /// Human label for the advisory constraint class that lost, for the yield
 /// warning. Naming the real owner is load-bearing: a sibling pin reported as
 /// a "learned conda fact" sends the reader to the wrong producer.
@@ -3753,7 +3776,7 @@ fn exact_requirement_pin(
     uv_pep508::uv_pep440::VersionSpecifiers,
     uv_pep508::uv_pep440::Version,
 )> {
-    let req: Requirement = Requirement::from_str(raw).ok()?;
+    let req: Requirement = crate::pep508_lenient::parse_requirement_lenient(raw).ok()?;
     let uv_pep508::VersionOrUrl::VersionSpecifier(specs) = req.version_or_url.as_ref()? else {
         return None;
     };
@@ -3764,7 +3787,7 @@ fn exact_requirement_pin(
 
 fn request_has_direct_root(req: &UvClosureRequest, name: &str) -> bool {
     req.dependencies.iter().any(|raw| {
-        let root: Result<Requirement, _> = Requirement::from_str(raw);
+        let root: Result<Requirement, _> = crate::pep508_lenient::parse_requirement_lenient(raw);
         root.is_ok_and(|root| {
             canonical_conda_name(root.name.as_ref()) == canonical_conda_name(name)
         })
@@ -3772,7 +3795,7 @@ fn request_has_direct_root(req: &UvClosureRequest, name: &str) -> bool {
 }
 
 fn override_name(raw: &str) -> Option<String> {
-    let req: Requirement = Requirement::from_str(raw).ok()?;
+    let req: Requirement = crate::pep508_lenient::parse_requirement_lenient(raw).ok()?;
     Some(canonical_conda_name(req.name.as_ref()))
 }
 
@@ -4557,8 +4580,7 @@ pub fn read_reconciler_conflicts(
                         spec: requirement.spec.clone(),
                         source: requirement.source.clone(),
                         injected_root,
-                        learned: is_yieldable_advisory_source(&requirement.source)
-                            || requirement.source.contains(LEARNED_WORKSPACE_FACT_SOURCE),
+                        learned: is_learned_advisory_sentence(&requirement.source),
                     }
                 })
                 .collect();
@@ -4934,7 +4956,7 @@ fn apply_learned_fact_yields(req: &mut UvClosureRequest, yielded: &BTreeSet<Stri
     let mut kept: Vec<String> = Vec::with_capacity(req.constraints.constraints.len());
     let mut remapped: BTreeSet<usize> = BTreeSet::new();
     for (index, line) in req.constraints.constraints.iter().enumerate() {
-        let parsed: Result<Requirement, _> = Requirement::from_str(line);
+        let parsed: Result<Requirement, _> = crate::pep508_lenient::parse_requirement_lenient(line);
         let name = parsed
             .ok()
             .map(|parsed| canonical_conda_name(parsed.name.as_ref()));
@@ -6975,7 +6997,7 @@ fn active_uv_dependency(
         }
         toml::Value::String(raw_requirement) => {
             let requirement: Requirement =
-                Requirement::from_str(raw_requirement).with_context(|| {
+                crate::pep508_lenient::parse_requirement_lenient(raw_requirement).with_context(|| {
                     format!("parsing uv.lock dependency `{raw_requirement}` of package `{parent}`")
                 })?;
             if !requirement.marker.evaluate(target, &[]) {

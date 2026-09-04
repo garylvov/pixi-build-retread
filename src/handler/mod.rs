@@ -2284,7 +2284,7 @@ fn sibling_lock_constraints(
             .flat_map(|wheel| &wheel.requires_dist)
         {
             let Ok(requirement): Result<uv_pep508::Requirement, _> =
-                uv_pep508::Requirement::from_str(raw)
+                crate::pep508_lenient::parse_requirement_lenient(raw)
             else {
                 continue;
             };
@@ -9161,7 +9161,7 @@ fn dedupe_roots_last_wins(roots: Vec<String>) -> Vec<String> {
 /// e.g. `"Foo_Bar[extra]==1.0"` -> `Some("foo-bar")`. `None` if the string
 /// doesn't parse as a PEP 508 requirement.
 fn root_req_name(req: &str) -> Option<String> {
-    let parsed: uv_pep508::Requirement = uv_pep508::Requirement::from_str(req).ok()?;
+    let parsed: uv_pep508::Requirement = crate::pep508_lenient::parse_requirement_lenient(req).ok()?;
     Some(canonical_conda_name(parsed.name.as_ref()))
 }
 
@@ -10457,7 +10457,7 @@ fn apply_deps_from_conda_floors(
     let mut eligible_roots = BTreeSet::new();
     for raw in roots {
         let Ok(requirement): Result<uv_pep508::Requirement, _> =
-            uv_pep508::Requirement::from_str(raw)
+            crate::pep508_lenient::parse_requirement_lenient(raw)
         else {
             continue;
         };
@@ -10549,7 +10549,7 @@ fn apply_deps_from_conda_floors(
 
     for (pypi, floor) in candidates {
         let line = format!("{pypi}{}", floor.floor_spec);
-        let _: uv_pep508::Requirement = uv_pep508::Requirement::from_str(&line)
+        let _: uv_pep508::Requirement = crate::pep508_lenient::parse_requirement_lenient(&line)
             .with_context(|| format!("validating deps-from advisory constraint `{line}`"))?;
         constraints.constraints.push(line.clone());
         constraints.provenance.insert(
@@ -13761,7 +13761,7 @@ gpu = { features = ["gpu"], no-default-feature = true }
 pub(crate) fn deps_from_exact_pinned_names(roots: &[String]) -> std::collections::BTreeSet<String> {
     let mut out = std::collections::BTreeSet::new();
     for root in roots {
-        let Ok(req): Result<uv_pep508::Requirement, _> = uv_pep508::Requirement::from_str(root)
+        let Ok(req): Result<uv_pep508::Requirement, _> = crate::pep508_lenient::parse_requirement_lenient(root)
         else {
             continue;
         };
@@ -15767,7 +15767,7 @@ fn relaxed_retry_specs(
     if relaxed_line == original {
         return None;
     }
-    let req: uv_pep508::Requirement = uv_pep508::Requirement::from_str(&relaxed_line).ok()?;
+    let req: uv_pep508::Requirement = crate::pep508_lenient::parse_requirement_lenient(&relaxed_line).ok()?;
     match req.version_or_url {
         Some(uv_pep508::VersionOrUrl::VersionSpecifier(specs)) if specs != *specifiers => {
             Some(specs)
@@ -19984,7 +19984,7 @@ pub(crate) fn check_output_abi_invariants(
         .collect::<Vec<_>>();
     for (wheel, raw) in embedded_requires_dist {
         let Ok(requirement): Result<uv_pep508::Requirement, _> =
-            uv_pep508::Requirement::from_str(raw)
+            crate::pep508_lenient::parse_requirement_lenient(raw)
         else {
             continue;
         };
@@ -20635,7 +20635,7 @@ fn resolve_ceded_pypi_bounds(
     for wheel in bundle.all_wheels() {
         for raw in &wheel.metadata.requires_dist {
             let Ok(requirement): Result<uv_pep508::Requirement, _> =
-                uv_pep508::Requirement::from_str(raw)
+                crate::pep508_lenient::parse_requirement_lenient(raw)
             else {
                 continue;
             };
