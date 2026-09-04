@@ -6078,6 +6078,45 @@ impl Handler {
                                 }
                             }
                         }
+                        // p6s-4: the back-off is already spent for this
+                        // bundle and the invariant rejected it AGAIN. Refuse
+                        // here, loudly and by name, rather than handing an
+                        // ABI violation to `collect_conflicts` -- which has no
+                        // shape for one, so the request continued and died
+                        // three layers away as `-32603 reconstructing final
+                        // relaxation record` plus a build_dispatch panic
+                        // (job 5752280). Failure is loud and reaches an actor.
+                        Err(error)
+                            if error.downcast_ref::<AbiInvariantViolation>().is_some()
+                                && abi_backoff_already_spent(
+                                    &abi_backoff_suppressed,
+                                    &base_bundle.conda_name,
+                                ) =>
+                        {
+                            let violation = format!("{error:#}");
+                            let still_injected = auto_imports_injected
+                                .get(&base_bundle.conda_name)
+                                .cloned()
+                                .unwrap_or_default();
+                            let already_dropped = auto_imports_suppressed_all_bundles
+                                .get(&base_bundle.conda_name)
+                                .cloned()
+                                .unwrap_or_default();
+                            let refusal = abi_backoff_exhausted_refusal(
+                                &base_bundle.conda_name,
+                                python_version,
+                                &still_injected,
+                                &already_dropped,
+                                &violation,
+                            );
+                            tracing::error!(
+                                bundle = %base_bundle.conda_name,
+                                still_injected = %still_injected.join(","),
+                                already_dropped = %already_dropped.join(","),
+                                "auto_imports: ABI BACK-OFF EXHAUSTED -- {refusal}",
+                            );
+                            return Err(RpcError::internal(refusal));
+                        }
                         Err(error) => {
                             let mut bundle_conflicts = Vec::new();
                             if let Err(error) = collect_conflicts(error, &mut bundle_conflicts) {
@@ -15995,6 +16034,50 @@ fn auto_imports_conda_provided_names(
         }
     }
     provided
+}
+
+/// p6s-4: has this bundle's Lane C ABI back-off ALREADY been spent?
+///
+/// The back-off is once per bundle by construction -- `abi_backoff_suppressed`
+/// only grows, which is also the termination proof. A SECOND ABI rejection of
+/// a bundle already in that set therefore cannot be a Lane C problem: the
+/// roots are already gone, and there is nothing left to drop.
+///
+/// Measured (job 5752280, B-cert lane): `protomotions-deps-pack` took its
+/// back-off, logged `ABI BACK-OFF SUCCEEDED`, and a later re-emission with a
+/// LARGER root set (18 roots against the green run's 15, because the wheel
+/// store had grown to 62 wheels mid-run) was rejected again. That second
+/// rejection fell into the generic conflict collector, which has no shape for
+/// an ABI violation, so the request limped on and died far away as
+/// `-32603 reconstructing final relaxation record` and a panic in
+/// build_dispatch. A detector must terminate in an actuator; this one
+/// terminated in a panic three layers downstream.
+fn abi_backoff_already_spent(suppressed: &BTreeSet<String>, bundle: &str) -> bool {
+    suppressed.contains(AUTO_IMPORTS_SUPPRESS_ALL) || suppressed.contains(bundle)
+}
+
+/// p6s-4: the refusal text for a second ABI rejection after the back-off.
+///
+/// It names the bundle, BOTH root lists (what this pass still injected and
+/// what an earlier pass already dropped -- the root delta the operator asked
+/// for) and the violation itself, because the next question is always "which
+/// roots differed between the pass that emitted and the pass that did not".
+fn abi_backoff_exhausted_refusal(
+    bundle: &str,
+    python_version: &str,
+    still_injected: &[String],
+    already_dropped: &[String],
+    violation: &str,
+) -> String {
+    format!(
+        "ABI invariant rejected `{bundle}` AGAIN (python {python_version}) after its Lane C \
+         back-off was already spent. ROOT DELTA: still injected on this pass [{}]; already \
+         dropped by the back-off [{}]. Dropping more detected roots cannot fix this -- either \
+         the workspace ABI anchors and this bundle's closure genuinely disagree, or the root \
+         set moved between passes, which is itself the defect. Violation: {violation}",
+        still_injected.join(","),
+        already_dropped.join(","),
+    )
 }
 
 /// p6t: `bundle=root+root;bundle=root` for a suppression summary row.

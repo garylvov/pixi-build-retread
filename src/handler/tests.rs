@@ -12528,3 +12528,53 @@ fn the_recompute_door_and_the_courier_build_gate_cannot_both_run() {
     )
     .expect("the gate passes a build string that re-derives from the current inputs");
 }
+
+/// p6s-4 GUARD — a second ABI rejection after the back-off is spent must be a
+/// LOUD REFUSAL naming the root delta, never a fall-through.
+///
+/// Job 5752280 re-ran oncert-p6s's exact binary, manifest, diffs and flags and
+/// FAILED. `protomotions-deps-pack` had already taken its back-off and logged
+/// `ABI BACK-OFF SUCCEEDED`; a later re-emission carrying a LARGER root set
+/// (18 vs the green run's 15 — the wheel-store census had grown to 62 wheels
+/// mid-run) was rejected again, fell into `collect_conflicts`, and the request
+/// died three layers downstream as `-32603 reconstructing final relaxation
+/// record` and a build_dispatch panic. A detector must terminate in an
+/// actuator.
+#[test]
+fn p6s4_a_second_abi_rejection_after_the_backoff_refuses_by_name_with_the_root_delta() {
+    let mut suppressed: BTreeSet<String> = BTreeSet::new();
+    // NON-VACUITY: before the back-off is taken, the bundle is NOT spent, so
+    // the ordinary back-off arm still claims it. If this were true here the
+    // back-off would never run at all.
+    assert!(
+        !abi_backoff_already_spent(&suppressed, "protomotions-deps-pack"),
+        "a bundle that has not backed off must still be allowed to back off"
+    );
+    suppressed.insert("protomotions-deps-pack".to_string());
+    assert!(abi_backoff_already_spent(&suppressed, "protomotions-deps-pack"));
+    assert!(
+        !abi_backoff_already_spent(&suppressed, "newton-pack-latest"),
+        "one bundle's spent back-off must not disarm another's"
+    );
+    // The request-wide sentinel spends every bundle's back-off at once.
+    let all: BTreeSet<String> = [AUTO_IMPORTS_SUPPRESS_ALL.to_string()].into_iter().collect();
+    assert!(abi_backoff_already_spent(&all, "newton-pack-latest"));
+
+    let refusal = abi_backoff_exhausted_refusal(
+        "protomotions-deps-pack",
+        "3.11",
+        &["isaacsim-extscache-kit-sdk".to_string(), "usd-core".to_string(), "warp-lang".to_string()],
+        &["viser".to_string()],
+        "numpy==2.5.2 is not covered by numpy>=1.0,<2",
+    );
+    for needle in [
+        "protomotions-deps-pack",
+        "3.11",
+        "isaacsim-extscache-kit-sdk,usd-core,warp-lang",
+        "viser",
+        "ROOT DELTA",
+        "numpy==2.5.2 is not covered by numpy>=1.0,<2",
+    ] {
+        assert!(refusal.contains(needle), "refusal must name {needle}: {refusal}");
+    }
+}
