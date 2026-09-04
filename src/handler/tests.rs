@@ -11127,3 +11127,124 @@ fn p6g_a_single_owner_name_keeps_its_declared_constrains_bound_with_the_gate_on(
 /// Gate-OFF emission of the p6g fixture as produced by `integration/4.12` @
 /// 44233cf, captured in a detached worktree at that commit.
 const P6G_GATE_OFF_GOLDEN_44233CF: &str = "depends=[\"python 3.11.*\", \"fsspec >=2024.6.1,<2025\"]\nconstrains=[]";
+
+// p6q -- THE PILLOW ROW, AND THE ORIGIN KIND THAT CARRIES IT.
+//
+// Job 5739415 (LANE-C-WARM-LOG §16.9), arm ONCERT on binsnap `p6n-b-627de7f`,
+// manifest `b1-scratch/pixi.toml.a3b` (both `pillow = "==10.4.0"` hand pins
+// deliberately deleted). 21 of 27 environments resolved; the run died on:
+//
+//   × failed to solve requirements of environment 'pm-isaaclab'
+//     ├─ moviepy ==2.2.1              would require  pillow <11.0,>=9.2.0
+//     ├─ isaaclab-2.3x-pack 0.54.2    would constrain pillow !=8.3.*,>=8.3.2,==11.3.0
+//     └─ protomotions-deps-pack 3.1   would constrain pillow >=10.1,<12.0
+//
+// Measured from that run's own backend log, the `==11.3.0` has exactly ONE
+// producer and it is NOT the auto-route:
+//
+//   auto-routed pillow -> conda, bundle=isaaclab-2.3x-pack ....... 0 rows
+//   wheel `isaacsim-kernel==5.1.0.0` Requires-Dist `pillow==11.3.0`  (the only
+//     exact-point bound for `pillow` in that bundle's emission group)
+//   retread-constrains-discipline rows naming `pillow` .......... 0 of 985
+//
+// So `closure_derived_route_origins` (p6g) could never have matched it: the
+// origin kind is `wheel-requires-dist`, which is precisely the shape p6j's
+// `closure_derived_exact_origins` was written for. The pillow row is that
+// projection MISSING, not a further origin it fails to cover -- p6n branched
+// off `c0a87d3`, which predates p6j's merge (`614f746`), so the arm binary
+// carried p6g's predicate and not p6j's.
+//
+// The proof is a live pair, same name, same bundle, same origin, two binaries:
+//   job 5716354 (p6j IN):   "pillow !=8.3.*,>=8.3.2"
+//   job 5739415 (p6j OUT):  "pillow !=8.3.*,>=8.3.2,==11.3.0"
+//
+// This guard is that pair. It is distinct from p6j's own two guards in the one
+// way that matters: THERE IS NO AUTO-ROUTE FOR THE NAME AT ALL, so nothing
+// p6g projects out is present, and the test is a statement about the
+// wheel-requires-dist origin standing alone.
+// -----------------------------------------------------------------
+
+/// The 5739415 shape: the pack declares a compatibility BAND for a name the
+/// workspace provides, and one wheel it BUNDLES pins that same name to a
+/// point. No auto-route exists for the name.
+fn p6q_pillow_pack() -> Bundle {
+    let mut bundle = solo_bundle("isaaclab-2-3x-pack", vec!["pillow!=8.3.*,>=8.3.2"]);
+    bundle.primary.original_requires_dist = vec!["pillow!=8.3.*,>=8.3.2".to_string()];
+    // `isaacsim-kernel==5.1.0.0` is the wheel the pack bundles, and
+    // `pillow==11.3.0` is its literal `Requires-Dist`.
+    bundle.extras.push(rw(
+        "isaacsim-kernel",
+        meta("isaacsim-kernel", "5.1.0.0", vec!["pillow==11.3.0"], true),
+    ));
+    bundle
+        .extras
+        .push(rw("pillow", meta("pillow", "11.3.0", vec![], true)));
+    bundle.uv_closure_names.insert("pillow".to_string());
+    // The workspace declares `moviepy`; the injected root makes `pillow`
+    // reachable from it inside this pack's own uv graph, which is what makes
+    // the group `constrains_only` -- exactly the arm's gate-ON condition.
+    bundle
+        .workspace_declared_pypi
+        .insert(canonical_conda_name("moviepy"));
+    bundle
+        .uv_dependency_graph
+        .edges
+        .insert(crate::uv_closure::UvDependencyEdge {
+            parent: "moviepy".to_string(),
+            child: "pillow".to_string(),
+        });
+    bundle
+        .auto_imports_injected
+        .insert(canonical_conda_name("pillow"));
+    // The two counterparties the solver error names.
+    bundle.workspace_conda_provider_facts.insert(
+        "pillow".to_string(),
+        super::WorkspaceCondaProviderFact {
+            selected_versions: ["10.4.0", "12.3.0"]
+                .iter()
+                .map(|version| (*version).to_string())
+                .collect(),
+            declared_specs: BTreeSet::new(),
+            present_in_all_consumers: false,
+        },
+    );
+    bundle
+}
+
+/// (p6q) A bundled wheel's exact `Requires-Dist` is the ONLY exact-point origin
+/// in this group, and the emitted row must be the declared band and nothing
+/// else.
+///
+/// FAILS on `627de7f` (`fix/p6n-b`, the 5739415 arm binary): the call site is
+/// still `closure_derived_route_origins`, there is no auto-route for the name
+/// to match, and the emitted line is `pillow !=8.3.*,>=8.3.2,==11.3.0` --
+/// byte-for-byte the clause in 5739415's solver error.
+#[test]
+fn p6q_a_bundled_wheel_pin_is_not_advertised_when_no_auto_route_exists_for_the_name() {
+    let bundle = p6q_pillow_pack();
+    let (constrains, logs) = capture_warn_logs(|| p6g_constrains(&bundle));
+    let pillow: Vec<&String> = constrains
+        .iter()
+        .filter(|line| line.split(' ').next() == Some("pillow"))
+        .collect();
+    assert_eq!(
+        pillow,
+        vec![&"pillow !=8.3.*,>=8.3.2".to_string()],
+        "the emitted `pillow` row must be the DECLARED band alone -- job 5716354 \
+         (p6j in the binary) emitted exactly that, and job 5739415 (p6j absent) \
+         emitted `pillow !=8.3.*,>=8.3.2,==11.3.0`, which is what made \
+         pm-isaaclab unsolvable against `moviepy ==2.2.1` (`pillow <11.0,>=9.2.0`): \
+         {constrains:?}",
+    );
+    assert!(
+        logs.contains("retread-constrains-discipline"),
+        "the drop must be loud -- 5739415 wrote 985 discipline rows and not one \
+         of them named `pillow`: {logs}",
+    );
+    for counterparty in ["10.4.0", "12.3.0"] {
+        assert!(
+            logs.contains(counterparty),
+            "the row must NAME the counterparties ({counterparty} missing): {logs}",
+        );
+    }
+}
