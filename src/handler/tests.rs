@@ -735,7 +735,7 @@ fn pythons_for_rejects_bare_major_variant() {
         auto_imports: None,
         verify_snapshots: None,
         path_source_metadata: None,
-        path_sources: Default::default(),
+        path_source_records: None,
         parallel_probes: None,
     };
     let result = pythons_for(&cfg, Some(&variants));
@@ -793,7 +793,7 @@ fn pythons_for_accepts_dotted_variant() {
         auto_imports: None,
         verify_snapshots: None,
         path_source_metadata: None,
-        path_sources: Default::default(),
+        path_source_records: None,
         parallel_probes: None,
     };
     let result = pythons_for(&cfg, Some(&variants));
@@ -851,7 +851,7 @@ fn pythons_for_filters_bare_major_keeps_dotted() {
         auto_imports: None,
         verify_snapshots: None,
         path_source_metadata: None,
-        path_sources: Default::default(),
+        path_source_records: None,
         parallel_probes: None,
     };
     let result = pythons_for(&cfg, Some(&variants));
@@ -3628,7 +3628,7 @@ fn cfg() -> RetreadConfig {
         auto_imports: None,
         verify_snapshots: None,
         path_source_metadata: None,
-        path_sources: Default::default(),
+        path_source_records: None,
         parallel_probes: None,
     }
 }
@@ -12021,20 +12021,27 @@ fn the_recompute_door_and_the_courier_build_gate_cannot_both_run() {
         Some(&reproducible_build),
     )
     .expect("the gate passes a build string that re-derives from the current inputs");
-/// p6m WIRING GUARD -- the one that fails when the call is deleted.
+}
+
+/// p6m-b WIRING GUARD -- the one that fails when the call is deleted.
 ///
-/// The materializer has its own unit guards in
+/// The generator has its own unit guards in
 /// `crate::path_source_metadata::tests`, but a guard that only calls the
 /// helper stays green when production stops calling it -- exactly how p6k's
 /// first guard could not fail. This one drives the real `initialize` RPC and
-/// asserts against the file on disk, and it asserts BOTH directions: the
-/// declared source gains its `[project]` table, and with the gate absent the
-/// very same workspace is left untouched.
+/// asserts against the files on disk, and it asserts THREE things at once:
+/// the shim appears INSIDE the pack directory, the real source tree is left
+/// byte-identical (the whole point of p6m-b), and with the gate absent
+/// nothing is written at all.
 #[tokio::test]
-async fn initialize_materializes_declared_path_source_metadata_and_the_gate_governs_it() {
-    fn fixture(label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+async fn initialize_generates_the_pack_source_shim_and_never_touches_the_source_tree() {
+    const REL: &str = "third_party/pace-sim2real/source/pace_sim2real";
+    const PACK: &str = "pypi-packs/isaaclab-2.3x-pack";
+    const SHIM: &str = "pypi-packs/isaaclab-2.3x-pack/sources/pace-sim2real";
+
+    fn fixture(label: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!(
-            "retread-p6m-init-{label}-{}-{}",
+            "retread-p6mb-init-{label}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -12042,22 +12049,40 @@ async fn initialize_materializes_declared_path_source_metadata_and_the_gate_gove
                 .as_nanos(),
         ));
         let _ = std::fs::remove_dir_all(&root);
-        let rel = "third_party/pace-sim2real/source/pace_sim2real";
-        std::fs::create_dir_all(root.join(rel)).unwrap();
+        std::fs::create_dir_all(root.join(REL).join("pace_sim2real")).unwrap();
+        std::fs::write(root.join(REL).join("pace_sim2real").join("__init__.py"), "").unwrap();
+        // the tree's own pyproject.toml -- p6m appended to this file; p6m-b
+        // must leave it byte-identical.
         std::fs::write(
-            root.join("pixi.toml"),
-            format!(
-                "[workspace]\nchannels = []\n\n[pypi-dependencies]\npace_sim2real = {{ path = \"{rel}\", editable = true }}\n"
-            ),
-        )
-        .unwrap();
-        std::fs::write(
-            root.join(rel).join("pyproject.toml"),
+            root.join(REL).join("pyproject.toml"),
             "[build-system]\nrequires = [\"setuptools\", \"wheel\", \"toml\"]\nbuild-backend = \"setuptools.build_meta\"\n",
         )
         .unwrap();
-        let file = root.join(rel).join("pyproject.toml");
-        (root, file)
+        std::fs::create_dir_all(root.join(REL).join("pace_sim2real.egg-info")).unwrap();
+        std::fs::write(
+            root.join(REL).join("pace_sim2real.egg-info").join("PKG-INFO"),
+            "Metadata-Version: 2.1\nName: pace_sim2real\nVersion: 0.1.2\nRequires-Python: >=3.10\nRequires-Dist: psutil\nRequires-Dist: cmaes\n\nbody\n",
+        )
+        .unwrap();
+        // the workspace manifest points at the SHIM, not at the tree
+        std::fs::write(
+            root.join("pixi.toml"),
+            format!(
+                "[workspace]\nchannels = []\n\n[pypi-dependencies]\npace_sim2real = {{ path = \"{SHIM}\", editable = true }}\n"
+            ),
+        )
+        .unwrap();
+        // the pack, and its hand-editable record beside the manifest
+        std::fs::create_dir_all(root.join(PACK).join("path-sources")).unwrap();
+        std::fs::write(root.join(PACK).join("pixi.toml"), "[package]\n").unwrap();
+        std::fs::write(
+            root.join(PACK).join("path-sources").join("pace-sim2real.toml"),
+            format!(
+                "path = \"{REL}\"\nversion = \"0.1.2\"\nrequires-python = \">=3.10\"\ndependencies = [\"psutil\", \"cmaes\"]\n"
+            ),
+        )
+        .unwrap();
+        root
     }
 
     fn params(
@@ -12065,8 +12090,8 @@ async fn initialize_materializes_declared_path_source_metadata_and_the_gate_gove
         configuration: serde_json::Value,
     ) -> pixi_build_types::procedures::initialize::InitializeParams {
         pixi_build_types::procedures::initialize::InitializeParams {
-            manifest_path: root.join("pypi-packs/some-pack/pixi.toml"),
-            source_directory: Some(root.join("pypi-packs/some-pack")),
+            manifest_path: root.join(PACK).join("pixi.toml"),
+            source_directory: Some(root.join(PACK)),
             workspace_directory: Some(root.to_path_buf()),
             cache_directory: Some(root.join("cache")),
             project_model: None,
@@ -12078,54 +12103,73 @@ async fn initialize_materializes_declared_path_source_metadata_and_the_gate_gove
     let declared = serde_json::json!({
         "retread-wheels": { "placeholder": { "version": "==1.0.0" } },
         "retread-path-source-metadata": true,
-        "retread-path-sources": {
-            "pace_sim2real": {
-                "path": "third_party/pace-sim2real/source/pace_sim2real",
-                "version": "0.1.2",
-                "requires-python": ">=3.10",
-                "dependencies": ["psutil", "cmaes"],
-                "dynamic": ["description", "classifiers"],
-            }
-        },
     });
 
-    // ON: initialize writes the overlay.
-    let (root, file) = fixture("on");
-    let before = std::fs::read_to_string(&file).unwrap();
+    // ON: initialize generates the shim inside the pack, and only there.
+    let root = fixture("on");
+    let tree_pyproject = root.join(REL).join("pyproject.toml");
+    let tree_before = std::fs::read_to_string(&tree_pyproject).unwrap();
     Handler::new()
         .initialize(params(&root, declared.clone()))
         .await
         .expect("initialize failed");
-    let after = std::fs::read_to_string(&file).unwrap();
-    assert!(
-        after.starts_with(&before),
-        "the overlay must be append-only, got:\n{after}"
-    );
-    let parsed: toml::Value = toml::from_str(&after).unwrap();
+
+    let shim = root.join(SHIM).join("pyproject.toml");
+    let text = std::fs::read_to_string(&shim)
+        .expect("initialize did not generate the pack source shim");
+    let parsed: toml::Value = toml::from_str(&text).unwrap();
     let project = parsed
         .get("project")
-        .expect("initialize did not materialize the [project] table");
+        .expect("the generated shim has no [project] table");
     assert_eq!(project.get("version").unwrap().as_str().unwrap(), "0.1.2");
     assert_eq!(
         project.get("requires-python").unwrap().as_str().unwrap(),
         ">=3.10"
     );
+    // and it points back at the real tree
+    let package_dir = parsed["tool"]["setuptools"]["package-dir"][""]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        root.join(SHIM).join(package_dir).canonicalize().unwrap(),
+        root.join(REL).canonicalize().unwrap()
+    );
 
-    // OFF (key absent): the same workspace is left byte-identical.
-    let (root_off, file_off) = fixture("off");
-    let untouched = std::fs::read_to_string(&file_off).unwrap();
+    // THE p6m-b CLAIM: the source tree is byte-identical and gained no file.
+    assert_eq!(
+        std::fs::read_to_string(&tree_pyproject).unwrap(),
+        tree_before,
+        "p6m-b must not write into the source tree"
+    );
+    let mut tree_entries: Vec<String> = std::fs::read_dir(root.join(REL))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    tree_entries.sort();
+    assert_eq!(
+        tree_entries,
+        vec![
+            "pace_sim2real".to_string(),
+            "pace_sim2real.egg-info".to_string(),
+            "pyproject.toml".to_string(),
+        ],
+        "the source tree gained or lost an entry"
+    );
+
+    // OFF (key absent): nothing is generated at all.
+    let root_off = fixture("off");
     let mut gate_off = declared.clone();
-    let obj = gate_off.as_object_mut().unwrap();
-    obj.remove("retread-path-source-metadata");
-    obj.remove("retread-path-sources");
+    gate_off
+        .as_object_mut()
+        .unwrap()
+        .remove("retread-path-source-metadata");
     Handler::new()
         .initialize(params(&root_off, gate_off))
         .await
         .expect("initialize failed");
-    assert_eq!(
-        std::fs::read_to_string(&file_off).unwrap(),
-        untouched,
-        "the gate is off and the tree was still written"
+    assert!(
+        !root_off.join(SHIM).exists(),
+        "the gate is off and a shim was generated anyway"
     );
 
     let _ = std::fs::remove_dir_all(&root);

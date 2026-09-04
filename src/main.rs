@@ -65,6 +65,17 @@ async fn async_main() -> anyhow::Result<()> {
         return run_migrate_overrides(&argv[2..]);
     }
 
+    // `retread path-source-refresh` -- the operator-facing half of
+    // `retread-path-source-metadata`. The pack's `path-sources/<project>.toml`
+    // record is the SOURCE OF TRUTH, and every backend initialize refuses when
+    // it disagrees with the tree. This verb is how the operator adopts the
+    // tree's current facts: it prints the per-field diff, and `--write`
+    // rewrites the record so the change lands as one reviewable diff. It never
+    // touches the tree and never touches the generated shim.
+    if matches!(argv.get(1).map(String::as_str), Some("path-source-refresh")) {
+        return run_path_source_refresh(&argv[2..]);
+    }
+
     if matches!(
         argv.get(1).map(String::as_str),
         Some("install" | "verify" | "solve" | "lock")
@@ -150,6 +161,153 @@ async fn async_main() -> anyhow::Result<()> {
 /// `.retread/auto-overrides.json` ledger, leaving any genuinely manual
 /// (un-sentineled) `retread-overrides` entries untouched. Safe to re-run
 /// (no-op once migrated).
+/// `retread path-source-refresh --pack <dir> --workspace <dir> [--project <p>] [--write]`
+///
+/// Reads each `<pack>/path-sources/<project>.toml`, reads what the real tree
+/// says about itself, and reports every field that moved. Exit 0 = the records
+/// agree with the trees. Exit 3 = drift, and (without `--write`) nothing was
+/// changed. `--write` rewrites the drifted records from the tree.
+fn run_path_source_refresh(args: &[String]) -> anyhow::Result<()> {
+    use pixi_build_retread::path_source_metadata as psm;
+
+    let mut pack: Option<PathBuf> = None;
+    let mut workspace: Option<PathBuf> = None;
+    let mut only: Option<String> = None;
+    let mut records_dir = psm::RECORDS_DIR_DEFAULT.to_string();
+    let mut write = false;
+    let mut shims = false;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--pack" => {
+                pack = Some(PathBuf::from(it.next().ok_or_else(|| {
+                    anyhow::anyhow!("path-source-refresh: --pack <dir> requires a value")
+                })?));
+            }
+            "--workspace" => {
+                workspace = Some(PathBuf::from(it.next().ok_or_else(|| {
+                    anyhow::anyhow!("path-source-refresh: --workspace <dir> requires a value")
+                })?));
+            }
+            "--project" => {
+                only = Some(
+                    it.next()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "path-source-refresh: --project <name> requires a value"
+                            )
+                        })?
+                        .clone(),
+                );
+            }
+            "--records-dir" => {
+                records_dir = it
+                    .next()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("path-source-refresh: --records-dir <rel> requires a value")
+                    })?
+                    .clone();
+            }
+            "--write" => write = true,
+            "--shims" => shims = true,
+            other => anyhow::bail!("path-source-refresh: unknown arg {other}"),
+        }
+    }
+    let pack = pack
+        .ok_or_else(|| anyhow::anyhow!("path-source-refresh: --pack <pack directory> required"))?;
+    let workspace = workspace
+        .ok_or_else(|| anyhow::anyhow!("path-source-refresh: --workspace <dir> required"))?;
+
+    let records = psm::load_records(&pack, &records_dir)?;
+    if records.is_empty() {
+        anyhow::bail!(
+            "path-source-refresh: {}/{} holds no <project>.toml record",
+            pack.display(),
+            records_dir
+        );
+    }
+    let mut drifted = 0usize;
+    let mut checked = 0usize;
+    for record in &records {
+        if let Some(only) = only.as_deref()
+            && only != record.project
+        {
+            continue;
+        }
+        checked += 1;
+        let real = workspace.join(&record.entry.path);
+        if !real.is_dir() {
+            anyhow::bail!(
+                "path-source-refresh: {} names path = \"{}\", which is not a \
+                 directory under {}",
+                record.file.display(),
+                record.entry.path,
+                workspace.display()
+            );
+        }
+        let facts = psm::tree_facts(&real)?;
+        match psm::check_drift(record, &facts) {
+            Ok(()) => println!(
+                "path-source-refresh: {} agrees with {} (version {})",
+                record.file.display(),
+                real.display(),
+                record.entry.version
+            ),
+            Err(error) => {
+                drifted += 1;
+                println!("path-source-refresh: DRIFT {}\n  {error:#}", record.project);
+                let refreshed = psm::record_from_tree(&record.project, &record.entry, &facts)?;
+                let before = psm::render_record(&record.project, &record.entry);
+                let after = psm::render_record(&record.project, &refreshed);
+                for (b, a) in before.lines().zip(after.lines()) {
+                    if b != a {
+                        println!("  - {b}");
+                        println!("  + {a}");
+                    }
+                }
+                if write {
+                    std::fs::write(&record.file, &after)?;
+                    println!("  WROTE {}", record.file.display());
+                }
+            }
+        }
+    }
+    if checked == 0 {
+        anyhow::bail!(
+            "path-source-refresh: no record matched --project {}",
+            only.unwrap_or_default()
+        );
+    }
+    // `--shims` is how a developer materializes the pack content they COMMIT.
+    // It runs the SAME writer `Handler::initialize` runs, so a committed shim
+    // and a regenerated one are the same bytes and initialize is a no-op.
+    if shims {
+        if drifted > 0 && !write {
+            anyhow::bail!(
+                "path-source-refresh: refusing to generate shims from {drifted} \
+                 drifted record(s). Fix the records first (--write adopts the \
+                 tree's facts)."
+            );
+        }
+        for outcome in psm::generate_shims(&pack, &workspace, &records_dir, only.as_deref())? {
+            println!(
+                "path-source-refresh: shim {} {}",
+                outcome.verb(),
+                outcome.shim().display()
+            );
+        }
+    }
+    if drifted > 0 && !write {
+        eprintln!(
+            "path-source-refresh: {drifted} record(s) disagree with their trees and \
+             nothing was written. Re-run with --write to adopt the tree's facts, or \
+             edit the record(s) by hand."
+        );
+        std::process::exit(3);
+    }
+    Ok(())
+}
+
 fn run_migrate_overrides(args: &[String]) -> anyhow::Result<()> {
     let mut workspace: Option<PathBuf> = None;
     let mut pack: Option<PathBuf> = None;

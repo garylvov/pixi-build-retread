@@ -1545,7 +1545,7 @@ mod tests {
             auto_imports: None,
             verify_snapshots: None,
             path_source_metadata: None,
-            path_sources: Default::default(),
+            path_source_records: None,
             parallel_probes: None,
         }
     }

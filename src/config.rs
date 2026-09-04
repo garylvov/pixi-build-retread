@@ -245,28 +245,27 @@ pub struct RetreadConfig {
     )]
     pub path_source_metadata: Option<bool>,
 
-    /// The path sources this pack's workspace declares, keyed by
-    /// distribution name — the producer behind
-    /// `retread-path-source-metadata`.
+    /// Directory, relative to the PACK directory, holding one
+    /// `<project>.toml` path-source record per project — the hand-editable
+    /// SOURCE OF TRUTH that lives beside the pack's own manifest and json
+    /// outputs. Defaults to
+    /// [`crate::path_source_metadata::RECORDS_DIR_DEFAULT`].
     ///
-    /// Each record is what a PEP 517 metadata build of that tree produces
-    /// today; retread cross-checks it against the tree's own
-    /// `*.egg-info/PKG-INFO` when one is present and refuses to write when
-    /// the two disagree.
+    /// The record is the only half a human edits; the shim under
+    /// `<pack>/sources/<project>/` is generated from it on every initialize.
     ///
     /// ```toml
     /// [build.config]
     /// retread-path-source-metadata = true
-    ///
-    /// [build.config.retread-path-sources.pace_sim2real]
-    /// path = "third_party/pace-sim2real/source/pace_sim2real"
-    /// version = "0.1.2"
-    /// requires-python = ">=3.10"
-    /// dependencies = ["psutil", "cmaes"]
-    /// dynamic = ["description", "classifiers", "keywords", "authors", "maintainers", "license"]
+    /// # optional; "path-sources" if omitted
+    /// retread-path-source-records = "path-sources"
     /// ```
-    #[serde(default, rename = "retread-path-sources", alias = "path-sources")]
-    pub path_sources: BTreeMap<String, crate::path_source_metadata::PathSourceEntry>,
+    #[serde(
+        default,
+        rename = "retread-path-source-records",
+        alias = "path-source-records"
+    )]
+    pub path_source_records: Option<String>,
 
     /// PyPI -> conda name mapping overrides on top of the built-in identity
     /// mapping. Use for the common drift cases (`opencv-python-headless` ->

@@ -5103,18 +5103,19 @@ impl Handler {
         let path_source_outcomes = crate::path_source_metadata::materialize_declared_path_sources(
             &config,
             workspace_dir.as_deref(),
+            Some(params.manifest_path.as_path()),
         )
         .map_err(|error| {
             RpcError::invalid_params(format!("retread-path-source-metadata: {error:#}"))
         })?;
         if !path_source_outcomes.is_empty() {
             tracing::info!(
-                "retread-path-source-metadata: {} declared path source(s) [{}]: {}",
+                "retread-path-source-metadata: {} path-source shim(s) refreshed \
+                 from the pack layer: {}",
                 path_source_outcomes.len(),
-                crate::path_source_metadata::declared_summary(&config.path_sources),
                 path_source_outcomes
                     .iter()
-                    .map(|outcome| format!("{}={}", outcome.dist(), outcome.verb()))
+                    .map(|outcome| format!("{}={}", outcome.project(), outcome.verb()))
                     .collect::<Vec<_>>()
                     .join(" "),
             );
