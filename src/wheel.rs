@@ -1801,6 +1801,12 @@ fn bench_read_metadata(
 /// content-addressed store path whose directory name IS the digest): the hash
 /// here is the expensive half and the parse is a few KB off the zip central
 /// directory.
+///
+/// C10-b: production callers reach this through
+/// [`crate::wheel_content::read_metadata_recorded`], which answers from a
+/// record beside the bytes when the path identifies them and only lands here
+/// when it does not. Calling this directly from production code re-opens the
+/// 258.6 s the record removes.
 pub fn read_metadata(wheel_path: &Path) -> Result<WheelMetadata> {
     use sha2::{Digest, Sha256};
     let started = std::time::Instant::now();

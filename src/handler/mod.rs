@@ -13980,7 +13980,7 @@ async fn bfs_fetch_pypi_sdist(
     })?;
     let metadata = tokio::task::spawn_blocking({
         let p = built.wheel_path.clone();
-        move || crate::wheel::read_metadata(&p)
+        move || crate::wheel_content::read_metadata_recorded(&p)
     })
     .await
     .context("metadata reader panicked")??;

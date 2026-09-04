@@ -78,7 +78,41 @@ use sha2::{Digest, Sha256};
 
 use crate::wheel::WheelMetadata;
 
-pub(crate) const RECORD_SCHEMA: &str = "retread-wheel-content-record-v1";
+pub(crate) const RECORD_SCHEMA: &str = "retread-wheel-content-record-v2";
+
+/// Which read produced a record. This is not bookkeeping: the strict door
+/// additionally proves every ZIP member inflates, and a record filed by the
+/// `hash+parse` door makes no such statement. Serving the strict door from a
+/// `hash+parse` record would silently drop that proof, so the strict door
+/// spends only its own kind while the `hash+parse` door spends either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum RecordReadKind {
+    /// Filed by [`crate::wheel::read_metadata_strict`]: full payload hashed
+    /// AND every member inflated.
+    #[serde(rename = "strict-archive")]
+    StrictArchive,
+    /// Filed by [`crate::wheel::read_metadata`]: full payload hashed, members
+    /// not inflated.
+    #[serde(rename = "hash-and-parse")]
+    HashAndParse,
+}
+
+impl RecordReadKind {
+    /// A record of `self` may be spent by a door that needs `wanted`.
+    fn satisfies(self, wanted: RecordReadKind) -> bool {
+        match wanted {
+            RecordReadKind::StrictArchive => self == RecordReadKind::StrictArchive,
+            RecordReadKind::HashAndParse => true,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            RecordReadKind::StrictArchive => "strict-archive",
+            RecordReadKind::HashAndParse => "hash-and-parse",
+        }
+    }
+}
 
 /// Stat identity of the exact bytes a record was measured against. `ctime` is
 /// deliberately not a field; see the module docs.
@@ -100,6 +134,7 @@ pub(crate) struct WheelContentRecord {
     pub(crate) version: String,
     pub(crate) size: u64,
     pub(crate) structure_digest: String,
+    pub(crate) read_kind: RecordReadKind,
 }
 
 /// A content-addressed path whose bytes hash to something else. Terminal: the
@@ -173,18 +208,61 @@ pub(crate) fn content_fingerprint(path: &Path) -> Result<ContentFingerprint> {
 /// must not each pay a full pass. Keyed on the exact stat tuple this process
 /// hashed, so a file that moved under us is a miss.
 static INODE_SHA_MEMO: OnceLock<Mutex<HashMap<ContentFingerprint, String>>> = OnceLock::new();
-/// Parsed records for `(sha256, fingerprint)` already proven in this process.
+/// Parsed records for `(sha256, fingerprint)` already proven in this process,
+/// each remembering WHICH read proved it so the strict door cannot spend a
+/// `hash+parse` result that happened to land in the map first.
 #[allow(clippy::type_complexity)]
-static VERIFIED_MEMO: OnceLock<Mutex<HashMap<(String, ContentFingerprint), WheelMetadata>>> =
-    OnceLock::new();
+static VERIFIED_MEMO: OnceLock<
+    Mutex<HashMap<(String, ContentFingerprint), (WheelMetadata, RecordReadKind)>>,
+> = OnceLock::new();
 
 fn inode_sha_memo() -> &'static Mutex<HashMap<ContentFingerprint, String>> {
     INODE_SHA_MEMO.get_or_init(Default::default)
 }
 
 #[allow(clippy::type_complexity)]
-fn verified_memo() -> &'static Mutex<HashMap<(String, ContentFingerprint), WheelMetadata>> {
+fn verified_memo()
+-> &'static Mutex<HashMap<(String, ContentFingerprint), (WheelMetadata, RecordReadKind)>> {
     VERIFIED_MEMO.get_or_init(Default::default)
+}
+
+/// The metadata this process already proved for these bytes, when what it
+/// proved is good enough for the door asking.
+fn memo_hit(
+    sha256: &str,
+    fingerprint: ContentFingerprint,
+    wanted: RecordReadKind,
+) -> Option<WheelMetadata> {
+    let (metadata, kind) = verified_memo()
+        .lock()
+        .ok()
+        .and_then(|memo| memo.get(&(sha256.to_string(), fingerprint)).cloned())?;
+    kind.satisfies(wanted).then_some(metadata)
+}
+
+fn memo_insert(
+    sha256: &str,
+    fingerprint: ContentFingerprint,
+    metadata: &WheelMetadata,
+    kind: RecordReadKind,
+) {
+    if let Ok(mut memo) = verified_memo().lock() {
+        // A strict proof is strictly stronger; never let a `hash+parse` entry
+        // overwrite one.
+        match memo.entry((sha256.to_string(), fingerprint)) {
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                if kind == RecordReadKind::StrictArchive {
+                    slot.insert((metadata.clone(), kind));
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert((metadata.clone(), kind));
+            }
+        }
+    }
+    if let Ok(mut memo) = inode_sha_memo().lock() {
+        memo.insert(fingerprint, sha256.to_string());
+    }
 }
 
 /// Drop both in-process memos. Test-only: a guard that wants to prove the
@@ -199,26 +277,22 @@ pub(crate) fn reset_memos_for_test() {
     }
 }
 
-/// Test-only redirect for the record root. Guards must be able to start from
-/// an EMPTY record store and to prove the on-disk record (not a warm map) is
-/// what did the work, without mutating `RETREAD_CACHE_DIR` for every other
-/// test sharing the process.
-#[cfg(test)]
-pub(crate) static RECORD_ROOT_OVERRIDE: Mutex<Option<PathBuf>> = Mutex::new(None);
-
-fn record_dir(sha256: &str) -> PathBuf {
-    #[cfg(test)]
-    if let Some(root) = RECORD_ROOT_OVERRIDE.lock().ok().and_then(|root| root.clone()) {
-        return root.join(sha256);
-    }
-    crate::courier::retread_cache_root()
-        .join("wheel-content")
-        .join("v1")
-        .join(sha256)
-}
-
-fn record_path(sha256: &str) -> PathBuf {
-    record_dir(sha256).join("record.json")
+/// C10-b: the record is a SIBLING of the bytes it describes, filed exactly the
+/// way `wheel::write_store_integrity_marker` files
+/// `.<filename>.retread-integrity-v1.json`.
+///
+/// C10 filed it under `<retread cache root>/wheel-content/v1/<sha256>/`, and
+/// that root is job-scoped in every relock harness we run
+/// (`RETREAD_CACHE_DIR=…/certC10-<jobid>/retread-cache`), so the proof run's 50
+/// records were deleted with the job that paid for them. The persistent wheel
+/// store root, by contrast, has no `RETREAD_CACHE_DIR` branch at all
+/// (`courier::wheel_store_root_with`) — it is the one location shared by every
+/// job on this box. Beside the bytes is therefore both the persistent place and
+/// the CORRECT place: a record cannot outlive, or be orphaned from, the file it
+/// is a statement about.
+pub(crate) fn record_sidecar_path(wheel_path: &Path) -> Option<PathBuf> {
+    let filename = wheel_path.file_name()?.to_str()?;
+    Some(wheel_path.with_file_name(format!(".{filename}.retread-content-v1.json")))
 }
 
 fn is_lowercase_sha256(value: &str) -> bool {
@@ -339,8 +413,15 @@ fn structure_digest_and_metadata(path: &Path) -> Result<(String, Vec<u8>, String
     Ok((format!("{:x}", hasher.finalize()), metadata_bytes, metadata_name))
 }
 
-fn load_record(sha256: &str) -> Option<WheelContentRecord> {
-    let path = record_path(sha256);
+/// The record beside `wheel_path`, when one is filed there for exactly this
+/// digest. Every failure is `None` — a missing, half-written, wrong-schema or
+/// wrong-digest record is a MISS that costs a full read, never a wrong hit.
+/// The digest equality is what makes a sibling record safe: the sha is always
+/// supplied by something that is not this file (the caller's lock entry, the
+/// store integrity marker, or the content-addressed directory name), so a
+/// record that does not answer to it is simply not this file's record.
+fn load_record(wheel_path: &Path, sha256: &str) -> Option<WheelContentRecord> {
+    let path = record_sidecar_path(wheel_path)?;
     let file_type = std::fs::symlink_metadata(&path).ok()?.file_type();
     if !file_type.is_file() || file_type.is_symlink() {
         return None;
@@ -350,33 +431,46 @@ fn load_record(sha256: &str) -> Option<WheelContentRecord> {
     (record.schema == RECORD_SCHEMA && record.sha256 == sha256).then_some(record)
 }
 
-fn write_record(record: &WheelContentRecord) -> Result<()> {
-    let dir = record_dir(&record.sha256);
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("creating wheel content record dir {}", dir.display()))?;
-    let temporary = dir.join(format!(
-        ".record.{}.{}.tmp",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or_default(),
-    ));
+/// Publish a record beside the wheel, tmp-then-`rename`.
+///
+/// Concurrency: `wheel::unique_atomic_sibling` names the temp file with this
+/// process's pid and a process-local sequence number, it is opened
+/// `create_new`, and `rename` over the final name is atomic on every
+/// filesystem we run on. Two processes racing therefore each write their own
+/// temp and one `rename` wins; no reader can ever observe a partial record,
+/// and because both writers computed the same digest over the same bytes the
+/// winner is immaterial. A reader that catches the instant between `create_new`
+/// and `rename` sees no record at all, which is a MISS.
+fn write_record(wheel_path: &Path, record: &WheelContentRecord) -> Result<()> {
+    use std::io::Write;
+
+    let final_path = record_sidecar_path(wheel_path)
+        .ok_or_else(|| anyhow!("wheel path has no filename: {}", wheel_path.display()))?;
+    let temporary = crate::wheel::unique_atomic_sibling(&final_path, "tmp");
     let bytes = serde_json::to_vec_pretty(record).context("serializing wheel content record")?;
-    std::fs::write(&temporary, &bytes)
-        .with_context(|| format!("writing wheel content record {}", temporary.display()))?;
-    match std::fs::rename(&temporary, record_path(&record.sha256)) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let _ = std::fs::remove_file(&temporary);
-            Err(error).with_context(|| {
-                format!(
-                    "publishing wheel content record {}",
-                    record_path(&record.sha256).display()
-                )
-            })
-        }
+    let write = (|| -> Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .with_context(|| format!("creating {}", temporary.display()))?;
+        file.write_all(&bytes)
+            .with_context(|| format!("writing {}", temporary.display()))?;
+        file.sync_all()
+            .with_context(|| format!("syncing {}", temporary.display()))?;
+        drop(file);
+        std::fs::rename(&temporary, &final_path).with_context(|| {
+            format!(
+                "publishing wheel content record {} -> {}",
+                temporary.display(),
+                final_path.display(),
+            )
+        })
+    })();
+    if write.is_err() {
+        let _ = std::fs::remove_file(&temporary);
     }
+    write
 }
 
 /// Assemble the metadata a verified record stands for. The parse runs on the
@@ -404,23 +498,61 @@ fn metadata_from_record(
     Ok(metadata)
 }
 
-/// The strict local-artifact read, served from an attested record whenever the
-/// bytes can be identified without hashing them.
+/// Which full read a door falls back to when no record answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlowRead {
+    /// [`crate::wheel::read_metadata_strict`]: hash the payload AND inflate
+    /// every member.
+    StrictArchive,
+    /// [`crate::wheel::read_metadata`]: hash the payload, parse the central
+    /// directory, inflate nothing else.
+    HashAndParse,
+}
+
+impl SlowRead {
+    fn produces(self) -> RecordReadKind {
+        match self {
+            SlowRead::StrictArchive => RecordReadKind::StrictArchive,
+            SlowRead::HashAndParse => RecordReadKind::HashAndParse,
+        }
+    }
+
+    fn door(self) -> &'static str {
+        match self {
+            SlowRead::StrictArchive => "strict",
+            SlowRead::HashAndParse => "hash+parse",
+        }
+    }
+
+    fn run(self, path: &Path) -> Result<WheelMetadata> {
+        match self {
+            SlowRead::StrictArchive => crate::wheel::read_metadata_strict(path),
+            SlowRead::HashAndParse => crate::wheel::read_metadata(path),
+        }
+    }
+}
+
+/// The one memo/record seam both metadata doors go through.
 ///
 /// `authoritative_sha256` is the caller's own digest for these bytes when it
 /// has one (a pinned wheel's lock entry). When it is `None` the sha is taken
 /// from the content-addressed path, and when the path is not content-addressed
-/// there is nothing to look a record up by and the full strict read runs.
+/// there is nothing to look a record up by and the full read runs.
 ///
-/// Semantics are those of [`crate::wheel::read_metadata_strict`]: same
-/// `WheelMetadata`, same authoritative sha, same refusals — plus one refusal
-/// the strict read never made, that a content-addressed wheel whose bytes
-/// disagree with its own directory name is terminal.
-pub(crate) fn read_metadata_verified(
+/// Semantics are exactly `slow`'s: same `WheelMetadata`, same authoritative
+/// sha, same refusals — plus one refusal neither full read ever made, that a
+/// content-addressed wheel whose bytes disagree with its own directory name is
+/// terminal. A record is written only for a content-addressed wheel, because
+/// only such a wheel can ever be identified again in a later process without
+/// hashing it; filing one anywhere else would be litter that no lookup could
+/// spend.
+fn read_metadata_through_record(
     path: &Path,
     authoritative_sha256: Option<&str>,
+    slow: SlowRead,
 ) -> Result<WheelMetadata> {
     let started = std::time::Instant::now();
+    let wanted = slow.produces();
     let fingerprint = content_fingerprint(path)?;
     let path_sha256 = content_addressed_sha256(path);
     let claimed_sha256 = authoritative_sha256
@@ -435,37 +567,37 @@ pub(crate) fn read_metadata_verified(
         });
 
     if let Some(sha256) = claimed_sha256.as_deref() {
-        if let Some(metadata) = verified_memo()
-            .lock()
-            .ok()
-            .and_then(|memo| memo.get(&(sha256.to_string(), fingerprint)).cloned())
-        {
+        if let Some(metadata) = memo_hit(sha256, fingerprint, wanted) {
             tracing::info!(
                 wheel = %path.display(),
                 sha256 = %&sha256[..8],
                 source = "process-memo",
+                door = slow.door(),
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "bench: wheel_content_record hit",
             );
             return Ok(metadata);
         }
-        if let Some(record) = load_record(sha256) {
-            if record.size == fingerprint.size {
+        if let Some(record) = load_record(path, sha256) {
+            if !record.read_kind.satisfies(wanted) {
+                tracing::debug!(
+                    wheel = %path.display(),
+                    have = record.read_kind.label(),
+                    door = slow.door(),
+                    "wheel content record is not strong enough for this door",
+                );
+            } else if record.size == fingerprint.size {
                 match structure_digest_and_metadata(path) {
                     Ok((structure_digest, metadata_bytes, _)) => {
                         if structure_digest == record.structure_digest {
                             let metadata = metadata_from_record(path, &record, &metadata_bytes)?;
-                            if let Ok(mut memo) = verified_memo().lock() {
-                                memo.insert((sha256.to_string(), fingerprint), metadata.clone());
-                            }
-                            if let Ok(mut memo) = inode_sha_memo().lock() {
-                                memo.insert(fingerprint, sha256.to_string());
-                            }
+                            memo_insert(sha256, fingerprint, &metadata, record.read_kind);
                             tracing::info!(
                                 wheel = %path.display(),
                                 bytes = fingerprint.size,
                                 sha256 = %&sha256[..8],
                                 source = "record",
+                                door = slow.door(),
                                 elapsed_ms = started.elapsed().as_millis() as u64,
                                 "bench: wheel_content_record hit",
                             );
@@ -475,7 +607,8 @@ pub(crate) fn read_metadata_verified(
                             wheel = %path.display(),
                             sha256 = %&sha256[..8],
                             reason = "structure-digest",
-                            "bench: wheel_content_record miss -- re-reading strictly",
+                            door = slow.door(),
+                            "bench: wheel_content_record miss -- re-reading in full",
                         );
                     }
                     Err(error) => {
@@ -483,7 +616,8 @@ pub(crate) fn read_metadata_verified(
                             wheel = %path.display(),
                             error = %error,
                             reason = "central-directory",
-                            "bench: wheel_content_record miss -- re-reading strictly",
+                            door = slow.door(),
+                            "bench: wheel_content_record miss -- re-reading in full",
                         );
                     }
                 }
@@ -492,13 +626,14 @@ pub(crate) fn read_metadata_verified(
                     wheel = %path.display(),
                     sha256 = %&sha256[..8],
                     reason = "size",
-                    "bench: wheel_content_record miss -- re-reading strictly",
+                    door = slow.door(),
+                    "bench: wheel_content_record miss -- re-reading in full",
                 );
             }
         }
     }
 
-    let metadata = crate::wheel::read_metadata_strict(path)?;
+    let metadata = slow.run(path)?;
     let after = content_fingerprint(path)?;
 
     if let Some(path_sha256) = path_sha256.as_deref()
@@ -515,58 +650,84 @@ pub(crate) fn read_metadata_verified(
     // across the read that measured them: that window is what makes the sha,
     // the size and the structure digest one consistent statement.
     if after == fingerprint {
-        match structure_digest_and_metadata(path) {
-            Ok((structure_digest, _, _)) => {
-                let record = WheelContentRecord {
-                    schema: RECORD_SCHEMA.to_string(),
-                    sha256: metadata.sha256.clone(),
-                    name: metadata.name.clone(),
-                    version: metadata.version.clone(),
-                    size: fingerprint.size,
-                    structure_digest,
-                };
-                if let Err(error) = write_record(&record) {
+        if path_sha256.is_some() {
+            match structure_digest_and_metadata(path) {
+                Ok((structure_digest, _, _)) => {
+                    let record = WheelContentRecord {
+                        schema: RECORD_SCHEMA.to_string(),
+                        sha256: metadata.sha256.clone(),
+                        name: metadata.name.clone(),
+                        version: metadata.version.clone(),
+                        size: fingerprint.size,
+                        structure_digest,
+                        read_kind: wanted,
+                    };
+                    if let Err(error) = write_record(path, &record) {
+                        tracing::debug!(
+                            wheel = %path.display(),
+                            error = %error,
+                            "wheel content record not published",
+                        );
+                    }
+                }
+                Err(error) => {
                     tracing::debug!(
                         wheel = %path.display(),
                         error = %error,
-                        "wheel content record not published",
+                        "wheel content record not measured",
                     );
                 }
-                if let Ok(mut memo) = verified_memo().lock() {
-                    memo.insert((metadata.sha256.clone(), fingerprint), metadata.clone());
-                }
-            }
-            Err(error) => {
-                tracing::debug!(
-                    wheel = %path.display(),
-                    error = %error,
-                    "wheel content record not measured",
-                );
             }
         }
-        if let Ok(mut memo) = inode_sha_memo().lock() {
-            memo.insert(fingerprint, metadata.sha256.clone());
-        }
+        memo_insert(&metadata.sha256.clone(), fingerprint, &metadata, wanted);
     }
     Ok(metadata)
 }
 
-/// Fast path only: `Some(metadata)` when an attested record covers these exact
-/// bytes, `None` when the caller must run its own full validation. Never
+/// The strict local-artifact read (`wheel::read_metadata_strict`), served from
+/// an attested record whenever the bytes can be identified without hashing
+/// them. Spends only `strict-archive` records.
+pub(crate) fn read_metadata_verified(
+    path: &Path,
+    authoritative_sha256: Option<&str>,
+) -> Result<WheelMetadata> {
+    read_metadata_through_record(path, authoritative_sha256, SlowRead::StrictArchive)
+}
+
+/// C10-b: the `hash+parse` door (`wheel::read_metadata`), served from a record
+/// whenever the bytes can be identified without hashing them.
+///
+/// This is the larger of the two terms. In the C10 proof relock `5737433` the
+/// `path="hash+parse"` rows totalled 1121 reads / 334.3 s / 35.3 GB, of which
+/// **991 rows / 258.6 s / 29.57 GB were files in the persistent
+/// content-addressed wheel store** — a location whose directory name IS the
+/// authoritative digest and whose sibling integrity marker already says so.
+/// Every one of those is a record lookup. (The remaining 102 rows / 75.6 s are
+/// `.relaxed.whl` siblings, which are deliberately NOT content-addressed — see
+/// [`is_plain_wheel_filename`] — and are not served here.)
+pub(crate) fn read_metadata_recorded(path: &Path) -> Result<WheelMetadata> {
+    read_metadata_through_record(path, None, SlowRead::HashAndParse)
+}
+
+/// Fast path only: `Some(metadata)` when an attested STRICT record covers these
+/// exact bytes, `None` when the caller must run its own full validation. Never
 /// hashes, never writes.
 pub(crate) fn record_hit(path: &Path, authoritative_sha256: &str) -> Option<WheelMetadata> {
     if !is_lowercase_sha256(authoritative_sha256) {
         return None;
     }
     let fingerprint = content_fingerprint(path).ok()?;
-    if let Some(metadata) = verified_memo()
-        .lock()
-        .ok()
-        .and_then(|memo| memo.get(&(authoritative_sha256.to_string(), fingerprint)).cloned())
-    {
+    if let Some(metadata) = memo_hit(
+        authoritative_sha256,
+        fingerprint,
+        RecordReadKind::StrictArchive,
+    ) {
         return Some(metadata);
     }
-    let record = load_record(authoritative_sha256)?;
+    let record = load_record(path, authoritative_sha256)?;
+    if !record.read_kind.satisfies(RecordReadKind::StrictArchive) {
+        return None;
+    }
     if record.size != fingerprint.size {
         return None;
     }
@@ -575,20 +736,18 @@ pub(crate) fn record_hit(path: &Path, authoritative_sha256: &str) -> Option<Whee
         return None;
     }
     let metadata = metadata_from_record(path, &record, &metadata_bytes).ok()?;
-    if let Ok(mut memo) = verified_memo().lock() {
-        memo.insert(
-            (authoritative_sha256.to_string(), fingerprint),
-            metadata.clone(),
-        );
-    }
-    if let Ok(mut memo) = inode_sha_memo().lock() {
-        memo.insert(fingerprint, authoritative_sha256.to_string());
-    }
+    memo_insert(
+        authoritative_sha256,
+        fingerprint,
+        &metadata,
+        record.read_kind,
+    );
     tracing::info!(
         wheel = %path.display(),
         bytes = fingerprint.size,
         sha256 = %&authoritative_sha256[..8],
         source = "record",
+        door = "strict",
         "bench: wheel_content_record hit",
     );
     Some(metadata)
