@@ -115,7 +115,7 @@ async fn acquire_wheel_store_fill_lock(store_path: &Path) -> Result<WheelStoreFi
         .ok_or_else(|| anyhow!("wheel store path has no UTF-8 filename"))?;
     let lock_path = parent.join(fill_lock_filename(filename));
     tokio::task::spawn_blocking(move || {
-        let file = std::fs::OpenOptions::new()
+        let mut file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
@@ -124,10 +124,201 @@ async fn acquire_wheel_store_fill_lock(store_path: &Path) -> Result<WheelStoreFi
             .with_context(|| format!("opening wheel-store fill lock {}", lock_path.display()))?;
         fs4::fs_std::FileExt::lock_exclusive(&file)
             .with_context(|| format!("locking wheel-store fill {}", lock_path.display()))?;
+        // p6v: stamp WHO holds this fill, so a later reader can decide
+        // staleness by inspection instead of by guessing from an mtime. Best
+        // effort: an unwritable record must never fail a fill that the flock
+        // above already serialised, and a reader treats an absent or
+        // unparsable record as "holder unknown".
+        write_fill_lock_holder(&mut file, &lock_path);
         Ok(WheelStoreFillLock(file))
     })
     .await
     .context("wheel-store fill lock task panicked")?
+}
+
+/// Who took a `.retread-fill-v1.lock`, recorded INSIDE the lock at the moment
+/// it was taken.
+///
+/// Without this a reader meeting a lock and no wheel can only guess: the 492
+/// zero-byte locks job 5762227 died on carried no holder at all, so nothing on
+/// disk could distinguish "a sibling is filling this right now" from "a job
+/// that died 26 hours ago left this here". The record makes staleness
+/// DECIDABLE: a holder that is not this host, or a pid that no longer exists,
+/// is not filling anything.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct WheelStoreFillLockHolder {
+    pub(crate) schema: String,
+    pub(crate) pid: u32,
+    pub(crate) host: String,
+    pub(crate) acquired_unix: u64,
+}
+
+pub(crate) const WHEEL_STORE_FILL_LOCK_SCHEMA: &str = "retread-wheel-store-fill-v1";
+
+/// This machine's kernel hostname, or `None` where `/proc` is unavailable.
+///
+/// Read from `/proc/sys/kernel/hostname` rather than an environment variable:
+/// `HOSTNAME` is a shell convenience, is not exported to every child, and is
+/// exactly the sort of value a batch harness rewrites.
+pub(crate) fn kernel_hostname() -> Option<String> {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|host| host.trim().to_string())
+        .filter(|host| !host.is_empty())
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0)
+}
+
+/// Write the holder record into an already-flocked fill lock. Best effort by
+/// design: see the call site in [`acquire_wheel_store_fill_lock`].
+fn write_fill_lock_holder(file: &mut std::fs::File, lock_path: &Path) {
+    use std::io::{Seek as _, Write as _};
+    let holder = WheelStoreFillLockHolder {
+        schema: WHEEL_STORE_FILL_LOCK_SCHEMA.to_string(),
+        pid: std::process::id(),
+        host: kernel_hostname().unwrap_or_else(|| "unknown".to_string()),
+        acquired_unix: unix_now(),
+    };
+    let recorded = serde_json::to_vec(&holder).ok().and_then(|bytes| {
+        file.set_len(0).ok()?;
+        file.seek(std::io::SeekFrom::Start(0)).ok()?;
+        file.write_all(&bytes).ok()?;
+        file.flush().ok()?;
+        Some(())
+    });
+    if recorded.is_none() {
+        tracing::debug!(
+            lock = %lock_path.display(),
+            "wheel store: could not record the fill-lock holder; staleness will fall back to age",
+        );
+    }
+}
+
+/// The holder recorded in the fill lock for `store_path`, when there is one.
+///
+/// A zero-byte lock -- every one of the 492 entries in the shared store on
+/// 2026-09-04 -- parses to `None`, which is "unknown", never "live".
+pub(crate) fn read_fill_lock_holder(store_path: &Path) -> Option<WheelStoreFillLockHolder> {
+    let lock_path = wheel_store_fill_lock_path(store_path)?;
+    let bytes = std::fs::read(&lock_path).ok()?;
+    let holder: WheelStoreFillLockHolder = serde_json::from_slice(&bytes).ok()?;
+    (holder.schema == WHEEL_STORE_FILL_LOCK_SCHEMA).then_some(holder)
+}
+
+/// Whether a recorded holder is a process that could still be filling.
+///
+/// Only decidable for a holder on THIS host: a pid on another node cannot be
+/// probed from here, so it is reported live and the flock probe in
+/// [`reclaim_stale_fill_lock`] is left to settle it.
+fn fill_lock_holder_is_live(holder: &WheelStoreFillLockHolder) -> bool {
+    match kernel_hostname() {
+        Some(host) if host == holder.host => {
+            std::path::Path::new(&format!("/proc/{}", holder.pid)).exists()
+        }
+        _ => true,
+    }
+}
+
+/// What a takeover of an abandoned fill lock did, for the caller's one log row.
+pub(crate) struct ReclaimedFillLock {
+    pub(crate) lock_age_secs: u64,
+    pub(crate) holder: Option<WheelStoreFillLockHolder>,
+}
+
+/// Take over the fill lock of a store entry whose filler is GONE, so this
+/// process can fill the entry itself.
+///
+/// The store entry that killed job 5762227 held a 0-byte fill lock from
+/// 26 hours earlier and no wheel. p6i taught the reader that such an entry is
+/// a MISS rather than a fatal, which stopped the abort -- but a miss alone
+/// leaves the poison in place and the wheel unfetched, so every later reader
+/// pays the same bounded wait and misses again. A lock nobody holds is debris,
+/// and removing it is what lets the ordinary fill path run.
+///
+/// Refuses in every ambiguous case, because deleting a lock a live filler owns
+/// is the one thing that would be worse than the poison:
+///   * the wheel is already there -- nothing to reclaim;
+///   * the lock is younger than `min_age`;
+///   * a recorded holder on THIS host still has a live pid;
+///   * the flock is still held by somebody (probed non-blocking).
+///
+/// `Ok(None)` means "left alone" and is the ordinary answer.
+pub(crate) async fn reclaim_stale_fill_lock(
+    store_path: &Path,
+    min_age: std::time::Duration,
+) -> Result<Option<ReclaimedFillLock>> {
+    let Some(lock_path) = wheel_store_fill_lock_path(store_path) else {
+        return Ok(None);
+    };
+    let store_path = store_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        // A filled entry is not debris, whatever its sidecars say.
+        if std::fs::symlink_metadata(&store_path)
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+        {
+            return Ok(None);
+        }
+        let lock_metadata = match std::fs::symlink_metadata(&lock_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("stating {}", lock_path.display()));
+            }
+        };
+        let holder = read_fill_lock_holder(&store_path);
+        // Prefer the holder's own timestamp; fall back to the lock's mtime for
+        // the legacy zero-byte locks, which carry no record at all.
+        let acquired = holder.as_ref().map(|holder| holder.acquired_unix).or_else(|| {
+            lock_metadata
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|since| since.as_secs())
+        });
+        let age_secs = acquired.map_or(0, |acquired| unix_now().saturating_sub(acquired));
+        if age_secs < min_age.as_secs() {
+            return Ok(None);
+        }
+        if holder.as_ref().is_some_and(|holder| fill_lock_holder_is_live(holder)) {
+            return Ok(None);
+        }
+        // The decisive probe: a live filler still holds this flock. Taking it
+        // non-blocking answers "is anybody there" without waiting on anybody.
+        let file = match std::fs::OpenOptions::new().read(true).write(true).open(&lock_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("opening {}", lock_path.display()));
+            }
+        };
+        if !fs4::fs_std::FileExt::try_lock_exclusive(&file).unwrap_or(false) {
+            return Ok(None);
+        }
+        // Under the lock: re-check that nobody filled the entry while we probed.
+        if std::fs::symlink_metadata(&store_path)
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+        {
+            let _ = fs4::fs_std::FileExt::unlock(&file);
+            return Ok(None);
+        }
+        let removed = std::fs::remove_file(&lock_path);
+        let _ = fs4::fs_std::FileExt::unlock(&file);
+        removed.with_context(|| format!("removing abandoned {}", lock_path.display()))?;
+        Ok(Some(ReclaimedFillLock {
+            lock_age_secs: age_secs,
+            holder,
+        }))
+    })
+    .await
+    .context("wheel-store fill lock reclaim task panicked")?
 }
 
 #[derive(Debug, Clone)]

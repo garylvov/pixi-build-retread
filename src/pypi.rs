@@ -126,6 +126,17 @@ pub(crate) const WHEEL_STORE_FILL_WAIT_SECS: u64 = 30;
 /// Poll interval inside [`WHEEL_STORE_FILL_WAIT_SECS`].
 const WHEEL_STORE_FILL_POLL_MS: u64 = 250;
 
+/// How old a fill lock must be before a reader may conclude its filler is GONE
+/// and take the lock over (`wheel::reclaim_stale_fill_lock`).
+///
+/// Age alone never authorises a takeover -- the holder record and a
+/// non-blocking flock probe both have to agree that nobody is there -- but it
+/// is the cheap first test, and it has to exceed the longest legitimate single
+/// fill. The largest artifacts here are the ~5.9 GiB isaacsim extscache wheels;
+/// an hour is generous for one of those over this site's link, while the locks
+/// that killed job 5762227 were 26 HOURS old.
+pub(crate) const WHEEL_STORE_FILL_LOCK_STALE_SECS: u64 = 3600;
+
 /// Why a wheel-store path counts as a miss rather than a fatal failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WheelStoreRace {
@@ -220,10 +231,17 @@ pub(crate) async fn await_wheel_store_fill(
 ) -> bool {
     let deadline = std::time::Instant::now() + wait;
     loop {
-        if classify_wheel_store_path(path).is_none()
-            && tokio::fs::metadata(path)
-                .await
-                .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+        // p6v: the WHEEL decides, not the sidecar. Publication is a
+        // same-directory atomic rename (`wheel::atomic_owned_copy`), so a
+        // non-empty file at the entry's own name IS the finished artifact
+        // whether or not its filler has dropped the lock yet. Requiring the
+        // lock to be gone as well made 489 of the shared store's 706 entries
+        // -- every one of them holding a complete wheel beside a leftover
+        // lock on 2026-09-04 -- unadoptable: each cost a reader the full
+        // bounded wait and then a miss on a wheel that was sitting right there.
+        if tokio::fs::metadata(path)
+            .await
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
         {
             return true;
         }

@@ -12874,29 +12874,84 @@ where
         error = %format!("{error:#}"),
         "wheel store: raced a shared entry; this is a package MISS, not a chain abort",
     );
+    let mut took_over_abandoned_fill = false;
     if !pypi::await_wheel_store_fill(&store_path, wait).await {
-        tracing::warn!(
-            index = %index,
-            artifact_phase = phase.unwrap_or("any"),
-            path = %store_path.display(),
-            state = %state.label(),
-            wait_secs = wait.as_secs(),
-            "wheel store: entry never filled within the bounded wait; falling through to the next index",
-        );
-        return StoreRaceOutcome::Miss(format!(
-            "wheel-store miss ({}, waited {}s, never filled): {error:#}",
-            state.label(),
-            wait.as_secs(),
-        ));
+        // p6v: the wait expiring does NOT mean somebody is still filling. If
+        // the lock has been abandoned -- old, and no live holder by either the
+        // recorded pid or a non-blocking flock probe -- take it over and fill
+        // the entry HERE. Falling through as a bare miss leaves the poison in
+        // place: job 5762227 met a 26-hour-old lock over a wheel PyPI was
+        // serving happily, waited its 30 s, missed, and took the whole lock
+        // down when the remaining routes 404ed.
+        match crate::wheel::reclaim_stale_fill_lock(
+            &store_path,
+            std::time::Duration::from_secs(pypi::WHEEL_STORE_FILL_LOCK_STALE_SECS),
+        )
+        .await
+        {
+            Ok(Some(reclaimed)) => {
+                took_over_abandoned_fill = true;
+                tracing::warn!(
+                    index = %index,
+                    artifact_phase = phase.unwrap_or("any"),
+                    path = %store_path.display(),
+                    lock_age_secs = reclaimed.lock_age_secs,
+                    holder = %reclaimed
+                        .holder
+                        .as_ref()
+                        .map(|holder| format!("{}:{}", holder.host, holder.pid))
+                        .unwrap_or_else(|| "unrecorded".to_string()),
+                    "wheel store: the fill lock was ABANDONED; taking it over and filling this entry here",
+                );
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    index = %index,
+                    artifact_phase = phase.unwrap_or("any"),
+                    path = %store_path.display(),
+                    state = %state.label(),
+                    wait_secs = wait.as_secs(),
+                    "wheel store: entry never filled within the bounded wait and its filler is live; falling through to the next index",
+                );
+                return StoreRaceOutcome::Miss(format!(
+                    "wheel-store miss ({}, waited {}s, never filled): {error:#}",
+                    state.label(),
+                    wait.as_secs(),
+                ));
+            }
+            Err(reclaim_error) => {
+                tracing::warn!(
+                    index = %index,
+                    artifact_phase = phase.unwrap_or("any"),
+                    path = %store_path.display(),
+                    error = %format!("{reclaim_error:#}"),
+                    "wheel store: could not reclaim an unfilled entry; falling through to the next index",
+                );
+                return StoreRaceOutcome::Miss(format!(
+                    "wheel-store miss ({}, waited {}s, never filled): {error:#}",
+                    state.label(),
+                    wait.as_secs(),
+                ));
+            }
+        }
     }
     match retry().await {
         Ok(value) => {
-            tracing::info!(
-                index = %index,
-                artifact_phase = phase.unwrap_or("any"),
-                path = %store_path.display(),
-                "wheel store: sibling fill completed during the bounded wait; this index now hits",
-            );
+            if took_over_abandoned_fill {
+                tracing::info!(
+                    index = %index,
+                    artifact_phase = phase.unwrap_or("any"),
+                    path = %store_path.display(),
+                    "wheel store: refilled an abandoned entry on this index; the chain continues",
+                );
+            } else {
+                tracing::info!(
+                    index = %index,
+                    artifact_phase = phase.unwrap_or("any"),
+                    path = %store_path.display(),
+                    "wheel store: sibling fill completed during the bounded wait; this index now hits",
+                );
+            }
             StoreRaceOutcome::Retried(value)
         }
         Err(retry_error) if pypi::is_pypi_index_miss(&retry_error) => {
@@ -31286,6 +31341,169 @@ mod wheel_store_reader_guards {
                 panic!("a zero-byte placeholder must be a miss, not an abort: {error:#}")
             }
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The p6v fixtures write the lock's mtime into the past; a holder record
+    /// is what makes "who has this" decidable at all.
+    fn age_lock(lock: &std::path::Path, secs: u64) {
+        let when = std::time::SystemTime::now() - Duration::from_secs(secs);
+        std::fs::File::options()
+            .write(true)
+            .open(lock)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+    }
+
+    fn write_live_holder(lock: &std::path::Path, acquired_secs_ago: u64) {
+        let holder = serde_json::json!({
+            "schema": crate::wheel::WHEEL_STORE_FILL_LOCK_SCHEMA,
+            "pid": std::process::id(),
+            "host": crate::wheel::kernel_hostname().unwrap_or_else(|| "unknown".to_string()),
+            "acquired_unix": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                - acquired_secs_ago,
+        });
+        std::fs::write(lock, serde_json::to_vec(&holder).unwrap()).unwrap();
+    }
+
+    /// GUARD p6v (a): job 5762227's ACTUAL row. A 0-byte fill lock from a job
+    /// that died a day earlier, no wheel beside it, and PyPI serving the wheel
+    /// happily. p6i made this a miss instead of an abort; a miss alone still
+    /// never fetches the wheel, so the reader must take the abandoned lock
+    /// over and fill the entry itself.
+    ///
+    /// RED on `integration/4.12` = `27971db`, which returns
+    /// `Miss("wheel-store miss (fill-in-progress, waited 30s, never filled)")`
+    /// and leaves the lock exactly where it was.
+    #[tokio::test]
+    async fn a_stale_fill_lock_with_no_wheel_is_taken_over_and_filled() {
+        let root = store("abandoned");
+        let wheel = root
+            .join("cf08b93e204a")
+            .join("dex_retargeting-0.4.6-py3-none-any.whl");
+        std::fs::create_dir_all(wheel.parent().unwrap()).unwrap();
+        // The poison shape: a zero-byte lock, no holder recorded, and no wheel.
+        let lock = crate::wheel::wheel_store_fill_lock_path(&wheel).unwrap();
+        std::fs::write(&lock, b"").unwrap();
+        age_lock(&lock, 26 * 60 * 60);
+
+        let attempts = AtomicUsize::new(0);
+        let filling = wheel.clone();
+        let outcome = wheel_store_second_chance(
+            "https://pypi.org/simple",
+            Some("exact wheel"),
+            opening_enoent(&wheel),
+            &root,
+            Duration::from_millis(400),
+            || async {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                // This is the ordinary fetch/fill the poison was preventing.
+                std::fs::write(&filling, b"PK\x03\x04 refetched wheel bytes").unwrap();
+                Ok::<&str, anyhow::Error>("refetched after taking the abandoned lock over")
+            },
+        )
+        .await;
+        match outcome {
+            StoreRaceOutcome::Retried(value) => {
+                assert_eq!(value, "refetched after taking the abandoned lock over")
+            }
+            StoreRaceOutcome::Miss(diagnostic) => panic!(
+                "an abandoned fill lock must be taken over and refilled, not missed: {diagnostic}"
+            ),
+            StoreRaceOutcome::Fatal(error) => panic!("never a chain abort: {error:#}"),
+        }
+        assert_eq!(attempts.load(Ordering::SeqCst), 1, "exactly one refill");
+        assert!(!lock.exists(), "the abandoned lock must be gone");
+        assert!(wheel.exists(), "the entry must now hold its wheel");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// GUARD p6v (b), NON-VACUITY for (a): the same age, but a holder that is
+    /// ALIVE. A reader may never delete a lock somebody is filling under, so
+    /// this stays the bounded wait and an honest miss, with the lock intact.
+    #[tokio::test]
+    async fn an_old_lock_with_a_live_holder_is_never_taken_over() {
+        let root = store("live-holder");
+        let wheel = root
+            .join("be8cb45211aa")
+            .join("isaacsim_extscache_kit_sdk-5.1.0.0-cp311-none-manylinux_2_35_x86_64.whl");
+        std::fs::create_dir_all(wheel.parent().unwrap()).unwrap();
+        let lock = crate::wheel::wheel_store_fill_lock_path(&wheel).unwrap();
+        write_live_holder(&lock, 26 * 60 * 60);
+        age_lock(&lock, 26 * 60 * 60);
+
+        let outcome = wheel_store_second_chance(
+            "https://pypi.nvidia.com",
+            Some("exact wheel"),
+            opening_enoent(&wheel),
+            &root,
+            Duration::from_millis(400),
+            || async { Ok::<&str, anyhow::Error>("must not be reached") },
+        )
+        .await;
+        match outcome {
+            StoreRaceOutcome::Miss(diagnostic) => {
+                assert!(diagnostic.contains("never filled"), "{diagnostic}")
+            }
+            StoreRaceOutcome::Retried(_) => {
+                panic!("nothing filled this entry; there was nothing to retry")
+            }
+            StoreRaceOutcome::Fatal(error) => panic!("never a chain abort: {error:#}"),
+        }
+        assert!(
+            lock.exists(),
+            "a lock whose holder is alive must survive; deleting it races a live filler",
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// GUARD p6v (c): the 489-entry shape measured in the shared store on
+    /// 2026-09-04 -- a COMPLETE wheel with a leftover fill lock beside it.
+    /// Publication is an atomic rename, so the wheel is the authority and the
+    /// entry is a HIT. On `27971db` the wait predicate also demanded the lock
+    /// be gone, so every one of those entries burned the full bounded wait and
+    /// then missed on a wheel that was sitting right there.
+    #[tokio::test]
+    async fn a_complete_wheel_beside_a_leftover_lock_is_a_hit_not_a_wait() {
+        let root = store("leftover-lock");
+        let wheel = root
+            .join("949452be97a8")
+            .join("nvidia_cudnn_cu12-9.10.2.21-py3-none-manylinux_2_27_x86_64.whl");
+        std::fs::create_dir_all(wheel.parent().unwrap()).unwrap();
+        std::fs::write(&wheel, b"PK\x03\x04 a complete wheel").unwrap();
+        let lock = crate::wheel::wheel_store_fill_lock_path(&wheel).unwrap();
+        std::fs::write(&lock, b"").unwrap();
+        age_lock(&lock, 26 * 60 * 60);
+
+        let started = std::time::Instant::now();
+        let outcome = wheel_store_second_chance(
+            "https://pypi.org/simple",
+            Some("exact wheel"),
+            opening_enoent(&wheel),
+            &root,
+            Duration::from_secs(30),
+            || async { Ok::<&str, anyhow::Error>("read from the entry that was there all along") },
+        )
+        .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a present wheel must be adopted at once, not waited out: {:?}",
+            started.elapsed(),
+        );
+        match outcome {
+            StoreRaceOutcome::Retried(value) => {
+                assert_eq!(value, "read from the entry that was there all along")
+            }
+            StoreRaceOutcome::Miss(diagnostic) => {
+                panic!("the wheel is present; this is a hit: {diagnostic}")
+            }
+            StoreRaceOutcome::Fatal(error) => panic!("never a chain abort: {error:#}"),
+        }
+        assert!(wheel.exists(), "an adopted entry is never removed");
         let _ = std::fs::remove_dir_all(&root);
     }
 
