@@ -5210,6 +5210,15 @@ impl Handler {
         crate::source_build::set_verify_snapshots_full(
             pre_key_config.verify_snapshots.unwrap_or(false),
         );
+        // C18: the `retread-git-snapshot-store` config key, read beside it.
+        // Unset keeps `courier::retread_cache_root()`, which fasttmp redirects
+        // job-scoped -- the reason every relock on this campaign re-cloned all
+        // twelve canonical trees. `RETREAD_GIT_SNAPSHOT_STORE` is the
+        // harness-side fallback, for the same reason the built-output store has
+        // one: naming a store in a pack manifest moves that pack's build hash.
+        crate::source_build::set_git_snapshot_store(
+            pre_key_config.git_snapshot_store.as_deref(),
+        );
         // The SHARED built-output store, if the pack opted into one. Keyed on
         // content alone, so a workspace staged at a new path can adopt this
         // result instead of recomputing it. Unset = the store does not exist.

@@ -236,6 +236,48 @@ pub struct RetreadConfig {
     #[serde(default, rename = "retread-verify-snapshots", alias = "verify-snapshots")]
     pub verify_snapshots: Option<bool>,
 
+    /// C18: root of a PERSISTENT, cross-job store of sealed canonical Git
+    /// source snapshots — the `canonical-git-sources/v3/<repository
+    /// identity>/<ref state>` trees C12/C13/C15 built.
+    ///
+    /// Unset (the default) keeps today's location exactly:
+    /// `courier::retread_cache_root()`, which `fasttmp` redirects into
+    /// `$RETREAD_FAST_TMP_ROOT/retread-$USER/<workspace hash>/job-$SLURM_JOB_ID/
+    /// caches/retread`. That redirect is what makes the store JOB-SCOPED, and
+    /// it was never a decision about Git snapshots: `RETREAD_CACHE_DIR` is on
+    /// `fasttmp`'s scratch-cache list, and the only root deliberately kept off
+    /// it is the wheel blob store (`courier::wheel_store_root_with`, whose doc
+    /// comment carries the reason). So every relock on this campaign, warm or
+    /// cold, re-cloned and re-normalized all twelve canonical trees.
+    ///
+    /// A sealed canonical tree is IMMUTABLE by construction — published by
+    /// `rename(staging, cache_dir)` after `make_source_tree_read_only`, with
+    /// its marker renamed in whole, and never replaced or self-healed while a
+    /// reader could hold it — so cross-job sharing needs no new invariant.
+    /// The entry's writer lock is derived from the cache directory
+    /// (`artifact_cache_lock_path`), so it moves into the store with the tree
+    /// and keeps deduplicating concurrent clones ACROSS jobs, not just within
+    /// one.
+    ///
+    /// ```toml
+    /// [build.config]
+    /// retread-git-snapshot-store = "/shared/cache/retread/git-snapshots"
+    /// ```
+    ///
+    /// HAZARD, stated because it is load-bearing: the private per-entry build
+    /// tree is hardlinked out of the canonical tree (C13 lever b), and
+    /// `link(2)` returns EXDEV across filesystems. A store on a different
+    /// filesystem from `RETREAD_BUILD_ROOT` silently costs the hardlink farm
+    /// and falls back to a full checkout. Put the store on the same filesystem
+    /// as the build root.
+    #[serde(
+        default,
+        rename = "retread-git-snapshot-store",
+        alias = "git-snapshot-store",
+        alias = "git_snapshot_store"
+    )]
+    pub git_snapshot_store: Option<std::path::PathBuf>,
+
     /// Experimental: run the conda co-solve's resolvo probes on a thread pool
     /// instead of serially.
     ///

@@ -735,6 +735,7 @@ fn pythons_for_rejects_bare_major_variant() {
         auto_imports: None,
         auto_imports_strict: None,
         verify_snapshots: None,
+        git_snapshot_store: None,
         parallel_probes: None,
     };
     let result = pythons_for(&cfg, Some(&variants));
@@ -792,6 +793,7 @@ fn pythons_for_accepts_dotted_variant() {
         auto_imports: None,
         auto_imports_strict: None,
         verify_snapshots: None,
+        git_snapshot_store: None,
         parallel_probes: None,
     };
     let result = pythons_for(&cfg, Some(&variants));
@@ -849,6 +851,7 @@ fn pythons_for_filters_bare_major_keeps_dotted() {
         auto_imports: None,
         auto_imports_strict: None,
         verify_snapshots: None,
+        git_snapshot_store: None,
         parallel_probes: None,
     };
     let result = pythons_for(&cfg, Some(&variants));
@@ -3625,6 +3628,7 @@ fn cfg() -> RetreadConfig {
         auto_imports: None,
         auto_imports_strict: None,
         verify_snapshots: None,
+        git_snapshot_store: None,
         parallel_probes: None,
     }
 }

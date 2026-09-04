@@ -1545,6 +1545,7 @@ mod tests {
             auto_imports: None,
             auto_imports_strict: None,
             verify_snapshots: None,
+            git_snapshot_store: None,
             parallel_probes: None,
         }
     }
