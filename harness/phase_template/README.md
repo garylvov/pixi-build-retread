@@ -7,7 +7,8 @@ Three files:
 |---|---|
 | `phaseN_relock.sh` | the RELOCK half. Stages a pristine workspace, gates the manifest, locks under **persistent** caches, writes `artifacts/relock_env.sh` for the cert. Removes nothing. |
 | `phaseN_cert.sh` | the CERT half. Reads that stamp, installs + probes + verifies every x86 env, scores against the certified baseline, then **submits** `cleanup.sh` and exits. Removes nothing itself. |
-| `cleanup.sh` | a 1-CPU/4G job whose whole purpose is `rm -rf` on job-scoped roots. Refuses anything that is not `/oscar/data/stellex/glvov/retread/{cert*,ws.*}`. |
+| `cleanup_gated.sh` | the GATE in front of `cleanup.sh`, and what a lane actually submits. Refuses (exit 2, nothing deleted) unless the evidence is in the task root, the root basename carries the relock job as a `-<jid>` token, and no job id in the basename is still queued. |
+| `cleanup.sh` | a 1-CPU/4G job whose whole purpose is `rm -rf` on job-scoped roots. Refuses anything that is not `/oscar/data/stellex/glvov/retread/{cert*,ws.*}` or `agrescap/cache/retread-injection-on-<tag>`; refuses the persistent `agrescap/cache/retread` by name. `DRY_RUN=1` unlinks nothing. |
 
 ### The three relock shapes, and which one you are actually running
 
@@ -122,7 +123,18 @@ same node with the same manifest and the same binary.
    env -u SLURM_JOB_ID sbatch --partition=batch --qos=normal --cpus-per-task=16 \
        --mem=32G  --time=04:00:00 --job-name=<tag>-p2 --dependency=afterok:<p1 job> \
        --output=<T>/<newbatch>/logs/slurm-%j.out ./<newbatch>_cert.sh
+   env -u SLURM_JOB_ID sbatch --partition=batch --qos=normal --cpus-per-task=1 \
+       --mem=4G --time=16:00:00 --job-name=<tag>-cleanup \
+       --dependency=afterany:<p1 job>:<p2 job> \
+       --export=ALL,D=<T>/<newbatch>,TAG=<tag>,RJ=<p1 job> \
+       --output=<T>/<newbatch>/logs/slurm-cleanup-%j.out \
+       --wrap 'bash <T>/tools/phase_template/cleanup_gated.sh <cert root> <cache root> <ws root>'
    ```
+   **Submit all THREE, and the third one now, not later.** The cleanup is
+   `afterany` on *both* phases, so it also reclaims the roots of a relock that
+   failed its own lock — the case that stranded C18A/C18B. Then export
+   `CLEANUP_AT_DISPATCH=1` into the cert (or set it in the copied script) so the
+   cert prints its roots and submits nothing. See "Hazard 2".
    **24G relock / 32G cert, and the cert asks for 4 hours, not 8** — both changed
    2026-09-02 with the parallel env loop (next section). Sizing, all of it
    `/usr/bin/time -v` `Maximum resident set size`, never `sacct`: worst relock
@@ -184,17 +196,62 @@ An `rm -rf` of a job-scoped cache root on this filesystem takes tens of minutes:
 **4795 s + 2552 s** for job 5598763's two roots. It is slow, not wedged — decide
 by falling entry counts, never by an exit code.
 
-Hence the rule (HANDOFF §2): extract artifacts, exit, clean up from the last job
-of the chain. In this template the relock removes nothing at all, and the cert
-computes its verdict, prints the roots, submits `cleanup.sh` with
-`--dependency=afterany:<cert job>`, and exits. `afterany`, not `afterok`, so a
-RED cert still returns its disk; and because the roots are printed before the
-cleanup job exists, a diagnostician who wants to keep them can hold them by
-cancelling that cleanup job.
+Hence the rule (HANDOFF §2): extract artifacts, exit, clean up from a separate
+1-CPU job. In this template the relock removes nothing at all and the cert
+removes nothing at all; one cleanup job is hung behind **both** phases:
 
-`cleanup.sh` refuses any path outside `/oscar/data/stellex/glvov/retread/` and
-any basename that is not `cert*` or `ws.*`. The persistent cache is outside that
-prefix by construction and is never touched by it.
+    --dependency=afterany:<relock job>:<cert job>
+
+**`afterany` on BOTH, and never `afterok` on the cert alone.** Two reasons, and
+the second one cost us two 450k-entry roots:
+
+* `afterany` on the cert, so a RED cert still returns its disk.
+* **Both phases named**, because a relock that fails its own lock writes no
+  handoff, Slurm cancels the `afterok` cert, and a cleanup that names only the
+  cert then has a dependency that never releases. `certC18A-5759225`,
+  `ws.C18A-5759225` and the C18B pair are stranded exactly that way — job
+  5759225's log carries "the afterok dependency will not release" and
+  "self-cleanup NOT run here by design" on the same page, and no cleanup job for
+  5759225 exists in `sacct` at all. Naming both jobs fixes it: a cancelled cert
+  is terminal, so `afterany` releases and the roots come back.
+
+Who submits it. Preferred, and what p6mbc and b4u do (job 5769783 shows
+`afterany:5769781,afterany:5769782`): the **launcher** submits one *gated*
+cleanup at dispatch, right after it has both job ids, and sets
+`CLEANUP_AT_DISPATCH=1` for the cert so the cert only prints the roots. Fallback:
+the cert submits it, and includes `$P1_JOB` from the relock stamp in the
+dependency. Either way the roots are printed before the cleanup job exists, so a
+diagnostician who wants to keep them can hold them by cancelling it.
+
+    env -u SLURM_JOB_ID sbatch --partition=batch --qos=normal \
+        --cpus-per-task=1 --mem=4G --time=16:00:00 --job-name=<tag>-cleanup \
+        --dependency=afterany:<p1 job>:<p2 job> \
+        --export=ALL,D=<harness dir>,TAG=<tag>,RJ=<p1 job> \
+        --output=<T>/<newbatch>/logs/slurm-cleanup-%j.out \
+        --wrap 'bash <T>/tools/phase_template/cleanup_gated.sh <root> ...'
+
+`cleanup_gated.sh` is the gate, `cleanup.sh` is the deletion. The gate checks
+three things and exits 2 without unlinking a byte if any fails: the evidence is
+in the task root (`<TAG>-<RJ>*.rc`/`*.wall`/`*.lock.log`, plain or `.gz`, and a
+certified lock when the run was green), the root basename carries the relock job
+as a `-<jid>` **token** (the ownership proof), and no job id named in the
+basename is still in `squeue`.
+
+> **The token, not the suffix.** Until 2026-09-04 the gate read the job id as the
+> last dash-separated field, so a root had to *end* in its job id. Every root an
+> oncert lane mints ends in `-ONCERT`, so the whole class was permanently
+> un-reapable — `p6ua-cleanup` 5764454 and `p6ub-cleanup` 5764455 printed
+> `REFUSE: root … does not end in a job id` for six roots and deleted nothing.
+> The same gate asked for `O7P6UA-5764452.rc` while the lane had written
+> `O7P6UA-5764452-ONCERT.rc`, and so called present evidence missing.
+
+`cleanup.sh` refuses any path outside `/oscar/data/stellex/glvov/retread/` whose
+basename is not `cert*`/`ws.*`, and under `agrescap/cache/` accepts only
+`retread-injection-on-<tag>` — the per-arm isolated cache roots, which carry no
+job id in their name by construction. The persistent
+`agrescap/cache/retread` is refused **by name**, before any prefix test runs.
+`DRY_RUN=1` prints what it would remove (counting to depth 8 only) and unlinks
+nothing.
 
 ---
 

@@ -9,10 +9,16 @@
 # afterok critical path and blocks the successor. As a separate 1-CPU/4G job it
 # costs nothing anybody is waiting for.
 #
-# USAGE (the cert phase submits this for you):
+# USAGE (submitted at DISPATCH, behind BOTH phases -- see README "Hazard 2"):
 #     env -u SLURM_JOB_ID sbatch --partition=batch --qos=normal \
-#         --cpus-per-task=1 --mem=4G --time=06:00:00 \
-#         --dependency=afterany:<cert job> cleanup.sh <root> [<root> ...]
+#         --cpus-per-task=1 --mem=4G --time=16:00:00 \
+#         --dependency=afterany:<relock job>:<cert job> cleanup.sh <root> ...
+# `afterany` on BOTH, never `afterok` on the cert alone: a relock that fails its
+# own lock leaves a cert Slurm cancels, and a cleanup hung behind that cert never
+# runs -- C18A/C18B (job 5759225) are stranded exactly that way.
+#
+# `DRY_RUN=1` prints what it would remove, counts to depth 8 only, and unlinks
+# nothing. Use it whenever a root list is new.
 #
 # REFUSAL. Only paths under /oscar/data/stellex/glvov/retread/ whose basename
 # starts with `cert` or `ws.` are removed. Anything else is printed and skipped.
@@ -28,9 +34,31 @@ set -uo pipefail
 CQ=/oscar/runtime/bin/checkquota          # NOT on a batch job's default PATH: job 5611846 printed
 [ -x "$CQ" ] || CQ=$(command -v checkquota 2>/dev/null || echo true)   # two EMPTY quota rows because of it
 ALLOWED_PREFIX=/oscar/data/stellex/glvov/retread
+# p6s: a SECOND, equally narrow class -- the per-arm ISOLATED cache roots an
+# injection-ON arm mints (`ISO_CACHE=.../cache/retread-injection-on-<tag>`).
+# They are job-scoped and rebuilt by the next arm's seed, and they are the other
+# half of an arm's inode footprint, so an arm's cleanup has to be able to reach
+# them. The basename pattern below can NEVER match the persistent shared cache
+# `.../cache/retread` (no `-injection-on-` in its name) -- the one directory
+# that makes the next relock 69s instead of 2865s and that this file has always
+# promised never to touch. The refusal is proved, not asserted: passing
+# `.../cache/retread` to this script prints REFUSED and removes nothing.
+ALLOWED_CACHE_PREFIX=/oscar/data/stellex/glvov/agrescap/cache
+# The ONE directory this file has always promised never to touch, refused BY NAME
+# before any prefix or pattern test runs. Written out so the refusal cannot be
+# lost to a future widening of ALLOWED_CACHE_PREFIX: a prefix test is a claim
+# about a set, a name test is a claim about this directory.
+PERSISTENT_CACHE=/oscar/data/stellex/glvov/agrescap/cache/retread
+# OWNERSHIP PROOF. This file does not test job ids -- it cannot, because the
+# per-arm isolated cache roots (`retread-injection-on-<tag>`) carry no job id in
+# their name by construction. The proof that a root belongs to the job asking
+# for it lives in the GATE in front of this file (`cleanup_gated.sh`): the root
+# basename must carry the relock job as a `-<jid>` token, and no job id named in
+# the basename may still be in the queue. Run bare, this file is exactly what its
+# name says: two containment refusals and an `rm -rf`.
 
 hostname; date -Is
-echo "### CLEANUP job=${SLURM_JOB_ID:-none} roots=$#"
+echo "### CLEANUP job=${SLURM_JOB_ID:-none} roots=$# DRY_RUN=${DRY_RUN:-0}"
 if [ "$#" = 0 ]; then echo "### nothing to do (no roots passed)"; exit 0; fi
 echo "### inode quota BEFORE:"; "$CQ" 2>/dev/null | grep -E 'data\+stellex|^Name' | head -4
 
@@ -38,18 +66,40 @@ RC=0
 for r in "$@"; do
   [ -n "$r" ] || continue
   base=$(basename "$r")
-  case "$r" in
-    "$ALLOWED_PREFIX"/*) ;;
-    *) echo "### REFUSED (outside $ALLOWED_PREFIX): $r"; RC=1; continue;;
+  case "${r%/}" in
+    "$PERSISTENT_CACHE")
+      echo "### REFUSED (the persistent shared cache, refused by name): $r"; RC=1; continue;;
   esac
-  case "$base" in
-    cert*|ws.*) ;;
-    *) echo "### REFUSED (basename is not cert*/ws.*): $r"; RC=1; continue;;
+  case "$r" in
+    "$ALLOWED_PREFIX"/*)
+      case "$base" in
+        cert*|ws.*) ;;
+        *) echo "### REFUSED (basename is not cert*/ws.*): $r"; RC=1; continue;;
+      esac
+      ;;
+    "$ALLOWED_CACHE_PREFIX"/*)
+      case "$base" in
+        retread-injection-on-?*) ;;
+        *) echo "### REFUSED (cache basename is not retread-injection-on-<tag>): $r"; RC=1; continue;;
+      esac
+      ;;
+    *) echo "### REFUSED (outside $ALLOWED_PREFIX and $ALLOWED_CACHE_PREFIX): $r"; RC=1; continue;;
   esac
   case "$r" in
     */../*|*/..) echo "### REFUSED (path traversal): $r"; RC=1; continue;;
   esac
   if [ ! -e "$r" ]; then echo "### already gone: $r"; continue; fi
+  if [ "${DRY_RUN:-0}" = 1 ]; then
+    # A dry run counts to depth 8 only. An unbounded `find` here is a full NFS
+    # walk of the very tree we are NOT deleting -- hundreds of thousands of
+    # inodes, the load class that took node2257 out on 2026-09-02 (HANDOFF §2,
+    # 07:45 09-04 rule). The count is a FLOOR, and for a `cert*` root it is a
+    # bad one: 26 nested env trees sit below depth 8 (see the cost note in
+    # p6-inode-cleanup/cleanup-night-20260903.sh).
+    NF=$(find "$r" -maxdepth 8 2>/dev/null | wc -l)
+    echo "### DRY_RUN would remove $r  (entries>=$NF at depth 8)"
+    continue
+  fi
   N=$(find "$r" 2>/dev/null | wc -l)
   echo "### removing $r  (entries=$N) start $(date -Is)"
   S=$(date +%s)

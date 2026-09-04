@@ -811,9 +811,19 @@ fi
 
 ########## 7. NO SELF-CLEANUP HERE -- ON PURPOSE ##########
 # See the EVIDENCE header: an `rm -rf` of a job-scoped root on the afterok path
-# cost job 5596128 5152s of held QOS. The cert phase submits cleanup.sh with
-# --dependency=afterany and exits; that job removes $C and $WS.
-echo "### self-cleanup NOT run here by design -- roots left for the cert phase and cleanup.sh: $C $WS"
+# cost job 5596128 5152s of held QOS. Cleanup is a separate 1-CPU job hung on
+# `--dependency=afterany:<this job>:<cert job>` -- BOTH phases, `afterany` on
+# both. Submitted at DISPATCH by the launcher (CLEANUP_AT_DISPATCH=1) or, failing
+# that, by the cert phase with the relock job included in the dependency.
+#
+# NEVER behind the cert alone. When this relock fails its own lock the block
+# above writes no handoff, Slurm cancels the afterok cert, and a cleanup that
+# depends only on the cert never releases -- so BOTH roots below leak forever.
+# That is exactly what stranded `certC18A-5759225` / `ws.C18A-5759225` and the
+# C18B pair, whose run log reads "the afterok dependency will not release" and
+# "self-cleanup NOT run here by design" on the same page.
+echo "### self-cleanup NOT run here by design -- roots left to the afterany:<relock>:<cert> cleanup job: $C $WS"
+echo "### if no such cleanup job exists for THIS relock, that is the C18 defect: submit one now over those roots"
 echo "### inode quota AFTER:"; "$CQ" 2>/dev/null | grep -E 'data\+stellex' | head -2
 echo "### ${TAG} RELOCK DONE lock_rc=$LRC wall=${LW}s peak_rss_kb=${LRSS:-unknown} mirror_dirty=$MIRROR_DIRTY src_written=$SRC_WRITTEN $(date -Is)"
 # A job that mutated a shared input can never report rc=0. Until 2026-09-03 the

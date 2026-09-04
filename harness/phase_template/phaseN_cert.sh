@@ -14,7 +14,13 @@
 #
 #   2. CLEANUP MOVED OFF THE CRITICAL PATH ENTIRELY. This script removes
 #      nothing itself. After the verdict is computed and printed it submits
-#      cleanup.sh with --dependency=afterany:<this job> and exits. An `rm -rf`
+#      cleanup.sh with --dependency=afterany:<relock job>:<this job> and exits
+#      -- BOTH phases, and `afterany` on both, because a cleanup chained behind
+#      the cert alone never runs when the RELOCK fails (Slurm cancels the
+#      afterok cert, the cleanup's dependency never releases, and both roots are
+#      stranded forever: C18A/C18B, job 5759225). Better still, and what the
+#      launcher should do, is submit ONE gated cleanup at DISPATCH with that
+#      same dependency and set CLEANUP_AT_DISPATCH=1 here. An `rm -rf`
 #      of a job-scoped root inside the job cost 5152s (86 min) on job 5596128
 #      against a 3679s lock, and 4795s + 2552s on job 5598763 -- while holding
 #      16 CPUs and 100-160G of a per-user QOS capped at cpu 64 / mem 492G.
@@ -499,7 +505,7 @@ if [ "${DRY_RUN:-0}" = 1 ]; then
   echo "### envs that WOULD run, in DISPATCH order (longest-first):"; cert_run_order | sed 's/^/  /'
   echo "### rows would be concatenated back in DECLARATION order:"; for ENV in $CERT_ENVS; do echo "  $ENV"; done
   echo "### verdict gate that WOULD score them: $VERDICT against $CERT_BASELINE"
-  echo "### cleanup that WOULD be submitted: $CLEANUP with --dependency=afterany:$J on $C ${P1_CACHE_ROOT:-} $WS"
+  echo "### cleanup that WOULD be submitted: $CLEANUP with --dependency=afterany:${P1_JOB:-<p1>}:$J on $C ${P1_CACHE_ROOT:-} $WS (CLEANUP_AT_DISPATCH=${CLEANUP_AT_DISPATCH:-0})"
   exit 0
 fi
 
@@ -619,14 +625,29 @@ fi
 # so a diagnostician can hold them by cancelling the cleanup job before it runs.
 ROOTS="$C ${P1_CACHE_ROOT:-} $WS"
 echo "### cleanup roots: $ROOTS"
-if [ -x "$CLEANUP" ]; then
+# THE DEPENDENCY IS `afterany` ON BOTH PHASES, and it is submitted at DISPATCH
+# when it can be. A cleanup chained behind the CERT alone never runs when the
+# RELOCK fails, because Slurm cancels the afterok cert and the cleanup's own
+# dependency then never releases -- that is how `certC18A-5759225`/`ws.C18A-…`
+# and the C18B pair were stranded (C18B-run.out: "the afterok dependency will
+# not release; self-cleanup NOT run here by design"). Preferred shape, p6mbc's
+# and b4u's (job 5769783, `afterany:5769781,afterany:5769782`): the LAUNCHER
+# submits one gated cleanup with `--dependency=afterany:<p1>:<p2>` and sets
+# CLEANUP_AT_DISPATCH=1 so this block only prints. When it was not submitted at
+# dispatch, this block submits it here and includes the relock job in the
+# dependency too, so the same job also covers a relock that never handed off.
+CLEANUP_DEP=afterany:$J
+[ -n "${P1_JOB:-}" ] && CLEANUP_DEP=afterany:${P1_JOB}:$J
+if [ "${CLEANUP_AT_DISPATCH:-0}" = 1 ]; then
+  echo "### cleanup NOT submitted here: CLEANUP_AT_DISPATCH=1 -- the launcher owns one gated cleanup on --dependency=afterany:${P1_JOB:-<p1>}:$J over $ROOTS"
+elif [ -x "$CLEANUP" ]; then
   # shellcheck disable=SC2086
   CLJ=$(env -u SLURM_JOB_ID sbatch --parsable $CLEANUP_SBATCH_ARGS \
-        --job-name=${TAG}-cleanup --dependency=afterany:$J \
+        --job-name=${TAG}-cleanup --dependency=$CLEANUP_DEP \
         --output=$A/slurm-cleanup-%j.out "$CLEANUP" $ROOTS 2>&1)
   CLRC=$?
   if [ "$CLRC" = 0 ]; then
-    echo "### cleanup job submitted: $CLJ (--dependency=afterany:$J) -- this job exits WITHOUT unlinking anything"
+    echo "### cleanup job submitted: $CLJ (--dependency=$CLEANUP_DEP) -- this job exits WITHOUT unlinking anything"
   else
     echo "### CLEANUP SUBMIT FAILED rc=$CLRC output: $CLJ"
     echo "### RUN THIS BY HAND, it is the only thing that returns the inodes:"
