@@ -6469,6 +6469,123 @@ fn hardlink_private_git_build_tree(canonical_root: &Path, private_repo: &Path) -
     Ok(true)
 }
 
+// ---------------------------------------------------------------------- C16
+// A PEP 517 build does not need a private copy of the source tree; it needs a
+// place OUTSIDE that tree to put the two things setuptools insists on
+// creating beside `setup.py` -- the `<name>.egg-info` metadata directory and
+// the `build/` staging directory. `DIST_EXTRA_CONFIG` is distutils' own
+// supported extra-configuration file, so both are redirected with the
+// backend's own knob rather than by patching anything.
+//
+// MEASURED, C16 probe on node2311 over eight real packs of this manifest
+// (three IsaacLab 2.3.0 subprojects, two IsaacLab 3.0.0-beta2 subprojects,
+// two holosoma subprojects, one repository-root project): with this config
+// file plus `PYTHONDONTWRITEBYTECODE=1`, `uv build --wheel --out-dir
+// <elsewhere> <read-only canonical tree>` returns rc=0 for ALL eight and
+// writes ZERO bytes into the tree (inode set, sizes and mtimes identical
+// before and after). Without it, the same build dies at
+// `error: could not create '<name>.egg-info': Permission denied`.
+const OUT_OF_TREE_DIST_CONFIG_FILE: &str = "dist-extra.cfg";
+const OUT_OF_TREE_EGG_BASE: &str = "dist-egg-base";
+const OUT_OF_TREE_BUILD_BASE: &str = "dist-build-base";
+
+/// Create the two out-of-tree write destinations under `scratch` and the
+/// distutils configuration file that points setuptools at them. Returns the
+/// path to hand the child as `DIST_EXTRA_CONFIG`.
+fn write_out_of_tree_dist_config(scratch: &Path) -> Result<PathBuf> {
+    for name in [OUT_OF_TREE_EGG_BASE, OUT_OF_TREE_BUILD_BASE] {
+        let path = scratch.join(name);
+        std::fs::create_dir_all(&path).with_context(|| {
+            format!("creating the out-of-tree build destination {}", path.display())
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("securing {}", path.display()))?;
+        }
+    }
+    let config = scratch.join(OUT_OF_TREE_DIST_CONFIG_FILE);
+    std::fs::write(
+        &config,
+        format!(
+            "[egg_info]\negg_base = {}\n[build]\nbuild_base = {}\n",
+            scratch.join(OUT_OF_TREE_EGG_BASE).display(),
+            scratch.join(OUT_OF_TREE_BUILD_BASE).display(),
+        ),
+    )
+    .with_context(|| format!("writing the out-of-tree dist config {}", config.display()))?;
+    Ok(config)
+}
+
+/// Does this build failure say the backend could not WRITE where it wanted?
+/// That is the one failure a read-only canonical source tree can cause and
+/// the only one that authorizes falling back to a private writable farm. Any
+/// other failure is the package's own and is propagated unchanged, so a
+/// genuinely broken pack is not built twice.
+fn source_tree_write_refusal(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}").to_ascii_lowercase();
+    [
+        "permission denied",
+        "read-only file system",
+        "could not create",
+        "unable to create",
+        "cannot create",
+        "operation not permitted",
+        "os error 13",
+        "os error 30",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+}
+
+/// The immediate entries of one directory. A build that writes into the
+/// source tree writes `<name>.egg-info` or `build/` right here, so comparing
+/// this census across the build catches the write that the seal's 64-file
+/// sample is not obliged to see -- at the cost of one `read_dir`.
+fn project_directory_census(project: &Path) -> Result<std::collections::BTreeSet<std::ffi::OsString>> {
+    let mut names = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir(project)
+        .with_context(|| format!("reading the git build project directory {}", project.display()))?
+    {
+        names.insert(
+            entry
+                .with_context(|| format!("reading an entry of {}", project.display()))?
+                .file_name(),
+        );
+    }
+    Ok(names)
+}
+
+/// Refuse when a build left anything new in the canonical snapshot's project
+/// directory. This is the DETECTOR for the read-only build; the tree's own
+/// mode is the enforcement. It runs after a failed build as well as a
+/// successful one, because a half-written egg-info is exactly the state a
+/// fallback would otherwise carry forward for every sibling entry to read.
+fn refuse_if_the_build_wrote_into_the_snapshot(
+    project: &Path,
+    before: &std::collections::BTreeSet<std::ffi::OsString>,
+) -> Result<()> {
+    let after = project_directory_census(project)?;
+    if &after == before {
+        return Ok(());
+    }
+    let added: Vec<String> = after
+        .difference(before)
+        .map(|name| name.to_string_lossy().into_owned())
+        .collect();
+    let removed: Vec<String> = before
+        .difference(&after)
+        .map(|name| name.to_string_lossy().into_owned())
+        .collect();
+    bail!(
+        "the git build wrote into the read-only canonical snapshot at {}: added [{}] removed [{}]",
+        project.display(),
+        added.join(", "),
+        removed.join(", "),
+    )
+}
+
 /// Derive a disposable, writable SCM checkout from an immutable canonical Git
 /// snapshot. Build backends are allowed to create egg-info, SCM caches, and
 /// other temporary files here; the canonical tree remains the pristine source
@@ -6912,6 +7029,10 @@ async fn build_wheel_from_git_inner(
     let subdirectory_for_build = subdirectory.clone();
     let upstream_url_for_build = url.to_string();
     let build_requirements_for_build = build_requirements.clone();
+    // C16: the project directory INSIDE the read-only canonical snapshot. It
+    // is the same path `GitWheelBuild::source_root` already hands the
+    // injection phase, so building here builds the bytes that get injected.
+    let canonical_project_for_build = project_root.clone();
     let wheel_path = cached_build(
         "git",
         &source_identity,
@@ -6924,37 +7045,39 @@ async fn build_wheel_from_git_inner(
             let upstream_url_for_build = upstream_url_for_build.clone();
             let subdirectory_for_build = subdirectory_for_build.clone();
             let build_requirements = build_requirements_for_build.clone();
+            let canonical_project_for_build = canonical_project_for_build.clone();
             async move {
-                // bench (measurement only): C12 splits the previously silent
-                // git build into its two real terms -- the disposable
-                // `git clone --shared` of the canonical snapshot, and the
-                // PEP 517 `uv build --wheel` itself.
-                let tree_started = std::time::Instant::now();
-                let private_project_root = prepare_private_git_build_tree(
-                    &canonical_for_build,
-                    &upstream_url_for_build,
-                    &subdirectory_for_build,
-                    &private_out,
-                )
-                .await?;
-                tracing::info!(
-                    project = %private_project_root.display(),
-                    elapsed_ms = tree_started.elapsed().as_millis() as u64,
-                    "bench: private_git_build_tree",
-                );
                 let py_arg = format!(
                     "--python={}",
                     environment.python_argument(&python.identity())
                 );
                 let out_arg = format!("--out-dir={}", private_out.display());
-                let uv_build_started = std::time::Instant::now();
-                run_capturing_uv_in(
+
+                // C16. The canonical snapshot is already on disk, already
+                // byte-identical to what a private farm would produce, and
+                // already read-only. `git_build_tree_materialization` -- one
+                // NFS `link(2)` per file of the WHOLE worktree -- was 473.6 s
+                // over 48 builds in the C15 proof relock 5746831, 96 % of
+                // `private_git_build_tree` and the largest single item this
+                // lane had measured. None of it buys anything the build reads:
+                // the only reason the private tree existed is that setuptools
+                // creates `<name>.egg-info` and `build/` beside `setup.py`,
+                // and DIST_EXTRA_CONFIG sends both somewhere else.
+                //
+                // So build the canonical project directly. The tree's own
+                // read-only mode is the enforcement -- a backend that ignores
+                // the redirection fails with EACCES in its own log instead of
+                // editing a snapshot fifteen sibling entries are reading --
+                // and the census below is the detector.
+                let canonical_before = project_directory_census(&canonical_project_for_build)?;
+                let canonical_started = std::time::Instant::now();
+                let canonical_attempt = run_capturing_uv_in(
                     &[
                         "build",
                         "--wheel",
                         &py_arg,
                         &out_arg,
-                        &private_project_root.display().to_string(),
+                        &canonical_project_for_build.display().to_string(),
                     ],
                     environment.hermetic(),
                     Some(&private_out),
@@ -6962,11 +7085,88 @@ async fn build_wheel_from_git_inner(
                     build_epoch,
                     static_cpp_runtime,
                 )
-                .await?;
+                .await;
+                let canonical_elapsed_ms = canonical_started.elapsed().as_millis() as u64;
+                // Run this on the FAILING branch too: a build that died
+                // halfway through writing into the snapshot must not be
+                // allowed to fall back and leave the damage behind.
+                refuse_if_the_build_wrote_into_the_snapshot(
+                    &canonical_project_for_build,
+                    &canonical_before,
+                )?;
+
+                let build_project = match canonical_attempt {
+                    Ok(()) => {
+                        tracing::info!(
+                            span_path = "canonical",
+                            project = %canonical_project_for_build.display(),
+                            elapsed_ms = canonical_elapsed_ms,
+                            "bench: git_build_source_selection",
+                        );
+                        canonical_project_for_build.clone()
+                    }
+                    Err(error) if source_tree_write_refusal(&error) => {
+                        // The one failure a read-only source tree can cause.
+                        // Fall back to the C15 farm, which is proven, and say
+                        // in the row WHY -- a fallback nobody can see is a
+                        // fallback nobody can size.
+                        tracing::warn!(
+                            project = %canonical_project_for_build.display(),
+                            error = %format!("{error:#}"),
+                            "the build backend insisted on writing into its source tree; \
+                             falling back to a private farmed build tree",
+                        );
+                        let tree_started = std::time::Instant::now();
+                        let private_project_root = prepare_private_git_build_tree(
+                            &canonical_for_build,
+                            &upstream_url_for_build,
+                            &subdirectory_for_build,
+                            &private_out,
+                        )
+                        .await?;
+                        tracing::info!(
+                            project = %private_project_root.display(),
+                            elapsed_ms = tree_started.elapsed().as_millis() as u64,
+                            "bench: private_git_build_tree",
+                        );
+                        tracing::info!(
+                            span_path = "full-farm",
+                            reason = "backend requires a writable source tree",
+                            project = %private_project_root.display(),
+                            elapsed_ms = canonical_elapsed_ms,
+                            "bench: git_build_source_selection",
+                        );
+                        private_project_root
+                    }
+                    Err(error) => return Err(error),
+                };
+
+                let uv_build_started = std::time::Instant::now();
+                if build_project != canonical_project_for_build {
+                    run_capturing_uv_in(
+                        &[
+                            "build",
+                            "--wheel",
+                            &py_arg,
+                            &out_arg,
+                            &build_project.display().to_string(),
+                        ],
+                        environment.hermetic(),
+                        Some(&private_out),
+                        Some(&build_requirements),
+                        build_epoch,
+                        static_cpp_runtime,
+                    )
+                    .await?;
+                }
                 tracing::info!(
                     kind = "git",
-                    project = %private_project_root.display(),
-                    elapsed_ms = uv_build_started.elapsed().as_millis() as u64,
+                    project = %build_project.display(),
+                    elapsed_ms = if build_project == canonical_project_for_build {
+                        canonical_elapsed_ms
+                    } else {
+                        uv_build_started.elapsed().as_millis() as u64
+                    },
                     "bench: uv_build_wheel",
                 );
                 let validate_started = std::time::Instant::now();
@@ -7171,6 +7371,11 @@ fn prepare_hermetic_build_scratch(private_build_dir: &Path) -> Result<PathBuf> {
         "activation-tmp",
         "build",
         "ccache",
+        // C16: where a PEP 517 backend's `<name>.egg-info` and `build/` go
+        // when the source tree it is pointed at is the read-only canonical
+        // snapshot and therefore cannot hold them.
+        OUT_OF_TREE_BUILD_BASE,
+        OUT_OF_TREE_EGG_BASE,
         "home",
         "pip-cache",
         "runtime",
@@ -7195,12 +7400,17 @@ fn prepare_hermetic_build_scratch(private_build_dir: &Path) -> Result<PathBuf> {
                 .with_context(|| format!("securing hermetic scratch {}", path.display()))?;
         }
     }
-    std::fs::canonicalize(&scratch).with_context(|| {
+    let scratch = std::fs::canonicalize(&scratch).with_context(|| {
         format!(
             "canonicalizing hermetic build scratch {}",
             scratch.display()
         )
-    })
+    })?;
+    // C16: the child exports DIST_EXTRA_CONFIG=$scratch/dist-extra.cfg, so the
+    // file has to exist before the child starts. It is rewritten on every
+    // attempt because the scratch tree is wiped on every attempt.
+    write_out_of_tree_dist_config(&scratch)?;
+    Ok(scratch)
 }
 
 /// Build (but do not spawn) the `uv` child for one source build.
@@ -7403,6 +7613,9 @@ else
 fi
 export PYTHONNOUSERSITE=1
 export PYTHONDONTWRITEBYTECODE=1
+# C16: send setuptools' egg-info and build/ OUT of the source tree, so the
+# build can be pointed straight at the read-only canonical snapshot.
+export DIST_EXTRA_CONFIG="$scratch/dist-extra.cfg"
 export PIP_CONFIG_FILE=/dev/null
 unset PYTHONHOME PYTHONPATH PIP_NO_INDEX PIP_NO_DEPENDENCIES AUDITWHEEL_LD_LIBRARY_PATH AUDITWHEEL_ZIP_COMPRESSION_LEVEL
 build_python="$scratch/build-env/bin/python"
@@ -7476,6 +7689,17 @@ exec "$uv" "${filtered[@]}" --python="$build_python" --no-build-isolation
         command.args(args);
         command.env("SOURCE_DATE_EPOCH", build_epoch.to_string());
         command.env("UV_PYTHON_DOWNLOADS", "automatic");
+        // C16: the host build gets the same out-of-tree redirection the
+        // hermetic child's script exports, for the same reason -- the source
+        // tree it is pointed at may be the read-only canonical snapshot.
+        if let Some(private_build_dir) = private_build_dir {
+            let scratch = private_build_dir.join(".retread-out-of-tree");
+            std::fs::create_dir_all(&scratch).with_context(|| {
+                format!("creating the host build's out-of-tree scratch {}", scratch.display())
+            })?;
+            command.env("DIST_EXTRA_CONFIG", write_out_of_tree_dist_config(&scratch)?);
+            command.env("PYTHONDONTWRITEBYTECODE", "1");
+        }
         command
     };
     if hermetic.is_some() {
@@ -12415,6 +12639,172 @@ version = "0.1.0"
     }
 
     #[cfg(unix)]
+
+    // ---------------------------------------------------------------- C16
+    /// GUARD 1. The out-of-tree destinations are real, writable, and OUTSIDE
+    /// the snapshot; the snapshot itself refuses the write the backend would
+    /// otherwise make there; and the census can see the difference.
+    #[cfg(unix)]
+    #[test]
+    fn the_out_of_tree_dist_config_gives_the_backend_somewhere_else_to_write() {
+        use std::os::unix::fs::PermissionsExt;
+        let repo = canonical_seal_fixture("c16-out-of-tree", 12);
+        let project = repo.join("pkg");
+        let scratch = repo.parent().unwrap().join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+
+        let config = write_out_of_tree_dist_config(&scratch).unwrap();
+        let text = std::fs::read_to_string(&config).unwrap();
+        let egg_base = scratch.join(OUT_OF_TREE_EGG_BASE);
+        let build_base = scratch.join(OUT_OF_TREE_BUILD_BASE);
+        assert!(
+            text.contains(&format!("egg_base = {}", egg_base.display()))
+                && text.contains(&format!("build_base = {}", build_base.display())),
+            "the config must name both destinations: {text}",
+        );
+        // NON-VACUITY: both destinations exist and are writable NOW, because a
+        // config naming a directory that is not there is a build failure, not
+        // a redirection.
+        for destination in [&egg_base, &build_base] {
+            assert!(destination.is_dir(), "{} must exist", destination.display());
+            std::fs::write(destination.join("probe"), b"x")
+                .unwrap_or_else(|e| panic!("{} must be writable: {e}", destination.display()));
+            assert!(
+                !destination.starts_with(&repo),
+                "{} must be OUTSIDE the snapshot",
+                destination.display(),
+            );
+        }
+
+        // THE POINT: with the redirection in place the backend writes nothing
+        // here, and if it tried anyway the snapshot would refuse it.
+        let before = project_directory_census(&project).unwrap();
+        let refused = std::fs::create_dir(project.join("retread_fixture.egg-info"))
+            .expect_err("a read-only snapshot must refuse an in-tree egg-info");
+        assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied);
+        refuse_if_the_build_wrote_into_the_snapshot(&project, &before)
+            .expect("a refused write leaves the census unchanged");
+
+        // NON-VACUITY: the census CAN fail. Open the directory the way a
+        // filesystem without a read-only mode would leave it, write the
+        // egg-info, and the same call must now refuse.
+        std::fs::set_permissions(&project, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::create_dir(project.join("retread_fixture.egg-info")).unwrap();
+        let error = refuse_if_the_build_wrote_into_the_snapshot(&project, &before)
+            .expect_err("the census must be able to fail");
+        assert!(
+            format!("{error:#}").contains("retread_fixture.egg-info"),
+            "the refusal must name what appeared: {error:#}",
+        );
+
+        make_staging_tree_removable(&repo);
+        let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+    }
+
+    /// GUARD 2. Only a build that could not WRITE where it wanted authorizes
+    /// the farm fallback. Every other failure is the package's own and is
+    /// propagated, so a genuinely broken pack is never built twice.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_source_tree_write_refusal_authorizes_the_private_farm_fallback() {
+        let repo = canonical_seal_fixture("c16-refusal", 6);
+        let project = repo.join("pkg");
+
+        // The REAL error, produced by the real filesystem against the real
+        // read-only snapshot -- not a hand-written string.
+        let real = std::fs::create_dir(project.join("pkg.egg-info"))
+            .expect_err("the snapshot refuses the write");
+        let wrapped = anyhow::Error::new(real).context(format!(
+            "uv build --wheel {} failed (status exit status: 1)",
+            project.display(),
+        ));
+        assert!(
+            source_tree_write_refusal(&wrapped),
+            "an EACCES from the source tree must authorize the fallback: {wrapped:#}",
+        );
+        // And the shape setuptools itself prints, which is not an io::Error at
+        // all by the time it reaches us -- it is captured child stderr.
+        assert!(
+            source_tree_write_refusal(&anyhow!(
+                "uv build failed (status exit status: 1): running egg_info\n\
+                 error: could not create 'isaaclab_rl.egg-info': Permission denied"
+            )),
+            "setuptools' own wording must authorize the fallback",
+        );
+
+        // NON-VACUITY / RED: an ordinary build failure must NOT.
+        assert!(
+            !source_tree_write_refusal(&anyhow!(
+                "uv build failed (status exit status: 1): \
+                 ModuleNotFoundError: No module named 'torch'"
+            )),
+            "a broken package must be reported, not rebuilt in a farm",
+        );
+        assert!(
+            !source_tree_write_refusal(&anyhow!(
+                "uv build failed (status exit status: 2): \
+                 error: Failed to resolve build requirements"
+            )),
+            "a resolve failure must be reported, not rebuilt in a farm",
+        );
+
+        make_staging_tree_removable(&repo);
+        let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+    }
+
+    /// GUARD 3. The fallback the ladder falls back TO still works on the same
+    /// snapshot, and its tree is writable where the canonical one is not.
+    /// Without this the ladder's second rung is reading, not evidence.
+    #[cfg(unix)]
+    #[test]
+    fn the_farm_fallback_still_yields_a_writable_tree_of_the_same_bytes() {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
+        let canonical = canonical_seal_fixture("c16-fallback", 10);
+        let private = canonical.parent().unwrap().join("private");
+        std::fs::create_dir_all(private.join(".git")).unwrap();
+        let inodes_before = canonical_regular_files(&canonical);
+
+        assert!(
+            hardlink_private_git_build_tree(&canonical, &private).unwrap(),
+            "the fallback must farm, not copy",
+        );
+        // The rung exists so that a backend which MUST write beside setup.py
+        // can. Prove it can, in the very place the canonical tree refused.
+        std::fs::create_dir(private.join("pkg/retread_fixture.egg-info"))
+            .expect("the farmed project directory must accept an egg-info");
+        assert_eq!(
+            std::fs::symlink_metadata(private.join("pkg"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o700,
+            0o700,
+        );
+        for (relative, identity) in &inodes_before {
+            let linked = std::fs::symlink_metadata(private.join(relative)).unwrap();
+            assert_eq!(
+                (linked.dev(), linked.ino()),
+                *identity,
+                "{relative} must still be the same inode",
+            );
+        }
+        // NON-VACUITY: and none of that reached the snapshot.
+        assert_eq!(
+            canonical_regular_files(&canonical),
+            inodes_before,
+            "the canonical tree's inode set must be unchanged",
+        );
+        assert!(
+            !canonical.join("pkg/retread_fixture.egg-info").exists(),
+            "the fallback's write must not appear in the snapshot",
+        );
+
+        make_staging_tree_removable(&canonical);
+        make_staging_tree_removable(&private);
+        let _ = std::fs::remove_dir_all(canonical.parent().unwrap());
+    }
+
     fn canonical_regular_files(root: &Path) -> std::collections::BTreeMap<String, (u64, u64)> {
         use std::os::unix::fs::MetadataExt;
         let mut entries = Vec::new();
