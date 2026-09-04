@@ -130,10 +130,24 @@ for r in "$@"; do
       # The ownership proof: the relock job id, as a `-<jid>` token, ANYWHERE in
       # the basename -- `certO7P6UA-5764452-ONCERT` proves 5764452 owns it just
       # as well as `certC18P1-5763080` proves 5763080 does.
-      case "-$base-" in
-        *"-$RJ-"*) ;;
-        *) echo "### REFUSE: root $r does not carry relock job $RJ as a -<jid> token in its basename"; fail=1; continue;;
-      esac
+      # A TWO-PHASE chain owns a root the relock job did NOT name: the cert
+      # phase mints `cert<TAG>P2-<CERT JOB>`, whose only job-id token is the
+      # CERT job. Demanding `-$RJ-` on every root refuses that set outright and
+      # deletes nothing, so every two-phase cert leaks all three of its roots --
+      # measured on job 5768460, which refused `certP6MBCP2-5768459` and kept
+      # `certP6MBC-5768458` and `ws.P6MBC-5768458` with it. `OJ` names the
+      # ADDITIONAL owner job ids of the same chain (space-separated, optional,
+      # empty for every existing caller, so nothing else changes). Ownership is
+      # still proved by a job-id token, and terminality is still checked below
+      # for every id the basename carries -- OJ widens WHOSE token counts, it
+      # does not skip the check.
+      owner_hit=0
+      for oj in $RJ ${OJ:-}; do
+        case "-$base-" in *"-$oj-"*) owner_hit=1;; esac
+      done
+      if [ "$owner_hit" != 1 ]; then
+        echo "### REFUSE: root $r carries none of the owner job ids ($RJ ${OJ:-}) as a -<jid> token in its basename"; fail=1; continue
+      fi
       jids=$(printf '%s\n' "$base" | grep -oE -- '-[0-9]{6,}' | tr -d - | sort -u)
       if [ -z "$jids" ]; then
         echo "### REFUSE: root $r has no -<jobid> token in its basename"; fail=1; continue
