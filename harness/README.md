@@ -22,6 +22,8 @@ here outward.
 | `inode-cleanup/` | the stale-root sweeper (`delete_stale_roots.v2.sh`), `delete_allowlisted.sh`, the census/characterize/verify scripts and their sbatch wrappers |
 | `instrumented/` | the p6b instrumented relock (`p6b_relock.sh`, `.b2.sh` variant) plus `p6b_stamp.py` / `p6b_extract.py` |
 | `verdict/cert_verdict.sh` | the typed-exit verdict gate |
+| `manifests/a3b/` | the A3b-family pack-manifest cessions (`patch` diffs against `pypi-packs/<pack>/pixi.toml`) — see its README for the md5s and the apply matrix |
+| `arms/` | derived relock harnesses kept verbatim because later arms are derived from them by SUBSTITUTE-only edits (`c29_relock.sh`) |
 
 ## How to derive a harness
 

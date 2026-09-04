@@ -1,0 +1,67 @@
+--- pixi.toml
++++ pixi.toml
+@@ -31,7 +31,63 @@
+ # isaaclab has NO real pydantic/click bound (pydantic 1.10.26 arrived via stale favor-lock;
+ # every pydantic>=2 req is behind a false extra marker) while protomotions holds the hard
+ # bounds (wandb>=0.28.2 -> pydantic>=2.6,<3; click>=8.2). One binding owner per shared name.
++#
++# [A3b2-ONLY REBASE 2026-09-04, C29] This block is the A3b2 cession and NOTHING ELSE,
++# rebased onto the CANONICAL pack. The file a3b-work/isaaclab-2.3x-pack.pixi.toml.a3b2.diff
++# (md5 11ab83a65d10e7250db497836a621126) was cut against the A3b-PATCHED pack, whose
++# retread-drop-deps already reads ["pydantic","click","wandb","platformdirs","fsspec"];
++# applied to the canonical pack it FAILS ("Hunk #1 FAILED at 60", measured 2026-09-04 on
++# node1948). C29's variable is "a3b2 and nothing else", so the cession text below is
++# carried verbatim from that diff and only the drop-deps list is rebased: canonical
++# ["pydantic","click"] gains typing-extensions and gains NOTHING else. wandb, platformdirs
++# and fsspec are DELIBERATELY still emitted by this pack, exactly as canonical emits them.
++# "the SAME reason" below therefore refers to the F34 rule four lines up -- one binding
++# owner per shared name -- which is the rule A3b itself applied.
++#
++# [A3b2 cession 2026-09-03] typing-extensions ceded for the SAME reason, and it is the
++# only remaining name on which the two co-resident packs' emitted `constrains` bands
++# actually disagree: of the 17 wheel names both sidecars carry, and of the 12 x 16 names
++# the two bundles emit as constrains in the injection-ON run, only pillow and
++# typing-extensions overlap at all, and pillow intersects (this pack
++# `!=8.3.*,>=8.3.2` vs protomotions `>=10.1,<12.0` -> `>=10.1,<12.0`, and the certified
++# lock installs pillow 10.4.0 inside it).
++#
++#   typing-extensions -- this pack emits `~=4.12,>=4.12.2,<4.13` (from the hard upstream
++#                   exact `isaacsim-kernel==5.1.0.0 -> typing_extensions==4.12.2`);
++#                   protomotions-deps-pack emits `>4.5.0,>=4.15.0,<5` (from
++#                   `pydantic 2.14.0b1 -> typing-extensions>=4.15.0` and
++#                   `typing-inspection -> >=4.15.0`, and pydantic is the name F34 already
++#                   ceded TO that pack four lines up). `~=4.12` expands to `<4.13`, so the
++#                   two bands cannot both hold and the pm-isaaclab solve dies with
++#                   auto-imports ON: `isaaclab-2.3x-pack 0.54.2 would constrain
++#                   typing-extensions ~=4.12,>=4.12.2,<4.13, which conflicts with any
++#                   installable versions previously reported`
++#                   (job 5716354 rc=1 first recorded it; job 5829952 -- injection ON,
++#                   CANONICAL manifest, NO pack diffs at all -- reproduced the identical
++#                   text with pm-isaaclab the only failing env, LANE-C-WARM-LOG 28.2).
++#                   This does not invent a policy: the comment block above
++#                   `[package.build.config.retread-overrides]` in THIS file already reasons
++#                   it out and prescribes exactly this remedy -- "drop it from this pack's
++#                   emitted conda run-deps entirely instead of overriding, so each consuming
++#                   environment's own pin (or the conda solver's free choice, where no
++#                   consumer pins it) is the sole owner" -- and explains why a
++#                   `[retread-overrides]` widen is wrong (it is pack-wide and would reopen
++#                   the Kit-107 GUI-compat bug in unitree-rl-lab-gpu). The intent was
++#                   written but never wired into this list; this wires it.
++#                   Installed bytes: none move. In the certified lock
++#                   (bfinal-phase1/artifacts/pixi.lock.cert) three of this pack's four envs
++#                   -- pace, pm-isaaclab, uwlab-gpu -- already resolve conda
++#                   `typing-extensions 4.16.0`, i.e. they ALREADY violate the band this
++#                   pack advertises, which is inert only because injection is off there.
++#                   The fourth, unitree-rl-lab-gpu, resolves 4.12.2 and keeps doing so
++#                   because the WORKSPACE pins it at
++#                   `[feature.isaaclab-unitree.dependencies] typing-extensions =
++#                   ">=4.12.2,<4.13"`, which a pack-level drop cannot touch.
++#                   KNOWN CONSTRAINT (board under A3): isaacsim-kernel 5.1.0.0's upstream
++#                   `typing_extensions==4.12.2` exact is knowingly overridden by the
++#                   workspace's conda provider in the three envs above, as it already is
++#                   today.
++retread-drop-deps = ["pydantic", "click", "typing-extensions"]
+-retread-drop-deps = ["pydantic", "click"]
+ retread-courier-mode = "activation"
+ retread-relax = "patch-then-minor-then-major-then-last-resort"
+ retread-build-number = 5
