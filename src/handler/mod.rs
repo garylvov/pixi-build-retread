@@ -5086,6 +5086,41 @@ impl Handler {
             &params.manifest_path,
         ));
 
+        // p6m: give pixi's OWN resolver static metadata for the workspace's
+        // local PyPI path sources before it resolves anything.
+        //
+        // This has to happen at `initialize`, not at `conda/outputs`: it is
+        // the earliest verb that carries both the pack's configuration and
+        // the workspace root, and every later verb (and therefore every
+        // environment's `resolve_pypi`) is downstream of it. It sits beside
+        // `ensure_pixi_bld_symlink_target` above because that is the other
+        // workspace-scoped side effect the backend performs here, for the
+        // same reason: the frontend has to see it before it starts.
+        //
+        // A refusal is an RPC error, not a warning. The failure this replaces
+        // is a 28-minute silent wait, and a warning in a 40k-line log is
+        // indistinguishable from it.
+        let path_source_outcomes = crate::path_source_metadata::materialize_declared_path_sources(
+            &config,
+            workspace_dir.as_deref(),
+            Some(params.manifest_path.as_path()),
+        )
+        .map_err(|error| {
+            RpcError::invalid_params(format!("retread-path-source-metadata: {error:#}"))
+        })?;
+        if !path_source_outcomes.is_empty() {
+            tracing::info!(
+                "retread-path-source-metadata: {} path-source shim(s) refreshed \
+                 from the pack layer: {}",
+                path_source_outcomes.len(),
+                path_source_outcomes
+                    .iter()
+                    .map(|outcome| format!("{}={}", outcome.project(), outcome.verb()))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
+        }
+
         // Fix #22: merge this pack's auto-repaired overrides from the
         // workspace's `.retread/auto-overrides.json` ledger into
         // `config.overrides`, IN MEMORY only -- the pack's pixi.toml is

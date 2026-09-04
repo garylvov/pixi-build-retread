@@ -1545,6 +1545,8 @@ mod tests {
             auto_imports: None,
             verify_snapshots: None,
             git_snapshot_store: None,
+            path_source_metadata: None,
+            path_source_records: None,
             parallel_probes: None,
         }
     }

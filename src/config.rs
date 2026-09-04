@@ -265,6 +265,50 @@ pub struct RetreadConfig {
     #[serde(default, rename = "retread-parallel-probes", alias = "parallel-probes")]
     pub parallel_probes: Option<bool>,
 
+    /// Materialize static PEP 621 metadata for the workspace's local PyPI
+    /// **path sources**, so pixi's own (frontend) resolver never runs a PEP
+    /// 517 metadata build for them.
+    ///
+    /// `None` (the key absent) is OFF, so merging this changes no existing
+    /// lock. There is deliberately no env var: the facts and the switch both
+    /// belong to the pack that declares them.
+    ///
+    /// ```toml
+    /// [build.config]
+    /// retread-path-source-metadata = true
+    /// ```
+    ///
+    /// See [`crate::path_source_metadata`] for what is written, where, and
+    /// the four refusals.
+    #[serde(
+        default,
+        rename = "retread-path-source-metadata",
+        alias = "path-source-metadata"
+    )]
+    pub path_source_metadata: Option<bool>,
+
+    /// Directory, relative to the PACK directory, holding one
+    /// `<project>.toml` path-source record per project — the hand-editable
+    /// SOURCE OF TRUTH that lives beside the pack's own manifest and json
+    /// outputs. Defaults to
+    /// [`crate::path_source_metadata::RECORDS_DIR_DEFAULT`].
+    ///
+    /// The record is the only half a human edits; the shim under
+    /// `<pack>/sources/<project>/` is generated from it on every initialize.
+    ///
+    /// ```toml
+    /// [build.config]
+    /// retread-path-source-metadata = true
+    /// # optional; "path-sources" if omitted
+    /// retread-path-source-records = "path-sources"
+    /// ```
+    #[serde(
+        default,
+        rename = "retread-path-source-records",
+        alias = "path-source-records"
+    )]
+    pub path_source_records: Option<String>,
+
     /// PyPI -> conda name mapping overrides on top of the built-in identity
     /// mapping. Use for the common drift cases (`opencv-python-headless` ->
     /// `py-opencv`, etc.).
