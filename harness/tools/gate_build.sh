@@ -2,7 +2,7 @@
 # merge-4-12-h/i/j: ONE test gate + release build + binsnap for a merge candidate.
 #
 # DERIVED BY SUBSTITUTION from merge-e/gate_build.sh (the script that gated
-# c0a87d3) with THREE additions, each of them a defect this campaign was bitten
+# c0a87d3) with FOUR additions, each of them a defect this campaign was bitten
 # by and each of them a reader:
 #
 #   1. THE SUITE MUST HAVE PRINTED A RESULT LINE. C14.7(a): c14-gatep2 5741936
