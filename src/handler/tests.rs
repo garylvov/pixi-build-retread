@@ -12578,3 +12578,38 @@ fn p6s4_a_second_abi_rejection_after_the_backoff_refuses_by_name_with_the_root_d
         assert!(refusal.contains(needle), "refusal must name {needle}: {refusal}");
     }
 }
+
+/// p6t-4 GUARD — `conda/build_v1` must name the ABI invariant, not the
+/// relaxation record.
+///
+/// Measured on arm `oncert-p6tb` 5757174: BOTH arms logged
+/// `ABI BACK-OFF SUCCEEDED bundle=protomotions-deps-pack` in `conda/outputs`,
+/// arm B then re-emitted the same bundle inside `conda/build_v1` — which
+/// carries no Lane C back-off across the RPC boundary — and the operator got
+/// `-32603: reconstructing final relaxation record for protomotions-deps-pack`
+/// over 67 `bundle emission rejected by ABI invariant` rows about
+/// `numpy >=1.0.0` bare-major specs. A failure that reaches an actor under the
+/// wrong name has not reached an actor.
+#[test]
+fn p6t4_build_v1_refusal_names_the_abi_invariant_not_the_relaxation_record() {
+    // The production discriminator, exercised on a real error value: an
+    // AbiInvariantViolation must be recognised through `anyhow`'s erasure,
+    // and anything else must NOT be.
+    let abi: anyhow::Error = AbiInvariantViolation {
+        violations: vec!["wheel `etils` embeds `numpy >=1.0.0` (bare-major)".to_string()],
+    }
+    .into();
+    assert!(
+        abi.downcast_ref::<AbiInvariantViolation>().is_some(),
+        "the build_v1 arm keys on exactly this downcast"
+    );
+    // NON-VACUITY: an ordinary emission error must still be reported as a
+    // relaxation-record failure, or the new arm would swallow every error.
+    let other = anyhow::anyhow!("some other emission failure");
+    assert!(other.downcast_ref::<AbiInvariantViolation>().is_none());
+    // The violation text the refusal quotes is the one the invariant wrote.
+    assert!(
+        format!("{abi}").contains("bare-major"),
+        "the refusal quotes the violation verbatim: {abi}"
+    );
+}

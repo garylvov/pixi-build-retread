@@ -7155,6 +7155,41 @@ impl Handler {
                 None,
             )
             .map_err(|error| {
+                // p6t-4, measured on arm oncert-p6tb 5757174. `conda/build_v1`
+                // re-does the emission `conda/outputs` already performed, and
+                // it has NO Lane C back-off: the suppression `conda/outputs`
+                // decided (`ABI BACK-OFF SUCCEEDED bundle=protomotions-deps-pack`,
+                // in BOTH arms) is not carried across this RPC boundary, so the
+                // invariant rejects the same emission a second time here. Under
+                // p6s-4 every error on this line — an `AbiInvariantViolation`
+                // included — was reported as "reconstructing final relaxation
+                // record", which is misattribution: the relaxation record is
+                // fine, the ABI contract is what refused. Arm B's operator saw
+                // `-32603 reconstructing final relaxation record for
+                // protomotions-deps-pack` and had to open a 179 MB backend log
+                // to learn it was 67 `bundle emission rejected by ABI
+                // invariant` rows about `numpy >=1.0.0` bare-major specs.
+                //
+                // Carrying the suppression set across the boundary is the real
+                // fix and is boarded; naming the actual refusal is the part
+                // that must never wait, because a failure that reaches an actor
+                // under the wrong name has not reached an actor.
+                if let Some(violation) = error.downcast_ref::<AbiInvariantViolation>() {
+                    let refusal = format!(
+                        "ABI invariant rejected `{}` while conda/build_v1 reconstructed its \
+                         final emission. This is NOT a relaxation-record failure. \
+                         conda/build_v1 re-runs the emission conda/outputs already made and \
+                         does not carry conda/outputs' Lane C back-off across the RPC \
+                         boundary, so a bundle that was emitted there WITHOUT its detected \
+                         roots is emitted here WITH them and refused again. Violation: {violation}",
+                        bundle.conda_name,
+                    );
+                    tracing::error!(
+                        bundle = %bundle.conda_name,
+                        "auto_imports: ABI INVARIANT IN conda/build_v1 -- {refusal}",
+                    );
+                    return RpcError::internal(refusal);
+                }
                 RpcError::internal(format!(
                     "reconstructing final relaxation record for {}: {error:#}",
                     bundle.conda_name
