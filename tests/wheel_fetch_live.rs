@@ -19,13 +19,14 @@
 //!   committed `tests/fixtures/*.METADATA.txt` snapshots cover the same
 //!   ground without network for normal test runs.
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
-use pixi_build_retread::config::{RelaxPolicy, RetreadConfig};
 use pixi_build_retread::recipe::{BundleSource, build_bundle_recipe, to_yaml};
 use pixi_build_retread::wheel::{fetch_wheel, read_metadata};
+
+mod common;
+use common::baseline_config;
 
 fn tempdir(label: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("retread-test-{label}-{}", std::process::id()));
@@ -81,42 +82,7 @@ async fn fetch_isaacsim_kernel_end_to_end() {
     );
     assert!(!meta.is_pure_python, "isaacsim-kernel is platform-specific");
 
-    let config = RetreadConfig {
-        resolver: Default::default(),
-        auto_route: true,
-        // v4.6: legacy sweep semantics for the pre-v4.6 test matrix.
-        route_policy: pixi_build_retread::config::RoutePolicy::Aggressive,
-        route_include: vec![],
-        keep_pypi: vec![],
-        force_conda: vec![],
-        retread_wheels: BTreeMap::new(),
-        relax: RelaxPolicy::Minor,
-        built_output_store: None,
-        overrides: BTreeMap::new(),
-        name_map: BTreeMap::new(),
-        shadow_libs: BTreeMap::new(),
-        build_number: 0,
-        drop_deps: Vec::new(),
-        auto_bundle: false,
-        conda_deps: Vec::new(),
-        default_bundle: None,
-        compression_level: None,
-        compression_threads: None,
-        emit_pypi: false,
-        bundle_mode: pixi_build_retread::config::BundleMode::Fat,
-        courier_mode: Default::default(),
-        courier: false,
-        blueprint: Default::default(),
-        blueprint_sync: Default::default(),
-        git_sources: std::collections::BTreeMap::new(),
-        python: None,
-        pin_version: false,
-        deps_from: Default::default(),
-        ledger_overrides: Default::default(),
-        pack_manifest_path: None,
-        sdist_build: Default::default(),
-        hermetic: true,
-    };
+    let config = baseline_config();
     let recipe = build_bundle_recipe(
         "isaacsim-kernel",
         &[BundleSource {

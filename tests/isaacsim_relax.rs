@@ -19,14 +19,16 @@
 //! `relax = "minor"`, those overrides become unnecessary because the
 //! generated conda package's run-deps are widened to compatible ranges.
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
-use pixi_build_retread::config::{RelaxPolicy, RetreadConfig};
+use pixi_build_retread::config::RelaxPolicy;
 use pixi_build_retread::recipe::{BundleSource, build_bundle_recipe, to_yaml};
 use pixi_build_retread::relax::{CondaName, CondaTarget, PypiKey};
 use pixi_build_retread::wheel::parse_metadata;
+
+mod common;
+use common::baseline_config;
 
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
@@ -45,49 +47,6 @@ fn load_fixture(slug: &str) -> (String, String, String, bool) {
     (metadata, filename, sha256, is_pure_python)
 }
 
-fn baseline_config() -> RetreadConfig {
-    // Intentionally stripped: no overrides, no name-map. The whole point is
-    // proving relax='minor' alone is enough to let ros2 + isaacsim coexist.
-    // Compare to gigastrap's `[feature.isaaclab.pypi-options.dependency-overrides]`
-    // block in /home/garylvov/projects/gigastrap/pixi.toml — that's what
-    // should NOT be needed once retread is in the loop.
-    RetreadConfig {
-        resolver: Default::default(),
-        auto_route: true,
-        // v4.6: legacy sweep semantics for the pre-v4.6 test matrix.
-        route_policy: pixi_build_retread::config::RoutePolicy::Aggressive,
-        route_include: vec![],
-        keep_pypi: vec![],
-        force_conda: vec![],
-        retread_wheels: BTreeMap::new(),
-        relax: RelaxPolicy::Minor,
-        built_output_store: None,
-        overrides: BTreeMap::new(),
-        name_map: BTreeMap::new(),
-        shadow_libs: BTreeMap::new(),
-        build_number: 0,
-        drop_deps: Vec::new(),
-        auto_bundle: false,
-        conda_deps: Vec::new(),
-        default_bundle: None,
-        compression_level: None,
-        compression_threads: None,
-        emit_pypi: false,
-        bundle_mode: pixi_build_retread::config::BundleMode::Fat,
-        courier_mode: Default::default(),
-        courier: false,
-        blueprint: Default::default(),
-        blueprint_sync: Default::default(),
-        git_sources: std::collections::BTreeMap::new(),
-        python: None,
-        pin_version: false,
-        deps_from: Default::default(),
-        ledger_overrides: Default::default(),
-        pack_manifest_path: None,
-        sdist_build: Default::default(),
-        hermetic: true,
-    }
-}
 
 /// Pluck the run-deps line for a given package name out of the rendered YAML.
 fn find_run_dep<'a>(yaml: &'a str, package: &str) -> Option<&'a str> {
@@ -286,4 +245,36 @@ fn aggressive_major_relax_preserves_abi_anchors() {
     let pillow = find_run_dep(&yaml, "pillow").expect("pillow must appear");
     assert_eq!(numpy, "numpy ==1.26.0", "ABI anchor changed: {numpy}");
     assert_eq!(pillow, "pillow >=11", "ordinary dependency: {pillow}");
+}
+
+/// Guard for the shared `baseline_config()` helper.
+///
+/// The helper builds `RetreadConfig` through serde precisely so a NEW field
+/// cannot break these targets the way a struct literal did. The cost of that
+/// is that a field the tests rely on could silently change meaning if its
+/// SERDE DEFAULT were flipped upstream. This pins the values the two
+/// integration tests are written against, so such a flip fails here, loudly,
+/// naming the field — instead of turning an assertion elsewhere into a
+/// mysterious red.
+#[test]
+fn baseline_config_pins_what_the_tests_depend_on() {
+    let cfg = baseline_config();
+    assert_eq!(cfg.relax, RelaxPolicy::Minor, "relax policy");
+    assert_eq!(
+        cfg.route_policy,
+        pixi_build_retread::config::RoutePolicy::Aggressive,
+        "route policy (pre-v4.6 legacy sweep semantics)"
+    );
+    assert_eq!(
+        cfg.bundle_mode,
+        pixi_build_retread::config::BundleMode::Fat,
+        "bundle mode: these tests render a full recipe, not a loose stub"
+    );
+    assert!(cfg.auto_route, "auto-route");
+    assert!(cfg.hermetic, "hermetic builds");
+    assert!(!cfg.auto_bundle, "auto-bundle DEFAULTS TO TRUE and must be off");
+    assert!(!cfg.courier, "courier DEFAULTS TO TRUE and must be off");
+    assert!(cfg.retread_wheels.is_empty(), "no wheel entries");
+    assert!(cfg.overrides.is_empty(), "no dependency overrides");
+    assert!(cfg.name_map.is_empty(), "no name-map");
 }
