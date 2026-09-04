@@ -12939,6 +12939,86 @@ Requires-Dist `setuptools>=41.0.0`; `*` required by wheel `sapien==3.0.3` \
 Requires-Dist `setuptools`.
 ";
 
+/// ARM 5772100's ACTUAL error text, and the reason p6w has a second guard for
+/// its own attribution slice. When Pass A fails, the error carries Pass A's
+/// report AND Pass B's, joined by the pass-B banner -- and Pass B's half is
+/// the child's raw DEBUG trace. `uv_conflict_report` anchors on the first `x`
+/// and returns everything to the END of the text, so its slice swallowed that
+/// trace and `uv_reason_sentence` found a "sentence" naming almost every
+/// injected root. The first arm dropped THIRTEEN of robojudo-pack's roots
+/// where uv blamed exactly one.
+const P6W_UV_REPORT_WITH_PASS_B_TRACE: &str = "\
+uv lock failed for bundle `robojudo-pack` (python 3.12, linux-64):
+
+Using CPython 3.12.14
+  \u{d7} No solution found when resolving dependencies:
+  \u{2570}\u{2500}\u{25b6} Because unitree-sdk2py was not found in the package registry and your
+      project depends on unitree-sdk2py, we can conclude that your project's
+      requirements are unsatisfiable.
+
+--- uv closure pass B (sdist/prerelease detection) also failed ---
+
+uv lock failed for bundle `robojudo-pack` (python 3.12, linux-64):
+DEBUG Searching for a compatible version of colorlog (*)
+DEBUG Adding transitive dependency for pydantic==2.9.2: annotated-types
+DEBUG Searching for a compatible version of msgpack (*)
+DEBUG Adding transitive dependency for pygame==2.6.1: python-box
+DEBUG Searching for a compatible version of redis (*)
+DEBUG Adding transitive dependency for torch==2.5.1: tqdm
+DEBUG Searching for a compatible version of onnxruntime (*)
+DEBUG Adding transitive dependency for imprint==0.1.0: msgpack-numpy
+";
+
+#[test]
+fn p6w_d_a_pass_b_trace_appended_to_the_report_blames_nobody_extra() {
+    // Every root below appears in the Pass B DEBUG trace; exactly one appears
+    // in uv's conclusion. Before the banner cut, all nine were attributed.
+    let injected = BTreeMap::from([(
+        "robojudo-pack".to_string(),
+        vec![
+            "colorlog".to_string(),
+            "imprint".to_string(),
+            "msgpack".to_string(),
+            "msgpack-numpy".to_string(),
+            "onnxruntime".to_string(),
+            "pydantic".to_string(),
+            "pygame".to_string(),
+            "python-box".to_string(),
+            "redis".to_string(),
+            "torch".to_string(),
+            "tqdm".to_string(),
+            "unitree-sdk2py".to_string(),
+        ],
+    )]);
+    let drops = crate::uv_closure::attribute_auto_imports_failure(
+        P6W_UV_REPORT_WITH_PASS_B_TRACE,
+        &injected,
+    );
+    let named: Vec<&str> = drops.iter().map(|d| d.root.as_str()).collect();
+    assert_eq!(
+        named,
+        vec!["unitree-sdk2py"],
+        "only uv's CONCLUSION may name a culprit; a Pass B trace names candidates it rejected",
+    );
+    // NON-VACUITY: the trace really does mention the others, so this passes
+    // because the trace is excluded and not because the names are absent.
+    for root in ["colorlog", "msgpack", "pydantic", "redis"] {
+        assert!(
+            P6W_UV_REPORT_WITH_PASS_B_TRACE.contains(root),
+            "{root} must be present in the fixture for this guard to mean anything",
+        );
+    }
+    // NON-VACUITY: with the Pass B half removed entirely the answer is the
+    // same, so the cut is what does the work.
+    let pass_a_only = P6W_UV_REPORT_WITH_PASS_B_TRACE
+        .split("--- uv closure pass B")
+        .next()
+        .expect("the fixture has a pass A half");
+    let drops_a = crate::uv_closure::attribute_auto_imports_failure(pass_a_only, &injected);
+    assert_eq!(drops_a.len(), 1);
+    assert_eq!(drops_a[0].root, "unitree-sdk2py");
+}
+
 fn p6w_robojudo_injected() -> BTreeMap<String, Vec<String>> {
     // Three of robojudo-pack's twelve measured roots: one uv named, two it
     // did not. The claim under test is about the two.

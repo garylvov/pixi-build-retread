@@ -4245,8 +4245,33 @@ pub fn attribute_auto_imports_failure(
     error_text: &str,
     injected_by_bundle: &BTreeMap<String, Vec<String>>,
 ) -> Vec<AttributedRootDrop> {
-    let report = uv_conflict_report(error_text);
-    let report: &str = report.as_ref();
+    // MEASURED ON ARM A 5772100, AND IT IS WHY THIS IS NOT JUST
+    // `uv_conflict_report(error_text)`. When Pass A fails, the error handed up
+    // is Pass A's report AND Pass B's, joined by
+    // `PASS_B_BANNER` -- and Pass B's half carries the child's raw DEBUG
+    // trace. `uv_conflict_report` anchors on the FIRST `x` and returns
+    // everything to the END of the text, so with a Pass B appended its slice
+    // swallows that trace. `uv_reason_sentence` then found a "sentence"
+    // naming almost every injected root, and the first arm dropped THIRTEEN of
+    // robojudo-pack's roots where uv blamed exactly one -- attribution firing
+    // like the coarse back-off it replaces, only slower.
+    //
+    // Two cuts, in this order. Pass A's conclusion is the authority (it is the
+    // pass whose roots are under test), so the text is cut at the banner
+    // BEFORE the report is sliced; then trace lines are removed from the slice
+    // by the same level-prefix rule `uv_conflict_report` already applies on
+    // its no-marker path. Both are needed: the banner cut alone still leaves
+    // any trace uv wrote after its own report.
+    let primary = error_text
+        .split_once(PASS_B_BANNER)
+        .map_or(error_text, |(pass_a, _)| pass_a);
+    let sliced = uv_conflict_report(primary);
+    let report: String = sliced
+        .lines()
+        .filter(|line| !is_uv_trace_line(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let report: &str = &report;
     let prose = flatten_conflict_prose(report);
     let mut out = Vec::new();
     for (bundle, roots) in injected_by_bundle {
@@ -4753,7 +4778,7 @@ where
 /// behind a healable evdev error for a whole cert run.
 fn both_passes_failed(pass_a: &str, pass_b: &str) -> String {
     format!(
-        "{}\n\n--- uv closure pass B (sdist/prerelease detection) also failed ---\n\n{}\n",
+        "{}\n\n{PASS_B_BANNER}\n\n{}\n",
         pass_a.trim_end(),
         pass_b.trim_end(),
     )
@@ -5512,6 +5537,11 @@ const CONFLICT_FILE: &str = "retread-conflict.json";
 /// Pass-B (sdist/prerelease detection) conflict record, written beside
 /// [`CONFLICT_FILE`] so a Pass-B failure has a reader (Law 9).
 const PASS_B_CONFLICT_FILE: &str = "retread-passb-conflict.json";
+/// The joiner between Pass A's failure and Pass B's in one error. Named
+/// because `attribute_auto_imports_failure` must CUT on it: everything after
+/// it is a second pass's text, trace included, and uv's report slice would
+/// otherwise run straight through it (arm 5772100).
+const PASS_B_BANNER: &str = "--- uv closure pass B (sdist/prerelease detection) also failed ---";
 static CLOSURE_META_TMP_SEQUENCE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
