@@ -44,6 +44,28 @@
 #       evidence that was sitting in the artifacts directory. The gate now
 #       accepts `<TAG>-<J>*.rc` (and `.gz`, merge-h's 2026-09-04 gzip fix).
 #
+# 2026-09-04 ROOT FIX (jobs 5814670 and 5823482 refused, roots kept). A THIRD
+# instance of the same mistake, this time in the LOCK half of condition 1:
+#
+#   (c) the green-run lock check looked for `pixi.lock.cert` and
+#       `pixi.lock.<TAG>-<J>*` only -- the word `pixi` FIRST in both. Eight
+#       harnesses of this campaign (c17c, c17w, c18a, c18b, c18c, c18p1, c18p2,
+#       c21c) write the certified lock the other way round, with the tag+job
+#       stem first: `<TAG>-<J>.pixi.lock.cert`. The gate could not see a lock
+#       that was sitting in the artifacts directory and refused every one of
+#       those runs. Measured on cleanup jobs 5814670 and 5823482, which both
+#       printed `### MISSING: a green run with no pixi.lock.cert and no
+#       pixi.lock.C21C-<J>* in the task root` while
+#       `artifacts/C21C-5814669.pixi.lock.cert` (2758192 B) and
+#       `artifacts/C21C-5823481.pixi.lock.cert` (2758170 B) existed and were
+#       non-empty -- so ws.C21C-5814669, certC21C-5814669, ws.C21C-5823481 and
+#       certC21C-5823481 were all stranded. Both refusals were CORRECT given
+#       what the gate could see, and deleted nothing; the defect is that the
+#       evidence was invisible to it. The stem-first shape
+#       `<TAG>-<J>*pixi.lock.cert` is now accepted alongside the two it already
+#       took. A green run with NO lock in ANY of the three shapes still refuses.
+#       Reader: cleanup_lock_evidence_guard.sh.
+#
 #   usage: env -u SLURM_JOB_ID sbatch --partition=batch --qos=normal \
 #            --cpus-per-task=1 --mem=4G --time=16:00:00 \
 #            --dependency=afterany:<relock job>:<cert job> \
@@ -99,14 +121,19 @@ LRC=$(cat "$RCFILE" 2>/dev/null | tr -d '[:space:]' || echo missing)
 [ -n "$LRC" ] || LRC=missing
 echo "### recorded lock rc=$LRC (from ${RCFILE:-<none>})"
 if [ "$LRC" = 0 ]; then
+  # Three accepted shapes, all of them a certified lock in the task root, and
+  # nothing else. The third is the STEM-FIRST one (`<TAG>-<J>.pixi.lock.cert`,
+  # and with an arm suffix `<TAG>-<J>-ONCERT.pixi.lock.cert`) written by c17c,
+  # c17w, c18a/b/c/p1/p2 and c21c -- see defect (c) in the header. A run with a
+  # lock in none of them is still MISSING and still refuses.
   lockhit=
-  for f in "$A/pixi.lock.cert" "$A/pixi.lock.$TAG-$RJ"*; do
+  for f in "$A/pixi.lock.cert" "$A/pixi.lock.$TAG-$RJ"* "$A/$TAG-$RJ"*"pixi.lock.cert"; do
     [ -s "$f" ] || continue
     lockhit=$f
     echo "### lock present: $f ($(stat -c%s "$f") B) md5 $(md5sum "$f" | awk '{print $1}')"
   done
   if [ -z "$lockhit" ]; then
-    echo "### MISSING: a green run with no pixi.lock.cert and no pixi.lock.$TAG-$RJ* in the task root"; fail=1
+    echo "### MISSING: a green run with no pixi.lock.cert, no pixi.lock.$TAG-$RJ* and no $TAG-$RJ*pixi.lock.cert in the task root"; fail=1
   fi
 fi
 
