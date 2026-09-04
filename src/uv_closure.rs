@@ -4187,6 +4187,24 @@ fn workspace_fact_override_needed(
 /// log lines are stripped by level prefix instead, and if that leaves nothing
 /// the whole text is returned: attribution degrades to today's behaviour
 /// rather than going silent.
+///
+/// p6aa, boarded p6z-2 (= p6w-3). THE MARKER ANCHORS THE REPORT'S START AND
+/// SAYS NOTHING ABOUT ITS END. The marker branch used to return everything
+/// from that line to the end of the text, so any trace uv wrote AFTER its own
+/// conclusion stayed in the slice -- and when Pass A fails, the error handed
+/// up is Pass A's report followed by [`PASS_B_BANNER`] and Pass B's raw DEBUG
+/// trace, so the slice swallowed a second resolver log wholesale.
+///
+/// `attribute_auto_imports_failure` already knew this and stripped the trace
+/// again itself after calling here (p6w). `attribute_conflict` -- p6r's
+/// reader, the one that decides which LEARNED workspace fact yields -- did
+/// NOT, so the same text that was safe for one caller was unsafe for the
+/// other. One rule in one place: the level-prefix filter now applies on BOTH
+/// branches, and the marker only chooses where the slice begins.
+///
+/// A text whose slice contains no trace is still returned BORROWED and
+/// byte-identical, so nothing changes for the ordinary single-pass failure.
+///
 /// p6ab COLLAPSED ITS OWN COPY OF THIS ANCHOR INTO THIS FUNCTION (B11). The
 /// transient-index classifier [`uv_closure_transient_class`] needs the text
 /// BEFORE uv's report, not the report itself -- a transport phrase quoted
@@ -4196,38 +4214,37 @@ fn workspace_fact_override_needed(
 /// of one anchor is one of them drifting later. There is now exactly one, and
 /// it returns BOTH halves: `(prelude, report)`.
 ///
-/// The halves keep the fallbacks they were each given, because they answer
-/// different questions and neither answer changes here:
-///
-/// * the PRELUDE also accepts the ASCII opener `x No solution found`. Every
-///   hand-transcribed fixture in this file (`SAGE_PASS_B_STDERR` and friends)
-///   writes the ASCII `x`, and a classifier that only understood the real `×`
-///   would read those fixtures' conflict prose as if it were transport noise.
-/// * the REPORT keeps p6r's level-prefix strip when there is no `×`, so no
-///   attribution moves as a result of this collapse.
+/// The PRELUDE half has its own fallback, and it is not the report's: it also
+/// accepts the ASCII opener `x No solution found`. Every hand-transcribed
+/// fixture in this file (`SAGE_PASS_B_STDERR` and friends) writes the ASCII
+/// `x`, and a classifier that only understood the real `×` would read those
+/// fixtures' conflict prose as if it were transport noise. The prelude is the
+/// text BEFORE the report begins, so when there is no marker at all it is the
+/// whole text -- which is the right answer for a classifier and the wrong one
+/// for an attributor, which is why the two halves are computed separately and
+/// returned together rather than one being derived from the other.
 pub fn uv_conflict_report(stderr: &str) -> (&str, std::borrow::Cow<'_, str>) {
     let line_start = |byte: usize| stderr[..byte].rfind('\n').map_or(0, |nl| nl + 1);
-    if let Some(marker) = stderr.find('\u{d7}') {
+    let (prelude, sliced) = match stderr.find('\u{d7}') {
         // Back up to the start of the marker's own line so the report keeps
         // its leading indentation exactly as uv wrote it.
-        let start = line_start(marker);
-        return (
-            &stderr[..start],
-            std::borrow::Cow::Borrowed(&stderr[start..]),
-        );
-    }
-    let prelude = match stderr.find("No solution found") {
-        Some(byte) => &stderr[..line_start(byte)],
-        None => stderr,
+        Some(marker) => {
+            let start = line_start(marker);
+            (&stderr[..start], &stderr[start..])
+        }
+        None => match stderr.find("No solution found") {
+            Some(byte) => (&stderr[..line_start(byte)], stderr),
+            None => (stderr, stderr),
+        },
     };
-    let kept: Vec<&str> = stderr
+    let kept: Vec<&str> = sliced
         .lines()
         .filter(|line| !is_uv_trace_line(line))
         .collect();
-    if kept.iter().any(|line| !line.trim().is_empty()) && kept.len() != stderr.lines().count() {
+    if kept.iter().any(|line| !line.trim().is_empty()) && kept.len() != sliced.lines().count() {
         return (prelude, std::borrow::Cow::Owned(kept.join("\n")));
     }
-    (prelude, std::borrow::Cow::Borrowed(stderr))
+    (prelude, std::borrow::Cow::Borrowed(sliced))
 }
 
 /// True for one line of uv's `-v` resolver log, identified by the level token
@@ -4483,10 +4500,15 @@ pub fn attribute_auto_imports_failure(
     //
     // Two cuts, in this order. Pass A's conclusion is the authority (it is the
     // pass whose roots are under test), so the text is cut at the banner
-    // BEFORE the report is sliced; then trace lines are removed from the slice
-    // by the same level-prefix rule `uv_conflict_report` already applies on
-    // its no-marker path. Both are needed: the banner cut alone still leaves
-    // any trace uv wrote after its own report.
+    // BEFORE the report is sliced; `uv_conflict_report` then removes the trace
+    // lines from the slice. Both are needed: the banner cut alone still leaves
+    // any trace uv wrote after its own report, and the trace strip alone still
+    // leaves Pass B's PROSE.
+    //
+    // p6aa: the trace strip used to be repeated HERE, because
+    // `uv_conflict_report`'s marker branch stripped nothing. It now applies
+    // the level-prefix rule on both of its branches (boarded p6z-2), so this
+    // caller keeps only the cut that is its own -- the banner.
     // p6z. A `Requires-Dist` PARSE failure can never be attributed to a
     // detection, and this is checked FIRST because the text is full of
     // distribution names that look like accusations. The measured holosoma
@@ -4503,12 +4525,7 @@ pub fn attribute_auto_imports_failure(
         .split_once(PASS_B_BANNER)
         .map_or(error_text, |(pass_a, _)| pass_a);
     let (_prelude, sliced) = uv_conflict_report(primary);
-    let report: String = sliced
-        .lines()
-        .filter(|line| !is_uv_trace_line(line))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let report: &str = &report;
+    let report: &str = sliced.as_ref();
     let prose = flatten_conflict_prose(report);
     let mut out = Vec::new();
     for (bundle, roots) in injected_by_bundle {
@@ -11517,6 +11534,98 @@ DEBUG Package trl has too many conflicts (culprit), deprioritizing and backtrack
         assert_eq!(needed.pypi_name, "xxhash");
         assert_eq!(needed.learned_version, "0.8.3");
     }
+
+    /// p6aa guard, boarded p6z-2 (= p6w-3). A TRACE AFTER THE MARKER IS STILL
+    /// A TRACE.
+    ///
+    /// Both halves of this fixture are already in the tree and both are
+    /// measured: [`P6R_VIRAL_GPU_STDERR`] is job 5742776's uv `-v` stderr,
+    /// whose trace explores `tensorboard 2.21.0` (and so names `protobuf`)
+    /// before uv backtracks off it and concludes about `datasets` /
+    /// `fsspec[http]` / `xxhash`; the second half is the shape arm 5772100
+    /// actually handed up, a Pass A report joined to Pass B's raw DEBUG log by
+    /// [`PASS_B_BANNER`].
+    ///
+    /// RED on `f59aa35`: `uv_conflict_report`'s marker branch returned
+    /// everything from the `\u{d7}` line to the END of the text, so the slice
+    /// ran straight into Pass B. `attribute_conflict` then read a `protobuf`
+    /// requirement out of Pass B's trace and attributed it -- and
+    /// `learned_fact_yield_needed` would have dropped the learned
+    /// `protobuf==5.29.3` pin that was doing its job, which is precisely the
+    /// defect p6r fixed for the single-pass case and never fixed for this one.
+    ///
+    /// p6w fixed it for `attribute_auto_imports_failure` by stripping the
+    /// trace a second time in that function. This guard is about the OTHER
+    /// caller, which had no such repair.
+    #[test]
+    fn p6aa_b_a_trace_after_uvs_conclusion_is_stripped_for_attribute_conflict_too() {
+        let two_passes = format!(
+            "{P6R_VIRAL_GPU_STDERR}\n\n{PASS_B_BANNER}\n\n{}",
+            "\
+uv lock failed for bundle `isaaclab-viral-pack` (python 3.11, linux-64):
+DEBUG Searching for a compatible version of tensorboard (*)
+DEBUG Selecting: tensorboard==2.21.0 [compatible]
+DEBUG Adding transitive dependency for tensorboard==2.21.0: protobuf>=6.31.1, <8.0.0
+DEBUG Recording unit propagation conflict of protobuf from incompatibility of (tensorboard)
+",
+        );
+
+        // NON-VACUITY, stated before the claim: the trace really does name
+        // `protobuf` after uv's marker, so a guard that passes does so because
+        // the trace is excluded and not because the name is absent.
+        let marker = two_passes
+            .find('\u{d7}')
+            .expect("the fixture carries uv's conclusion marker");
+        assert!(
+            two_passes[marker..].contains("protobuf"),
+            "the fixture must name protobuf AFTER the marker or this guard is vacuous",
+        );
+
+        let learned = p6r_viral_gpu_learned_constraints();
+        let attributions = attribute_conflict(&two_passes, &learned.provenance);
+        let attributed: Vec<&str> = attributions.iter().map(|a| a.package.as_str()).collect();
+        assert_eq!(
+            attributed,
+            vec!["xxhash"],
+            "uv's CONCLUSION blames xxhash; the protobuf line lives in a resolver \
+             TRACE that happens to sit AFTER the marker, and the marker anchors \
+             where the report STARTS, not where it ends",
+        );
+
+        // And the yield decision that reads this text agrees: the innocent
+        // learned pin keeps its constraint.
+        let needed = learned_fact_yield_needed(
+            &attribute_conflict(&two_passes, &learned.provenance),
+            &two_passes,
+        )
+        .expect("the fact uv DID blame must still yield");
+        assert_eq!(
+            needed.pypi_name, "xxhash",
+            "a two-pass text must not turn an innocent pin into the culprit",
+        );
+
+        // The single-pass text is UNCHANGED and still borrowed byte for byte:
+        // this is a widening of an existing rule, not a new normalisation.
+        let (_prelude, single) = uv_conflict_report(P6W_SINGLE_PASS_REPORT_NO_TRACE);
+        assert!(
+            matches!(single, std::borrow::Cow::Borrowed(_)),
+            "a report with no trace after the marker must not be rebuilt",
+        );
+        assert_eq!(
+            AsRef::<str>::as_ref(&single),
+            P6W_SINGLE_PASS_REPORT_NO_TRACE.trim_start_matches("Using CPython 3.12.14\n"),
+            "and its bytes must be uv's own, indentation included",
+        );
+    }
+
+    /// A plain single-pass failure: interpreter banner, marker, conclusion, no
+    /// trace anywhere after the marker. The control for the guard above.
+    const P6W_SINGLE_PASS_REPORT_NO_TRACE: &str = "\
+Using CPython 3.12.14
+  \u{d7} No solution found when resolving dependencies:
+  \u{2570}\u{2500}\u{25b6} Because unitree-sdk2py was not found in the package registry and your
+      project depends on unitree-sdk2py, we can conclude that your project's
+      requirements are unsatisfiable.";
 
     /// p6r (b), the outcome the arm reads: with the innocent pin kept, the
     /// closure's own resolution takes the tensorboard whose `Requires-Dist`
