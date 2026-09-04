@@ -579,6 +579,118 @@ fn conflict_from_active(package: &PypiKey, active: &[&Constraint]) -> Conflict {
     }
 }
 
+// ---- p6z-1: THE YIELD'S APPLIED-ROW ---------------------------------------
+//
+// THE DEFECT (boarded p6z-1, measured on arms 5787087 / 5787088). Both p6z
+// pair-2 arms resolved `flashsac-pack` with all thirteen detected roots, and
+// NEITHER printed a single `learned fact yields` row. The policy that
+// rescued the pack left no trace of having run: `finalize_impl`'s yield fired
+// inside `finalize_quiet` / `finalize_quiet_detailed` (`emit_diagnostics =
+// false`) during candidate evaluation, and the committed path then never met
+// the conflict at all, so the loud entry point had nothing to say.
+//
+// A policy that silently changes a pack's outcome is exactly the shape the
+// reader/writer law exists to catch. The prose WARN below is a DIAGNOSTIC and
+// stays behind `emit_diagnostics` -- it belongs to the committed path. The
+// APPLIED-ROW is an audit record and is emitted wherever the yield is
+// applied, quiet or loud.
+//
+// TWO THINGS THE ROW NEEDS THAT THIS FUNCTION DID NOT HAVE.
+//
+// (a) The bundle. `finalize_impl` decides one package's specifier set and has
+//     never known which pack it is deciding for, so a row it wrote could not
+//     have named `flashsac-pack` even if it had written one.
+//     `handler::produce_output_with_conflicts` -- the ONE production entry
+//     into the emission reconciler, and the only caller of
+//     `relax_decision::decide_for_emission` -- enters `ActiveBundleScope` for
+//     the bundle it is producing. The scope is thread-local and restored on
+//     drop, so work that fans out to another thread degrades to `<unknown>`
+//     instead of reporting the wrong pack.
+//
+// (b) A bound on volume. Candidate search calls the quiet oracle once per
+//     speculative subset, and a yield that holds for the committed set holds
+//     for most of them; an unconditional row would write the same sentence
+//     hundreds of times per package. 842 MB of repeated warnings to /oscar is
+//     a measured way to take a node out, so the row is emitted ONCE per
+//     (bundle, package, yielded clause, kept) and says so.
+thread_local! {
+    static ACTIVE_BUNDLE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Names the bundle whose closure the reconciler is finalizing, for the
+/// duration of the guard. Restores the previous value on drop, so nesting is
+/// safe and a panic cannot leave a stale name behind.
+pub(crate) struct ActiveBundleScope(Option<String>);
+
+impl ActiveBundleScope {
+    pub(crate) fn enter(bundle: &str) -> Self {
+        Self(ACTIVE_BUNDLE.with(|slot| slot.replace(Some(bundle.to_string()))))
+    }
+}
+
+impl Drop for ActiveBundleScope {
+    fn drop(&mut self) {
+        ACTIVE_BUNDLE.with(|slot| *slot.borrow_mut() = self.0.take());
+    }
+}
+
+/// The bundle the current thread is finalizing for, or `<unknown>`.
+pub(crate) fn active_bundle() -> String {
+    ACTIVE_BUNDLE.with(|slot| {
+        slot.borrow()
+            .clone()
+            .unwrap_or_else(|| "<unknown>".to_string())
+    })
+}
+
+/// Every applied-row key this process has already written.
+///
+/// Bounded: once the cap is reached the set stops growing and every further
+/// distinct yield is written, so the failure mode of the bound is MORE rows,
+/// never a silently dropped one.
+static YIELD_ROWS_SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+const YIELD_ROW_KEY_CAP: usize = 4096;
+
+fn yield_row_is_new(key: &str) -> bool {
+    let seen = YIELD_ROWS_SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    let mut seen = match seen.lock() {
+        Ok(seen) => seen,
+        // A poisoned lock must not silence an audit record.
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if seen.len() >= YIELD_ROW_KEY_CAP {
+        return true;
+    }
+    seen.insert(key.to_string())
+}
+
+/// The row the yield writes wherever it is APPLIED, quiet or loud.
+///
+/// `learned_fact_yielded bundle=… package=… clause=… kept=… reason=…`
+fn record_learned_fact_yield(package: &PypiKey, yielded: &str, kept: &VersionSpecifiers) {
+    let bundle = active_bundle();
+    let kept = if kept.is_empty() {
+        "*".to_string()
+    } else {
+        kept.to_string()
+    };
+    let key = format!("{bundle}\u{1f}{package}\u{1f}{yielded}\u{1f}{kept}");
+    if !yield_row_is_new(&key) {
+        return;
+    }
+    tracing::warn!(
+        "learned_fact_yielded bundle={} package={} clause={} kept={} \
+         reason=satisfiable-only-without-it (once per distinct yield)",
+        bundle,
+        package,
+        yielded,
+        kept,
+    );
+}
+
 /// Apply override replacement, exclude preferences, deduplicate, and prove
 /// the active constraint intersection satisfiable.
 ///
@@ -722,22 +834,26 @@ fn finalize_impl(
         let without_learned = intersect(&hard);
         if !specifiers_unsatisfiable(&without_learned) {
             let unsoftened_conflict = conflict_from_active(package, &active);
+            let yielded = learned
+                .iter()
+                .map(|constraint| {
+                    format!(
+                        "`{}` from {}",
+                        if constraint.specifiers.is_empty() {
+                            "*".to_string()
+                        } else {
+                            constraint.specifiers.to_string()
+                        },
+                        constraint.source
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            // p6z-1. The APPLIED-ROW, regardless of `emit_diagnostics`: this
+            // is the point at which the yield changes the answer, and the
+            // quiet oracle is where it changed `flashsac-pack`'s.
+            record_learned_fact_yield(package, &yielded, &without_learned);
             if emit_diagnostics {
-                let yielded = learned
-                    .iter()
-                    .map(|constraint| {
-                        format!(
-                            "`{}` from {}",
-                            if constraint.specifiers.is_empty() {
-                                "*".to_string()
-                            } else {
-                                constraint.specifiers.to_string()
-                            },
-                            constraint.source
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("; ");
                 tracing::warn!(
                     package = %package,
                     yielded = %yielded,
@@ -877,7 +993,68 @@ mod tests {
         assert!(error.sources.contains("wheel `b==1`"));
     }
 
-    #[test]
+    /// The `flashsac-pack` `setuptools` clause set, job 5776669 line 250906,
+    /// verbatim. Shared by p6z guard (b) and p6aa guard (a) so the fixture the
+    /// yield is proved on and the fixture the ROW is proved on cannot drift.
+    ///
+    /// The LEARNED clause carries the RENDERED sentence, which CONTAINS the
+    /// constant and is not equal to it -- p6z pair 1 built this on the bare
+    /// constant, the yield fired in the test and never in the arm, and
+    /// flashsac-pack dropped its 13 roots again.
+    fn flashsac_learned_setuptools_fact() -> Constraint {
+        let mut constraint = constraint(
+            "==84.0.0",
+            Provenance::UvConstraint,
+            "uv constraint `setuptools==84.0.0` from workspace conda fact",
+        );
+        constraint.source = format!(
+            "uv constraint `setuptools==84.0.0` from {} `precise-consuming-envs` \
+             (conda `setuptools==84.0.0`)",
+            crate::uv_closure::LEARNED_WORKSPACE_FACT_SOURCE,
+        );
+        assert_ne!(
+            constraint.source,
+            crate::uv_closure::LEARNED_WORKSPACE_FACT_SOURCE,
+            "non-vacuity: the rendered sentence must NOT equal the constant, or the \
+             guards built on it cannot catch the equality-vs-substring defect",
+        );
+        constraint
+    }
+
+    /// `FlashRL==0.1.0`'s declared `setuptools<=65` -- a real runtime
+    /// dependency (`third_party/FlashSAC/pyproject.toml`), and the fifth
+    /// clause whose absence made §24's transcription unable to tell "no root
+    /// is the culprit" from "there is no conflict".
+    fn flashsac_flashrl_cap() -> Constraint {
+        constraint(
+            "<=65",
+            Provenance::IndexWheelMetadata,
+            "wheel `FlashRL==0.1.0` Requires-Dist `setuptools<=65`",
+        )
+    }
+
+    fn flashsac_measured_clauses() -> Vec<Constraint> {
+        vec![
+            flashsac_learned_setuptools_fact(),
+            constraint(
+                "!=50.0.0",
+                Provenance::IndexWheelMetadata,
+                "wheel `dm_control==1.0.45` Requires-Dist `setuptools!=50.0.0`",
+            ),
+            constraint(
+                ">=41.0.0",
+                Provenance::IndexWheelMetadata,
+                "wheel `tensorboard==2.21.0` Requires-Dist `setuptools>=41.0.0`",
+            ),
+            constraint(
+                "",
+                Provenance::IndexWheelMetadata,
+                "wheel `sapien==3.0.3` Requires-Dist `setuptools`",
+            ),
+            flashsac_flashrl_cap(),
+        ]
+    }
+
     /// p6z guard (b), the reconciler half. Boarded p6w-2.
     ///
     /// THE MEASURED CLAUSES, job 5776669 line 250906, verbatim:
@@ -902,51 +1079,9 @@ mod tests {
         // the yield fired in the test and never fired in the arm, and
         // flashsac-pack dropped its 13 roots again. The fixture is now the
         // real string.
-        let learned = || {
-            let mut constraint = constraint(
-                "==84.0.0",
-                Provenance::UvConstraint,
-                "uv constraint `setuptools==84.0.0` from workspace conda fact",
-            );
-            constraint.source = format!(
-                "uv constraint `setuptools==84.0.0` from {} `precise-consuming-envs` \
-                 (conda `setuptools==84.0.0`)",
-                crate::uv_closure::LEARNED_WORKSPACE_FACT_SOURCE,
-            );
-            assert_ne!(
-                constraint.source,
-                crate::uv_closure::LEARNED_WORKSPACE_FACT_SOURCE,
-                "non-vacuity: the rendered sentence must NOT equal the constant, or this \
-                 guard cannot catch the equality-vs-substring defect it exists for",
-            );
-            constraint
-        };
-        let flashrl = || {
-            constraint(
-                "<=65",
-                Provenance::IndexWheelMetadata,
-                "wheel `FlashRL==0.1.0` Requires-Dist `setuptools<=65`",
-            )
-        };
-        let constraints = vec![
-            learned(),
-            constraint(
-                "!=50.0.0",
-                Provenance::IndexWheelMetadata,
-                "wheel `dm_control==1.0.45` Requires-Dist `setuptools!=50.0.0`",
-            ),
-            constraint(
-                ">=41.0.0",
-                Provenance::IndexWheelMetadata,
-                "wheel `tensorboard==2.21.0` Requires-Dist `setuptools>=41.0.0`",
-            ),
-            constraint(
-                "",
-                Provenance::IndexWheelMetadata,
-                "wheel `sapien==3.0.3` Requires-Dist `setuptools`",
-            ),
-            flashrl(),
-        ];
+        let learned = flashsac_learned_setuptools_fact;
+        let flashrl = flashsac_flashrl_cap;
+        let constraints = flashsac_measured_clauses();
 
         let specifiers = finalize(&PypiKey::from_pypi("setuptools"), &constraints)
             .expect("the LEARNED fact must yield rather than fail the pack");
@@ -1012,6 +1147,7 @@ mod tests {
             .expect_err("the measured clause set is unsatisfiable unless the learned fact yields");
     }
 
+    #[test]
     fn advisory_only_conflict_still_errors() {
         let constraints = vec![
             constraint(
@@ -1178,6 +1314,141 @@ mod tests {
         assert_eq!(
             format!("{unrelated:#}"),
             "fetching metadata: network unavailable"
+        );
+    }
+
+    /// Capture WARN-level rows written by `body`, exactly as an arm's backend
+    /// log records them.
+    fn captured_rows<T>(body: impl FnOnce() -> T) -> (T, String) {
+        #[derive(Clone)]
+        struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer({
+                let buffer = std::sync::Arc::clone(&buffer);
+                move || Sink(std::sync::Arc::clone(&buffer))
+            })
+            .finish();
+        let value = tracing::subscriber::with_default(subscriber, body);
+        let text = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+        (value, text)
+    }
+
+    /// p6aa guard, boarded p6z-1. THE YIELD MUST LEAVE A ROW WHERE IT IS
+    /// APPLIED, AND THE QUIET ORACLE IS WHERE IT WAS APPLIED.
+    ///
+    /// RED on `f59aa35`: both p6z pair-2 arms (5787087 / 5787088) resolved
+    /// `flashsac-pack` with all thirteen detected roots and printed NO yield
+    /// row at all, because the yield fired inside `finalize_quiet` during
+    /// candidate evaluation and the committed path never met the conflict.
+    /// `finalize_quiet` is the entry point this guard drives, and before this
+    /// commit it wrote nothing.
+    ///
+    /// The clause set is §25.5's measured one, reused through the same
+    /// fixture builders so the two guards cannot drift apart.
+    #[test]
+    fn p6aa_a_the_learned_fact_yield_writes_its_applied_row_from_the_quiet_oracle() {
+        let constraints = flashsac_measured_clauses();
+        let package = PypiKey::from_pypi("setuptools");
+
+        // The bundle name is not decoration: the operator reading this row
+        // needs to know WHICH pack's outcome the policy changed, and
+        // `finalize_impl` learns that only from the scope
+        // `produce_output_with_conflicts` enters.
+        let (result, rows) = captured_rows(|| {
+            let _scope = ActiveBundleScope::enter("flashsac-pack");
+            finalize_quiet(&package, &constraints)
+        });
+        result.expect("the LEARNED fact must yield rather than fail the pack");
+
+        assert!(
+            rows.contains("learned_fact_yielded"),
+            "the quiet oracle applied the yield and must say so; rows were:\n{rows}",
+        );
+        assert!(
+            rows.contains("bundle=flashsac-pack"),
+            "the row must name the pack whose outcome changed; rows were:\n{rows}",
+        );
+        assert!(
+            rows.contains("package=setuptools"),
+            "the row must name the package it decided; rows were:\n{rows}",
+        );
+        assert!(
+            rows.contains("reason=satisfiable-only-without-it"),
+            "the row must state WHY the clause yielded -- dropping it alone is \
+             what makes the request satisfiable; rows were:\n{rows}",
+        );
+        assert!(
+            rows.contains("setuptools==84.0.0"),
+            "the row must quote the clause that yielded, not just its package; \
+             rows were:\n{rows}",
+        );
+
+        // NON-VACUITY 1: the row is not written for a finalization that never
+        // yields. A satisfiable set takes the early return and says nothing.
+        let (ok, quiet_rows) = captured_rows(|| {
+            let _scope = ActiveBundleScope::enter("flashsac-pack");
+            finalize_quiet(
+                &PypiKey::from_pypi("setuptools"),
+                &[constraint(
+                    ">=41.0.0",
+                    Provenance::IndexWheelMetadata,
+                    "wheel `tensorboard==2.21.0` Requires-Dist `setuptools>=41.0.0`",
+                )],
+            )
+        });
+        ok.expect("a satisfiable set finalizes");
+        assert!(
+            !quiet_rows.contains("learned_fact_yielded"),
+            "a finalization that applied no yield must write no row: {quiet_rows}",
+        );
+
+        // NON-VACUITY 2: the scope really is what supplies the name. Outside
+        // one the row is honest about not knowing rather than blaming a pack.
+        let (_, unscoped) = captured_rows(|| {
+            finalize_quiet(&PypiKey::from_pypi("setuptools-unscoped-probe"), &{
+                let mut probe = flashsac_measured_clauses();
+                probe.push(constraint(
+                    "",
+                    Provenance::IndexWheelMetadata,
+                    "wheel `probe==1.0` Requires-Dist `setuptools`",
+                ));
+                probe
+            })
+        });
+        assert!(
+            unscoped.contains("bundle=<unknown>"),
+            "with no scope entered the row must say `<unknown>`, never a stale \
+             or invented pack: {unscoped}",
+        );
+
+        // NON-VACUITY 3: the LOUD entry point keeps its prose diagnostic. The
+        // applied-row is an addition, not a replacement -- deleting the
+        // committed-path WARN would still be a regression.
+        let (loud, loud_rows) = captured_rows(|| {
+            let _scope = ActiveBundleScope::enter("flashsac-pack-loud");
+            finalize(&PypiKey::from_pypi("setuptools-loud-probe"), &constraints)
+        });
+        loud.expect("the loud path yields too");
+        assert!(
+            loud_rows.contains("a LEARNED workspace fact contradicted a hard requirement"),
+            "the committed path's prose diagnostic must survive: {loud_rows}",
+        );
+        assert!(
+            loud_rows.contains("learned_fact_yielded"),
+            "and the applied-row is written on the loud path as well: {loud_rows}",
         );
     }
 }

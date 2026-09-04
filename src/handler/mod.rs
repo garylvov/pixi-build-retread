@@ -20798,6 +20798,15 @@ fn produce_output_with_conflicts(
     // (today's behaviour, always chosen when RETREAD_INCREMENTAL is unset).
     version_override: Option<&str>,
 ) -> Result<ProducedOutput> {
+    // p6z-1. NAME THE PACK FOR THE RECONCILER'S ROWS.
+    //
+    // This function is the single production entry into the emission
+    // reconciler (`relax_decision::decide_for_emission` -> `constraint::
+    // finalize_*`), and the reconciler decides one PACKAGE at a time with no
+    // idea which pack it is deciding for. Without this scope the learned-fact
+    // yield's applied-row cannot name `flashsac-pack`, which is the one thing
+    // an operator reading it needs. Held for the whole body, restored on drop.
+    let _bundle_scope = crate::constraint::ActiveBundleScope::enter(&bundle.conda_name);
     // Python version for the emitted variant/build/`python` dep. Shared with
     // the build recipe via `emit_python_version` so the metadata and the
     // recipe can never disagree. NEVER bare-major: a `py3-none-manylinux`
