@@ -9707,6 +9707,19 @@ fn bundle_conda_contribution(
     contribution
 }
 
+/// The folded contribution, rendered `name spec` for the `p6n pass=` rows.
+///
+/// §16.6 boarded this: `folded=N` alone cannot distinguish "folded the pack's
+/// own hand pins" from "folded a workspace repair floor". Reading the 5727660
+/// sentry-sdk regression from a count took a repodata grep and a hunt through
+/// `imprint-data/.retread/auto-overrides.json`; the names belong in the row.
+fn p6n_folded_names(contribution: &BTreeMap<String, String>) -> Vec<String> {
+    contribution
+        .iter()
+        .map(|(name, spec)| format!("{name} {spec}"))
+        .collect()
+}
+
 /// p6n. Which learned conda versions moved between two fact passes, as
 /// `name old->new` rows (`(none)` for a name the earlier pass never learned).
 ///
@@ -9980,6 +9993,7 @@ async fn uv_group_closure(
         bundle = %group_name,
         pass = 1,
         folded = p6n_pass1_contribution.len(),
+        folded_names = ?p6n_folded_names(&p6n_pass1_contribution),
         learned = workspace_facts.common_selected_versions.len(),
         "p6n pass=1 workspace conda facts",
     );
@@ -11062,6 +11076,7 @@ async fn uv_group_closure(
             tracing::info!(
                 bundle = %group_name,
                 folded = contribution.len(),
+                folded_names = ?p6n_folded_names(&contribution),
                 "p6n pass=2 learned_moved=[] (the folded solve abstained; pass 1 facts stand)",
             );
             break;
@@ -11080,6 +11095,7 @@ async fn uv_group_closure(
             bundle = %group_name,
             pass = 2,
             folded = contribution.len(),
+            folded_names = ?p6n_folded_names(&contribution),
             learned = refolded.common_selected_versions.len(),
             learned_moved = ?moves,
             "p6n pass=2 workspace conda facts",
@@ -12327,6 +12343,44 @@ gpu = { features = ["gpu"], no-default-feature = true }
         assert_eq!(super::exact_contribution_version("==not-a-version"), None);
         assert_eq!(super::exact_contribution_version("*"), None);
         assert_eq!(super::exact_contribution_version(""), None);
+    }
+
+    /// (§16.6, boarded then closed) The `p6n pass=` row must name WHICH names
+    /// were folded, not just how many.
+    ///
+    /// Reading the 5727660 sentry-sdk regression from `folded=5` alone took a
+    /// repodata grep plus a hunt through `imprint-data/.retread/
+    /// auto-overrides.json`, because a count cannot tell "folded the pack's
+    /// own hand pins" from "folded a workspace repair floor". With the names
+    /// in the row, the same two runs read off it directly:
+    /// `folded_names=["ray-core ==2.49.1", "sentry-sdk >=2.0.0", ...]`
+    /// against `folded_names=["ray-core ==2.49.1", ...]`.
+    #[test]
+    fn p6n_the_folded_row_names_the_specs_it_folded_not_only_how_many() {
+        // The floor-bearing contribution as f69f41a would have built it --
+        // the exact map whose `folded=5` was unreadable in 5727660.
+        let with_floor = BTreeMap::from([
+            ("ray-core".to_string(), "==2.49.1".to_string()),
+            ("sentry-sdk".to_string(), ">=2.0.0".to_string()),
+        ]);
+        assert_eq!(
+            super::p6n_folded_names(&with_floor),
+            vec![
+                "ray-core ==2.49.1".to_string(),
+                "sentry-sdk >=2.0.0".to_string(),
+            ],
+            "the row must render every folded name WITH its spec, so a floor is \
+             distinguishable from a hand pin without opening the repair ledger",
+        );
+        // And on p6n-b's contribution the row is one line shorter, which is
+        // the whole delta 5739415 measured against 5727660.
+        let exact_only =
+            BTreeMap::from([("ray-core".to_string(), "==2.49.1".to_string())]);
+        assert_eq!(
+            super::p6n_folded_names(&exact_only),
+            vec!["ray-core ==2.49.1".to_string()],
+        );
+        assert!(super::p6n_folded_names(&BTreeMap::new()).is_empty());
     }
 
     /// The decisive assertion: the learned fact for the second name is the
