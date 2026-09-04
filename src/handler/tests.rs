@@ -733,6 +733,7 @@ fn pythons_for_rejects_bare_major_variant() {
         ledger_overrides: Default::default(),
         pack_manifest_path: None,
         auto_imports: None,
+        verify_snapshots: None,
         parallel_probes: None,
     };
     let result = pythons_for(&cfg, Some(&variants));
@@ -788,6 +789,7 @@ fn pythons_for_accepts_dotted_variant() {
         ledger_overrides: Default::default(),
         pack_manifest_path: None,
         auto_imports: None,
+        verify_snapshots: None,
         parallel_probes: None,
     };
     let result = pythons_for(&cfg, Some(&variants));
@@ -843,6 +845,7 @@ fn pythons_for_filters_bare_major_keeps_dotted() {
         ledger_overrides: Default::default(),
         pack_manifest_path: None,
         auto_imports: None,
+        verify_snapshots: None,
         parallel_probes: None,
     };
     let result = pythons_for(&cfg, Some(&variants));
@@ -3617,6 +3620,7 @@ fn cfg() -> RetreadConfig {
         ledger_overrides: Default::default(),
         pack_manifest_path: None,
         auto_imports: None,
+        verify_snapshots: None,
         parallel_probes: None,
     }
 }
@@ -10718,6 +10722,44 @@ fn store_key_for(
     source_dir: &std::path::Path,
     effective: &RetreadConfig,
 ) -> String {
+    store_key_full(workspace_dir, source_dir, effective).key
+}
+
+/// The absolute-path-carrying solve fingerprint production produces, restated
+/// so the key's path redaction is actually exercised.
+fn store_key_solve_fingerprint(
+    workspace_dir: &std::path::Path,
+    source_dir: &std::path::Path,
+) -> String {
+    format!(
+        "co-activated-sibling:{}/packs/two/retread-linux-64-py3.11.lock\nsource:{}",
+        workspace_dir.display(),
+        source_dir.display(),
+    )
+}
+
+fn store_key_material_for(
+    workspace_dir: &std::path::Path,
+    source_dir: &std::path::Path,
+    effective: &RetreadConfig,
+) -> Vec<String> {
+    built_output_store_key_material(
+        &store_key_params(),
+        "none",
+        &ResolutionTarget::for_subdir("3.11", "linux-64"),
+        None,
+        &store_key_solve_fingerprint(workspace_dir, source_dir),
+        Some(workspace_dir),
+        source_dir,
+        effective,
+    )
+}
+
+fn store_key_full(
+    workspace_dir: &std::path::Path,
+    source_dir: &std::path::Path,
+    effective: &RetreadConfig,
+) -> BuiltOutputStoreKey {
     let target = ResolutionTarget::for_subdir("3.11", "linux-64");
     // Production's workspace solve fingerprint carries ABSOLUTE paths:
     // `coactivated_sibling_packs` canonicalizes every sibling pack directory
@@ -10814,13 +10856,14 @@ fn built_output_store_key_is_workspace_path_and_mtime_free() {
         "two sibling packs in one workspace must not share a store key"
     );
 
-    // The backend's own identity is in the key, so a backend change
-    // invalidates every entry rather than serving a stale render.
-    let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
-    sha2::Digest::update(&mut hasher, backend_build_identity().as_bytes());
+    // C11: the backend's BEHAVIOUR identity is in the key -- not its build
+    // identity. The git-hash-freeness of the key is guarded separately in
+    // `c11_the_store_key_carries_no_backend_git_hash`; here we only state that
+    // the behaviour identity is non-empty, since an empty one would make the
+    // component vacuous.
     assert!(
-        !backend_build_identity().is_empty(),
-        "backend build identity must be non-empty for the key to carry it"
+        !backend_behaviour_identity().is_empty(),
+        "backend behaviour identity must be non-empty for the key to carry it"
     );
 
     for dir in [ws_a, ws_b, ws_c, ws_d, ws_e] {
@@ -10848,34 +10891,48 @@ async fn built_output_store_hit_serves_the_same_result_a_cold_compute_produced()
 
     // Job 1: a cold compute in workspace A publishes its result.
     let (ws_a, pack_a) = stage_store_key_workspace("hit-a", WS_MANIFEST, PACK_MANIFEST, "packs/one");
-    let key_a = store_key_for(&ws_a, &pack_a, &cfg());
+    let key_a = store_key_full(&ws_a, &pack_a, &cfg());
     let result = CondaOutputsResult {
         outputs: Default::default(),
         input_globs: Default::default(),
     };
-    let payload = serde_json::to_vec(&result).unwrap();
+    let payload = crate::built_output_store::encode(
+        &key_a.inputs_digest,
+        backend_build_identity(),
+        &result,
+        &Vec::<AdvertisedIdentityRecord>::new(),
+    )
+    .unwrap();
     assert_eq!(
-        store.get(&key_a).0,
+        store.get(&key_a.key).0,
         crate::built_output_store::Lookup::Miss,
         "the first job must miss"
     );
-    assert!(store.publish(&key_a, &payload).unwrap());
+    assert!(store.publish(&key_a.key, &payload).unwrap());
 
     // Job 2: a FRESH workspace at a different path, the case that measured as
     // a full cold relock today. It must hit, and adopt the identical result.
     std::thread::sleep(std::time::Duration::from_millis(20));
     let (ws_b, pack_b) = stage_store_key_workspace("hit-b", WS_MANIFEST, PACK_MANIFEST, "packs/one");
-    let key_b = store_key_for(&ws_b, &pack_b, &cfg());
-    let (lookup, bytes) = store.get(&key_b);
+    let key_b = store_key_full(&ws_b, &pack_b, &cfg());
+    let (lookup, bytes) = store.get(&key_b.key);
     assert_eq!(
         lookup,
         crate::built_output_store::Lookup::Hit,
         "a fresh workspace with identical content must hit the shared store"
     );
-    let adopted: CondaOutputsResult = serde_json::from_slice(&bytes.unwrap()).unwrap();
+    let accepted = crate::built_output_store::decode(&bytes.unwrap(), &key_b.inputs_digest)
+        .expect("a record this backend wrote must be accepted by this backend");
+    let adopted: CondaOutputsResult = serde_json::from_value(accepted.payload).unwrap();
     assert_eq!(adopted.outputs.len(), result.outputs.len());
     assert_eq!(
-        serde_json::to_vec(&adopted).unwrap(),
+        crate::built_output_store::encode(
+            &key_b.inputs_digest,
+            backend_build_identity(),
+            &adopted,
+            &Vec::<AdvertisedIdentityRecord>::new(),
+        )
+        .unwrap(),
         payload,
         "the adopted result must be byte-identical to what the cold compute published"
     );
@@ -10901,6 +10958,288 @@ async fn built_output_store_hit_serves_the_same_result_a_cold_compute_produced()
     for dir in [store_root, ws_a, ws_b] {
         let _ = std::fs::remove_dir_all(dir);
     }
+}
+
+// -----------------------------------------------------------------
+// C11: the shared built-output store is keyed on BEHAVIOUR, not on the
+// backend's git hash.
+//
+// Measured on two consecutive canonical 27-environment relocks (`me1b-relock`
+// 5719937 and `mf1-relock` 5723776): `built_output_store miss=14 hit=0` on
+// both, with 139 warm entries in the shared root that no run could reach,
+// because `backend_build_identity()` = CARGO_PKG_VERSION + RETREAD_GIT_HASH
+// was folded into the key TWICE -- once directly and once inside the restated
+// memo key -- so every rebuild re-addressed the whole store.
+//
+// The property the hash was buying is stated in the key's own doc comment: a
+// backend change must make old entries "unreachable rather than misreadable".
+// C11 keeps the second half and drops the first: the key folds
+// `backend_behaviour_identity()`, and the RECORD carries the schema, the
+// emission schema and the full input digest, all re-checked on read.
+// -----------------------------------------------------------------
+
+/// Guard (a): same inputs, a different backend GIT HASH -> the same address.
+///
+/// The git hash is a compile-time constant, so this cannot vary it; it states
+/// the stronger structural fact instead -- the hash's VALUE appears nowhere in
+/// the material the key is hashed from, so no build of any commit can move the
+/// address. RED on the pre-C11 tip, where the value is present twice.
+#[test]
+fn c11_the_store_key_carries_no_backend_git_hash() {
+    const WS_MANIFEST: &str = "[workspace]\nname = \"c11\"\n";
+    const PACK_MANIFEST: &str = "[package]\nname = \"c11-pack\"\n";
+    let (ws, pack) = stage_store_key_workspace("c11-a", WS_MANIFEST, PACK_MANIFEST, "packs/one");
+
+    let material = store_key_material_for(&ws, &pack, &cfg());
+
+    // NON-VACUITY: the hash must be a real, findable string, or "it is absent"
+    // is trivially true.
+    let git_hash = env!("RETREAD_GIT_HASH");
+    assert!(
+        !git_hash.is_empty() && git_hash != "unknown",
+        "this build has no usable git hash (`{git_hash}`), so this guard cannot fail; \
+         build from a git checkout"
+    );
+    assert!(
+        backend_build_identity().contains(git_hash),
+        "the memo key's identity must still carry the git hash: `{}`",
+        backend_build_identity()
+    );
+
+    for (index, part) in material.iter().enumerate() {
+        assert!(
+            !part.contains(git_hash),
+            "store key material[{index}] carries the backend git hash `{git_hash}`, so every \
+             rebuild re-addresses the whole store: `{part}`"
+        );
+    }
+
+    // And the thing that replaced it is present, in full.
+    let behaviour = backend_behaviour_identity();
+    assert!(
+        material.contains(&behaviour),
+        "the store key material must carry the behaviour identity `{behaviour}`: {material:?}"
+    );
+    assert!(
+        behaviour.contains(env!("CARGO_PKG_VERSION"))
+            && behaviour.contains(crate::built_output_store::BUILT_OUTPUT_SCHEMA)
+            && behaviour.contains(crate::uv_closure::REQUIRED_UV),
+        "the behaviour identity must carry the crate version, the emission schema and the \
+         pinned uv version: `{behaviour}`"
+    );
+
+    // The address is the truncation of the digest the record carries, so the
+    // record's check is genuinely independent of the directory name.
+    let key = store_key_full(&ws, &pack, &cfg());
+    assert_eq!(key.inputs_digest.len(), 64);
+    assert_eq!(key.key.len(), 32);
+    assert!(key.inputs_digest.starts_with(&key.key));
+
+    let _ = std::fs::remove_dir_all(ws);
+}
+
+/// Guard (b): ANY input digest component moves the address.
+///
+/// Perturbs each component of the real material and re-addresses through the
+/// same `built_output_store_key_from_material` production uses, so a component
+/// that stopped being hashed fails here instead of passing against a local
+/// copy of the hash.
+#[test]
+fn c11_every_key_material_component_moves_the_address() {
+    const WS_MANIFEST: &str = "[workspace]\nname = \"c11b\"\n";
+    const PACK_MANIFEST: &str = "[package]\nname = \"c11b-pack\"\n";
+    let (ws, pack) = stage_store_key_workspace("c11-b", WS_MANIFEST, PACK_MANIFEST, "packs/one");
+
+    let material = store_key_material_for(&ws, &pack, &cfg());
+    let base = built_output_store_key_from_material(&material);
+    assert_eq!(
+        base,
+        store_key_full(&ws, &pack, &cfg()),
+        "the material path and the production key path must agree exactly"
+    );
+    assert!(
+        material.len() >= 7,
+        "the key must still hash every declared component, got {material:?}"
+    );
+
+    for index in 0..material.len() {
+        let mut perturbed = material.clone();
+        perturbed[index] = format!("{}~c11", perturbed[index]);
+        let moved = built_output_store_key_from_material(&perturbed);
+        assert_ne!(
+            base.key, moved.key,
+            "component {index} (`{}`) does not reach the store address",
+            material[index]
+        );
+        assert_ne!(
+            base.inputs_digest, moved.inputs_digest,
+            "component {index} does not reach the record's input digest"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(ws);
+}
+
+/// Guard (c): a bump of the hand-maintained emission-schema constant is a
+/// MISS, on both halves -- a new address AND a refusal of any record found at
+/// the old one.
+#[test]
+fn c11_an_emission_schema_bump_is_a_miss() {
+    const WS_MANIFEST: &str = "[workspace]\nname = \"c11c\"\n";
+    const PACK_MANIFEST: &str = "[package]\nname = \"c11c-pack\"\n";
+    let (ws, pack) = stage_store_key_workspace("c11-c", WS_MANIFEST, PACK_MANIFEST, "packs/one");
+
+    let material = store_key_material_for(&ws, &pack, &cfg());
+    let before = built_output_store_key_from_material(&material);
+
+    // The identity is one whole component, so a bump of the constant inside it
+    // is exactly a substitution of that component.
+    let behaviour = backend_behaviour_identity();
+    let index = material
+        .iter()
+        .position(|part| *part == behaviour)
+        .expect("the behaviour identity is a key component");
+    let mut bumped = material.clone();
+    bumped[index] = behaviour.replace(
+        crate::built_output_store::BUILT_OUTPUT_SCHEMA,
+        "retread-built-output-emission-99",
+    );
+    assert_ne!(
+        bumped[index], material[index],
+        "the substitution must actually change the identity: `{behaviour}`"
+    );
+    let after = built_output_store_key_from_material(&bumped);
+    assert_ne!(
+        before.key, after.key,
+        "bumping the emission schema must re-address every entry"
+    );
+
+    // Second half: even at an address that somehow collided, the record from
+    // the pre-bump binary is refused rather than adopted.
+    let published = crate::built_output_store::encode(
+        &before.inputs_digest,
+        backend_build_identity(),
+        &serde_json::json!({"outputs": []}),
+        &serde_json::json!([]),
+    )
+    .unwrap();
+    assert!(
+        crate::built_output_store::decode(&published, &after.inputs_digest).is_err(),
+        "a pre-bump record must be refused at a post-bump lookup"
+    );
+
+    let _ = std::fs::remove_dir_all(ws);
+}
+
+/// C11 / p19 follow-on: a store ADOPTION must leave the same
+/// `advertised_identity` records a cold compute leaves.
+///
+/// `conda/build_v1`'s `validate_advertised_courier_build` reads exactly this
+/// record and can only `Err`. Job 5723770 (`p19-depadd`) adopted 14 of 14
+/// outputs from the shared store, wrote no record, and then refused to build:
+/// `courier inputs changed between conda/outputs and conda/build_v1 ... pixi
+/// requested build py311_h2cb6c52e99_loose_5, but current inputs ... require
+/// py311_h8ea3313da6_loose_5`. C11 makes adoptions reachable ACROSS binaries,
+/// so this stops being an occasional race and becomes the normal path.
+///
+/// Drives the real production writer through the real production restore
+/// function and reads back with the real production loader.
+#[tokio::test]
+async fn c11_an_adopted_output_restores_the_cold_passs_advertised_identity() {
+    let root = std::env::temp_dir().join(format!(
+        "retread-c11-adv-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    let cache_dir = root.join("cache");
+    let source_dir = root.join("pack");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    std::fs::create_dir_all(&source_dir).unwrap();
+    let config = cfg();
+
+    let record = AdvertisedIdentityRecord {
+        schema: advertised_identity::SCHEMA,
+        name: "isaaclab-2-3x-pack".to_string(),
+        version: "0.54.2".to_string(),
+        build: "py311_h2cb6c52e99_loose_5".to_string(),
+        subdir: "linux-64".to_string(),
+        target_identity: ResolutionTarget::for_subdir("3.11", "linux-64").resolution_identity(),
+        python_version: "3.11".to_string(),
+        workspace_fp: "the-producing-workspace-fingerprint".to_string(),
+        run_depends: vec!["python 3.11.*".to_string()],
+        run_constrains: vec![],
+    };
+
+    // The record travels inside the store record, exactly as production
+    // publishes and adopts it.
+    let bytes = crate::built_output_store::encode(
+        "digest",
+        backend_build_identity(),
+        &serde_json::json!({"outputs": []}),
+        &vec![record.clone()],
+    )
+    .unwrap();
+    let accepted = crate::built_output_store::decode(&bytes, "digest").unwrap();
+    let carried: Vec<AdvertisedIdentityRecord> =
+        serde_json::from_value(accepted.advertised).unwrap();
+    assert_eq!(carried, vec![record.clone()], "the record must survive the store");
+
+    // NON-VACUITY: before the restore, the loader finds nothing -- so a pass
+    // that skipped it really would leave `conda/build_v1` with no record.
+    let relax = advertised_identity::relax_digest(&config);
+    assert!(
+        advertised_identity::load_record(
+            &cache_dir,
+            &source_dir,
+            &record.name,
+            Some(&record.version),
+            &record.subdir,
+            &record.build,
+            &record.target_identity,
+            &record.python_version,
+            &relax,
+        )
+        .await
+        .is_none(),
+        "the fixture must start with no record, or the guard proves nothing"
+    );
+
+    let restored =
+        restore_advertised_identities(&cache_dir, &source_dir, &config, &carried).await;
+    assert_eq!(restored, 1);
+
+    let loaded = advertised_identity::load_record(
+        &cache_dir,
+        &source_dir,
+        &record.name,
+        Some(&record.version),
+        &record.subdir,
+        &record.build,
+        &record.target_identity,
+        &record.python_version,
+        &relax,
+    )
+    .await
+    .expect("an adopted output must leave the record conda/build_v1 reads");
+    assert_eq!(
+        loaded, record,
+        "the restored record must be the one the cold pass advertised"
+    );
+    assert!(
+        loaded.describes(
+            &record.name,
+            Some(&record.version),
+            &record.subdir,
+            &record.target_identity,
+            &record.python_version,
+        ),
+        "the restored record must satisfy the check conda/build_v1 applies"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 // -----------------------------------------------------------------
@@ -11771,4 +12110,421 @@ fn p6t_an_ambiguous_module_is_refused_rather_than_arbitrated() {
         },
     ]);
     assert_eq!(ranked.lookup("viser").unwrap().root_specifier(), "viser==0.2.7");
+}
+
+// -----------------------------------------------------------------
+// C14: component 5 of the built-output store key is a PER-PACK PROJECTION
+// of the workspace manifest, not a digest of the whole file.
+//
+// The measured defect (`p19c-depadd` 5733263): every single-dependency-add
+// step read `built_output_store hit=0 miss=14`. One added line in one
+// feature moved `file_digest(workspace_dir/"pixi.toml")`, and every pack's
+// address folded that one digest. These guards pin the replacement's two
+// halves: what must STILL move a key (or the store serves a stale
+// resolution), and what must now stop moving it (or the store is worthless
+// for a dep-add).
+// -----------------------------------------------------------------
+
+/// A workspace holding four packs. `pack-a`, `pack-b` and `pack-c` are
+/// declared by ONE feature that ONE env activates; `pack-d` is declared by a
+/// feature of its own; `unrelated` is activated by an env that consumes no
+/// pack at all.
+const C14_WS: &str = r#"
+[workspace]
+name = "c14"
+channels = ["https://prefix.dev/conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+python = "==3.11"
+
+[pypi-options]
+extra-index-urls = ["https://pypi.org/simple"]
+
+[system-requirements]
+libc = "2.34"
+
+[feature.shared.dependencies]
+"pack-a" = { path = "./packs/a" }
+"pack-b" = { path = "./packs/b" }
+"pack-c" = { path = "./packs/c" }
+
+[feature.solo.dependencies]
+"pack-d" = { path = "./packs/d" }
+
+[feature.extra.dependencies]
+zlib = ">=1.2"
+
+[feature.unrelated.dependencies]
+ripgrep = ">=14"
+
+[feature.unrelated.pypi-dependencies]
+tabulate = "*"
+
+[environments]
+main = { features = ["shared", "extra"] }
+solo = { features = ["solo"] }
+side = { features = ["unrelated"] }
+"#;
+
+const C14_PACK: &str = "[package]\nname = \"c14-pack\"\n";
+
+/// Stage the four-pack workspace and return (workspace_dir, [pack dirs in
+/// a,b,c,d order]).
+fn c14_stage(tag: &str, ws_manifest: &str) -> (std::path::PathBuf, Vec<std::path::PathBuf>) {
+    let ws = std::env::temp_dir().join(format!(
+        "retread-c14-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::write(ws.join("pixi.toml"), ws_manifest).unwrap();
+    let mut packs = Vec::new();
+    for name in ["a", "b", "c", "d"] {
+        let pack = ws.join("packs").join(name);
+        std::fs::create_dir_all(&pack).unwrap();
+        std::fs::write(pack.join("pixi.toml"), C14_PACK).unwrap();
+        packs.push(pack);
+    }
+    (ws, packs)
+}
+
+/// The four packs' store addresses under `ws_manifest`, and an assertion that
+/// every one of them was actually PROJECTED. Without that assertion a
+/// fixture that fails to declare a consuming env would fall back to the
+/// whole-file digest and every guard below would pass for the wrong reason.
+fn c14_keys(tag: &str, ws_manifest: &str) -> Vec<String> {
+    let (ws, packs) = c14_stage(tag, ws_manifest);
+    let target = ResolutionTarget::for_subdir("3.11", "linux-64");
+    let keys = packs
+        .iter()
+        .map(|pack| {
+            let (_, scope) = workspace_manifest_projection(Some(&ws), pack, &target);
+            assert_eq!(
+                scope,
+                "projected",
+                "fixture pack {} fell back to the whole-file digest ({scope}); the guard would be vacuous",
+                pack.display()
+            );
+            store_key_for(&ws, pack, &cfg())
+        })
+        .collect();
+    std::fs::remove_dir_all(&ws).ok();
+    keys
+}
+
+/// Which of the four addresses moved between two manifests.
+fn c14_moved(tag: &str, edited: &str) -> Vec<usize> {
+    let base = c14_keys(&format!("{tag}-base"), C14_WS);
+    let after = c14_keys(&format!("{tag}-edit"), edited);
+    assert_eq!(base.len(), 4);
+    (0..4).filter(|i| base[*i] != after[*i]).collect()
+}
+
+#[test]
+fn c14_a_dep_added_to_a_feature_that_reaches_one_pack_moves_only_that_packs_key() {
+    let edited = C14_WS.replace(
+        "[feature.solo.dependencies]",
+        "[feature.solo.dependencies]\nsqlite = \">=3.45\"",
+    );
+    assert_ne!(edited, C14_WS, "the edit must actually change the manifest");
+    assert_eq!(
+        c14_moved("one", &edited),
+        vec![3],
+        "a dependency added to `solo` -- the only feature that declares pack-d -- must move pack-d's address and NOTHING else"
+    );
+}
+
+#[test]
+fn c14_a_dep_added_to_a_feature_that_reaches_three_packs_moves_exactly_three_keys() {
+    let edited = C14_WS.replace(
+        "[feature.shared.dependencies]",
+        "[feature.shared.dependencies]\nsqlite = \">=3.45\"",
+    );
+    assert_ne!(edited, C14_WS);
+    assert_eq!(
+        c14_moved("three", &edited),
+        vec![0, 1, 2],
+        "a dependency added to `shared` must move exactly the three packs that feature declares"
+    );
+}
+
+#[test]
+fn c14_a_workspace_level_table_change_moves_every_key() {
+    for edited in [
+        C14_WS.replace(
+            "channels = [\"https://prefix.dev/conda-forge\"]",
+            "channels = [\"https://prefix.dev/conda-forge\", \"https://prefix.dev/pytorch\"]",
+        ),
+        C14_WS.replace("platforms = [\"linux-64\"]", "platforms = [\"linux-64\", \"osx-64\"]"),
+        C14_WS.replace("libc = \"2.34\"", "libc = \"2.35\""),
+        C14_WS.replace("python = \"==3.11\"", "python = \"==3.11.9\""),
+    ] {
+        assert_ne!(edited, C14_WS);
+        assert_eq!(
+            c14_moved("ws", &edited),
+            vec![0, 1, 2, 3],
+            "a workspace-level table reaches every pack and must move every address"
+        );
+    }
+}
+
+#[test]
+fn c14_a_dep_added_to_a_feature_no_consuming_env_activates_moves_no_key() {
+    // This is the whole win, and it is the assertion most likely to become a
+    // WRONG HIT if the projection is ever widened by accident: `unrelated` is
+    // activated only by env `side`, which declares no pack, so its conda
+    // dependency table cannot reach any pack's `conda/outputs`.
+    let edited = C14_WS.replace(
+        "[feature.unrelated.dependencies]",
+        "[feature.unrelated.dependencies]\nsqlite = \">=3.45\"",
+    );
+    assert_ne!(edited, C14_WS);
+    assert!(
+        c14_moved("unrelated", &edited).is_empty(),
+        "a dependency in a feature no consuming env activates must move NO pack address -- this is the dep-add case the whole-file digest broke"
+    );
+}
+
+#[test]
+fn c14_a_star_pypi_spec_moves_no_key_but_a_real_one_moves_every_key() {
+    // `declared_pypi_specs_anywhere` unions EVERY feature's
+    // `[pypi-dependencies]` and reaches emission through
+    // `Bundle::workspace_declared_pypi_specs`, so it is workspace-wide by
+    // construction and is in the projection. Both of its consumers drop a
+    // spec that is empty or `*` before using it, so a bare `name = "*"` --
+    // which is also how a path/url/git declaration is spelled in that map --
+    // cannot change an emitted byte, and the projection must not move on one.
+    let star = C14_WS.replace(
+        "[feature.unrelated.pypi-dependencies]",
+        "[feature.unrelated.pypi-dependencies]\nrich = \"*\"",
+    );
+    assert_ne!(star, C14_WS);
+    assert!(
+        c14_moved("star", &star).is_empty(),
+        "a `*` pypi declaration is filtered out by every consumer and must not move an address"
+    );
+
+    let real = C14_WS.replace(
+        "[feature.unrelated.pypi-dependencies]",
+        "[feature.unrelated.pypi-dependencies]\nrich = \">=13\"",
+    );
+    assert_ne!(real, C14_WS);
+    assert_eq!(
+        c14_moved("real", &real),
+        vec![0, 1, 2, 3],
+        "a CONSTRAINED pypi declaration anywhere can become an injected root's emitted constraint in any pack, so it must move every address"
+    );
+}
+
+#[test]
+fn c14_a_feature_index_url_anywhere_moves_every_key() {
+    // `resolution_pypi_index_urls` folds every feature's `pypi-options`,
+    // active or not, and `compute_bundles` reads it on the outputs path.
+    let edited = C14_WS.replace(
+        "[feature.unrelated.pypi-dependencies]",
+        "[feature.unrelated.pypi-options]\nextra-index-urls = [\"https://example.invalid/simple\"]\n\n[feature.unrelated.pypi-dependencies]",
+    );
+    assert_ne!(edited, C14_WS);
+    assert_eq!(
+        c14_moved("index", &edited),
+        vec![0, 1, 2, 3],
+        "an index declared by ANY feature joins every resolution chain and must move every address"
+    );
+}
+
+#[test]
+fn c14_the_projection_is_deterministic_and_path_free() {
+    // Two workspaces, same bytes, different absolute paths and different
+    // mtimes -- and a second read of the first, which also exercises the
+    // manifest model's own mtime-keyed memo.
+    let one = c14_keys("det-1", C14_WS);
+    let two = c14_keys("det-2", C14_WS);
+    let three = c14_keys("det-3", C14_WS);
+    assert_eq!(one, two, "the projection must not depend on the workspace path or the manifest's mtime");
+    assert_eq!(one, three);
+    assert_eq!(
+        one.iter().collect::<std::collections::BTreeSet<_>>().len(),
+        4,
+        "four packs must have four distinct addresses"
+    );
+
+    // Comment and whitespace are not resolution inputs: the projection is
+    // canonical, so they render to nothing.
+    let commented = format!("# a comment the whole-file digest would have charged for\n{C14_WS}");
+    assert!(
+        c14_moved("comment", &commented).is_empty(),
+        "a comment cannot change what conda/outputs emits and must not move an address"
+    );
+}
+
+#[test]
+fn c14_a_solve_group_refuses_to_narrow_and_falls_back_to_the_whole_file() {
+    // pixi solves a solve group as ONE unit, so a group member that declares
+    // no pack still reaches this pack's resolution -- and this backend's
+    // manifest model does not carry solve groups. The projection must refuse
+    // to narrow rather than guess; a fallback costs a miss, which is the
+    // behaviour that ships today.
+    let edited = C14_WS.replace(
+        "side = { features = [\"unrelated\"] }",
+        "side = { features = [\"unrelated\"], solve-group = \"g\" }",
+    );
+    assert_ne!(edited, C14_WS);
+    let (ws, packs) = c14_stage("solvegroup", &edited);
+    let target = ResolutionTarget::for_subdir("3.11", "linux-64");
+    let (digest, scope) = workspace_manifest_projection(Some(&ws), &packs[0], &target);
+    assert_eq!(scope, "solve-group", "a solve group must refuse the narrowing");
+    assert!(
+        digest.starts_with("whole:solve-group:"),
+        "the fallback must be the whole-file digest, tagged with its reason: {digest}"
+    );
+
+    // Non-vacuity: without the solve group the SAME fixture does narrow.
+    let (ws2, packs2) = c14_stage("solvegroup-control", C14_WS);
+    let (_, scope2) = workspace_manifest_projection(Some(&ws2), &packs2[0], &target);
+    assert_eq!(scope2, "projected");
+    std::fs::remove_dir_all(&ws).ok();
+    std::fs::remove_dir_all(&ws2).ok();
+}
+
+#[test]
+fn c14_a_pack_no_env_consumes_falls_back_to_the_whole_file() {
+    // The empty consuming-env set is also the state in which
+    // `consuming_env_dependencies_for_target` widens to every feature, so
+    // narrowing there would be unsound.
+    let (ws, _) = c14_stage("orphan", C14_WS);
+    let orphan = ws.join("packs").join("orphan");
+    std::fs::create_dir_all(&orphan).unwrap();
+    std::fs::write(orphan.join("pixi.toml"), C14_PACK).unwrap();
+    let target = ResolutionTarget::for_subdir("3.11", "linux-64");
+    let (digest, scope) = workspace_manifest_projection(Some(&ws), &orphan, &target);
+    assert_eq!(scope, "no-consuming-env");
+    assert!(digest.starts_with("whole:no-consuming-env:"));
+    std::fs::remove_dir_all(&ws).ok();
+}
+
+// -----------------------------------------------------------------
+// p6p: the recompute door and the courier build-string gate ask the
+// SAME question and cannot both run.
+// -----------------------------------------------------------------
+
+/// Job 5733324 arm B, `protomotions-deps-pack=3.1`, backend log
+/// `C3B-5733324.backend.log`. Two rows, 13.6 ms apart, from one
+/// `conda/build_v1`:
+///
+/// ```text
+/// 23:54:00.835765 WARN  advertised identity: the build string drifted between the
+///   metadata and build passes (shared decision cache / sibling-lock workspace
+///   fingerprint). Run dependencies agree, so the recomputed plan is built and
+///   emitted under the ADVERTISED build string instead of refusing.
+///   advertised_build=py311_hff66755995_loose_0 recomputed_build=py311_h62689b0ab4_loose_0
+/// 23:54:00.849339 ERROR retread rpc error: ... code=-32602: courier inputs changed
+///   between conda/outputs and conda/build_v1: pixi requested build
+///   `py311_hff66755995_loose_0`, but current inputs for source bundle
+///   `protomotions-deps-pack` require `py311_h62689b0ab4_loose_0`
+/// ```
+///
+/// The p6i recompute door decided not to refuse; `validate_advertised_courier_build`
+/// then refused anyway, and pixi's `build_dispatch.rs` panicked on it. The door
+/// was a decision with no consumer.
+///
+/// This test pins WHY the two are incompatible rather than merely inconvenient:
+/// the door's entry condition (`ColdCandidateVerdict::BuildStringDrift` -- name,
+/// version and subdir agree, the build string does not) is exactly the condition
+/// under which the gate can only return `courier inputs changed`. So on every
+/// path the door opens, the gate refuses; running both makes the door
+/// unreachable by construction.
+///
+/// Falsifiable by mutation, both halves:
+///   * widen `cold_candidate_verdict` so a drifted build string is an exact
+///     match and the first assertion fails;
+///   * make `validate_advertised_courier_build` tolerate a build-string
+///     difference and the second fails.
+#[test]
+fn the_recompute_door_and_the_courier_build_gate_cannot_both_run() {
+    let (advertised_bundle, _) = advertised_and_drifted_bundles();
+    let output = emit_for_recovery(&advertised_bundle);
+
+    // Half 1 -- the door opens on a build-string-only drift. This is the state
+    // arm B was in when it logged the adoption WARN.
+    let drifted_request = pixi_build_types::procedures::conda_build_v1::CondaBuildV1Output {
+        name: output.metadata.name.clone(),
+        version: Some(output.metadata.version.clone()),
+        build: Some("py311_hff66755995_loose_0".to_string()),
+        subdir: output.metadata.subdir,
+        variant: output.metadata.variant.clone(),
+    };
+    assert_ne!(
+        Some(&output.metadata.build),
+        drifted_request.build.as_ref(),
+        "the fixture must actually differ on the build string",
+    );
+    assert_eq!(
+        cold_candidate_verdict(&output, &drifted_request),
+        ColdCandidateVerdict::BuildStringDrift,
+        "the recompute door's entry condition is a build-string-only drift",
+    );
+
+    // Half 2 -- for a request in exactly that state, and with no record for the
+    // advertised build (a shared built-output-store hit returns a cached
+    // conda/outputs result without writing one, which is how arm B got here),
+    // the courier gate has no answer but refusal.
+    let mut config = cfg();
+    config.courier = true;
+    config
+        .retread_wheels
+        .insert("protomotions-deps-pack".to_string(), WheelEntry::default());
+    let target = ResolutionTarget::for_subdir("3.11", "linux-64");
+    let source = Path::new("/source");
+    let ws = Path::new("/ws");
+    let live_fp = EffectiveWorkspaceFp::resolve(None, None, ws, source, &target);
+    let error = validate_advertised_courier_build(
+        &config,
+        "protomotions-deps-pack",
+        &target,
+        None,
+        None,
+        source,
+        &live_fp,
+        drifted_request.build.as_deref(),
+    )
+    .expect_err(
+        "a build string the current inputs do not re-derive is precisely what this gate \
+         refuses -- and it is precisely the door's entry condition",
+    );
+    assert!(
+        format!("{error:?}").contains("courier inputs changed"),
+        "{error:?}",
+    );
+
+    // Non-vacuous: the gate is not simply always-refuse. Hand it the build
+    // string the current inputs DO re-derive and it passes, so the refusal
+    // above is about the drift and nothing else.
+    let reproducible_build = courier_build_string_for_target(
+        &target,
+        &courier_inputs_hash_with_workspace_fp(
+            &config,
+            "protomotions-deps-pack",
+            &target,
+            &[],
+            None,
+            live_fp.as_str(),
+        ),
+        config.build_number,
+        config.bundle_mode == crate::config::BundleMode::Loose,
+    );
+    validate_advertised_courier_build(
+        &config,
+        "protomotions-deps-pack",
+        &target,
+        None,
+        None,
+        source,
+        &live_fp,
+        Some(&reproducible_build),
+    )
+    .expect("the gate passes a build string that re-derives from the current inputs");
 }

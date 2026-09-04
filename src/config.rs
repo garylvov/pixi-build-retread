@@ -192,6 +192,22 @@ pub struct RetreadConfig {
     #[serde(default, rename = "retread-auto-imports", alias = "auto-imports")]
     pub auto_imports: Option<bool>,
 
+    /// C13: force the FULL `git status --untracked-files=all` walk on every
+    /// canonical Git snapshot check, instead of verifying the seal a publish
+    /// wrote beside the tree.
+    ///
+    /// `None` (the key absent) is OFF, which is the sealed fast path. Turn it
+    /// on when a canonical source cache is under suspicion: the walk sees a
+    /// byte edit or a stray file ANYWHERE in the tree, where the seal sees only
+    /// the sampled set and the read-only bit.
+    ///
+    /// ```toml
+    /// [build.config]
+    /// retread-verify-snapshots = true
+    /// ```
+    #[serde(default, rename = "retread-verify-snapshots", alias = "verify-snapshots")]
+    pub verify_snapshots: Option<bool>,
+
     /// Experimental: run the conda co-solve's resolvo probes on a thread pool
     /// instead of serially.
     ///

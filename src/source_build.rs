@@ -40,6 +40,33 @@ const BUILT_WHEEL_CACHE_VERSION: &str = "v12";
 const CHECKOUT_CACHE_VERSION: &str = "v3";
 const LOCAL_SOURCE_SNAPSHOT_VERSION: &str = "v5";
 const CANONICAL_GIT_SOURCE_SCHEMA: &str = "retread-canonical-git-source-v3";
+/// C13. Bumping this makes every existing seal unreadable, which downgrades a
+/// hit to the full walk and re-seals it — never a hard failure.
+const CANONICAL_GIT_SEAL_SCHEMA: &str = "retread-canonical-git-seal-v1";
+/// How many files a cache hit re-hashes. Chosen so the check is milliseconds
+/// against the 16.5 s mean the full walk cost (C12 proof 5731815).
+const CANONICAL_GIT_SEAL_SAMPLE_LIMIT: usize = 64;
+/// A sampled file must be small enough that hashing it stays cheap. Bigger
+/// files are still counted in `entries`/`file_bytes`/`tree_digest`; they are
+/// just never the ones re-hashed on the cheap path.
+const CANONICAL_GIT_SEAL_SAMPLE_MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
+/// C13 lever (a) escape hatch, set from the `retread-verify-snapshots` config
+/// key (an argument, not an ambient environment variable). `true` makes every
+/// canonical-snapshot check take the full `git status` walk, which is exactly
+/// the pre-C13 behaviour.
+static VERIFY_SNAPSHOTS_FULL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Wire the `retread-verify-snapshots` config key into the snapshot checker.
+/// Called once per pack from the handler, next to the built-output store's own
+/// config read, so the control is a config key and not an environment variable.
+pub(crate) fn set_verify_snapshots_full(verify: bool) {
+    VERIFY_SNAPSHOTS_FULL.store(verify, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn verify_snapshots_full() -> bool {
+    VERIFY_SNAPSHOTS_FULL.load(std::sync::atomic::Ordering::Relaxed)
+}
 const SDIST_BUILD_CONSTRAINTS: &str = "setuptools<81\ncmake<4\n";
 static BUILD_TMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -156,6 +183,63 @@ struct CanonicalGitSourceMarker {
     resolved_sha: String,
     ref_state: String,
     submodules: Option<GitSubmodules>,
+    /// C13 lever (a). Absent on every marker a pre-C13 backend published, and
+    /// absent is not an error: it means "no seal, take the full walk", which
+    /// is byte-for-byte the pre-C13 behaviour. Present means the tree was
+    /// sealed at publish time and a cache hit may verify the seal instead of
+    /// re-running `git status` over an immutable tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    seal: Option<CanonicalGitSeal>,
+}
+
+/// What a published canonical Git tree looked like at the instant it was
+/// sealed, published, and made read-only.
+///
+/// WHAT THIS DETECTS on a cache hit, exactly, and nothing beyond it:
+/// * the root of the snapshot regaining any write bit (`root_mode`);
+/// * any change to the bytes, length, or mode of a SAMPLED file, and the
+///   disappearance of one (`sample`);
+/// * a marker whose seal schema this backend does not know (forces the walk).
+///
+/// WHAT IT DOES NOT DETECT on a cache hit: a byte edit to an UNSAMPLED file,
+/// a new untracked file anywhere in the tree, or the deletion of an unsampled
+/// file. Those are caught only by the full `git status` walk, which still runs
+/// at publish, whenever the seal is absent or unreadable, and whenever the
+/// `retread-verify-snapshots` config key asks for it. `tree_digest`,
+/// `entries` and `file_bytes` are recorded so that walk can compare a whole
+/// tree against its seal; they are NOT checked on the cheap path, because
+/// checking them IS the walk.
+///
+/// `repo/.git` is excluded from the seal on purpose: `.git/lfs/tmp` is the one
+/// deliberately writable directory inside an otherwise immutable snapshot
+/// (see `make_canonical_git_lfs_tmp_writable`), and Git's own metadata is
+/// already covered by the HEAD / ref-state / branch-ref checks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalGitSeal {
+    schema: String,
+    entries: u64,
+    file_bytes: u64,
+    tree_digest: String,
+    root_mode: u32,
+    sample: Vec<CanonicalGitSealSample>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalGitSealSample {
+    path: String,
+    len: u64,
+    mode: u32,
+    sha256: String,
+}
+
+/// How hard a canonical-snapshot check works. `Sealed` is the C13 cheap path;
+/// `Full` is the pre-C13 `git status --porcelain --untracked-files=all` walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotVerification {
+    Sealed,
+    Full,
 }
 
 #[derive(Debug, Clone)]
@@ -1714,6 +1798,11 @@ where
     F: FnMut(PathBuf, SourceBuildEnvironment) -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
+    // bench (measurement only): C12. Every wheel built from a git or path
+    // source passes through here, and until C12 the whole call emitted
+    // nothing -- a cache hit and a full `uv build --wheel` were
+    // indistinguishable from the log. `span_path` says which one ran.
+    let cached_build_started = std::time::Instant::now();
     let hermetic_candidate = hermetic_build_may_engage(target);
     let hermetic_environment = if hermetic_candidate {
         let target_floor = target
@@ -1805,7 +1894,23 @@ where
                 }
             }
             if !rebuild_hermetically {
-                return materialize_validated_wheel(&wheel, &materialized_out).await;
+                let wheel_bytes = std::fs::metadata(&wheel.path).map(|m| m.len()).unwrap_or(0);
+                let materialize_started = std::time::Instant::now();
+                let materialized = materialize_validated_wheel(&wheel, &materialized_out).await;
+                tracing::info!(
+                    kind,
+                    wheel = %wheel.marker.filename,
+                    bytes = wheel_bytes,
+                    elapsed_ms = materialize_started.elapsed().as_millis() as u64,
+                    "bench: materialize_validated_wheel",
+                );
+                tracing::info!(
+                    kind,
+                    span_path = "cache-hit",
+                    elapsed_ms = cached_build_started.elapsed().as_millis() as u64,
+                    "bench: cached_build",
+                );
+                return materialized;
             }
         }
         Ok(None) => {}
@@ -2000,7 +2105,29 @@ where
         path: cache_dir.join(&marker.filename),
         marker,
     };
-    materialize_validated_wheel(&published, &materialized_out).await
+    let wheel_bytes = std::fs::metadata(&published.path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let materialize_started = std::time::Instant::now();
+    let materialized = materialize_validated_wheel(&published, &materialized_out).await;
+    tracing::info!(
+        kind,
+        wheel = %published.marker.filename,
+        bytes = wheel_bytes,
+        elapsed_ms = materialize_started.elapsed().as_millis() as u64,
+        "bench: materialize_validated_wheel",
+    );
+    tracing::info!(
+        kind,
+        span_path = if retried_hermetically {
+            "built-hermetic"
+        } else {
+            "built-host"
+        },
+        elapsed_ms = cached_build_started.elapsed().as_millis() as u64,
+        "bench: cached_build",
+    );
+    materialized
 }
 
 async fn lookup_cached_build(
@@ -2821,8 +2948,19 @@ fn prepare_source_snapshot(
     out_dir: &Path,
     additional_excluded_roots: &[PathBuf],
 ) -> Result<PreparedSourceSnapshot> {
+    // bench (measurement only): C12. This is a full byte-for-byte tree copy
+    // that also hashes every file it writes, and it runs at least twice per
+    // path-source build (pristine + disposable). It emitted no row before.
+    let snapshot_started = std::time::Instant::now();
     let mut visit_hook = |_: &Path, _: SnapshotVisitPhase| Ok(());
-    prepare_source_snapshot_with_hook(source, out_dir, additional_excluded_roots, &mut visit_hook)
+    let prepared =
+        prepare_source_snapshot_with_hook(source, out_dir, additional_excluded_roots, &mut visit_hook);
+    tracing::info!(
+        tree = %source.display(),
+        elapsed_ms = snapshot_started.elapsed().as_millis() as u64,
+        "bench: source_snapshot",
+    );
+    prepared
 }
 
 #[cfg(target_os = "linux")]
@@ -3630,7 +3768,8 @@ pub(crate) async fn build_wheel_from_path_for_target(
                     environment.python_argument(&python.identity())
                 );
                 let out_arg = format!("--out-dir={}", private_out.display());
-                run_capturing_uv_in(
+                let uv_build_started = std::time::Instant::now();
+                let built = run_capturing_uv_in(
                     &[
                         "build",
                         "--wheel",
@@ -3644,7 +3783,14 @@ pub(crate) async fn build_wheel_from_path_for_target(
                     build_epoch,
                     static_cpp_runtime,
                 )
-                .await
+                .await;
+                tracing::info!(
+                    kind = "path",
+                    project = %build_source.display(),
+                    elapsed_ms = uv_build_started.elapsed().as_millis() as u64,
+                    "bench: uv_build_wheel",
+                );
+                built
             }
         },
     )
@@ -5318,14 +5464,295 @@ fn make_source_tree_read_only(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn marker_identity(
+    repository_identity: &str,
+    resolved_sha: &str,
+    ref_state: &str,
+    submodules: Option<GitSubmodules>,
+) -> CanonicalGitSourceMarker {
+    CanonicalGitSourceMarker {
+        schema: CANONICAL_GIT_SOURCE_SCHEMA.to_string(),
+        repository_identity: repository_identity.to_string(),
+        resolved_sha: resolved_sha.to_string(),
+        ref_state: ref_state.to_string(),
+        submodules,
+        seal: None,
+    }
+}
+
+/// Replace a published tree's marker atomically. The marker is the only file a
+/// published canonical entry is ever allowed to change, and only under the
+/// cache lock: a reader either sees the old marker or the new one, never a
+/// half-written file.
+fn write_canonical_git_marker(cache_dir: &Path, marker: &CanonicalGitSourceMarker) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(marker).context("serializing canonical Git marker")?;
+    let temporary = cache_dir.join("source.json.retread-tmp");
+    let _ = std::fs::remove_file(&temporary);
+    std::fs::write(&temporary, &bytes)
+        .with_context(|| format!("writing canonical Git marker {}", temporary.display()))?;
+    std::fs::rename(&temporary, cache_dir.join("source.json")).with_context(|| {
+        format!(
+            "publishing canonical Git marker {}",
+            cache_dir.join("source.json").display()
+        )
+    })
+}
+
+/// One entry of the seal walk: the record that feeds `tree_digest`, plus the
+/// facts a sample needs.
+struct CanonicalGitSealEntry {
+    relative: String,
+    kind: u8,
+    mode: u32,
+    len: u64,
+    is_file: bool,
+}
+
+fn collect_canonical_git_seal_entries(
+    root: &Path,
+    path: &Path,
+    out: &mut Vec<CanonicalGitSealEntry>,
+) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("stating canonical source path {}", path.display()))?;
+    let file_type = metadata.file_type();
+    if path != root {
+        let relative = path
+            .strip_prefix(root)
+            .expect("seal walk stays under its root")
+            .to_str()
+            .ok_or_else(|| {
+                anyhow!(
+                    "canonical source path is not valid UTF-8 and cannot be sealed: {}",
+                    path.display()
+                )
+            })?
+            .to_string();
+        let kind = if file_type.is_symlink() {
+            b'l'
+        } else if file_type.is_dir() {
+            b'd'
+        } else if file_type.is_file() {
+            b'f'
+        } else {
+            b'o'
+        };
+        #[cfg(unix)]
+        let mode = {
+            use std::os::unix::fs::PermissionsExt;
+            metadata.permissions().mode() & 0o7777
+        };
+        #[cfg(not(unix))]
+        let mode = u32::from(metadata.permissions().readonly());
+        out.push(CanonicalGitSealEntry {
+            relative,
+            kind,
+            mode,
+            len: if file_type.is_file() { metadata.len() } else { 0 },
+            is_file: file_type.is_file(),
+        });
+    }
+    if file_type.is_symlink() {
+        return Ok(());
+    }
+    if file_type.is_dir() {
+        let mut entries = std::fs::read_dir(path)
+            .with_context(|| format!("reading canonical source path {}", path.display()))?
+            .collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            // `.git` is excluded at the snapshot root only: it carries the one
+            // writable exception (`.git/lfs/tmp`) and Git's own mutable state.
+            if path == root && entry.file_name() == std::ffi::OsStr::new(".git") {
+                continue;
+            }
+            collect_canonical_git_seal_entries(root, &entry.path(), out)?;
+        }
+    }
+    Ok(())
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = File::open(path)
+        .with_context(|| format!("opening canonical source file {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher)
+        .with_context(|| format!("hashing canonical source file {}", path.display()))?;
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Walk a published canonical tree once and describe it. Runs at publish (when
+/// the walk is unavoidable anyway) and on the first hit of a pre-C13 tree.
+fn compute_canonical_git_seal(repo: &Path) -> Result<CanonicalGitSeal> {
+    let mut entries = Vec::new();
+    collect_canonical_git_seal_entries(repo, repo, &mut entries)?;
+    entries.sort_by(|left, right| left.relative.cmp(&right.relative));
+    let mut hasher = Sha256::new();
+    hasher.update(b"retread-canonical-git-seal-v1\0");
+    let mut file_bytes = 0u64;
+    for entry in &entries {
+        hash_snapshot_record(&mut hasher, entry.kind, &entry.relative, entry.mode);
+        hasher.update(entry.len.to_le_bytes());
+        file_bytes = file_bytes.saturating_add(entry.len);
+    }
+    let tree_digest = format!("{:x}", hasher.finalize());
+
+    // Sample selection is content-independent and deterministic: order the
+    // eligible files by SHA-256 of their path and take the first N. A process
+    // that rewrites a file cannot move it out of the sample, because the
+    // selection never reads the file.
+    let mut eligible: Vec<(String, &CanonicalGitSealEntry)> = entries
+        .iter()
+        .filter(|entry| entry.is_file && entry.len <= CANONICAL_GIT_SEAL_SAMPLE_MAX_FILE_BYTES)
+        .map(|entry| {
+            (
+                hash_fields(
+                    b"retread-canonical-git-seal-sample-v1\0",
+                    &[entry.relative.as_bytes()],
+                ),
+                entry,
+            )
+        })
+        .collect();
+    eligible.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut sample = Vec::new();
+    for (_, entry) in eligible.into_iter().take(CANONICAL_GIT_SEAL_SAMPLE_LIMIT) {
+        sample.push(CanonicalGitSealSample {
+            sha256: sha256_file(&repo.join(&entry.relative))?,
+            path: entry.relative.clone(),
+            len: entry.len,
+            mode: entry.mode,
+        });
+    }
+    sample.sort_by(|left, right| left.path.cmp(&right.path));
+
+    let root_metadata = std::fs::symlink_metadata(repo)
+        .with_context(|| format!("stating canonical source root {}", repo.display()))?;
+    #[cfg(unix)]
+    let root_mode = {
+        use std::os::unix::fs::PermissionsExt;
+        root_metadata.permissions().mode() & 0o7777
+    };
+    #[cfg(not(unix))]
+    let root_mode = u32::from(root_metadata.permissions().readonly());
+
+    Ok(CanonicalGitSeal {
+        schema: CANONICAL_GIT_SEAL_SCHEMA.to_string(),
+        entries: entries.len() as u64,
+        file_bytes,
+        tree_digest,
+        root_mode,
+        sample,
+    })
+}
+
+/// The cheap path. Fails CLOSED: a seal that does not match is corruption of a
+/// tree that is supposed to be immutable, and self-healing it would race the
+/// readers it was published for.
+fn verify_canonical_git_seal(repo: &Path, seal: &CanonicalGitSeal) -> Result<()> {
+    let root_metadata = std::fs::symlink_metadata(repo)
+        .with_context(|| format!("stating canonical source root {}", repo.display()))?;
+    #[cfg(unix)]
+    let root_mode = {
+        use std::os::unix::fs::PermissionsExt;
+        root_metadata.permissions().mode() & 0o7777
+    };
+    #[cfg(not(unix))]
+    let root_mode = u32::from(root_metadata.permissions().readonly());
+    if root_mode != seal.root_mode {
+        bail!(
+            "canonical Git source root mode changed since it was sealed: expected {:o}, found {:o} ({})",
+            seal.root_mode,
+            root_mode,
+            repo.display(),
+        );
+    }
+    #[cfg(unix)]
+    if root_mode & 0o222 != 0 {
+        bail!(
+            "canonical Git source root regained a write bit ({:o}): {}",
+            root_mode,
+            repo.display(),
+        );
+    }
+    for entry in &seal.sample {
+        let path = repo.join(&entry.path);
+        let metadata = std::fs::symlink_metadata(&path).with_context(|| {
+            format!(
+                "stating sealed canonical source file {} (it was present when the snapshot was sealed)",
+                path.display()
+            )
+        })?;
+        if !metadata.file_type().is_file() {
+            bail!(
+                "sealed canonical source file is no longer a regular file: {}",
+                path.display(),
+            );
+        }
+        #[cfg(unix)]
+        let mode = {
+            use std::os::unix::fs::PermissionsExt;
+            metadata.permissions().mode() & 0o7777
+        };
+        #[cfg(not(unix))]
+        let mode = u32::from(metadata.permissions().readonly());
+        if metadata.len() != entry.len || mode != entry.mode {
+            bail!(
+                "sealed canonical source file changed size or mode: {} (expected {} bytes mode {:o}, found {} bytes mode {:o})",
+                path.display(),
+                entry.len,
+                entry.mode,
+                metadata.len(),
+                mode,
+            );
+        }
+        let digest = sha256_file(&path)?;
+        if digest != entry.sha256 {
+            bail!(
+                "sealed canonical source file changed bytes: {} (expected {}, found {})",
+                path.display(),
+                entry.sha256,
+                digest,
+            );
+        }
+    }
+    Ok(())
+}
+
 async fn validate_canonical_git_snapshot(
     cache_dir: &Path,
     repository_identity: &str,
     resolved_sha: &str,
     ref_state: &str,
     submodules: Option<GitSubmodules>,
-    require_clean: bool,
+    verification: SnapshotVerification,
 ) -> Result<CanonicalGitSnapshot> {
+    Ok(
+        validate_canonical_git_snapshot_sealed(
+            cache_dir,
+            repository_identity,
+            resolved_sha,
+            ref_state,
+            submodules,
+            verification,
+        )
+        .await?
+        .0,
+    )
+}
+
+/// As [`validate_canonical_git_snapshot`], but also reports whether the marker
+/// carried a usable seal. `false` means this call took the full walk because
+/// there was nothing to check against — the caller that holds the cache lock
+/// uses it to seal the tree forward.
+async fn validate_canonical_git_snapshot_sealed(
+    cache_dir: &Path,
+    repository_identity: &str,
+    resolved_sha: &str,
+    ref_state: &str,
+    submodules: Option<GitSubmodules>,
+    verification: SnapshotVerification,
+) -> Result<(CanonicalGitSnapshot, bool)> {
     let cache_metadata = std::fs::symlink_metadata(cache_dir)
         .with_context(|| format!("stating canonical Git source cache {}", cache_dir.display()))?;
     if !cache_metadata.file_type().is_dir() || cache_metadata.file_type().is_symlink() {
@@ -5405,22 +5832,50 @@ async fn validate_canonical_git_snapshot(
         bail!("canonical Git repository regained branch or remote-tracking refs");
     }
     ensure_no_canonical_gitlinks(&repo, resolved_sha, submodules).await?;
-    if require_clean {
-        let status = validate_canonical_git_worktree(cache_dir, &repo).await?;
-        if !status.is_empty() {
-            bail!(
-                "canonical Git source was mutated while a build used it: {}",
-                String::from_utf8_lossy(&status).trim(),
-            );
+
+    // C13 lever (a). The tree above this line was published atomically and
+    // then made read-only by `make_source_tree_read_only`; re-walking it with
+    // `git status --untracked-files=all` on every cache hit cost 692.6 s over
+    // 42 hits, plus 166.7 s over 48 post-build re-checks, in the C12 proof
+    // relock 5731815. A sealed tree is checked against its seal instead.
+    let sealed = match (verification, &marker.seal) {
+        (SnapshotVerification::Sealed, Some(seal))
+            if seal.schema == CANONICAL_GIT_SEAL_SCHEMA && !verify_snapshots_full() =>
+        {
+            let repo_for_seal = repo.clone();
+            let seal = seal.clone();
+            tokio::task::spawn_blocking(move || verify_canonical_git_seal(&repo_for_seal, &seal))
+                .await
+                .context("canonical Git seal verification task panicked")??;
+            true
         }
-    }
-    Ok(CanonicalGitSnapshot {
-        root: repo,
-        repository_identity: repository_identity.to_string(),
-        resolved_sha: resolved_sha.to_string(),
-        ref_state: ref_state.to_string(),
-        submodules,
-    })
+        _ => {
+            let status = validate_canonical_git_worktree(cache_dir, &repo).await?;
+            if !status.is_empty() {
+                bail!(
+                    "canonical Git source was mutated while a build used it: {}",
+                    String::from_utf8_lossy(&status).trim(),
+                );
+            }
+            // Only a marker with NO usable seal asks its lock-holding caller
+            // to seal forward; a full walk demanded by the config key leaves
+            // an existing seal exactly as it is.
+            marker
+                .seal
+                .as_ref()
+                .is_some_and(|seal| seal.schema == CANONICAL_GIT_SEAL_SCHEMA)
+        }
+    };
+    Ok((
+        CanonicalGitSnapshot {
+            root: repo,
+            repository_identity: repository_identity.to_string(),
+            resolved_sha: resolved_sha.to_string(),
+            ref_state: ref_state.to_string(),
+            submodules,
+        },
+        sealed,
+    ))
 }
 
 async fn ensure_canonical_git_snapshot(
@@ -5430,6 +5885,12 @@ async fn ensure_canonical_git_snapshot(
     ref_state: &str,
     submodules: Option<GitSubmodules>,
 ) -> Result<CanonicalGitSnapshot> {
+    // bench (measurement only): C12 -- this span and the `cached_build` span
+    // below are the only two terms in the git-source materialization chain
+    // that ever emitted no row at all. The 404 s block in the p6m cold proof
+    // (job 5723774) was inferred from gaps between unrelated rows because of
+    // it; measure it directly instead.
+    let snapshot_started = std::time::Instant::now();
     let repository_identity =
         canonical_git_repository_identity(upstream_url, resolved_sha, submodules);
     let cache_dir = crate::courier::retread_cache_root()
@@ -5468,15 +5929,77 @@ async fn ensure_canonical_git_snapshot(
             // Published canonical trees are never self-healed or replaced
             // while a reader could be using them. Corruption is therefore a
             // fail-closed error rather than a delete/rebuild race.
-            return validate_canonical_git_snapshot(
+            let validated = validate_canonical_git_snapshot_sealed(
                 &cache_dir,
                 &repository_identity,
                 resolved_sha,
                 ref_state,
                 submodules,
-                true,
+                SnapshotVerification::Sealed,
             )
             .await;
+            // C13: a tree published by a pre-C13 backend has no seal, so the
+            // hit above took the full walk. Seal it forward under the cache
+            // lock this function already holds, so the NEXT hit is cheap. The
+            // seal describes the tree the walk just found clean.
+            let sealed = match &validated {
+                Ok((snapshot, false)) => {
+                    let repo_for_seal = snapshot.root.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        compute_canonical_git_seal(&repo_for_seal)
+                    })
+                    .await
+                    .context("canonical Git seal task panicked")?
+                    {
+                        Ok(seal) => {
+                            match write_canonical_git_marker(
+                                &cache_dir,
+                                &CanonicalGitSourceMarker {
+                                    seal: Some(seal),
+                                    ..marker_identity(
+                                        &repository_identity,
+                                        resolved_sha,
+                                        ref_state,
+                                        submodules,
+                                    )
+                                },
+                            ) {
+                                Ok(()) => true,
+                                Err(error) => {
+                                    tracing::warn!(
+                                        cache = %cache_dir.display(),
+                                        error = %error,
+                                        "could not seal an already published canonical Git \
+                                         source; hits keep taking the full walk",
+                                    );
+                                    false
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                cache = %cache_dir.display(),
+                                error = %error,
+                                "could not compute a seal for an already published canonical \
+                                 Git source; hits keep taking the full walk",
+                            );
+                            false
+                        }
+                    }
+                }
+                Ok((_, true)) => true,
+                Err(_) => false,
+            };
+            let validated = validated.map(|(snapshot, _)| snapshot);
+            tracing::info!(
+                repository = %repository_identity,
+                commit = %resolved_sha,
+                sealed = sealed,
+                span_path = "cache-hit",
+                elapsed_ms = snapshot_started.elapsed().as_millis() as u64,
+                "bench: canonical_git_snapshot",
+            );
+            return validated;
         }
     }
 
@@ -5517,7 +6040,14 @@ async fn ensure_canonical_git_snapshot(
         clone.arg(shared_checkout);
     }
     clone.arg(&repo);
+    let clone_started = std::time::Instant::now();
     run_silent(&mut clone, "git clone canonical source").await?;
+    tracing::info!(
+        repository = %repository_identity,
+        promisor = promisor_checkout,
+        elapsed_ms = clone_started.elapsed().as_millis() as u64,
+        "bench: canonical_git_clone",
+    );
     if let Some(shared_tags) = &shared_tags {
         let mut required_objects = vec![resolved_sha.to_string()];
         required_objects.extend(shared_tags.refs.iter().map(|tag| tag.object_id.clone()));
@@ -5607,6 +6137,8 @@ async fn ensure_canonical_git_snapshot(
         );
     }
     let repo_for_normalize = repo.clone();
+    let normalize_started = std::time::Instant::now();
+    let repo_for_seal = repo.clone();
     tokio::task::spawn_blocking(move || {
         sanitize_canonical_git_metadata(&repo_for_normalize)?;
         // `git status` runs clean filters. Git LFS writes a transient file to
@@ -5614,18 +6146,54 @@ async fn ensure_canonical_git_snapshot(
         // non-source scratch directory as the sole writable exception inside
         // the otherwise immutable canonical snapshot.
         reset_canonical_git_lfs_tmp(&repo_for_normalize)?;
-        normalize_source_tree_times(&repo_for_normalize)?;
-        make_source_tree_read_only(&repo_for_normalize)?;
-        make_canonical_git_lfs_tmp_writable(&repo_for_normalize)
+        normalize_source_tree_times(&repo_for_normalize)
     })
     .await
     .context("canonical Git source normalization task panicked")??;
+    // C13 lever (b) depends on this line. `normalize_source_tree_times`
+    // rewrites every mtime, which invalidates the stat cache Git keeps in
+    // `.git/index`; every later `git status`/`git describe` in this repo, and
+    // in every private build tree that inherits this index through a hardlink
+    // farm, would then re-hash the whole worktree. Refresh the index once here,
+    // while `.git` is still writable, so the stat cache matches the tree the
+    // snapshot will freeze. `update-index --refresh` exits non-zero when it had
+    // entries to update, which is the normal case and not a failure.
+    let refresh = Command::new("git")
+        .args(["update-index", "--refresh", "-q"])
+        .current_dir(&repo)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+    if let Err(error) = refresh {
+        tracing::warn!(
+            repository = %repository_identity,
+            error = %error,
+            "could not refresh the canonical Git index; private build trees will re-hash",
+        );
+    }
+    let repo_for_readonly = repo.clone();
+    tokio::task::spawn_blocking(move || {
+        make_source_tree_read_only(&repo_for_readonly)?;
+        make_canonical_git_lfs_tmp_writable(&repo_for_readonly)
+    })
+    .await
+    .context("canonical Git source read-only task panicked")??;
+    tracing::info!(
+        repository = %repository_identity,
+        elapsed_ms = normalize_started.elapsed().as_millis() as u64,
+        "bench: canonical_git_normalize",
+    );
+    // C13: seal the tree in the same breath that publishes it. This walk is
+    // the one the snapshot pays exactly once, in place of the one every cache
+    // hit used to pay.
+    let seal = tokio::task::spawn_blocking(move || compute_canonical_git_seal(&repo_for_seal))
+        .await
+        .context("canonical Git seal task panicked")??;
     let marker = CanonicalGitSourceMarker {
-        schema: CANONICAL_GIT_SOURCE_SCHEMA.to_string(),
-        repository_identity: repository_identity.clone(),
-        resolved_sha: resolved_sha.to_string(),
-        ref_state: ref_state.to_string(),
-        submodules,
+        seal: Some(seal),
+        ..marker_identity(&repository_identity, resolved_sha, ref_state, submodules)
     };
     std::fs::write(
         staging.0.join("source.json"),
@@ -5639,15 +6207,146 @@ async fn ensure_canonical_git_snapshot(
     })?;
     std::fs::rename(&staging.0, &cache_dir)
         .with_context(|| format!("publishing canonical Git source {}", cache_dir.display()))?;
-    validate_canonical_git_snapshot(
+    // The publish path always takes the FULL walk: it is the walk that earns
+    // the seal the cheap path will trust.
+    let published = validate_canonical_git_snapshot(
         &cache_dir,
         &repository_identity,
         resolved_sha,
         ref_state,
         submodules,
-        true,
+        SnapshotVerification::Full,
     )
-    .await
+    .await;
+    tracing::info!(
+        repository = %repository_identity,
+        commit = %resolved_sha,
+        span_path = "clone",
+        elapsed_ms = snapshot_started.elapsed().as_millis() as u64,
+        "bench: canonical_git_snapshot",
+    );
+    published
+}
+
+/// Materialize a private build worktree from an immutable canonical tree
+/// without copying a byte: every regular file becomes a hardlink to the
+/// canonical inode, every symlink is recreated, and every directory is made
+/// fresh and WRITABLE so a build backend can create `*.egg-info`, `build/` and
+/// its other outputs beside the sources.
+///
+/// The source files themselves stay at the canonical mode, which is read-only,
+/// because mode lives on the inode a hardlink shares. That is deliberate: a
+/// build that tries to REWRITE a source file in place fails with EACCES —
+/// loudly, in its own log — instead of silently editing the canonical snapshot
+/// that every other entry in the run is about to read. Creating new files and
+/// deleting tracked ones both need write permission on the DIRECTORY, not on
+/// the file, so both still work.
+///
+/// Returns `Ok(false)` (never an error) when the first link fails in a way the
+/// checkout path can absorb — a cross-device canonical tree being the case
+/// that matters — so the caller can fall back.
+fn hardlink_private_git_build_tree(canonical_root: &Path, private_repo: &Path) -> Result<bool> {
+    let mut entries = Vec::new();
+    collect_canonical_git_seal_entries(canonical_root, canonical_root, &mut entries)?;
+    // Directories first and in path order, so a parent always exists before
+    // its children.
+    entries.sort_by(|left, right| left.relative.cmp(&right.relative));
+
+    // Probe once with a real link before building anything: EXDEV, a
+    // link-count limit, or a filesystem without hardlinks all show up here,
+    // and the caller can still take the checkout path for free.
+    if let Some(probe) = entries.iter().find(|entry| entry.is_file) {
+        let probe_target = private_repo.join(".retread-hardlink-probe");
+        let _ = std::fs::remove_file(&probe_target);
+        if let Err(error) = std::fs::hard_link(canonical_root.join(&probe.relative), &probe_target) {
+            tracing::debug!(
+                canonical = %canonical_root.display(),
+                error = %error,
+                "canonical Git tree does not support hardlinking into the build staging directory",
+            );
+            return Ok(false);
+        }
+        std::fs::remove_file(&probe_target).with_context(|| {
+            format!("removing hardlink probe {}", probe_target.display())
+        })?;
+    }
+
+    for entry in &entries {
+        let source = canonical_root.join(&entry.relative);
+        let target = private_repo.join(&entry.relative);
+        match entry.kind {
+            b'd' => {
+                std::fs::create_dir_all(&target).with_context(|| {
+                    format!("creating private build directory {}", target.display())
+                })?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    // The canonical directory is read-only; the build's is not.
+                    std::fs::set_permissions(
+                        &target,
+                        std::fs::Permissions::from_mode((entry.mode & 0o7777) | 0o700),
+                    )
+                    .with_context(|| {
+                        format!("making private build directory writable {}", target.display())
+                    })?;
+                }
+            }
+            b'l' => {
+                let link = std::fs::read_link(&source).with_context(|| {
+                    format!("reading canonical symlink {}", source.display())
+                })?;
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(&link, &target).with_context(|| {
+                    format!("recreating private build symlink {}", target.display())
+                })?;
+            }
+            b'f' => {
+                std::fs::hard_link(&source, &target).with_context(|| {
+                    format!(
+                        "hardlinking {} into the private build tree at {}",
+                        source.display(),
+                        target.display()
+                    )
+                })?;
+            }
+            _ => bail!(
+                "canonical Git tree holds a path that is neither file, directory nor symlink and \
+                 cannot be hardlinked: {}",
+                source.display(),
+            ),
+        }
+    }
+
+    // Hand Git the canonical index. Its stat cache names the very inodes just
+    // linked (same st_dev/st_ino/size/mtime), so `git status`, `git clean` and
+    // `git describe` in the private tree are index-cache hits rather than a
+    // re-hash of the whole worktree.
+    let canonical_index = canonical_root.join(".git/index");
+    let private_index = private_repo.join(".git/index");
+    if canonical_index.is_file() {
+        let _ = std::fs::remove_file(&private_index);
+        std::fs::copy(&canonical_index, &private_index).with_context(|| {
+            format!(
+                "copying the canonical Git index to {}",
+                private_index.display()
+            )
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&private_index, std::fs::Permissions::from_mode(0o600))
+                .with_context(|| {
+                    format!("making the private Git index writable {}", private_index.display())
+                })?;
+        }
+    } else {
+        bail!(
+            "canonical Git snapshot has no index to hand the private build tree: {}",
+            canonical_index.display(),
+        );
+    }
+    Ok(true)
 }
 
 /// Derive a disposable, writable SCM checkout from an immutable canonical Git
@@ -5676,20 +6375,70 @@ async fn prepare_private_git_build_tree(
         "git clone private build source",
     )
     .await?;
-    run_silent(
-        Command::new("git")
-            .args([
-                "-c",
-                "lfs.storage=lfs",
-                "checkout",
-                "--detach",
-                "--force",
-                &canonical.resolved_sha,
-            ])
-            .current_dir(&private_repo),
-        "git checkout private build source",
-    )
-    .await?;
+    // C13 lever (b). `git checkout --detach --force` re-materialized the whole
+    // canonical worktree out of the object store for EVERY entry: 590.6 s over
+    // 48 builds in the C12 proof relock 5731815, decompressing bytes that were
+    // already sitting, byte-identical and read-only, in the canonical tree.
+    // Hardlink them instead and hand Git the canonical index, whose stat cache
+    // still matches because a hardlink shares the inode it describes.
+    //
+    // Not attempted, and it falls back to the checkout instead of failing:
+    // * recursive submodules — a submodule's `.git` is a pointer into the
+    //   OTHER repository's `modules/` directory and does not survive a copy;
+    // * a canonical tree on a different filesystem from the build staging
+    //   directory, where `link(2)` returns EXDEV.
+    let mut farmed = false;
+    if canonical.submodules != Some(GitSubmodules::Recursive) {
+        let canonical_root = canonical.root.clone();
+        let private_for_farm = private_repo.clone();
+        farmed = tokio::task::spawn_blocking(move || {
+            hardlink_private_git_build_tree(&canonical_root, &private_for_farm)
+        })
+        .await
+        .context("private Git build tree hardlink task panicked")?
+        .unwrap_or_else(|error| {
+            tracing::warn!(
+                canonical = %canonical.root.display(),
+                error = %error,
+                "could not hardlink the canonical Git tree into the private build tree; \
+                 falling back to a full checkout",
+            );
+            false
+        });
+    }
+    // bench (measurement only): C13 -- which of the two ways this tree got its
+    // bytes. Deliberately NOT named `bench: private_git_build_tree …`: that row
+    // is counted by prefix-matching greps in the relock and dep-add harnesses,
+    // and a second row sharing its prefix would double every total.
+    tracing::info!(
+        canonical = %canonical.root.display(),
+        span_path = if farmed { "hardlink" } else { "checkout" },
+        "bench: git_build_tree_materialization",
+    );
+    if farmed {
+        run_silent(
+            Command::new("git")
+                .args(["update-ref", "--no-deref", "HEAD", &canonical.resolved_sha])
+                .current_dir(&private_repo),
+            "git detach private build HEAD",
+        )
+        .await?;
+    } else {
+        run_silent(
+            Command::new("git")
+                .args([
+                    "-c",
+                    "lfs.storage=lfs",
+                    "checkout",
+                    "--detach",
+                    "--force",
+                    &canonical.resolved_sha,
+                ])
+                .current_dir(&private_repo),
+            "git checkout private build source",
+        )
+        .await?;
+    }
     run_silent(
         Command::new("git")
             .args(["clean", "-ffdx"])
@@ -5976,9 +6725,15 @@ async fn build_wheel_from_git_inner(
             .await?;
     let project_root = confined_git_source_dir(&canonical.root, &subdirectory)?;
     let pyproject = pyproject_from_directory(&project_root)?;
+    let build_requirements_started = std::time::Instant::now();
     let build_requirements =
         resolve_build_requirements(pyproject.as_deref(), &base_source_identity, target, false)
             .await?;
+    tracing::info!(
+        kind = "git",
+        elapsed_ms = build_requirements_started.elapsed().as_millis() as u64,
+        "bench: resolve_build_requirements",
+    );
     let source_identity = hash_fields(
         b"retread-git-wheel-build-inputs-v1\0",
         &[
@@ -6017,6 +6772,11 @@ async fn build_wheel_from_git_inner(
             let subdirectory_for_build = subdirectory_for_build.clone();
             let build_requirements = build_requirements_for_build.clone();
             async move {
+                // bench (measurement only): C12 splits the previously silent
+                // git build into its two real terms -- the disposable
+                // `git clone --shared` of the canonical snapshot, and the
+                // PEP 517 `uv build --wheel` itself.
+                let tree_started = std::time::Instant::now();
                 let private_project_root = prepare_private_git_build_tree(
                     &canonical_for_build,
                     &upstream_url_for_build,
@@ -6024,11 +6784,17 @@ async fn build_wheel_from_git_inner(
                     &private_out,
                 )
                 .await?;
+                tracing::info!(
+                    project = %private_project_root.display(),
+                    elapsed_ms = tree_started.elapsed().as_millis() as u64,
+                    "bench: private_git_build_tree",
+                );
                 let py_arg = format!(
                     "--python={}",
                     environment.python_argument(&python.identity())
                 );
                 let out_arg = format!("--out-dir={}", private_out.display());
+                let uv_build_started = std::time::Instant::now();
                 run_capturing_uv_in(
                     &[
                         "build",
@@ -6044,6 +6810,13 @@ async fn build_wheel_from_git_inner(
                     static_cpp_runtime,
                 )
                 .await?;
+                tracing::info!(
+                    kind = "git",
+                    project = %private_project_root.display(),
+                    elapsed_ms = uv_build_started.elapsed().as_millis() as u64,
+                    "bench: uv_build_wheel",
+                );
+                let validate_started = std::time::Instant::now();
                 let cache_dir = canonical_for_build
                     .root
                     .parent()
@@ -6054,9 +6827,21 @@ async fn build_wheel_from_git_inner(
                     &canonical_for_build.resolved_sha,
                     &canonical_for_build.ref_state,
                     canonical_for_build.submodules,
-                    true,
+                    // C13: `uv build --wheel` is pointed at the PRIVATE tree,
+                    // never at the canonical one, so this check exists to
+                    // prove a build did not reach out of its own tree — not to
+                    // reconcile an expected change. The seal proves it for the
+                    // sampled set and for the read-only bit at a cost of
+                    // milliseconds, where the full walk cost 166.7 s over 48
+                    // builds in the C12 proof relock 5731815.
+                    SnapshotVerification::Sealed,
                 )
                 .await?;
+                tracing::info!(
+                    repository = %canonical_for_build.repository_identity,
+                    elapsed_ms = validate_started.elapsed().as_millis() as u64,
+                    "bench: revalidate_canonical_git_snapshot",
+                );
                 Ok(())
             }
         },
@@ -8765,7 +9550,7 @@ version = "0.1.0"
             &canonical.resolved_sha,
             &canonical.ref_state,
             canonical.submodules,
-            true,
+            SnapshotVerification::Full,
         )
         .await
         .expect("private build must not mutate canonical injection source");
@@ -10812,5 +11597,250 @@ version = "0.1.0"
         assert!(format!("{error:#}").contains("MAJOR.MINOR"));
         assert!(!output.exists());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ---------------------------------------------------------------- C13 (a)
+    /// Build a fixture that looks like a published canonical snapshot: a
+    /// read-only tree with enough small files that the sample cannot cover
+    /// them all, so the boundary between "detected" and "not detected" is
+    /// exercised by the same fixture.
+    #[cfg(unix)]
+    fn canonical_seal_fixture(label: &str, files: usize) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let repo = unique_test_dir(label).join("repo");
+        std::fs::create_dir_all(repo.join("pkg")).unwrap();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(repo.join(".git/index"), b"fixture-index").unwrap();
+        for index in 0..files {
+            std::fs::write(
+                repo.join("pkg").join(format!("mod{index}.py")),
+                format!("payload-{index:04}"),
+            )
+            .unwrap();
+        }
+        std::os::unix::fs::symlink("mod0.py", repo.join("pkg/alias.py")).unwrap();
+        make_source_tree_read_only(&repo).unwrap();
+        std::fs::set_permissions(repo.join(".git"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        repo
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_git_seal_catches_a_tampered_sampled_file_without_walking_the_tree() {
+        use std::os::unix::fs::PermissionsExt;
+        let repo = canonical_seal_fixture("seal-tamper", 400);
+        let seal = compute_canonical_git_seal(&repo).unwrap();
+
+        // NON-VACUITY 1: the seal must actually be verifying something, and
+        // the clean tree must pass. A guard whose green arm is red proves
+        // nothing about its red arm.
+        assert_eq!(seal.sample.len(), CANONICAL_GIT_SEAL_SAMPLE_LIMIT);
+        assert!(seal.entries >= 400, "seal walked the tree: {}", seal.entries);
+        verify_canonical_git_seal(&repo, &seal).expect("an untouched sealed tree verifies");
+
+        // NON-VACUITY 2: the sample is a strict SUBSET, so the test below is
+        // about the sampled set and not about "every file".
+        assert!(
+            (seal.sample.len() as u64) < seal.entries,
+            "the sample must not accidentally cover the whole tree",
+        );
+
+        // RED: a same-length byte rewrite of a SAMPLED file. Length and mode
+        // are unchanged, so only the content digest can catch it.
+        let victim = repo.join(&seal.sample[0].path);
+        let original = std::fs::read(&victim).unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mut tampered = original.clone();
+        *tampered.last_mut().unwrap() ^= 0x01;
+        std::fs::write(&victim, &tampered).unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let error = verify_canonical_git_seal(&repo, &seal)
+            .expect_err("a tampered sampled file must be refused");
+        assert!(
+            error.to_string().contains("changed bytes"),
+            "the refusal must name what changed: {error}",
+        );
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::write(&victim, &original).unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o444)).unwrap();
+        verify_canonical_git_seal(&repo, &seal).expect("restoring the bytes restores the seal");
+
+        // RED: the root regaining a write bit. This is the invariant the whole
+        // cheap path stands on -- an immutable tree -- so losing it must refuse
+        // even though every sampled byte is still correct.
+        std::fs::set_permissions(&repo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let error = verify_canonical_git_seal(&repo, &seal)
+            .expect_err("a writable snapshot root must be refused");
+        assert!(
+            error.to_string().contains("mode changed") || error.to_string().contains("write bit"),
+            "the refusal must name the mode: {error}",
+        );
+        std::fs::set_permissions(&repo, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        // RED: a sampled file that disappeared.
+        std::fs::set_permissions(repo.join("pkg"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_file(&victim).unwrap();
+        verify_canonical_git_seal(&repo, &seal)
+            .expect_err("a sampled file that vanished must be refused");
+
+        make_staging_tree_removable(&repo);
+        let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_git_seal_states_exactly_what_a_cache_hit_does_not_see() {
+        use std::os::unix::fs::PermissionsExt;
+        let repo = canonical_seal_fixture("seal-blindspot", 400);
+        let seal = compute_canonical_git_seal(&repo).unwrap();
+        let sampled: std::collections::BTreeSet<&str> =
+            seal.sample.iter().map(|entry| entry.path.as_str()).collect();
+        let unsampled = (0..400)
+            .map(|index| format!("pkg/mod{index}.py"))
+            .find(|path| !sampled.contains(path.as_str()))
+            .expect("the sample is a strict subset");
+
+        // NOT DETECTED, on purpose and in writing: a same-length byte edit of
+        // an UNSAMPLED file. The seal passes. Only the full `git status` walk
+        // -- which still runs at publish, whenever the seal is missing, and
+        // under `retread-verify-snapshots` -- sees this.
+        let victim = repo.join(&unsampled);
+        let mut bytes = std::fs::read(&victim).unwrap();
+        *bytes.last_mut().unwrap() ^= 0x01;
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::write(&victim, &bytes).unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o444)).unwrap();
+        verify_canonical_git_seal(&repo, &seal)
+            .expect("an unsampled byte edit is NOT what the cheap path detects");
+
+        // ... and the walk that DOES see it is the one that computes the seal
+        // again: a new file moves `entries`, so a re-seal never silently
+        // blesses a grown tree.
+        std::fs::set_permissions(repo.join("pkg"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(repo.join("pkg/stray.py"), b"stray").unwrap();
+        let regrown = compute_canonical_git_seal(&repo).unwrap();
+        assert_eq!(
+            regrown.entries,
+            seal.entries + 1,
+            "a stray file must move the sealed entry count",
+        );
+        assert_ne!(
+            regrown.tree_digest, seal.tree_digest,
+            "a stray file must move the sealed tree digest",
+        );
+
+        make_staging_tree_removable(&repo);
+        let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+    }
+
+    // ---------------------------------------------------------------- C13 (b)
+    #[cfg(unix)]
+    #[test]
+    fn private_git_build_tree_is_hardlinked_and_leaves_the_canonical_inodes_untouched() {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
+        let canonical = canonical_seal_fixture("hardlink-farm", 24);
+        let private = canonical.parent().unwrap().join("private");
+        std::fs::create_dir_all(private.join(".git")).unwrap();
+
+        let inodes_before: std::collections::BTreeMap<String, (u64, u64)> =
+            canonical_regular_files(&canonical);
+        assert!(
+            !inodes_before.is_empty(),
+            "the fixture must have files to link",
+        );
+
+        assert!(
+            hardlink_private_git_build_tree(&canonical, &private).unwrap(),
+            "a same-filesystem canonical tree must be hardlinked, not copied",
+        );
+
+        // The private tree is byte-identical AND shares the inode, which is
+        // the whole point: no bytes were read, written, or decompressed.
+        for (relative, identity) in &inodes_before {
+            let linked = std::fs::symlink_metadata(private.join(relative)).unwrap();
+            assert_eq!(
+                (linked.dev(), linked.ino()),
+                *identity,
+                "{relative} must be the SAME inode, not a copy",
+            );
+            assert_eq!(
+                std::fs::read(canonical.join(relative)).unwrap(),
+                std::fs::read(private.join(relative)).unwrap(),
+                "{relative} must be byte-identical",
+            );
+        }
+        assert_eq!(
+            std::fs::read_link(private.join("pkg/alias.py")).unwrap(),
+            std::path::Path::new("mod0.py"),
+            "a symlink must be recreated as a symlink, never dereferenced",
+        );
+        assert_eq!(
+            std::fs::read(private.join(".git/index")).unwrap(),
+            b"fixture-index".to_vec(),
+            "the private tree must inherit the canonical index stat cache",
+        );
+
+        // A build creates NEW files beside the sources: the directory is
+        // writable even though every file in it is not.
+        assert_eq!(
+            std::fs::symlink_metadata(private.join("pkg"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o700,
+            0o700,
+            "build outputs need a writable directory",
+        );
+        std::fs::write(private.join("pkg/retread_fixture.egg-info"), b"built").unwrap();
+        assert!(
+            !canonical.join("pkg/retread_fixture.egg-info").exists(),
+            "a build output must not appear in the canonical tree",
+        );
+
+        // And a build that tries to REWRITE a source fails loudly rather than
+        // editing the canonical snapshot through the shared inode.
+        let error = std::fs::OpenOptions::new()
+            .write(true)
+            .open(private.join("pkg/mod0.py"))
+            .expect_err("a hardlinked source must not be writable");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+
+        // NON-VACUITY: the comparison above can SEE a difference. Break one
+        // link and the inode check that just passed must fail.
+        std::fs::remove_file(private.join("pkg/mod1.py")).unwrap();
+        std::fs::write(private.join("pkg/mod1.py"), b"payload-0001").unwrap();
+        let broken = std::fs::symlink_metadata(private.join("pkg/mod1.py")).unwrap();
+        assert_ne!(
+            (broken.dev(), broken.ino()),
+            inodes_before["pkg/mod1.py"],
+            "the inode check must be able to fail",
+        );
+
+        // THE GUARD THE BRIEF ASKED FOR: the canonical tree's inode set is
+        // unchanged after everything a build did above.
+        assert_eq!(
+            canonical_regular_files(&canonical),
+            inodes_before,
+            "the canonical tree's inode set must be unchanged after a build",
+        );
+
+        make_staging_tree_removable(&canonical);
+        let _ = std::fs::remove_dir_all(canonical.parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    fn canonical_regular_files(root: &Path) -> std::collections::BTreeMap<String, (u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        let mut entries = Vec::new();
+        collect_canonical_git_seal_entries(root, root, &mut entries).unwrap();
+        entries
+            .into_iter()
+            .filter(|entry| entry.is_file)
+            .map(|entry| {
+                let metadata = std::fs::symlink_metadata(root.join(&entry.relative)).unwrap();
+                (entry.relative, (metadata.dev(), metadata.ino()))
+            })
+            .collect()
     }
 }
