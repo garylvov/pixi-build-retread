@@ -487,8 +487,18 @@ fn workspace_manifest_projection(
     let Ok(source) = std::str::from_utf8(&bytes) else {
         return fallback("manifest-not-utf8");
     };
-    let Ok(document) = source.parse::<toml::Value>() else {
-        return fallback("toml-unparsed");
+    // `toml::from_str`, not `str::parse`: this is the exact call
+    // `WorkspaceManifest::from_toml_source` makes on the same bytes, so the
+    // projection and the model cannot disagree about whether a manifest
+    // parses. (`str::parse::<toml::Value>()` was tried first and refused the
+    // canonical fixture outright — gate run 5740893, all nine guards red with
+    // `toml-unparsed`.)
+    let document = match toml::from_str::<toml::Value>(source) {
+        Ok(document) => document,
+        Err(why) => {
+            tracing::debug!(%why, "bench: built_output_store key -- manifest did not parse as TOML");
+            return fallback("toml-unparsed");
+        }
     };
     let Some(document) = document.as_table() else {
         return fallback("toml-not-a-table");
