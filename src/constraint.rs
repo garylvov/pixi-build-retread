@@ -612,20 +612,42 @@ fn conflict_from_active(package: &PypiKey, active: &[&Constraint]) -> Conflict {
 //     for most of them; an unconditional row would write the same sentence
 //     hundreds of times per package. 842 MB of repeated warnings to /oscar is
 //     a measured way to take a node out, so the row is emitted ONCE per
-//     (bundle, package, yielded clause, kept) and says so.
+//     (package, yielded clause, kept) WITHIN ONE BUNDLE SCOPE and says so.
+//
+//     The seen-set lives IN the scope and dies with it, and that placement is
+//     load-bearing rather than tidy. A process-wide set makes an audit row's
+//     presence depend on what some earlier, unrelated resolve happened to do:
+//     the second pack to yield the same clause prints nothing, and the row
+//     that is supposed to prove a policy ran becomes evidence of nothing. A
+//     caller with no scope entered -- a unit guard, any future direct caller
+//     -- gets every row, because suppressing an audit record by default is
+//     the wrong failure direction.
+/// The bundle this thread is finalizing for, and the applied-rows it has
+/// already written for that bundle. Both die with the scope.
+struct BundleFrame {
+    bundle: String,
+    rows_written: std::collections::HashSet<String>,
+}
+
 thread_local! {
-    static ACTIVE_BUNDLE: std::cell::RefCell<Option<String>> =
+    static ACTIVE_BUNDLE: std::cell::RefCell<Option<BundleFrame>> =
         const { std::cell::RefCell::new(None) };
 }
 
 /// Names the bundle whose closure the reconciler is finalizing, for the
-/// duration of the guard. Restores the previous value on drop, so nesting is
-/// safe and a panic cannot leave a stale name behind.
-pub(crate) struct ActiveBundleScope(Option<String>);
+/// duration of the guard, and carries that bundle's seen-set. Restores the
+/// previous frame on drop, so nesting is safe and a panic cannot leave a stale
+/// name -- or a stale seen-set -- behind.
+pub(crate) struct ActiveBundleScope(Option<BundleFrame>);
 
 impl ActiveBundleScope {
     pub(crate) fn enter(bundle: &str) -> Self {
-        Self(ACTIVE_BUNDLE.with(|slot| slot.replace(Some(bundle.to_string()))))
+        Self(ACTIVE_BUNDLE.with(|slot| {
+            slot.replace(Some(BundleFrame {
+                bundle: bundle.to_string(),
+                rows_written: std::collections::HashSet::new(),
+            }))
+        }))
     }
 }
 
@@ -637,34 +659,19 @@ impl Drop for ActiveBundleScope {
 
 /// The bundle the current thread is finalizing for, or `<unknown>`.
 pub(crate) fn active_bundle() -> String {
-    ACTIVE_BUNDLE.with(|slot| {
-        slot.borrow()
-            .clone()
-            .unwrap_or_else(|| "<unknown>".to_string())
+    ACTIVE_BUNDLE.with(|slot| match slot.borrow().as_ref() {
+        Some(frame) => frame.bundle.clone(),
+        None => "<unknown>".to_string(),
     })
 }
 
-/// Every applied-row key this process has already written.
-///
-/// Bounded: once the cap is reached the set stops growing and every further
-/// distinct yield is written, so the failure mode of the bound is MORE rows,
-/// never a silently dropped one.
-static YIELD_ROWS_SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-    std::sync::OnceLock::new();
-
-const YIELD_ROW_KEY_CAP: usize = 4096;
-
+/// Record `key` against the current bundle scope; `true` if it is the first
+/// time this scope has seen it. With no scope entered every row is written.
 fn yield_row_is_new(key: &str) -> bool {
-    let seen = YIELD_ROWS_SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-    let mut seen = match seen.lock() {
-        Ok(seen) => seen,
-        // A poisoned lock must not silence an audit record.
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    if seen.len() >= YIELD_ROW_KEY_CAP {
-        return true;
-    }
-    seen.insert(key.to_string())
+    ACTIVE_BUNDLE.with(|slot| match slot.borrow_mut().as_mut() {
+        Some(frame) => frame.rows_written.insert(key.to_string()),
+        None => true,
+    })
 }
 
 /// The row the yield writes wherever it is APPLIED, quiet or loud.
@@ -677,13 +684,13 @@ fn record_learned_fact_yield(package: &PypiKey, yielded: &str, kept: &VersionSpe
     } else {
         kept.to_string()
     };
-    let key = format!("{bundle}\u{1f}{package}\u{1f}{yielded}\u{1f}{kept}");
+    let key = format!("{package}\u{1f}{yielded}\u{1f}{kept}");
     if !yield_row_is_new(&key) {
         return;
     }
     tracing::warn!(
         "learned_fact_yielded bundle={} package={} clause={} kept={} \
-         reason=satisfiable-only-without-it (once per distinct yield)",
+         reason=satisfiable-only-without-it (once per distinct yield in this bundle)",
         bundle,
         package,
         yielded,
@@ -1434,7 +1441,38 @@ mod tests {
              or invented pack: {unscoped}",
         );
 
-        // NON-VACUITY 3: the LOUD entry point keeps its prose diagnostic. The
+        // NON-VACUITY 3: THE ROW IS ONCE PER SCOPE, NOT ONCE PER PROCESS, AND
+        // THIS IS THE ASSERTION THAT CAUGHT THE FIRST DESIGN. With the
+        // seen-set process-wide, whether this guard saw its own row depended
+        // on whether some earlier, unrelated resolve had already yielded the
+        // same clause -- and it went red the moment a sibling lane's merge
+        // changed which tests share the process. An audit record that a
+        // previous unrelated call can suppress proves nothing.
+        //
+        // Inside ONE scope the second identical yield is quiet (that is the
+        // volume bound doing its job); a NEW scope prints again.
+        let (_, repeat_same_scope) = captured_rows(|| {
+            let _scope = ActiveBundleScope::enter("flashsac-pack");
+            let first = finalize_quiet(&package, &constraints);
+            let second = finalize_quiet(&package, &constraints);
+            (first.is_ok(), second.is_ok())
+        });
+        assert_eq!(
+            repeat_same_scope.matches("learned_fact_yielded").count(),
+            1,
+            "two identical yields inside one bundle scope are ONE row: {repeat_same_scope}",
+        );
+        let (_, fresh_scope) = captured_rows(|| {
+            let _scope = ActiveBundleScope::enter("holosoma-pack");
+            finalize_quiet(&package, &constraints)
+        });
+        assert!(
+            fresh_scope.contains("bundle=holosoma-pack"),
+            "a DIFFERENT pack yielding the same clause must get its own row -- \
+             the whole point of naming the pack: {fresh_scope}",
+        );
+
+        // NON-VACUITY 4: the LOUD entry point keeps its prose diagnostic. The
         // applied-row is an addition, not a replacement -- deleting the
         // committed-path WARN would still be a regression.
         let (loud, loud_rows) = captured_rows(|| {
