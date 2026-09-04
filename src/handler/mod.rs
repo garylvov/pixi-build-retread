@@ -5064,6 +5064,13 @@ impl Handler {
         // bundle can trigger at most one re-resolve).
         let mut abi_backoff_suppressed: BTreeSet<String> = BTreeSet::new();
         let mut abi_backoff_count = 0usize;
+        // p6t: every Lane C root DROPPED anywhere in this request, keyed by
+        // bundle. The summary row below names them and publishes a counter,
+        // because a `suppressed_all=true` request that also produced a lock
+        // reads as a clean pass otherwise -- which is exactly how job
+        // 5748915's 27/27 was read before anyone counted the dropped roots.
+        let mut auto_imports_suppressed_all_bundles: BTreeMap<String, Vec<String>> =
+            BTreeMap::new();
         // v4.2.0: the per-env pre-emission solve check (and its
         // bookkeeping / fail gate) was deleted with the legacy
         // mirror-solver; outputs ship unvalidated and `retread solve`
@@ -5110,8 +5117,13 @@ impl Handler {
                 &abi_backoff_suppressed,
             )
             .await;
-            let (materialized, base_config, restore_relaxations, auto_imports_injected) =
-                match resolve_attempt {
+            let (
+                materialized,
+                base_config,
+                restore_relaxations,
+                auto_imports_injected,
+                auto_imports_suppressed_by_bundle,
+            ) = match resolve_attempt {
                     Ok(resolved) => resolved,
                     Err(error)
                         if auto_imports_injection_enabled(&config)
@@ -5154,6 +5166,12 @@ impl Handler {
                         )));
                     }
                 };
+            for (bundle, roots) in auto_imports_suppressed_by_bundle {
+                auto_imports_suppressed_all_bundles
+                    .entry(bundle)
+                    .or_default()
+                    .extend(roots);
+            }
             pending_output_relaxations.extend(restore_relaxations.iter().cloned());
             tracing::info!(
                 python = %python_version,
@@ -5543,7 +5561,7 @@ impl Handler {
                             );
                             abi_backoff_suppressed.insert(base_bundle.conda_name.clone());
                             abi_backoff_count += 1;
-                            let (retry_materialized, retry_config, _, _) = resolve_all(
+                            let (retry_materialized, retry_config, _, _, _) = resolve_all(
                                 &config,
                                 &target,
                                 &download_dir,
@@ -5782,11 +5800,31 @@ impl Handler {
         }
         // One summary line per request, so a back-off is always a reported
         // finding and never a silent retreat. Emitted at WARN when it fired.
+        // p6t: the counter the harness zero-gates. Emitted UNCONDITIONALLY --
+        // a gate that only exists on the bad path cannot be checked for zero
+        // on the good one, and "the row was absent" is not evidence (a run
+        // that died before the summary produces the same absence).
+        let suppressed_all_fired = abi_backoff_suppressed.contains(AUTO_IMPORTS_SUPPRESS_ALL);
+        let suppressed_root_total = emit_auto_imports_suppression_counter(
+            &format!(
+                "conda/outputs work_directory={} pythons={}",
+                params.work_directory.display(),
+                pythons.join("+"),
+            ),
+            &auto_imports_suppressed_all_bundles,
+            suppressed_all_fired,
+            abi_backoff_count,
+        );
+        let suppressed_named = auto_imports_suppression_roots_by_bundle(
+            &auto_imports_suppressed_all_bundles,
+        );
         if abi_backoff_count > 0 {
             tracing::warn!(
                 backoffs = abi_backoff_count,
                 bundles = %abi_backoff_suppressed.iter().cloned().collect::<Vec<_>>().join(","),
-                suppressed_all = abi_backoff_suppressed.contains(AUTO_IMPORTS_SUPPRESS_ALL),
+                suppressed_all = suppressed_all_fired,
+                suppressed_roots = suppressed_root_total,
+                roots_by_bundle = %suppressed_named,
                 "auto_imports: LANE C BACK-OFF SUMMARY -- these bundles emitted WITHOUT their detected roots, because injecting them either contradicted a workspace ABI anchor or made resolution fail. Every dropped root is a FINDING for manifest work, not a resolved issue. A `*` entry means the resolve-time back-off suppressed every bundle in the request.",
             );
         }
@@ -6445,7 +6483,7 @@ impl Handler {
 
         // Re-resolve materialized bundles, then autodiscover emissions
         // and pick the one matching the requested output name.
-        let (materialized, base_config, restore_relaxations, _auto_imports_injected) =
+        let (materialized, base_config, restore_relaxations, _auto_imports_injected, _) =
             resolve_all(
                 &config,
                 &target,
@@ -7408,8 +7446,14 @@ async fn resolve_all(
     // Lets the emission side decide whether an ABI failure is worth a
     // back-off, and name the roots it dropped.
     BTreeMap<String, Vec<String>>,
+    // p6t: Lane C roots DETECTED and then DROPPED per bundle, because the
+    // back-off was active for it. Read by the request summary so a
+    // `suppressed_all=true` request names what it dropped and carries a
+    // counter the harness can zero-gate.
+    BTreeMap<String, Vec<String>>,
 )> {
     let mut auto_imports_injected_by_bundle: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut auto_imports_suppressed_by_bundle: BTreeMap<String, Vec<String>> = BTreeMap::new();
     // Bind the pack-level policy to the target used by every source-build
     // branch in this resolution. Resolution/cache identity intentionally does
     // not change: the policy controls how an exact cache miss is produced,
@@ -7581,6 +7625,7 @@ async fn resolve_all(
             conda_co_solve,
             sibling_pin_relaxations,
             auto_imports_injected,
+            auto_imports_suppressed,
         ): (
             Option<crate::uv_closure::UvClosure>,
             std::collections::BTreeSet<String>,
@@ -7589,6 +7634,7 @@ async fn resolve_all(
             BTreeSet<String>,
             CondaCoSolveContext,
             Vec<auto_bundle::WheelMetadataRelaxation>,
+            Vec<String>,
             Vec<String>,
         ) = uv_group_closure(
             &group_name,
@@ -7616,6 +7662,12 @@ async fn resolve_all(
             auto_imports_injected_by_bundle.insert(
                 canonical_conda_name(&group_name),
                 auto_imports_injected.clone(),
+            );
+        }
+        if !auto_imports_suppressed.is_empty() {
+            auto_imports_suppressed_by_bundle.insert(
+                canonical_conda_name(&group_name),
+                auto_imports_suppressed.clone(),
             );
         }
         // F32: declared pins widened to converge on a co-activated sibling are
@@ -7938,6 +7990,7 @@ async fn resolve_all(
         effective,
         pending_relaxations,
         auto_imports_injected_by_bundle,
+        auto_imports_suppressed_by_bundle,
     ))
 }
 
@@ -10055,6 +10108,14 @@ async fn uv_group_closure(
     // is off or the back-off suppressed them. Carried out so the emission
     // side can tell whether an ABI failure is worth retrying without them.
     Vec<String>,
+    // p6t: Lane C roots this bundle DETECTED and then dropped because the
+    // back-off was active. Under p6s these existed only as a per-bundle log
+    // line, so a request that emitted `suppressed_all=true` reported a
+    // boolean and no names -- the 27/27 lock of job 5748915 was read as a
+    // pass for four minutes before anyone noticed two whole requests had
+    // shipped with their detected roots dropped. Carried out so the request
+    // summary can NAME them and so the harness has a counter to zero-gate.
+    Vec<String>,
 )> {
     let uv_retry_keep_names: BTreeSet<String> = uv_retry_keep
         .iter()
@@ -10141,6 +10202,36 @@ async fn uv_group_closure(
         conda_provided = auto_imports_conda_provided.len(),
         "auto_imports: conda-provided names that are never injected",
     );
+    // p6t: the import->distribution naming authority, built from REQUEST
+    // FACTS ONLY -- the workspace's committed lock for the consuming
+    // environments and the manifest's own `[pypi-dependencies]`. This is the
+    // thing that used to be a directory listing of the machine-wide wheel
+    // store, and being a directory listing is how one run named
+    // `module=isaacsim` two different ways six minutes apart (§19.9).
+    let auto_imports_naming = build_auto_imports_naming_authority(
+        workspace_dir,
+        manifest_opt.as_ref(),
+        &workspace_facts,
+        target,
+    );
+    {
+        let (locked, declared) = auto_imports_naming.counts_by_origin();
+        tracing::info!(
+            bundle = %group_name,
+            determined = auto_imports_naming.len(),
+            locked_records = locked,
+            declared_deps = declared,
+            ambiguous = auto_imports_naming.ambiguous.len(),
+            ambiguous_modules = %auto_imports_naming
+                .ambiguous
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(","),
+            "auto_imports_naming: import->distribution authority built from request facts \
+             (lock + manifest); the wheel store names nothing",
+        );
+    }
 
     for (name, entry) in group_entries {
         if entry.is_spec() {
@@ -10227,6 +10318,42 @@ async fn uv_group_closure(
                     })
                     .await
                     .unwrap_or_else(|_| crate::auto_imports::build_index(&[]));
+                    // p6t: prove, every run, that the store named nothing.
+                    // `refused_undetermined` counts edges that under p6r
+                    // WOULD have become roots -- `isaacsim` ->
+                    // `isaacsim-extscache-kit-sdk` is exactly one of them.
+                    // Each is a FINDING for manifest work, never a root.
+                    let confirmation = auto_imports_naming.store_confirmation(&idx);
+                    tracing::info!(
+                        bundle = %group_name,
+                        store = %wheel_store_root.display(),
+                        offered = confirmation.offered,
+                        confirmed = confirmation.confirmed,
+                        refused_undetermined = confirmation.refused_undetermined,
+                        contributed_roots = 0,
+                        "auto_imports_naming: the wheel-store scan is an ACCELERATOR ONLY -- \
+                         it confirms names the request already determined and contributes \
+                         no root of its own, so an empty store and a warm one inject the \
+                         same set",
+                    );
+                    if confirmation.refused_undetermined > 0 {
+                        let refused = auto_imports_naming.refused_store_edges(&idx);
+                        tracing::warn!(
+                            bundle = %group_name,
+                            refused = refused.len(),
+                            edges = %refused
+                                .iter()
+                                .take(24)
+                                .map(|(m, d)| format!("{m}->{d}"))
+                                .collect::<Vec<_>>()
+                                .join(","),
+                            "auto_imports_naming: store edges REFUSED as naming sources -- \
+                             no lock row and no manifest declaration accounts for these \
+                             distributions. Under p6r each of these could become a uv root \
+                             purely because the wheel happened to be on this machine. Every \
+                             row is a FINDING for manifest work.",
+                        );
+                    }
                     auto_imports_index.insert(idx)
                 }
             };
@@ -10240,6 +10367,7 @@ async fn uv_group_closure(
                     source_dir,
                     cache_dir,
                     index,
+                    &auto_imports_naming,
                     &auto_imports_siblings,
                     &auto_imports_conda_provided,
                 )
@@ -10249,9 +10377,11 @@ async fn uv_group_closure(
     }
     // Prepend, so every explicitly declared root outranks a detected one.
     // Empty unless RETREAD_AUTO_IMPORTS=1, so this is a no-op by default.
+    let mut auto_imports_suppressed: Vec<String> = Vec::new();
     if suppress_auto_imports && !auto_imports_roots.is_empty() {
         auto_imports_roots.sort();
         auto_imports_roots.dedup();
+        auto_imports_suppressed = auto_imports_roots.clone();
         tracing::warn!(
             bundle = %group_name,
             suppressed = auto_imports_roots.len(),
@@ -10887,6 +11017,7 @@ async fn uv_group_closure(
             conda_co_solve,
             sibling_pin_relaxations,
             auto_imports_injected,
+            auto_imports_suppressed,
         ));
     }
     // ABI-anchor pins (`cuda-version`, `python_abi`, ...) from the
@@ -11329,6 +11460,7 @@ async fn uv_group_closure(
         conda_co_solve,
         sibling_pin_relaxations,
         auto_imports_injected,
+        auto_imports_suppressed,
     ))
 }
 
@@ -15368,6 +15500,150 @@ fn auto_imports_conda_provided_names(
     provided
 }
 
+/// p6t: `bundle=root+root;bundle=root` for a suppression summary row.
+fn auto_imports_suppression_roots_by_bundle(
+    suppressed_by_bundle: &BTreeMap<String, Vec<String>>,
+) -> String {
+    suppressed_by_bundle
+        .iter()
+        .map(|(bundle, roots)| format!("{bundle}={}", roots.join("+")))
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+/// p6t: publish this request's suppressed-root counter and return the total.
+///
+/// WHY THIS IS ITS OWN ROW. Job 5748915 emitted `suppressed_all=true` twice
+/// and still produced a 27/27 `pixi.lock`, and the lock was read as a pass:
+/// the only evidence to the contrary was a boolean inside a summary line that
+/// named no root and published no number. A gate criterion needs a live
+/// producer, and this is it -- one row, always emitted, carrying
+/// `auto_imports_suppressed_roots=<n>` for the harness to zero-gate, the
+/// bundle->roots map for the operator to read, and the reason. WARN when
+/// anything was dropped, INFO when nothing was, so the row's LEVEL is itself
+/// the verdict and its absence is never mistaken for a zero.
+fn emit_auto_imports_suppression_counter(
+    output: &str,
+    suppressed_by_bundle: &BTreeMap<String, Vec<String>>,
+    suppressed_all: bool,
+    backoffs: usize,
+) -> usize {
+    let total: usize = suppressed_by_bundle.values().map(Vec::len).sum();
+    let counter = format!(
+        "auto_imports_suppressed_roots={total} \
+         auto_imports_suppressed_all={suppressed_all} \
+         auto_imports_backoffs={backoffs}"
+    );
+    let by_bundle = auto_imports_suppression_roots_by_bundle(suppressed_by_bundle);
+    if total > 0 || suppressed_all {
+        tracing::warn!(
+            output = %output,
+            counter = %counter,
+            suppressed_roots = total,
+            suppressed_all = suppressed_all,
+            roots_by_bundle = %by_bundle,
+            reason = "a Lane C emission failed the ABI invariant or failed to resolve, so the \
+                      retry dropped the detected roots",
+            "auto_imports: LANE C SUPPRESSED-ROOT COUNTER -- this request shipped WITHOUT the \
+             roots named above. Zero-gate `auto_imports_suppressed_roots=0` unless the operator \
+             has declared this acceptable: a lock produced with injection partially suppressed \
+             is not a lock produced with injection in force.",
+        );
+    } else {
+        tracing::info!(
+            output = %output,
+            counter = %counter,
+            "auto_imports: LANE C SUPPRESSED-ROOT COUNTER -- nothing suppressed",
+        );
+    }
+    total
+}
+
+/// p6t: the request-fact naming authority for one bundle.
+///
+/// EVERY input here is a property of the REQUEST -- the workspace's committed
+/// lock, and the workspace manifest's own `[pypi-dependencies]` declarations.
+/// Nothing here reads a cache, a fetch directory, a sidecar, or a wheel-store
+/// listing, so two runs of the same request produce the same authority no
+/// matter what either machine has downloaded before. That is the whole point:
+/// under p6r the answer for `import isaacsim` was
+/// `isaacsim-extscache-kit-sdk` on a warm store and nothing at all on a cold
+/// one, six minutes apart in one run.
+///
+/// Two tiers, in the order the operator ruled:
+///   (a) RESOLVED -- `locked_pypi_versions_for_envs` over the very consuming
+///       environments whose conda solves produced `facts`, on this target's
+///       subdir. The env already installs a distribution; its version comes
+///       from that record verbatim, local segments and all.
+///   (b) DECLARED -- `declared_pypi_specs_anywhere`. A version only when the
+///       declared band is an exact `==` pin; a range names, it does not pin.
+///
+/// NOT here, and boarded rather than faked (reader/writer law: a variant with
+/// no producer is a defect, so `NamingOrigin` has no variant for either):
+///   * the index metadata tier. PyPI publishes no reverse module->project
+///     query, so tier (c) can only VERIFY a candidate name, which is a
+///     network round trip per unmapped module. Boarded as p6t-1.
+///   * a pack's `requires-dist` closure from a SIBLING bundle. One backend
+///     request sees one bundle's entries; `isaacsim==5.1.0.0` reached p6r's
+///     resolve from a co-resident isaaclab pack that this function cannot
+///     see. Boarded as p6t-2.
+///
+/// The conda side is deliberately absent: `auto_imports_conda_provided_names`
+/// already refuses every conda-owned name at screen (d), earlier than this
+/// runs, so a conda tier here would have no reachable consumer.
+fn build_auto_imports_naming_authority(
+    workspace_dir: Option<&Path>,
+    manifest: Option<&crate::workspace::WorkspaceManifest>,
+    facts: &WorkspaceCondaFacts,
+    target: &ResolutionTarget,
+) -> crate::auto_imports::NamingAuthority {
+    use crate::auto_imports::{DeterminedDistribution, NamingOrigin};
+    let mut determined: Vec<DeterminedDistribution> = Vec::new();
+    if let Some(root) = workspace_dir {
+        let envs: BTreeSet<String> = facts.env_exact_specs.keys().cloned().collect();
+        for (name, version) in
+            crate::workspace::locked_pypi_versions_for_envs(root, &envs, &target.conda_subdir)
+        {
+            determined.push(DeterminedDistribution {
+                name: canonical_conda_name(&name),
+                version: Some(version),
+                origin: NamingOrigin::LockedRecord,
+            });
+        }
+    }
+    if let Some(manifest) = manifest {
+        for (name, specs) in manifest.declared_pypi_specs_anywhere() {
+            determined.push(DeterminedDistribution {
+                name: canonical_conda_name(&name),
+                version: auto_imports_declared_exact_version(&specs),
+                origin: NamingOrigin::DeclaredDep,
+            });
+        }
+    }
+    crate::auto_imports::NamingAuthority::from_determined(determined)
+}
+
+/// The one exact version a name's declared specs pin to, when they agree.
+///
+/// `*` (declared with no constraint) and any range yield None -- a bare root
+/// is a deterministic answer and a guessed pin is not. Disagreeing pins across
+/// features also yield None: this function never picks a winner.
+fn auto_imports_declared_exact_version(specs: &[String]) -> Option<String> {
+    let pinned: BTreeSet<&str> = specs
+        .iter()
+        .map(|s| s.trim())
+        .filter_map(|s| s.strip_prefix("=="))
+        .map(str::trim)
+        .filter(|v| {
+            !v.is_empty() && !v.contains(['*', ',', ' ', '<', '>', '!', '=', '~'])
+        })
+        .collect();
+    match pinned.len() {
+        1 => pinned.into_iter().next().map(str::to_string),
+        _ => None,
+    }
+}
+
 /// Curated distribution name for an import module, if the table knows it.
 /// Exact, case-sensitive match on the module as imported.
 fn auto_imports_mapped_distribution(module: &str) -> Option<&'static str> {
@@ -15417,6 +15693,7 @@ fn auto_imports_injection_verdict(
     req: &crate::auto_imports::ResolvedImport,
     sibling_entries: &BTreeSet<String>,
     conda_provided: &BTreeSet<String>,
+    naming: &crate::auto_imports::NamingAuthority,
 ) -> std::result::Result<String, &'static str> {
     // (a) Conditional imports are optional by construction (every import site
     // sits in a try/except). Requiring one turns an optional feature into a
@@ -15472,23 +15749,38 @@ fn auto_imports_injection_verdict(
     if let Some(mapped) = auto_imports_mapped_distribution(&req.module) {
         return Ok(mapped.to_string());
     }
-    // (f) Index authority: a wheel in the store really ships this module
-    // under this distribution name.
-    if req.source.is_some() {
-        return Ok(canonical);
-    }
-    // --- Neither mapped nor indexed: NEVER injected from here down. The
-    // remaining screens only sharpen the reason recorded in the log. ---
-    // (g1) Known host-application internals.
+    // (g1) Known host-application internals. p6t moved this ABOVE the naming
+    // authority: `pxr`, `carb`, `omni` and friends are not PyPI
+    // distributions no matter what a lock row is spelled, so a coincidental
+    // same-name record must not be able to inject one.
     if AUTO_IMPORTS_NO_PYPI_DISTRIBUTION.contains(&req.module.as_str()) {
         return Err("module has no PyPI distribution (host-application internal)");
     }
     // (g2) Isaac Lab extensions: source-built entries of SOME bundle in this
     // workspace, never PyPI distributions. Screen (c) sees only the importing
-    // bundle's own entries, so a cross-bundle import needs this.
+    // bundle's own entries, so a cross-bundle import needs this. Also moved
+    // above the authority by p6t, for the same reason as (g1).
     if auto_imports_is_isaaclab_extension(&req.module) {
         return Err("Isaac Lab extension is source-built in this workspace, not a PyPI distribution");
     }
+    // (f) p6t: REQUEST-FACT AUTHORITY. The distribution must be one this
+    // request has already determined it installs -- a PyPI row of the
+    // workspace's committed lock for the consuming environments, or a
+    // `[pypi-dependencies]` declaration of the manifest. The root carries
+    // that record's version, so an injected root is pinned by the same fact
+    // that named it.
+    //
+    // THIS REPLACES the wheel-store index authority (`req.source.is_some()`),
+    // which is the p6s-2 defect: the store is a machine-wide listing of every
+    // wheel retread ever fetched, so it made the injected root set a function
+    // of download history. `req.source` still travels for the LOG -- the
+    // `indexed=` field and the extras hints read it -- but it no longer
+    // decides anything. See `NamingAuthority`.
+    if let Some(determined) = naming.lookup(&req.module) {
+        return Ok(determined.root_specifier());
+    }
+    // --- Neither mapped nor determined: NEVER injected from here down. The
+    // remaining screen only sharpens the reason recorded in the log. ---
     // (g3) Intra-repo module PATH shapes: `convert_rigv1_to_proto` and
     // friends, which the own-top-level screen missed because they live in a
     // SIBLING directory of a shared checkout.
@@ -15617,6 +15909,7 @@ async fn auto_imports_dry_run(
     source_dir: &Path,
     cache_dir: &Path,
     index: &crate::auto_imports::ClosureIndex,
+    naming: &crate::auto_imports::NamingAuthority,
     sibling_entries: &BTreeSet<String>,
     conda_provided: &BTreeSet<String>,
 ) -> Vec<String> {
@@ -15698,7 +15991,7 @@ async fn auto_imports_dry_run(
         }
         // The verdict is computed WHETHER OR NOT injection is enabled, so the
         // OFF arm still measures exactly what the ON arm would have done.
-        match auto_imports_injection_verdict(req, sibling_entries, conda_provided) {
+        match auto_imports_injection_verdict(req, sibling_entries, conda_provided, naming) {
             Ok(root) => {
                 if inject {
                     injected.push(root.clone());
@@ -15711,6 +16004,15 @@ async fn auto_imports_dry_run(
                     would_emit = %line,
                     root = %root,
                     indexed = req.source.is_some(),
+                    // p6t: WHICH request fact named this root. `indexed`
+                    // above is now provenance for the log only -- the store
+                    // has no vote. A row with `indexed=true naming=table`
+                    // means the store agreed with the table and changed
+                    // nothing; there is no row in which the store decides.
+                    naming = %naming
+                        .lookup(&req.module)
+                        .map(|d| d.origin.as_str())
+                        .unwrap_or("curated-table"),
                     injected = inject,
                     files = req.files.len(),
                     "auto_imports_dry: detected requirement (INJECTABLE)",

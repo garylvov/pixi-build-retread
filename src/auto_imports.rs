@@ -196,6 +196,17 @@ pub struct ClosureIndex {
     unreadable: Vec<(PathBuf, String)>,
 }
 
+impl ClosureIndex {
+    /// Every module -> distribution edge this scan produced.
+    ///
+    /// p6t reader: the naming authority needs to see what the store WOULD
+    /// have said so it can report the edges it refuses. Without this the
+    /// store's influence could only be measured by its absence.
+    pub fn module_edges(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.by_module.iter().map(|(m, (d, _src))| (m.as_str(), d.as_str()))
+    }
+}
+
 pub fn build_index(wheels: &[PathBuf]) -> ClosureIndex {
     let mut by_module = BTreeMap::new();
     let mut submodules: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -356,6 +367,225 @@ impl AutoImportReport {
         }
         out
     }
+}
+
+
+// ---------------------------------------------------------------------------
+// p6t: the import -> distribution NAMING AUTHORITY
+// ---------------------------------------------------------------------------
+//
+// WHY THIS EXISTS. Until p6t the only naming source besides the curated table
+// was [`ClosureIndex`], which is built by opening every wheel that happens to
+// be sitting in the machine-wide content-addressed store. That made the
+// injected root set a function of CACHE STATE. Measured, same manifest, same
+// pack records, same tree, two arms:
+//
+//   * oncert-p6r job 5745086 -- the store held 19 wheels at injection time,
+//     one of them `isaacsim_extscache_kit_sdk-6.0.0.1-...whl`. That wheel
+//     ships the top-level module `isaacsim`, so `import isaacsim` in
+//     ProtoMotions was named `isaacsim-extscache-kit-sdk`, injected as a bare
+//     root, pinned to 5.1.0.0 by a co-resident pack, and the resolve then
+//     died building NVIDIA's placeholder sdist.
+//   * oncert-p6s job 5748915 -- the same scan at the deciding instant saw 0
+//     wheels, so the same import stayed an unnamed LEAD, 15 roots went in
+//     instead of 16, and the request locked 27/27.
+//
+// Two different dependency graphs for the same inputs. A lock is not
+// reproducible if the thing that decides its roots is a directory listing.
+//
+// THE RULE p6t ENFORCES: a detected import may only be named from facts that
+// are properties of the REQUEST -- the workspace manifest, the pack records,
+// and the lock/index facts the workspace already carries. The wheel store is
+// demoted to what it always should have been: an accelerator that may confirm
+// an answer already determined, and may never supply one. With an empty store
+// and with a full store the injected root set is byte-identical, and
+// [`NamingAuthority::store_confirmation`] is the row that proves it each run.
+
+/// Where a determined distribution name+version came from. Every variant has
+/// a live producer in `build_auto_imports_naming_authority`; a naming source
+/// with no producer is not listed here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum NamingOrigin {
+    /// A PyPI row of the workspace's committed `pixi.lock`, intersected over
+    /// the consuming environments. Carries the resolved version verbatim.
+    LockedRecord,
+    /// A `[pypi-dependencies]` declaration of the workspace manifest. Carries
+    /// a version only when the declared spec is an exact `==` pin.
+    DeclaredDep,
+}
+
+impl NamingOrigin {
+    /// Stable log token.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NamingOrigin::LockedRecord => "locked-record",
+            NamingOrigin::DeclaredDep => "declared-dep",
+        }
+    }
+}
+
+/// One distribution this request has ALREADY determined it installs.
+///
+/// `version` never comes from a filename. It is the locked record's version
+/// or the declared band's exact pin, or nothing at all -- a bare root is a
+/// deterministic answer, a filename-derived version is not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeterminedDistribution {
+    /// PEP 503 canonical distribution name.
+    pub name: String,
+    pub version: Option<String>,
+    pub origin: NamingOrigin,
+}
+
+impl DeterminedDistribution {
+    /// The uv root to emit: pinned when the record pins, bare otherwise.
+    pub fn root_specifier(&self) -> String {
+        match &self.version {
+            Some(v) => format!("{}=={}", self.name, v),
+            None => self.name.clone(),
+        }
+    }
+}
+
+/// What a store scan was allowed to do, per bundle. Written every run so
+/// "the store named nothing" is measured, not asserted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StoreConfirmation {
+    /// module->distribution edges the store scan offered.
+    pub offered: usize,
+    /// Offered edges naming a distribution this request already determined.
+    /// These confirm; they change no answer.
+    pub confirmed: usize,
+    /// Offered edges naming a distribution NOTHING in this request
+    /// determined. Under p6r these were injected as roots. They are now
+    /// refused, and each one is a FINDING for manifest work.
+    pub refused_undetermined: usize,
+}
+
+/// import module -> distribution, from request facts only.
+///
+/// Construction is deliberately dumb: the caller hands in the determined
+/// distributions, and the authority derives the module names each one is
+/// known to provide. There is exactly one derivation -- PEP 503 inverse,
+/// `-` back to `_`, plus the literal name -- because that is the only
+/// module/distribution relationship knowable without opening an artifact.
+/// Everything else is the curated table's job (`PIL` -> `pillow`), and the
+/// table is consulted BEFORE this, so drift is already handled where it is
+/// known and is a LEAD where it is not.
+#[derive(Debug, Clone, Default)]
+pub struct NamingAuthority {
+    by_name: BTreeMap<String, DeterminedDistribution>,
+    /// module -> distribution name. A module two determined distributions
+    /// both claim is AMBIGUOUS and is absent here: never injected on doubt.
+    by_module: BTreeMap<String, String>,
+    /// Modules dropped for ambiguity, retained so a log row can name them.
+    pub ambiguous: BTreeSet<String>,
+}
+
+impl NamingAuthority {
+    /// Build from the determined set. Later entries never displace earlier
+    /// ones silently: a module claimed twice becomes ambiguous and is
+    /// dropped, which is a refusal, not a coin flip.
+    pub fn from_determined(dists: impl IntoIterator<Item = DeterminedDistribution>) -> Self {
+        let mut by_name: BTreeMap<String, DeterminedDistribution> = BTreeMap::new();
+        for d in dists {
+            match by_name.get(&d.name) {
+                // A locked record outranks a declared band for the SAME
+                // name: both are request facts, the lock is the resolved one.
+                Some(existing) if existing.origin <= d.origin => {}
+                _ => {
+                    by_name.insert(d.name.clone(), d);
+                }
+            }
+        }
+        let mut by_module: BTreeMap<String, String> = BTreeMap::new();
+        let mut ambiguous: BTreeSet<String> = BTreeSet::new();
+        for name in by_name.keys() {
+            for module in distribution_module_forms(name) {
+                match by_module.get(&module) {
+                    Some(other) if other != name => {
+                        ambiguous.insert(module.clone());
+                    }
+                    _ => {
+                        by_module.insert(module, name.clone());
+                    }
+                }
+            }
+        }
+        for module in &ambiguous {
+            by_module.remove(module);
+        }
+        NamingAuthority { by_name, by_module, ambiguous }
+    }
+
+    /// The distribution this request determined for `module`, if any.
+    pub fn lookup(&self, module: &str) -> Option<&DeterminedDistribution> {
+        let name = self.by_module.get(module)?;
+        self.by_name.get(name)
+    }
+
+    /// Is `dist` (PEP 503 canonical) one this request determined?
+    pub fn is_determined(&self, dist: &str) -> bool {
+        self.by_name.contains_key(dist)
+    }
+
+    pub fn len(&self) -> usize {
+        self.by_name.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_name.is_empty()
+    }
+
+    /// How many determined distributions came from each origin.
+    pub fn counts_by_origin(&self) -> (usize, usize) {
+        let locked = self
+            .by_name
+            .values()
+            .filter(|d| d.origin == NamingOrigin::LockedRecord)
+            .count();
+        (locked, self.by_name.len() - locked)
+    }
+
+    /// ACCELERATOR ONLY. Fold a wheel-store index against the determined set
+    /// and report what it would have said. This function returns COUNTS. It
+    /// deliberately returns no names to inject and mutates nothing: that is
+    /// the whole guarantee -- with an empty store and with a full one, the
+    /// injected root set is the same, because the store is never in the
+    /// naming path at all.
+    pub fn store_confirmation(&self, index: &ClosureIndex) -> StoreConfirmation {
+        let mut c = StoreConfirmation::default();
+        for (_module, dist) in index.module_edges() {
+            c.offered += 1;
+            if self.is_determined(dist) {
+                c.confirmed += 1;
+            } else {
+                c.refused_undetermined += 1;
+            }
+        }
+        c
+    }
+
+    /// Store edges that would have NAMED a root under the p6r rule and are
+    /// refused under p6t, as `(module, store distribution)` pairs. Each is a
+    /// FINDING: an import the code makes that no request fact accounts for.
+    pub fn refused_store_edges(&self, index: &ClosureIndex) -> Vec<(String, String)> {
+        index
+            .module_edges()
+            .filter(|(_m, d)| !self.is_determined(d))
+            .map(|(m, d)| (m.to_string(), d.to_string()))
+            .collect()
+    }
+}
+
+/// The top-level module names a distribution called `name` is known to
+/// provide without opening anything: the literal name and its PEP 503
+/// inverse. `dm-control` -> `dm_control`, `isaacsim` -> `isaacsim`.
+pub fn distribution_module_forms(name: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    out.insert(name.to_string());
+    out.insert(name.replace('-', "_"));
+    out
 }
 
 #[cfg(test)]

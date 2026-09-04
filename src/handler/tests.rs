@@ -7736,7 +7736,9 @@ fn auto_imports_injection_verdict_skips_unmappable_names() {
     // Empty conda-provided set for the naming assertions below; the
     // conda-precedence screen gets its own dedicated test.
     let no_conda: BTreeSet<String> = BTreeSet::new();
-    let verdict = |r: &ResolvedImport| auto_imports_injection_verdict(r, &siblings, &no_conda);
+    let no_naming = crate::auto_imports::NamingAuthority::default();
+    let verdict =
+        |r: &ResolvedImport| auto_imports_injection_verdict(r, &siblings, &no_conda, &no_naming);
 
     // --- INJECTED ---
     // Index-provided: PIL -> pillow, the naming the warm wheel slice gave.
@@ -7750,13 +7752,44 @@ fn auto_imports_injection_verdict_skips_unmappable_names() {
     {
         assert_eq!(verdict(&req(module, name, false, false)), Ok(name.to_string()), "{module}");
     }
-    // An INDEX-provided name is authoritative even with many segments, and
-    // even when it is on the denylist.
-    assert_eq!(
-        verdict(&req("some_mod", "a-b-c-d", true, false)),
-        Ok("a-b-c-d".to_string())
+    // p6t: an INDEX-provided name is no longer authoritative. `indexed=true`
+    // means only "a wheel with this module happened to be in the machine-wide
+    // store" -- the p6s-2 defect, measured as two different answers for
+    // `module=isaacsim` six minutes apart in one run (job 5745086 vs 5748915).
+    // With no request fact behind them these are LEADS.
+    assert!(
+        verdict(&req("some_mod", "a-b-c-d", true, false)).is_err(),
+        "a store listing must not name a root"
     );
-    assert_eq!(verdict(&req("warp", "warp-lang", true, false)), Ok("warp-lang".to_string()));
+    assert!(verdict(&req("warp", "warp-lang", true, false)).is_err());
+    // The SAME rows inject the moment a request fact determines them, and
+    // then they carry that fact's version.
+    {
+        use crate::auto_imports::{DeterminedDistribution, NamingAuthority, NamingOrigin};
+        let determined = NamingAuthority::from_determined([
+            DeterminedDistribution {
+                name: "a-b-c-d".to_string(),
+                version: None,
+                origin: NamingOrigin::DeclaredDep,
+            },
+            DeterminedDistribution {
+                name: "warp-lang".to_string(),
+                version: Some("1.5.0".to_string()),
+                origin: NamingOrigin::LockedRecord,
+            },
+        ]);
+        let determined_verdict =
+            |r: &ResolvedImport| auto_imports_injection_verdict(r, &siblings, &no_conda, &determined);
+        // `a_b_c_d` is the module form of the declared distribution `a-b-c-d`.
+        assert_eq!(
+            determined_verdict(&req("a_b_c_d", "a-b-c-d", true, false)),
+            Ok("a-b-c-d".to_string())
+        );
+        assert_eq!(
+            determined_verdict(&req("warp_lang", "warp-lang", true, false)),
+            Ok("warp-lang==1.5.0".to_string())
+        );
+    }
 
     // --- SKIPPED, with the reason each one is skipped for ---
     // (a) conditional: `import cv2` inside a try/except.
@@ -7787,7 +7820,7 @@ fn auto_imports_injection_verdict_skips_unmappable_names() {
     // NOT in it, which is precisely why screen (c) could not save arm B.
     let foreign_siblings: BTreeSet<String> = ["flashrl"].iter().map(|s| s.to_string()).collect();
     let foreign =
-        |r: &ResolvedImport| auto_imports_injection_verdict(r, &foreign_siblings, &no_conda);
+        |r: &ResolvedImport| auto_imports_injection_verdict(r, &foreign_siblings, &no_conda, &no_naming);
     for module in [
         "isaaclab",
         "isaaclab_tasks",
@@ -7813,12 +7846,40 @@ fn auto_imports_injection_verdict_skips_unmappable_names() {
         verdict(&req("isaaclabel", "isaaclabel", false, false)),
         Err(AUTO_IMPORTS_LEAD_REASON)
     );
-    // (`isaaclab_tasks` is a sibling in this fixture, so screen (c) claims it
-    // first; use a non-sibling to exercise index authority over (g2).)
-    assert_eq!(
-        verdict(&req("isaaclab_newton", "isaaclab-newton", true, false)),
-        Ok("isaaclab-newton".to_string())
+    // p6t REVERSED THIS PRECEDENCE, deliberately. It used to read "index
+    // authority beats (g2)": a wheel named `isaaclab_newton-*.whl` sitting in
+    // the machine-wide store made the extension injectable as a PyPI root.
+    // An Isaac Lab extension is a source-built entry of some bundle in this
+    // workspace and is published to no index, so that could only ever produce
+    // "isaaclab-newton was not found in the package registry" -- and it did,
+    // in job 5547304 arm B, for the sibling name. (g1)/(g2) now run BEFORE
+    // the naming authority, so neither a store listing nor a coincidental
+    // lock row can make one of these a root.
+    assert!(
+        verdict(&req("isaaclab_newton", "isaaclab-newton", true, false))
+            .unwrap_err()
+            .contains("Isaac Lab extension"),
+        "a store-indexed Isaac Lab extension is still not a PyPI distribution"
     );
+    {
+        use crate::auto_imports::{DeterminedDistribution, NamingAuthority, NamingOrigin};
+        let even_locked = NamingAuthority::from_determined([DeterminedDistribution {
+            name: "isaaclab-newton".to_string(),
+            version: Some("0.1.0".to_string()),
+            origin: NamingOrigin::LockedRecord,
+        }]);
+        assert!(
+            auto_imports_injection_verdict(
+                &req("isaaclab_newton", "isaaclab-newton", true, false),
+                &siblings,
+                &no_conda,
+                &even_locked,
+            )
+            .unwrap_err()
+            .contains("Isaac Lab extension"),
+            "not even a lock row promotes a workspace-built extension to a PyPI root"
+        );
+    }
     // (e) repo-local module paths the own-top-level screen missed because
     // they live in a SIBLING directory of a shared checkout.
     for (module, name) in [
@@ -7909,11 +7970,43 @@ fn auto_imports_injection_verdict_skips_unmappable_names() {
         Ok("pillow".to_string()),
         "the curated table outranks the index"
     );
-    // An unmapped module is a lead when cold and a root when the index knows
-    // it -- that asymmetry is intended (the index is evidence, the fallback
-    // is not), and is the one case where warmth legitimately matters.
+    // p6t DELETED THE LAST ASYMMETRY. This assertion used to read "an unmapped
+    // module is a lead when cold and a root when the index knows it -- that
+    // asymmetry is intended, and is the one case where warmth legitimately
+    // matters." It is not legitimate and it was not one case: it is the whole
+    // of p6s-2. `isaacsim` took exactly this path -- lead at 03:24:10 on a
+    // 0-wheel store, INJECTABLE at 03:29:05 once the store filled, in ONE run
+    // (job 5748915), and injected as `isaacsim-extscache-kit-sdk` in job
+    // 5745086 whose store was warm at the deciding instant. Warmth now
+    // decides nothing anywhere: cold and warm are the same verdict.
     assert_eq!(verdict(&req("annoy", "annoy", false, false)), Err(AUTO_IMPORTS_LEAD_REASON));
-    assert_eq!(verdict(&req("annoy", "annoy", true, false)), Ok("annoy".to_string()));
+    assert_eq!(
+        verdict(&req("annoy", "annoy", true, false)),
+        Err(AUTO_IMPORTS_LEAD_REASON),
+        "a store listing is not evidence: same verdict cold and warm"
+    );
+    // The lead becomes a root the moment a REQUEST FACT names it, and then it
+    // carries that fact's version -- store state still irrelevant either way.
+    {
+        use crate::auto_imports::{DeterminedDistribution, NamingAuthority, NamingOrigin};
+        let determined = NamingAuthority::from_determined([DeterminedDistribution {
+            name: "annoy".to_string(),
+            version: Some("1.17.3".to_string()),
+            origin: NamingOrigin::LockedRecord,
+        }]);
+        for indexed in [false, true] {
+            assert_eq!(
+                auto_imports_injection_verdict(
+                    &req("annoy", "annoy", indexed, false),
+                    &siblings,
+                    &no_conda,
+                    &determined,
+                ),
+                Ok("annoy==1.17.3".to_string()),
+                "indexed={indexed}"
+            );
+        }
+    }
 }
 
 /// CONDA PRECEDENCE (screen (d)). Job 5551014 died because `open3d` was
@@ -7945,7 +8038,9 @@ fn auto_imports_never_injects_a_name_conda_already_provides() {
     .iter()
     .map(|s| s.to_string())
     .collect();
-    let verdict = |r: &ResolvedImport| auto_imports_injection_verdict(r, &siblings, &conda);
+    let no_naming = crate::auto_imports::NamingAuthority::default();
+    let verdict =
+        |r: &ResolvedImport| auto_imports_injection_verdict(r, &siblings, &conda, &no_naming);
 
     // THE NEWTON SIX, the exact roots injected into `newton-pack-latest`.
     // Five are conda-provided and must now be skipped; `sphinx` is NOT in the
@@ -7995,7 +8090,12 @@ fn auto_imports_never_injects_a_name_conda_already_provides() {
     // entirely by workspace facts, never by a hardcoded list.
     let none: BTreeSet<String> = BTreeSet::new();
     assert_eq!(
-        auto_imports_injection_verdict(&req("open3d", "open3d", false), &siblings, &none),
+        auto_imports_injection_verdict(
+            &req("open3d", "open3d", false),
+            &siblings,
+            &none,
+            &crate::auto_imports::NamingAuthority::default(),
+        ),
         Ok("open3d".to_string())
     );
 }
@@ -8232,7 +8332,9 @@ fn auto_imports_never_injects_an_abi_anchor() {
     // narrow fact set does not mention numpy at all. The anchor guard must
     // still refuse it -- that is the whole point of adding it.
     let empty: BTreeSet<String> = BTreeSet::new();
-    let verdict = |r: &ResolvedImport| auto_imports_injection_verdict(r, &siblings, &empty);
+    let no_naming = crate::auto_imports::NamingAuthority::default();
+    let verdict =
+        |r: &ResolvedImport| auto_imports_injection_verdict(r, &siblings, &empty, &no_naming);
 
     for module in ["numpy", "python", "cuda"] {
         assert_eq!(
@@ -11377,4 +11479,296 @@ fn p6q_a_bundled_wheel_pin_is_not_advertised_when_no_auto_route_exists_for_the_n
             "the row must NAME the counterparties ({counterparty} missing): {logs}",
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// p6t: injection is a pure function of request facts, never of cache state
+// ---------------------------------------------------------------------------
+
+/// A wheel on disk whose dist-info names `modules` as its top level.
+/// Filename shape is PEP 427, because that filename is what the p6r naming
+/// path derived the distribution name from.
+fn p6t_wheel(dir: &std::path::Path, filename: &str, dist: &str, modules: &[&str]) -> PathBuf {
+    use std::io::Write;
+    let path = dir.join(filename);
+    let f = std::fs::File::create(&path).unwrap();
+    let mut z = zip::ZipWriter::new(f);
+    let o: zip::write::FileOptions<()> =
+        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    z.start_file(format!("{dist}.dist-info/top_level.txt"), o).unwrap();
+    z.write_all(modules.join("\n").as_bytes()).unwrap();
+    z.finish().unwrap();
+    path
+}
+
+fn p6t_tmpdir(label: &str) -> PathBuf {
+    let p = std::env::temp_dir().join(format!(
+        "retread-p6t-{label}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&p);
+    std::fs::create_dir_all(&p).unwrap();
+    p
+}
+
+/// The 19-wheel store oncert-p6r 5745086 held at injection time, reduced to
+/// the wheels that carry a naming edge: the kit-sdk wheel that made
+/// `import isaacsim` mean `isaacsim-extscache-kit-sdk`, plus a handful of
+/// ordinary ones so the store is not a one-wheel strawman.
+fn p6t_p6r_store(dir: &std::path::Path) -> Vec<PathBuf> {
+    vec![
+        p6t_wheel(
+            dir,
+            "isaacsim_extscache_kit_sdk-6.0.0.1-cp312-none-manylinux_2_35_x86_64.whl",
+            "isaacsim_extscache_kit_sdk-6.0.0.1",
+            &["isaacsim"],
+        ),
+        p6t_wheel(dir, "opencv_python-4.10.0.84-py3-none-any.whl", "opencv_python-4.10.0.84", &["cv2"]),
+        p6t_wheel(dir, "warp_lang-1.5.0-py3-none-any.whl", "warp_lang-1.5.0", &["warp"]),
+        p6t_wheel(dir, "some_pkg-1.0.0-py3-none-any.whl", "some_pkg-1.0.0", &["some_mod"]),
+    ]
+}
+
+fn p6t_req(module: &str, provider: &str, indexed: bool) -> crate::auto_imports::ResolvedImport {
+    crate::auto_imports::ResolvedImport {
+        module: module.to_string(),
+        provider: Some(provider.to_string()),
+        source: indexed.then_some(crate::auto_imports::ProvenanceSource::TopLevelTxt),
+        conditional: false,
+        files: vec![PathBuf::from("a.py")],
+    }
+}
+
+/// p6t GUARD (a) — THE DETERMINISM PROOF.
+///
+/// Same manifest, same pack records, same detected imports. One arm sees an
+/// EMPTY wheel store, the other sees the store oncert-p6r 5745086 actually
+/// held. The injected root set must be identical, name AND version.
+///
+/// RED on 0dcda13: the empty arm injects nothing for `isaacsim`/`cv2`/`warp`/
+/// `some_mod`, the warm arm injects `isaacsim-extscache-kit-sdk`, `warp-lang`
+/// and `a-b-c-d`-shaped names off the store listing — which is the measured
+/// difference between jobs 5745086 and 5748915.
+#[test]
+fn p6t_a_the_injected_root_set_is_identical_with_an_empty_store_and_p6rs_warm_one() {
+    use crate::auto_imports::{build_index, DeterminedDistribution, NamingAuthority, NamingOrigin};
+
+    let dir = p6t_tmpdir("store");
+    let warm = p6t_p6r_store(&dir);
+    let cold: Vec<PathBuf> = Vec::new();
+
+    // The request facts, identical in both arms: the workspace lock resolves
+    // `isaacsim 5.1.0.0`, the manifest declares `opencv-python`.
+    let naming = NamingAuthority::from_determined([
+        DeterminedDistribution {
+            name: "isaacsim".to_string(),
+            version: Some("5.1.0.0".to_string()),
+            origin: NamingOrigin::LockedRecord,
+        },
+        DeterminedDistribution {
+            name: "opencv-python".to_string(),
+            version: None,
+            origin: NamingOrigin::DeclaredDep,
+        },
+    ]);
+    let siblings: BTreeSet<String> = BTreeSet::new();
+    let conda: BTreeSet<String> = BTreeSet::new();
+
+    // What the scan detects. `indexed` is exactly the flag the store sets, so
+    // the two arms differ in it — that is the input under test.
+    let modules = ["isaacsim", "cv2", "warp", "some_mod"];
+    let roots_for = |wheels: &[PathBuf]| -> Vec<String> {
+        let index = build_index(wheels);
+        let mut roots: Vec<String> = Vec::new();
+        for module in modules {
+            let provider = index
+                .module_edges()
+                .find(|(m, _)| *m == module)
+                .map(|(_, d)| d.to_string())
+                .unwrap_or_else(|| module.replace('_', "-").to_lowercase());
+            let indexed = index.module_edges().any(|(m, _)| m == module);
+            let req = p6t_req(module, &provider, indexed);
+            if let Ok(root) = auto_imports_injection_verdict(&req, &siblings, &conda, &naming) {
+                roots.push(root);
+            }
+        }
+        roots.sort();
+        roots
+    };
+
+    let cold_roots = roots_for(&cold);
+    let warm_roots = roots_for(&warm);
+    assert_eq!(
+        cold_roots, warm_roots,
+        "injection must be a pure function of (manifest, pack records, lock facts): \
+         an empty store gave {cold_roots:?} and p6r's 19-wheel store gave {warm_roots:?}"
+    );
+    // Non-vacuity: the identical set is not the empty set, and the warm store
+    // really does offer the kit-sdk edge that p6r injected.
+    assert_eq!(
+        cold_roots,
+        vec!["isaacsim==5.1.0.0".to_string(), "opencv-python".to_string()],
+        "the determined roots are what the request facts say, versions included"
+    );
+    let warm_index = build_index(&warm);
+    assert!(
+        warm_index
+            .module_edges()
+            .any(|(m, d)| m == "isaacsim" && d == "isaacsim-extscache-kit-sdk"),
+        "the fixture store must actually carry p6r's naming edge, or this guard proves nothing"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// p6t GUARD (b) — the ProtoMotions import names the RESOLVED record.
+///
+/// `import isaacsim`, with a consuming env whose lock resolves
+/// `isaacsim 5.1.0.0`, must emit `isaacsim==5.1.0.0`. Never
+/// `isaacsim-extscache-kit-sdk` — that name exists in this test's world only
+/// as a wheel someone once downloaded, which is precisely the authority p6t
+/// removes.
+#[test]
+fn p6t_b_import_isaacsim_names_the_locked_record_not_a_kit_sdk_wheel_from_the_store() {
+    use crate::auto_imports::{build_index, DeterminedDistribution, NamingAuthority, NamingOrigin};
+
+    let dir = p6t_tmpdir("isaacsim");
+    let store = p6t_p6r_store(&dir);
+    let index = build_index(&store);
+    // The store's answer, unchanged — this is what p6r injected.
+    assert_eq!(
+        index
+            .module_edges()
+            .find(|(m, _)| *m == "isaacsim")
+            .map(|(_, d)| d),
+        Some("isaacsim-extscache-kit-sdk"),
+    );
+
+    let naming = NamingAuthority::from_determined([DeterminedDistribution {
+        name: "isaacsim".to_string(),
+        version: Some("5.1.0.0".to_string()),
+        origin: NamingOrigin::LockedRecord,
+    }]);
+    let siblings: BTreeSet<String> = BTreeSet::new();
+    let conda: BTreeSet<String> = BTreeSet::new();
+    // The request as the ProtoMotions scan produces it on a WARM store: the
+    // provider field already says kit-sdk and `indexed` is true.
+    let req = p6t_req("isaacsim", "isaacsim-extscache-kit-sdk", true);
+    assert_eq!(
+        auto_imports_injection_verdict(&req, &siblings, &conda, &naming),
+        Ok("isaacsim==5.1.0.0".to_string()),
+        "the resolved record names the root and pins it; the store listing does neither"
+    );
+    // And the store edge is REPORTED as refused rather than silently ignored.
+    let refused = naming.refused_store_edges(&index);
+    assert!(
+        refused
+            .iter()
+            .any(|(m, d)| m == "isaacsim" && d == "isaacsim-extscache-kit-sdk"),
+        "the refused edge must be nameable in a log row, not dropped in silence: {refused:?}"
+    );
+    assert_eq!(naming.store_confirmation(&index).confirmed, 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// p6t GUARD (c) — `suppressed_all` is LOUD.
+///
+/// Job 5748915 emitted `suppressed_all=true` twice and produced a 27/27 lock.
+/// The row that said so named no root and published no number, so the lock
+/// read as a clean pass. The counter row must carry the request, the roots,
+/// the reason and a zero-gateable number, at WARN — and must still be emitted,
+/// at INFO with a zero, when nothing was suppressed.
+#[test]
+fn p6t_c_suppressed_all_emits_a_loud_row_naming_the_roots_and_a_zero_gateable_counter() {
+    let mut suppressed: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    suppressed.insert(
+        "protomotions-deps-pack".to_string(),
+        vec!["isaacsim-extscache-kit-sdk".to_string(), "viser".to_string()],
+    );
+    suppressed.insert("newton-pack-latest".to_string(), vec!["open3d".to_string()]);
+
+    let (total, logs) = capture_warn_logs(|| {
+        emit_auto_imports_suppression_counter("pm-isaaclab", &suppressed, true, 2)
+    });
+    assert_eq!(total, 3);
+    assert!(
+        logs.contains("auto_imports_suppressed_roots=3"),
+        "the harness zero-gates on this exact token: {logs}"
+    );
+    assert!(logs.contains("auto_imports_suppressed_all=true"), "{logs}");
+    assert!(logs.contains("pm-isaaclab"), "the row must name the request: {logs}");
+    assert!(
+        logs.contains("protomotions-deps-pack=isaacsim-extscache-kit-sdk+viser"),
+        "the row must name the dropped roots per bundle: {logs}"
+    );
+    assert!(logs.contains("reason"), "the row must carry a reason: {logs}");
+
+    // Non-vacuity: with nothing suppressed the row is NOT a warning, so the
+    // WARN capture is empty -- and the counter is still zero, not absent.
+    let (clean_total, clean_logs) = capture_warn_logs(|| {
+        emit_auto_imports_suppression_counter("pm-isaaclab", &BTreeMap::new(), false, 0)
+    });
+    assert_eq!(clean_total, 0);
+    assert!(
+        !clean_logs.contains("SUPPRESSED-ROOT COUNTER"),
+        "a clean request must not raise the alarm: {clean_logs}"
+    );
+}
+
+/// p6t: an exact pin is a pin; a range, a `*` and two disagreeing pins are
+/// not. A guessed version is exactly the class of answer p6t exists to stop.
+#[test]
+fn p6t_declared_exact_version_pins_only_on_an_unambiguous_equals_clause() {
+    let v = |specs: &[&str]| {
+        auto_imports_declared_exact_version(
+            &specs.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        )
+    };
+    assert_eq!(v(&["==5.1.0.0"]), Some("5.1.0.0".to_string()));
+    assert_eq!(v(&["==2.7.0+cu128"]), Some("2.7.0+cu128".to_string()));
+    assert_eq!(v(&[">=1.0,<2"]), None);
+    assert_eq!(v(&["*"]), None);
+    assert_eq!(v(&["==1.0", "==2.0"]), None, "disagreeing pins must not pick a winner");
+    assert_eq!(v(&["==1.0.*"]), None, "a wildcard pin is not an exact version");
+    assert_eq!(v(&[]), None);
+}
+
+/// p6t: a module two determined distributions both claim is AMBIGUOUS and is
+/// never injected. The alternative -- first writer wins over a BTreeMap -- is
+/// a coin flip decided by alphabetical order.
+#[test]
+fn p6t_an_ambiguous_module_is_refused_rather_than_arbitrated() {
+    use crate::auto_imports::{DeterminedDistribution, NamingAuthority, NamingOrigin};
+    // Two distributions whose PEP 503 inverse is the same module name.
+    let naming = NamingAuthority::from_determined([
+        DeterminedDistribution {
+            name: "foo-bar".to_string(),
+            version: Some("1.0".to_string()),
+            origin: NamingOrigin::LockedRecord,
+        },
+        DeterminedDistribution {
+            name: "foo_bar".to_string(),
+            version: Some("2.0".to_string()),
+            origin: NamingOrigin::LockedRecord,
+        },
+    ]);
+    assert!(naming.lookup("foo_bar").is_none(), "ambiguous module must not name a root");
+    assert!(naming.ambiguous.contains("foo_bar"), "and must be reportable");
+    // A locked record outranks a declared band for the same NAME.
+    let ranked = NamingAuthority::from_determined([
+        DeterminedDistribution {
+            name: "viser".to_string(),
+            version: None,
+            origin: NamingOrigin::DeclaredDep,
+        },
+        DeterminedDistribution {
+            name: "viser".to_string(),
+            version: Some("0.2.7".to_string()),
+            origin: NamingOrigin::LockedRecord,
+        },
+    ]);
+    assert_eq!(ranked.lookup("viser").unwrap().root_specifier(), "viser==0.2.7");
 }
