@@ -11886,6 +11886,9 @@ fn c14_a_pack_no_env_consumes_falls_back_to_the_whole_file() {
     assert_eq!(scope, "no-consuming-env");
     assert!(digest.starts_with("whole:no-consuming-env:"));
     std::fs::remove_dir_all(&ws).ok();
+}
+
+// -----------------------------------------------------------------
 // p6p: the recompute door and the courier build-string gate ask the
 // SAME question and cannot both run.
 // -----------------------------------------------------------------
