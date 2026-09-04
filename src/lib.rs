@@ -43,6 +43,7 @@ pub(crate) mod thread_budget;
 pub mod uv_closure;
 pub(crate) mod virtual_override;
 pub mod wheel;
+pub(crate) mod wheel_content;
 pub mod wheel_inject;
 pub mod wheel_inject_data;
 pub mod wheel_rewrite;

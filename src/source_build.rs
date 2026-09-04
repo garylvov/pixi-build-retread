@@ -1002,6 +1002,65 @@ fn validate_wheel_file_with(
     expected: Option<&ExpectedWheel>,
     strict_archive: bool,
 ) -> Result<BuiltWheelMarker> {
+    // Order preserved from before the C10 split: an incompatible or malformed
+    // filename is refused before anything opens the archive, so a wheel that
+    // could never be used never costs a read. `validate_wheel_metadata` makes
+    // the same two checks again -- they are pure and cheap, and repeating them
+    // is what lets the record-served caller reach the identity checks by the
+    // same door rather than a copy of it.
+    validate_wheel_filename_for_target(path, target)?;
+    let metadata = if strict_archive {
+        // C10: identical semantics to the strict read, served from an
+        // attested content record when these exact bytes are already
+        // identified by a content-addressed path or a store marker.
+        crate::wheel_content::read_metadata_verified(path, None)
+    } else {
+        let file_type = std::fs::symlink_metadata(path)
+            .with_context(|| format!("stating cached wheel {}", path.display()))?
+            .file_type();
+        if !file_type.is_file() || file_type.is_symlink() {
+            bail!("cached wheel is not a regular file: {}", path.display());
+        }
+        // C10-b: the same record seam as the strict arm above, spending the
+        // weaker `hash-and-parse` records as well as strict ones.
+        crate::wheel_content::read_metadata_recorded(path)
+    }
+    .with_context(|| format!("validating source-built wheel {}", path.display()))?;
+    validate_wheel_metadata(path, target, expected, metadata)
+}
+
+/// Refuse a wheel on its filename alone: wrong platform/python for this
+/// target, or not a PEP 427 name at all. Reads no bytes.
+fn validate_wheel_filename_for_target(path: &Path, target: &ResolutionTarget) -> Result<()> {
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("wheel path has no UTF-8 filename: {}", path.display()))?;
+    let standard_filename = crate::emit_pypi::standard_wheel_filename(filename);
+    if crate::pypi::score_wheel(&standard_filename, target.wheel_target()) < 0 {
+        bail!(
+            "source-built wheel `{filename}` is incompatible with python {} on {}",
+            target.python_version(),
+            target.conda_subdir(),
+        );
+    }
+    crate::pypi::wheel_filename_identity(&standard_filename).ok_or_else(|| {
+        anyhow!("source build produced invalid PEP 427 filename `{filename}`")
+    })?;
+    Ok(())
+}
+
+/// The identity half of [`validate_wheel_file_with`]: everything that is
+/// decided from a `WheelMetadata` plus the filename, and nothing that reads
+/// the payload. Split out by C10 so a caller holding metadata proven by an
+/// attested content record reaches exactly these checks, in this order,
+/// instead of a near-copy of them.
+fn validate_wheel_metadata(
+    path: &Path,
+    target: &ResolutionTarget,
+    expected: Option<&ExpectedWheel>,
+    metadata: crate::wheel::WheelMetadata,
+) -> Result<BuiltWheelMarker> {
     let filename = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -1018,18 +1077,6 @@ fn validate_wheel_file_with(
         crate::pypi::wheel_filename_identity(&standard_filename).ok_or_else(|| {
             anyhow!("source build produced invalid PEP 427 filename `{filename}`")
         })?;
-    let metadata = if strict_archive {
-        crate::wheel::read_metadata_strict(path)
-    } else {
-        let file_type = std::fs::symlink_metadata(path)
-            .with_context(|| format!("stating cached wheel {}", path.display()))?
-            .file_type();
-        if !file_type.is_file() || file_type.is_symlink() {
-            bail!("cached wheel is not a regular file: {}", path.display());
-        }
-        crate::wheel::read_metadata(path)
-    }
-    .with_context(|| format!("validating source-built wheel {}", path.display()))?;
     let metadata_name = crate::relax::canonical_conda_name(&metadata.name);
     let filename_name = crate::relax::canonical_conda_name(&filename_name);
     if metadata_name != filename_name {
@@ -1304,6 +1351,35 @@ pub(crate) async fn validate_pinned_wheel_for_target_async(
             return Ok(authoritative_sha256);
         }
 
+        // C10: an attested content record for this authoritative digest is a
+        // statement that these exact bytes were once fully hashed and fully
+        // inflated, re-proved here against the ZIP central directory. It costs
+        // one seek and a few KB where the two passes below cost two full reads
+        // of a multi-gigabyte payload -- measured 82.8 s + 50.9 s on
+        // `isaacsim_extscache_kit` alone. It is checked AFTER the attestation
+        // marker above, because that path is cheaper still, and it is what
+        // makes the SAME BYTES reached by a second spelling (the persistent
+        // store and the per-workspace fetch dir both name the same sha) a hit:
+        // the attestation is keyed on the request's source, the record on the
+        // content.
+        if let Some(metadata) = crate::wheel_content::record_hit(path, &authoritative_sha256) {
+            let marker = validate_wheel_metadata(path, target, Some(expected), metadata)?;
+            let post_record_fingerprint = wheel_file_fingerprint(path)?;
+            if post_record_fingerprint != fingerprint {
+                bail!(
+                    "pinned wheel changed while its content record was checked: {}",
+                    path.display(),
+                );
+            }
+            if marker.sha256 != authoritative_sha256 {
+                return Err(anyhow::Error::new(AuthoritativeWheelHashMismatch {
+                    expected: authoritative_sha256,
+                    actual: marker.sha256,
+                }));
+            }
+            return Ok(authoritative_sha256);
+        }
+
         // Hash raw bytes before opening the ZIP. A truncated/malformed file
         // with the wrong authoritative digest is healable ingress corruption;
         // only a correct-hash artifact proceeds to terminal archive/semantic
@@ -1502,7 +1578,7 @@ async fn materialize_validated_wheel(wheel: &ValidatedWheel, out_dir: &Path) -> 
     if destination.is_file() && !same_filesystem_inode(&destination, &wheel.path) {
         let actual = tokio::task::spawn_blocking({
             let destination = destination.clone();
-            move || crate::wheel::read_metadata(&destination)
+            move || crate::wheel_content::read_metadata_recorded(&destination)
         })
         .await
         .context("existing output wheel validation task panicked")?;
@@ -10459,6 +10535,779 @@ version = "0.1.0"
 
     fn write_test_wheel(path: &Path, metadata_name: &str, metadata_version: &str) {
         write_test_wheel_with_payload(path, metadata_name, metadata_version, &[]);
+    }
+
+    // ---- C10 guards -------------------------------------------------------
+    //
+    // All three drive the production door `validate_wheel_file`, which is what
+    // `validate_pinned_wheel_for_target_async` and the source-build cache both
+    // reach the strict read through. Control for the RED runs: the body of
+    // `wheel_content::read_metadata_verified` replaced by a straight
+    // `crate::wheel::read_metadata_strict(path)` and NOTHING else.
+
+    /// A wheel with an equal-length, byte-different payload, Stored so the two
+    /// files are the same size on disk. `mtime` is pinned inside the archive
+    /// too, so the only thing that separates two of these is content.
+    fn write_content_addressed_test_wheel(path: &Path, payload_byte: u8, payload_len: usize) {
+        let file = File::create(path).unwrap();
+        let mut archive = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored)
+            .last_modified_time(zip::DateTime::from_date_and_time(2020, 1, 1, 0, 0, 0).unwrap());
+        archive
+            .start_file("pkg-1.0.0.dist-info/METADATA", options)
+            .unwrap();
+        archive
+            .write_all(b"Metadata-Version: 2.4\nName: pkg\nVersion: 1.0.0\n\n")
+            .unwrap();
+        archive
+            .start_file("pkg-1.0.0.dist-info/WHEEL", options)
+            .unwrap();
+        archive
+            .write_all(b"Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n")
+            .unwrap();
+        archive.start_file("pkg/payload.bin", options).unwrap();
+        archive.write_all(&vec![payload_byte; payload_len]).unwrap();
+        archive.finish().unwrap();
+    }
+
+    fn sha256_of_file(path: &Path) -> String {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(std::fs::read(path).unwrap()))
+    }
+
+    /// Place a wheel at the per-workspace pinned fetch layout
+    /// `wheel::pinned_wheel_destination` builds, whose `<sha256>` directory
+    /// name IS the authoritative digest.
+    fn place_content_addressed(workspace: &Path, source: &Path) -> PathBuf {
+        let sha256 = sha256_of_file(source);
+        let dir = workspace
+            .join(".retread-wheel-fetch")
+            .join("v1")
+            .join("sha256")
+            .join(&sha256);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("pkg-1.0.0-py3-none-any.whl");
+        std::fs::copy(source, &dest).unwrap();
+        dest
+    }
+
+    /// C10-b: there is no record ROOT any more to redirect -- the record is a
+    /// sibling of the wheel, so a guard is isolated by its own temp directory
+    /// and by nothing else. What still has to be cleared around a guard is the
+    /// process-wide memos, or an on-disk claim can be "proved" by a warm map.
+    struct MemoGuard;
+
+    impl MemoGuard {
+        fn fresh() -> Self {
+            crate::wheel_content::reset_memos_for_test();
+            MemoGuard
+        }
+    }
+
+    impl Drop for MemoGuard {
+        fn drop(&mut self) {
+            crate::wheel_content::reset_memos_for_test();
+        }
+    }
+
+    fn sidecar_of(wheel: &Path) -> PathBuf {
+        crate::wheel_content::record_sidecar_path(wheel).unwrap()
+    }
+
+    /// C10-c: point the persistent-store root at a temp tree for the duration
+    /// of one guard, without touching a process-wide environment variable.
+    struct StoreRootGuard;
+
+    impl StoreRootGuard {
+        fn set(root: &Path) -> Self {
+            std::fs::create_dir_all(root).unwrap();
+            *crate::wheel_content::WHEEL_STORE_ROOT_OVERRIDE
+                .lock()
+                .unwrap() = Some(root.to_path_buf());
+            StoreRootGuard
+        }
+    }
+
+    impl Drop for StoreRootGuard {
+        fn drop(&mut self) {
+            *crate::wheel_content::WHEEL_STORE_ROOT_OVERRIDE
+                .lock()
+                .unwrap() = None;
+        }
+    }
+
+    fn write_store_integrity_marker_for_test(store_entry: &Path, sha256: &str) {
+        crate::wheel::write_store_integrity_marker_blocking_for_test(store_entry, sha256).unwrap();
+    }
+
+    /// Serializes the three guards, which share the process-wide record-root
+    /// override and the process-wide content memos.
+    static C10_GUARD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn hashes_of(path: &Path) -> usize {
+        crate::wheel::full_hash_probe::hashes_for(&path.to_string_lossy()).len()
+    }
+
+    /// C10 guard (a). The measured cost of the strict read on
+    /// `isaacsim_extscache_kit` is 82.8 s, of which 50.9 s is a SHA-256 that
+    /// recomputes the name of the directory the file is already sitting in.
+    /// With an attested record for those bytes the second read must hash
+    /// nothing at all.
+    #[test]
+    fn a_content_addressed_wheel_with_a_verified_record_is_never_rehashed() {
+        let _serial = C10_GUARD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let base = unique_test_dir("c10-record-hit");
+        std::fs::create_dir_all(&base).unwrap();
+        let _memos = MemoGuard::fresh();
+
+        let staged = base.join("staged.whl");
+        write_content_addressed_test_wheel(&staged, 0xA5, 4096);
+        let wheel = place_content_addressed(&base.join("ws"), &staged);
+        let sha256 = sha256_of_file(&wheel);
+        let target = ResolutionTarget::from_parts("3.12", "linux-64", None);
+
+        let before = hashes_of(&wheel);
+        let first = validate_wheel_file(&wheel, &target, None).unwrap();
+        assert_eq!(first.sha256, sha256);
+        let after_first = hashes_of(&wheel);
+        assert!(
+            after_first > before,
+            "non-vacuity: the FIRST read must actually stream the payload, \
+             otherwise the second read's zero proves nothing (before={before} after={after_first})",
+        );
+        assert!(
+            sidecar_of(&wheel).is_file(),
+            "the read that paid must leave the record BESIDE THE BYTES, or nothing downstream \
+             can spend it",
+        );
+
+        // The on-disk record, not a warm map, has to be what carries this.
+        crate::wheel_content::reset_memos_for_test();
+        let second = validate_wheel_file(&wheel, &target, None).unwrap();
+        assert_eq!(second.sha256, sha256);
+        assert_eq!(
+            hashes_of(&wheel),
+            after_first,
+            "a byte-identical content-addressed wheel with a verified record must cost ZERO full hashes",
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// C10 guard (b). The threat the design names out loud: an in-place
+    /// replacement that holds size AND mtime fixed. The stat fingerprint does
+    /// not catch it -- the test asserts that first, so the guard cannot pass
+    /// for the wrong reason -- and the structure digest over the ZIP central
+    /// directory does, forcing the rehash that then refuses the artifact.
+    #[test]
+    fn b_a_wheel_swapped_in_place_under_a_stale_record_is_not_trusted() {
+        let _serial = C10_GUARD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let base = unique_test_dir("c10-swap");
+        std::fs::create_dir_all(&base).unwrap();
+        let _memos = MemoGuard::fresh();
+
+        let staged = base.join("staged.whl");
+        write_content_addressed_test_wheel(&staged, 0x11, 4096);
+        let wheel = place_content_addressed(&base.join("ws"), &staged);
+        let honest_sha256 = sha256_of_file(&wheel);
+        let target = ResolutionTarget::from_parts("3.12", "linux-64", None);
+
+        validate_wheel_file(&wheel, &target, None).unwrap();
+        let record = sidecar_of(&wheel);
+        let hashes_before_swap = hashes_of(&wheel);
+
+        let impostor = base.join("impostor.whl");
+        write_content_addressed_test_wheel(&impostor, 0x22, 4096);
+        assert_eq!(
+            std::fs::metadata(&impostor).unwrap().len(),
+            std::fs::metadata(&wheel).unwrap().len(),
+            "the swap only tests anything if the two files are the same size",
+        );
+        assert_ne!(sha256_of_file(&impostor), honest_sha256);
+
+        let before = crate::wheel_content::content_fingerprint(&wheel).unwrap();
+        let original = std::fs::metadata(&wheel).unwrap();
+        let times = std::fs::FileTimes::new()
+            .set_accessed(original.accessed().unwrap())
+            .set_modified(original.modified().unwrap());
+        {
+            // Same inode: opened for writing, not replaced by a rename.
+            let mut handle = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&wheel)
+                .unwrap();
+            handle.write_all(&std::fs::read(&impostor).unwrap()).unwrap();
+            handle.sync_all().unwrap();
+            handle.set_times(times).unwrap();
+        }
+        let after = crate::wheel_content::content_fingerprint(&wheel).unwrap();
+        assert_eq!(
+            before, after,
+            "non-vacuity: dev+inode+size+mtime is BLIND to this swap. If this ever \
+             fails the guard has stopped testing the threat it was written for.",
+        );
+
+        crate::wheel_content::reset_memos_for_test();
+        let error = validate_wheel_file(&wheel, &target, None).unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("disagrees with the directory that names it"),
+            "a content-addressed wheel whose bytes are not the ones its directory names must be \
+             refused, not served from a stale record: {rendered}",
+        );
+        assert!(
+            hashes_of(&wheel) > hashes_before_swap,
+            "the refusal must come from re-reading the bytes, not from a lucky stat compare",
+        );
+        // Checked last on purpose: the interesting failure is the artifact
+        // being ACCEPTED, and an earlier assertion here would mask it.
+        assert!(
+            record.is_file(),
+            "the stale record this guard has to defeat must have been filed by the first read",
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// C10 guard (c). The p6m cold profile strict-read the SAME bytes twice
+    /// under two content-addressed spellings -- the persistent store and the
+    /// per-workspace fetch directory -- for 77.6 s of its 277.1 s, because the
+    /// existing memo is keyed on the request rather than on the content. Two
+    /// request paths to one inode must cost one strict read.
+    #[test]
+    fn c_two_request_paths_to_one_inode_pay_one_strict_read() {
+        let _serial = C10_GUARD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let base = unique_test_dir("c10-two-paths");
+        std::fs::create_dir_all(&base).unwrap();
+        let _memos = MemoGuard::fresh();
+
+        let staged = base.join("staged.whl");
+        write_content_addressed_test_wheel(&staged, 0x5C, 4096);
+        let first_path = place_content_addressed(&base.join("ws-a"), &staged);
+        let sha256 = sha256_of_file(&first_path);
+        let second_dir = base
+            .join("ws-b")
+            .join(".retread-wheel-fetch")
+            .join("v1")
+            .join("sha256")
+            .join(&sha256);
+        std::fs::create_dir_all(&second_dir).unwrap();
+        let second_path = second_dir.join("pkg-1.0.0-py3-none-any.whl");
+        std::fs::hard_link(&first_path, &second_path).unwrap();
+
+        let target = ResolutionTarget::from_parts("3.12", "linux-64", None);
+        let first_before = hashes_of(&first_path);
+        let second_before = hashes_of(&second_path);
+
+        validate_wheel_file(&first_path, &target, None).unwrap();
+        validate_wheel_file(&second_path, &target, None).unwrap();
+
+        assert_eq!(
+            hashes_of(&first_path) - first_before,
+            1,
+            "the first spelling pays exactly one strict read",
+        );
+        assert_eq!(
+            hashes_of(&second_path) - second_before,
+            0,
+            "the second spelling of the same inode must pay none",
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The phase-2 relax writes `<entry>.relaxed.whl` INSIDE the entry's own
+    /// `<sha256>` directory, and its bytes are deliberately not the ones that
+    /// directory names. Reading the parent's digest for that file would turn
+    /// every relaxed wheel into a false refusal, so the recogniser must not
+    /// claim it.
+    #[test]
+    fn a_derived_wheel_beside_a_store_entry_is_not_content_addressed() {
+        let base = unique_test_dir("c10-derived-sibling");
+        let dir = base
+            .join(".retread-wheel-fetch")
+            .join("v1")
+            .join("sha256")
+            .join("a".repeat(64));
+        std::fs::create_dir_all(&dir).unwrap();
+        let entry = dir.join("pkg-1.0.0-py3-none-any.whl");
+        let derived = dir.join("pkg-1.0.0-py3-none-any.relaxed.whl");
+        write_content_addressed_test_wheel(&entry, 0x01, 16);
+        write_content_addressed_test_wheel(&derived, 0x02, 16);
+        assert_eq!(
+            crate::wheel_content::content_addressed_sha256(&entry),
+            Some("a".repeat(64)),
+            "the entry itself is content-addressed",
+        );
+        assert_eq!(
+            crate::wheel_content::content_addressed_sha256(&derived),
+            None,
+            "a derived sibling is NOT, or phase-2 relax becomes a false refusal",
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The recogniser must not treat a 64-hex directory that names something
+    /// OTHER than the bytes as content-addressed. `.retread-wheel-fetch/v1/url/`
+    /// entries are keyed by a hash of the URL, and reading a digest off one of
+    /// those would turn every unpinned fetch into a false refusal.
+    #[test]
+    fn a_url_keyed_fetch_directory_is_not_content_addressed() {
+        let base = unique_test_dir("c10-url-keyed");
+        let dir = base
+            .join(".retread-wheel-fetch")
+            .join("v1")
+            .join("url")
+            .join("f".repeat(64));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wheel = dir.join("pkg-1.0.0-py3-none-any.whl");
+        write_content_addressed_test_wheel(&wheel, 0x01, 16);
+        assert_eq!(crate::wheel_content::content_addressed_sha256(&wheel), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ---------------------------------------------------------------------
+    // C10-b guards. C10 put the STRICT door behind a record; these four cover
+    // what C10 left: the record must outlive the job that paid for it, the
+    // `hash+parse` door must spend it, and neither of those may weaken the
+    // strict door or the in-place-swap refusal.
+    // ---------------------------------------------------------------------
+
+    /// Read a wheel through the NON-strict production door -- the one whose
+    /// full read is `wheel::read_metadata` and whose bench rows say
+    /// `path="hash+parse"`.
+    fn read_through_hash_and_parse_door(path: &Path, target: &ResolutionTarget) -> BuiltWheelMarker {
+        validate_wheel_file_with(path, target, None, false).unwrap()
+    }
+
+    /// Copy a content-addressed entry AND whatever sibling records it has into
+    /// a second content-addressed location, the way a second job on the same
+    /// shared store reaches the same digest by a different spelling.
+    fn clone_entry_with_siblings(source_wheel: &Path, destination_dir: &Path) -> PathBuf {
+        std::fs::create_dir_all(destination_dir).unwrap();
+        let parent = source_wheel.parent().unwrap();
+        for entry in std::fs::read_dir(parent).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::copy(entry.path(), destination_dir.join(entry.file_name())).unwrap();
+        }
+        destination_dir.join(source_wheel.file_name().unwrap())
+    }
+
+    /// C10-b guard (d). THE headline, and the one C10.10 says C10 cannot make:
+    /// a record written by one run is spent by the next.
+    ///
+    /// C10 filed records under `<retread cache root>/wheel-content/v1/<sha>/`,
+    /// and every relock harness we run job-scopes that root
+    /// (`RETREAD_CACHE_DIR=…/certC10-<jobid>/retread-cache`), so the proof
+    /// run's 50 records were deleted with the job that built them. The record
+    /// is now a sibling of the bytes, so it travels with them: a second
+    /// spelling of the same digest, reached with COLD memos, must cost zero
+    /// full hashes. This also proves the `hash+parse` door spends records at
+    /// all -- 991 rows / 258.6 s / 29.57 GB of the C10 proof relock came in by
+    /// that door on files in the persistent store.
+    #[test]
+    fn d_a_record_beside_the_bytes_is_spent_by_a_later_run_at_the_hash_and_parse_door() {
+        let _serial = C10_GUARD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let base = unique_test_dir("c10b-across-runs");
+        std::fs::create_dir_all(&base).unwrap();
+        let _memos = MemoGuard::fresh();
+
+        let staged = base.join("staged.whl");
+        write_content_addressed_test_wheel(&staged, 0x7E, 4096);
+        let first = place_content_addressed(&base.join("run-1"), &staged);
+        let sha256 = sha256_of_file(&first);
+        let target = ResolutionTarget::from_parts("3.12", "linux-64", None);
+
+        let before = hashes_of(&first);
+        assert_eq!(read_through_hash_and_parse_door(&first, &target).sha256, sha256);
+        let after_first = hashes_of(&first);
+        assert!(
+            after_first > before,
+            "non-vacuity: run 1 must actually stream the payload, or run 2's zero proves \
+             nothing (before={before} after={after_first})",
+        );
+        let sidecar = sidecar_of(&first);
+        assert!(
+            sidecar.is_file(),
+            "the record must be filed BESIDE the bytes: {}",
+            sidecar.display(),
+        );
+        assert_eq!(
+            sidecar.parent(),
+            first.parent(),
+            "a record anywhere but beside the bytes dies with a job-scoped cache root",
+        );
+        // C10's sha-keyed `<cache root>/wheel-content/v1/<sha>/record.json`
+        // layout is deleted from the source outright rather than kept as a
+        // second location; asserting its ABSENCE on disk here would only
+        // measure whether some earlier binary left a tree behind on this box.
+        // What this guard can assert is the positive claim, above: the record
+        // is a sibling of the wheel and of nothing else.
+
+        // Run 2: a different spelling of the same digest, and NOTHING warm.
+        let second_dir = base
+            .join("run-2")
+            .join(".retread-wheel-fetch")
+            .join("v1")
+            .join("sha256")
+            .join(&sha256);
+        let second = clone_entry_with_siblings(&first, &second_dir);
+        crate::wheel_content::reset_memos_for_test();
+
+        let second_before = hashes_of(&second);
+        assert_eq!(
+            read_through_hash_and_parse_door(&second, &target).sha256,
+            sha256,
+        );
+        assert_eq!(
+            hashes_of(&second),
+            second_before,
+            "a second run over the same content-addressed bytes must pay ZERO full hashes",
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// C10-b guard (e). The strict door proves every member inflates; the
+    /// `hash+parse` door does not. Widening the record to the second door must
+    /// not let the first one spend what the second one wrote.
+    #[test]
+    fn e_the_strict_door_refuses_to_spend_a_hash_and_parse_record() {
+        let _serial = C10_GUARD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let base = unique_test_dir("c10b-provenance");
+        std::fs::create_dir_all(&base).unwrap();
+        let _memos = MemoGuard::fresh();
+
+        let staged = base.join("staged.whl");
+        write_content_addressed_test_wheel(&staged, 0x3F, 4096);
+        let wheel = place_content_addressed(&base.join("ws"), &staged);
+        let target = ResolutionTarget::from_parts("3.12", "linux-64", None);
+
+        read_through_hash_and_parse_door(&wheel, &target);
+        let sidecar = sidecar_of(&wheel);
+        let filed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
+        assert_eq!(
+            filed["read_kind"], "hash-and-parse",
+            "non-vacuity: the record under test must be the weaker kind",
+        );
+
+        // Cold memos: only the ON-DISK record can decide this.
+        crate::wheel_content::reset_memos_for_test();
+        let before = hashes_of(&wheel);
+        validate_wheel_file(&wheel, &target, None).unwrap();
+        assert!(
+            hashes_of(&wheel) > before,
+            "the strict door must re-read the payload rather than spend a `hash-and-parse` \
+             record, whose writer never inflated a single member",
+        );
+
+        let upgraded: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
+        assert_eq!(
+            upgraded["read_kind"], "strict-archive",
+            "the strict read that paid must leave the stronger record behind",
+        );
+
+        // And now the strict door DOES spend it -- otherwise this guard would
+        // pass just as well if records never worked at all.
+        crate::wheel_content::reset_memos_for_test();
+        let before = hashes_of(&wheel);
+        validate_wheel_file(&wheel, &target, None).unwrap();
+        assert_eq!(
+            hashes_of(&wheel),
+            before,
+            "positive control: a strict record must serve the strict door",
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// C10-b guard (f). C10's guard (b) proves the in-place swap is caught at
+    /// the STRICT door. The new door has to refuse it too, and for the same
+    /// reason: `dev+inode+size+mtime` is blind to it (asserted here, so the
+    /// guard cannot pass for the wrong reason) and the structure digest over
+    /// the ZIP central directory is not.
+    ///
+    /// What the fingerprint covers, stated exactly: device, inode, size, and
+    /// mtime to nanoseconds -- no `ctime` (a sibling job's `cp -al` moves it;
+    /// that was the ME1 false failure) and no content. A same-inode overwrite
+    /// that restores size and mtime leaves it BIT-IDENTICAL. It is therefore
+    /// never asked whether the artifact is admissible, only whether work can
+    /// be skipped. The record carries the sha, and the read sample-verifies it
+    /// against the central directory: every member's CRC-32 is in that digest,
+    /// so a changed payload moves it, the record misses, the full hash runs,
+    /// and the artifact is then refused because its bytes are not the ones its
+    /// directory names.
+    #[test]
+    fn f_a_swapped_wheel_under_a_stale_record_is_refused_at_the_hash_and_parse_door() {
+        let _serial = C10_GUARD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let base = unique_test_dir("c10b-swap");
+        std::fs::create_dir_all(&base).unwrap();
+        let _memos = MemoGuard::fresh();
+
+        let staged = base.join("staged.whl");
+        write_content_addressed_test_wheel(&staged, 0x44, 4096);
+        let wheel = place_content_addressed(&base.join("ws"), &staged);
+        let honest_sha256 = sha256_of_file(&wheel);
+        let target = ResolutionTarget::from_parts("3.12", "linux-64", None);
+
+        read_through_hash_and_parse_door(&wheel, &target);
+        let record = sidecar_of(&wheel);
+        let hashes_before_swap = hashes_of(&wheel);
+
+        let impostor = base.join("impostor.whl");
+        write_content_addressed_test_wheel(&impostor, 0x55, 4096);
+        assert_eq!(
+            std::fs::metadata(&impostor).unwrap().len(),
+            std::fs::metadata(&wheel).unwrap().len(),
+            "the swap only tests anything if the two files are the same size",
+        );
+        assert_ne!(sha256_of_file(&impostor), honest_sha256);
+
+        let before = crate::wheel_content::content_fingerprint(&wheel).unwrap();
+        let original = std::fs::metadata(&wheel).unwrap();
+        let times = std::fs::FileTimes::new()
+            .set_accessed(original.accessed().unwrap())
+            .set_modified(original.modified().unwrap());
+        {
+            // Same inode: opened for writing, not replaced by a rename.
+            let mut handle = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&wheel)
+                .unwrap();
+            handle.write_all(&std::fs::read(&impostor).unwrap()).unwrap();
+            handle.sync_all().unwrap();
+            handle.set_times(times).unwrap();
+        }
+        let after = crate::wheel_content::content_fingerprint(&wheel).unwrap();
+        assert_eq!(
+            before, after,
+            "non-vacuity: dev+inode+size+mtime is BLIND to a same-inode overwrite. If this ever \
+             fails the guard has stopped testing the threat it was written for.",
+        );
+
+        crate::wheel_content::reset_memos_for_test();
+        let error = validate_wheel_file_with(&wheel, &target, None, false).unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("disagrees with the directory that names it"),
+            "a content-addressed wheel whose bytes are not the ones its directory names must be \
+             refused at the `hash+parse` door too, not served from a stale record: {rendered}",
+        );
+        assert!(
+            hashes_of(&wheel) > hashes_before_swap,
+            "the refusal must come from re-reading the bytes, not from a lucky stat compare",
+        );
+        // Checked last on purpose: the interesting failure is the artifact
+        // being ACCEPTED, and an earlier assertion here would mask it.
+        assert!(
+            record.is_file(),
+            "the stale record this guard has to defeat must have been filed by the first read",
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// C10-c guard (i). C10's derived-sibling rule excluded every platform
+    /// field containing a `.`, which also excluded the PEP 425 compressed tag
+    /// SET that most real manylinux wheels carry. Measured in run 2 of the
+    /// C10-b proof pair (job 5743374): 118 distinct store wheels, 190
+    /// `hash+parse` rows / 20.0 s, declined for this reason alone and unable to
+    /// hold a record at all. Both halves are asserted here, because a rule that
+    /// admits the compressed tag set by admitting EVERYTHING would pass on the
+    /// first half alone and reopen C10.6's false refusal.
+    #[test]
+    fn i_a_compressed_platform_tag_set_is_content_addressed_but_a_derived_name_is_not() {
+        let base = unique_test_dir("c10c-tag-set");
+        let dir = base
+            .join(".retread-wheel-fetch")
+            .join("v1")
+            .join("sha256")
+            .join("b".repeat(64));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Names taken verbatim from job 5743374's own `hash+parse` rows.
+        for admitted in [
+            "frozenlist-1.5.0-cp312-cp312-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+            "pillow-11.3.0-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+            "psutil-7.2.2-cp36-abi3-manylinux2010_x86_64.manylinux_2_12_x86_64.manylinux_2_28_x86_64.whl",
+            "pkg-1.0.0-py3-none-any.whl",
+        ] {
+            let wheel = dir.join(admitted);
+            write_content_addressed_test_wheel(&wheel, 0x01, 16);
+            assert_eq!(
+                crate::wheel_content::content_addressed_sha256(&wheel),
+                Some("b".repeat(64)),
+                "a real compressed platform tag set must be recognised: {admitted}",
+            );
+        }
+        // ... and the thing the rule exists for is still out.
+        for declined in [
+            "pkg-1.0.0-py3-none-any.relaxed.whl",
+            "pillow-11.3.0-cp311-cp311-manylinux_2_28_x86_64.relaxed.whl",
+        ] {
+            let wheel = dir.join(declined);
+            write_content_addressed_test_wheel(&wheel, 0x02, 16);
+            assert_eq!(
+                crate::wheel_content::content_addressed_sha256(&wheel),
+                None,
+                "a derived sibling must stay out, or phase-2 relax becomes a false \
+                 refusal (C10.6/C10.12): {declined}",
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// C10-c guard (h). One wheel is routinely present twice as two separate
+    /// inodes -- the persistent store entry and the per-workspace pinned fetch
+    /// copy -- so the stat-keyed in-process memo does not join them and a
+    /// sibling record beside one is not beside the other. C10's sha-keyed
+    /// record joined them because it was keyed on the digest alone. Measured
+    /// cost of losing that in run A of the C10-b proof pair (job 5743373): 11
+    /// strict reads / 141.2 s on fetch-directory spellings of wheels the store
+    /// already held a record for.
+    #[test]
+    fn h_a_second_spelling_of_one_digest_spends_the_store_entrys_record() {
+        use std::os::unix::fs::MetadataExt;
+        let _serial = C10_GUARD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let base = unique_test_dir("c10c-second-spelling");
+        std::fs::create_dir_all(&base).unwrap();
+        let _memos = MemoGuard::fresh();
+        let _store = StoreRootGuard::set(&base.join("store"));
+
+        let staged = base.join("staged.whl");
+        write_content_addressed_test_wheel(&staged, 0x9D, 4096);
+        let sha256 = sha256_of_file(&staged);
+        let target = ResolutionTarget::from_parts("3.12", "linux-64", None);
+
+        // Spelling 1: the persistent store entry, `<store root>/<sha>/<file>`.
+        let store_dir = base.join("store").join(&sha256);
+        std::fs::create_dir_all(&store_dir).unwrap();
+        let store_entry = store_dir.join("pkg-1.0.0-py3-none-any.whl");
+        std::fs::copy(&staged, &store_entry).unwrap();
+        write_store_integrity_marker_for_test(&store_entry, &sha256);
+        assert_eq!(
+            crate::wheel_content::content_addressed_sha256(&store_entry),
+            Some(sha256.clone()),
+            "the store entry must be recognised, or this guard tests nothing",
+        );
+
+        let before = hashes_of(&store_entry);
+        validate_wheel_file(&store_entry, &target, None).unwrap();
+        assert!(
+            hashes_of(&store_entry) > before,
+            "non-vacuity: the store spelling must actually pay the strict read",
+        );
+
+        // Spelling 2: a SEPARATE INODE in a per-workspace fetch directory.
+        let fetched = place_content_addressed(&base.join("ws"), &staged);
+        assert_ne!(
+            std::fs::metadata(&fetched).unwrap().ino(),
+            std::fs::metadata(&store_entry).unwrap().ino(),
+            "non-vacuity: the two spellings must be different inodes, or the \
+             in-process memo would carry this and the record would not be tested",
+        );
+        assert!(
+            crate::wheel_content::record_sidecar_path(&fetched)
+                .is_some_and(|path| !path.exists()),
+            "non-vacuity: the fetch spelling must have NO record of its own",
+        );
+
+        crate::wheel_content::reset_memos_for_test();
+        let fetched_before = hashes_of(&fetched);
+        validate_wheel_file(&fetched, &target, None).unwrap();
+        assert_eq!(
+            hashes_of(&fetched),
+            fetched_before,
+            "a second spelling of one digest must spend the store entry's record",
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// C10-b guard (g). The record now lives in a directory two jobs share, so
+    /// concurrent writers are the normal case rather than an edge. Every
+    /// writer must land ONE intact record and leave no temp behind, and no
+    /// reader may ever observe a partial one.
+    #[test]
+    fn g_concurrent_writers_leave_one_intact_record_and_no_torn_read() {
+        let _serial = C10_GUARD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let base = unique_test_dir("c10b-concurrent");
+        std::fs::create_dir_all(&base).unwrap();
+        let _memos = MemoGuard::fresh();
+
+        let staged = base.join("staged.whl");
+        write_content_addressed_test_wheel(&staged, 0x6B, 65536);
+        let wheel = place_content_addressed(&base.join("ws"), &staged);
+        let sha256 = sha256_of_file(&wheel);
+        let target = ResolutionTarget::from_parts("3.12", "linux-64", None);
+        let sidecar = sidecar_of(&wheel);
+
+        // Eight writers racing the same publish, and eight readers racing them
+        // -- a reader either sees no record or sees a complete one, never a
+        // prefix.
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let wheel = wheel.clone();
+                let target = target.clone();
+                let sha256 = sha256.clone();
+                scope.spawn(move || {
+                    crate::wheel_content::reset_memos_for_test();
+                    let marker = validate_wheel_file_with(&wheel, &target, None, false).unwrap();
+                    assert_eq!(marker.sha256, sha256);
+                });
+            }
+            for _ in 0..8 {
+                let sidecar = sidecar.clone();
+                let sha256 = sha256.clone();
+                scope.spawn(move || {
+                    for _ in 0..200 {
+                        if let Ok(bytes) = std::fs::read(&sidecar) {
+                            let parsed: serde_json::Value = serde_json::from_slice(&bytes)
+                                .unwrap_or_else(|error| {
+                                    panic!(
+                                        "torn read of {}: {error} in {:?}",
+                                        sidecar.display(),
+                                        String::from_utf8_lossy(&bytes),
+                                    )
+                                });
+                            assert_eq!(parsed["sha256"], sha256);
+                        }
+                        std::thread::yield_now();
+                    }
+                });
+            }
+        });
+
+        let leftovers: Vec<_> = std::fs::read_dir(wheel.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "a racing publish must not strand temp files: {leftovers:?}",
+        );
+        let published: Vec<_> = std::fs::read_dir(wheel.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".retread-content-v1.json"))
+            .collect();
+        assert_eq!(
+            published.len(),
+            1,
+            "exactly one record for one digest: {published:?}",
+        );
+        let record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
+        assert_eq!(record["sha256"], sha256);
+        assert_eq!(record["schema"], crate::wheel_content::RECORD_SCHEMA);
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
