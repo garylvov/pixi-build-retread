@@ -621,6 +621,47 @@ export RUST_BACKTRACE=1
 . "$FAST_ENV"
 retread_fast_env "$WS" || { echo "FATAL: retread_fast_env refused"; exit 7; }
 
+# --- OPTIONAL: JOB-SCOPED WHEEL STORE, SEEDED FROM THE PERSISTENT ONE ---------
+# retread_fast_env just exported RETREAD_WHEEL_STORE=<persist root>/wheels, the
+# SHARED store. That is the right default and it is what buys index authority
+# (see the wheel-store block in retread_fast_env.sh). But a lane whose lock is
+# being killed by a stale `.<wheel>.whl.retread-fill-v1.lock` sidecar in that
+# shared store needs the store's WARMTH without its POISON, and the way to get
+# that is a job-scoped store SEEDED by a byte copy.
+#
+# To turn it on, a harness sets WHEEL_STORE_SEED to the store to seed FROM
+# before it reaches this point, e.g.
+#     WHEEL_STORE_SEED=$RETREAD_PERSIST_CACHE_ROOT/wheels
+# and this block redirects RETREAD_WHEEL_STORE at a fresh job-scoped copy.
+#
+# THE SEED IS `retread_seed_wheel_store`, AND `cp -al` IS REFUSED FOR THIS.
+# A `cp -al` of the wheel store is wrong twice over:
+#   (a) a hardlink shares the inode, so making one bumps the ctime of files
+#       other live lanes are reading and any write through the "isolated" copy
+#       lands in the shared store (the p6k-b burn);
+#   (b) `cp -al` copies the directory whole, fill locks included, so the store
+#       that was supposed to be clean carries exactly the poison it was
+#       isolated from.
+# `retread_seed_wheel_store` does an `rsync -aW` byte copy with the fill locks
+# and quarantine dirs excluded, prints a census line, and REFUSES (non-zero) if
+# a fill lock, a quarantine dir, or a wheel with link count != 1 reached the
+# destination. That link-count assert is the reader for this whole comment.
+#
+# NOTE: the `cp -al` calls elsewhere in this template stage $SRC_WS/third_party
+# and the build mirror. Those are a different argument (read-only shared trees
+# with no lock sidecars in them) and are NOT covered by this refusal.
+if [ -n "${WHEEL_STORE_SEED:-}" ]; then
+  WHEEL_STORE_JOBSCOPED=${WHEEL_STORE_JOBSCOPED:-$C/wheels-seeded}
+  rm -rf "$WHEEL_STORE_JOBSCOPED"
+  echo "### wheel store: seeding job-scoped store from $WHEEL_STORE_SEED (byte copy; cp -al is refused here)"
+  retread_seed_wheel_store "$WHEEL_STORE_SEED" "$WHEEL_STORE_JOBSCOPED" \
+    || { echo "FATAL: retread_seed_wheel_store refused"; exit 7; }
+  export RETREAD_WHEEL_STORE=$WHEEL_STORE_JOBSCOPED
+  echo "### wheel store: RETREAD_WHEEL_STORE=$RETREAD_WHEEL_STORE (job-scoped; seed wall is OUTSIDE the lock span)"
+else
+  echo "### wheel store: SHARED, RETREAD_WHEEL_STORE=$RETREAD_WHEEL_STORE (set WHEEL_STORE_SEED to isolate)"
+fi
+
 # backend stderr shim (pixi 0.73 swallows backend stderr behind its expect() panic)
 BLOG=$A/${TAG}-$J.backend.log
 : > "$BLOG"

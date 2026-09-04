@@ -229,3 +229,99 @@ retread_fast_env () {
   echo "retread_fast_env: UV_CACHE_DIR=$UV_CACHE_DIR"
   echo "retread_fast_env: RETREAD_BUILT_OUTPUT_STORE=$RETREAD_BUILT_OUTPUT_STORE"
 }
+
+########## retread_seed_wheel_store -- THE ONE WAY TO SEED A WHEEL STORE #######
+# Seed a JOB-SCOPED wheel store from a PERSISTENT one, as a BYTE COPY.
+#
+#     retread_seed_wheel_store <src_store> <dst_store>
+#
+# WHY A JOB-SCOPED STORE AT ALL. `wheel::acquire_wheel_store_fill_lock` writes a
+# zero-byte `.<wheel>.whl.retread-fill-v1.lock` sidecar BEFORE the wheel exists.
+# If the fill never completes, `handler::wheel_store_second_chance` waits
+# WHEEL_STORE_FILL_WAIT_SECS on that sidecar and then returns an Err that
+# propagates into the PyPI index-chain aggregate and takes the WHOLE lock down
+# (measured: job 5762227, rc=1 at 308 s, on a fill lock dated 26 h earlier).
+# The persistent store holds hundreds of these sidecars. So a lane that wants
+# the store's WARMTH without its POISON copies the wheels and record sidecars
+# and leaves the fill locks and the quarantine dirs behind.
+#
+# WHY `rsync -aW` AND NEVER `cp -al`. Two independent reasons, and each one on
+# its own is fatal:
+#   (a) A hardlink shares the INODE. Creating one bumps the ctime of an inode
+#       that other live lanes are reading out of the shared store, and any write
+#       through the "isolated" copy is a write to the shared store. That is the
+#       p6k-b burn on this campaign.
+#   (b) `cp -al` copies the WHOLE directory, fill locks included, so the store
+#       that was supposed to be clean carries the exact poison it was isolated
+#       from. `--exclude` on rsync is what actually drops them.
+# `-W` forces whole-file transfer: no delta algorithm, no partial-file linking,
+# a real byte copy on every entry.
+#
+# THE SOURCE STORE IS READ-ONLY TO THIS FUNCTION. It never writes, deletes,
+# chmods or relinks anything under <src_store>. The only thing it touches is
+# <dst_store>, which it creates.
+#
+# rc 24 ("some files vanished before they could be transferred") is ACCEPTED: a
+# concurrent lane publishing into the shared store races the walk, and the
+# entries that vanished were by definition not part of the warm set. Every
+# other non-zero rsync rc is fatal.
+#
+# It prints exactly ONE census line and then ASSERTS on it. Returns non-zero if
+# any fill lock or quarantine dir survived, if no wheel arrived (the seed is not
+# warm, so the caller gained nothing and should know), or if ANY destination
+# wheel has a link count other than 1 -- that last one is the direct, positive
+# reader for the "byte copy, not hardlink" claim above.
+retread_seed_wheel_store () {
+  local src=${1:-} dst=${2:-}
+  if [ -z "$src" ] || [ -z "$dst" ]; then
+    echo "retread_seed_wheel_store: usage: retread_seed_wheel_store <src_store> <dst_store>" >&2
+    return 2
+  fi
+  if [ ! -d "$src" ]; then
+    echo "retread_seed_wheel_store: FATAL source store is not a directory: $src" >&2
+    return 2
+  fi
+  mkdir -p "$dst" || { echo "retread_seed_wheel_store: FATAL cannot create $dst" >&2; return 2; }
+
+  local t0 rc wall
+  t0=$(date +%s)
+  rsync -aW --exclude='.*.retread-fill-v1.lock' --exclude='*.quarantine-*' "$src/" "$dst/"
+  rc=$?
+  wall=$(( $(date +%s) - t0 ))
+  if [ "$rc" != 0 ] && [ "$rc" != 24 ]; then
+    echo "retread_seed_wheel_store: FATAL rsync rc=$rc src=$src dst=$dst (only 0 and 24 are OK)" >&2
+    return 3
+  fi
+
+  local entries wheels locks quars hard
+  entries=$(ls -1U "$dst" 2>/dev/null | wc -l)
+  wheels=$(find "$dst" -mindepth 2 -maxdepth 2 -name '*.whl' 2>/dev/null | wc -l)
+  locks=$(find "$dst" -mindepth 2 -maxdepth 2 -name '.*.retread-fill-v1.lock' 2>/dev/null | wc -l)
+  quars=$(find "$dst" -mindepth 1 -maxdepth 2 -name '*.quarantine-*' 2>/dev/null | wc -l)
+  # `grep -c` EXITS 1 when the count is zero, which is the healthy case here, so
+  # the pipeline is guarded and the empty-output case is normalised to 0.
+  hard=$(find "$dst" -mindepth 2 -maxdepth 2 -name '*.whl' -printf '%n\n' 2>/dev/null | { grep -vc '^1$' || true; })
+  [ -n "$hard" ] || hard=0
+
+  echo "### wheel_store seeded src=$src dst=$dst entries=$entries wheels=$wheels fill_locks=$locks hardlinks=$hard quarantines=$quars rc=$rc wall=${wall}s"
+
+  local bad=0
+  if [ "$locks" -ne 0 ]; then
+    echo "retread_seed_wheel_store: FATAL $locks fill-lock sidecar(s) survived into $dst -- the seed carries the poison it was isolating from" >&2
+    bad=1
+  fi
+  if [ "$quars" -ne 0 ]; then
+    echo "retread_seed_wheel_store: FATAL $quars quarantine entr(y/ies) survived into $dst" >&2
+    bad=1
+  fi
+  if [ "$wheels" -le 0 ]; then
+    echo "retread_seed_wheel_store: FATAL no wheels under $dst -- the seed is not warm, the caller gained nothing" >&2
+    bad=1
+  fi
+  if [ "$hard" -ne 0 ]; then
+    echo "retread_seed_wheel_store: FATAL $hard wheel(s) under $dst have a link count != 1 -- a HARDLINK survived, this store is not isolated from $src" >&2
+    bad=1
+  fi
+  [ "$bad" -eq 0 ] || return 4
+  return 0
+}
