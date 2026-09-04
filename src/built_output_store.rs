@@ -50,14 +50,179 @@
 
 use std::path::{Path, PathBuf};
 
-/// Bumped whenever the payload's meaning or serialization changes. Folded
-/// into every key, so an old entry is invisible rather than misread.
+/// Bumped whenever the stored RECORD's wire format changes. Folded into
+/// every key AND written into every record, so an old entry is invisible
+/// rather than misread — and, if it is read anyway, refused rather than
+/// decoded.
 ///
 /// v2 (fix p6c): the key gained the resolution-policy fingerprint (the
 /// auto-imports injection gate). Every v1 entry may hold a POST-INJECTION
 /// payload stored at an injection-OFF address, so all of them are invalidated
 /// once.
-pub const SCHEMA: &str = "retread-built-output-store-v2";
+///
+/// v3 (fix C11): the payload stopped being a bare `CondaOutputsResult` and
+/// became [`Record`] — an envelope carrying this schema, the emission-schema
+/// constant and the FULL input digest the reader independently recomputes.
+/// The key stopped folding the backend's GIT HASH (see
+/// `handler::backend_behaviour_identity`), so entries now survive a backend
+/// rebuild; the envelope is what keeps a surviving entry from being MISREAD
+/// after that survival became possible.
+pub const SCHEMA: &str = "retread-built-output-store-v3";
+
+/// The EMISSION-SEMANTICS version of the payload: what the backend decided,
+/// as opposed to how it is spelled on disk ([`SCHEMA`]).
+///
+/// This is the constant that replaces the git hash. Until C11 the key folded
+/// `CARGO_PKG_VERSION + "+" + RETREAD_GIT_HASH`, so every rebuild made all
+/// existing entries unreachable — measured as `miss=14 hit=0` on two
+/// consecutive canonical relocks that differed only by a binary. Dropping the
+/// hash is what makes the store useful across binaries; this constant is what
+/// keeps that safe.
+///
+/// **Any commit that changes what `conda/outputs` EMITS for unchanged inputs
+/// must bump this.** That includes: the auto-bundle cascade's selection or
+/// ordering, route-probe acceptance, pin rendering or relaxation, injected
+/// dependencies, and the `input_globs` set. It does NOT include changes that
+/// cannot move the emitted bytes for fixed inputs — logging, timing,
+/// diagnostics, error text, or a pure refactor.
+///
+/// Why a hand-bumped constant and not a hash of the emitting code: the code
+/// that decides these outputs is spread across `handler/mod.rs`,
+/// `uv_closure.rs`, `pypi.rs`, `pack_overrides.rs` and `source_build.rs`, so a
+/// hash of ONE module is false comfort and a hash of ALL of `src/` is
+/// precisely the git hash this change exists to remove. A curated file list is
+/// the same human discipline as this constant with none of its visibility: a
+/// file omitted from the list fails silently, while a missing bump here is a
+/// named, greppable line in review. The residual risk is bounded on three
+/// sides — `CARGO_PKG_VERSION` is also in the identity, so every release bump
+/// invalidates the store regardless; the record carries the producing git hash
+/// for post-hoc audit; and a stale hit is a stale RESOLUTION, never a wrong
+/// artifact, because everything downstream re-validates bytes.
+pub const BUILT_OUTPUT_SCHEMA: &str = "retread-built-output-emission-1";
+
+/// Why a stored record was not usable. Every arm is a MISS at the call site;
+/// the variant exists so the log line names which one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refusal {
+    /// The bytes are not a [`Record`] at all — including every pre-v3 entry,
+    /// which is a bare payload object with none of the envelope's fields.
+    Undecodable,
+    /// A record written by a different wire schema.
+    Schema { found: String },
+    /// A record emitted by different emission semantics.
+    Emission { found: String },
+    /// A record whose own input digest disagrees with the one the reader
+    /// computed for the address it looked up. Cannot happen through an honest
+    /// publish; it catches a truncated-key collision, a hand-moved entry, and
+    /// a publisher that addressed and stamped a record from different inputs.
+    Inputs { found: String },
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Refusal::Undecodable => write!(f, "not a built-output record (pre-v3 or corrupt)"),
+            Refusal::Schema { found } => {
+                write!(f, "record schema `{found}` != `{SCHEMA}`")
+            }
+            Refusal::Emission { found } => {
+                write!(
+                    f,
+                    "record emission schema `{found}` != `{BUILT_OUTPUT_SCHEMA}`"
+                )
+            }
+            Refusal::Inputs { found } => {
+                write!(f, "record input digest `{found}` != the digest of the inputs this lookup was built from")
+            }
+        }
+    }
+}
+
+/// The stored envelope.
+///
+/// The reader accepts a record only when all three stamped identities match
+/// what it computed itself. That is the difference between an entry being
+/// *unreachable* (the pre-C11 property, bought with the git hash) and an entry
+/// being *unmisreadable* (the C11 property, bought with these fields) — and
+/// only the second one survives the git hash being dropped from the key.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Record {
+    pub schema: String,
+    pub emission_schema: String,
+    /// The FULL sha256 over the key material. The store address is only the
+    /// first 16 bytes of it, so this is an independent check and not a
+    /// restatement of the directory name.
+    pub inputs_digest: String,
+    /// AUDIT ONLY. Never consulted by [`decode`]; it exists so an operator can
+    /// read which binary produced an adopted entry — the fact the git hash
+    /// used to buy by making the entry unreachable.
+    pub produced_by: String,
+    pub payload: serde_json::Value,
+    /// The `advertised_identity` records the COLD compute wrote as a side
+    /// effect of producing `payload`.
+    ///
+    /// A store hit returns before that loop runs, so without these an adopted
+    /// output leaves no record and `conda/build_v1` re-derives the build string
+    /// from the ADOPTING workspace's live inputs — job 5723770 (`p19-depadd`,
+    /// `hit=14 miss=0`) died exactly there, on `courier inputs changed between
+    /// conda/outputs and conda/build_v1`. Carrying them in the record is what
+    /// makes an adoption leave the same on-disk state a cold compute leaves.
+    /// `serde(default)` so the field is additive within this schema.
+    #[serde(default)]
+    pub advertised: serde_json::Value,
+}
+
+/// A record this reader accepted: the payload plus the cold pass's side
+/// effects, which the caller must restore before it can behave as if it had
+/// computed the payload itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Accepted {
+    pub payload: serde_json::Value,
+    pub advertised: serde_json::Value,
+}
+
+/// Wrap a payload for publication.
+pub fn encode<T: serde::Serialize, A: serde::Serialize>(
+    inputs_digest: &str,
+    produced_by: &str,
+    payload: &T,
+    advertised: &A,
+) -> Result<Vec<u8>, serde_json::Error> {
+    let record = Record {
+        schema: SCHEMA.to_string(),
+        emission_schema: BUILT_OUTPUT_SCHEMA.to_string(),
+        inputs_digest: inputs_digest.to_string(),
+        produced_by: produced_by.to_string(),
+        payload: serde_json::to_value(payload)?,
+        advertised: serde_json::to_value(advertised)?,
+    };
+    serde_json::to_vec(&record)
+}
+
+/// Unwrap a stored record, refusing anything whose stamped identity does not
+/// match this reader. A refusal never yields the payload.
+pub fn decode(bytes: &[u8], expected_inputs_digest: &str) -> Result<Accepted, Refusal> {
+    let record: Record = serde_json::from_slice(bytes).map_err(|_| Refusal::Undecodable)?;
+    if record.schema != SCHEMA {
+        return Err(Refusal::Schema {
+            found: record.schema,
+        });
+    }
+    if record.emission_schema != BUILT_OUTPUT_SCHEMA {
+        return Err(Refusal::Emission {
+            found: record.emission_schema,
+        });
+    }
+    if record.inputs_digest != expected_inputs_digest {
+        return Err(Refusal::Inputs {
+            found: record.inputs_digest,
+        });
+    }
+    Ok(Accepted {
+        payload: record.payload,
+        advertised: record.advertised,
+    })
+}
 
 /// The payload filename inside an entry.
 const PAYLOAD: &str = "outputs.json";
@@ -357,6 +522,130 @@ mod tests {
         );
         let store = BuiltOutputStore::from_config(Some(&root)).unwrap();
         assert_eq!(store.get("shared-key").0, Lookup::Hit);
+    }
+
+    // ---------------------------------------------------------------
+    // C11 guard (d): a record written by an older schema is REFUSED, not
+    // misread. Every arm here is red on the pre-C11 reader, which was a bare
+    // `serde_json::from_slice::<CondaOutputsResult>` with no envelope at all.
+    // ---------------------------------------------------------------
+
+    /// The shape of the pre-v3 payload: exactly what `serde_json::to_vec`
+    /// wrote before C11, i.e. the bare result object.
+    fn legacy_payload() -> Vec<u8> {
+        use pixi_build_types::procedures::conda_outputs::CondaOutputsResult;
+        serde_json::to_vec(&CondaOutputsResult {
+            outputs: Default::default(),
+            input_globs: Default::default(),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_pre_v3_bare_payload_is_refused_not_decoded() {
+        use pixi_build_types::procedures::conda_outputs::CondaOutputsResult;
+        let bytes = legacy_payload();
+
+        // NON-VACUITY: these bytes really are a payload the OLD reader would
+        // have adopted -- they deserialize through the exact call the pre-C11
+        // hit path made. If this stops holding, the guard below is testing
+        // that garbage is rejected, which proves nothing.
+        let _as_old_reader: CondaOutputsResult = serde_json::from_slice(&bytes)
+            .expect("the legacy fixture must deserialize the way the pre-C11 reader did");
+
+        assert_eq!(
+            decode(&bytes, "any-digest"),
+            Err(Refusal::Undecodable),
+            "a pre-v3 entry must be refused"
+        );
+    }
+
+    #[test]
+    fn a_record_from_another_schema_or_emission_or_input_set_is_refused() {
+        let good = encode(
+            "digest-a",
+            "1.2.3+deadbeef",
+            &serde_json::json!({"outputs": []}),
+            &serde_json::json!([{"name": "pack", "build": "py311_hdeadbeef_loose_5"}]),
+        )
+        .unwrap();
+
+        // Positive control first: the honest round trip must work, or every
+        // refusal below is trivially satisfiable.
+        let accepted = decode(&good, "digest-a").unwrap();
+        assert_eq!(
+            accepted.payload,
+            serde_json::json!({"outputs": []}),
+            "a record this reader wrote must decode to exactly its payload"
+        );
+        // The cold pass's side effects travel with the payload, or an adoption
+        // is not equivalent to the compute it stands in for (job 5723770).
+        assert_eq!(
+            accepted.advertised,
+            serde_json::json!([{"name": "pack", "build": "py311_hdeadbeef_loose_5"}]),
+            "the advertised-identity records must survive the round trip"
+        );
+
+        let tamper = |field: &str, value: &str| {
+            let mut record: serde_json::Value = serde_json::from_slice(&good).unwrap();
+            record[field] = serde_json::Value::String(value.to_string());
+            serde_json::to_vec(&record).unwrap()
+        };
+
+        // (d) an older WIRE schema.
+        assert_eq!(
+            decode(&tamper("schema", "retread-built-output-store-v2"), "digest-a"),
+            Err(Refusal::Schema {
+                found: "retread-built-output-store-v2".to_string()
+            }),
+        );
+        // (c) an older EMISSION schema -- the hand-bumped constant. A binary
+        // that bumped it must not adopt what the previous one emitted.
+        assert_eq!(
+            decode(
+                &tamper("emission_schema", "retread-built-output-emission-0"),
+                "digest-a"
+            ),
+            Err(Refusal::Emission {
+                found: "retread-built-output-emission-0".to_string()
+            }),
+        );
+        // (b) a record stamped with a different input digest, i.e. an entry
+        // that landed at this address without standing for these inputs --
+        // the truncated-key collision the git hash never covered.
+        assert_eq!(
+            decode(&good, "digest-b"),
+            Err(Refusal::Inputs {
+                found: "digest-a".to_string()
+            }),
+        );
+
+        // And no refusal ever yields the payload.
+        for bytes in [
+            tamper("schema", "retread-built-output-store-v2"),
+            tamper("emission_schema", "retread-built-output-emission-0"),
+        ] {
+            assert!(decode(&bytes, "digest-a").is_err());
+        }
+    }
+
+    #[test]
+    fn the_producing_binary_is_recorded_but_never_gates_acceptance() {
+        // The git hash left the KEY; it must still be readable off an entry,
+        // and it must not be able to refuse one -- that was the whole trade.
+        let bytes = encode(
+            "digest-a",
+            "9.9.9+cafebabe",
+            &serde_json::json!({"outputs": []}),
+            &serde_json::json!([]),
+        )
+        .unwrap();
+        let record: Record = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(record.produced_by, "9.9.9+cafebabe");
+        assert!(
+            decode(&bytes, "digest-a").is_ok(),
+            "a record from another binary must still be adoptable"
+        );
     }
 
     #[test]
