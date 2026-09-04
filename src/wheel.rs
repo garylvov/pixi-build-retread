@@ -115,7 +115,7 @@ async fn acquire_wheel_store_fill_lock(store_path: &Path) -> Result<WheelStoreFi
         .ok_or_else(|| anyhow!("wheel store path has no UTF-8 filename"))?;
     let lock_path = parent.join(fill_lock_filename(filename));
     tokio::task::spawn_blocking(move || {
-        let file = std::fs::OpenOptions::new()
+        let mut file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
@@ -124,10 +124,201 @@ async fn acquire_wheel_store_fill_lock(store_path: &Path) -> Result<WheelStoreFi
             .with_context(|| format!("opening wheel-store fill lock {}", lock_path.display()))?;
         fs4::fs_std::FileExt::lock_exclusive(&file)
             .with_context(|| format!("locking wheel-store fill {}", lock_path.display()))?;
+        // p6v: stamp WHO holds this fill, so a later reader can decide
+        // staleness by inspection instead of by guessing from an mtime. Best
+        // effort: an unwritable record must never fail a fill that the flock
+        // above already serialised, and a reader treats an absent or
+        // unparsable record as "holder unknown".
+        write_fill_lock_holder(&mut file, &lock_path);
         Ok(WheelStoreFillLock(file))
     })
     .await
     .context("wheel-store fill lock task panicked")?
+}
+
+/// Who took a `.retread-fill-v1.lock`, recorded INSIDE the lock at the moment
+/// it was taken.
+///
+/// Without this a reader meeting a lock and no wheel can only guess: the 492
+/// zero-byte locks job 5762227 died on carried no holder at all, so nothing on
+/// disk could distinguish "a sibling is filling this right now" from "a job
+/// that died 26 hours ago left this here". The record makes staleness
+/// DECIDABLE: a holder that is not this host, or a pid that no longer exists,
+/// is not filling anything.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct WheelStoreFillLockHolder {
+    pub(crate) schema: String,
+    pub(crate) pid: u32,
+    pub(crate) host: String,
+    pub(crate) acquired_unix: u64,
+}
+
+pub(crate) const WHEEL_STORE_FILL_LOCK_SCHEMA: &str = "retread-wheel-store-fill-v1";
+
+/// This machine's kernel hostname, or `None` where `/proc` is unavailable.
+///
+/// Read from `/proc/sys/kernel/hostname` rather than an environment variable:
+/// `HOSTNAME` is a shell convenience, is not exported to every child, and is
+/// exactly the sort of value a batch harness rewrites.
+pub(crate) fn kernel_hostname() -> Option<String> {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|host| host.trim().to_string())
+        .filter(|host| !host.is_empty())
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0)
+}
+
+/// Write the holder record into an already-flocked fill lock. Best effort by
+/// design: see the call site in [`acquire_wheel_store_fill_lock`].
+fn write_fill_lock_holder(file: &mut std::fs::File, lock_path: &Path) {
+    use std::io::{Seek as _, Write as _};
+    let holder = WheelStoreFillLockHolder {
+        schema: WHEEL_STORE_FILL_LOCK_SCHEMA.to_string(),
+        pid: std::process::id(),
+        host: kernel_hostname().unwrap_or_else(|| "unknown".to_string()),
+        acquired_unix: unix_now(),
+    };
+    let recorded = serde_json::to_vec(&holder).ok().and_then(|bytes| {
+        file.set_len(0).ok()?;
+        file.seek(std::io::SeekFrom::Start(0)).ok()?;
+        file.write_all(&bytes).ok()?;
+        file.flush().ok()?;
+        Some(())
+    });
+    if recorded.is_none() {
+        tracing::debug!(
+            lock = %lock_path.display(),
+            "wheel store: could not record the fill-lock holder; staleness will fall back to age",
+        );
+    }
+}
+
+/// The holder recorded in the fill lock for `store_path`, when there is one.
+///
+/// A zero-byte lock -- every one of the 492 entries in the shared store on
+/// 2026-09-04 -- parses to `None`, which is "unknown", never "live".
+pub(crate) fn read_fill_lock_holder(store_path: &Path) -> Option<WheelStoreFillLockHolder> {
+    let lock_path = wheel_store_fill_lock_path(store_path)?;
+    let bytes = std::fs::read(&lock_path).ok()?;
+    let holder: WheelStoreFillLockHolder = serde_json::from_slice(&bytes).ok()?;
+    (holder.schema == WHEEL_STORE_FILL_LOCK_SCHEMA).then_some(holder)
+}
+
+/// Whether a recorded holder is a process that could still be filling.
+///
+/// Only decidable for a holder on THIS host: a pid on another node cannot be
+/// probed from here, so it is reported live and the flock probe in
+/// [`reclaim_stale_fill_lock`] is left to settle it.
+fn fill_lock_holder_is_live(holder: &WheelStoreFillLockHolder) -> bool {
+    match kernel_hostname() {
+        Some(host) if host == holder.host => {
+            std::path::Path::new(&format!("/proc/{}", holder.pid)).exists()
+        }
+        _ => true,
+    }
+}
+
+/// What a takeover of an abandoned fill lock did, for the caller's one log row.
+pub(crate) struct ReclaimedFillLock {
+    pub(crate) lock_age_secs: u64,
+    pub(crate) holder: Option<WheelStoreFillLockHolder>,
+}
+
+/// Take over the fill lock of a store entry whose filler is GONE, so this
+/// process can fill the entry itself.
+///
+/// The store entry that killed job 5762227 held a 0-byte fill lock from
+/// 26 hours earlier and no wheel. p6i taught the reader that such an entry is
+/// a MISS rather than a fatal, which stopped the abort -- but a miss alone
+/// leaves the poison in place and the wheel unfetched, so every later reader
+/// pays the same bounded wait and misses again. A lock nobody holds is debris,
+/// and removing it is what lets the ordinary fill path run.
+///
+/// Refuses in every ambiguous case, because deleting a lock a live filler owns
+/// is the one thing that would be worse than the poison:
+///   * the wheel is already there -- nothing to reclaim;
+///   * the lock is younger than `min_age`;
+///   * a recorded holder on THIS host still has a live pid;
+///   * the flock is still held by somebody (probed non-blocking).
+///
+/// `Ok(None)` means "left alone" and is the ordinary answer.
+pub(crate) async fn reclaim_stale_fill_lock(
+    store_path: &Path,
+    min_age: std::time::Duration,
+) -> Result<Option<ReclaimedFillLock>> {
+    let Some(lock_path) = wheel_store_fill_lock_path(store_path) else {
+        return Ok(None);
+    };
+    let store_path = store_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        // A filled entry is not debris, whatever its sidecars say.
+        if std::fs::symlink_metadata(&store_path)
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+        {
+            return Ok(None);
+        }
+        let lock_metadata = match std::fs::symlink_metadata(&lock_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("stating {}", lock_path.display()));
+            }
+        };
+        let holder = read_fill_lock_holder(&store_path);
+        // Prefer the holder's own timestamp; fall back to the lock's mtime for
+        // the legacy zero-byte locks, which carry no record at all.
+        let acquired = holder.as_ref().map(|holder| holder.acquired_unix).or_else(|| {
+            lock_metadata
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|since| since.as_secs())
+        });
+        let age_secs = acquired.map_or(0, |acquired| unix_now().saturating_sub(acquired));
+        if age_secs < min_age.as_secs() {
+            return Ok(None);
+        }
+        if holder.as_ref().is_some_and(|holder| fill_lock_holder_is_live(holder)) {
+            return Ok(None);
+        }
+        // The decisive probe: a live filler still holds this flock. Taking it
+        // non-blocking answers "is anybody there" without waiting on anybody.
+        let file = match std::fs::OpenOptions::new().read(true).write(true).open(&lock_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("opening {}", lock_path.display()));
+            }
+        };
+        if !fs4::fs_std::FileExt::try_lock_exclusive(&file).unwrap_or(false) {
+            return Ok(None);
+        }
+        // Under the lock: re-check that nobody filled the entry while we probed.
+        if std::fs::symlink_metadata(&store_path)
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+        {
+            let _ = fs4::fs_std::FileExt::unlock(&file);
+            return Ok(None);
+        }
+        let removed = std::fs::remove_file(&lock_path);
+        let _ = fs4::fs_std::FileExt::unlock(&file);
+        removed.with_context(|| format!("removing abandoned {}", lock_path.display()))?;
+        Ok(Some(ReclaimedFillLock {
+            lock_age_secs: age_secs,
+            holder,
+        }))
+    })
+    .await
+    .context("wheel-store fill lock reclaim task panicked")?
 }
 
 #[derive(Debug, Clone)]
@@ -581,16 +772,206 @@ pub(crate) async fn cached_wheel_store_path(
     match inspect_store_entry(&store_path, &sha256).await? {
         StoreEntryState::Valid(_) => Ok(Some(store_path)),
         StoreEntryState::Corrupt => {
-            evict_store_entry(&store_path).await;
+            evict_store_entry(&store_path, "integrity-inspection-corrupt", "cached_wheel_store_path").await;
             Ok(None)
         }
         StoreEntryState::Missing => Ok(None),
     }
 }
 
-async fn evict_store_entry(store_path: &Path) {
-    let _ = fs::remove_file(store_path).await;
-    let _ = fs::remove_file(store_integrity_marker_path(store_path)).await;
+/// How long a quarantined store entry is kept before the next eviction in the
+/// same store may reclaim it.
+///
+/// The point of the delay is a reader that is ALREADY inside the entry: a
+/// rename keeps the inode, so an open file descriptor survives the quarantine
+/// untouched, but a reader that resolved the path and has not opened it yet
+/// needs the bytes to still be findable while it retries. A day is far longer
+/// than any single relock on this site and short enough that a store cannot
+/// accumulate quarantines without bound. It is also the retention the
+/// job-scoped cleanup pattern (`harness/phase_template/cleanup_gated.sh`)
+/// assumes when it sweeps `*.quarantine-*` out of a job's own store.
+pub(crate) const WHEEL_STORE_QUARANTINE_RETENTION_SECS: u64 = 24 * 60 * 60;
+
+/// Where a corrupt entry's payload was moved, and why.
+///
+/// `dir` is the quarantine directory; `None` means the move could not be
+/// performed at all and the caller has been told so in the row it emitted.
+#[derive(Debug, Clone)]
+pub(crate) struct QuarantinedStoreEntry {
+    pub(crate) dir: PathBuf,
+    pub(crate) moved: Vec<PathBuf>,
+}
+
+/// Retire a store entry judged [`StoreEntryState::Corrupt`] WITHOUT deleting
+/// anything in place, and say so in a first-class row.
+///
+/// The predecessor of this function was two `remove_file` calls and no log at
+/// all. Three of its five call sites were silent, so a writer was deleting
+/// from a cache shared by every concurrent lane on this machine and no reader
+/// anywhere could see it happen -- the p6v census found three entries emptied
+/// to exactly this shape (content record + fill lock, no wheel, no integrity
+/// marker) and nothing in any `.log` or `.out` under the campaign explained
+/// them. P6V-1.
+///
+/// What replaces it:
+///
+/// * **A rename, not an unlink.** The wheel and its integrity marker are moved
+///   into a sibling `<sha>.quarantine-<unix>-<pid>` directory under the same
+///   store root, which is the same filesystem, so each move is one atomic
+///   `rename(2)`. The inode is preserved, so a concurrent reader that already
+///   holds the old path open keeps reading VALID BYTES to the end; a reader
+///   that comes later finds no wheel at the entry, which
+///   [`inspect_store_entry`] reports as [`StoreEntryState::Missing`] -- a miss,
+///   and the caller refills.
+/// * **The entry directory itself is left in place.** Renaming the whole
+///   directory was the obvious move and it is wrong here: three call sites
+///   evict while HOLDING a lock whose file lives inside that directory (the
+///   first-fill lock, and `store_wheel_in_cache`'s entry lock). Renaming the
+///   directory carries the locked inode away and lets the very next process
+///   create and lock a fresh file at the same path, so two processes would
+///   hold "the" lock at once -- the race p6i and p6v just closed. Moving the
+///   PAYLOAD out of a directory that keeps its identity has the same effect on
+///   readers and breaks no lock.
+/// * **A row at every call site.** The row is emitted here, once, so no call
+///   site can be silent: adding a caller means passing a `caller` label.
+///
+/// Returns where the payload went, or `None` if nothing could be moved.
+async fn evict_store_entry(
+    store_path: &Path,
+    reason: &str,
+    caller: &str,
+) -> Option<QuarantinedStoreEntry> {
+    let quarantine = quarantine_store_entry(store_path).await;
+    let sha = store_path
+        .parent()
+        .and_then(|dir| dir.file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or("<unknown>");
+    let filename = store_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("<unknown>");
+    match &quarantine {
+        Some(entry) => tracing::warn!(
+            "wheel_store evicted sha={} reason={} caller={} quarantine={} moved={} wheel={}",
+            sha,
+            reason,
+            caller,
+            entry.dir.display(),
+            entry.moved.len(),
+            filename,
+        ),
+        None => tracing::warn!(
+            "wheel_store evicted sha={} reason={} caller={} quarantine=none moved=0 wheel={}",
+            sha,
+            reason,
+            caller,
+            filename,
+        ),
+    }
+    if quarantine.is_some() {
+        sweep_expired_quarantines(store_path).await;
+    }
+    quarantine
+}
+
+/// Move an entry's wheel and integrity marker into a fresh sibling quarantine
+/// directory. Nothing is removed; a failure to move any one file leaves that
+/// file exactly where it was.
+async fn quarantine_store_entry(store_path: &Path) -> Option<QuarantinedStoreEntry> {
+    let entry_dir = store_path.parent()?;
+    let store_root = entry_dir.parent()?;
+    let sha = entry_dir.file_name()?.to_str()?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0);
+    let quarantine_dir = store_root.join(format!(
+        "{sha}.quarantine-{stamp}-{}",
+        std::process::id()
+    ));
+    if fs::create_dir_all(&quarantine_dir).await.is_err() {
+        return None;
+    }
+
+    let marker = store_integrity_marker_path(store_path);
+    let mut moved = Vec::new();
+    for source in [store_path.to_path_buf(), marker] {
+        let Some(name) = source.file_name() else {
+            continue;
+        };
+        // A second eviction of the same entry inside the same second, from the
+        // same process, must not clobber the first one's evidence.
+        let mut destination = quarantine_dir.join(name);
+        for attempt in 1..16u32 {
+            if fs::symlink_metadata(&destination).await.is_err() {
+                break;
+            }
+            destination = quarantine_dir.join(format!(
+                "{}.{attempt}",
+                name.to_str().unwrap_or("entry")
+            ));
+        }
+        if fs::rename(&source, &destination).await.is_ok() {
+            moved.push(destination);
+        }
+    }
+    if moved.is_empty() {
+        // Nothing was there to move -- do not leave an empty quarantine behind
+        // to be counted by a census as evidence of an eviction that moved
+        // nothing.
+        let _ = fs::remove_dir(&quarantine_dir).await;
+        return None;
+    }
+    Some(QuarantinedStoreEntry {
+        dir: quarantine_dir,
+        moved,
+    })
+}
+
+/// Reclaim quarantines older than [`WHEEL_STORE_QUARANTINE_RETENTION_SECS`].
+///
+/// Bounded by construction: one `read_dir` of the store root, and a `stat`
+/// only of the entries whose name already carries the `.quarantine-` infix, so
+/// the ~700 real entries of the shared store are never walked into. It runs
+/// only after an eviction actually quarantined something, so a store that
+/// never evicts never pays for it. A failure to remove one is ignored -- the
+/// next eviction, or the job-scoped cleanup, will get it.
+async fn sweep_expired_quarantines(store_path: &Path) {
+    let Some(store_root) = store_path.parent().and_then(|dir| dir.parent()) else {
+        return;
+    };
+    let Ok(mut entries) = fs::read_dir(store_root).await else {
+        return;
+    };
+    let cutoff = std::time::SystemTime::now()
+        - std::time::Duration::from_secs(WHEEL_STORE_QUARANTINE_RETENTION_SECS);
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.contains(".quarantine-") {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata().await else {
+            continue;
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        if modified <= cutoff {
+            let path = entry.path();
+            if fs::remove_dir_all(&path).await.is_ok() {
+                tracing::info!(
+                    "wheel_store quarantine reclaimed path={} age_secs>={}",
+                    path.display(),
+                    WHEEL_STORE_QUARANTINE_RETENTION_SECS,
+                );
+            }
+        }
+    }
 }
 
 /// Copy to a fresh inode and publish with a same-directory atomic rename.
@@ -998,7 +1379,7 @@ pub async fn fetch_wheel_cached(
                         wheel = %filename,
                         "wheel cache: authoritative store entry is corrupt; evicting under first-fill lock",
                     );
-                    evict_store_entry(&store_path).await;
+                    evict_store_entry(&store_path, "corrupt-after-first-fill-wait", "fetch_wheel_cached:under_fill_lock").await;
                     break;
                 }
                 Ok(StoreEntryState::Missing) => break,
@@ -1016,7 +1397,7 @@ pub async fn fetch_wheel_cached(
         inspect_store_entry(&store_path, sha256).await,
         Ok(StoreEntryState::Corrupt)
     ) {
-        evict_store_entry(&store_path).await;
+        evict_store_entry(&store_path, "integrity-inspection-corrupt", "fetch_wheel_cached:no_fill_lock").await;
     }
 
     // Cache miss: download normally.
@@ -1135,7 +1516,9 @@ pub(crate) async fn store_wheel_in_cache(src: &Path, store_root: &Path) -> Resul
             );
             return Ok(sha256);
         }
-        StoreEntryState::Corrupt => evict_store_entry(&store_final).await,
+        StoreEntryState::Corrupt => {
+            evict_store_entry(&store_final, "integrity-inspection-corrupt", "store_wheel_in_cache").await;
+        }
         StoreEntryState::Missing => {}
     }
     fs::create_dir_all(&store_dir)
@@ -1215,7 +1598,9 @@ pub async fn prefetch_url_wheel_as_source(
         let store_path = pinned_wheel_store_path(url, sha, store_root)?;
         match inspect_store_entry(&store_path, sha).await? {
             StoreEntryState::Valid(_) => return Ok(store_path),
-            StoreEntryState::Corrupt => evict_store_entry(&store_path).await,
+            StoreEntryState::Corrupt => {
+                evict_store_entry(&store_path, "integrity-inspection-corrupt", "prefetch_url_wheel_as_source").await;
+            }
             StoreEntryState::Missing => {}
         }
         // Cold store: fetch (verifies the sha, streaming/incremental -- never
@@ -4311,6 +4696,302 @@ mod tests {
         assert!(
             err.is_err(),
             "unreachable fetch must error (caller falls back to URL)"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ---------------------------------------------------------------------
+    // p6x: an eviction from a SHARED store is a rename with a row, not a
+    // silent unlink. P6V-1.
+    // ---------------------------------------------------------------------
+
+    /// The one directory under `store_root` whose name quarantines `sha`.
+    /// Panics with the store's actual contents when there is not exactly one,
+    /// so a failure names what it found instead of just unwrapping `None`.
+    #[cfg(unix)]
+    fn sole_quarantine_dir(store_root: &Path, sha: &str) -> PathBuf {
+        let prefix = format!("{sha}.quarantine-");
+        let mut found: Vec<PathBuf> = Vec::new();
+        let mut seen: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(store_root).expect("reading the store root") {
+            let entry = entry.expect("a store-root entry");
+            let name = entry.file_name().to_string_lossy().to_string();
+            seen.push(name.clone());
+            if name.starts_with(&prefix) {
+                found.push(entry.path());
+            }
+        }
+        assert_eq!(
+            found.len(),
+            1,
+            "want exactly one quarantine for {sha}; the store root holds {seen:?}",
+        );
+        found.pop().unwrap()
+    }
+
+    #[cfg(unix)]
+    struct CapturedRows(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    #[cfg(unix)]
+    impl std::io::Write for CapturedRows {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(buf).to_string());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Drive `body` on a current-thread runtime under a subscriber that keeps
+    /// every emitted row, so a test can assert on what an OPERATOR would have
+    /// been able to grep out of a job's backend log.
+    #[cfg(unix)]
+    fn with_captured_rows<F: std::future::Future>(body: F) -> (F::Output, Vec<String>) {
+        let rows = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer({
+                let rows = std::sync::Arc::clone(&rows);
+                move || CapturedRows(std::sync::Arc::clone(&rows))
+            })
+            .finish();
+        let value = tracing::subscriber::with_default(subscriber, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("building the test runtime")
+                .block_on(body)
+        });
+        let rows = rows.lock().unwrap().clone();
+        (value, rows)
+    }
+
+    /// RED on the tip: `evict_store_entry` was two `remove_file` calls, so
+    /// there is no quarantine directory to find and the corrupt bytes are gone
+    /// for good.
+    ///
+    /// It also pins the two things that made a directory rename the WRONG
+    /// shape: the entry directory keeps its identity, so a fill lock living
+    /// inside it is not carried away and re-creatable by the next process; and
+    /// the moved wheel keeps its INODE, so a reader that opened the entry
+    /// before the eviction reads its bytes through to the end.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_corrupt_store_entry_is_quarantined_and_not_unlinked() {
+        use std::io::Read as _;
+        use std::os::unix::fs::MetadataExt as _;
+
+        let poison: &[u8] = b"poisoned shared-cache bytes";
+        let bytes = build_test_wheel_zip();
+        let sha = hex_sha256(&bytes);
+        // No server: this path inspects and evicts, it never fetches.
+        let url: url::Url = "http://127.0.0.1:1/foo-1.0-py3-none-any.whl"
+            .parse()
+            .unwrap();
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-p6x-quarantine-{}-{}",
+            std::process::id(),
+            line!(),
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let store = tmp.join("store");
+        let store_path = pinned_wheel_store_path(&url, &sha, &store).unwrap();
+        let entry_dir = store_path.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&entry_dir).unwrap();
+        // The exact shape p6v's census found: a wheel whose bytes are not the
+        // digest the entry claims, a fill-lock sidecar, and a content record.
+        std::fs::write(&store_path, poison).unwrap();
+        let fill_lock = entry_dir.join(format!(
+            ".{}{}",
+            store_path.file_name().unwrap().to_string_lossy(),
+            WHEEL_STORE_FILL_LOCK_SUFFIX,
+        ));
+        std::fs::write(&fill_lock, b"").unwrap();
+        let content_record = entry_dir.join(format!(
+            ".{}.retread-content-v1.json",
+            store_path.file_name().unwrap().to_string_lossy(),
+        ));
+        std::fs::write(&content_record, b"{}").unwrap();
+        let poisoned_inode = std::fs::metadata(&store_path).unwrap().ino();
+        // A concurrent reader that resolved AND opened the entry already.
+        let mut held = std::fs::File::open(&store_path).unwrap();
+
+        let hit = cached_wheel_store_path(&url, &sha, &store).await.unwrap();
+        assert!(hit.is_none(), "a corrupt entry is a miss, never a hit");
+
+        assert!(
+            !store_path.exists(),
+            "the corrupt wheel must no longer be selectable at the entry",
+        );
+        assert!(
+            entry_dir.is_dir(),
+            "the entry DIRECTORY must survive: three call sites evict while \
+             holding a lock whose file lives inside it, and renaming the \
+             directory would carry that lock away and let a second process \
+             create and lock a fresh one at the same path",
+        );
+        assert!(
+            fill_lock.exists() && content_record.exists(),
+            "only the wheel and its integrity marker move; the fill lock and \
+             the content record stay where their owners left them",
+        );
+
+        let quarantine = sole_quarantine_dir(&store, &sha);
+        let moved = quarantine.join(store_path.file_name().unwrap());
+        assert_eq!(
+            std::fs::read(&moved).unwrap(),
+            poison,
+            "the evidence must survive the eviction verbatim",
+        );
+        assert_eq!(
+            std::fs::metadata(&moved).unwrap().ino(),
+            poisoned_inode,
+            "a rename keeps the inode: the bytes were MOVED, never copied and \
+             never deleted",
+        );
+
+        let mut still_readable = Vec::new();
+        held.read_to_end(&mut still_readable).unwrap();
+        assert_eq!(
+            still_readable, poison,
+            "a reader holding the old path keeps reading valid bytes",
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// NON-VACUITY for the guard above: a VALID entry is a hit, is never
+    /// quarantined, and emits no eviction row. A quarantine-everything
+    /// implementation passes the first guard and fails this one.
+    #[cfg(unix)]
+    #[test]
+    fn a_valid_store_entry_is_never_quarantined_and_emits_no_row() {
+        let bytes = build_test_wheel_zip();
+        let sha = hex_sha256(&bytes);
+        let filename = "foo-1.0-py3-none-any.whl";
+        let url: url::Url = format!("http://127.0.0.1:1/{filename}").parse().unwrap();
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-p6x-valid-{}-{}",
+            std::process::id(),
+            line!(),
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let store = tmp.join("store");
+        std::fs::create_dir_all(store.join(&sha)).unwrap();
+        let store_path = store.join(&sha).join(filename);
+        std::fs::write(&store_path, &bytes).unwrap();
+
+        let (hit, rows) = with_captured_rows(async {
+            let fingerprint = set_store_file_readonly(&store_path).await.unwrap();
+            write_store_integrity_marker(&store_path, &sha, &fingerprint)
+                .await
+                .unwrap();
+            cached_wheel_store_path(&url, &sha, &store).await.unwrap()
+        });
+
+        assert_eq!(hit, Some(store_path.clone()), "a valid entry is a hit");
+        assert!(store_path.is_file(), "and it is left exactly where it was");
+        let evictions: Vec<&String> = rows
+            .iter()
+            .filter(|row| row.contains("wheel_store evicted"))
+            .collect();
+        assert!(
+            evictions.is_empty(),
+            "a healthy entry must not produce an eviction row; got {evictions:?}",
+        );
+        let quarantines: Vec<String> = std::fs::read_dir(&store)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|name| name.contains(".quarantine-"))
+            .collect();
+        assert!(
+            quarantines.is_empty(),
+            "a healthy entry must not be quarantined; got {quarantines:?}",
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// RED on the tip: `cached_wheel_store_path` and
+    /// `prefetch_url_wheel_as_source` were the two `evict_store_entry` callers
+    /// that logged NOTHING, and `grep -rn "authoritative store entry is
+    /// corrupt"` over every `.log`/`.out` on this campaign returned zero hits
+    /// while three shared-store entries were being emptied. Both now name
+    /// themselves in a row an operator can grep.
+    #[cfg(unix)]
+    #[test]
+    fn the_two_silent_eviction_call_sites_now_emit_a_row() {
+        let poison: &[u8] = b"poisoned shared-cache bytes";
+        let bytes = build_test_wheel_zip();
+        let sha = hex_sha256(&bytes);
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-p6x-rows-{}-{}",
+            std::process::id(),
+            line!(),
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let store = tmp.join("store");
+
+        let ((), rows) = with_captured_rows(async {
+            let (port, server) = serve_ranged(bytes.clone()).await;
+            let url: url::Url = format!("http://127.0.0.1:{port}/foo-1.0-py3-none-any.whl")
+                .parse()
+                .unwrap();
+
+            // (1) the metadata-reader fast path.
+            let store_path = pinned_wheel_store_path(&url, &sha, &store).unwrap();
+            std::fs::create_dir_all(store_path.parent().unwrap()).unwrap();
+            std::fs::write(&store_path, poison).unwrap();
+            assert!(
+                cached_wheel_store_path(&url, &sha, &store)
+                    .await
+                    .unwrap()
+                    .is_none(),
+            );
+
+            // (2) the source-prefetch fast path, re-poisoned so it faces the
+            // same corrupt entry and then refills it from the server.
+            std::fs::write(&store_path, poison).unwrap();
+            let dest = tmp.join("dl");
+            let fetched = prefetch_url_wheel_as_source(&url, Some(&sha), &dest, &store)
+                .await
+                .expect("prefetch must recover from a corrupt entry, not fail");
+            assert_eq!(std::fs::read(&fetched).unwrap(), bytes);
+
+            server.abort();
+        });
+
+        let evictions: Vec<&String> = rows
+            .iter()
+            .filter(|row| row.contains("wheel_store evicted"))
+            .collect();
+        for caller in [
+            "caller=cached_wheel_store_path",
+            "caller=prefetch_url_wheel_as_source",
+        ] {
+            assert!(
+                evictions.iter().any(|row| row.contains(caller)),
+                "no eviction row named {caller}; rows were {evictions:?}",
+            );
+        }
+        for field in ["sha=", "reason=", "quarantine="] {
+            assert!(
+                evictions.iter().all(|row| row.contains(field)),
+                "every eviction row must carry {field}; rows were {evictions:?}",
+            );
+        }
+        assert!(
+            evictions
+                .iter()
+                .all(|row| !row.contains("quarantine=none")),
+            "an eviction that deleted rather than quarantined is the defect \
+             this guard exists for; rows were {evictions:?}",
         );
 
         let _ = std::fs::remove_dir_all(&tmp);

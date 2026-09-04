@@ -7199,6 +7199,8 @@ fn validate_one_built_wheel_source(
     // already refactored into this helper, so git could not place it. Both
     // sides are kept -- the parallel validation above, and c10's content
     // record door here -- rather than either being dropped to resolve.
+    // p6z merge note: p6x's side of this hunk was the same lines WITHOUT the
+    // note; the note is comment-only and is kept.
     let source_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     let read_metadata_started = std::time::Instant::now();
     let metadata = crate::wheel_content::read_metadata_verified(&path, None)
