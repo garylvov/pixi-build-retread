@@ -479,7 +479,7 @@ fn parse_pyproject(source: &FetchedDepSource) -> Result<ParsedDepsFrom> {
             match dep.as_str() {
                 Some(requirement) => {
                     let parsed: Option<uv_pep508::Requirement> =
-                        uv_pep508::Requirement::from_str(requirement).ok();
+                        crate::pep508_lenient::parse_requirement_lenient(requirement).ok();
                     let normalized_name = parsed
                         .as_ref()
                         .map(|req| crate::relax::canonical_conda_name(req.name.as_ref()));

@@ -277,8 +277,22 @@ pub(crate) enum FinalizeSuccess {
     Unchanged(VersionSpecifiers),
     AdvisoryFloorSoftened {
         specifiers: VersionSpecifiers,
+        kind: SoftenKind,
         unsoftened_conflict: Conflict,
     },
+}
+
+/// Which policy let a finalization succeed after discarding a clause.
+///
+/// Both are already-decided policy; the distinction is what the WARN row says
+/// and what a post-hoc audit can separate. `AdvisoryFloor` is the long-standing
+/// conda-as-truth rule. `LearnedWorkspaceFact` is p6z's reader for a policy
+/// that already had two writers and no reader here -- see
+/// [`finalize_impl`]'s learned-fact step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SoftenKind {
+    AdvisoryFloor,
+    LearnedWorkspaceFact,
 }
 
 impl FinalizeSuccess {
@@ -664,6 +678,78 @@ fn finalize_impl(
             }
             return Ok(FinalizeSuccess::AdvisoryFloorSoftened {
                 specifiers: remove_redundant_specifier_clauses(softened),
+                kind: SoftenKind::AdvisoryFloor,
+                unsoftened_conflict,
+            });
+        }
+    }
+
+    // p6z / boarded p6w-2. THE LEARNED WORKSPACE FACT YIELDS HERE TOO.
+    //
+    // The policy is not new and it is not this lane's invention. It is stated
+    // twice already: `uv_closure::is_yieldable_advisory_source` says a LEARNED
+    // workspace conda fact "yields to a hard requirement inside the closure,
+    // rather than failing the pack", and `learned_fact_yield_needed` /
+    // `apply_learned_fact_yields` enforce exactly that -- but ONLY for a
+    // failure uv reports, because they read uv's conflict prose. The emission
+    // side enforces it too
+    // (`a_learned_workspace_conda_fact_cannot_veto_a_bundled_wheels_cap`).
+    // This reconciler runs BEFORE uv, so a conflict it raises never reached
+    // either reader: a writer with no reader on this path.
+    //
+    // MEASURED, jobs 5764452/5776669, `flashsac-pack`: `setuptools`
+    // `==84.0.0` "required by uv constraint from workspace conda fact
+    // (learned: selected by every consuming env's conda solve)" against
+    // `<=65` required by wheel `FlashRL==0.1.0` Requires-Dist
+    // `setuptools<=65` -- a REAL runtime dependency declared in
+    // `third_party/FlashSAC/pyproject.toml`. This finalization failed closed,
+    // the resolve-time back-off could attribute nothing (neither side is a
+    // detected root), and THIRTEEN detected roots were dropped to route
+    // around a fact that was false for the pack's own consuming env: the lock
+    // the back-off then produced gives `flashsac-gpu` setuptools 59.8.0, not
+    // 84.0.0. The learned fact was wrong and the wheel was right, and the
+    // policy already said so.
+    //
+    // A DECLARED fact is never in this set -- it is operator intent and keeps
+    // its own recovery. Nothing is dropped unless dropping the learned clauses
+    // ALONE makes the request satisfiable, so this can never mask a conflict
+    // between two hard requirements.
+    let (learned, hard): (Vec<&Constraint>, Vec<&Constraint>) = active
+        .iter()
+        .copied()
+        .partition(|constraint| crate::uv_closure::is_learned_advisory_sentence(&constraint.source));
+    if !learned.is_empty() && !hard.is_empty() {
+        let without_learned = intersect(&hard);
+        if !specifiers_unsatisfiable(&without_learned) {
+            let unsoftened_conflict = conflict_from_active(package, &active);
+            if emit_diagnostics {
+                let yielded = learned
+                    .iter()
+                    .map(|constraint| {
+                        format!(
+                            "`{}` from {}",
+                            if constraint.specifiers.is_empty() {
+                                "*".to_string()
+                            } else {
+                                constraint.specifiers.to_string()
+                            },
+                            constraint.source
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                tracing::warn!(
+                    package = %package,
+                    yielded = %yielded,
+                    kept = %without_learned,
+                    "a LEARNED workspace fact contradicted a hard requirement stated inside \
+                     this closure; the learned fact yields (it is what a previous solve \
+                     happened to pick, not operator intent)",
+                );
+            }
+            return Ok(FinalizeSuccess::AdvisoryFloorSoftened {
+                specifiers: remove_redundant_specifier_clauses(without_learned),
+                kind: SoftenKind::LearnedWorkspaceFact,
                 unsoftened_conflict,
             });
         }
@@ -792,6 +878,140 @@ mod tests {
     }
 
     #[test]
+    /// p6z guard (b), the reconciler half. Boarded p6w-2.
+    ///
+    /// THE MEASURED CLAUSES, job 5776669 line 250906, verbatim:
+    ///   `==84.0.0`  uv constraint from workspace conda fact (LEARNED)
+    ///   `!=50.0.0`  wheel `dm_control==1.0.45`
+    ///   `>=41.0.0`  wheel `tensorboard==2.21.0`
+    ///   `*`         wheel `sapien==3.0.3`
+    ///   `<=65`      wheel `FlashRL==0.1.0`
+    ///
+    /// Before p6z this finalization failed closed and THIRTEEN detected roots
+    /// were dropped by the request-wide back-off -- none of which carries the
+    /// contradiction. `FlashRL`'s `setuptools<=65` is a real runtime
+    /// dependency (`third_party/FlashSAC/pyproject.toml`, `[project]
+    /// dependencies`), so it stays. The learned fact is what an earlier solve
+    /// happened to pick, and the lock the back-off produced proves it wrong
+    /// for this pack's own env: `flashsac-gpu` locks setuptools 59.8.0.
+    #[test]
+    fn p6z_b_a_learned_workspace_fact_yields_to_a_wheels_declared_cap() {
+        // THE SOURCE AS A CONSTRAINT ACTUALLY CARRIES IT, measured off arm
+        // 5784994: the RENDERED sentence, which CONTAINS the constant and is
+        // not equal to it. p6z pair 1 built this guard on the bare constant,
+        // the yield fired in the test and never fired in the arm, and
+        // flashsac-pack dropped its 13 roots again. The fixture is now the
+        // real string.
+        let learned = || {
+            let mut constraint = constraint(
+                "==84.0.0",
+                Provenance::UvConstraint,
+                "uv constraint `setuptools==84.0.0` from workspace conda fact",
+            );
+            constraint.source = format!(
+                "uv constraint `setuptools==84.0.0` from {} `precise-consuming-envs` \
+                 (conda `setuptools==84.0.0`)",
+                crate::uv_closure::LEARNED_WORKSPACE_FACT_SOURCE,
+            );
+            assert_ne!(
+                constraint.source,
+                crate::uv_closure::LEARNED_WORKSPACE_FACT_SOURCE,
+                "non-vacuity: the rendered sentence must NOT equal the constant, or this \
+                 guard cannot catch the equality-vs-substring defect it exists for",
+            );
+            constraint
+        };
+        let flashrl = || {
+            constraint(
+                "<=65",
+                Provenance::IndexWheelMetadata,
+                "wheel `FlashRL==0.1.0` Requires-Dist `setuptools<=65`",
+            )
+        };
+        let constraints = vec![
+            learned(),
+            constraint(
+                "!=50.0.0",
+                Provenance::IndexWheelMetadata,
+                "wheel `dm_control==1.0.45` Requires-Dist `setuptools!=50.0.0`",
+            ),
+            constraint(
+                ">=41.0.0",
+                Provenance::IndexWheelMetadata,
+                "wheel `tensorboard==2.21.0` Requires-Dist `setuptools>=41.0.0`",
+            ),
+            constraint(
+                "",
+                Provenance::IndexWheelMetadata,
+                "wheel `sapien==3.0.3` Requires-Dist `setuptools`",
+            ),
+            flashrl(),
+        ];
+
+        let specifiers = finalize(&PypiKey::from_pypi("setuptools"), &constraints)
+            .expect("the LEARNED fact must yield rather than fail the pack");
+        let fifty_nine = uv_pep508::uv_pep440::Version::from_str("59.8.0").unwrap();
+        let eighty_four = uv_pep508::uv_pep440::Version::from_str("84.0.0").unwrap();
+        assert!(
+            specifiers.contains(&fifty_nine),
+            "the version the workspace's own solve picks for flashsac-gpu must be \
+             admissible: {specifiers}",
+        );
+        assert!(
+            !specifiers.contains(&eighty_four),
+            "the wheel's declared cap is a HARD requirement and must survive: {specifiers}",
+        );
+
+        // NON-VACUITY 1: a DECLARED workspace pin is operator intent and does
+        // NOT yield -- the same split `a_declared_workspace_pin_still_decides_
+        // the_constrains_carry` makes at emission.
+        let declared = constraint(
+            "==84.0.0",
+            Provenance::WorkspaceCondaFact("flashsac-gpu".to_string()),
+            "workspace conda fact `flashsac-gpu`",
+        );
+        finalize(
+            &PypiKey::from_pypi("setuptools"),
+            &[declared, flashrl()],
+        )
+        .expect_err("a DECLARED pin must still fail closed against the wheel's cap");
+
+        // NON-VACUITY 2: dropping the learned clause must be what rescues it.
+        // Two HARD requirements that contradict each other still fail, even
+        // with a learned clause beside them.
+        finalize(
+            &PypiKey::from_pypi("setuptools"),
+            &[
+                learned(),
+                flashrl(),
+                constraint(
+                    ">=70",
+                    Provenance::IndexWheelMetadata,
+                    "wheel `other==1.0` Requires-Dist `setuptools>=70`",
+                ),
+            ],
+        )
+        .expect_err("a contradiction between two hard requirements must stay fatal");
+
+        // NON-VACUITY 3: without the yield the measured set really is fatal,
+        // so the guard passes because of the yield and not because the clauses
+        // happen to intersect.
+        let hard_only: Vec<Constraint> = constraints
+            .iter()
+            .filter(|constraint| {
+                !crate::uv_closure::is_learned_advisory_sentence(&constraint.source)
+            })
+            .cloned()
+            .chain(std::iter::once(constraint(
+                "==84.0.0",
+                Provenance::UvConstraint,
+                "uv constraint `setuptools==84.0.0` from a DECLARED pin",
+            )))
+            .collect();
+        finalize(&PypiKey::from_pypi("setuptools"), &hard_only)
+            .expect_err("the measured clause set is unsatisfiable unless the learned fact yields");
+    }
+
     fn advisory_only_conflict_still_errors() {
         let constraints = vec![
             constraint(

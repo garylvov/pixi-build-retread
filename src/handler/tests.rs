@@ -733,6 +733,7 @@ fn pythons_for_rejects_bare_major_variant() {
         ledger_overrides: Default::default(),
         pack_manifest_path: None,
         auto_imports: None,
+        auto_imports_strict: None,
         verify_snapshots: None,
         git_snapshot_store: None,
         path_source_metadata: None,
@@ -792,6 +793,7 @@ fn pythons_for_accepts_dotted_variant() {
         ledger_overrides: Default::default(),
         pack_manifest_path: None,
         auto_imports: None,
+        auto_imports_strict: None,
         verify_snapshots: None,
         git_snapshot_store: None,
         path_source_metadata: None,
@@ -851,6 +853,7 @@ fn pythons_for_filters_bare_major_keeps_dotted() {
         ledger_overrides: Default::default(),
         pack_manifest_path: None,
         auto_imports: None,
+        auto_imports_strict: None,
         verify_snapshots: None,
         git_snapshot_store: None,
         path_source_metadata: None,
@@ -3629,6 +3632,7 @@ fn cfg() -> RetreadConfig {
         ledger_overrides: Default::default(),
         pack_manifest_path: None,
         auto_imports: None,
+        auto_imports_strict: None,
         verify_snapshots: None,
         git_snapshot_store: None,
         path_source_metadata: None,
@@ -7455,6 +7459,9 @@ fn the_advertised_courier_build_gate_resolves_under_the_recorded_fingerprint() {
         workspace_fp: "sibling-locks-as-of-the-metadata-pass".to_string(),
         run_depends: vec!["python 3.11.*".to_string()],
         run_constrains: Vec::new(),
+        auto_imports_suppressed_bundles: Vec::new(),
+        auto_imports_suppressed: Vec::new(),
+        auto_imports_suppressed_roots: Vec::new(),
     };
     let advertising_fp = EffectiveWorkspaceFp::resolve(Some(&record), None, ws, source, &target);
     assert_eq!(
@@ -7752,7 +7759,9 @@ fn auto_imports_injection_verdict_skips_unmappable_names() {
     // Empty conda-provided set for the naming assertions below; the
     // conda-precedence screen gets its own dedicated test.
     let no_conda: BTreeSet<String> = BTreeSet::new();
-    let verdict = |r: &ResolvedImport| auto_imports_injection_verdict(r, &siblings, &no_conda);
+    let no_naming = crate::auto_imports::NamingAuthority::default();
+    let verdict =
+        |r: &ResolvedImport| auto_imports_injection_verdict(r, &siblings, &no_conda, &no_naming);
 
     // --- INJECTED ---
     // Index-provided: PIL -> pillow, the naming the warm wheel slice gave.
@@ -7766,13 +7775,44 @@ fn auto_imports_injection_verdict_skips_unmappable_names() {
     {
         assert_eq!(verdict(&req(module, name, false, false)), Ok(name.to_string()), "{module}");
     }
-    // An INDEX-provided name is authoritative even with many segments, and
-    // even when it is on the denylist.
-    assert_eq!(
-        verdict(&req("some_mod", "a-b-c-d", true, false)),
-        Ok("a-b-c-d".to_string())
+    // p6t: an INDEX-provided name is no longer authoritative. `indexed=true`
+    // means only "a wheel with this module happened to be in the machine-wide
+    // store" -- the p6s-2 defect, measured as two different answers for
+    // `module=isaacsim` six minutes apart in one run (job 5745086 vs 5748915).
+    // With no request fact behind them these are LEADS.
+    assert!(
+        verdict(&req("some_mod", "a-b-c-d", true, false)).is_err(),
+        "a store listing must not name a root"
     );
-    assert_eq!(verdict(&req("warp", "warp-lang", true, false)), Ok("warp-lang".to_string()));
+    assert!(verdict(&req("warp", "warp-lang", true, false)).is_err());
+    // The SAME rows inject the moment a request fact determines them, and
+    // then they carry that fact's version.
+    {
+        use crate::auto_imports::{DeterminedDistribution, NamingAuthority, NamingOrigin};
+        let determined = NamingAuthority::from_determined([
+            DeterminedDistribution {
+                name: "a-b-c-d".to_string(),
+                version: None,
+                origin: NamingOrigin::DeclaredDep,
+            },
+            DeterminedDistribution {
+                name: "warp-lang".to_string(),
+                version: Some("1.5.0".to_string()),
+                origin: NamingOrigin::LockedRecord,
+            },
+        ]);
+        let determined_verdict =
+            |r: &ResolvedImport| auto_imports_injection_verdict(r, &siblings, &no_conda, &determined);
+        // `a_b_c_d` is the module form of the declared distribution `a-b-c-d`.
+        assert_eq!(
+            determined_verdict(&req("a_b_c_d", "a-b-c-d", true, false)),
+            Ok("a-b-c-d".to_string())
+        );
+        assert_eq!(
+            determined_verdict(&req("warp_lang", "warp-lang", true, false)),
+            Ok("warp-lang==1.5.0".to_string())
+        );
+    }
 
     // --- SKIPPED, with the reason each one is skipped for ---
     // (a) conditional: `import cv2` inside a try/except.
@@ -7803,7 +7843,7 @@ fn auto_imports_injection_verdict_skips_unmappable_names() {
     // NOT in it, which is precisely why screen (c) could not save arm B.
     let foreign_siblings: BTreeSet<String> = ["flashrl"].iter().map(|s| s.to_string()).collect();
     let foreign =
-        |r: &ResolvedImport| auto_imports_injection_verdict(r, &foreign_siblings, &no_conda);
+        |r: &ResolvedImport| auto_imports_injection_verdict(r, &foreign_siblings, &no_conda, &no_naming);
     for module in [
         "isaaclab",
         "isaaclab_tasks",
@@ -7829,12 +7869,40 @@ fn auto_imports_injection_verdict_skips_unmappable_names() {
         verdict(&req("isaaclabel", "isaaclabel", false, false)),
         Err(AUTO_IMPORTS_LEAD_REASON)
     );
-    // (`isaaclab_tasks` is a sibling in this fixture, so screen (c) claims it
-    // first; use a non-sibling to exercise index authority over (g2).)
-    assert_eq!(
-        verdict(&req("isaaclab_newton", "isaaclab-newton", true, false)),
-        Ok("isaaclab-newton".to_string())
+    // p6t REVERSED THIS PRECEDENCE, deliberately. It used to read "index
+    // authority beats (g2)": a wheel named `isaaclab_newton-*.whl` sitting in
+    // the machine-wide store made the extension injectable as a PyPI root.
+    // An Isaac Lab extension is a source-built entry of some bundle in this
+    // workspace and is published to no index, so that could only ever produce
+    // "isaaclab-newton was not found in the package registry" -- and it did,
+    // in job 5547304 arm B, for the sibling name. (g1)/(g2) now run BEFORE
+    // the naming authority, so neither a store listing nor a coincidental
+    // lock row can make one of these a root.
+    assert!(
+        verdict(&req("isaaclab_newton", "isaaclab-newton", true, false))
+            .unwrap_err()
+            .contains("Isaac Lab extension"),
+        "a store-indexed Isaac Lab extension is still not a PyPI distribution"
     );
+    {
+        use crate::auto_imports::{DeterminedDistribution, NamingAuthority, NamingOrigin};
+        let even_locked = NamingAuthority::from_determined([DeterminedDistribution {
+            name: "isaaclab-newton".to_string(),
+            version: Some("0.1.0".to_string()),
+            origin: NamingOrigin::LockedRecord,
+        }]);
+        assert!(
+            auto_imports_injection_verdict(
+                &req("isaaclab_newton", "isaaclab-newton", true, false),
+                &siblings,
+                &no_conda,
+                &even_locked,
+            )
+            .unwrap_err()
+            .contains("Isaac Lab extension"),
+            "not even a lock row promotes a workspace-built extension to a PyPI root"
+        );
+    }
     // (e) repo-local module paths the own-top-level screen missed because
     // they live in a SIBLING directory of a shared checkout.
     for (module, name) in [
@@ -7925,11 +7993,43 @@ fn auto_imports_injection_verdict_skips_unmappable_names() {
         Ok("pillow".to_string()),
         "the curated table outranks the index"
     );
-    // An unmapped module is a lead when cold and a root when the index knows
-    // it -- that asymmetry is intended (the index is evidence, the fallback
-    // is not), and is the one case where warmth legitimately matters.
+    // p6t DELETED THE LAST ASYMMETRY. This assertion used to read "an unmapped
+    // module is a lead when cold and a root when the index knows it -- that
+    // asymmetry is intended, and is the one case where warmth legitimately
+    // matters." It is not legitimate and it was not one case: it is the whole
+    // of p6s-2. `isaacsim` took exactly this path -- lead at 03:24:10 on a
+    // 0-wheel store, INJECTABLE at 03:29:05 once the store filled, in ONE run
+    // (job 5748915), and injected as `isaacsim-extscache-kit-sdk` in job
+    // 5745086 whose store was warm at the deciding instant. Warmth now
+    // decides nothing anywhere: cold and warm are the same verdict.
     assert_eq!(verdict(&req("annoy", "annoy", false, false)), Err(AUTO_IMPORTS_LEAD_REASON));
-    assert_eq!(verdict(&req("annoy", "annoy", true, false)), Ok("annoy".to_string()));
+    assert_eq!(
+        verdict(&req("annoy", "annoy", true, false)),
+        Err(AUTO_IMPORTS_LEAD_REASON),
+        "a store listing is not evidence: same verdict cold and warm"
+    );
+    // The lead becomes a root the moment a REQUEST FACT names it, and then it
+    // carries that fact's version -- store state still irrelevant either way.
+    {
+        use crate::auto_imports::{DeterminedDistribution, NamingAuthority, NamingOrigin};
+        let determined = NamingAuthority::from_determined([DeterminedDistribution {
+            name: "annoy".to_string(),
+            version: Some("1.17.3".to_string()),
+            origin: NamingOrigin::LockedRecord,
+        }]);
+        for indexed in [false, true] {
+            assert_eq!(
+                auto_imports_injection_verdict(
+                    &req("annoy", "annoy", indexed, false),
+                    &siblings,
+                    &no_conda,
+                    &determined,
+                ),
+                Ok("annoy==1.17.3".to_string()),
+                "indexed={indexed}"
+            );
+        }
+    }
 }
 
 /// CONDA PRECEDENCE (screen (d)). Job 5551014 died because `open3d` was
@@ -7961,7 +8061,9 @@ fn auto_imports_never_injects_a_name_conda_already_provides() {
     .iter()
     .map(|s| s.to_string())
     .collect();
-    let verdict = |r: &ResolvedImport| auto_imports_injection_verdict(r, &siblings, &conda);
+    let no_naming = crate::auto_imports::NamingAuthority::default();
+    let verdict =
+        |r: &ResolvedImport| auto_imports_injection_verdict(r, &siblings, &conda, &no_naming);
 
     // THE NEWTON SIX, the exact roots injected into `newton-pack-latest`.
     // Five are conda-provided and must now be skipped; `sphinx` is NOT in the
@@ -8011,7 +8113,12 @@ fn auto_imports_never_injects_a_name_conda_already_provides() {
     // entirely by workspace facts, never by a hardcoded list.
     let none: BTreeSet<String> = BTreeSet::new();
     assert_eq!(
-        auto_imports_injection_verdict(&req("open3d", "open3d", false), &siblings, &none),
+        auto_imports_injection_verdict(
+            &req("open3d", "open3d", false),
+            &siblings,
+            &none,
+            &crate::auto_imports::NamingAuthority::default(),
+        ),
         Ok("open3d".to_string())
     );
 }
@@ -8248,7 +8355,9 @@ fn auto_imports_never_injects_an_abi_anchor() {
     // narrow fact set does not mention numpy at all. The anchor guard must
     // still refuse it -- that is the whole point of adding it.
     let empty: BTreeSet<String> = BTreeSet::new();
-    let verdict = |r: &ResolvedImport| auto_imports_injection_verdict(r, &siblings, &empty);
+    let no_naming = crate::auto_imports::NamingAuthority::default();
+    let verdict =
+        |r: &ResolvedImport| auto_imports_injection_verdict(r, &siblings, &empty, &no_naming);
 
     for module in ["numpy", "python", "cuda"] {
         assert_eq!(
@@ -9609,6 +9718,9 @@ fn advertised_output_record(
         workspace_fp: "metadata-pass-fp".to_string(),
         run_depends: depends,
         run_constrains: constrains,
+        auto_imports_suppressed_bundles: Vec::new(),
+        auto_imports_suppressed: Vec::new(),
+        auto_imports_suppressed_roots: Vec::new(),
     }
 }
 
@@ -11081,6 +11193,9 @@ async fn c11_an_adopted_output_restores_the_cold_passs_advertised_identity() {
         workspace_fp: "the-producing-workspace-fingerprint".to_string(),
         run_depends: vec!["python 3.11.*".to_string()],
         run_constrains: vec![],
+        auto_imports_suppressed_bundles: Vec::new(),
+        auto_imports_suppressed: Vec::new(),
+        auto_imports_suppressed_roots: Vec::new(),
     };
 
     // The record travels inside the store record, exactly as production
@@ -11609,6 +11724,418 @@ fn p6j_a_bundled_wheels_range_requires_dist_survives_the_widened_projection() {
     );
 }
 
+// p6q -- THE PILLOW ROW, AND THE ORIGIN KIND THAT CARRIES IT.
+//
+// Job 5739415 (LANE-C-WARM-LOG §16.9), arm ONCERT on binsnap `p6n-b-627de7f`,
+// manifest `b1-scratch/pixi.toml.a3b` (both `pillow = "==10.4.0"` hand pins
+// deliberately deleted). 21 of 27 environments resolved; the run died on:
+//
+//   × failed to solve requirements of environment 'pm-isaaclab'
+//     ├─ moviepy ==2.2.1              would require  pillow <11.0,>=9.2.0
+//     ├─ isaaclab-2.3x-pack 0.54.2    would constrain pillow !=8.3.*,>=8.3.2,==11.3.0
+//     └─ protomotions-deps-pack 3.1   would constrain pillow >=10.1,<12.0
+//
+// Measured from that run's own backend log, the `==11.3.0` has exactly ONE
+// producer and it is NOT the auto-route:
+//
+//   auto-routed pillow -> conda, bundle=isaaclab-2.3x-pack ....... 0 rows
+//   wheel `isaacsim-kernel==5.1.0.0` Requires-Dist `pillow==11.3.0`  (the only
+//     exact-point bound for `pillow` in that bundle's emission group)
+//   retread-constrains-discipline rows naming `pillow` .......... 0 of 985
+//
+// So `closure_derived_route_origins` (p6g) could never have matched it: the
+// origin kind is `wheel-requires-dist`, which is precisely the shape p6j's
+// `closure_derived_exact_origins` was written for. The pillow row is that
+// projection MISSING, not a further origin it fails to cover -- p6n branched
+// off `c0a87d3`, which predates p6j's merge (`614f746`), so the arm binary
+// carried p6g's predicate and not p6j's.
+//
+// The proof is a live pair, same name, same bundle, same origin, two binaries:
+//   job 5716354 (p6j IN):   "pillow !=8.3.*,>=8.3.2"
+//   job 5739415 (p6j OUT):  "pillow !=8.3.*,>=8.3.2,==11.3.0"
+//
+// This guard is that pair. It is distinct from p6j's own two guards in the one
+// way that matters: THERE IS NO AUTO-ROUTE FOR THE NAME AT ALL, so nothing
+// p6g projects out is present, and the test is a statement about the
+// wheel-requires-dist origin standing alone.
+// -----------------------------------------------------------------
+
+/// The 5739415 shape: the pack declares a compatibility BAND for a name the
+/// workspace provides, and one wheel it BUNDLES pins that same name to a
+/// point. No auto-route exists for the name.
+fn p6q_pillow_pack() -> Bundle {
+    let mut bundle = solo_bundle("isaaclab-2-3x-pack", vec!["pillow!=8.3.*,>=8.3.2"]);
+    bundle.primary.original_requires_dist = vec!["pillow!=8.3.*,>=8.3.2".to_string()];
+    // `isaacsim-kernel==5.1.0.0` is the wheel the pack bundles, and
+    // `pillow==11.3.0` is its literal `Requires-Dist`.
+    bundle.extras.push(rw(
+        "isaacsim-kernel",
+        meta("isaacsim-kernel", "5.1.0.0", vec!["pillow==11.3.0"], true),
+    ));
+    bundle
+        .extras
+        .push(rw("pillow", meta("pillow", "11.3.0", vec![], true)));
+    bundle.uv_closure_names.insert("pillow".to_string());
+    // The workspace declares `moviepy`; the injected root makes `pillow`
+    // reachable from it inside this pack's own uv graph, which is what makes
+    // the group `constrains_only` -- exactly the arm's gate-ON condition.
+    bundle
+        .workspace_declared_pypi
+        .insert(canonical_conda_name("moviepy"));
+    bundle
+        .uv_dependency_graph
+        .edges
+        .insert(crate::uv_closure::UvDependencyEdge {
+            parent: "moviepy".to_string(),
+            child: "pillow".to_string(),
+        });
+    bundle
+        .auto_imports_injected
+        .insert(canonical_conda_name("pillow"));
+    // The two counterparties the solver error names.
+    bundle.workspace_conda_provider_facts.insert(
+        "pillow".to_string(),
+        super::WorkspaceCondaProviderFact {
+            selected_versions: ["10.4.0", "12.3.0"]
+                .iter()
+                .map(|version| (*version).to_string())
+                .collect(),
+            declared_specs: BTreeSet::new(),
+            present_in_all_consumers: false,
+        },
+    );
+    bundle
+}
+
+/// (p6q) A bundled wheel's exact `Requires-Dist` is the ONLY exact-point origin
+/// in this group, and the emitted row must be the declared band and nothing
+/// else.
+///
+/// FAILS on `627de7f` (`fix/p6n-b`, the 5739415 arm binary): the call site is
+/// still `closure_derived_route_origins`, there is no auto-route for the name
+/// to match, and the emitted line is `pillow !=8.3.*,>=8.3.2,==11.3.0` --
+/// byte-for-byte the clause in 5739415's solver error.
+#[test]
+fn p6q_a_bundled_wheel_pin_is_not_advertised_when_no_auto_route_exists_for_the_name() {
+    let bundle = p6q_pillow_pack();
+    let (constrains, logs) = capture_warn_logs(|| p6g_constrains(&bundle));
+    let pillow: Vec<&String> = constrains
+        .iter()
+        .filter(|line| line.split(' ').next() == Some("pillow"))
+        .collect();
+    assert_eq!(
+        pillow,
+        vec![&"pillow !=8.3.*,>=8.3.2".to_string()],
+        "the emitted `pillow` row must be the DECLARED band alone -- job 5716354 \
+         (p6j in the binary) emitted exactly that, and job 5739415 (p6j absent) \
+         emitted `pillow !=8.3.*,>=8.3.2,==11.3.0`, which is what made \
+         pm-isaaclab unsolvable against `moviepy ==2.2.1` (`pillow <11.0,>=9.2.0`): \
+         {constrains:?}",
+    );
+    assert!(
+        logs.contains("retread-constrains-discipline"),
+        "the drop must be loud -- 5739415 wrote 985 discipline rows and not one \
+         of them named `pillow`: {logs}",
+    );
+    for counterparty in ["10.4.0", "12.3.0"] {
+        assert!(
+            logs.contains(counterparty),
+            "the row must NAME the counterparties ({counterparty} missing): {logs}",
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// p6t: injection is a pure function of request facts, never of cache state
+// ---------------------------------------------------------------------------
+
+/// A wheel on disk whose dist-info names `modules` as its top level.
+/// Filename shape is PEP 427, because that filename is what the p6r naming
+/// path derived the distribution name from.
+fn p6t_wheel(dir: &std::path::Path, filename: &str, dist: &str, modules: &[&str]) -> PathBuf {
+    use std::io::Write;
+    let path = dir.join(filename);
+    let f = std::fs::File::create(&path).unwrap();
+    let mut z = zip::ZipWriter::new(f);
+    let o: zip::write::FileOptions<()> =
+        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    z.start_file(format!("{dist}.dist-info/top_level.txt"), o).unwrap();
+    z.write_all(modules.join("\n").as_bytes()).unwrap();
+    z.finish().unwrap();
+    path
+}
+
+fn p6t_tmpdir(label: &str) -> PathBuf {
+    let p = std::env::temp_dir().join(format!(
+        "retread-p6t-{label}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&p);
+    std::fs::create_dir_all(&p).unwrap();
+    p
+}
+
+/// The 19-wheel store oncert-p6r 5745086 held at injection time, reduced to
+/// the wheels that carry a naming edge: the kit-sdk wheel that made
+/// `import isaacsim` mean `isaacsim-extscache-kit-sdk`, plus a handful of
+/// ordinary ones so the store is not a one-wheel strawman.
+fn p6t_p6r_store(dir: &std::path::Path) -> Vec<PathBuf> {
+    vec![
+        p6t_wheel(
+            dir,
+            "isaacsim_extscache_kit_sdk-6.0.0.1-cp312-none-manylinux_2_35_x86_64.whl",
+            "isaacsim_extscache_kit_sdk-6.0.0.1",
+            &["isaacsim"],
+        ),
+        p6t_wheel(dir, "opencv_python-4.10.0.84-py3-none-any.whl", "opencv_python-4.10.0.84", &["cv2"]),
+        p6t_wheel(dir, "warp_lang-1.5.0-py3-none-any.whl", "warp_lang-1.5.0", &["warp"]),
+        p6t_wheel(dir, "some_pkg-1.0.0-py3-none-any.whl", "some_pkg-1.0.0", &["some_mod"]),
+    ]
+}
+
+fn p6t_req(module: &str, provider: &str, indexed: bool) -> crate::auto_imports::ResolvedImport {
+    crate::auto_imports::ResolvedImport {
+        module: module.to_string(),
+        provider: Some(provider.to_string()),
+        source: indexed.then_some(crate::auto_imports::ProvenanceSource::TopLevelTxt),
+        conditional: false,
+        files: vec![PathBuf::from("a.py")],
+    }
+}
+
+/// p6t GUARD (a) — THE DETERMINISM PROOF.
+///
+/// Same manifest, same pack records, same detected imports. One arm sees an
+/// EMPTY wheel store, the other sees the store oncert-p6r 5745086 actually
+/// held. The injected root set must be identical, name AND version.
+///
+/// RED on 0dcda13: the empty arm injects nothing for `isaacsim`/`cv2`/`warp`/
+/// `some_mod`, the warm arm injects `isaacsim-extscache-kit-sdk`, `warp-lang`
+/// and `a-b-c-d`-shaped names off the store listing — which is the measured
+/// difference between jobs 5745086 and 5748915.
+#[test]
+fn p6t_a_the_injected_root_set_is_identical_with_an_empty_store_and_p6rs_warm_one() {
+    use crate::auto_imports::{build_index, DeterminedDistribution, NamingAuthority, NamingOrigin};
+
+    let dir = p6t_tmpdir("store");
+    let warm = p6t_p6r_store(&dir);
+    let cold: Vec<PathBuf> = Vec::new();
+
+    // The request facts, identical in both arms: the workspace lock resolves
+    // `isaacsim 5.1.0.0`, the manifest declares `opencv-python`.
+    let naming = NamingAuthority::from_determined([
+        DeterminedDistribution {
+            name: "isaacsim".to_string(),
+            version: Some("5.1.0.0".to_string()),
+            origin: NamingOrigin::LockedRecord,
+        },
+        DeterminedDistribution {
+            name: "opencv-python".to_string(),
+            version: None,
+            origin: NamingOrigin::DeclaredDep,
+        },
+    ]);
+    let siblings: BTreeSet<String> = BTreeSet::new();
+    let conda: BTreeSet<String> = BTreeSet::new();
+
+    // What the scan detects. `indexed` is exactly the flag the store sets, so
+    // the two arms differ in it — that is the input under test.
+    let modules = ["isaacsim", "cv2", "warp", "some_mod"];
+    let roots_for = |wheels: &[PathBuf]| -> Vec<String> {
+        let index = build_index(wheels);
+        let mut roots: Vec<String> = Vec::new();
+        for module in modules {
+            let provider = index
+                .module_edges()
+                .find(|(m, _)| *m == module)
+                .map(|(_, d)| d.to_string())
+                .unwrap_or_else(|| module.replace('_', "-").to_lowercase());
+            let indexed = index.module_edges().any(|(m, _)| m == module);
+            let req = p6t_req(module, &provider, indexed);
+            if let Ok(root) = auto_imports_injection_verdict(&req, &siblings, &conda, &naming) {
+                roots.push(root);
+            }
+        }
+        roots.sort();
+        roots
+    };
+
+    let cold_roots = roots_for(&cold);
+    let warm_roots = roots_for(&warm);
+    assert_eq!(
+        cold_roots, warm_roots,
+        "injection must be a pure function of (manifest, pack records, lock facts): \
+         an empty store gave {cold_roots:?} and p6r's 19-wheel store gave {warm_roots:?}"
+    );
+    // Non-vacuity: the identical set is not the empty set, and the warm store
+    // really does offer the kit-sdk edge that p6r injected.
+    assert_eq!(
+        cold_roots,
+        vec!["isaacsim==5.1.0.0".to_string(), "opencv-python".to_string()],
+        "the determined roots are what the request facts say, versions included"
+    );
+    let warm_index = build_index(&warm);
+    assert!(
+        warm_index
+            .module_edges()
+            .any(|(m, d)| m == "isaacsim" && d == "isaacsim-extscache-kit-sdk"),
+        "the fixture store must actually carry p6r's naming edge, or this guard proves nothing"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// p6t GUARD (b) — the ProtoMotions import names the RESOLVED record.
+///
+/// `import isaacsim`, with a consuming env whose lock resolves
+/// `isaacsim 5.1.0.0`, must emit `isaacsim==5.1.0.0`. Never
+/// `isaacsim-extscache-kit-sdk` — that name exists in this test's world only
+/// as a wheel someone once downloaded, which is precisely the authority p6t
+/// removes.
+#[test]
+fn p6t_b_import_isaacsim_names_the_locked_record_not_a_kit_sdk_wheel_from_the_store() {
+    use crate::auto_imports::{build_index, DeterminedDistribution, NamingAuthority, NamingOrigin};
+
+    let dir = p6t_tmpdir("isaacsim");
+    let store = p6t_p6r_store(&dir);
+    let index = build_index(&store);
+    // The store's answer, unchanged — this is what p6r injected.
+    assert_eq!(
+        index
+            .module_edges()
+            .find(|(m, _)| *m == "isaacsim")
+            .map(|(_, d)| d),
+        Some("isaacsim-extscache-kit-sdk"),
+    );
+
+    let naming = NamingAuthority::from_determined([DeterminedDistribution {
+        name: "isaacsim".to_string(),
+        version: Some("5.1.0.0".to_string()),
+        origin: NamingOrigin::LockedRecord,
+    }]);
+    let siblings: BTreeSet<String> = BTreeSet::new();
+    let conda: BTreeSet<String> = BTreeSet::new();
+    // The request as the ProtoMotions scan produces it on a WARM store: the
+    // provider field already says kit-sdk and `indexed` is true.
+    let req = p6t_req("isaacsim", "isaacsim-extscache-kit-sdk", true);
+    assert_eq!(
+        auto_imports_injection_verdict(&req, &siblings, &conda, &naming),
+        Ok("isaacsim==5.1.0.0".to_string()),
+        "the resolved record names the root and pins it; the store listing does neither"
+    );
+    // And the store edge is REPORTED as refused rather than silently ignored.
+    let refused = naming.refused_store_edges(&index);
+    assert!(
+        refused
+            .iter()
+            .any(|(m, d)| m == "isaacsim" && d == "isaacsim-extscache-kit-sdk"),
+        "the refused edge must be nameable in a log row, not dropped in silence: {refused:?}"
+    );
+    assert_eq!(naming.store_confirmation(&index).confirmed, 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// p6t GUARD (c) — `suppressed_all` is LOUD.
+///
+/// Job 5748915 emitted `suppressed_all=true` twice and produced a 27/27 lock.
+/// The row that said so named no root and published no number, so the lock
+/// read as a clean pass. The counter row must carry the request, the roots,
+/// the reason and a zero-gateable number, at WARN — and must still be emitted,
+/// at INFO with a zero, when nothing was suppressed.
+#[test]
+fn p6t_c_suppressed_all_emits_a_loud_row_naming_the_roots_and_a_zero_gateable_counter() {
+    let mut suppressed: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    suppressed.insert(
+        "protomotions-deps-pack".to_string(),
+        vec!["isaacsim-extscache-kit-sdk".to_string(), "viser".to_string()],
+    );
+    suppressed.insert("newton-pack-latest".to_string(), vec!["open3d".to_string()]);
+
+    let (total, logs) = capture_warn_logs(|| {
+        emit_auto_imports_suppression_counter("pm-isaaclab", &suppressed, true, 2)
+    });
+    assert_eq!(total, 3);
+    assert!(
+        logs.contains("auto_imports_suppressed_roots=3"),
+        "the harness zero-gates on this exact token: {logs}"
+    );
+    assert!(logs.contains("auto_imports_suppressed_all=true"), "{logs}");
+    assert!(logs.contains("pm-isaaclab"), "the row must name the request: {logs}");
+    assert!(
+        logs.contains("protomotions-deps-pack=isaacsim-extscache-kit-sdk+viser"),
+        "the row must name the dropped roots per bundle: {logs}"
+    );
+    assert!(logs.contains("reason"), "the row must carry a reason: {logs}");
+
+    // Non-vacuity: with nothing suppressed the row is NOT a warning, so the
+    // WARN capture is empty -- and the counter is still zero, not absent.
+    let (clean_total, clean_logs) = capture_warn_logs(|| {
+        emit_auto_imports_suppression_counter("pm-isaaclab", &BTreeMap::new(), false, 0)
+    });
+    assert_eq!(clean_total, 0);
+    assert!(
+        !clean_logs.contains("SUPPRESSED-ROOT COUNTER"),
+        "a clean request must not raise the alarm: {clean_logs}"
+    );
+}
+
+/// p6t: an exact pin is a pin; a range, a `*` and two disagreeing pins are
+/// not. A guessed version is exactly the class of answer p6t exists to stop.
+#[test]
+fn p6t_declared_exact_version_pins_only_on_an_unambiguous_equals_clause() {
+    let v = |specs: &[&str]| {
+        auto_imports_declared_exact_version(
+            &specs.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        )
+    };
+    assert_eq!(v(&["==5.1.0.0"]), Some("5.1.0.0".to_string()));
+    assert_eq!(v(&["==2.7.0+cu128"]), Some("2.7.0+cu128".to_string()));
+    assert_eq!(v(&[">=1.0,<2"]), None);
+    assert_eq!(v(&["*"]), None);
+    assert_eq!(v(&["==1.0", "==2.0"]), None, "disagreeing pins must not pick a winner");
+    assert_eq!(v(&["==1.0.*"]), None, "a wildcard pin is not an exact version");
+    assert_eq!(v(&[]), None);
+}
+
+/// p6t: a module two determined distributions both claim is AMBIGUOUS and is
+/// never injected. The alternative -- first writer wins over a BTreeMap -- is
+/// a coin flip decided by alphabetical order.
+#[test]
+fn p6t_an_ambiguous_module_is_refused_rather_than_arbitrated() {
+    use crate::auto_imports::{DeterminedDistribution, NamingAuthority, NamingOrigin};
+    // Two distributions whose PEP 503 inverse is the same module name.
+    let naming = NamingAuthority::from_determined([
+        DeterminedDistribution {
+            name: "foo-bar".to_string(),
+            version: Some("1.0".to_string()),
+            origin: NamingOrigin::LockedRecord,
+        },
+        DeterminedDistribution {
+            name: "foo_bar".to_string(),
+            version: Some("2.0".to_string()),
+            origin: NamingOrigin::LockedRecord,
+        },
+    ]);
+    assert!(naming.lookup("foo_bar").is_none(), "ambiguous module must not name a root");
+    assert!(naming.ambiguous.contains("foo_bar"), "and must be reportable");
+    // A locked record outranks a declared band for the same NAME.
+    let ranked = NamingAuthority::from_determined([
+        DeterminedDistribution {
+            name: "viser".to_string(),
+            version: None,
+            origin: NamingOrigin::DeclaredDep,
+        },
+        DeterminedDistribution {
+            name: "viser".to_string(),
+            version: Some("0.2.7".to_string()),
+            origin: NamingOrigin::LockedRecord,
+        },
+    ]);
+    assert_eq!(ranked.lookup("viser").unwrap().root_specifier(), "viser==0.2.7");
+}
 
 // -----------------------------------------------------------------
 // C14: component 5 of the built-output store key is a PER-PACK PROJECTION
@@ -12178,4 +12705,930 @@ async fn initialize_generates_the_pack_source_shim_and_never_touches_the_source_
 
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&root_off);
+}
+
+/// p6s-4 GUARD — a second ABI rejection after the back-off is spent must be a
+/// LOUD REFUSAL naming the root delta, never a fall-through.
+///
+/// Job 5752280 re-ran oncert-p6s's exact binary, manifest, diffs and flags and
+/// FAILED. `protomotions-deps-pack` had already taken its back-off and logged
+/// `ABI BACK-OFF SUCCEEDED`; a later re-emission carrying a LARGER root set
+/// (18 vs the green run's 15 — the wheel-store census had grown to 62 wheels
+/// mid-run) was rejected again, fell into `collect_conflicts`, and the request
+/// died three layers downstream as `-32603 reconstructing final relaxation
+/// record` and a build_dispatch panic. A detector must terminate in an
+/// actuator.
+#[test]
+fn p6s4_a_second_abi_rejection_after_the_backoff_refuses_by_name_with_the_root_delta() {
+    let mut suppressed: BTreeSet<String> = BTreeSet::new();
+    // NON-VACUITY: before the back-off is taken, the bundle is NOT spent, so
+    // the ordinary back-off arm still claims it. If this were true here the
+    // back-off would never run at all.
+    assert!(
+        !abi_backoff_already_spent(&suppressed, "protomotions-deps-pack"),
+        "a bundle that has not backed off must still be allowed to back off"
+    );
+    suppressed.insert("protomotions-deps-pack".to_string());
+    assert!(abi_backoff_already_spent(&suppressed, "protomotions-deps-pack"));
+    assert!(
+        !abi_backoff_already_spent(&suppressed, "newton-pack-latest"),
+        "one bundle's spent back-off must not disarm another's"
+    );
+    // The request-wide sentinel spends every bundle's back-off at once.
+    let all: BTreeSet<String> = [AUTO_IMPORTS_SUPPRESS_ALL.to_string()].into_iter().collect();
+    assert!(abi_backoff_already_spent(&all, "newton-pack-latest"));
+
+    let refusal = abi_backoff_exhausted_refusal(
+        "protomotions-deps-pack",
+        "3.11",
+        &["isaacsim-extscache-kit-sdk".to_string(), "usd-core".to_string(), "warp-lang".to_string()],
+        &["viser".to_string()],
+        "numpy==2.5.2 is not covered by numpy>=1.0,<2",
+    );
+    for needle in [
+        "protomotions-deps-pack",
+        "3.11",
+        "isaacsim-extscache-kit-sdk,usd-core,warp-lang",
+        "viser",
+        "ROOT DELTA",
+        "numpy==2.5.2 is not covered by numpy>=1.0,<2",
+    ] {
+        assert!(refusal.contains(needle), "refusal must name {needle}: {refusal}");
+    }
+}
+
+/// p6t-4 GUARD — `conda/build_v1` must name the ABI invariant, not the
+/// relaxation record.
+///
+/// Measured on arm `oncert-p6tb` 5757174: BOTH arms logged
+/// `ABI BACK-OFF SUCCEEDED bundle=protomotions-deps-pack` in `conda/outputs`,
+/// arm B then re-emitted the same bundle inside `conda/build_v1` — which
+/// carries no Lane C back-off across the RPC boundary — and the operator got
+/// `-32603: reconstructing final relaxation record for protomotions-deps-pack`
+/// over 67 `bundle emission rejected by ABI invariant` rows about
+/// `numpy >=1.0.0` bare-major specs. A failure that reaches an actor under the
+/// wrong name has not reached an actor.
+#[test]
+fn p6t4_build_v1_refusal_names_the_abi_invariant_not_the_relaxation_record() {
+    // The production discriminator, exercised on a real error value: an
+    // AbiInvariantViolation must be recognised through `anyhow`'s erasure,
+    // and anything else must NOT be.
+    let abi: anyhow::Error = AbiInvariantViolation {
+        violations: vec!["wheel `etils` embeds `numpy >=1.0.0` (bare-major)".to_string()],
+    }
+    .into();
+    assert!(
+        abi.downcast_ref::<AbiInvariantViolation>().is_some(),
+        "the build_v1 arm keys on exactly this downcast"
+    );
+    // NON-VACUITY: an ordinary emission error must still be reported as a
+    // relaxation-record failure, or the new arm would swallow every error.
+    let other = anyhow::anyhow!("some other emission failure");
+    assert!(other.downcast_ref::<AbiInvariantViolation>().is_none());
+    // The violation text the refusal quotes is the one the invariant wrote.
+    assert!(
+        format!("{abi}").contains("bare-major"),
+        "the refusal quotes the violation verbatim: {abi}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// p6u — the back-off decision crosses the RPC boundary, and a dropped
+// detection is a refusal rather than a footnote.
+//
+// Arm `oncert-p6tb` 5757174 is the whole reason: `conda/outputs` logged
+// `ABI BACK-OFF SUCCEEDED bundle=protomotions-deps-pack`, `conda/build_v1`
+// re-ran the same emission with the roots back in, and the request died
+// `-32603 reconstructing final relaxation record`. Arm `oncert-p6ta` 5757173
+// produced its 27/27 lock while dropping 51 detected roots across three
+// requests, and nothing refused it.
+// ---------------------------------------------------------------------------
+
+/// p6u GUARD (b). `conda/build_v1`'s ABI refusal states a DELTA against the
+/// plan the advertising pass reached — which of the three distinguishable
+/// situations this is — and never blames the relaxation record.
+#[test]
+fn p6u_b_build_v1_abi_refusal_states_the_delta_against_the_carried_plan() {
+    let violation = AbiInvariantViolation {
+        violations: vec!["wheel `contourpy` embeds `numpy >=1.0.0` (bare-major)".to_string()],
+    };
+    let suppressing_record = || {
+        let mut record = advertised_output_record(
+            vec!["python 3.11.*".to_string()],
+            Vec::new(),
+        );
+        record.auto_imports_suppressed_bundles = vec!["protomotions-deps-pack".to_string()];
+        record.auto_imports_suppressed = vec![advertised_identity::SuppressedEnv {
+            env: "protomotions-deps-pack".to_string(),
+            roots: vec!["isaacsim-extscache-kit-sdk".to_string(), "viser".to_string()],
+            reason: "abi-backoff: ABI invariant: wheel `contourpy` embeds `numpy >=1.0.0`"
+                .to_string(),
+        }];
+        record
+    };
+
+    // (1) The carry was made and DID NOT TAKE: roots are still injected here.
+    // That is the loud refusal p6t asked for, and the delta is the root list.
+    let record = suppressing_record();
+    let delta = build_v1_abi_refusal(
+        "protomotions-deps-pack",
+        Some(&record),
+        &["usd-core".to_string(), "warp-lang".to_string()],
+        &violation,
+    );
+    assert!(delta.contains("DELTA"), "{delta}");
+    assert!(delta.contains("usd-core,warp-lang"), "the delta names the difference: {delta}");
+    assert!(
+        delta.contains("isaacsim-extscache-kit-sdk"),
+        "and what the advertising pass had dropped: {delta}"
+    );
+    assert!(delta.contains("bare-major"), "the violation is quoted verbatim: {delta}");
+    assert!(
+        !delta.contains("reconstructing final relaxation record"),
+        "an ABI violation must never be reported as a relaxation-record failure: {delta}"
+    );
+
+    // (2) The carry TOOK — nothing injected here — so the violation is not
+    // about injection at all, and the refusal says so instead of blaming it.
+    let carried = build_v1_abi_refusal(
+        "protomotions-deps-pack",
+        Some(&record),
+        &[],
+        &violation,
+    );
+    assert!(carried.contains("WAS carried"), "{carried}");
+    assert!(carried.contains("NOT about injection"), "{carried}");
+    assert!(!carried.contains("DELTA"), "nothing differed, so there is no delta: {carried}");
+
+    // (3) NO record: nothing could be carried, and the absence is the finding.
+    let none = build_v1_abi_refusal(
+        "protomotions-deps-pack",
+        None,
+        &["usd-core".to_string()],
+        &violation,
+    );
+    assert!(none.contains("NO advertised-identity record"), "{none}");
+    assert!(none.contains("usd-core"), "{none}");
+
+    // NON-VACUITY: the three messages are genuinely different verdicts, not
+    // one template with the same text.
+    assert_ne!(delta, carried);
+    assert_ne!(delta, none);
+    assert_ne!(carried, none);
+}
+
+/// p6u GUARD (c). A suppressed root that is UNSATISFIABLE on this platform:
+/// strict refuses and names the reason; non-strict emits the row and proceeds.
+/// This is the 5.1.0.0 kit-sdk case — the only wheels it publishes are
+/// `manylinux_2_35` — and its resolution is a DECLARED PLATFORM FACT, not a
+/// silent drop.
+#[test]
+fn p6u_c_an_unsatisfiable_root_refuses_under_strict_and_only_warns_without_it() {
+    let mut suppressed: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    suppressed.insert(
+        "protomotions-deps-pack".to_string(),
+        vec!["isaacsim-extscache-kit-sdk".to_string()],
+    );
+    let mut reasons: BTreeMap<String, String> = BTreeMap::new();
+    reasons.insert(
+        "protomotions-deps-pack".to_string(),
+        "resolve-backoff: no wheel of isaacsim-extscache-kit-sdk==5.1.0.0 is usable: the \
+         only distributions are manylinux_2_35 and this target admits less"
+            .to_string(),
+    );
+    let subdir = "linux-64-cuda-12-glibc-2-35";
+
+    // STRICT: a refusal, naming the env, the root, the reason, and the
+    // declaration that would restore it.
+    let refusal = auto_imports_strict_verdict(true, &suppressed, false, &reasons, subdir)
+        .expect_err("strict must refuse a lock that dropped a detected import");
+    assert!(refusal.contains("auto_imports_suppressed_roots=1"), "{refusal}");
+    assert!(refusal.contains("env=protomotions-deps-pack"), "{refusal}");
+    assert!(refusal.contains("isaacsim-extscache-kit-sdk"), "{refusal}");
+    assert!(refusal.contains("manylinux_2_35"), "the reason is quoted: {refusal}");
+    // THE DECLARED PLATFORM FACT, spelled out. Not "we dropped it".
+    assert!(refusal.contains("glibc = \"2.35\""), "{refusal}");
+    assert!(refusal.contains(subdir), "on the platform actually being built: {refusal}");
+    assert!(
+        refusal.contains(crate::config::AUTO_IMPORTS_STRICT_KEY),
+        "and it names the key that turns it off: {refusal}"
+    );
+
+    // NON-STRICT: the same inputs proceed, and the per-env row still names
+    // everything the refusal would have.
+    let (verdict, logs) = capture_warn_logs(|| {
+        let rows = emit_auto_imports_suppressed_rows(
+            "conda/outputs fixture",
+            &suppressed,
+            &reasons,
+            subdir,
+        );
+        (
+            auto_imports_strict_verdict(false, &suppressed, false, &reasons, subdir),
+            rows,
+        )
+    });
+    assert!(verdict.0.is_ok(), "non-strict must proceed: {:?}", verdict.0);
+    assert_eq!(verdict.1, 1, "one environment shipped short");
+    assert!(
+        logs.contains("auto_imports_suppressed env=protomotions-deps-pack"),
+        "the first-class per-env row: {logs}"
+    );
+    assert!(logs.contains("roots=[isaacsim-extscache-kit-sdk]"), "{logs}");
+    assert!(logs.contains("reason=resolve-backoff"), "{logs}");
+    assert!(logs.contains("glibc = \\\"2.35\\\"") || logs.contains("glibc = \"2.35\""), "the row carries the platform fact: {logs}");
+
+    // NON-VACUITY: strict with nothing suppressed is not a refusal, so the
+    // gate is not simply "always fail".
+    assert!(
+        auto_imports_strict_verdict(true, &BTreeMap::new(), false, &reasons, subdir).is_ok(),
+        "a clean request must pass strict"
+    );
+    // ...but `suppressed_all` with no attributed roots STILL refuses: every
+    // bundle in the request lost its injection, which is the p6s/5748915
+    // shape, and a zero root count there is missing attribution, not innocence.
+    assert!(
+        auto_imports_strict_verdict(true, &BTreeMap::new(), true, &reasons, subdir).is_err(),
+        "suppressed_all is a refusal even when no roots were attributed"
+    );
+    // A root with no manylinux floor gets the MANIFEST remedy, not a bogus
+    // platform declaration -- the remedy must be about this root, not a
+    // template.
+    let mut plain = BTreeMap::new();
+    plain.insert("robojudo-pack".to_string(), vec!["viser".to_string()]);
+    let mut plain_reasons = BTreeMap::new();
+    plain_reasons.insert(
+        "robojudo-pack".to_string(),
+        "abi-backoff: ABI invariant: wheel `viser` embeds `numpy >=1.0.0` (bare-major)"
+            .to_string(),
+    );
+    let plain_refusal =
+        auto_imports_strict_verdict(true, &plain, false, &plain_reasons, subdir).unwrap_err();
+    assert!(plain_refusal.contains("MANIFEST finding"), "{plain_refusal}");
+    assert!(!plain_refusal.contains("glibc = "), "{plain_refusal}");
+}
+
+/// p6u GUARD (d). The suppression findings survive the trip into the
+/// advertised-identity record and back out, so an ADOPTING `conda/outputs` --
+/// which runs no back-off of its own -- republishes the same rows and takes
+/// the same strict verdict instead of reading a store hit as a clean pass.
+#[test]
+fn p6u_d_an_adopted_store_hit_re_publishes_the_suppression_it_inherited() {
+    let mut suppressed: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    suppressed.insert("holosoma-pack".to_string(), vec!["etils".to_string()]);
+    suppressed.insert(
+        "flashsac-pack".to_string(),
+        vec!["viser".to_string(), "wandb".to_string()],
+    );
+    let mut reasons: BTreeMap<String, String> = BTreeMap::new();
+    reasons.insert(
+        AUTO_IMPORTS_SUPPRESS_ALL.to_string(),
+        "resolve-backoff: resolution failed with Lane C roots injected".to_string(),
+    );
+    let envs = auto_imports_suppressed_envs(&suppressed, &reasons);
+    assert_eq!(envs.len(), 2);
+    // Every env inherits the request-wide reason when it has none of its own:
+    // a dropped root with no reason is a silent drop wearing a number.
+    assert!(envs.iter().all(|e| e.reason.starts_with("resolve-backoff:")));
+
+    let mut record =
+        advertised_output_record(vec!["python 3.11.*".to_string()], Vec::new());
+    record.auto_imports_suppressed = envs;
+    let (roots_back, reasons_back) =
+        auto_imports_suppression_from_records(std::slice::from_ref(&record));
+    assert_eq!(roots_back, suppressed, "the adopting run sees the same roots");
+    assert_eq!(
+        auto_imports_suppression_reason_for(&reasons_back, "holosoma-pack"),
+        auto_imports_suppression_reason_for(&reasons, "holosoma-pack"),
+    );
+    // And it takes the same verdict -- this is the reader that makes the
+    // carried field load-bearing rather than decoration.
+    assert!(
+        auto_imports_strict_verdict(true, &roots_back, false, &reasons_back, "linux-64").is_err(),
+        "an adopted result that shipped short must refuse under strict too"
+    );
+
+    // NON-VACUITY: a record that suppressed nothing yields nothing, so an
+    // adopting run of a clean result is not gated on a phantom.
+    let clean = advertised_output_record(vec!["python 3.11.*".to_string()], Vec::new());
+    let (none_back, _) = auto_imports_suppression_from_records(std::slice::from_ref(&clean));
+    assert!(none_back.is_empty());
+    assert!(auto_imports_strict_verdict(true, &none_back, false, &BTreeMap::new(), "linux-64").is_ok());
+}
+
+/// p6u GUARD (e). Strict is ON BY DEFAULT whenever injection is on. A gate
+/// that ships off is a gate nobody turns on, and the failure it catches is
+/// silent by construction.
+#[test]
+fn p6u_e_strict_defaults_on_with_injection_and_follows_the_key_when_set() {
+    // The pure decision, so this guard does not depend on whatever
+    // `RETREAD_AUTO_IMPORTS_STRICT` the surrounding shell happens to export.
+    let decide = auto_imports_strict_decision;
+    assert!(
+        decide(None, None, true),
+        "injection on and no key: strict is the default"
+    );
+    assert!(
+        !decide(Some(false), None, true),
+        "the manifest key is how an operator accepts a short lock"
+    );
+    assert!(decide(Some(true), None, true));
+    // Injection OFF detects nothing, so there is nothing to drop and strict is
+    // vacuous: it follows injection to off rather than refusing every run.
+    assert!(!decide(None, None, false));
+    // The env override is the harness door: a measurement arm must be able to
+    // land the lock and then READ what strict would have refused, without
+    // editing the manifest it is certifying.
+    assert!(!decide(None, Some("0"), true), "the env override wins over the default");
+    assert!(decide(Some(false), Some("1"), true), "and over the manifest key");
+}
+
+// ---------------------------------------------------------------------------
+// p6w — the resolve-time back-off attributes before it drops
+// ---------------------------------------------------------------------------
+//
+// THE DEFECT (boarded p6u-1). Jobs 5764452/5764453 dropped 51 detected roots
+// across three packs — `flashsac-pack` 13, `holosoma-pack` 26, `robojudo-pack`
+// 12 — every one of them `reason=resolve-backoff`, because ONE resolve failure
+// suppressed injection for every bundle in the request. Reading both arms'
+// backend logs, only FIVE of those 51 roots are named anywhere in the three
+// failure texts, and only TWO are genuine culprits. `etils==1.13.0` — a
+// correctly pinned detection that resolves — was dropped as collateral, which
+// is the whole argument for attributing first.
+//
+// The fixtures below are the measured texts, not invented ones.
+
+/// uv's own report from `robojudo-pack`, job 5764452 line 60234 (identical in
+/// arm B at line 47685). The `×` marker is uv's, and it is what tells
+/// attribution this failure came out of the resolver rather than out of
+/// retread's own reconciler.
+const P6W_UV_ROBOJUDO_REPORT: &str = "\
+uv lock failed for bundle `robojudo-pack` (python 3.12, linux-64):
+
+Using CPython 3.12.14
+  \u{d7} No solution found when resolving dependencies for split (markers:
+  \u{2502} python_full_version == '3.12.*' and platform_machine == 'x86_64' and
+  \u{2502} sys_platform == 'linux'):
+  \u{2570}\u{2500}\u{25b6} Because unitree-sdk2py was not found in the package registry and your
+      project depends on unitree-sdk2py, we can conclude that your project's
+      requirements are unsatisfiable.
+
+no generated conda constraint was named in uv's message; the conflict may be
+intrinsic to the PyPI requirements.
+";
+
+/// `holosoma-pack`, job 5764452 line 264706 (arm B line 291302). A PEP 508
+/// metadata PARSE failure in retread's own reader: uv never ran, there is no
+/// report, and NONE of the 26 injected roots is named. Attribution must say
+/// so rather than pick one.
+const P6W_PARSE_FAILURE: &str = "\
+computing uv closure for bundle `holosoma-pack`: parsing requirement \
+`PyYAML (>=5.1.*)`: Operator >= cannot be used with a wildcard version specifier
+PyYAML (>=5.1.*)
+        ^^^^^^^
+";
+
+/// `flashsac-pack`, job 5764452 line 247282 (arm B line 310381). retread's OWN
+/// constraint reconciler, which lists every requirement's provenance and so
+/// MENTIONS three injected roots — none of which is individually unsatisfiable
+/// against `setuptools==84.0.0`. The real contradiction is a declared
+/// `FlashRL<=65` against a conda fact, and neither side is a detected root.
+/// p6z CORRECTION. p6w transcribed this fixture WITHOUT its last clause, and
+/// the omission mattered: `<=65` required by wheel `FlashRL==0.1.0` is the
+/// clause that makes the set unsatisfiable at all. Without it the four
+/// remaining clauses intersect fine, so the fixture could not distinguish "no
+/// injected root is the culprit" from "there is no conflict". Re-read from job
+/// 5776669 line 250906 and the `retread-relax`/`retread-overrides`/
+/// `retread-drop-deps` tail restored, because
+/// `RegexConflictParser::retread_mutually_unsatisfiable` anchors on it.
+const P6W_RECONCILER_FAILURE: &str = "\
+computing uv closure for bundle `flashsac-pack`: dependency conflict in \
+environment 'flashsac-gpu' for bundle 'flashsac-pack' (target profile \
+'linux-64-cuda-12-glibc-2-35', platform linux-64, python 3.11): `setuptools` \
+requirements are mutually unsatisfiable: `==84.0.0` required by uv constraint \
+`setuptools==84.0.0` from workspace conda fact (learned: selected by every \
+consuming env's conda solve) `precise-consuming-envs` (conda \
+`setuptools==84.0.0`); \
+`!=50.0.0` required by wheel `dm_control==1.0.45` Requires-Dist \
+`setuptools!=50.0.0`; `>=41.0.0` required by wheel `tensorboard==2.21.0` \
+Requires-Dist `setuptools>=41.0.0`; `*` required by wheel `sapien==3.0.3` \
+Requires-Dist `setuptools`; `<=65` required by wheel `FlashRL==0.1.0` \
+Requires-Dist `setuptools<=65`. Resolve by pinning one side, or use \
+`retread-relax`, `retread-overrides`, or `retread-drop-deps` in the pack \
+manifest (see README).
+";
+
+/// p6z. The SAME parse failure as [`P6W_PARSE_FAILURE`], as the code now
+/// produces it: the wheel whose `Requires-Dist` refused is named. p6w-1's
+/// second half was exactly this absence -- 25 bystanders went with one culprit
+/// because no row said whose metadata failed.
+const P6Z_PARSE_FAILURE_WITH_OWNER: &str = "\
+computing uv closure for bundle `holosoma-pack`: reading `Requires-Dist` of \
+wheel `omegaconf==2.0.6`: parsing requirement `PyYAML (>=5.1.*)`: Operator >= \
+cannot be used with a wildcard version specifier
+";
+
+/// ARM 5772100's ACTUAL error text, and the reason p6w has a second guard for
+/// its own attribution slice. When Pass A fails, the error carries Pass A's
+/// report AND Pass B's, joined by the pass-B banner -- and Pass B's half is
+/// the child's raw DEBUG trace. `uv_conflict_report` anchors on the first `x`
+/// and returns everything to the END of the text, so its slice swallowed that
+/// trace and `uv_reason_sentence` found a "sentence" naming almost every
+/// injected root. The first arm dropped THIRTEEN of robojudo-pack's roots
+/// where uv blamed exactly one.
+const P6W_UV_REPORT_WITH_PASS_B_TRACE: &str = "\
+uv lock failed for bundle `robojudo-pack` (python 3.12, linux-64):
+
+Using CPython 3.12.14
+  \u{d7} No solution found when resolving dependencies:
+  \u{2570}\u{2500}\u{25b6} Because unitree-sdk2py was not found in the package registry and your
+      project depends on unitree-sdk2py, we can conclude that your project's
+      requirements are unsatisfiable.
+
+--- uv closure pass B (sdist/prerelease detection) also failed ---
+
+uv lock failed for bundle `robojudo-pack` (python 3.12, linux-64):
+DEBUG Searching for a compatible version of colorlog (*)
+DEBUG Adding transitive dependency for pydantic==2.9.2: annotated-types
+DEBUG Searching for a compatible version of msgpack (*)
+DEBUG Adding transitive dependency for pygame==2.6.1: python-box
+DEBUG Searching for a compatible version of redis (*)
+DEBUG Adding transitive dependency for torch==2.5.1: tqdm
+DEBUG Searching for a compatible version of onnxruntime (*)
+DEBUG Adding transitive dependency for imprint==0.1.0: msgpack-numpy
+";
+
+#[test]
+fn p6w_d_a_pass_b_trace_appended_to_the_report_blames_nobody_extra() {
+    // Every root below appears in the Pass B DEBUG trace; exactly one appears
+    // in uv's conclusion. Before the banner cut, all nine were attributed.
+    let injected = BTreeMap::from([(
+        "robojudo-pack".to_string(),
+        vec![
+            "colorlog".to_string(),
+            "imprint".to_string(),
+            "msgpack".to_string(),
+            "msgpack-numpy".to_string(),
+            "onnxruntime".to_string(),
+            "pydantic".to_string(),
+            "pygame".to_string(),
+            "python-box".to_string(),
+            "redis".to_string(),
+            "torch".to_string(),
+            "tqdm".to_string(),
+            "unitree-sdk2py".to_string(),
+        ],
+    )]);
+    let drops = crate::uv_closure::attribute_auto_imports_failure(
+        P6W_UV_REPORT_WITH_PASS_B_TRACE,
+        &injected,
+    );
+    let named: Vec<&str> = drops.iter().map(|d| d.root.as_str()).collect();
+    assert_eq!(
+        named,
+        vec!["unitree-sdk2py"],
+        "only uv's CONCLUSION may name a culprit; a Pass B trace names candidates it rejected",
+    );
+    // NON-VACUITY: the trace really does mention the others, so this passes
+    // because the trace is excluded and not because the names are absent.
+    for root in ["colorlog", "msgpack", "pydantic", "redis"] {
+        assert!(
+            P6W_UV_REPORT_WITH_PASS_B_TRACE.contains(root),
+            "{root} must be present in the fixture for this guard to mean anything",
+        );
+    }
+    // NON-VACUITY: with the Pass B half removed entirely the answer is the
+    // same, so the cut is what does the work.
+    let pass_a_only = P6W_UV_REPORT_WITH_PASS_B_TRACE
+        .split("--- uv closure pass B")
+        .next()
+        .expect("the fixture has a pass A half");
+    let drops_a = crate::uv_closure::attribute_auto_imports_failure(pass_a_only, &injected);
+    assert_eq!(drops_a.len(), 1);
+    assert_eq!(drops_a[0].root, "unitree-sdk2py");
+}
+
+fn p6w_robojudo_injected() -> BTreeMap<String, Vec<String>> {
+    // Three of robojudo-pack's twelve measured roots: one uv named, two it
+    // did not. The claim under test is about the two.
+    BTreeMap::from([(
+        "robojudo-pack".to_string(),
+        vec![
+            "pydantic".to_string(),
+            "tqdm".to_string(),
+            "unitree-sdk2py".to_string(),
+        ],
+    )])
+}
+
+#[test]
+fn p6w_a_one_named_root_is_dropped_and_its_two_siblings_are_kept() {
+    let injected = p6w_robojudo_injected();
+    let decision = attributed_backoff_decision(
+        0,
+        P6W_UV_ROBOJUDO_REPORT,
+        &injected,
+        &BTreeMap::new(),
+    );
+    let AttributedBackoffDecision::DropRoots(drops) = decision else {
+        panic!("uv named a root; the ladder must drop it, not fall back: {decision:?}");
+    };
+    // EXACTLY ONE. On 26ac32b there is no attribution at all and all three go.
+    assert_eq!(drops.len(), 1, "exactly one culprit, got {drops:?}");
+    assert_eq!(drops[0].root, "unitree-sdk2py");
+    assert_eq!(drops[0].bundle, "robojudo-pack");
+    // The culprit is named with uv's OWN sentence, verbatim, not a paraphrase.
+    assert!(
+        drops[0].clause.contains("was not found in the package registry"),
+        "the clause must be uv's sentence: {}",
+        drops[0].clause,
+    );
+    // And the remedy is the one that is true: no declaration conjures a
+    // distribution no index carries. Before p6w this failure's per-env row
+    // told the operator to declare `glibc = \"2.28\"`.
+    assert_eq!(
+        drops[0].remedy,
+        crate::uv_closure::RootDropRemedy::UpstreamAbsence,
+        "an absent distribution is not a platform-fact problem",
+    );
+    assert_eq!(drops[0].remedy.token(), "upstream-absence");
+    assert!(
+        !format!("{}", drops[0].remedy).contains("glibc"),
+        "the upstream-absence remedy must not offer a glibc declaration",
+    );
+
+    // THE OTHER HALF OF THE CLAIM: the two siblings are still injected.
+    let withheld: BTreeSet<String> = drops.iter().map(|d| d.name.clone()).collect();
+    let (dropped, kept) =
+        partition_attributed_roots(&injected["robojudo-pack"], &withheld);
+    assert_eq!(dropped, vec!["unitree-sdk2py".to_string()]);
+    assert_eq!(
+        kept,
+        vec!["pydantic".to_string(), "tqdm".to_string()],
+        "every root uv did not name must still be injected",
+    );
+
+    // NON-VACUITY 1: a root already withheld is not re-named, so the ladder
+    // cannot spin on the same culprit.
+    let already = BTreeMap::from([(
+        "robojudo-pack".to_string(),
+        BTreeSet::from(["unitree-sdk2py".to_string()]),
+    )]);
+    assert!(
+        matches!(
+            attributed_backoff_decision(1, P6W_UV_ROBOJUDO_REPORT, &injected, &already),
+            AttributedBackoffDecision::FallBackToAll(_),
+        ),
+        "re-naming an already-withheld root must not produce another round",
+    );
+    // NON-VACUITY 2: the ladder is bounded, and the bound is its own reason.
+    let AttributedBackoffDecision::FallBackToAll(why) = attributed_backoff_decision(
+        AUTO_IMPORTS_ATTRIBUTED_BACKOFF_MAX_ROUNDS,
+        P6W_UV_ROBOJUDO_REPORT,
+        &injected,
+        &BTreeMap::new(),
+    ) else {
+        panic!("the ladder must be bounded");
+    };
+    assert!(why.contains("bound"), "the bound must name itself: {why}");
+}
+
+#[test]
+fn p6w_b_a_failure_that_names_no_injected_root_falls_back_and_says_so() {
+    // (i) The parse failure: uv never ran and no root is named anywhere.
+    let holosoma = BTreeMap::from([(
+        "holosoma-pack".to_string(),
+        vec![
+            "etils==1.13.0".to_string(),
+            "omegaconf".to_string(),
+            "tqdm".to_string(),
+        ],
+    )]);
+    let AttributedBackoffDecision::FallBackToAll(why) =
+        attributed_backoff_decision(0, P6W_PARSE_FAILURE, &holosoma, &BTreeMap::new())
+    else {
+        panic!("nothing in a parse error attributes it to a detection");
+    };
+    // p6z: the fallback no longer settles for "uv named nobody" -- true, and
+    // useless, since uv never ran. It names the CLAUSE that refused.
+    assert!(
+        why.contains("`Requires-Dist` clause could not be parsed")
+            && why.contains("PyYAML (>=5.1.*)"),
+        "the fallback must name the clause that refused: {why}",
+    );
+
+    // (ii) THE HARDER CASE, and why this guard is not a formality. retread's
+    // own reconciler text MENTIONS three injected roots while the actual
+    // contradiction is between a declared package and a conda fact. Believing
+    // those mentions would spend three re-resolves reaching the same failure.
+    let flashsac = BTreeMap::from([(
+        "flashsac-pack".to_string(),
+        vec![
+            "dm-control".to_string(),
+            "mani-skill".to_string(),
+            "tensorboard".to_string(),
+            "tqdm".to_string(),
+        ],
+    )]);
+    assert!(
+        matches!(
+            attributed_backoff_decision(0, P6W_RECONCILER_FAILURE, &flashsac, &BTreeMap::new()),
+            AttributedBackoffDecision::FallBackToAll(_),
+        ),
+        "a non-uv failure mentioning several roots accuses none of them",
+    );
+    // NON-VACUITY: the same non-uv text naming exactly ONE injected root CAN
+    // be trusted -- it cannot be pointing anywhere else. So the rule above is
+    // a discrimination, not a blanket refusal of every non-uv failure.
+    let single = BTreeMap::from([(
+        "flashsac-pack".to_string(),
+        vec!["dm-control".to_string(), "tqdm".to_string()],
+    )]);
+    let decision =
+        attributed_backoff_decision(0, P6W_RECONCILER_FAILURE, &single, &BTreeMap::new());
+    let AttributedBackoffDecision::DropRoots(drops) = decision else {
+        panic!("a lone named root is attributable: {decision:?}");
+    };
+    assert_eq!(drops.len(), 1);
+    assert_eq!(drops[0].root, "dm-control");
+
+    // NON-VACUITY: a pass that injected nothing cannot blame a detection.
+    let AttributedBackoffDecision::FallBackToAll(why) = attributed_backoff_decision(
+        0,
+        P6W_UV_ROBOJUDO_REPORT,
+        &BTreeMap::from([("robojudo-pack".to_string(), Vec::new())]),
+        &BTreeMap::new(),
+    ) else {
+        panic!("no injected roots means no attributable cause");
+    };
+    assert!(why.contains("injected no Lane C roots"), "{why}");
+}
+
+/// p6z guard (a). Boarded p6w-1.
+///
+/// `holosoma-pack`'s 26 detected roots were dropped in FOUR arms
+/// (5764452/5764453, 5776669/5776671) for one reason: retread's own PEP 508
+/// reader refused `omegaconf==2.0.6`'s real `Requires-Dist` value
+/// `PyYAML (>=5.1.*)`. uv never ran.
+///
+/// MEASURED with uv 0.11.29 on this box before deciding anything: a project
+/// whose only dependency is `omegaconf==2.0.6` resolves, picking pyyaml 6.0.3,
+/// and pinned against `pyyaml==5.0.1` uv names its own reading in its own
+/// prose -- "omegaconf==2.0.6 depends on pyyaml>=5.1". uv normalizes the
+/// clause; the distribution is not defective; retread's reader was.
+#[test]
+fn p6z_a_a_legacy_wildcard_in_requires_dist_costs_no_roots() {
+    // (i) The clause uv accepts, retread now accepts -- with uv's semantics,
+    // not a guess. `>=5.1`, so pyyaml 6.0.3 is in and 5.0.1 is out.
+    let requirement = crate::pep508_lenient::parse_requirement_lenient(
+        "PyYAML (>=5.1.*)",
+    )
+    .expect("uv accepts this line, so retread must");
+    assert_eq!(requirement.name.to_string(), "pyyaml");
+
+    // (ii) NOTHING IS ATTRIBUTED TO A DETECTION BY A PARSE FAILURE, and the
+    // row names the distribution that published the clause. All 26 roots stay
+    // requested: a `FallBackToAll` carries no root drops at all.
+    let holosoma_roots: Vec<String> = [
+        "absl-py", "etils==1.13.0", "flask", "glfw", "hydra-core", "imageio",
+        "jax", "matplotlib", "mediapy", "mujoco", "numpy", "omegaconf",
+        "onnxruntime", "opencv-python", "pandas", "pillow", "pyyaml",
+        "rich", "scipy", "tqdm", "trimesh", "typeguard", "warp-lang",
+        "wandb", "yourdfpy", "zmq",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    assert_eq!(holosoma_roots.len(), 26, "the measured request size");
+    let holosoma = BTreeMap::from([("holosoma-pack".to_string(), holosoma_roots)]);
+
+    let decision =
+        attributed_backoff_decision(0, P6Z_PARSE_FAILURE_WITH_OWNER, &holosoma, &BTreeMap::new());
+    let AttributedBackoffDecision::FallBackToAll(why) = decision else {
+        panic!("a metadata parse failure blames no detection: {decision:?}");
+    };
+    assert!(
+        why.contains("omegaconf==2.0.6") && why.contains("PyYAML (>=5.1.*)"),
+        "the row must name the DISTRIBUTION and the CLAUSE: {why}",
+    );
+    for root in ["etils==1.13.0", "pyyaml", "omegaconf"] {
+        assert!(
+            !why.contains(&format!("root={root}")),
+            "no root may be blamed for a parse failure: {why}",
+        );
+    }
+
+    // NON-VACUITY 1: with no owner in the text the row still refuses to guess
+    // a distribution, and says so rather than inventing one.
+    let AttributedBackoffDecision::FallBackToAll(anonymous) =
+        attributed_backoff_decision(0, P6W_PARSE_FAILURE, &holosoma, &BTreeMap::new())
+    else {
+        panic!("still a fallback");
+    };
+    assert!(
+        anonymous.contains("an unnamed distribution")
+            && anonymous.contains("PyYAML (>=5.1.*)"),
+        "{anonymous}",
+    );
+
+    // NON-VACUITY 2: the strict reader really did refuse this line, so (i)
+    // passes because of the lenient reader and not because the line was
+    // always fine.
+    assert!(
+        <uv_pep508::Requirement as std::str::FromStr>::from_str("PyYAML (>=5.1.*)").is_err(),
+        "the strict reader must still refuse the line the lenient one repairs",
+    );
+
+    // NON-VACUITY 3: a line NO reader can repair still fails, and the row
+    // still names it. A lenient reader that swallowed everything would be the
+    // same defect pointing the other way.
+    assert!(
+        crate::pep508_lenient::parse_requirement_lenient("=== nonsense ===")
+            .is_err(),
+        "leniency is a repair ladder, not a shrug",
+    );
+}
+
+/// p6z guard (b), the attribution half. Boarded p6w-2.
+///
+/// The full measured `flashsac-pack` text -- with the `FlashRL<=65` clause
+/// p6w's fixture dropped -- read STRUCTURALLY: every clause with its carrier,
+/// which carriers are Lane C detections, and which clause is a LEARNED
+/// workspace fact rather than operator intent.
+#[test]
+fn p6z_b_the_reconciler_conflict_names_its_carrier_not_thirteen_bystanders() {
+    let flashsac = BTreeMap::from([(
+        "flashsac-pack".to_string(),
+        vec![
+            "brax".to_string(),
+            "dm-control".to_string(),
+            "mani-skill".to_string(),
+            "tensorboard".to_string(),
+            "tqdm".to_string(),
+        ],
+    )]);
+
+    let conflicts = crate::uv_closure::read_reconciler_conflicts(
+        P6W_RECONCILER_FAILURE,
+        &flashsac,
+    );
+    let conflict = conflicts
+        .first()
+        .unwrap_or_else(|| panic!("the reconciler diagnostic must parse: {conflicts:?}"));
+    assert_eq!(conflict.package, "setuptools");
+    assert_eq!(conflict.bundle, "flashsac-pack");
+
+    let flashrl = conflict
+        .clauses
+        .iter()
+        .find(|clause| clause.carrier == "FlashRL")
+        .unwrap_or_else(|| panic!("FlashRL carries the cap: {:?}", conflict.clauses));
+    assert_eq!(flashrl.spec, "<=65");
+    assert!(
+        flashrl.injected_root.is_none(),
+        "FlashRL is the pack's own wheel, not a Lane C detection",
+    );
+    assert!(!flashrl.learned, "a wheel's Requires-Dist is not a learned fact");
+
+    let learned = conflict
+        .clauses
+        .iter()
+        .find(|clause| clause.learned)
+        .unwrap_or_else(|| panic!("the conda fact is LEARNED: {:?}", conflict.clauses));
+    assert_eq!(learned.spec, "==84.0.0");
+
+    // The spelling fold still holds on this path: the root is injected as
+    // `dm-control` and quoted as `dm_control==1.0.45`.
+    assert!(
+        conflict
+            .clauses
+            .iter()
+            .any(|clause| clause.carrier == "dm_control"
+                && clause.injected_root.as_deref() == Some("dm-control")),
+        "{:?}",
+        conflict.clauses,
+    );
+    // ...and a carrier that is NOT an injected root is not made one. `sapien`
+    // reaches the closure through `mani-skill`; the text names `sapien`, and
+    // guessing `mani-skill` from it is exactly the inference this lane refuses.
+    assert!(
+        conflict
+            .clauses
+            .iter()
+            .any(|clause| clause.carrier == "sapien" && clause.injected_root.is_none()),
+        "{:?}",
+        conflict.clauses,
+    );
+
+    // AND THE DECISION: none of the five detections is the culprit, so none is
+    // dropped, and the fallback row NAMES the two clauses that actually
+    // contradict instead of "uv named nobody".
+    let decision =
+        attributed_backoff_decision(0, P6W_RECONCILER_FAILURE, &flashsac, &BTreeMap::new());
+    let AttributedBackoffDecision::FallBackToAll(why) = decision else {
+        panic!("no detection carries this contradiction: {decision:?}");
+    };
+    assert!(
+        why.contains("constraint reconciler")
+            && why.contains("`<=65`")
+            && why.contains("FlashRL")
+            && why.contains("LEARNED"),
+        "the row must name the carriers: {why}",
+    );
+
+    // NON-VACUITY: the arithmetic is a real discrimination. Give the same
+    // bundle a text whose ONLY unsatisfiable clause IS carried by an injected
+    // root, and that root is named -- so the empty answer above is a
+    // measurement, not a refusal to answer.
+    let sole = P6W_RECONCILER_FAILURE
+        .replace(
+            "`<=65` required by wheel `FlashRL==0.1.0` Requires-Dist `setuptools<=65`",
+            "`<=65` required by wheel `dm_control==1.0.45` Requires-Dist `setuptools<=65`",
+        )
+        .replace(
+            "`!=50.0.0` required by wheel `dm_control==1.0.45` Requires-Dist \
+             `setuptools!=50.0.0`; ",
+            "",
+        );
+    let conflicts = crate::uv_closure::read_reconciler_conflicts(&sole, &flashsac);
+    assert!(
+        conflicts
+            .first()
+            .is_some_and(|conflict| conflict.clauses.iter().any(|clause| clause.spec == "<=65"
+                && clause.injected_root.as_deref() == Some("dm-control"))),
+        "the rewritten fixture must put the decisive clause on a detection: {conflicts:?}",
+    );
+}
+
+#[test]
+fn p6w_c_a_correctly_pinned_sibling_survives_the_culprit_beside_it() {
+    // `etils==1.13.0` is the measured case: holosoma-pack's naming authority
+    // determined it from a request fact, it is satisfiable, and p6u dropped it
+    // anyway because a SIBLING root made the request-wide resolve fail. It is
+    // never named in either arm's failure text.
+    let injected = BTreeMap::from([(
+        "holosoma-pack".to_string(),
+        vec![
+            "etils==1.13.0".to_string(),
+            "tqdm".to_string(),
+            "unitree-sdk2py".to_string(),
+        ],
+    )]);
+    let decision =
+        attributed_backoff_decision(0, P6W_UV_ROBOJUDO_REPORT, &injected, &BTreeMap::new());
+    let AttributedBackoffDecision::DropRoots(drops) = decision else {
+        panic!("the sibling culprit is named and must be dropped: {decision:?}");
+    };
+    assert_eq!(drops.len(), 1, "only the culprit: {drops:?}");
+    assert!(
+        !drops.iter().any(|d| d.name == "etils"),
+        "a correctly pinned, satisfiable root must never be dropped for a sibling's failure",
+    );
+
+    let withheld: BTreeSet<String> = drops.iter().map(|d| d.name.clone()).collect();
+    let (dropped, kept) = partition_attributed_roots(&injected["holosoma-pack"], &withheld);
+    assert_eq!(dropped, vec!["unitree-sdk2py".to_string()]);
+    assert!(
+        kept.contains(&"etils==1.13.0".to_string()),
+        "the VERSION must survive with the root: {kept:?}",
+    );
+
+    // NON-VACUITY: the withheld set matches on the normalized NAME, so a
+    // withheld `etils` really would take `etils==1.13.0` with it -- the guard
+    // above passes because uv did not name it, not because the matcher is
+    // broken.
+    let (dropped, kept) = partition_attributed_roots(
+        &injected["holosoma-pack"],
+        &BTreeSet::from(["etils".to_string()]),
+    );
+    assert_eq!(dropped, vec!["etils==1.13.0".to_string()]);
+    assert_eq!(kept.len(), 2);
+    // And a name that merely STARTS with a withheld name is not withheld.
+    let (dropped, _) = partition_attributed_roots(
+        &["etils-extras==1.0.0".to_string()],
+        &BTreeSet::from(["etils".to_string()]),
+    );
+    assert!(dropped.is_empty(), "prefix is not identity");
+
+    // NON-VACUITY: p6w's remedy classifier no longer routes an upstream
+    // absence into the platform-fact branch. This is the row both arms got
+    // wrong for robojudo-pack.
+    let robojudo_detail = format!("resolve-backoff: {P6W_UV_ROBOJUDO_REPORT} manylinux_2_28");
+    let resolution = auto_imports_suppression_resolution(&robojudo_detail, "linux-64");
+    assert!(
+        resolution.contains("MANIFEST finding"),
+        "a stray manylinux token in unrelated prose must not become a platform remedy: \
+         {resolution}",
+    );
+    assert!(
+        !resolution.contains("glibc = \"2.28\""),
+        "and must not tell the operator to declare a glibc that cannot help: {resolution}",
+    );
+    // ... while a REAL platform-tag rejection still gets the platform fact.
+    let platform_detail = "resolve-backoff: no wheels with a matching platform tag; only \
+                           manylinux_2_35 wheels are published";
+    assert!(
+        auto_imports_suppression_resolution(platform_detail, "linux-64").contains("2.35"),
+        "the platform-fact remedy must still fire when uv really rejected on the tag",
+    );
 }

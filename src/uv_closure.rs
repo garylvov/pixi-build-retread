@@ -138,6 +138,65 @@ pub struct ConstraintSet {
     pub auto_route_constraint_indices: BTreeSet<usize>,
 }
 
+impl ConstraintSet {
+    /// p6n. Swap the LEARNED workspace-conda-fact half of this set for a
+    /// freshly derived one, leaving every other line (declared facts,
+    /// sibling pins, CUDA family, deps-from floors) exactly where it is.
+    ///
+    /// A learned fact is a `name==version` line, so a second pass cannot
+    /// simply ADD its version: `protobuf==7.35.1` and `protobuf==5.29.3`
+    /// together are unsatisfiable. The stale line has to come out, and it is
+    /// identified by provenance (`LEARNED_WORKSPACE_FACT_SOURCE`), never by
+    /// re-parsing the line text.
+    ///
+    /// `auto_route_constraint_indices` indexes INTO `constraints`, so it is
+    /// remapped rather than cleared: dropping it would let a routed package's
+    /// stabilizing pin be mistaken for an authoritative requirement.
+    pub fn replace_learned_workspace_facts(&mut self, relearned: ConstraintSet) {
+        let stale: BTreeSet<String> = self
+            .provenance
+            .iter()
+            .filter(|(_, prov)| prov.source == LEARNED_WORKSPACE_FACT_SOURCE)
+            .map(|(name, _)| name.clone())
+            .collect();
+        let stale_lines: BTreeSet<String> = stale
+            .iter()
+            .filter_map(|name| self.provenance.get(name))
+            .map(|prov| prov.constraint.clone())
+            .collect();
+        let mut index_map: BTreeMap<usize, usize> = BTreeMap::new();
+        let mut kept: Vec<String> = Vec::with_capacity(self.constraints.len());
+        for (old_index, line) in self.constraints.iter().enumerate() {
+            if stale_lines.contains(line) {
+                continue;
+            }
+            index_map.insert(old_index, kept.len());
+            kept.push(line.clone());
+        }
+        self.auto_route_constraint_indices = self
+            .auto_route_constraint_indices
+            .iter()
+            .filter_map(|old| index_map.get(old).copied())
+            .collect();
+        self.constraints = kept;
+        for name in &stale {
+            self.provenance.remove(name);
+        }
+        for (name, prov) in relearned.provenance {
+            if self.provenance.contains_key(&name) {
+                // A declared fact or an operator pin already owns this name;
+                // a learned float never overwrites intent (same rule
+                // `learned_fact_constraints` applies through `already`).
+                continue;
+            }
+            if !self.constraints.contains(&prov.constraint) {
+                self.constraints.push(prov.constraint.clone());
+            }
+            self.provenance.insert(name, prov);
+        }
+    }
+}
+
 /// Precise conda-side provider eligible to satisfy one PyPI dependency before
 /// uv's first lock. Construction requires a typed workspace fact; routing
 /// aliases and prior selections are never ownership authority.
@@ -605,7 +664,7 @@ fn active_input_requirement(
     raw: &str,
     target: &uv_pep508::MarkerEnvironment,
 ) -> Result<Option<(String, String)>> {
-    let requirement: Requirement = Requirement::from_str(raw)
+    let requirement: Requirement = crate::pep508_lenient::parse_requirement_lenient(raw)
         .with_context(|| format!("parsing authoritative uv input requirement `{raw}`"))?;
     if !requirement.marker.evaluate(target, &[]) {
         return Ok(None);
@@ -680,7 +739,7 @@ fn effective_auto_route_input_requirements(
     };
 
     for raw in &req.dependencies {
-        let provenance = Requirement::from_str(raw)
+        let provenance = crate::pep508_lenient::parse_requirement_lenient(raw)
             .ok()
             .and_then(|requirement: Requirement| {
                 req.dependency_provenance
@@ -704,7 +763,7 @@ fn effective_auto_route_input_requirements(
         {
             continue;
         }
-        let recorded_provenance = Requirement::from_str(raw)
+        let recorded_provenance = crate::pep508_lenient::parse_requirement_lenient(raw)
             .ok()
             .and_then(|requirement: Requirement| {
                 effective_constraints
@@ -2136,7 +2195,14 @@ pub struct BuiltSdistWheel {
     pub sha256: String,
     /// Sdist provenance: index, name, version, and the exact resolved
     /// sdist URL (+ `#sha256` when the index advertised one).
-    pub sdist_source: crate::lock::SdistWheelSource,
+    ///
+    /// `None` when the heal did NOT build anything: the index chain already
+    /// published a wheel for this exact `name==version` that satisfies the
+    /// artifact target's compatibility contract, so that wheel was fetched
+    /// and stored instead (p6s wheel-before-build rung). Recording an
+    /// `sdist_source` for such an artifact would put a `.tar.gz` URL in the
+    /// lock for bytes that were never built from one.
+    pub sdist_source: Option<crate::lock::SdistWheelSource>,
 }
 
 /// A transitive PRERELEASE pin the heal injected: the offending package
@@ -2681,7 +2747,7 @@ where
             must_ship: true,
             upstream_url: None,
             git_source: None,
-            sdist_source: Some(w.sdist_source.clone()),
+            sdist_source: w.sdist_source.clone(),
         });
     }
     Ok(closure)
@@ -2858,6 +2924,29 @@ pub const COACTIVATED_SIBLING_PIN_SOURCE_PREFIX: &str = "co-activated-sibling-pi
 pub(crate) fn is_yieldable_advisory_source(source: &str) -> bool {
     source == LEARNED_WORKSPACE_FACT_SOURCE
         || source.starts_with(COACTIVATED_SIBLING_PIN_SOURCE_PREFIX)
+}
+
+/// The same question asked of a RENDERED provenance sentence rather than the
+/// bare `ConstraintProvenance::source`.
+///
+/// p6z pair 1 found this the hard way. `is_yieldable_advisory_source` compares
+/// for EQUALITY, which is right where it is called: those callers hold the
+/// provenance record and its `source` IS the constant. A `Constraint` reaching
+/// `constraint::finalize` carries the sentence a human reads --
+///
+/// ```text
+/// uv constraint `setuptools==84.0.0` from workspace conda fact (learned:
+/// selected by every consuming env's conda solve) `precise-consuming-envs`
+/// (conda `setuptools==84.0.0`)
+/// ```
+///
+/// -- which CONTAINS the constant and is not equal to it, so the learned-fact
+/// yield never fired in arm 5784994 and `flashsac-pack` still dropped its 13
+/// roots. Substring, not equality, and only for the rendered form.
+pub(crate) fn is_learned_advisory_sentence(sentence: &str) -> bool {
+    is_yieldable_advisory_source(sentence)
+        || sentence.contains(LEARNED_WORKSPACE_FACT_SOURCE)
+        || sentence.contains(COACTIVATED_SIBLING_PIN_SOURCE_PREFIX)
 }
 
 /// Human label for the advisory constraint class that lost, for the yield
@@ -3687,7 +3776,7 @@ fn exact_requirement_pin(
     uv_pep508::uv_pep440::VersionSpecifiers,
     uv_pep508::uv_pep440::Version,
 )> {
-    let req: Requirement = Requirement::from_str(raw).ok()?;
+    let req: Requirement = crate::pep508_lenient::parse_requirement_lenient(raw).ok()?;
     let uv_pep508::VersionOrUrl::VersionSpecifier(specs) = req.version_or_url.as_ref()? else {
         return None;
     };
@@ -3698,7 +3787,7 @@ fn exact_requirement_pin(
 
 fn request_has_direct_root(req: &UvClosureRequest, name: &str) -> bool {
     req.dependencies.iter().any(|raw| {
-        let root: Result<Requirement, _> = Requirement::from_str(raw);
+        let root: Result<Requirement, _> = crate::pep508_lenient::parse_requirement_lenient(raw);
         root.is_ok_and(|root| {
             canonical_conda_name(root.name.as_ref()) == canonical_conda_name(name)
         })
@@ -3706,7 +3795,7 @@ fn request_has_direct_root(req: &UvClosureRequest, name: &str) -> bool {
 }
 
 fn override_name(raw: &str) -> Option<String> {
-    let req: Requirement = Requirement::from_str(raw).ok()?;
+    let req: Requirement = crate::pep508_lenient::parse_requirement_lenient(raw).ok()?;
     Some(canonical_conda_name(req.name.as_ref()))
 }
 
@@ -3892,14 +3981,76 @@ fn workspace_fact_override_needed(
     None
 }
 
+/// uv's own CONCLUSION, sliced out of a verbose run's stderr.
+///
+/// p6r. The closure runs uv with `-v`, so its stderr carries the resolver's
+/// entire exploration -- every `Adding transitive dependency`, every
+/// `Recording unit propagation conflict`, every candidate it tried and then
+/// backtracked past -- ahead of the report uv finally writes. Those trace
+/// lines name requirements uv CONSIDERED, not requirements that hold, and
+/// attributing a constraint to one of them blames a fact for a conflict that
+/// never happened.
+///
+/// Measured, job `5742776` (`isaaclab-viral-pack`): uv's report named
+/// `datasets` / `fsspec[http]` / `xxhash` / `trl` / `isaacsim[all]` and said
+/// nothing at all about `protobuf`, while its trace carried
+/// `Adding transitive dependency for tensorboard==2.21.0: protobuf>=6.31.1,
+/// <8.0.0` -- a candidate uv itself rejected two hundred lines later
+/// (`Searching for a compatible version of tensorboard (<=2.20.0)` ->
+/// `Selecting: tensorboard==2.20.0`) precisely BECAUSE the learned
+/// `protobuf==5.29.3` constraint was in force. Reading the trace made
+/// [`learned_fact_yield_needed`] drop that constraint and re-lock without it;
+/// the re-lock was free to take `tensorboard 2.21.0`, whose
+/// `Requires-Dist protobuf>=6.31.1,<8` became the emitted conda `constrains`
+/// row that made `viral-gpu` unsolvable. The same run dropped ~130 learned
+/// facts this way, one per re-lock, in provenance (alphabetical) order.
+///
+/// The report is anchored on uv's own summary marker `×`, which opens the
+/// failure block and appears nowhere in the trace. When there is no marker --
+/// a hand-transcribed fixture, a non-resolution failure -- the resolver's own
+/// log lines are stripped by level prefix instead, and if that leaves nothing
+/// the whole text is returned: attribution degrades to today's behaviour
+/// rather than going silent.
+pub fn uv_conflict_report(stderr: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(marker) = stderr.find('\u{d7}') {
+        // Back up to the start of the marker's own line so the report keeps
+        // its leading indentation exactly as uv wrote it.
+        let start = stderr[..marker].rfind('\n').map_or(0, |nl| nl + 1);
+        return std::borrow::Cow::Borrowed(&stderr[start..]);
+    }
+    let kept: Vec<&str> = stderr
+        .lines()
+        .filter(|line| !is_uv_trace_line(line))
+        .collect();
+    if kept.iter().any(|line| !line.trim().is_empty()) && kept.len() != stderr.lines().count() {
+        return std::borrow::Cow::Owned(kept.join("\n"));
+    }
+    std::borrow::Cow::Borrowed(stderr)
+}
+
+/// True for one line of uv's `-v` resolver log, identified by the level token
+/// uv writes at the head of every such line.
+fn is_uv_trace_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    ["TRACE ", "DEBUG ", "INFO ", "WARN ", "ERROR "]
+        .iter()
+        .any(|level| trimmed.starts_with(level))
+}
+
 /// Best-effort join of uv's conflict prose to the constraint provenance
-/// table: any constrained name appearing in the error text is attributed
+/// table: any constrained name appearing in uv's REPORT is attributed
 /// to its conda source package. Degrades gracefully — an unparseable
 /// message still yields records for every constrained name it mentions.
+///
+/// p6r: the text searched is [`uv_conflict_report`], not the raw stderr. A
+/// name that appears only in the resolver's exploration trace is not named in
+/// the conflict and must not be attributed to one.
 pub fn attribute_conflict(
     stderr: &str,
     provenance: &BTreeMap<String, ConstraintProvenance>,
 ) -> Vec<ConflictAttribution> {
+    let report = uv_conflict_report(stderr);
+    let stderr: &str = report.as_ref();
     let mut out = Vec::new();
     for (pypi_name, prov) in provenance {
         if authority(&prov.provenance) != Authority::Authoritative {
@@ -3955,6 +4106,567 @@ pub fn attribute_conflict(
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// p6w: attributing a resolve failure to the injected roots that caused it
+// ---------------------------------------------------------------------------
+
+/// p6w. What the operator must DO about one dropped auto-imports root, decided
+/// from uv's own clause rather than from the fact that a resolve failed.
+///
+/// p6u's per-ENV row already carried a remedy, but it could only ever choose
+/// between "declare the platform" and "manifest finding" for a whole
+/// environment at once, because the resolve-time back-off had no per-root
+/// attribution to hang a remedy on. Three roots dropped together got one
+/// answer; here each root gets its own, from the sentence uv wrote about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RootDropRemedy {
+    /// uv rejected every distribution because the only wheels published are
+    /// above this workspace's manylinux ceiling. The remedy is a DECLARED
+    /// platform fact, not a dropped detection (the 5.1.0.0 kit-sdk case).
+    PlatformFact { major: u32, minor: u32 },
+    /// The index publishes NO distribution matching the root at all for this
+    /// python/platform. No declaration makes it satisfiable; the import is
+    /// real and its distribution is not on this index.
+    UpstreamAbsence,
+    /// uv named the root in a genuine version conflict with something this
+    /// request already declares. A manifest decision, not a platform one.
+    ManifestFinding,
+}
+
+impl RootDropRemedy {
+    /// The token the `auto_imports_root_dropped` row prints, so the row, the
+    /// strict refusal and the guards all say one word.
+    pub fn token(&self) -> &'static str {
+        match self {
+            Self::PlatformFact { .. } => "platform-fact",
+            Self::UpstreamAbsence => "upstream-absence",
+            Self::ManifestFinding => "manifest-finding",
+        }
+    }
+}
+
+impl std::fmt::Display for RootDropRemedy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PlatformFact { major, minor } => write!(
+                f,
+                "platform-fact: the only distributions published are above this target's \
+                 manylinux ceiling; declare `[system-requirements] libc = \"{major}.{minor}\"` \
+                 (or the pixi >= 0.71 `platforms` form) so the ceiling admits them"
+            ),
+            Self::UpstreamAbsence => f.write_str(
+                "upstream-absence: the index publishes no distribution matching this root for \
+                 this python and platform; no declaration makes it satisfiable, so the import \
+                 needs a different distribution or a `retread-name-map` entry",
+            ),
+            Self::ManifestFinding => f.write_str(
+                "manifest-finding: uv named this root in a genuine conflict with a requirement \
+                 this request already states; declare the version this workspace intends, or \
+                 relax the pin that excludes it",
+            ),
+        }
+    }
+}
+
+/// p6w. One injected root uv's own conflict report names, with the clause it
+/// was named in and the remedy that clause implies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttributedRootDrop {
+    /// Canonical conda name of the bundle whose resolve failed.
+    pub bundle: String,
+    /// The root exactly as it was injected (`etils==1.13.0`, `tqdm`).
+    pub root: String,
+    /// The distribution name the root names, normalized PEP 503-style.
+    pub name: String,
+    /// uv's OWN sentence about this root, verbatim. Never paraphrased: the
+    /// whole reason this is trustworthy is that it is uv's conclusion and not
+    /// retread's re-derivation of one.
+    pub clause: String,
+    pub remedy: RootDropRemedy,
+}
+
+/// The distribution name an injected root names: everything before the first
+/// specifier, extra, marker or whitespace character, lowercased with `_`/`.`
+/// folded to `-` (PEP 503).
+///
+/// Injected roots come from `NamingAuthority::root_specifier`, which emits
+/// either `name` or `name==version` -- but this must not assume that shape,
+/// because a root that ever gains an extra or a marker would otherwise be
+/// matched under a name that contains a bracket and never attributed.
+pub fn root_distribution_name(root: &str) -> String {
+    let cut = root
+        .find(|c: char| "=<>!~[; \t".contains(c))
+        .unwrap_or(root.len());
+    root[..cut]
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['_', '.'], "-")
+}
+
+/// The spellings one normalized distribution name appears under in resolver
+/// prose: PEP 503 folds `-`, `_` and `.` together, so a text may carry any of
+/// them and a matcher that knows only one of them silently misses the rest.
+fn root_name_spellings(name: &str) -> Vec<String> {
+    let mut out = vec![name.to_string()];
+    for sep in ['_', '.'] {
+        let spelled = name.replace('-', &sep.to_string());
+        if spelled != name {
+            out.push(spelled);
+        }
+    }
+    out
+}
+
+/// True when uv's prose says the index holds no versions of `name` at all.
+///
+/// The `==`-pinned case is [`conflict_says_no_such_version`], which needs a
+/// parsed version to decide whether uv's specifier covers the pin. A BARE
+/// injected root has no version to check, so this is its sibling: uv naming
+/// `no versions of <name>` with no specifier at all is upstream absence.
+/// Measured on jobs 5764452/5764453 (`robojudo-pack`): the failure that made
+/// the request-wide back-off drop 12 roots was uv saying
+/// `Because unitree-sdk2py was not found in the package registry and your
+/// project depends on unitree-sdk2py, we can conclude that your project's
+/// requirements are unsatisfiable.` -- an absence sentence uv writes in a
+/// SECOND shape, with no "no versions of" in it at all. Matching only the
+/// first shape classified that root as a manifest finding and told the
+/// operator to declare a dependency for a distribution no index carries.
+fn report_says_no_versions_of(prose: &str, name: &str) -> bool {
+    let name = regex::escape(name);
+    let pattern = format!(
+        r"(?i)(?:\bno versions? of\s+{name}(?:\[[^\]]*\])?(?:[^A-Za-z0-9._-]|$))|(?:\b{name}(?:\[[^\]]*\])?\s+was not found in the package registry)"
+    );
+    regex::Regex::new(&pattern)
+        .expect("static bare no-such-version regex")
+        .is_match(prose)
+}
+
+/// p6w. Which injected roots did uv actually blame?
+///
+/// THE DEFECT THIS EXISTS FOR (boarded p6u-1). The resolve-time back-off had
+/// no per-bundle -- let alone per-root -- attribution, so ONE unsatisfiable
+/// root made it drop every detected root in the request: 51 of them across
+/// three packs in jobs 5764452/5764453, including `etils==1.13.0`, a correctly
+/// pinned detection that resolves perfectly well. Dropping 51 detections to
+/// learn that at least one is unsatisfiable is not auto-detection.
+///
+/// uv already answers the question. `format_lock_failure` embeds uv's stderr
+/// VERBATIM in the error, and [`uv_conflict_report`] slices uv's own
+/// CONCLUSION out of the surrounding `-v` exploration trace -- the same slice
+/// p6r made `attribute_conflict` read, for the same reason: a name that
+/// appears only in the trace is a candidate uv considered and rejected, not a
+/// cause. So attribution here is a lookup of each injected root in uv's
+/// conclusion, and a root uv never mentions is never blamed.
+///
+/// Returns one entry per (bundle, root) uv named. EMPTY is a meaningful
+/// answer and the caller must handle it: it means uv's report blamed none of
+/// the injected roots, and the honest response is the whole-request back-off
+/// with that fact stated, not a guess at which root to drop.
+pub fn attribute_auto_imports_failure(
+    error_text: &str,
+    injected_by_bundle: &BTreeMap<String, Vec<String>>,
+) -> Vec<AttributedRootDrop> {
+    // MEASURED ON ARM A 5772100, AND IT IS WHY THIS IS NOT JUST
+    // `uv_conflict_report(error_text)`. When Pass A fails, the error handed up
+    // is Pass A's report AND Pass B's, joined by
+    // `PASS_B_BANNER` -- and Pass B's half carries the child's raw DEBUG
+    // trace. `uv_conflict_report` anchors on the FIRST `x` and returns
+    // everything to the END of the text, so with a Pass B appended its slice
+    // swallows that trace. `uv_reason_sentence` then found a "sentence"
+    // naming almost every injected root, and the first arm dropped THIRTEEN of
+    // robojudo-pack's roots where uv blamed exactly one -- attribution firing
+    // like the coarse back-off it replaces, only slower.
+    //
+    // Two cuts, in this order. Pass A's conclusion is the authority (it is the
+    // pass whose roots are under test), so the text is cut at the banner
+    // BEFORE the report is sliced; then trace lines are removed from the slice
+    // by the same level-prefix rule `uv_conflict_report` already applies on
+    // its no-marker path. Both are needed: the banner cut alone still leaves
+    // any trace uv wrote after its own report.
+    // p6z. A `Requires-Dist` PARSE failure can never be attributed to a
+    // detection, and this is checked FIRST because the text is full of
+    // distribution names that look like accusations. The measured holosoma
+    // failure quotes `PyYAML (>=5.1.*)`, and `pyyaml` is one of the 26 roots
+    // that request injected -- so the single-mention rule below would have
+    // blamed `pyyaml` for a line `omegaconf` published. The clause did not
+    // fail because some root was requested; it failed because a distribution
+    // shipped metadata retread could not read, and
+    // `attribution_failure_detail` says exactly that.
+    if requires_dist_parse_failure(error_text).is_some() {
+        return Vec::new();
+    }
+    let primary = error_text
+        .split_once(PASS_B_BANNER)
+        .map_or(error_text, |(pass_a, _)| pass_a);
+    let sliced = uv_conflict_report(primary);
+    let report: String = sliced
+        .lines()
+        .filter(|line| !is_uv_trace_line(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let report: &str = &report;
+    let prose = flatten_conflict_prose(report);
+    let mut out = Vec::new();
+    for (bundle, roots) in injected_by_bundle {
+        for root in roots {
+            let name = root_distribution_name(root);
+            if name.is_empty() {
+                continue;
+            }
+            // BOTH SPELLINGS, and this is not cosmetic. Injected roots carry
+            // the PEP 503-normalized name (`dm-control`), while uv and
+            // retread quote the distribution as the wheel spells it
+            // (`dm_control==1.0.45`, job 5764452 line 247282). Searching only
+            // the normalized form found `tensorboard` and missed
+            // `dm_control` in that very failure -- which left ONE apparent
+            // culprit where there were two, and so turned a text that
+            // attributes nothing into one that confidently blamed a root.
+            let Some(clause) = root_name_spellings(&name)
+                .into_iter()
+                .find_map(|spelling| uv_reason_sentence(report, &spelling))
+            else {
+                continue;
+            };
+            // The remedy is read from the clause uv wrote about THIS root,
+            // then from the whole report -- never the other way round, or one
+            // root's manylinux ceiling would be pinned on every sibling in the
+            // same failure.
+            let remedy = if let Some((major, minor)) =
+                crate::glibc::extract_manylinux_floor(&clause)
+                    .filter(|_| crate::installer::is_platform_tag_conflict(&clause))
+            {
+                RootDropRemedy::PlatformFact { major, minor }
+            } else if root_name_spellings(&name).into_iter().any(|spelling| {
+                report_says_no_versions_of(&prose, &spelling)
+                    || pinned_version_absent(report, root, &spelling)
+            }) {
+                RootDropRemedy::UpstreamAbsence
+            } else {
+                RootDropRemedy::ManifestFinding
+            };
+            out.push(AttributedRootDrop {
+                bundle: bundle.clone(),
+                root: root.clone(),
+                name,
+                clause,
+                remedy,
+            });
+        }
+    }
+    // NOT EVERY RESOLVE FAILURE IS A UV RESOLUTION FAILURE, and this is where
+    // that matters. Measured on jobs 5764452/5764453: of the three
+    // request-wide back-offs, only `robojudo-pack`'s came from uv (its report
+    // carries the `x` marker). `flashsac-pack`'s was retread's OWN constraint
+    // reconciler refusing a mutually unsatisfiable `setuptools`, and
+    // `holosoma-pack`'s was a PEP 508 metadata PARSE error -- uv never ran.
+    //
+    // Those texts still MENTION injected roots, because retread's reconciler
+    // lists every requirement's provenance: flashsac's names `dm_control`,
+    // `tensorboard` and (through `sapien`) `mani-skill`, none of which is
+    // individually unsatisfiable -- the actual contradiction is a declared
+    // `FlashRL<=65` against a conda fact `setuptools==84.0.0`, and neither
+    // side is a detected root. Dropping the three mentioned roots would spend
+    // three full re-resolves to arrive at the same failure.
+    //
+    // So a mention is only trusted as an ACCUSATION when it came out of uv's
+    // own conclusion block, or when the text names exactly one injected root
+    // and therefore cannot be pointing anywhere else. Anything else returns
+    // empty, and empty means the caller says "attribution named nobody"
+    // rather than guessing.
+    if !error_text.contains('\u{d7}') && out.len() > 1 {
+        // p6z. Before p6w's blanket refusal, ASK THE ARITHMETIC. A non-uv text
+        // that mentions several roots is not evidence against any of them --
+        // but retread's own reconciler diagnostic is structured, and
+        // `reconciler_sole_culprits` decides by removing one carrier's clauses
+        // and re-intersecting, not by counting mentions. A conflict that
+        // genuinely turns on ONE detection is named; anything else still
+        // returns empty, and the caller says so with the carriers named.
+        let attributed: Vec<AttributedRootDrop> =
+            read_reconciler_conflicts(error_text, injected_by_bundle)
+                .into_iter()
+                .flat_map(|conflict| {
+                    let bundle = conflict.bundle.clone();
+                    reconciler_sole_culprits(&conflict)
+                        .into_iter()
+                        .map(move |(root, clause)| AttributedRootDrop {
+                            bundle: bundle.clone(),
+                            name: root_distribution_name(&root),
+                            root,
+                            clause,
+                            remedy: RootDropRemedy::ManifestFinding,
+                        })
+                })
+                .collect();
+        return attributed;
+    }
+    out
+}
+
+/// p6z. What the fallback row should say when nothing was attributed.
+///
+/// p6w's fallback said "uv's conflict report named none of the injected
+/// roots". For `flashsac-pack` and `holosoma-pack` that sentence was TRUE and
+/// USELESS: uv never ran. This names what actually refused -- the reconciler
+/// and its carriers, or the distribution whose `Requires-Dist` would not
+/// parse -- so a whole-request drop is readable without opening a 137 MB log.
+pub fn attribution_failure_detail(
+    error_text: &str,
+    injected_by_bundle: &BTreeMap<String, Vec<String>>,
+) -> Option<String> {
+    if let Some(parse_failure) = requires_dist_parse_failure(error_text) {
+        return Some(parse_failure);
+    }
+    let conflicts = read_reconciler_conflicts(error_text, injected_by_bundle);
+    let named = conflicts
+        .iter()
+        .map(ReconcilerConflict::naming_sentence)
+        .collect::<Vec<_>>();
+    (!named.is_empty()).then(|| named.join(" | "))
+}
+
+/// p6z / boarded p6w-1. A `Requires-Dist` line retread's own reader refused,
+/// with the distribution that published it when the text carries one.
+///
+/// The 26 `holosoma-pack` roots were dropped for this text and nothing else:
+///
+/// ```text
+/// computing uv closure for bundle `holosoma-pack`: parsing requirement
+/// `PyYAML (>=5.1.*)`: Operator >= cannot be used with a wildcard version
+/// specifier
+/// ```
+///
+/// The lenient reader in [`crate::pep508_lenient`] means a line uv accepts no
+/// longer reaches here at all. A line uv ALSO refuses still can, and then this
+/// is what the row must say.
+pub fn requires_dist_parse_failure(error_text: &str) -> Option<String> {
+    static PARSE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"parsing (?:extra )?requirement `([^`]+)`: ([^\n]+)")
+            .expect("static requires-dist parse-failure regex")
+    });
+    static OWNER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"reading `Requires-Dist` of wheel `([^`]+)`")
+            .expect("static requires-dist owner regex")
+    });
+    let captures = PARSE.captures(error_text)?;
+    let clause = captures.get(1)?.as_str();
+    let reason = captures.get(2)?.as_str().trim();
+    let owner = OWNER
+        .captures(error_text)
+        .and_then(|captures| captures.get(1))
+        .map(|owner| format!("wheel `{}`", owner.as_str()))
+        .unwrap_or_else(|| "an unnamed distribution".to_string());
+    Some(format!(
+        "a `Requires-Dist` clause could not be parsed: {owner} declares `{clause}` ({reason}). \
+         No Lane C detection is its cause; the distribution that published the clause is."
+    ))
+}
+
+/// p6z / boarded p6w-2. One clause of retread's OWN reconciler conflict, with
+/// the distribution that carries it and whether that distribution is a Lane C
+/// detection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconcilerClause {
+    /// The distribution that states the clause, as the text spells it, or
+    /// empty when the clause comes from a constraint rather than a wheel.
+    pub carrier: String,
+    /// The version specifier, verbatim (`<=65`, `==84.0.0`, `*`).
+    pub spec: String,
+    /// The provenance sentence, verbatim, so a row can quote it.
+    pub source: String,
+    /// The injected root (as injected) this clause's carrier IS, if any.
+    pub injected_root: Option<String>,
+    /// True when the clause is a LEARNED workspace fact -- what some earlier
+    /// solve happened to pick, not operator intent
+    /// ([`is_yieldable_advisory_source`]).
+    pub learned: bool,
+}
+
+/// p6z. Retread's own `requirements are mutually unsatisfiable` failure, read
+/// structurally instead of by mention-counting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconcilerConflict {
+    pub bundle: String,
+    /// The package whose requirements do not intersect (`setuptools`).
+    pub package: String,
+    pub clauses: Vec<ReconcilerClause>,
+}
+
+impl ReconcilerConflict {
+    /// A sentence naming the carriers, for the row that says nobody was
+    /// attributed. p6w's fallback said only "uv's conflict report named none
+    /// of the injected roots" -- true, and useless, because the failure was
+    /// never uv's. This names the distributions actually in contradiction.
+    pub fn naming_sentence(&self) -> String {
+        let clauses = self
+            .clauses
+            .iter()
+            .map(|clause| {
+                let who = if clause.carrier.is_empty() {
+                    clause.source.clone()
+                } else {
+                    format!("`{}`", clause.carrier)
+                };
+                let tag = match (clause.injected_root.is_some(), clause.learned) {
+                    (true, _) => " [Lane C detection]",
+                    (_, true) => " [LEARNED workspace fact, not operator intent]",
+                    _ => "",
+                };
+                format!("`{}` from {who}{tag}", clause.spec)
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        format!(
+            "retread's own constraint reconciler refused `{}` in bundle `{}`: {clauses}",
+            self.package, self.bundle
+        )
+    }
+}
+
+/// Carrier of one reconciler clause: `wheel `dm_control==1.0.45` ...`.
+fn reconciler_clause_carrier(source: &str) -> String {
+    static CARRIER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"^wheel `([^`=<>!~\s]+)").expect("static reconciler carrier regex")
+    });
+    CARRIER
+        .captures(source.trim())
+        .and_then(|captures| captures.get(1))
+        .map(|carrier| carrier.as_str().to_string())
+        .unwrap_or_default()
+}
+
+/// p6z. Read retread's OWN reconciler conflict out of an error text.
+///
+/// Reuses [`crate::solve::parse::RegexConflictParser::parse_retread_conflicts`]
+/// -- the single structured reader for this diagnostic, which its own doc
+/// comment says must not be duplicated -- and adds only the question this lane
+/// asks: which clause is carried by an injected Lane C root, and which by a
+/// LEARNED workspace fact.
+pub fn read_reconciler_conflicts(
+    error_text: &str,
+    injected_by_bundle: &BTreeMap<String, Vec<String>>,
+) -> Vec<ReconcilerConflict> {
+    let parser = crate::solve::parse::RegexConflictParser::new();
+    parser
+        .parse_retread_conflicts(error_text)
+        .into_iter()
+        .map(|conflict| {
+            let injected = injected_by_bundle
+                .get(&conflict.bundle)
+                .cloned()
+                .unwrap_or_default();
+            let clauses = conflict
+                .requirements
+                .iter()
+                .map(|requirement| {
+                    let carrier = reconciler_clause_carrier(&requirement.source);
+                    // Same spelling fold p6w needed: a root is injected as
+                    // `dm-control` and quoted by the reconciler as
+                    // `dm_control==1.0.45`.
+                    let injected_root = (!carrier.is_empty())
+                        .then(|| {
+                            injected.iter().find(|root| {
+                                let name = root_distribution_name(root);
+                                root_name_spellings(&name)
+                                    .iter()
+                                    .any(|spelling| spelling.eq_ignore_ascii_case(&carrier))
+                            })
+                        })
+                        .flatten()
+                        .cloned();
+                    ReconcilerClause {
+                        carrier,
+                        spec: requirement.spec.clone(),
+                        source: requirement.source.clone(),
+                        injected_root,
+                        learned: is_learned_advisory_sentence(&requirement.source),
+                    }
+                })
+                .collect();
+            ReconcilerConflict {
+                bundle: conflict.bundle,
+                package: conflict.package,
+                clauses,
+            }
+        })
+        .collect()
+}
+
+/// p6z. Which injected root, if any, is the SOLE reason a reconciler conflict
+/// is unsatisfiable.
+///
+/// The rule is a measurement, not a mention count. p6w refused to trust a
+/// non-uv text that mentioned several roots, and it was right to for the
+/// reason it gave -- but "mentioned" was the wrong question. The right one is
+/// arithmetic: remove one carrier's clauses and ask whether the rest still
+/// fails to intersect. `flashsac-pack` answers NO for every one of its three
+/// mentioned roots, because its real contradiction is `FlashRL==0.1.0`'s
+/// declared `setuptools<=65` against a LEARNED `setuptools==84.0.0` -- and
+/// that is now settled before this point, by the learned-fact yield in
+/// `constraint::finalize_impl`. A conflict that reaches here and DOES turn on
+/// one detection names it.
+fn reconciler_sole_culprits(conflict: &ReconcilerConflict) -> Vec<(String, String)> {
+    let parse = |spec: &str| {
+        let spec = spec.trim();
+        if spec.is_empty() || spec == "*" {
+            return Some(uv_pep508::uv_pep440::VersionSpecifiers::empty());
+        }
+        uv_pep508::uv_pep440::VersionSpecifiers::from_str(spec).ok()
+    };
+    let mut parsed = Vec::new();
+    for clause in &conflict.clauses {
+        let Some(specifiers) = parse(&clause.spec) else {
+            // A clause this reader cannot parse means the arithmetic below is
+            // not decidable, so nothing is blamed.
+            return Vec::new();
+        };
+        parsed.push((clause, specifiers));
+    }
+    let intersect_all = |skip: Option<usize>| {
+        let mut clauses = Vec::new();
+        for (index, (_, specifiers)) in parsed.iter().enumerate() {
+            if Some(index) == skip {
+                continue;
+            }
+            clauses.extend(specifiers.iter().cloned());
+        }
+        uv_pep508::uv_pep440::VersionSpecifiers::from_iter(clauses)
+    };
+    if !crate::constraint::specifiers_unsatisfiable(&intersect_all(None)) {
+        return Vec::new();
+    }
+    let mut culprits = Vec::new();
+    for (index, (clause, _)) in parsed.iter().enumerate() {
+        let Some(root) = clause.injected_root.as_ref() else {
+            continue;
+        };
+        if !crate::constraint::specifiers_unsatisfiable(&intersect_all(Some(index))) {
+            culprits.push((root.clone(), clause.clone()));
+        }
+    }
+    culprits
+        .into_iter()
+        .map(|(root, clause)| {
+            (
+                root,
+                format!(
+                    "retread's constraint reconciler: `{}` {} required by {} is the only clause \\
+                     that makes `{}` unsatisfiable in bundle `{}`",
+                    conflict.package, clause.spec, clause.source, conflict.package, conflict.bundle
+                ),
+            )
+        })
+        .collect()
+}
+
+/// `name==version`-shaped root whose exact pin uv says the index cannot serve.
+fn pinned_version_absent(report: &str, root: &str, name: &str) -> bool {
+    let Some((_, version)) = root.split_once("==") else {
+        return false;
+    };
+    uv_pep508::uv_pep440::Version::from_str(version.trim())
+        .is_ok_and(|version| conflict_says_no_such_version(report, name, &version))
 }
 
 fn apply_workspace_fact_overrides(req: &mut UvClosureRequest, facts: &[WorkspaceFactOverride]) {
@@ -4244,7 +4956,7 @@ fn apply_learned_fact_yields(req: &mut UvClosureRequest, yielded: &BTreeSet<Stri
     let mut kept: Vec<String> = Vec::with_capacity(req.constraints.constraints.len());
     let mut remapped: BTreeSet<usize> = BTreeSet::new();
     for (index, line) in req.constraints.constraints.iter().enumerate() {
-        let parsed: Result<Requirement, _> = Requirement::from_str(line);
+        let parsed: Result<Requirement, _> = crate::pep508_lenient::parse_requirement_lenient(line);
         let name = parsed
             .ok()
             .map(|parsed| canonical_conda_name(parsed.name.as_ref()));
@@ -4380,7 +5092,7 @@ where
 /// behind a healable evdev error for a whole cert run.
 fn both_passes_failed(pass_a: &str, pass_b: &str) -> String {
     format!(
-        "{}\n\n--- uv closure pass B (sdist/prerelease detection) also failed ---\n\n{}\n",
+        "{}\n\n{PASS_B_BANNER}\n\n{}\n",
         pass_a.trim_end(),
         pass_b.trim_end(),
     )
@@ -5139,6 +5851,11 @@ const CONFLICT_FILE: &str = "retread-conflict.json";
 /// Pass-B (sdist/prerelease detection) conflict record, written beside
 /// [`CONFLICT_FILE`] so a Pass-B failure has a reader (Law 9).
 const PASS_B_CONFLICT_FILE: &str = "retread-passb-conflict.json";
+/// The joiner between Pass A's failure and Pass B's in one error. Named
+/// because `attribute_auto_imports_failure` must CUT on it: everything after
+/// it is a second pass's text, trace included, and uv's report slice would
+/// otherwise run straight through it (arm 5772100).
+const PASS_B_BANNER: &str = "--- uv closure pass B (sdist/prerelease detection) also failed ---";
 static CLOSURE_META_TMP_SEQUENCE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -6280,7 +6997,7 @@ fn active_uv_dependency(
         }
         toml::Value::String(raw_requirement) => {
             let requirement: Requirement =
-                Requirement::from_str(raw_requirement).with_context(|| {
+                crate::pep508_lenient::parse_requirement_lenient(raw_requirement).with_context(|| {
                     format!("parsing uv.lock dependency `{raw_requirement}` of package `{parent}`")
                 })?;
             if !requirement.marker.evaluate(target, &[]) {
@@ -6499,6 +7216,13 @@ fn validate_one_built_wheel_source(
     // from an attested content record when the bytes are already
     // identified, which turns that cost into one central-directory walk;
     // record both so the two doors stay comparable in the same units.
+    //
+    // p6w merge note: c10's swap landed on the SERIAL loop this branch had
+    // already refactored into this helper, so git could not place it. Both
+    // sides are kept -- the parallel validation above, and c10's content
+    // record door here -- rather than either being dropped to resolve.
+    // p6z merge note: p6x's side of this hunk was the same lines WITHOUT the
+    // note; the note is comment-only and is kept.
     let source_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     let read_metadata_started = std::time::Instant::now();
     let metadata = crate::wheel_content::read_metadata_verified(&path, None)
@@ -10498,6 +11222,215 @@ Using CPython 3.8.20
     /// the learned `sympy==1.14.0` uncovers the NEXT learned float in the same
     /// chain: `sympy==1.13.1`'s own `Requires-Dist: mpmath>=1.1.0,<1.4` excludes
     /// the learned `mpmath==1.4.1`.
+    /// Job `5742776`, bundle `isaaclab-viral-pack`, python 3.11 / linux-64:
+    /// uv's `-v` stderr, trimmed to the two regions that decide the
+    /// attribution and otherwise verbatim.
+    ///
+    /// The TRACE half is uv exploring `tensorboard 2.21.0` and then
+    /// backtracking off it -- the backtrack happens BECAUSE the learned
+    /// `protobuf==5.29.3` constraint (which uv renders as the
+    /// `protobuf>=5.29.3, <5.29.3+` transitive) is in force. The REPORT half
+    /// is uv's conclusion, and it is about `datasets` / `fsspec[http]` /
+    /// `xxhash` / `trl` / `isaacsim[all]`. **`protobuf` is not in it.**
+    const P6R_VIRAL_GPU_STDERR: &str = "\
+DEBUG Searching for a compatible version of tensorboard (*)
+DEBUG Selecting: tensorboard==2.21.0 [compatible] (tensorboard-2.21.0-py3-none-any.whl)
+DEBUG Adding transitive dependency for tensorboard==2.21.0: protobuf>=6.31.1, <8.0.0
+DEBUG Adding transitive dependency for tensorboard==2.21.0: protobuf>=5.29.3, <5.29.3+
+DEBUG Recording unit propagation conflict of protobuf from incompatibility of (tensorboard)
+DEBUG Searching for a compatible version of tensorboard (<=2.20.0)
+DEBUG Selecting: tensorboard==2.20.0 [compatible] (tensorboard-2.20.0-py3-none-any.whl)
+DEBUG Adding transitive dependency for tensorboard==2.20.0: protobuf!=4.24.0, >=3.19.6
+DEBUG Recording unit propagation conflict of datasets from incompatibility of (fsspec, trl)
+DEBUG Package trl has too many conflicts (culprit), deprioritizing and backtracking
+  \u{d7} No solution found when resolving dependencies for split (markers:
+  \u{2502} python_full_version == '3.11.*' and platform_machine == 'x86_64' and
+  \u{2502} sys_platform == 'linux'):
+  \u{2570}\u{2500}\u{25b6} Because datasets>=3.0.2,<=3.2.0 depends on
+      fsspec[http]>=2023.1.0,<=2024.9.0 and datasets>=3.0.0,<=3.0.1
+      depends on fsspec[http]>=2023.1.0,<=2024.6.1, we can conclude that
+      datasets>=3.0.0,<=3.2.0 depends on fsspec[http]>=2023.1.0,<=2024.9.0.
+      (1)
+
+      Because there is no version of xxhash==0.8.3 and datasets>=3.3.0 depends
+      on xxhash==0.8.3, we can conclude that datasets>=3.3.0 cannot be used.
+      And because we know from (1) that datasets>=3.0.0,<=3.2.0 depends on
+      fsspec[http]>=2023.1.0,<=2024.9.0, we can conclude that datasets>=3.0.0
+      depends on fsspec>=2023.1.0,<=2024.9.0.
+      And because trl==0.17.0 depends on datasets>=3.0.0, we can conclude that
+      trl==0.17.0 depends on fsspec>=2023.1.0,<=2024.9.0.
+      And because isaacsim-core==5.1.0.0 depends on fsspec==2024.10.0 and
+      isaacsim[all]==5.1.0.0 depends on isaacsim-core==5.1.0.0, we can
+      conclude that isaacsim[all]==5.1.0.0 and trl==0.17.0 are incompatible.
+      And because your project depends on isaacsim[all]==5.1.0 and
+      trl==0.17.0, we can conclude that your project's requirements are
+      unsatisfiable.";
+
+    /// The two learned workspace conda facts that mattered in that run:
+    /// `protobuf==5.29.3` (innocent -- uv honoured it) and `xxhash==0.8.3`
+    /// (guilty -- conda's build spelling, which PyPI never published).
+    fn p6r_viral_gpu_learned_constraints() -> ConstraintSet {
+        learned_fact_constraints(
+            &BTreeMap::from([
+                ("protobuf".to_string(), "5.29.3".to_string()),
+                ("xxhash".to_string(), "0.8.3".to_string()),
+            ]),
+            &BTreeMap::new(),
+            &Default::default(),
+            &ConstraintSet::default(),
+            &BTreeSet::new(),
+            "precise-consuming-envs",
+            "3.11",
+        )
+    }
+
+    /// p6r (a). A learned fact uv mentions ONLY while exploring -- and then
+    /// backtracks past, because the fact itself forced the backtrack -- is
+    /// not named in uv's conflict and must keep its constraint. The fact uv
+    /// really did blame still yields, in the same call, so the guard cannot
+    /// pass by making the yield path inert.
+    #[test]
+    fn p6r_a_learned_fact_named_only_in_uvs_resolver_trace_is_not_yielded() {
+        let learned = p6r_viral_gpu_learned_constraints();
+        let attributions = attribute_conflict(P6R_VIRAL_GPU_STDERR, &learned.provenance);
+        let attributed: Vec<&str> = attributions
+            .iter()
+            .map(|a| a.package.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            attributed,
+            vec!["xxhash"],
+            "uv's REPORT blames xxhash and says nothing about protobuf; the \
+             `protobuf>=6.31.1, <8.0.0` line lives in the resolver TRACE, on a \
+             tensorboard candidate uv itself rejected because the learned \
+             protobuf pin was in force (job 5742776)",
+        );
+
+        let needed = learned_fact_yield_needed(&attributions, P6R_VIRAL_GPU_STDERR)
+            .expect("the fact uv DID blame must still yield -- this fix narrows the text \
+                     attribution reads, it does not disarm the yield");
+        assert_eq!(needed.pypi_name, "xxhash");
+        assert_eq!(needed.learned_version, "0.8.3");
+    }
+
+    /// p6r (b), the outcome the arm reads: with the innocent pin kept, the
+    /// closure's own resolution takes the tensorboard whose `Requires-Dist`
+    /// ADMITS conda's `protobuf 5.29.3`, so the conda `constrains` row the
+    /// bundle goes on to emit agrees with the workspace instead of demanding
+    /// `>=6.31.1`.
+    ///
+    /// The stub resolver is uv in miniature over the two candidate wheels the
+    /// run actually saw: `tensorboard 2.21.0` (`protobuf>=6.31.1,<8`) and
+    /// `2.20.0` (`protobuf!=4.24.0,>=3.19.6`), highest-compatible-first
+    /// against whatever protobuf constraint the request carries. It fails
+    /// with the captured stderr for as long as the request still holds the
+    /// genuinely unsatisfiable `xxhash==0.8.3`, which is what made the run
+    /// re-lock over and over.
+    #[tokio::test]
+    async fn p6r_the_closure_keeps_the_learned_pin_and_picks_the_tensorboard_that_admits_it() {
+        let mut req = sample_request();
+        req.constraints = p6r_viral_gpu_learned_constraints();
+
+        let seen = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+        let raw = {
+            let seen = Arc::clone(&seen);
+            move |req: UvClosureRequest| {
+                let seen = Arc::clone(&seen);
+                Box::pin(async move {
+                    seen.lock()
+                        .unwrap()
+                        .push(req.constraints.constraints.clone());
+                    if req
+                        .constraints
+                        .constraints
+                        .iter()
+                        .any(|line| line == "xxhash==0.8.3")
+                    {
+                        let attributions =
+                            attribute_conflict(P6R_VIRAL_GPU_STDERR, &req.constraints.provenance);
+                        return Err(
+                            match learned_fact_yield_needed(&attributions, P6R_VIRAL_GPU_STDERR) {
+                                Some(needed) => anyhow::Error::new(needed),
+                                None => anyhow!("no solution found"),
+                            },
+                        );
+                    }
+                    // uv in miniature: highest tensorboard whose own
+                    // `Requires-Dist` on protobuf agrees with the constraint.
+                    let protobuf_pin = req
+                        .constraints
+                        .constraints
+                        .iter()
+                        .find_map(|line| line.strip_prefix("protobuf=="))
+                        .map(|v| {
+                            uv_pep508::uv_pep440::Version::from_str(v)
+                                .expect("fixture pins a PEP 440 version")
+                        });
+                    let (tensorboard, requires_protobuf) = [
+                        ("2.21.0", ">=6.31.1,<8"),
+                        ("2.20.0", "!=4.24.0,>=3.19.6"),
+                    ]
+                    .into_iter()
+                    .find(|(_, requires)| {
+                        let specs =
+                            uv_pep508::uv_pep440::VersionSpecifiers::from_str(requires)
+                                .expect("fixture specifiers parse");
+                        protobuf_pin
+                            .as_ref()
+                            .is_none_or(|pin| specs.contains(pin))
+                    })
+                    .expect("one of the two candidates always resolves");
+                    Ok(UvClosure {
+                        wheels: vec![],
+                        pins: BTreeMap::from([
+                            ("tensorboard".to_string(), tensorboard.to_string()),
+                            ("requires-protobuf".to_string(), requires_protobuf.to_string()),
+                        ]),
+                        uv_version: "test".to_string(),
+                        auto_routed: vec![],
+                        auto_dropped: BTreeSet::new(),
+                        effective_input_requirements: None,
+                        dependency_graph: UvDependencyGraph::default(),
+                    })
+                }) as futures::future::BoxFuture<'static, Result<UvClosure>>
+            }
+        };
+
+        let yielded = Arc::new(Mutex::new(BTreeSet::new()));
+        let mut solve = with_learned_fact_yields(raw, Arc::clone(&yielded));
+        let closure = solve(req)
+            .await
+            .expect("dropping the guilty xxhash fact must let the closure resolve");
+
+        assert_eq!(
+            closure.pins["tensorboard"], "2.20.0",
+            "with `protobuf==5.29.3` still constraining the closure, 2.21.0's \
+             `protobuf>=6.31.1,<8` is out of reach and 2.20.0 is the pick",
+        );
+        let emitted = uv_pep508::uv_pep440::VersionSpecifiers::from_str(
+            &closure.pins["requires-protobuf"],
+        )
+        .expect("the emitted constrains bound parses");
+        assert!(
+            emitted.contains(
+                &uv_pep508::uv_pep440::Version::from_str("5.29.3").expect("5.29.3 parses")
+            ),
+            "the conda `constrains` row this bundle emits must admit the \
+             workspace's own conda protobuf 5.29.3; got `{emitted}`",
+        );
+        assert_eq!(
+            *yielded.lock().unwrap(),
+            BTreeSet::from(["xxhash".to_string()]),
+            "only the fact uv's report blamed may be given up; job 5742776 gave \
+             up ~130 of them, protobuf among the first, on trace mentions alone",
+        );
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            2,
+            "one retry, not one per learned fact",
+        );
+    }
+
     const SAGE_PASS_B_STDERR_ROUND_2: &str = "\
   x No solution found when resolving dependencies:
   |-> Because sympy==1.13.1 depends on mpmath>=1.1.0,<1.4 and mpmath==1.4.1,
@@ -13326,15 +14259,15 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
     type NoBuild =
         fn(String, Option<String>) -> futures::future::BoxFuture<'static, Result<BuiltSdistWheel>>;
 
-    fn sdist_source_fixture(name: &str, version: &str) -> crate::lock::SdistWheelSource {
-        crate::lock::SdistWheelSource {
+    fn sdist_source_fixture(name: &str, version: &str) -> Option<crate::lock::SdistWheelSource> {
+        Some(crate::lock::SdistWheelSource {
             index: "https://pypi.org/simple/".to_string(),
             name: name.to_string(),
             version: version.to_string(),
             sdist_url: format!(
                 "https://files.pythonhosted.org/packages/{name}-{version}.tar.gz#sha256=deadbeef"
             ),
-        }
+        })
     }
 
     /// Build a [`HealNeeded`] the way `compute_closure`'s two-pass would.

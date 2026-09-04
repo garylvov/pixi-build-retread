@@ -738,7 +738,7 @@ pub(crate) fn relax_pep508_with_abi_aliases(
     abi_aliases: &AbiAliasGraph,
 ) -> Result<String> {
     let req: Requirement =
-        Requirement::from_str(raw).map_err(|e| anyhow!("parsing `{raw}`: {e}"))?;
+        crate::pep508_lenient::parse_requirement_lenient(raw).map_err(|e| anyhow!("parsing `{raw}`: {e}"))?;
     // ABI anchors and every transitive semantic alias are off-limits to this
     // blanket policy rewrite. Candidate-level, same-major relaxation belongs
     // exclusively to the strict-first decision engine.

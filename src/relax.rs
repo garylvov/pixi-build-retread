@@ -279,7 +279,7 @@ pub fn translate(
     overrides: &BTreeMap<String, String>,
     policy: RelaxPolicy,
 ) -> Result<Option<CondaDep>> {
-    let req: Requirement = Requirement::from_str(raw)
+    let req: Requirement = crate::pep508_lenient::parse_requirement_lenient(raw)
         .map_err(|e| anyhow!("failed to parse `{raw}` as PEP 508: {e}"))?;
 
     // Marker evaluation: skip if the marker is unsatisfied in our target env.
@@ -1160,6 +1160,55 @@ mod tests {
                 original_specifiers: "==12.1.4".to_string(),
                 effective_specifiers: ">=12.1,<13".to_string(),
             }
+        );
+    }
+
+    /// p6z guard (c). Boarded from arm 5784994, which is the whole reason this
+    /// guard is here rather than in `pep508_lenient` alone.
+    ///
+    /// p6z's first pass routed the auto-bundle metadata readers through the
+    /// lenient parser and stopped there. The arm then produced the SAME
+    /// omegaconf clause refused by a DIFFERENT reader -- `relax::translate`,
+    /// which is what turns a wheel's `Requires-Dist` into a conda dep -- so
+    /// `holosoma-pack` was still short its detections. A lenient reader that
+    /// one of the crate's requirement readers bypasses is not a fix; it is a
+    /// fix with a hole. Every `Requirement::from_str` in this crate now goes
+    /// through the ladder, and this guard is the behavioural proof at the
+    /// reader that actually failed.
+    #[test]
+    fn p6z_c_the_conda_translation_reads_a_legacy_wildcard_the_way_uv_does() {
+        let dep = translate(
+            "PyYAML (>=5.1.*)",
+            &env(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            RelaxPolicy::None,
+        )
+        .expect("uv accepts this clause, so the conda translation must too")
+        .expect("a base dep with a satisfied marker is not filtered out");
+        assert_eq!(dep.name, "pyyaml");
+        assert!(
+            dep.spec.contains("5.1") && !dep.spec.contains('*'),
+            "the star is dropped, matching uv's `pyyaml>=5.1`: {dep:?}",
+        );
+
+        // NON-VACUITY: the strict reader really does refuse this line, so the
+        // guard passes because of the ladder.
+        assert!(
+            <Requirement as std::str::FromStr>::from_str("PyYAML (>=5.1.*)").is_err(),
+            "the strict reader must still refuse the clause the ladder repairs",
+        );
+        // ...and a clause no ladder can repair still fails here, loudly.
+        assert!(
+            translate(
+                "=== nonsense ===",
+                &env(),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                RelaxPolicy::None,
+            )
+            .is_err(),
+            "leniency is a repair ladder, not a shrug",
         );
     }
 

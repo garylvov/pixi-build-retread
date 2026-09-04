@@ -2284,7 +2284,7 @@ fn sibling_lock_constraints(
             .flat_map(|wheel| &wheel.requires_dist)
         {
             let Ok(requirement): Result<uv_pep508::Requirement, _> =
-                uv_pep508::Requirement::from_str(raw)
+                crate::pep508_lenient::parse_requirement_lenient(raw)
             else {
                 continue;
             };
@@ -5440,6 +5440,47 @@ impl Handler {
                         restored,
                         "bench: built_output_store adopted -- restored the adopted pass's advertised-identity records",
                     );
+                    // p6u. An adoption runs no back-off, so without this it
+                    // publishes no suppression rows and takes no strict
+                    // verdict -- a request that ships exactly the same
+                    // partially-suppressed content as the cold pass reads as a
+                    // clean pass. The findings travel in the adopted records;
+                    // republish them and apply the same gate to them.
+                    let (adopted_suppressed, adopted_reasons) =
+                        auto_imports_suppression_from_records(&adopted_advertised);
+                    let adopted_total =
+                        emit_auto_imports_suppression_counter(
+                            &format!(
+                                "conda/outputs ADOPTED work_directory={}",
+                                params.work_directory.display()
+                            ),
+                            &adopted_suppressed,
+                            false,
+                            0,
+                        );
+                    emit_auto_imports_suppressed_rows(
+                        &format!(
+                            "conda/outputs ADOPTED {}",
+                            params.work_directory.display()
+                        ),
+                        &adopted_suppressed,
+                        &adopted_reasons,
+                        params.host_platform.as_str(),
+                    );
+                    if let Err(refusal) = auto_imports_strict_verdict(
+                        auto_imports_strict_enabled(&config),
+                        &adopted_suppressed,
+                        false,
+                        &adopted_reasons,
+                        params.host_platform.as_str(),
+                    ) {
+                        tracing::error!(
+                            key = %key,
+                            suppressed_roots = adopted_total,
+                            "auto_imports: LANE C STRICT REFUSAL on an ADOPTED result -- {refusal}",
+                        );
+                        return Err(RpcError::invalid_params(refusal));
+                    }
                     self.invalidate_prepared_builds().await;
                     log_final_bundle_outputs(cached);
                     return Ok(cached.clone());
@@ -5572,6 +5613,32 @@ impl Handler {
         // bundle can trigger at most one re-resolve).
         let mut abi_backoff_suppressed: BTreeSet<String> = BTreeSet::new();
         let mut abi_backoff_count = 0usize;
+        // p6w: the ATTRIBUTED plan -- canonical conda name -> the normalized
+        // root names uv's conflict report blamed. Shared across every python
+        // in the request for the same reason `abi_backoff_suppressed` is: it
+        // only ever grows, which is the termination proof, and a root uv
+        // blamed under one python is not going to become satisfiable under
+        // the next one in the same resolve.
+        let mut auto_imports_attributed_roots: BTreeMap<String, BTreeSet<String>> =
+            BTreeMap::new();
+        // p6t: every Lane C root DROPPED anywhere in this request, keyed by
+        // bundle. The summary row below names them and publishes a counter,
+        // because a `suppressed_all=true` request that also produced a lock
+        // reads as a clean pass otherwise -- which is exactly how job
+        // 5748915's 27/27 was read before anyone counted the dropped roots.
+        let mut auto_imports_suppressed_all_bundles: BTreeMap<String, Vec<String>> =
+            BTreeMap::new();
+        // p6u: WHY each suppression happened, keyed the same way, so the
+        // per-env row can say `reason=abi-backoff` / `reason=resolve-backoff`
+        // and quote the violation that caused it. A dropped root with no
+        // reason is a silent drop wearing a number.
+        let mut auto_imports_suppression_reasons: BTreeMap<String, String> = BTreeMap::new();
+        // The subdir the suppression rows quote when they name the platform
+        // fact a dropped root needs. Starts as the request's host platform and
+        // is replaced by the RESOLUTION target's subdir (a named rich platform
+        // such as `linux-64-cuda-12-glibc-2-35`) as soon as one exists, because
+        // that is the platform the operator would have to declare on.
+        let mut target_conda_subdir_for_suppression = params.host_platform.as_str().to_string();
         // v4.2.0: the per-env pre-emission solve check (and its
         // bookkeeping / fail gate) was deleted with the legacy
         // mirror-solver; outputs ship unvalidated and `retread solve`
@@ -5589,6 +5656,7 @@ impl Handler {
                 ))
             })?;
             let python_version = target.python_version();
+            target_conda_subdir_for_suppression = target.conda_subdir().to_string();
             // Phase 1: materialize wheels + auto-bundle. Env-agnostic;
             // results reused across all per-env emissions.
             let t_materialize = std::time::Instant::now();
@@ -5607,33 +5675,118 @@ impl Handler {
             // retry suppresses injection for every bundle in this request
             // rather than one. Bounded to a single extra resolve by the
             // sentinel, and loud, so it is a reported finding either way.
-            let resolve_attempt = resolve_all(
-                &config,
-                &target,
-                &download_dir,
-                &source_dir,
-                &cache_dir,
-                &params.channels,
-                workspace_dir.as_deref(),
-                &abi_backoff_suppressed,
-            )
-            .await;
-            let (materialized, base_config, restore_relaxations, auto_imports_injected) =
-                match resolve_attempt {
-                    Ok(resolved) => resolved,
-                    Err(error)
-                        if auto_imports_injection_enabled(&config)
-                            && !abi_backoff_suppressed
-                                .contains(AUTO_IMPORTS_SUPPRESS_ALL) =>
-                    {
+            // p6w: THE ATTRIBUTED LADDER. Each turn resolves, and on failure
+            // asks uv's own conflict report which of the injected roots it
+            // blamed. Named roots are dropped -- only those -- and the resolve
+            // is retried with every sibling detection still in. The
+            // whole-request drop below is now the FALLBACK, taken only when
+            // attribution names nothing, and it says so when it is taken.
+            let request_label = format!(
+                "conda/outputs {} python={python_version}",
+                params.work_directory.display(),
+            );
+            let mut attributed_round = 0usize;
+            let (
+                materialized,
+                base_config,
+                restore_relaxations,
+                auto_imports_injected,
+                auto_imports_suppressed_by_bundle,
+            ) = loop {
+                let mut injected_observed: BTreeMap<String, Vec<String>> = BTreeMap::new();
+                let resolve_attempt = resolve_all(
+                    &config,
+                    &target,
+                    &download_dir,
+                    &source_dir,
+                    &cache_dir,
+                    &params.channels,
+                    workspace_dir.as_deref(),
+                    &abi_backoff_suppressed,
+                    &auto_imports_attributed_roots,
+                    &mut injected_observed,
+                )
+                .await;
+                let error = match resolve_attempt {
+                    Ok(resolved) => break resolved,
+                    Err(error) => error,
+                };
+                // Injection off, or the whole-request back-off already spent:
+                // there is nothing left to drop, so this is a real failure and
+                // must not be retried into a second identical resolve.
+                if !auto_imports_injection_enabled(&config)
+                    || abi_backoff_suppressed.contains(AUTO_IMPORTS_SUPPRESS_ALL)
+                {
+                    return Err(RpcError::invalid_params(format!(
+                        "resolving wheels for python {python_version}: {error:#}"
+                    )));
+                }
+                let error_text = format!("{error:#}");
+                match attributed_backoff_decision(
+                    attributed_round,
+                    &error_text,
+                    &injected_observed,
+                    &auto_imports_attributed_roots,
+                ) {
+                    AttributedBackoffDecision::DropRoots(drops) => {
+                        attributed_round += 1;
+                        abi_backoff_count += 1;
+                        emit_auto_imports_root_dropped_rows(&request_label, &drops);
+                        for drop in &drops {
+                            auto_imports_attributed_roots
+                                .entry(drop.bundle.clone())
+                                .or_default()
+                                .insert(drop.name.clone());
+                            auto_imports_suppression_reasons.insert(
+                                drop.bundle.clone(),
+                                format!(
+                                    "{AUTO_IMPORTS_REASON_ATTRIBUTED_BACKOFF}: uv named \
+                                     `{}` -- {} -- {}",
+                                    drop.root, drop.clause, drop.remedy,
+                                ),
+                            );
+                        }
                         tracing::warn!(
                             python = %python_version,
-                            error = %format!("{error:#}"),
-                            "auto_imports: RESOLVE BACK-OFF -- wheel resolution failed with                              Lane C roots injected; retrying with injection suppressed for                              every bundle in this request. The error above is a FINDING: a                              detected dependency this workspace cannot resolve.",
+                            round = attributed_round,
+                            dropped = drops.len(),
+                            roots = %drops
+                                .iter()
+                                .map(|d| format!("{}={}", d.bundle, d.root))
+                                .collect::<Vec<_>>()
+                                .join(","),
+                            "auto_imports: ATTRIBUTED RESOLVE BACK-OFF -- uv's conflict report \
+                             named these roots as the cause, so exactly these are withheld and \
+                             every other detection is re-resolved WITH its roots. This is the \
+                             p6u-1 remedy: a request no longer drops all of its detections to \
+                             learn that one of them is unsatisfiable.",
                         );
-                        abi_backoff_suppressed
-                            .insert(AUTO_IMPORTS_SUPPRESS_ALL.to_string());
+                        continue;
+                    }
+                    AttributedBackoffDecision::FallBackToAll(why) => {
+                        tracing::warn!(
+                            python = %python_version,
+                            round = attributed_round,
+                            attribution = %why,
+                            error = %error_text,
+                            "auto_imports: RESOLVE BACK-OFF -- wheel resolution failed with \
+                             Lane C roots injected and ATTRIBUTION DID NOT NAME A CULPRIT \
+                             ({why}); falling back to suppressing injection for every bundle \
+                             in this request. The error above is a FINDING: a detected \
+                             dependency this workspace cannot resolve.",
+                        );
+                        emit_auto_imports_attribution_fallback_row(
+                            &request_label,
+                            &why,
+                            &injected_observed,
+                        );
+                        abi_backoff_suppressed.insert(AUTO_IMPORTS_SUPPRESS_ALL.to_string());
+                        auto_imports_suppression_reasons.insert(
+                            AUTO_IMPORTS_SUPPRESS_ALL.to_string(),
+                            format!("{AUTO_IMPORTS_REASON_RESOLVE_BACKOFF}: {why}: {error_text}"),
+                        );
                         abi_backoff_count += 1;
+                        let mut retried_injected: BTreeMap<String, Vec<String>> = BTreeMap::new();
                         let retried = resolve_all(
                             &config,
                             &target,
@@ -5643,6 +5796,8 @@ impl Handler {
                             &params.channels,
                             workspace_dir.as_deref(),
                             &abi_backoff_suppressed,
+                            &auto_imports_attributed_roots,
+                            &mut retried_injected,
                         )
                         .await
                         .map_err(|e| {
@@ -5654,14 +5809,16 @@ impl Handler {
                             python = %python_version,
                             "auto_imports: RESOLVE BACK-OFF SUCCEEDED -- resolved without                              injected roots",
                         );
-                        retried
+                        break retried;
                     }
-                    Err(e) => {
-                        return Err(RpcError::invalid_params(format!(
-                            "resolving wheels for python {python_version}: {e:#}"
-                        )));
-                    }
-                };
+                }
+            };
+            for (bundle, roots) in auto_imports_suppressed_by_bundle {
+                auto_imports_suppressed_all_bundles
+                    .entry(bundle)
+                    .or_default()
+                    .extend(roots);
+            }
             pending_output_relaxations.extend(restore_relaxations.iter().cloned());
             tracing::info!(
                 python = %python_version,
@@ -6050,8 +6207,12 @@ impl Handler {
                                 "auto_imports: ABI BACK-OFF -- emission failed the ABI                                  invariant with Lane C roots injected; re-resolving this                                  bundle WITHOUT them. The dropped names are a FINDING:                                  each is a detected dependency this workspace cannot                                  satisfy under its current ABI anchors.",
                             );
                             abi_backoff_suppressed.insert(base_bundle.conda_name.clone());
+                            auto_imports_suppression_reasons.insert(
+                                base_bundle.conda_name.clone(),
+                                format!("{AUTO_IMPORTS_REASON_ABI_BACKOFF}: {violation}"),
+                            );
                             abi_backoff_count += 1;
-                            let (retry_materialized, retry_config, _, _) = resolve_all(
+                            let (retry_materialized, retry_config, _, _, _) = resolve_all(
                                 &config,
                                 &target,
                                 &download_dir,
@@ -6060,6 +6221,8 @@ impl Handler {
                                 &params.channels,
                                 workspace_dir.as_deref(),
                                 &abi_backoff_suppressed,
+                                &auto_imports_attributed_roots,
+                                &mut BTreeMap::new(),
                             )
                             .await
                             .map_err(|e| {
@@ -6103,6 +6266,45 @@ impl Handler {
                                     )));
                                 }
                             }
+                        }
+                        // p6s-4: the back-off is already spent for this
+                        // bundle and the invariant rejected it AGAIN. Refuse
+                        // here, loudly and by name, rather than handing an
+                        // ABI violation to `collect_conflicts` -- which has no
+                        // shape for one, so the request continued and died
+                        // three layers away as `-32603 reconstructing final
+                        // relaxation record` plus a build_dispatch panic
+                        // (job 5752280). Failure is loud and reaches an actor.
+                        Err(error)
+                            if error.downcast_ref::<AbiInvariantViolation>().is_some()
+                                && abi_backoff_already_spent(
+                                    &abi_backoff_suppressed,
+                                    &base_bundle.conda_name,
+                                ) =>
+                        {
+                            let violation = format!("{error:#}");
+                            let still_injected = auto_imports_injected
+                                .get(&base_bundle.conda_name)
+                                .cloned()
+                                .unwrap_or_default();
+                            let already_dropped = auto_imports_suppressed_all_bundles
+                                .get(&base_bundle.conda_name)
+                                .cloned()
+                                .unwrap_or_default();
+                            let refusal = abi_backoff_exhausted_refusal(
+                                &base_bundle.conda_name,
+                                python_version,
+                                &still_injected,
+                                &already_dropped,
+                                &violation,
+                            );
+                            tracing::error!(
+                                bundle = %base_bundle.conda_name,
+                                still_injected = %still_injected.join(","),
+                                already_dropped = %already_dropped.join(","),
+                                "auto_imports: ABI BACK-OFF EXHAUSTED -- {refusal}",
+                            );
+                            return Err(RpcError::internal(refusal));
                         }
                         Err(error) => {
                             let mut bundle_conflicts = Vec::new();
@@ -6163,6 +6365,32 @@ impl Handler {
                                 .constraints
                                 .iter()
                                 .map(format_constraint_spec)
+                                .collect(),
+                            // p6u: the Lane C back-off decision AS IT STOOD
+                            // when this identity was advertised. conda/build_v1
+                            // re-runs this very emission and has no back-off of
+                            // its own; without these two fields it re-derives a
+                            // plan this pass had already rejected and the ABI
+                            // invariant refuses the same emission a second time
+                            // (arm oncert-p6tb 5757174, `-32603`).
+                            auto_imports_suppressed_bundles: abi_backoff_suppressed
+                                .iter()
+                                .cloned()
+                                .collect(),
+                            auto_imports_suppressed: auto_imports_suppressed_envs(
+                                &auto_imports_suppressed_all_bundles,
+                                &auto_imports_suppression_reasons,
+                            ),
+                            // p6w: the ATTRIBUTED plan, so build_v1 withholds
+                            // exactly the roots uv named and re-injects the
+                            // rest -- the coarse field above cannot express
+                            // "this bundle, minus one root".
+                            auto_imports_suppressed_roots: auto_imports_attributed_roots
+                                .iter()
+                                .map(|(env, roots)| advertised_identity::SuppressedRoots {
+                                    env: env.clone(),
+                                    roots: roots.iter().cloned().collect(),
+                                })
                                 .collect(),
                         };
                         // Also carried into the shared built-output store, so
@@ -6305,13 +6533,60 @@ impl Handler {
         }
         // One summary line per request, so a back-off is always a reported
         // finding and never a silent retreat. Emitted at WARN when it fired.
+        // p6t: the counter the harness zero-gates. Emitted UNCONDITIONALLY --
+        // a gate that only exists on the bad path cannot be checked for zero
+        // on the good one, and "the row was absent" is not evidence (a run
+        // that died before the summary produces the same absence).
+        let suppressed_all_fired = abi_backoff_suppressed.contains(AUTO_IMPORTS_SUPPRESS_ALL);
+        let suppressed_root_total = emit_auto_imports_suppression_counter(
+            &format!(
+                "conda/outputs work_directory={} pythons={}",
+                params.work_directory.display(),
+                pythons.join("+"),
+            ),
+            &auto_imports_suppressed_all_bundles,
+            suppressed_all_fired,
+            abi_backoff_count,
+        );
+        // p6u: the per-ENV rows. The counter above is the number a harness
+        // gates on; these are the rows a person acts on -- which environment
+        // shipped short, which roots, why, and what declaration would fix it.
+        let suppressed_envs = emit_auto_imports_suppressed_rows(
+            &format!("conda/outputs {}", params.work_directory.display()),
+            &auto_imports_suppressed_all_bundles,
+            &auto_imports_suppression_reasons,
+            &target_conda_subdir_for_suppression,
+        );
+        let suppressed_named = auto_imports_suppression_roots_by_bundle(
+            &auto_imports_suppressed_all_bundles,
+        );
         if abi_backoff_count > 0 {
             tracing::warn!(
                 backoffs = abi_backoff_count,
                 bundles = %abi_backoff_suppressed.iter().cloned().collect::<Vec<_>>().join(","),
-                suppressed_all = abi_backoff_suppressed.contains(AUTO_IMPORTS_SUPPRESS_ALL),
+                suppressed_all = suppressed_all_fired,
+                suppressed_roots = suppressed_root_total,
+                roots_by_bundle = %suppressed_named,
                 "auto_imports: LANE C BACK-OFF SUMMARY -- these bundles emitted WITHOUT their detected roots, because injecting them either contradicted a workspace ABI anchor or made resolution fail. Every dropped root is a FINDING for manifest work, not a resolved issue. A `*` entry means the resolve-time back-off suppressed every bundle in the request.",
             );
+        }
+        // p6u: THE ZERO-GATE, in the backend rather than only in a harness
+        // grep. A harness gate can only refuse a lock that already exists;
+        // this refuses before one is advertised, and it names every dropped
+        // root and the declaration that would restore it.
+        if let Err(refusal) = auto_imports_strict_verdict(
+            auto_imports_strict_enabled(&config),
+            &auto_imports_suppressed_all_bundles,
+            suppressed_all_fired,
+            &auto_imports_suppression_reasons,
+            &target_conda_subdir_for_suppression,
+        ) {
+            tracing::error!(
+                suppressed_envs,
+                suppressed_roots = suppressed_root_total,
+                "auto_imports: LANE C STRICT REFUSAL -- {refusal}",
+            );
+            return Err(RpcError::invalid_params(refusal));
         }
         Ok(result)
     }
@@ -6966,9 +7241,60 @@ impl Handler {
             params.output.name.as_normalized(),
         )?;
 
+        // p6u. THE CARRY. `conda/build_v1` re-does the emission
+        // `conda/outputs` already made, and it has no Lane C back-off of its
+        // own -- so before p6u it re-derived a plan the back-off had already
+        // rejected, the ABI invariant refused the same emission a second time,
+        // and the request died `-32603 reconstructing final relaxation record`
+        // (arm oncert-p6tb 5757174). The advertising pass's decision travels in
+        // the advertised-identity record, which is loaded above and is
+        // ALREADY the authority for this request's workspace fingerprint and
+        // emitted run-deps; the suppression set is the same kind of fact and
+        // now rides the same door. An adopted store hit leaves the same record
+        // (`restore_advertised_identities`), so a warm run carries it too.
+        let carried_auto_imports_suppression: BTreeSet<String> = advertised_identity_record
+            .as_ref()
+            .map(AdvertisedIdentityRecord::carried_auto_imports_suppression)
+            .unwrap_or_default();
+        // p6w: the finer half of the same carry. Without it a bundle whose
+        // culprit root alone was withheld looks unsuppressed to build_v1,
+        // which re-injects the very root uv refused -- the p6t-4 failure
+        // reproduced one root at a time.
+        let carried_auto_imports_suppression_roots: BTreeMap<String, BTreeSet<String>> =
+            advertised_identity_record
+                .as_ref()
+                .map(AdvertisedIdentityRecord::carried_auto_imports_suppression_roots)
+                .unwrap_or_default();
+        if !carried_auto_imports_suppression_roots.is_empty() {
+            tracing::warn!(
+                output = %params.output.name.as_normalized(),
+                attributed = %carried_auto_imports_suppression_roots
+                    .iter()
+                    .map(|(env, roots)| format!(
+                        "{env}={}",
+                        roots.iter().cloned().collect::<Vec<_>>().join("+")
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(";"),
+                "auto_imports: CARRYING the advertising pass's ATTRIBUTED root drops into \
+                 conda/build_v1 -- exactly the roots uv named stay out, and every other \
+                 detection is re-injected here as it was there",
+            );
+        }
+        if !carried_auto_imports_suppression.is_empty() {
+            tracing::warn!(
+                output = %params.output.name.as_normalized(),
+                suppressed_bundles = %carried_auto_imports_suppression
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(","),
+                "auto_imports: CARRYING the advertising pass's Lane C back-off into                  conda/build_v1 -- this emission is reconstructed under the plan                  conda/outputs actually reached, not a fresh one the back-off had                  already rejected",
+            );
+        }
         // Re-resolve materialized bundles, then autodiscover emissions
         // and pick the one matching the requested output name.
-        let (materialized, base_config, restore_relaxations, _auto_imports_injected) =
+        let (materialized, base_config, restore_relaxations, build_auto_imports_injected, _) =
             resolve_all(
                 &config,
                 &target,
@@ -6977,7 +7303,9 @@ impl Handler {
                 &cache_dir,
                 &params.channels,
                 workspace_dir.as_deref(),
-                &BTreeSet::new(),
+                &carried_auto_imports_suppression,
+                &carried_auto_imports_suppression_roots,
+                &mut BTreeMap::new(),
             )
             .await
             .map_err(|e| RpcError::internal(format!("resolving wheels: {e:#}")))?;
@@ -7122,6 +7450,41 @@ impl Handler {
                 None,
             )
             .map_err(|error| {
+                // p6t-4, measured on arm oncert-p6tb 5757174. `conda/build_v1`
+                // re-does the emission `conda/outputs` already performed, and
+                // it has NO Lane C back-off: the suppression `conda/outputs`
+                // decided (`ABI BACK-OFF SUCCEEDED bundle=protomotions-deps-pack`,
+                // in BOTH arms) is not carried across this RPC boundary, so the
+                // invariant rejects the same emission a second time here. Under
+                // p6s-4 every error on this line — an `AbiInvariantViolation`
+                // included — was reported as "reconstructing final relaxation
+                // record", which is misattribution: the relaxation record is
+                // fine, the ABI contract is what refused. Arm B's operator saw
+                // `-32603 reconstructing final relaxation record for
+                // protomotions-deps-pack` and had to open a 179 MB backend log
+                // to learn it was 67 `bundle emission rejected by ABI
+                // invariant` rows about `numpy >=1.0.0` bare-major specs.
+                //
+                // Carrying the suppression set across the boundary is the real
+                // fix and is boarded; naming the actual refusal is the part
+                // that must never wait, because a failure that reaches an actor
+                // under the wrong name has not reached an actor.
+                if let Some(violation) = error.downcast_ref::<AbiInvariantViolation>() {
+                    let refusal = build_v1_abi_refusal(
+                        &bundle.conda_name,
+                        advertised_identity_record.as_ref(),
+                        build_auto_imports_injected
+                            .get(&base_bundle.conda_name)
+                            .map(Vec::as_slice)
+                            .unwrap_or_default(),
+                        violation,
+                    );
+                    tracing::error!(
+                        bundle = %bundle.conda_name,
+                        "auto_imports: ABI INVARIANT IN conda/build_v1 -- {refusal}",
+                    );
+                    return RpcError::internal(refusal);
+                }
                 RpcError::internal(format!(
                     "reconstructing final relaxation record for {}: {error:#}",
                     bundle.conda_name
@@ -7941,6 +8304,16 @@ async fn resolve_all(
     // for this pass. Grows by one bundle per ABI back-off; empty on the
     // first pass, so the default path is byte-identical to before.
     suppress_auto_imports: &BTreeSet<String>,
+    // p6w. The ATTRIBUTED plan: canonical conda name -> the PEP 503-normalized
+    // root names uv's conflict report blamed for that bundle. A bundle in here
+    // and NOT in `suppress_auto_imports` keeps every root uv did not name.
+    // Empty on the first pass, so the default path is unchanged.
+    suppress_auto_imports_roots: &BTreeMap<String, BTreeSet<String>>,
+    // p6w OUT-PARAMETER. Filled bundle by bundle as the resolve proceeds, so
+    // that when it FAILS the caller still holds the roots the failing pass
+    // injected -- including the failing bundle's own, which the Ok tuple below
+    // would have carried had there been an Ok. Attribution reads this.
+    injected_observed: &mut BTreeMap<String, Vec<String>>,
 ) -> Result<(
     Vec<Bundle>,
     RetreadConfig,
@@ -7949,8 +8322,17 @@ async fn resolve_all(
     // Lets the emission side decide whether an ABI failure is worth a
     // back-off, and name the roots it dropped.
     BTreeMap<String, Vec<String>>,
+    // p6t: Lane C roots DETECTED and then DROPPED per bundle, because the
+    // back-off was active for it. Read by the request summary so a
+    // `suppressed_all=true` request names what it dropped and carries a
+    // counter the harness can zero-gate.
+    BTreeMap<String, Vec<String>>,
 )> {
     let mut auto_imports_injected_by_bundle: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut auto_imports_suppressed_by_bundle: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    // p6w: the "this bundle has no attributed drops" case, borrowed rather
+    // than allocated per bundle.
+    let empty_suppressed_roots: BTreeSet<String> = BTreeSet::new();
     // Bind the pack-level policy to the target used by every source-build
     // branch in this resolution. Resolution/cache identity intentionally does
     // not change: the policy controls how an exact cache miss is produced,
@@ -8113,6 +8495,9 @@ async fn resolve_all(
         // Packaging / courier / lock-write downstream are unchanged.
         // `Ok(None)` = no uv-resolvable roots (all source-built entries);
         // the materialization path then runs unpinned.
+        // p6w: filled by `uv_group_closure` the moment injection is decided,
+        // read by both arms of the call below.
+        let mut injected_this_bundle: Vec<String> = Vec::new();
         let (
             uv_closure,
             deps_from_root_names,
@@ -8122,6 +8507,7 @@ async fn resolve_all(
             conda_co_solve,
             sibling_pin_relaxations,
             auto_imports_injected,
+            auto_imports_suppressed,
         ): (
             Option<crate::uv_closure::UvClosure>,
             std::collections::BTreeSet<String>,
@@ -8130,6 +8516,7 @@ async fn resolve_all(
             BTreeSet<String>,
             CondaCoSolveContext,
             Vec<auto_bundle::WheelMetadataRelaxation>,
+            Vec<String>,
             Vec<String>,
         ) = uv_group_closure(
             &group_name,
@@ -8150,13 +8537,40 @@ async fn resolve_all(
             ),
             suppress_auto_imports.contains(AUTO_IMPORTS_SUPPRESS_ALL)
                 || suppress_auto_imports.contains(&canonical_conda_name(&group_name)),
+            suppress_auto_imports_roots
+                .get(&canonical_conda_name(&group_name))
+                .unwrap_or(&empty_suppressed_roots),
+            &mut injected_this_bundle,
         )
         .await
+        .inspect_err(|_| {
+            // p6w: the roots are recorded on the FAILURE path too. Without
+            // this the attributed back-off has nothing to attribute, which is
+            // exactly the state p6u-1 boarded.
+            if !injected_this_bundle.is_empty() {
+                injected_observed.insert(
+                    canonical_conda_name(&group_name),
+                    std::mem::take(&mut injected_this_bundle),
+                );
+            }
+        })
         .with_context(|| format!("computing uv closure for bundle `{group_name}`"))?;
+        if !injected_this_bundle.is_empty() {
+            injected_observed.insert(
+                canonical_conda_name(&group_name),
+                std::mem::take(&mut injected_this_bundle),
+            );
+        }
         if !auto_imports_injected.is_empty() {
             auto_imports_injected_by_bundle.insert(
                 canonical_conda_name(&group_name),
                 auto_imports_injected.clone(),
+            );
+        }
+        if !auto_imports_suppressed.is_empty() {
+            auto_imports_suppressed_by_bundle.insert(
+                canonical_conda_name(&group_name),
+                auto_imports_suppressed.clone(),
             );
         }
         // F32: declared pins widened to converge on a co-activated sibling are
@@ -8479,6 +8893,7 @@ async fn resolve_all(
         effective,
         pending_relaxations,
         auto_imports_injected_by_bundle,
+        auto_imports_suppressed_by_bundle,
     ))
 }
 
@@ -8562,6 +8977,65 @@ async fn build_sdist_wheel_with_specifiers(
     target: ResolutionTarget,
     cache_dir: PathBuf,
 ) -> Result<crate::uv_closure::BuiltSdistWheel> {
+    // p6s RUNG 2.5 -- WHEEL BEFORE BUILD.
+    //
+    // The heal's build rung used to be entered without ever asking whether
+    // the index chain publishes a WHEEL for this exact `(name, specifiers)`
+    // that satisfies the artifact target's compatibility contract. The
+    // sibling phase-1 entry path never had that hole: it reaches its sdist
+    // fallback only after `crate::pypi::resolve` returns an index MISS. So
+    // `ResolutionTarget`'s declared-glibc ceiling had a live consumer on one
+    // path and none on the other, and a package whose real wheels live on a
+    // private index while public PyPI carries only a `wheel_stub`
+    // PLACEHOLDER sdist went straight to a PEP 517 build.
+    //
+    // That build can never succeed: the placeholder's whole job is to
+    // re-download the very wheel we can already resolve, and it tests the
+    // candidate filenames against the BUILD HOST's tag set -- so a
+    // `manylinux_2_35` wheel is unreachable from a glibc 2.34 builder no
+    // matter how reachable the index is. Measured on oncert-p6r job 5745086:
+    // `isaacsim-extscache-kit-sdk==5.1.0.0` took this rung, and wheel_stub
+    // reported `Didn't find wheel` while
+    // `isaacsim_extscache_kit_sdk-5.1.0.0-cp311-none-manylinux_2_35_x86_64.whl`
+    // was listed on pypi.nvidia.com the whole time.
+    //
+    // So: try the target-compatible wheel first. A hit means this was never
+    // an sdist-only package and nothing is built; `sdist_source` is `None`
+    // because no sdist produced these bytes.
+    if let Ok((wheel_index, wheel)) = fetch_from_pypi_index_chain(
+        &index_urls,
+        |index| {
+            let name = name.clone();
+            let specifiers = specifiers.clone();
+            let target = target.clone();
+            async move {
+                crate::pypi::resolve(&index, &name, &specifiers, target.wheel_target())
+                    .await
+                    .map(|wheel| (index, wheel))
+            }
+        },
+        format!(
+            "sdist auto-build: no index in the chain has a target-compatible wheel for `{name}`"
+        ),
+    )
+    .await
+    {
+        match index_wheel_instead_of_build(&name, &wheel_index, &wheel, &cache_dir).await {
+            Ok(built) => return Ok(built),
+            Err(error) => {
+                // Fail OPEN to the build rung rather than losing the heal:
+                // the wheel was resolvable but could not be fetched/stored.
+                tracing::warn!(
+                    pkg = %name,
+                    index = %wheel_index,
+                    wheel = %wheel.filename,
+                    error = %format!("{error:#}"),
+                    "wheel-before-build: index wheel resolved but could not be materialized; \
+                     falling through to the sdist auto-build rung",
+                );
+            }
+        }
+    }
     let (index, version, sdist) = fetch_from_pypi_index_chain(
         &index_urls,
         |index| async {
@@ -8614,12 +9088,83 @@ async fn build_sdist_wheel_with_specifiers(
         filename,
         wheel_path: store_path,
         sha256,
-        sdist_source: crate::lock::SdistWheelSource {
+        sdist_source: Some(crate::lock::SdistWheelSource {
             index,
             name: name.clone(),
             version: version.to_string(),
             sdist_url,
-        },
+        }),
+    })
+}
+
+/// PEP 427 version field of a wheel filename
+/// (`{name}-{version}(-{build})?-{py}-{abi}-{platform}.whl`).
+pub(crate) fn wheel_filename_version(filename: &str) -> Result<&str> {
+    let stem = filename
+        .strip_suffix(".whl")
+        .ok_or_else(|| anyhow!("wheel filename `{filename}` does not end in `.whl`"))?;
+    let mut parts = stem.split('-');
+    let _name = parts
+        .next()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow!("wheel filename `{filename}` has no distribution field"))?;
+    parts
+        .next()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow!("wheel filename `{filename}` has no version field"))
+}
+
+/// Materialize an index wheel the heal resolved INSTEAD of building a
+/// placeholder sdist (see the wheel-before-build rung above). Fetches the
+/// exact artifact, persists it content-addressed in the shared wheel store
+/// (same store and same `store_wheel_in_cache` call the build rung uses, so
+/// `retread install` replay is identical), and reports it with no
+/// `sdist_source`.
+async fn index_wheel_instead_of_build(
+    name: &str,
+    index: &str,
+    wheel: &crate::pypi::ResolvedWheel,
+    cache_dir: &Path,
+) -> Result<crate::uv_closure::BuiltSdistWheel> {
+    let version = wheel_filename_version(&wheel.filename)
+        .with_context(|| format!("wheel-before-build: resolving version for `{name}`"))?
+        .to_string();
+    let store_root = crate::courier::retread_wheel_store_root();
+    let dest_dir = cache_dir
+        .join("sdist-auto-build-outputs")
+        .join(canonical_conda_name(name))
+        .join(".retread-index-wheel");
+    tokio::fs::create_dir_all(&dest_dir)
+        .await
+        .with_context(|| format!("wheel-before-build: creating {}", dest_dir.display()))?;
+    let fetched = crate::wheel::fetch_wheel_cached(
+        &wheel.url,
+        wheel.sha256.as_deref(),
+        &dest_dir,
+        &store_root,
+    )
+    .await
+    .with_context(|| format!("wheel-before-build: fetching {}", wheel.url))?;
+    let sha256 = crate::wheel::store_wheel_in_cache(&fetched, &store_root)
+        .await
+        .with_context(|| format!("wheel-before-build: storing index wheel for `{name}`"))?;
+    tracing::info!(
+        pkg = %name,
+        version = %version,
+        index = %index,
+        wheel = %wheel.filename,
+        sha256 = %sha256,
+        url = %wheel.url,
+        "wheel-before-build: the index chain already publishes a target-compatible wheel for \
+         this exact version; using it and building NOTHING",
+    );
+    Ok(crate::uv_closure::BuiltSdistWheel {
+        pypi_name: name.to_string(),
+        version,
+        wheel_path: store_root.join(&sha256).join(&wheel.filename),
+        sha256,
+        filename: wheel.filename.clone(),
+        sdist_source: None,
     })
 }
 
@@ -8651,7 +9196,7 @@ fn dedupe_roots_last_wins(roots: Vec<String>) -> Vec<String> {
 /// e.g. `"Foo_Bar[extra]==1.0"` -> `Some("foo-bar")`. `None` if the string
 /// doesn't parse as a PEP 508 requirement.
 fn root_req_name(req: &str) -> Option<String> {
-    let parsed: uv_pep508::Requirement = uv_pep508::Requirement::from_str(req).ok()?;
+    let parsed: uv_pep508::Requirement = crate::pep508_lenient::parse_requirement_lenient(req).ok()?;
     Some(canonical_conda_name(parsed.name.as_ref()))
 }
 
@@ -9947,7 +10492,7 @@ fn apply_deps_from_conda_floors(
     let mut eligible_roots = BTreeSet::new();
     for raw in roots {
         let Ok(requirement): Result<uv_pep508::Requirement, _> =
-            uv_pep508::Requirement::from_str(raw)
+            crate::pep508_lenient::parse_requirement_lenient(raw)
         else {
             continue;
         };
@@ -10039,7 +10584,7 @@ fn apply_deps_from_conda_floors(
 
     for (pypi, floor) in candidates {
         let line = format!("{pypi}{}", floor.floor_spec);
-        let _: uv_pep508::Requirement = uv_pep508::Requirement::from_str(&line)
+        let _: uv_pep508::Requirement = crate::pep508_lenient::parse_requirement_lenient(&line)
             .with_context(|| format!("validating deps-from advisory constraint `{line}`"))?;
         constraints.constraints.push(line.clone());
         constraints.provenance.insert(
@@ -10065,6 +10610,238 @@ fn apply_deps_from_conda_floors(
     Ok(())
 }
 
+/// p6n. How many times one bundle's closure may be resolved while the
+/// workspace conda facts are being corrected. TWO: pass 1 gathers facts
+/// without the bundle (the pack does not exist yet), pass 2 folds the
+/// bundle's own conda-side contribution back in and re-closes if any learned
+/// version moved. A third pass has never been observed to move anything and
+/// would cost a full uv lock to prove it.
+const P6N_MAX_FACT_PASSES: usize = 2;
+
+/// p6n. The conda specs each precise consuming environment is solved with,
+/// for the fact-gathering solve.
+///
+/// The bundle under construction is removed (it does not exist yet, so it
+/// cannot be a spec) -- that exclusion is pre-p6n behavior and unchanged.
+/// What p6n adds is `contribution`: the conda-side specs the bundle will
+/// itself put into that environment. Without them the facts describe a
+/// prefix the workspace never builds. Measured instance (job 5720294,
+/// `LANE-C-WARM-LOG.md` §14): `isaaclab-viral-pack` hand-pins
+/// `ray = "==2.49.1"`, which routes to conda `ray-core 2.49.1 -> libgrpc
+/// 1.71.0 -> libprotobuf >=5.29.3,<5.29.4.0a0`, so `viral-gpu` resolves
+/// `protobuf 5.29.3`. With the pack removed the same environment solves
+/// FREE to `protobuf 7.35.1`, and that is the version the closure learned --
+/// so it resolved `tensorboard 2.21.0` (`protobuf>=6.31.1,<8`) and emitted a
+/// `constrains` floor the real environment can never satisfy.
+///
+/// A contribution spec for the bundle's own name is ignored: the exclusion
+/// above is not negotiable.
+fn precise_env_solve_specs(
+    deps: &BTreeMap<String, String>,
+    bundle_key: &PypiKey,
+    contribution: &BTreeMap<String, String>,
+    python_version: &str,
+) -> Vec<crate::relax::CondaMatchSpec> {
+    let mut specs = deps
+        .iter()
+        .filter_map(|(name, spec)| {
+            let name = CondaName::new(name.as_str());
+            if name.key() == *bundle_key {
+                return None;
+            }
+            Some(name.match_spec(spec))
+        })
+        .collect::<Vec<_>>();
+    // Folded AFTER the environment's own declarations and never in place of
+    // them: both specs reach the solver and the solver intersects them, which
+    // is what a real prefix holding both does.
+    for (name, spec) in contribution {
+        let name = CondaName::new(name.as_str());
+        if name.key() == *bundle_key {
+            continue;
+        }
+        if name.as_spec() == "python" {
+            continue;
+        }
+        specs.push(name.match_spec(spec));
+    }
+    specs.push(CondaName::new("python").match_spec(&format!("{python_version}.*")));
+    specs
+}
+
+/// p6n. The bundle's own conda-side contribution to its consuming
+/// environments, as far as it is knowable at the point of use.
+///
+/// Two producers, both of which the pack owns:
+///
+/// * `retread-overrides` -- hand pins in the pack's own manifest, mapped to
+///   their conda spelling through the effective name map (which already
+///   carries the parselmouth table, see `effective_name_map`). This is the
+///   producer of the live instance: `ray = "==2.49.1"` -> `ray-core ==2.49.1`.
+/// * the resolved closure's auto-routes -- every PyPI member the closure
+///   moved to the conda side, at the conda version it picked. These are only
+///   available on the SECOND pass, which is exactly why there is one.
+///
+/// Names the pack ships itself (`[retread-wheels]` entries and closure
+/// members it bundles) are NOT a contribution to the environment's conda
+/// side and are never folded in.
+/// p6n-b. The exact version a pack override contributes to the conda side,
+/// or `None` when the override is not an exact pin.
+///
+/// THE DEFECT THIS CLOSES (job 5727660, `LANE-C-WARM-LOG.md` §16). p6n folded
+/// every non-empty override into the consuming environments' conda solve
+/// verbatim, INCLUDING open-ended ones. `effective.overrides` is not the
+/// pack manifest's hand pins alone: `pack_overrides::merge_ledger_overrides`
+/// REPLACES a manifest pin with the repair ledger's entry, and those are
+/// routinely floors. In `imprint-data/.retread/auto-overrides.json`,
+/// `pypi-packs/protomotions-deps-pack` carries `sentry-sdk = ">=2.0.0"`
+/// (provenance `DepsFromPin`), which supersedes the manifest's
+/// `sentry-sdk = "==2.29.1"`. Folded as a conda spec into every precise
+/// consuming environment and solved with `SolveStrategy::Highest`, `>=2.0.0`
+/// INVENTED conda `sentry-sdk 2.68.1` -- a package `pm-isaaclab` does not
+/// install at all (it gets sentry-sdk 2.29.1 as a WHEEL, because
+/// `isaacsim-kernel==5.1.0.0` exact-pins it). `facts_from_solved_records`
+/// then published 2.68.1 as a workspace conda fact, emission attached it to
+/// the `sentry-sdk` group next to the co-activated sibling pin
+/// `sentry-sdk==2.29.1` from `isaaclab-2.3x-pack`, and the group became
+/// mutually unsatisfiable. The same manifest resolved `pm-isaaclab` fine in
+/// job 5720294 without p6n.
+///
+/// A FLOOR IS NOT A CONTRIBUTION. `>=2.0.0` says nothing about the version
+/// the workspace's prefix will hold; it is a bound on the pack's WHEEL
+/// closure. Only `==<version>` states "this environment will hold exactly
+/// this", which is the premise the whole fold rests on. Folding a floor does
+/// not add a fact -- it drags the name into a solve that then makes one up.
+/// The motivating instance is untouched: `ray = "==2.49.1"` is exact, and
+/// every pass-2 auto-route contribution is built as `==<conda_version>`.
+fn exact_contribution_version(spec: &str) -> Option<&str> {
+    let spec = spec.trim();
+    let version = spec.strip_prefix("==")?.trim();
+    if version.is_empty()
+        || version.contains(',')
+        || version.contains('*')
+        || version.contains(char::is_whitespace)
+    {
+        return None;
+    }
+    uv_pep508::uv_pep440::Version::from_str(version).ok()?;
+    Some(spec)
+}
+
+fn bundle_conda_contribution(
+    effective: &RetreadConfig,
+    closure: Option<&crate::uv_closure::UvClosure>,
+) -> BTreeMap<String, String> {
+    let mut contribution: BTreeMap<String, String> = BTreeMap::new();
+    let shipped: BTreeSet<String> = effective
+        .retread_wheels
+        .keys()
+        .map(|name| canonical_conda_name(name))
+        .collect();
+    for (pypi, spec) in &effective.overrides {
+        // p6n-b. Only an EXACT pin is a conda-side contribution; a floor or a
+        // range is a bound on this pack's wheel closure and must never reach
+        // the fact solve. See `exact_contribution_version`.
+        let Some(spec) = exact_contribution_version(spec) else {
+            tracing::debug!(
+                override_name = %pypi,
+                spec = %spec,
+                "p6n: override is not an exact pin; not a conda-side contribution",
+            );
+            continue;
+        };
+        if shipped.contains(&canonical_conda_name(pypi)) {
+            continue;
+        }
+        if effective
+            .drop_deps
+            .iter()
+            .any(|dropped| canonical_conda_name(dropped) == canonical_conda_name(pypi))
+        {
+            continue;
+        }
+        // A name the pack deliberately keeps on the PyPI side is not a conda
+        // contribution, whatever the override says.
+        if effective
+            .keep_pypi
+            .iter()
+            .any(|kept| canonical_conda_name(kept) == canonical_conda_name(pypi))
+        {
+            continue;
+        }
+        let conda = match effective.name_map.get(&PypiKey::from_pypi(pypi)) {
+            Some(target) => match target.mapped_name() {
+                Some(name) => name.as_spec().to_string(),
+                // `retread-name-map = { x = false }` is an explicit refusal
+                // to give this name a conda side.
+                None => continue,
+            },
+            None => canonical_conda_name(pypi),
+        };
+        contribution.insert(conda, spec.to_string());
+    }
+    if let Some(closure) = closure {
+        for route in &closure.auto_routed {
+            if closure.auto_dropped.contains(&route.pypi_name) {
+                continue;
+            }
+            contribution
+                .entry(route.conda_name.clone())
+                .or_insert_with(|| format!("=={}", route.conda_version));
+        }
+    }
+    contribution
+}
+
+/// The folded contribution, rendered `name spec` for the `p6n pass=` rows.
+///
+/// §16.6 boarded this: `folded=N` alone cannot distinguish "folded the pack's
+/// own hand pins" from "folded a workspace repair floor". Reading the 5727660
+/// sentry-sdk regression from a count took a repodata grep and a hunt through
+/// `imprint-data/.retread/auto-overrides.json`; the names belong in the row.
+fn p6n_folded_names(contribution: &BTreeMap<String, String>) -> Vec<String> {
+    contribution
+        .iter()
+        .map(|(name, spec)| format!("{name} {spec}"))
+        .collect()
+}
+
+/// p6n. Which learned conda versions moved between two fact passes, as
+/// `name old->new` rows (`(none)` for a name the earlier pass never learned).
+///
+/// Restricted to names the closure actually resolved plus names the earlier
+/// pass learned: a name that neither side of the closure touches is noise,
+/// and re-closing on it would burn a uv lock for nothing.
+fn p6n_learned_moves(
+    before: &BTreeMap<String, String>,
+    after: &BTreeMap<String, String>,
+    closure_names: &BTreeSet<String>,
+) -> Vec<String> {
+    let mut moves = Vec::new();
+    for (name, new_version) in after {
+        let old = before.get(name);
+        if old == Some(new_version) {
+            continue;
+        }
+        if old.is_none() && !closure_names.contains(&canonical_conda_name(name)) {
+            continue;
+        }
+        moves.push(format!(
+            "{name} {}->{new_version}",
+            old.map(String::as_str).unwrap_or("(none)")
+        ));
+    }
+    // A name the earlier pass learned and the folded pass did NOT select is
+    // a real move too: the constraint has to come back out.
+    for name in before.keys() {
+        if !after.contains_key(name) {
+            moves.push(format!("{name} {}->(none)", before[name]));
+        }
+    }
+    moves.sort();
+    moves
+}
+
 /// Solve each precise consuming environment independently. Destructive
 /// behavior is enabled only when the workspace can map this source package to
 /// concrete active environments and every environment solve succeeds.
@@ -10076,6 +10853,10 @@ async fn solve_workspace_conda_facts(
     conda_channels: &[ChannelUrl],
     name_map: &NameMap,
     bundle_name: &str,
+    // p6n. The bundle's own conda-side contribution, folded into every
+    // precise consuming environment's spec list. EMPTY on the first pass,
+    // which reproduces the pre-p6n solve exactly.
+    bundle_conda_contribution: &BTreeMap<String, String>,
 ) -> WorkspaceCondaFacts {
     let Some(inputs) =
         precise_consumer_inputs_for_target(manifest, workspace_dir, source_dir, target)
@@ -10115,18 +10896,12 @@ async fn solve_workspace_conda_facts(
             let env = &input.env;
             let deps = &input.conda_deps;
             let channels = precise_consumer_solve_channels(conda_channels, input);
-            let mut specs = deps
-                .iter()
-                .filter_map(|(name, spec)| {
-                    let name = CondaName::new(name.as_str());
-                    if name.key() == bundle_key {
-                        return None;
-                    }
-                    Some(name.match_spec(spec))
-                })
-                .collect::<Vec<_>>();
-            specs
-                .push(CondaName::new("python").match_spec(&format!("{}.*", target.python_version)));
+            let specs = precise_env_solve_specs(
+                deps,
+                &bundle_key,
+                bundle_conda_contribution,
+                &target.python_version,
+            );
             let sysreqs = workspace_effective_system_requirements(manifest, env, target);
             async move {
                 let result = crate::conda_solve::solve_selected_records_for_target(
@@ -10224,6 +10999,21 @@ async fn uv_group_closure(
     // invariant rejection so the retry differs from the failed attempt by
     // exactly the injected-roots delta and nothing else.
     suppress_auto_imports: bool,
+    // p6w. The NAMED roots withheld from this bundle -- PEP 503-normalized
+    // distribution names, as `uv_closure::root_distribution_name` produces
+    // them. This is the ATTRIBUTED back-off: uv's conflict report named these
+    // roots as the cause, so exactly these are dropped and every sibling
+    // detection is still injected. Empty on the first pass and whenever
+    // attribution found nothing, in which case the coarse `suppress_auto_
+    // imports` flag above is the only lever and the whole bundle goes.
+    suppress_auto_imports_roots: &BTreeSet<String>,
+    // p6w OUT-PARAMETER, and the reason it exists: the roots this bundle
+    // injected are returned in the Ok tuple below, so a FAILING resolve threw
+    // them away -- and the attributed back-off cannot name a culprit among
+    // roots it cannot see. Written the moment injection is decided, before
+    // anything fallible runs after it, so the caller has the failed pass's
+    // root set whichever way this function returns.
+    injected_observed: &mut Vec<String>,
 ) -> Result<(
     Option<crate::uv_closure::UvClosure>,
     std::collections::BTreeSet<String>,
@@ -10235,6 +11025,14 @@ async fn uv_group_closure(
     // Lane C roots actually injected for this bundle. Empty when the gate
     // is off or the back-off suppressed them. Carried out so the emission
     // side can tell whether an ABI failure is worth retrying without them.
+    Vec<String>,
+    // p6t: Lane C roots this bundle DETECTED and then dropped because the
+    // back-off was active. Under p6s these existed only as a per-bundle log
+    // line, so a request that emitted `suppressed_all=true` reported a
+    // boolean and no names -- the 27/27 lock of job 5748915 was read as a
+    // pass for four minutes before anyone noticed two whole requests had
+    // shipped with their detected roots dropped. Carried out so the request
+    // summary can NAME them and so the harness has a counter to zero-gate.
     Vec<String>,
 )> {
     let uv_retry_keep_names: BTreeSet<String> = uv_retry_keep
@@ -10280,6 +11078,10 @@ async fn uv_group_closure(
     // immutable parameters that the loop does not touch, so moving the call
     // changes WHEN it runs, never WHAT it returns. Nothing between the old and
     // new position feeds it (the deps-from block only extends `roots`).
+    // p6n PASS 1. The bundle's conda-side contribution is not yet knowable
+    // beyond its hand pins, so the fold is the overrides only; the closure's
+    // own routes join it on pass 2, after the closure exists.
+    let p6n_pass1_contribution = bundle_conda_contribution(effective, None);
     let mut workspace_facts = match (manifest_opt.as_ref(), workspace_dir) {
         (Some(manifest), Some(ws_dir)) => {
             solve_workspace_conda_facts(
@@ -10290,11 +11092,20 @@ async fn uv_group_closure(
                 conda_channels,
                 fact_name_map,
                 group_name,
+                &p6n_pass1_contribution,
             )
             .await
         }
         _ => WorkspaceCondaFacts::default(),
     };
+    tracing::info!(
+        bundle = %group_name,
+        pass = 1,
+        folded = p6n_pass1_contribution.len(),
+        folded_names = ?p6n_folded_names(&p6n_pass1_contribution),
+        learned = workspace_facts.common_selected_versions.len(),
+        "p6n pass=1 workspace conda facts",
+    );
     // Names the CONDA side of this workspace already provides. Lane C exists
     // to surface MISSING dependencies; a conda-provided module is not
     // missing, and injecting it re-routes the solve toward a PyPI wheel whose
@@ -10309,6 +11120,36 @@ async fn uv_group_closure(
         conda_provided = auto_imports_conda_provided.len(),
         "auto_imports: conda-provided names that are never injected",
     );
+    // p6t: the import->distribution naming authority, built from REQUEST
+    // FACTS ONLY -- the workspace's committed lock for the consuming
+    // environments and the manifest's own `[pypi-dependencies]`. This is the
+    // thing that used to be a directory listing of the machine-wide wheel
+    // store, and being a directory listing is how one run named
+    // `module=isaacsim` two different ways six minutes apart (§19.9).
+    let auto_imports_naming = build_auto_imports_naming_authority(
+        workspace_dir,
+        manifest_opt.as_ref(),
+        &workspace_facts,
+        target,
+    );
+    {
+        let (locked, declared) = auto_imports_naming.counts_by_origin();
+        tracing::info!(
+            bundle = %group_name,
+            determined = auto_imports_naming.len(),
+            locked_records = locked,
+            declared_deps = declared,
+            ambiguous = auto_imports_naming.ambiguous.len(),
+            ambiguous_modules = %auto_imports_naming
+                .ambiguous
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(","),
+            "auto_imports_naming: import->distribution authority built from request facts \
+             (lock + manifest); the wheel store names nothing",
+        );
+    }
 
     for (name, entry) in group_entries {
         if entry.is_spec() {
@@ -10395,6 +11236,42 @@ async fn uv_group_closure(
                     })
                     .await
                     .unwrap_or_else(|_| crate::auto_imports::build_index(&[]));
+                    // p6t: prove, every run, that the store named nothing.
+                    // `refused_undetermined` counts edges that under p6r
+                    // WOULD have become roots -- `isaacsim` ->
+                    // `isaacsim-extscache-kit-sdk` is exactly one of them.
+                    // Each is a FINDING for manifest work, never a root.
+                    let confirmation = auto_imports_naming.store_confirmation(&idx);
+                    tracing::info!(
+                        bundle = %group_name,
+                        store = %wheel_store_root.display(),
+                        offered = confirmation.offered,
+                        confirmed = confirmation.confirmed,
+                        refused_undetermined = confirmation.refused_undetermined,
+                        contributed_roots = 0,
+                        "auto_imports_naming: the wheel-store scan is an ACCELERATOR ONLY -- \
+                         it confirms names the request already determined and contributes \
+                         no root of its own, so an empty store and a warm one inject the \
+                         same set",
+                    );
+                    if confirmation.refused_undetermined > 0 {
+                        let refused = auto_imports_naming.refused_store_edges(&idx);
+                        tracing::warn!(
+                            bundle = %group_name,
+                            refused = refused.len(),
+                            edges = %refused
+                                .iter()
+                                .take(24)
+                                .map(|(m, d)| format!("{m}->{d}"))
+                                .collect::<Vec<_>>()
+                                .join(","),
+                            "auto_imports_naming: store edges REFUSED as naming sources -- \
+                             no lock row and no manifest declaration accounts for these \
+                             distributions. Under p6r each of these could become a uv root \
+                             purely because the wheel happened to be on this machine. Every \
+                             row is a FINDING for manifest work.",
+                        );
+                    }
                     auto_imports_index.insert(idx)
                 }
             };
@@ -10408,6 +11285,7 @@ async fn uv_group_closure(
                     source_dir,
                     cache_dir,
                     index,
+                    &auto_imports_naming,
                     &auto_imports_siblings,
                     &auto_imports_conda_provided,
                 )
@@ -10417,9 +11295,11 @@ async fn uv_group_closure(
     }
     // Prepend, so every explicitly declared root outranks a detected one.
     // Empty unless RETREAD_AUTO_IMPORTS=1, so this is a no-op by default.
+    let mut auto_imports_suppressed: Vec<String> = Vec::new();
     if suppress_auto_imports && !auto_imports_roots.is_empty() {
         auto_imports_roots.sort();
         auto_imports_roots.dedup();
+        auto_imports_suppressed = auto_imports_roots.clone();
         tracing::warn!(
             bundle = %group_name,
             suppressed = auto_imports_roots.len(),
@@ -10427,6 +11307,30 @@ async fn uv_group_closure(
             "auto_imports: BACK-OFF ACTIVE -- detected roots NOT injected for this              bundle because a previous emission failed the ABI invariant",
         );
         auto_imports_roots.clear();
+    } else if !suppress_auto_imports_roots.is_empty() && !auto_imports_roots.is_empty() {
+        // p6w: the ATTRIBUTED back-off. uv's report named these roots, so only
+        // these go. Every other detection this bundle made is still injected,
+        // which is the entire difference from the whole-request drop that took
+        // 51 roots to learn that at least one was unsatisfiable.
+        auto_imports_roots.sort();
+        auto_imports_roots.dedup();
+        let (dropped, kept) =
+            partition_attributed_roots(&auto_imports_roots, suppress_auto_imports_roots);
+        if !dropped.is_empty() {
+            tracing::warn!(
+                bundle = %group_name,
+                dropped = dropped.len(),
+                kept = kept.len(),
+                dropped_roots = %dropped.join(","),
+                kept_roots = %kept.join(","),
+                "auto_imports: ATTRIBUTED BACK-OFF -- uv's conflict report named these roots \
+                 as the cause, so ONLY these are withheld; every sibling detection is still \
+                 injected. See the per-root `auto_imports_root_dropped` rows for each \
+                 culprit clause and its remedy.",
+            );
+        }
+        auto_imports_suppressed = dropped;
+        auto_imports_roots = kept;
     }
     let mut auto_imports_injected: Vec<String> = Vec::new();
     if !auto_imports_roots.is_empty() {
@@ -10444,6 +11348,10 @@ async fn uv_group_closure(
         auto_imports_roots.extend(std::mem::take(&mut roots));
         roots = dedupe_roots_last_wins(auto_imports_roots);
     }
+    // p6w. Publish the failed pass's root set BEFORE anything fallible runs on
+    // it. Everything below this line can `?`, and the Ok tuple is the only
+    // other channel these roots have.
+    *injected_observed = auto_imports_injected.clone();
     // retread-deps-from: fetch + parse each configured source and append
     // its PEP 508 lines as additional roots. A pure deps-from bundle (no
     // uv-resolvable `[retread-wheels]` entries at all) is exactly why this
@@ -10606,27 +11514,34 @@ async fn uv_group_closure(
         .keys()
         .map(|name| canonical_conda_name(name))
         .collect();
+    // A name the pack overrides, explicitly keeps on the PyPI side, or ships
+    // itself must never receive a learned conda `==` pin.
+    // p6n: HOISTED out of the match arm below so the second fact pass can
+    // re-derive the learned constraints under exactly the same exclusions.
+    // Nothing in it depends on the facts, so hoisting cannot change it.
+    let p6n_learned_excluded: BTreeSet<String> = {
+        let mut learned_excluded = manual.clone();
+        learned_excluded.extend(
+            effective
+                .keep_pypi
+                .iter()
+                .map(|name| canonical_conda_name(name)),
+        );
+        learned_excluded.extend(uv_retry_keep_names.iter().cloned());
+        learned_excluded.extend(
+            group_entries
+                .iter()
+                .map(|(name, _)| canonical_conda_name(name)),
+        );
+        learned_excluded
+    };
+    let p6n_manual_names = manual.clone();
     let mut constraints = match effective.route_policy {
         crate::config::RoutePolicy::PreferCondaValidated | crate::config::RoutePolicy::Minimal => {
-            // A name the pack overrides, explicitly keeps on the PyPI side,
-            // or ships itself must never receive a learned conda `==` pin.
-            let mut learned_excluded = manual.clone();
-            learned_excluded.extend(
-                effective
-                    .keep_pypi
-                    .iter()
-                    .map(|name| canonical_conda_name(name)),
-            );
-            learned_excluded.extend(uv_retry_keep_names.iter().cloned());
-            learned_excluded.extend(
-                group_entries
-                    .iter()
-                    .map(|(name, _)| canonical_conda_name(name)),
-            );
             workspace_fact_constraints(
                 &workspace_facts,
                 &manual,
-                &learned_excluded,
+                &p6n_learned_excluded,
                 fact_name_map,
                 load_pypi_to_conda_map().await.as_ref(),
                 target.python_version(),
@@ -11048,6 +11963,7 @@ async fn uv_group_closure(
             conda_co_solve,
             sibling_pin_relaxations,
             auto_imports_injected,
+            auto_imports_suppressed,
         ));
     }
     // ABI-anchor pins (`cuda-version`, `python_abi`, ...) from the
@@ -11112,6 +12028,57 @@ async fn uv_group_closure(
         workspace_fact_fingerprint: workspace_facts.fingerprint.clone(),
     };
 
+    // Seed the heal ledgers from facts persisted by a previous run (issue
+    // #10 perf): with these present, the FIRST Pass A already carries the
+    // learned overrides / pins / built-wheel path-sources, so a warm rerun
+    // resolves in a single lock (and the pyproject fingerprint matches the
+    // recorded meta, letting uv reuse the healed uv.lock instead of
+    // re-resolving).
+    // Stale built-wheel entries (store pruned) are dropped on load.
+    // Facts are only replayable under the manifest/routing state they were
+    // learned from (B1): stamp over the BASE request + routing options; a
+    // mismatch discards the file (fresh heal), never a stale replay.
+    let facts_stamp = crate::uv_closure::heal_facts_stamp_for_target(
+        &req,
+        &auto_route_opts,
+        effective.sdist_build,
+        target,
+    );
+    let persisted_facts =
+        crate::uv_closure::load_heal_facts_for_target(&heal_facts_path, &facts_stamp, target)
+            .await?;
+    if !persisted_facts.is_empty() {
+        tracing::info!(
+            bundle = %group_name,
+            routed = persisted_facts.routed.len(),
+            built = persisted_facts.built.len(),
+            prereleased = persisted_facts.prereleased.len(),
+            workspace_overrides = persisted_facts.workspace_overrides.len(),
+            "uv closure: seeding heal ledgers from persisted facts (warm reuse path)",
+        );
+    }
+    let workspace_overrides = Arc::new(std::sync::Mutex::new(persisted_facts.workspace_overrides));
+    let persisted_routes = seed_persisted_routes(persisted_facts.routed, &uv_retry_keep_names);
+    let sdist_routed = Arc::new(std::sync::Mutex::new(persisted_routes));
+    let sdist_built = Arc::new(std::sync::Mutex::new(persisted_facts.built));
+    // Transitive-prerelease repairs surface naturally in the closure's
+    // pins/wheels (the offender keeps its own index wheel); collected here
+    // only for logging/audit parity with the route/build ledgers.
+    let sdist_prereleased = Arc::new(std::sync::Mutex::new(persisted_facts.prereleased));
+    // Innermost: a LEARNED workspace conda fact that a hard requirement in
+    // the closure excludes is dropped and the lock retried (F13 turn 2). It
+    // wraps `raw_solve` so the outer heal/override wrappers only ever see a
+    // constraint set the closure's own requirements can accept.
+    let yielded_learned_facts = Arc::new(std::sync::Mutex::new(BTreeSet::new()));
+    // p6n. The fixpoint driver's three closures are built HERE, in a macro,
+    // because p6n may close this bundle TWICE: `auto_route_fixpoint_checked`
+    // consumes `solve`/`probe`/`co_solve` by value, so a second pass needs a
+    // second set. Everything they capture is cloned per build (a uv
+    // subprocess dwarfs the clones) and the shared heal ledgers above are
+    // Arc'd, so pass 2 inherits pass 1's learned routes and built wheels
+    // exactly as a warm rerun would.
+    macro_rules! p6n_build_solvers {
+        () => {{
     // `'static` closures for the fixpoint driver: clone the inputs each
     // solve/probe needs. Cheap relative to a uv subprocess / repodata hit.
     let raw_solve = {
@@ -11209,48 +12176,6 @@ async fn uv_group_closure(
                 as futures::future::BoxFuture<'static, Result<crate::uv_closure::BuiltSdistWheel>>
         }
     });
-    // Seed the heal ledgers from facts persisted by a previous run (issue
-    // #10 perf): with these present, the FIRST Pass A already carries the
-    // learned overrides / pins / built-wheel path-sources, so a warm rerun
-    // resolves in a single lock (and the pyproject fingerprint matches the
-    // recorded meta, letting uv reuse the healed uv.lock instead of
-    // re-resolving).
-    // Stale built-wheel entries (store pruned) are dropped on load.
-    // Facts are only replayable under the manifest/routing state they were
-    // learned from (B1): stamp over the BASE request + routing options; a
-    // mismatch discards the file (fresh heal), never a stale replay.
-    let facts_stamp = crate::uv_closure::heal_facts_stamp_for_target(
-        &req,
-        &auto_route_opts,
-        effective.sdist_build,
-        target,
-    );
-    let persisted_facts =
-        crate::uv_closure::load_heal_facts_for_target(&heal_facts_path, &facts_stamp, target)
-            .await?;
-    if !persisted_facts.is_empty() {
-        tracing::info!(
-            bundle = %group_name,
-            routed = persisted_facts.routed.len(),
-            built = persisted_facts.built.len(),
-            prereleased = persisted_facts.prereleased.len(),
-            workspace_overrides = persisted_facts.workspace_overrides.len(),
-            "uv closure: seeding heal ledgers from persisted facts (warm reuse path)",
-        );
-    }
-    let workspace_overrides = Arc::new(std::sync::Mutex::new(persisted_facts.workspace_overrides));
-    let persisted_routes = seed_persisted_routes(persisted_facts.routed, &uv_retry_keep_names);
-    let sdist_routed = Arc::new(std::sync::Mutex::new(persisted_routes));
-    let sdist_built = Arc::new(std::sync::Mutex::new(persisted_facts.built));
-    // Transitive-prerelease repairs surface naturally in the closure's
-    // pins/wheels (the offender keeps its own index wheel); collected here
-    // only for logging/audit parity with the route/build ledgers.
-    let sdist_prereleased = Arc::new(std::sync::Mutex::new(persisted_facts.prereleased));
-    // Innermost: a LEARNED workspace conda fact that a hard requirement in
-    // the closure excludes is dropped and the lock retried (F13 turn 2). It
-    // wraps `raw_solve` so the outer heal/override wrappers only ever see a
-    // constraint set the closure's own requirements can accept.
-    let yielded_learned_facts = Arc::new(std::sync::Mutex::new(BTreeSet::new()));
     let raw_solve =
         crate::uv_closure::with_learned_fact_yields(raw_solve, Arc::clone(&yielded_learned_facts));
     let solve = crate::uv_closure::with_workspace_fact_overrides(
@@ -11285,34 +12210,127 @@ async fn uv_group_closure(
                 as futures::future::BoxFuture<'static, crate::uv_closure::CoInstallVerdict>
         }
     };
+            (solve, probe, co_solve)
+        }};
+    }
     // Harmonization shares Rule 3's precise authority: exact conda names
     // selected identically in every concrete consumer. Ambiguous ownership,
     // failed solves, transitive-only names, or disagreement leave the map
     // empty and the fixpoint abstains to its un-route fallback.
     let mut auto_route_opts = auto_route_opts;
     auto_route_opts.workspace_conda_versions = workspace_facts.common_conda_versions.clone();
-    let mut closure = match crate::uv_closure::auto_route_fixpoint_checked(
-        &req,
-        &auto_route_opts,
-        solve,
-        probe,
-        co_solve,
-    )
-    .await
-    {
-        Ok(c) => c,
-        Err(e) => {
-            // B1: a genuine resolution/heal failure may have been poisoned by
-            // stale persisted facts (or is about to change the manifest state
-            // via a repair loop), so the facts file is dropped to force a
-            // clean re-heal next run. A merely TRANSIENT failure (io/network/
-            // backend crash) leaves the facts valid and keeps them -- see
-            // `discard_facts_on_solve_failure` for the transient-vs-resolution
-            // classification and why "when unsure, delete" stays wedge-safe.
-            discard_facts_on_solve_failure(&heal_facts_path, &e);
-            return Err(e);
+    // p6n. Bounded fact fixpoint, at most `P6N_MAX_FACT_PASSES` closes.
+    // Pass 1 is today's behavior byte for byte. Pass 2 exists because pass
+    // 1's facts were gathered from a solve of each consuming environment
+    // with THIS bundle removed, so every version the bundle itself decides
+    // was learned free or not learned at all; once the closure exists, its
+    // conda-side routes are folded back in and the facts are re-learned.
+    let mut closure;
+    let mut pass: usize = 1;
+    loop {
+        let (solve, probe, co_solve) = p6n_build_solvers!();
+        closure = match crate::uv_closure::auto_route_fixpoint_checked(
+            &req,
+            &auto_route_opts,
+            solve,
+            probe,
+            co_solve,
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                // B1: a genuine resolution/heal failure may have been poisoned by
+                // stale persisted facts (or is about to change the manifest state
+                // via a repair loop), so the facts file is dropped to force a
+                // clean re-heal next run. A merely TRANSIENT failure (io/network/
+                // backend crash) leaves the facts valid and keeps them -- see
+                // `discard_facts_on_solve_failure` for the transient-vs-resolution
+                // classification and why "when unsure, delete" stays wedge-safe.
+                discard_facts_on_solve_failure(&heal_facts_path, &e);
+                return Err(e);
+            }
+        };
+        if pass >= P6N_MAX_FACT_PASSES {
+            break;
         }
-    };
+        let (Some(manifest), Some(ws_dir)) = (manifest_opt.as_ref(), workspace_dir) else {
+            break;
+        };
+        let contribution = bundle_conda_contribution(effective, Some(&closure));
+        if contribution == p6n_pass1_contribution {
+            tracing::debug!(
+                bundle = %group_name,
+                "p6n pass=2 skipped: the closure added no conda-side contribution",
+            );
+            break;
+        }
+        let refolded = solve_workspace_conda_facts(
+            manifest,
+            ws_dir,
+            source_dir,
+            target,
+            conda_channels,
+            fact_name_map,
+            group_name,
+            &contribution,
+        )
+        .await;
+        // A pass that could not solve every consuming environment abstains
+        // (`WorkspaceCondaFacts::default`). Its emptiness is not a fact about
+        // this workspace, so pass 1's premise stands and nothing is re-closed.
+        if refolded.common_selected_versions.is_empty() {
+            tracing::info!(
+                bundle = %group_name,
+                folded = contribution.len(),
+                folded_names = ?p6n_folded_names(&contribution),
+                "p6n pass=2 learned_moved=[] (the folded solve abstained; pass 1 facts stand)",
+            );
+            break;
+        }
+        let closure_names: BTreeSet<String> = closure
+            .pins
+            .keys()
+            .map(|name| canonical_conda_name(name))
+            .collect();
+        let moves = p6n_learned_moves(
+            &workspace_facts.common_selected_versions,
+            &refolded.common_selected_versions,
+            &closure_names,
+        );
+        tracing::info!(
+            bundle = %group_name,
+            pass = 2,
+            folded = contribution.len(),
+            folded_names = ?p6n_folded_names(&contribution),
+            learned = refolded.common_selected_versions.len(),
+            learned_moved = ?moves,
+            "p6n pass=2 workspace conda facts",
+        );
+        if moves.is_empty() {
+            break;
+        }
+        // Only the VERSION-bearing half of the facts is adopted. Ownership
+        // (`owned_pypi`, `owned_conda_pypi`, `declared_pypi`) is about which
+        // manifest declares a name, which the fold cannot change, and it has
+        // already driven the drop/protection decisions above.
+        workspace_facts.common_selected_versions = refolded.common_selected_versions;
+        workspace_facts.common_conda_versions = refolded.common_conda_versions;
+        workspace_facts.selected_conda_packages = refolded.selected_conda_packages;
+        workspace_facts.fingerprint = refolded.fingerprint;
+        let relearned = workspace_fact_constraints(
+            &workspace_facts,
+            &p6n_manual_names,
+            &p6n_learned_excluded,
+            fact_name_map,
+            load_pypi_to_conda_map().await.as_ref(),
+            target.python_version(),
+        );
+        req.constraints.replace_learned_workspace_facts(relearned);
+        auto_route_opts.workspace_conda_versions = workspace_facts.common_conda_versions.clone();
+        auto_route_opts.workspace_fact_fingerprint = workspace_facts.fingerprint.clone();
+        pass += 1;
+    }
     // Splice in the sdist-only self-heal's discoveries (mirrors
     // `uv_closure::auto_route_fixpoint_with_sdist_heal`'s own splice,
     // which this call site can't use directly -- production also needs
@@ -11340,7 +12358,7 @@ async fn uv_group_closure(
                 must_ship: true,
                 upstream_url: None,
                 git_source: None,
-                sdist_source: Some(w.sdist_source.clone()),
+                sdist_source: w.sdist_source.clone(),
             });
         }
     }
@@ -11388,6 +12406,7 @@ async fn uv_group_closure(
         conda_co_solve,
         sibling_pin_relaxations,
         auto_imports_injected,
+        auto_imports_suppressed,
     ))
 }
 
@@ -12353,6 +13372,421 @@ gpu = { features = ["gpu"], no-default-feature = true }
         ]);
         assert_eq!(intersection, BTreeSet::from(["numpy".to_string()]));
     }
+
+    // ---------------------------------------------------------------------
+    // p6n GUARDS. The live fixture is job 5720294 / `LANE-C-WARM-LOG.md` §14:
+    // `viral-gpu` + `isaaclab-viral-pack`, whose hand pin `ray = "==2.49.1"`
+    // routes to conda `ray-core 2.49.1 -> libgrpc 1.71.0 ->
+    // libprotobuf >=5.29.3,<5.29.4.0a0`, holding conda `protobuf` at 5.29.3.
+    // Solved WITHOUT the pack the same environment goes to `protobuf 7.35.1`
+    // and never selects `tensorboard` at all, which is what the closure
+    // learned -- so it took `tensorboard 2.21.0` and emitted
+    // `protobuf >=6.31.1,<8`, a floor the environment cannot satisfy.
+    // ---------------------------------------------------------------------
+
+    /// The pack's hand pin must reach the fact-gathering solve under its
+    /// CONDA spelling, while the bundle under construction stays excluded.
+    #[test]
+    fn p6n_the_packs_hand_pin_reaches_the_precise_environment_solve() {
+        let deps = BTreeMap::from([
+            ("isaaclab-viral-pack".to_string(), "*".to_string()),
+            ("onnxruntime".to_string(), ">=1.20,<2".to_string()),
+        ]);
+        let bundle_key = PypiKey::from_pypi("isaaclab-viral-pack");
+        let contribution = BTreeMap::from([("ray-core".to_string(), "==2.49.1".to_string())]);
+
+        let specs = super::precise_env_solve_specs(&deps, &bundle_key, &contribution, "3.11");
+        let rendered: Vec<String> = specs.iter().map(|spec| spec.to_string()).collect();
+
+        assert!(
+            rendered.iter().any(|spec| spec == "ray-core ==2.49.1"),
+            "the pack's own conda-side contribution must be folded into the \
+             consuming environment's spec list; got {rendered:?}",
+        );
+        assert!(
+            !rendered
+                .iter()
+                .any(|spec| spec.starts_with("isaaclab-viral-pack")),
+            "the bundle under construction is still excluded; got {rendered:?}",
+        );
+        assert!(
+            rendered.iter().any(|spec| spec == "python 3.11.*"),
+            "the target python spec survives the fold; got {rendered:?}",
+        );
+
+        // NON-VACUITY: with no contribution the spec list is what it always
+        // was, so pass 1 cannot have changed.
+        let unfolded =
+            super::precise_env_solve_specs(&deps, &bundle_key, &BTreeMap::new(), "3.11");
+        let unfolded: Vec<String> = unfolded.iter().map(|spec| spec.to_string()).collect();
+        assert_eq!(
+            unfolded,
+            vec!["onnxruntime >=1.20,<2".to_string(), "python 3.11.*".to_string()],
+            "an empty contribution must reproduce the pre-p6n spec list exactly",
+        );
+    }
+
+    /// `retread-overrides ray = "==2.49.1"` is conda-side intent; the
+    /// closure's own auto-routes join it on the second pass.
+    #[test]
+    fn p6n_the_conda_contribution_is_the_packs_overrides_plus_its_routes() {
+        // Shaped like `isaaclab-viral-pack`'s own manifest: a hand pin that
+        // routes to conda, a hand pin on a name the pack SHIPS, and a `*`
+        // that is not a bound at all.
+        let mut config: crate::config::RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-wheels": { "aiodns": { "version": "==3.6.1" } },
+            "retread-overrides": {
+                "ray": "==2.49.1",
+                "aiodns": "==3.6.1",
+                "pandas": "*",
+            },
+        }))
+        .unwrap();
+        config.name_map = name_map(&[("ray", "ray-core"), ("aiodns", "aiodns")]);
+
+        let pass1 = super::bundle_conda_contribution(&config, None);
+        assert_eq!(
+            pass1,
+            BTreeMap::from([("ray-core".to_string(), "==2.49.1".to_string())]),
+            "only real, conda-mapped, non-shipped bounds are folded",
+        );
+
+        let closure = crate::uv_closure::UvClosure {
+            wheels: Vec::new(),
+            pins: BTreeMap::new(),
+            uv_version: "test".to_string(),
+            auto_routed: vec![crate::uv_closure::AutoRoutedPackage {
+                pypi_name: "numpy".to_string(),
+                conda_name: "numpy".to_string(),
+                pypi_version: "1.26.0".to_string(),
+                conda_version: "1.26.0".to_string(),
+                channel: "https://prefix.dev/conda-forge/linux-64".to_string(),
+                input_requirements: Vec::new(),
+                origin: crate::uv_closure::RouteOrigin::default(),
+            }],
+            auto_dropped: BTreeSet::new(),
+            effective_input_requirements: None,
+            dependency_graph: crate::uv_closure::UvDependencyGraph::default(),
+        };
+        let pass2 = super::bundle_conda_contribution(&config, Some(&closure));
+        assert_eq!(
+            pass2.get("numpy").map(String::as_str),
+            Some("==1.26.0"),
+            "the closure's own conda routes join the fold on pass 2",
+        );
+        assert_ne!(pass1, pass2, "pass 2 must have something new to fold, or it is not a pass");
+    }
+
+    /// p6n-b GUARD. The live fixture is job 5727660 / `LANE-C-WARM-LOG.md`
+    /// §16, reproduced from the two files it actually read:
+    /// `pypi-packs/protomotions-deps-pack/pixi.toml` pins
+    /// `sentry-sdk = "==2.29.1"`, and `.retread/auto-overrides.json`
+    /// SUPERSEDES it for that pack with `sentry-sdk = ">=2.0.0"`
+    /// (provenance `DepsFromPin`). Folded verbatim as a conda spec and
+    /// solved `Highest`, that floor invented conda `sentry-sdk 2.68.1` for
+    /// `pm-isaaclab` -- an environment whose sentry-sdk is a WHEEL at
+    /// 2.29.1 -- and the invented fact then collided at emission with the
+    /// co-activated sibling pin from `isaaclab-2.3x-pack`. A floor
+    /// contributes no version, so it must not reach the fact solve at all.
+    ///
+    /// RED on f69f41a: the fold's only spec filter there is
+    /// `spec.is_empty() || spec == "*"`, so `>=2.0.0` folds and this
+    /// assertion fails.
+    #[test]
+    fn p6n_b_an_open_ended_override_is_not_a_conda_contribution() {
+        let mut config: crate::config::RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-wheels": {},
+            "retread-overrides": {
+                // The repair-ledger entry as `merge_ledger_overrides` leaves
+                // it: the manifest's `==2.29.1` is GONE, replaced by a floor.
+                "sentry-sdk": ">=2.0.0",
+                // Ranges and non-`==` operators are the same class.
+                "attrs": ">=25.1.0,<26",
+                "packaging": "!=24.0",
+                "cycler": "~=0.11.0",
+                // The motivating p6n instance, which must SURVIVE.
+                "ray": "==2.49.1",
+            },
+        }))
+        .unwrap();
+        config.name_map = name_map(&[
+            ("ray", "ray-core"),
+            ("sentry-sdk", "sentry-sdk"),
+            ("attrs", "attrs"),
+            ("packaging", "packaging"),
+            ("cycler", "cycler"),
+        ]);
+
+        let contribution = super::bundle_conda_contribution(&config, None);
+
+        assert_eq!(
+            contribution,
+            BTreeMap::from([("ray-core".to_string(), "==2.49.1".to_string())]),
+            "only the exact pin is a conda-side contribution; got {contribution:?}",
+        );
+
+        // The decisive consequence, at the seam that actually failed: the
+        // floor must not reach the consuming environment's spec list, where
+        // `SolveStrategy::Highest` would turn it into a version.
+        let deps = BTreeMap::from([("isaaclab-2.3x-pack".to_string(), "*".to_string())]);
+        let specs = super::precise_env_solve_specs(
+            &deps,
+            &PypiKey::from_pypi("protomotions-deps-pack"),
+            &contribution,
+            "3.11",
+        );
+        let rendered: Vec<String> = specs.iter().map(|spec| spec.to_string()).collect();
+        assert!(
+            !rendered.iter().any(|spec| spec.starts_with("sentry-sdk")),
+            "a floor must never reach the fact solve; got {rendered:?}",
+        );
+
+        // NON-VACUITY: the same helper still accepts the shapes the fold is
+        // FOR, so this guard cannot pass by refusing everything.
+        assert_eq!(super::exact_contribution_version("==2.49.1"), Some("==2.49.1"));
+        assert_eq!(super::exact_contribution_version("  ==1.26.0 "), Some("==1.26.0"));
+        assert_eq!(super::exact_contribution_version(">=2.0.0"), None);
+        assert_eq!(super::exact_contribution_version("==2.*"), None);
+        assert_eq!(super::exact_contribution_version("==1.0,<2"), None);
+        assert_eq!(super::exact_contribution_version("==not-a-version"), None);
+        assert_eq!(super::exact_contribution_version("*"), None);
+        assert_eq!(super::exact_contribution_version(""), None);
+    }
+
+    /// (§16.6, boarded then closed) The `p6n pass=` row must name WHICH names
+    /// were folded, not just how many.
+    ///
+    /// Reading the 5727660 sentry-sdk regression from `folded=5` alone took a
+    /// repodata grep plus a hunt through `imprint-data/.retread/
+    /// auto-overrides.json`, because a count cannot tell "folded the pack's
+    /// own hand pins" from "folded a workspace repair floor". With the names
+    /// in the row, the same two runs read off it directly:
+    /// `folded_names=["ray-core ==2.49.1", "sentry-sdk >=2.0.0", ...]`
+    /// against `folded_names=["ray-core ==2.49.1", ...]`.
+    #[test]
+    fn p6n_the_folded_row_names_the_specs_it_folded_not_only_how_many() {
+        // The floor-bearing contribution as f69f41a would have built it --
+        // the exact map whose `folded=5` was unreadable in 5727660.
+        let with_floor = BTreeMap::from([
+            ("ray-core".to_string(), "==2.49.1".to_string()),
+            ("sentry-sdk".to_string(), ">=2.0.0".to_string()),
+        ]);
+        assert_eq!(
+            super::p6n_folded_names(&with_floor),
+            vec![
+                "ray-core ==2.49.1".to_string(),
+                "sentry-sdk >=2.0.0".to_string(),
+            ],
+            "the row must render every folded name WITH its spec, so a floor is \
+             distinguishable from a hand pin without opening the repair ledger",
+        );
+        // And on p6n-b's contribution the row is one line shorter, which is
+        // the whole delta 5739415 measured against 5727660.
+        let exact_only =
+            BTreeMap::from([("ray-core".to_string(), "==2.49.1".to_string())]);
+        assert_eq!(
+            super::p6n_folded_names(&exact_only),
+            vec!["ray-core ==2.49.1".to_string()],
+        );
+        assert!(super::p6n_folded_names(&BTreeMap::new()).is_empty());
+    }
+
+    /// The decisive assertion: the learned fact for the second name is the
+    /// WITH-pack version, and the constraint handed to the re-close carries
+    /// it INSTEAD OF -- not alongside -- the free one.
+    #[test]
+    fn p6n_the_refolded_pass_relearns_protobuf_at_the_with_pack_version() {
+        let env = "viral-gpu".to_string();
+        let declared = BTreeMap::from([("onnxruntime".to_string(), ">=1.20,<2".to_string())]);
+
+        // Pass 1: the pack is removed, so nothing holds libprotobuf down and
+        // nothing pulls tensorboard in at all.
+        let free = facts_from_solved_records(
+            BTreeMap::from([(
+                env.clone(),
+                vec![
+                    repo_record("onnxruntime", "1.28.0", &["protobuf >=3.20.3"]),
+                    repo_record("protobuf", "7.35.1", &["libprotobuf 7.35.1"]),
+                    repo_record("libprotobuf", "7.35.1", &[]),
+                ],
+            )]),
+            BTreeMap::from([(env.clone(), declared.clone())]),
+            BTreeSet::new(),
+            &name_map(&[]),
+            "isaaclab-viral-pack",
+        );
+        assert_eq!(
+            free.common_selected_versions.get("protobuf").map(String::as_str),
+            Some("7.35.1"),
+            "the free premise is the one the campaign actually learned",
+        );
+
+        // Pass 2: the pack's `ray-core ==2.49.1` is folded in and the whole
+        // ABI chain moves.
+        let folded = facts_from_solved_records(
+            BTreeMap::from([(
+                env.clone(),
+                vec![
+                    repo_record("onnxruntime", "1.28.0", &["protobuf >=3.20.3"]),
+                    repo_record("ray-core", "2.49.1", &["libgrpc >=1.71.0,<1.72.0a0"]),
+                    repo_record("libgrpc", "1.71.0", &["libprotobuf >=5.29.3,<5.29.4.0a0"]),
+                    repo_record("libprotobuf", "5.29.3", &[]),
+                    repo_record("protobuf", "5.29.3", &["libprotobuf 5.29.3"]),
+                    repo_record("tensorboard", "2.20.0", &["protobuf >=3.19.6"]),
+                ],
+            )]),
+            BTreeMap::from([(env.clone(), declared)]),
+            BTreeSet::new(),
+            &name_map(&[]),
+            "isaaclab-viral-pack",
+        );
+
+        let closure_names: BTreeSet<String> =
+            ["protobuf", "tensorboard", "onnxruntime", "numpy"]
+                .iter()
+                .map(|name| name.to_string())
+                .collect();
+        let moves = super::p6n_learned_moves(
+            &free.common_selected_versions,
+            &folded.common_selected_versions,
+            &closure_names,
+        );
+        assert!(
+            moves.contains(&"protobuf 7.35.1->5.29.3".to_string()),
+            "the second pass must report protobuf moving to the with-pack \
+             version; got {moves:?}",
+        );
+        assert!(
+            moves.contains(&"tensorboard (none)->2.20.0".to_string()),
+            "a name the pack drags in was learned by NO pass before p6n; \
+             got {moves:?}",
+        );
+
+        // And the constraint set the re-close is handed must SWAP the line,
+        // not stack a second one: `protobuf==7.35.1` and `protobuf==5.29.3`
+        // together are unsatisfiable.
+        let mut constraints = workspace_fact_constraints(
+            &free,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &name_map(&[]),
+            &PypiToCondaMap::new(),
+            "3.11",
+        );
+        assert!(
+            constraints.constraints.contains(&"protobuf==7.35.1".to_string()),
+            "the pre-p6n constraint set is the RED reference; got {:?}",
+            constraints.constraints,
+        );
+        let relearned = workspace_fact_constraints(
+            &folded,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &name_map(&[]),
+            &PypiToCondaMap::new(),
+            "3.11",
+        );
+        constraints.replace_learned_workspace_facts(relearned);
+        assert!(
+            constraints.constraints.contains(&"protobuf==5.29.3".to_string()),
+            "the re-close must carry the with-pack version; got {:?}",
+            constraints.constraints,
+        );
+        assert!(
+            !constraints.constraints.contains(&"protobuf==7.35.1".to_string()),
+            "the free version must be REMOVED, not stacked; got {:?}",
+            constraints.constraints,
+        );
+        assert!(
+            constraints.constraints.contains(&"tensorboard==2.20.0".to_string()),
+            "the name the pack drags in becomes a constraint uv can honor, \
+             which is what stops it resolving tensorboard 2.21.0; got {:?}",
+            constraints.constraints,
+        );
+    }
+
+    /// A line that is NOT a learned workspace fact survives the swap, and
+    /// `auto_route_constraint_indices` still points at the same lines.
+    #[test]
+    fn p6n_replacing_learned_facts_preserves_every_other_line_and_its_index() {
+        let mut set = crate::uv_closure::ConstraintSet::default();
+        set.constraints = vec![
+            "torch==2.5.1".to_string(),
+            "protobuf==7.35.1".to_string(),
+            "numpy==1.26.0".to_string(),
+        ];
+        set.provenance.insert(
+            "torch".to_string(),
+            crate::uv_closure::ConstraintProvenance {
+                constraint: "torch==2.5.1".to_string(),
+                conda_name: "pytorch".to_string(),
+                conda_version: "2.5.1".to_string(),
+                source: "workspace-solved".to_string(),
+                env: "viral-gpu".to_string(),
+                provenance: Provenance::WorkspaceCondaFact("viral-gpu".to_string()),
+            },
+        );
+        set.provenance.insert(
+            "protobuf".to_string(),
+            crate::uv_closure::ConstraintProvenance {
+                constraint: "protobuf==7.35.1".to_string(),
+                conda_name: "protobuf".to_string(),
+                conda_version: "7.35.1".to_string(),
+                source: crate::uv_closure::LEARNED_WORKSPACE_FACT_SOURCE.to_string(),
+                env: "viral-gpu".to_string(),
+                provenance: Provenance::UvConstraint,
+            },
+        );
+        set.provenance.insert(
+            "numpy".to_string(),
+            crate::uv_closure::ConstraintProvenance {
+                constraint: "numpy==1.26.0".to_string(),
+                conda_name: "numpy".to_string(),
+                conda_version: "1.26.0".to_string(),
+                source: "auto-route".to_string(),
+                env: "viral-gpu".to_string(),
+                provenance: Provenance::PriorSelection,
+            },
+        );
+        set.auto_route_constraint_indices = BTreeSet::from([2]);
+
+        let mut relearned = crate::uv_closure::ConstraintSet::default();
+        relearned.constraints = vec!["protobuf==5.29.3".to_string()];
+        relearned.provenance.insert(
+            "protobuf".to_string(),
+            crate::uv_closure::ConstraintProvenance {
+                constraint: "protobuf==5.29.3".to_string(),
+                conda_name: "protobuf".to_string(),
+                conda_version: "5.29.3".to_string(),
+                source: crate::uv_closure::LEARNED_WORKSPACE_FACT_SOURCE.to_string(),
+                env: "viral-gpu".to_string(),
+                provenance: Provenance::UvConstraint,
+            },
+        );
+
+        set.replace_learned_workspace_facts(relearned);
+
+        assert_eq!(
+            set.constraints,
+            vec![
+                "torch==2.5.1".to_string(),
+                "numpy==1.26.0".to_string(),
+                "protobuf==5.29.3".to_string(),
+            ],
+        );
+        assert_eq!(
+            set.auto_route_constraint_indices,
+            BTreeSet::from([1]),
+            "the auto-route index must follow its line, not its old position",
+        );
+        assert_eq!(
+            set.constraints[*set.auto_route_constraint_indices.first().unwrap()],
+            "numpy==1.26.0",
+            "and it must still name the same line",
+        );
+        assert_eq!(set.provenance["torch"].source, "workspace-solved");
+        assert_eq!(set.provenance["protobuf"].conda_version, "5.29.3");
+    }
 }
 
 /// retread-deps-from conda-as-truth: canonical PyPI names among `roots`
@@ -12362,7 +13796,7 @@ gpu = { features = ["gpu"], no-default-feature = true }
 pub(crate) fn deps_from_exact_pinned_names(roots: &[String]) -> std::collections::BTreeSet<String> {
     let mut out = std::collections::BTreeSet::new();
     for root in roots {
-        let Ok(req): Result<uv_pep508::Requirement, _> = uv_pep508::Requirement::from_str(root)
+        let Ok(req): Result<uv_pep508::Requirement, _> = crate::pep508_lenient::parse_requirement_lenient(root)
         else {
             continue;
         };
@@ -14368,7 +15802,7 @@ fn relaxed_retry_specs(
     if relaxed_line == original {
         return None;
     }
-    let req: uv_pep508::Requirement = uv_pep508::Requirement::from_str(&relaxed_line).ok()?;
+    let req: uv_pep508::Requirement = crate::pep508_lenient::parse_requirement_lenient(&relaxed_line).ok()?;
     match req.version_or_url {
         Some(uv_pep508::VersionOrUrl::VersionSpecifier(specs)) if specs != *specifiers => {
             Some(specs)
@@ -14755,6 +16189,45 @@ fn auto_imports_injection_enabled(effective: &RetreadConfig) -> bool {
     .0
 }
 
+/// p6u. Is the zero-gate on dropped detections in force for this request?
+///
+/// Precedence, and why: the env var wins (the harness override, so a
+/// measurement arm can land a lock and then read what strict would have
+/// refused), then the manifest key, then — and this is the part that differs
+/// from every other gate in this file — the DEFAULT is
+/// [`auto_imports_injection_enabled`] rather than `false`. A gate that ships
+/// off is a gate nobody turns on, and the failure it exists to catch (job
+/// 5748915: a 27/27 lock with 51 detected roots dropped, read as a clean pass)
+/// is silent by construction. Injection off means nothing is detected to drop,
+/// so strict is vacuous there and follows it to off.
+fn auto_imports_strict_enabled(effective: &RetreadConfig) -> bool {
+    let env_value = std::env::var(crate::config::AUTO_IMPORTS_STRICT_ENV).ok();
+    auto_imports_strict_decision(
+        effective.auto_imports_strict,
+        env_value.as_deref(),
+        auto_imports_injection_enabled(effective),
+    )
+}
+
+/// The decision itself, with both sources passed in. Split out so it can be
+/// exercised without the ambient environment deciding the test's answer.
+fn auto_imports_strict_decision(
+    configured: Option<bool>,
+    env_value: Option<&str>,
+    injection_enabled: bool,
+) -> bool {
+    let (enabled, source) = crate::config::effective_gate_flag(
+        crate::config::AUTO_IMPORTS_STRICT_ENV,
+        crate::config::AUTO_IMPORTS_STRICT_KEY,
+        configured,
+        env_value,
+    );
+    match source {
+        crate::config::GateFlagSource::Default => injection_enabled,
+        _ => enabled,
+    }
+}
+
 /// Revision tag for the resolve-time auto-imports BACK-OFF policy: what
 /// happens to the injected roots when the resolve they were injected into
 /// fails. Today that is "suppress injection for EVERY bundle in this request
@@ -14763,7 +16236,8 @@ fn auto_imports_injection_enabled(effective: &RetreadConfig) -> bool {
 /// can publish DIFFERENT resolved content, so this tag is folded into
 /// [`resolution_policy_fingerprint`] and must be bumped by hand whenever that
 /// behaviour changes.
-const AUTO_IMPORTS_BACKOFF_POLICY: &str = "v1-suppress-all-bundles-retry-once";
+const AUTO_IMPORTS_BACKOFF_POLICY: &str =
+    "v3-attribute-then-drop-named-roots-fallback-suppress-all-carried-into-build-v1";
 
 /// Revision tag for the ordered screens in [`auto_imports_injection_verdict`]
 /// -- the decision procedure that turns a detected module into an injected
@@ -15067,6 +16541,648 @@ fn auto_imports_conda_provided_names(
     provided
 }
 
+/// p6s-4: has this bundle's Lane C ABI back-off ALREADY been spent?
+///
+/// The back-off is once per bundle by construction -- `abi_backoff_suppressed`
+/// only grows, which is also the termination proof. A SECOND ABI rejection of
+/// a bundle already in that set therefore cannot be a Lane C problem: the
+/// roots are already gone, and there is nothing left to drop.
+///
+/// Measured (job 5752280, B-cert lane): `protomotions-deps-pack` took its
+/// back-off, logged `ABI BACK-OFF SUCCEEDED`, and a later re-emission with a
+/// LARGER root set (18 roots against the green run's 15, because the wheel
+/// store had grown to 62 wheels mid-run) was rejected again. That second
+/// rejection fell into the generic conflict collector, which has no shape for
+/// an ABI violation, so the request limped on and died far away as
+/// `-32603 reconstructing final relaxation record` and a panic in
+/// build_dispatch. A detector must terminate in an actuator; this one
+/// terminated in a panic three layers downstream.
+fn abi_backoff_already_spent(suppressed: &BTreeSet<String>, bundle: &str) -> bool {
+    suppressed.contains(AUTO_IMPORTS_SUPPRESS_ALL) || suppressed.contains(bundle)
+}
+
+/// p6s-4: the refusal text for a second ABI rejection after the back-off.
+///
+/// It names the bundle, BOTH root lists (what this pass still injected and
+/// what an earlier pass already dropped -- the root delta the operator asked
+/// for) and the violation itself, because the next question is always "which
+/// roots differed between the pass that emitted and the pass that did not".
+fn abi_backoff_exhausted_refusal(
+    bundle: &str,
+    python_version: &str,
+    still_injected: &[String],
+    already_dropped: &[String],
+    violation: &str,
+) -> String {
+    format!(
+        "ABI invariant rejected `{bundle}` AGAIN (python {python_version}) after its Lane C \
+         back-off was already spent. ROOT DELTA: still injected on this pass [{}]; already \
+         dropped by the back-off [{}]. Dropping more detected roots cannot fix this -- either \
+         the workspace ABI anchors and this bundle's closure genuinely disagree, or the root \
+         set moved between passes, which is itself the defect. Violation: {violation}",
+        still_injected.join(","),
+        already_dropped.join(","),
+    )
+}
+
+/// p6t: `bundle=root+root;bundle=root` for a suppression summary row.
+fn auto_imports_suppression_roots_by_bundle(
+    suppressed_by_bundle: &BTreeMap<String, Vec<String>>,
+) -> String {
+    suppressed_by_bundle
+        .iter()
+        .map(|(bundle, roots)| format!("{bundle}={}", roots.join("+")))
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+/// p6u. The per-env suppression findings in the shape the advertised-identity
+/// record carries them, so `conda/build_v1` and an ADOPTING `conda/outputs`
+/// read the same facts this pass measured instead of re-deriving none.
+fn auto_imports_suppressed_envs(
+    suppressed_by_bundle: &BTreeMap<String, Vec<String>>,
+    reasons: &BTreeMap<String, String>,
+) -> Vec<advertised_identity::SuppressedEnv> {
+    suppressed_by_bundle
+        .iter()
+        .filter(|(_, roots)| !roots.is_empty())
+        .map(|(bundle, roots)| advertised_identity::SuppressedEnv {
+            env: bundle.clone(),
+            roots: roots.clone(),
+            reason: auto_imports_suppression_reason_for(reasons, bundle),
+        })
+        .collect()
+}
+
+/// The inverse: the roots-by-env map and the reason map, rebuilt from records.
+/// Used by the adoption path, which never ran a back-off and would otherwise
+/// have nothing to publish and nothing to gate on.
+fn auto_imports_suppression_from_records(
+    records: &[AdvertisedIdentityRecord],
+) -> (BTreeMap<String, Vec<String>>, BTreeMap<String, String>) {
+    let mut roots: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut reasons: BTreeMap<String, String> = BTreeMap::new();
+    for record in records {
+        for env in &record.auto_imports_suppressed {
+            let entry = roots.entry(env.env.clone()).or_default();
+            for root in &env.roots {
+                if !entry.contains(root) {
+                    entry.push(root.clone());
+                }
+            }
+            reasons
+                .entry(env.env.clone())
+                .or_insert_with(|| env.reason.clone());
+        }
+    }
+    for list in roots.values_mut() {
+        list.sort();
+    }
+    (roots, reasons)
+}
+
+/// p6u. `conda/build_v1`'s refusal when the ABI invariant rejects an emission
+/// it reconstructed — stated as a DELTA against the plan the advertising pass
+/// reached, never as a relaxation-record failure.
+///
+/// Three distinguishable situations, and the operator needs to know which:
+///
+///   * NO RECORD. The advertising pass left nothing to carry, so this pass
+///     resolved fresh and may well have re-derived a plan the back-off had
+///     already rejected. The remedy is the record, and its absence is the
+///     finding.
+///   * A RECORD THAT SUPPRESSED THIS BUNDLE, and roots are STILL injected here
+///     anyway. The carry was made and did not take: the inputs at build time
+///     genuinely differ from the ones the advertising pass saw, and the roots
+///     named are exactly the difference. That is the loud refusal p6t asked
+///     for, with the delta in it.
+///   * A RECORD, the carry took, and the invariant refused anyway. Then the
+///     violation is not about Lane C at all and the roots list is empty —
+///     said plainly instead of blamed on injection.
+fn build_v1_abi_refusal(
+    bundle: &str,
+    record: Option<&AdvertisedIdentityRecord>,
+    still_injected: &[String],
+    violation: &AbiInvariantViolation,
+) -> String {
+    let delta = match record {
+        None => format!(
+            "NO advertised-identity record was found for this build request, so \
+             conda/outputs' Lane C back-off could not be carried and this pass resolved \
+             from scratch. Roots injected here: [{}].",
+            still_injected.join(","),
+        ),
+        Some(record) => {
+            let carried = record.carried_auto_imports_suppression();
+            let dropped: Vec<String> = record
+                .auto_imports_suppressed
+                .iter()
+                .map(|env| format!("{}=[{}]", env.env, env.roots.join(",")))
+                .collect();
+            if carried.contains(bundle) || carried.contains(AUTO_IMPORTS_SUPPRESS_ALL) {
+                if still_injected.is_empty() {
+                    format!(
+                        "The advertising pass's back-off WAS carried (suppressed=[{}]) and this \
+                         bundle injected no Lane C roots here, so the violation is NOT about \
+                         injection: the ABI contract refuses this emission on its own terms. \
+                         Roots the advertising pass dropped: {}.",
+                        carried.iter().cloned().collect::<Vec<_>>().join(","),
+                        if dropped.is_empty() { "none recorded".to_string() } else { dropped.join(" ") },
+                    )
+                } else {
+                    format!(
+                        "DELTA: the advertising pass emitted this bundle WITHOUT its detected \
+                         roots (suppressed=[{}], dropped {}), that decision WAS carried into \
+                         this pass, and yet [{}] are injected here. The inputs at build time \
+                         differ from the ones conda/outputs resolved under; those roots are \
+                         the difference and are what the invariant rejected.",
+                        carried.iter().cloned().collect::<Vec<_>>().join(","),
+                        if dropped.is_empty() { "nothing recorded".to_string() } else { dropped.join(" ") },
+                        still_injected.join(","),
+                    )
+                }
+            } else {
+                format!(
+                    "The advertising pass recorded NO suppression for this bundle \
+                     (suppressed=[{}]), so nothing was carried and the roots injected here \
+                     — [{}] — are this pass's own. Either the advertising pass never hit the \
+                     invariant and this one does (its inputs differ), or the record describes \
+                     a different resolution than the one just run.",
+                    carried.iter().cloned().collect::<Vec<_>>().join(","),
+                    still_injected.join(","),
+                )
+            }
+        }
+    };
+    format!(
+        "ABI invariant rejected `{bundle}` while conda/build_v1 reconstructed its final \
+         emission. This is NOT a relaxation-record failure. {delta} Violation: {violation}"
+    )
+}
+
+/// p6u. The two ways Lane C injection gets dropped, spelled once so the row,
+/// the strict refusal and the tests all say the same word.
+const AUTO_IMPORTS_REASON_ABI_BACKOFF: &str = "abi-backoff";
+const AUTO_IMPORTS_REASON_RESOLVE_BACKOFF: &str = "resolve-backoff";
+/// p6w. The THIRD way, and the one the operator asked for: uv's report named
+/// this root, so it -- and not its 50 siblings -- was withheld.
+const AUTO_IMPORTS_REASON_ATTRIBUTED_BACKOFF: &str = "attributed-resolve-backoff";
+
+/// p6w. How many attributed retries one request may take before it gives up
+/// and falls back to the whole-request drop.
+///
+/// The ladder terminates on its own -- `auto_imports_attributed_roots` only
+/// grows and `attributed_backoff_decision` refuses to re-name a root already
+/// in it, so the worst case is one round per injected root. That bound is the
+/// number of detections, which is exactly the runaway this must not have: 51
+/// roots would be 51 full resolves. Three rounds catches the realistic case
+/// (a handful of genuinely unsatisfiable detections) and hands anything worse
+/// to the coarse back-off with the reason stated.
+const AUTO_IMPORTS_ATTRIBUTED_BACKOFF_MAX_ROUNDS: usize = 3;
+
+/// p6w. What the resolve back-off does with ONE failed attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AttributedBackoffDecision {
+    /// uv's report named these roots. Withhold exactly them and re-resolve.
+    DropRoots(Vec<crate::uv_closure::AttributedRootDrop>),
+    /// Attribution produced nothing to act on. Take the whole-request
+    /// back-off, and SAY WHY -- a fallback that reads like the attributed
+    /// path is how p6u shipped 51 dropped roots looking like a clean pass.
+    ///
+    /// p6z widened this from a `&'static str` to an owned reason so the row
+    /// can NAME what actually refused: p6w's fixed sentence ("uv's conflict
+    /// report named none of the injected roots") was true of `flashsac-pack`
+    /// and `holosoma-pack` and told an operator nothing, because uv never ran
+    /// on either.
+    FallBackToAll(String),
+}
+
+/// p6w. The pure decision the ladder turns on, kept out of the async resolve
+/// loop so it can be guarded without an RPC.
+///
+/// Reads uv's error text, the roots the FAILING pass actually injected (the
+/// out-parameter `resolve_all` fills), and what has already been dropped.
+/// Returns only roots that are NEW, so a root uv keeps naming after it has
+/// been withheld cannot spin the ladder.
+fn attributed_backoff_decision(
+    round: usize,
+    error_text: &str,
+    injected_by_bundle: &BTreeMap<String, Vec<String>>,
+    already_dropped: &BTreeMap<String, BTreeSet<String>>,
+) -> AttributedBackoffDecision {
+    if round >= AUTO_IMPORTS_ATTRIBUTED_BACKOFF_MAX_ROUNDS {
+        return AttributedBackoffDecision::FallBackToAll(
+            "the attributed retry ladder reached its bound without resolving".to_string(),
+        );
+    }
+    if injected_by_bundle.values().all(Vec::is_empty) {
+        return AttributedBackoffDecision::FallBackToAll(
+            "the failing pass injected no Lane C roots, so no detection can be its cause"
+                .to_string(),
+        );
+    }
+    let fresh: Vec<crate::uv_closure::AttributedRootDrop> =
+        crate::uv_closure::attribute_auto_imports_failure(error_text, injected_by_bundle)
+            .into_iter()
+            .filter(|drop| {
+                !already_dropped
+                    .get(&drop.bundle)
+                    .is_some_and(|dropped| dropped.contains(&drop.name))
+            })
+            .collect();
+    if fresh.is_empty() {
+        // p6z: the generic sentence is the FALLBACK for the fallback. When the
+        // text is retread's own -- a reconciler conflict or a `Requires-Dist`
+        // parse refusal -- the row names the carriers or the distribution.
+        let detail = crate::uv_closure::attribution_failure_detail(error_text, injected_by_bundle)
+            .unwrap_or_else(|| {
+                "uv's conflict report named none of the injected roots, so nothing attributes \
+                 the failure to a detection"
+                    .to_string()
+            });
+        return AttributedBackoffDecision::FallBackToAll(detail);
+    }
+    AttributedBackoffDecision::DropRoots(fresh)
+}
+
+/// p6w. Split a bundle's detected roots into (withheld, still injected).
+///
+/// The whole claim of this lane lives here: given three detections of which
+/// uv named one, exactly one is withheld and two are still injected. Pure, so
+/// that claim is a unit guard rather than a three-hour arm. Matching is on the
+/// PEP 503-normalized distribution name, so a withheld `etils` covers the
+/// injected `etils==1.13.0` and an injected `etils-extras` is untouched.
+fn partition_attributed_roots(
+    detected: &[String],
+    withheld_names: &BTreeSet<String>,
+) -> (Vec<String>, Vec<String>) {
+    detected.iter().cloned().partition(|root| {
+        withheld_names.contains(&crate::uv_closure::root_distribution_name(root))
+    })
+}
+
+/// p6w. ONE row per ROOT withheld by the attributed back-off, naming uv's own
+/// clause and the remedy that clause implies.
+///
+/// p6u's per-ENV row is still emitted and still the summary; this is the
+/// resolution of it. `holosoma-pack roots=[26 names] reason=resolve-backoff`
+/// tells an operator that 26 detections vanished; it does not tell them which
+/// one to fix. These rows do.
+fn emit_auto_imports_root_dropped_rows(
+    request: &str,
+    drops: &[crate::uv_closure::AttributedRootDrop],
+) {
+    for drop in drops {
+        tracing::warn!(
+            request = %request,
+            env = %drop.bundle,
+            root = %drop.root,
+            culprit = %drop.clause,
+            remedy = %drop.remedy.token(),
+            remedy_detail = %drop.remedy,
+            "auto_imports_root_dropped env={} root={} culprit={} remedy={} -- uv named this \
+             root in its own conflict, so it alone is withheld and this bundle's other \
+             detections are re-resolved with their roots.",
+            drop.bundle,
+            drop.root,
+            drop.clause,
+            drop.remedy.token(),
+        );
+    }
+}
+
+/// p6w. The row the fallback owes, so a whole-request drop can never again be
+/// read as an attributed one.
+fn emit_auto_imports_attribution_fallback_row(
+    request: &str,
+    why: &str,
+    injected_by_bundle: &BTreeMap<String, Vec<String>>,
+) {
+    let total: usize = injected_by_bundle.values().map(Vec::len).sum();
+    tracing::warn!(
+        request = %request,
+        reason = %why,
+        injected_roots = total,
+        bundles = injected_by_bundle.len(),
+        roots_by_bundle = %auto_imports_suppression_roots_by_bundle(injected_by_bundle),
+        "auto_imports_root_dropped env=* root=* culprit=<none attributed> \
+         remedy=attribution-unavailable -- {why}. Every root named above is about to be \
+         dropped TOGETHER, which is the coarse behaviour p6w exists to avoid; that it \
+         happened here is itself the finding.",
+    );
+}
+
+/// The reason recorded for one bundle's suppression.
+///
+/// A bundle with its own entry backed off on its own emission. With no entry
+/// of its own it was carried out by the request-wide resolve back-off, whose
+/// reason is filed under the [`AUTO_IMPORTS_SUPPRESS_ALL`] sentinel. Never
+/// "unknown" when something really was dropped: a reason nobody wrote is a
+/// silent drop.
+fn auto_imports_suppression_reason_for(
+    reasons: &BTreeMap<String, String>,
+    bundle: &str,
+) -> String {
+    reasons
+        .get(bundle)
+        .or_else(|| reasons.get(AUTO_IMPORTS_SUPPRESS_ALL))
+        .cloned()
+        .unwrap_or_else(|| {
+            format!("{AUTO_IMPORTS_REASON_ABI_BACKOFF}: reason not recorded by the back-off")
+        })
+}
+
+/// p6u. What the operator must DECLARE for a suppressed root to stop being
+/// suppressed — never "nothing, we dropped it".
+///
+/// The 5.1.0.0 kit-sdk case is the worked example: the only wheels the index
+/// publishes for it are `manylinux_2_35`, this workspace's target admits a
+/// lower manylinux ceiling, so uv rejects every candidate and the root is
+/// unsatisfiable AS THE REQUEST IS DECLARED. That is not a reason to drop the
+/// detection; it is a reason to declare the platform. `manylinux_ceiling`
+/// reads exactly one declaration for this, and
+/// [`crate::glibc::undeclared_glibc_error_for_target`] is the long form of the
+/// same remedy already shipped for the installer path — this is its one-line
+/// sibling, for a log row.
+///
+/// When the detail names no manylinux floor there is no platform fact that
+/// helps, and saying so is the honest answer: the root is a MANIFEST finding.
+/// p6w FIX, measured rather than reasoned. §22 asserted that none of the three
+/// `resolve-backoff` reasons carried a manylinux floor, so all three would
+/// print the manifest remedy. One did not: `robojudo-pack`'s row in BOTH arms
+/// (5764452 and 5764453) printed
+/// `declare the platform fact ... glibc = "2.28"` for a failure whose actual
+/// cause is `unitree-sdk2py was not found in the package registry`. No glibc
+/// declaration makes a distribution that no index carries appear.
+///
+/// The cause is this function reading `extract_manylinux_floor` over the WHOLE
+/// detail, which for a resolve back-off is the entire error text and routinely
+/// contains a `manylinux_2_28` somewhere in unrelated prose. A floor is only a
+/// remedy when the distribution EXISTS and its published wheels sit above the
+/// ceiling, so an absence sentence -- uv's `was not found in the package
+/// registry`, or a `no versions of` -- now settles the question before the
+/// floor is even looked for.
+fn auto_imports_suppression_resolution(detail: &str, conda_subdir: &str) -> String {
+    // ABSENCE IS DECIDED FIRST, and the order is the whole fix. A resolve
+    // back-off's detail is the entire error text, and `manylinux_2_28` shows
+    // up in unrelated prose all the time, so "does a manylinux token appear"
+    // is not the question. "Did the index have the distribution at all" is,
+    // and when the answer is no, no ceiling declaration can change it.
+    let absent = detail.contains("was not found in the package registry")
+        || regex::Regex::new(r"(?i)\bno versions? of\b")
+            .expect("static absence phrase")
+            .is_match(detail);
+    match crate::glibc::extract_manylinux_floor(detail).filter(|_| !absent) {
+        Some((major, minor)) => format!(
+            "declare the platform fact -- `[workspace] platforms = [{{ platform = \
+             \"{conda_subdir}\", glibc = \"{major}.{minor}\" }}]` (pixi >= 0.71) or \
+             `[system-requirements] libc = \"{major}.{minor}\"` -- so the manylinux ceiling \
+             admits the only wheels this distribution publishes. The declaration is \
+             load-bearing: retread audits GLIBC symbols at install time against it. \
+             Dropping the root instead ships a lock that silently lacks a detected \
+             dependency."
+        ),
+        None => format!(
+            "no platform declaration makes this satisfiable as written: this is a MANIFEST \
+             finding. Declare the distribution the import needs (an explicit dependency, or \
+             a `retread-name-map` entry when the import name and the distribution name \
+             differ), or relax the ABI anchor the emission contradicted. Target subdir \
+             {conda_subdir}. A silent drop is not a resolution."
+        ),
+    }
+}
+
+/// p6u. ONE row per ENVIRONMENT (bundle) whose Lane C roots were dropped,
+/// naming the roots, the reason and the declaration that would fix it.
+///
+/// The p6t counter publishes a request-wide TOTAL, which is what a harness
+/// zero-gate needs and is not what a person needs: arm A's
+/// `auto_imports_suppressed_roots=26` named 26 nothing-in-particulars. The
+/// operator asked for auto-detect, not for detections dropped quietly, so each
+/// dropped set gets its own addressable row. Returns the number of rows, which
+/// is the number of environments that shipped short.
+fn emit_auto_imports_suppressed_rows(
+    request: &str,
+    suppressed_by_bundle: &BTreeMap<String, Vec<String>>,
+    reasons: &BTreeMap<String, String>,
+    conda_subdir: &str,
+) -> usize {
+    for (bundle, roots) in suppressed_by_bundle {
+        if roots.is_empty() {
+            continue;
+        }
+        let detail = auto_imports_suppression_reason_for(reasons, bundle);
+        let reason = detail
+            .split_once(':')
+            .map(|(head, _)| head.to_string())
+            .unwrap_or_else(|| detail.clone());
+        tracing::warn!(
+            request = %request,
+            env = %bundle,
+            roots = %format!("[{}]", roots.join(",")),
+            reason = %reason,
+            detail = %detail,
+            resolution = %auto_imports_suppression_resolution(&detail, conda_subdir),
+            "auto_imports_suppressed env={bundle} roots=[{}] reason={reason} -- these detected \
+             imports are NOT in the lock this request produced",
+            roots.join(","),
+        );
+    }
+    suppressed_by_bundle
+        .values()
+        .filter(|roots| !roots.is_empty())
+        .count()
+}
+
+/// p6u. The strict verdict: with `retread-auto-imports-strict` in force, a
+/// request that dropped ANY detected root fails, naming every one of them.
+///
+/// The operator asked for auto-detect. A lock produced with injection
+/// partially suppressed is not that lock, and job 5748915's 27/27 -- shipped
+/// with `suppressed_all=true` twice -- is the reason this is a refusal and not
+/// a note. Strict is the DEFAULT whenever injection is on, because a default
+/// that has to be switched on is a gate nobody switches on.
+///
+/// `Ok(())` when nothing was dropped, or when strict is off (the row is still
+/// emitted, and the request proceeds -- that is the measurement mode).
+fn auto_imports_strict_verdict(
+    strict: bool,
+    suppressed_by_bundle: &BTreeMap<String, Vec<String>>,
+    suppressed_all: bool,
+    reasons: &BTreeMap<String, String>,
+    conda_subdir: &str,
+) -> Result<(), String> {
+    let total: usize = suppressed_by_bundle.values().map(Vec::len).sum();
+    if !strict || (total == 0 && !suppressed_all) {
+        return Ok(());
+    }
+    let mut lines = Vec::new();
+    for (bundle, roots) in suppressed_by_bundle {
+        if roots.is_empty() {
+            continue;
+        }
+        let detail = auto_imports_suppression_reason_for(reasons, bundle);
+        lines.push(format!(
+            "  env={bundle} roots=[{}] reason={detail}\n    resolution: {}",
+            roots.join(","),
+            auto_imports_suppression_resolution(&detail, conda_subdir),
+        ));
+    }
+    if lines.is_empty() {
+        lines.push(format!(
+            "  env=* roots=[] reason={}\n    resolution: {}",
+            auto_imports_suppression_reason_for(reasons, AUTO_IMPORTS_SUPPRESS_ALL),
+            auto_imports_suppression_resolution(
+                &auto_imports_suppression_reason_for(reasons, AUTO_IMPORTS_SUPPRESS_ALL),
+                conda_subdir,
+            ),
+        ));
+    }
+    Err(format!(
+        "auto_imports_suppressed_roots={total} auto_imports_suppressed_all={suppressed_all}: \
+         `{}` is in force and this request dropped detected imports rather than resolving \
+         them. Auto-detection that silently drops its detections is not auto-detection. \
+         Either declare the fact each dropped root needs, or set `{} = false` under \
+         `[build.config]` to accept a lock that ships without them.\n{}",
+        crate::config::AUTO_IMPORTS_STRICT_KEY,
+        crate::config::AUTO_IMPORTS_STRICT_KEY,
+        lines.join("\n"),
+    ))
+}
+
+/// p6t: publish this request's suppressed-root counter and return the total.
+///
+/// WHY THIS IS ITS OWN ROW. Job 5748915 emitted `suppressed_all=true` twice
+/// and still produced a 27/27 `pixi.lock`, and the lock was read as a pass:
+/// the only evidence to the contrary was a boolean inside a summary line that
+/// named no root and published no number. A gate criterion needs a live
+/// producer, and this is it -- one row, always emitted, carrying
+/// `auto_imports_suppressed_roots=<n>` for the harness to zero-gate, the
+/// bundle->roots map for the operator to read, and the reason. WARN when
+/// anything was dropped, INFO when nothing was, so the row's LEVEL is itself
+/// the verdict and its absence is never mistaken for a zero.
+fn emit_auto_imports_suppression_counter(
+    output: &str,
+    suppressed_by_bundle: &BTreeMap<String, Vec<String>>,
+    suppressed_all: bool,
+    backoffs: usize,
+) -> usize {
+    let total: usize = suppressed_by_bundle.values().map(Vec::len).sum();
+    let counter = format!(
+        "auto_imports_suppressed_roots={total} \
+         auto_imports_suppressed_all={suppressed_all} \
+         auto_imports_backoffs={backoffs}"
+    );
+    let by_bundle = auto_imports_suppression_roots_by_bundle(suppressed_by_bundle);
+    if total > 0 || suppressed_all {
+        tracing::warn!(
+            output = %output,
+            counter = %counter,
+            suppressed_roots = total,
+            suppressed_all = suppressed_all,
+            roots_by_bundle = %by_bundle,
+            reason = "a Lane C emission failed the ABI invariant or failed to resolve, so the \
+                      retry dropped the detected roots",
+            "auto_imports: LANE C SUPPRESSED-ROOT COUNTER -- this request shipped WITHOUT the \
+             roots named above. Zero-gate `auto_imports_suppressed_roots=0` unless the operator \
+             has declared this acceptable: a lock produced with injection partially suppressed \
+             is not a lock produced with injection in force.",
+        );
+    } else {
+        tracing::info!(
+            output = %output,
+            counter = %counter,
+            "auto_imports: LANE C SUPPRESSED-ROOT COUNTER -- nothing suppressed",
+        );
+    }
+    total
+}
+
+/// p6t: the request-fact naming authority for one bundle.
+///
+/// EVERY input here is a property of the REQUEST -- the workspace's committed
+/// lock, and the workspace manifest's own `[pypi-dependencies]` declarations.
+/// Nothing here reads a cache, a fetch directory, a sidecar, or a wheel-store
+/// listing, so two runs of the same request produce the same authority no
+/// matter what either machine has downloaded before. That is the whole point:
+/// under p6r the answer for `import isaacsim` was
+/// `isaacsim-extscache-kit-sdk` on a warm store and nothing at all on a cold
+/// one, six minutes apart in one run.
+///
+/// Two tiers, in the order the operator ruled:
+///   (a) RESOLVED -- `locked_pypi_versions_for_envs` over the very consuming
+///       environments whose conda solves produced `facts`, on this target's
+///       subdir. The env already installs a distribution; its version comes
+///       from that record verbatim, local segments and all.
+///   (b) DECLARED -- `declared_pypi_specs_anywhere`. A version only when the
+///       declared band is an exact `==` pin; a range names, it does not pin.
+///
+/// NOT here, and boarded rather than faked (reader/writer law: a variant with
+/// no producer is a defect, so `NamingOrigin` has no variant for either):
+///   * the index metadata tier. PyPI publishes no reverse module->project
+///     query, so tier (c) can only VERIFY a candidate name, which is a
+///     network round trip per unmapped module. Boarded as p6t-1.
+///   * a pack's `requires-dist` closure from a SIBLING bundle. One backend
+///     request sees one bundle's entries; `isaacsim==5.1.0.0` reached p6r's
+///     resolve from a co-resident isaaclab pack that this function cannot
+///     see. Boarded as p6t-2.
+///
+/// The conda side is deliberately absent: `auto_imports_conda_provided_names`
+/// already refuses every conda-owned name at screen (d), earlier than this
+/// runs, so a conda tier here would have no reachable consumer.
+fn build_auto_imports_naming_authority(
+    workspace_dir: Option<&Path>,
+    manifest: Option<&crate::workspace::WorkspaceManifest>,
+    facts: &WorkspaceCondaFacts,
+    target: &ResolutionTarget,
+) -> crate::auto_imports::NamingAuthority {
+    use crate::auto_imports::{DeterminedDistribution, NamingOrigin};
+    let mut determined: Vec<DeterminedDistribution> = Vec::new();
+    if let Some(root) = workspace_dir {
+        let envs: BTreeSet<String> = facts.env_exact_specs.keys().cloned().collect();
+        for (name, version) in
+            crate::workspace::locked_pypi_versions_for_envs(root, &envs, &target.conda_subdir)
+        {
+            determined.push(DeterminedDistribution {
+                name: canonical_conda_name(&name),
+                version: Some(version),
+                origin: NamingOrigin::LockedRecord,
+            });
+        }
+    }
+    if let Some(manifest) = manifest {
+        for (name, specs) in manifest.declared_pypi_specs_anywhere() {
+            determined.push(DeterminedDistribution {
+                name: canonical_conda_name(&name),
+                version: auto_imports_declared_exact_version(&specs),
+                origin: NamingOrigin::DeclaredDep,
+            });
+        }
+    }
+    crate::auto_imports::NamingAuthority::from_determined(determined)
+}
+
+/// The one exact version a name's declared specs pin to, when they agree.
+///
+/// `*` (declared with no constraint) and any range yield None -- a bare root
+/// is a deterministic answer and a guessed pin is not. Disagreeing pins across
+/// features also yield None: this function never picks a winner.
+fn auto_imports_declared_exact_version(specs: &[String]) -> Option<String> {
+    let pinned: BTreeSet<&str> = specs
+        .iter()
+        .map(|s| s.trim())
+        .filter_map(|s| s.strip_prefix("=="))
+        .map(str::trim)
+        .filter(|v| {
+            !v.is_empty() && !v.contains(['*', ',', ' ', '<', '>', '!', '=', '~'])
+        })
+        .collect();
+    match pinned.len() {
+        1 => pinned.into_iter().next().map(str::to_string),
+        _ => None,
+    }
+}
+
 /// Curated distribution name for an import module, if the table knows it.
 /// Exact, case-sensitive match on the module as imported.
 fn auto_imports_mapped_distribution(module: &str) -> Option<&'static str> {
@@ -15116,6 +17232,7 @@ fn auto_imports_injection_verdict(
     req: &crate::auto_imports::ResolvedImport,
     sibling_entries: &BTreeSet<String>,
     conda_provided: &BTreeSet<String>,
+    naming: &crate::auto_imports::NamingAuthority,
 ) -> std::result::Result<String, &'static str> {
     // (a) Conditional imports are optional by construction (every import site
     // sits in a try/except). Requiring one turns an optional feature into a
@@ -15171,23 +17288,38 @@ fn auto_imports_injection_verdict(
     if let Some(mapped) = auto_imports_mapped_distribution(&req.module) {
         return Ok(mapped.to_string());
     }
-    // (f) Index authority: a wheel in the store really ships this module
-    // under this distribution name.
-    if req.source.is_some() {
-        return Ok(canonical);
-    }
-    // --- Neither mapped nor indexed: NEVER injected from here down. The
-    // remaining screens only sharpen the reason recorded in the log. ---
-    // (g1) Known host-application internals.
+    // (g1) Known host-application internals. p6t moved this ABOVE the naming
+    // authority: `pxr`, `carb`, `omni` and friends are not PyPI
+    // distributions no matter what a lock row is spelled, so a coincidental
+    // same-name record must not be able to inject one.
     if AUTO_IMPORTS_NO_PYPI_DISTRIBUTION.contains(&req.module.as_str()) {
         return Err("module has no PyPI distribution (host-application internal)");
     }
     // (g2) Isaac Lab extensions: source-built entries of SOME bundle in this
     // workspace, never PyPI distributions. Screen (c) sees only the importing
-    // bundle's own entries, so a cross-bundle import needs this.
+    // bundle's own entries, so a cross-bundle import needs this. Also moved
+    // above the authority by p6t, for the same reason as (g1).
     if auto_imports_is_isaaclab_extension(&req.module) {
         return Err("Isaac Lab extension is source-built in this workspace, not a PyPI distribution");
     }
+    // (f) p6t: REQUEST-FACT AUTHORITY. The distribution must be one this
+    // request has already determined it installs -- a PyPI row of the
+    // workspace's committed lock for the consuming environments, or a
+    // `[pypi-dependencies]` declaration of the manifest. The root carries
+    // that record's version, so an injected root is pinned by the same fact
+    // that named it.
+    //
+    // THIS REPLACES the wheel-store index authority (`req.source.is_some()`),
+    // which is the p6s-2 defect: the store is a machine-wide listing of every
+    // wheel retread ever fetched, so it made the injected root set a function
+    // of download history. `req.source` still travels for the LOG -- the
+    // `indexed=` field and the extras hints read it -- but it no longer
+    // decides anything. See `NamingAuthority`.
+    if let Some(determined) = naming.lookup(&req.module) {
+        return Ok(determined.root_specifier());
+    }
+    // --- Neither mapped nor determined: NEVER injected from here down. The
+    // remaining screen only sharpens the reason recorded in the log. ---
     // (g3) Intra-repo module PATH shapes: `convert_rigv1_to_proto` and
     // friends, which the own-top-level screen missed because they live in a
     // SIBLING directory of a shared checkout.
@@ -15316,6 +17448,7 @@ async fn auto_imports_dry_run(
     source_dir: &Path,
     cache_dir: &Path,
     index: &crate::auto_imports::ClosureIndex,
+    naming: &crate::auto_imports::NamingAuthority,
     sibling_entries: &BTreeSet<String>,
     conda_provided: &BTreeSet<String>,
 ) -> Vec<String> {
@@ -15397,7 +17530,7 @@ async fn auto_imports_dry_run(
         }
         // The verdict is computed WHETHER OR NOT injection is enabled, so the
         // OFF arm still measures exactly what the ON arm would have done.
-        match auto_imports_injection_verdict(req, sibling_entries, conda_provided) {
+        match auto_imports_injection_verdict(req, sibling_entries, conda_provided, naming) {
             Ok(root) => {
                 if inject {
                     injected.push(root.clone());
@@ -15410,6 +17543,15 @@ async fn auto_imports_dry_run(
                     would_emit = %line,
                     root = %root,
                     indexed = req.source.is_some(),
+                    // p6t: WHICH request fact named this root. `indexed`
+                    // above is now provenance for the log only -- the store
+                    // has no vote. A row with `indexed=true naming=table`
+                    // means the store agreed with the table and changed
+                    // nothing; there is no row in which the store decides.
+                    naming = %naming
+                        .lookup(&req.module)
+                        .map(|d| d.origin.as_str())
+                        .unwrap_or("curated-table"),
                     injected = inject,
                     files = req.files.len(),
                     "auto_imports_dry: detected requirement (INJECTABLE)",
@@ -15929,7 +18071,7 @@ async fn materialize_and_rewrite_with_abi_aliases(
                 })?
             }
             Err(error) if pypi::is_pypi_index_miss(&error) => {
-                let built = build_sdist_wheel_with_specifiers(
+                let built = crate::handler::build_sdist_wheel_with_specifiers(
                     entry_name.to_string(),
                     specifiers,
                     vec![index_url.clone()],
@@ -15943,13 +18085,15 @@ async fn materialize_and_rewrite_with_abi_aliases(
                          (version=`{version}`, index=`{index_url}`)"
                     )
                 })?;
-                url::Url::parse(&built.sdist_source.sdist_url).with_context(|| {
-                    format!(
-                        "phase 1 PyPI sdist fallback for entry `{entry_name}` returned invalid \
-                         sdist URL `{}`",
-                        built.sdist_source.sdist_url,
-                    )
-                })?;
+                if let Some(source) = built.sdist_source.as_ref() {
+                    url::Url::parse(&source.sdist_url).with_context(|| {
+                        format!(
+                            "phase 1 PyPI sdist fallback for entry `{entry_name}` returned invalid \
+                             sdist URL `{}`",
+                            source.sdist_url,
+                        )
+                    })?;
+                }
                 tracing::info!(
                     entry = %entry_name,
                     version = %built.version,
@@ -15964,7 +18108,7 @@ async fn materialize_and_rewrite_with_abi_aliases(
                 // [retread-wheels] version entry whose distribution publishes
                 // no wheel (e.g. compress-json). Same contract as
                 // bfs_fetch_provenance for BFS transitives.
-                sdist_source_captured = Some(built.sdist_source.clone());
+                sdist_source_captured = built.sdist_source.clone();
                 built.wheel_path
             }
             Err(error) => {
@@ -17875,7 +20019,7 @@ pub(crate) fn check_output_abi_invariants(
         .collect::<Vec<_>>();
     for (wheel, raw) in embedded_requires_dist {
         let Ok(requirement): Result<uv_pep508::Requirement, _> =
-            uv_pep508::Requirement::from_str(raw)
+            crate::pep508_lenient::parse_requirement_lenient(raw)
         else {
             continue;
         };
@@ -18526,7 +20670,7 @@ fn resolve_ceded_pypi_bounds(
     for wheel in bundle.all_wheels() {
         for raw in &wheel.metadata.requires_dist {
             let Ok(requirement): Result<uv_pep508::Requirement, _> =
-                uv_pep508::Requirement::from_str(raw)
+                crate::pep508_lenient::parse_requirement_lenient(raw)
             else {
                 continue;
             };
@@ -28082,6 +30226,9 @@ mod courier_build_string_tests {
             workspace_fp: metadata_pass_fp.to_string(),
             run_depends: vec!["python 3.11.*".to_string()],
             run_constrains: Vec::new(),
+            auto_imports_suppressed_bundles: Vec::new(),
+            auto_imports_suppressed: Vec::new(),
+            auto_imports_suppressed_roots: Vec::new(),
         };
         let from_record = build_for(&workspace_fp_for_build(
             Some(&record),
@@ -28763,6 +30910,198 @@ mod resolve_bundle_bfs_tests {
         });
 
         port
+    }
+
+
+    /// A PEP 503 index that serves ARBITRARY filenames (wheels with real
+    /// platform tags AND sdists), unlike `spawn_index_server`, which only
+    /// ever publishes `py3-none-any` wheels. The wheel-before-build rung is
+    /// exactly about choosing between a platform-tagged wheel and an sdist
+    /// for the same version, so the fixture has to be able to publish both.
+    async fn spawn_mixed_artifact_index(
+        pkg: &str,
+        artifacts: Vec<(String, Vec<u8>)>,
+        max_requests: u8,
+    ) -> u16 {
+        use std::collections::HashMap;
+        let pkg = pkg.to_string();
+        let mut by_filename: HashMap<String, Vec<u8>> = HashMap::new();
+        let mut links = String::new();
+        for (filename, bytes) in artifacts {
+            let sha = crate::wheel_rewrite::sha256_hex(&bytes);
+            links.push_str(&format!(
+                "<a href=\"/{filename}#sha256={sha}\">{filename}</a>\n"
+            ));
+            by_filename.insert(filename, bytes);
+        }
+        let page = format!("<!DOCTYPE html><html><body>\n{links}</body></html>\n");
+        let by_filename = Arc::new(by_filename);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            for _ in 0..max_requests {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let by_filename = by_filename.clone();
+                let page = page.clone();
+                let pkg = pkg.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let (status, ctype, body) = if let Some(rest) = path.strip_prefix("/simple/") {
+                        if rest.trim_end_matches('/') == pkg {
+                            ("200 OK", "text/html", page.clone().into_bytes())
+                        } else {
+                            ("404 Not Found", "text/plain", b"not found".to_vec())
+                        }
+                    } else if let Some(bytes) = by_filename.get(path.trim_start_matches('/')) {
+                        ("200 OK", "application/octet-stream", bytes.clone())
+                    } else {
+                        ("404 Not Found", "text/plain", b"not found".to_vec())
+                    };
+                    let resp = format!(
+                        "HTTP/1.0 {status}\r\nContent-Length: {}\r\nContent-Type: {ctype}\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                    let _ = stream.write_all(&body).await;
+                });
+            }
+        });
+        port
+    }
+
+    /// p6s GUARD A -- the heal's build rung must ask for a target-compatible
+    /// WHEEL before it builds anything.
+    ///
+    /// Shape taken verbatim from oncert-p6r job 5745086: an index that
+    /// publishes, for ONE version, both a platform-tagged wheel the artifact
+    /// target can use and an sdist that CANNOT be built (in production that
+    /// sdist is NVIDIA's `wheel_stub` placeholder, whose only job is to
+    /// re-download the very wheel next to it, and which fails on any builder
+    /// whose glibc is older than the wheel's manylinux tag). Before this
+    /// fix `build_sdist_wheel_with_specifiers` went straight to
+    /// `pypi::resolve_sdist` and the unbuildable sdist, so this returned the
+    /// build error. It must instead return the WHEEL, with no `sdist_source`
+    /// (nothing was built from an sdist) and the store digest of the exact
+    /// bytes the index served.
+    #[tokio::test]
+    async fn p6s_a_heal_takes_the_target_compatible_index_wheel_and_builds_nothing() {
+        let _env_guard = crate::TEST_ASYNC_ENV_MUTEX.lock().await;
+        let dir = unique_tmp_dir();
+        let store = dir.join("store");
+        let cache = dir.join("cache");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        // SAFETY: serialized by TEST_ASYNC_ENV_MUTEX, like every other
+        // env-touching async test in this crate.
+        unsafe { std::env::set_var("RETREAD_WHEEL_STORE", &store) };
+
+        let wheel_bytes = make_wheel_bytes("stub", "1.0.0", &[]);
+        let wheel_sha = crate::wheel_rewrite::sha256_hex(&wheel_bytes);
+        let wheel_name = "stub-1.0.0-cp311-none-manylinux_2_35_x86_64.whl".to_string();
+        let port = spawn_mixed_artifact_index(
+            "stub",
+            vec![
+                (wheel_name.clone(), wheel_bytes),
+                // Not a tarball at all: any attempt to BUILD it fails, which
+                // is what makes "did it build?" observable.
+                ("stub-1.0.0.tar.gz".to_string(), b"not a real sdist".to_vec()),
+            ],
+            64,
+        )
+        .await;
+
+        let target = crate::pypi::ResolutionTarget::from_parts("3.11", "linux-64", Some((2, 35)));
+        let built = crate::handler::build_sdist_wheel_with_specifiers(
+            "stub".to_string(),
+            <uv_pep508::uv_pep440::VersionSpecifiers as std::str::FromStr>::from_str("==1.0.0")
+                .unwrap(),
+            vec![format!("http://127.0.0.1:{port}/simple")],
+            target,
+            cache.clone(),
+        )
+        .await
+        .expect("the index publishes a target-compatible wheel for this exact version");
+
+        assert_eq!(
+            built.sdist_source, None,
+            "no sdist produced these bytes, so the lock must not carry an sdist provenance",
+        );
+        assert_eq!(built.filename, wheel_name);
+        assert_eq!(built.version, "1.0.0");
+        assert_eq!(
+            built.sha256, wheel_sha,
+            "the stored digest must be the digest of the bytes the index served",
+        );
+        assert!(
+            built.wheel_path.starts_with(&store),
+            "the wheel must be persisted in the shared store like a built one: {}",
+            built.wheel_path.display(),
+        );
+        assert!(built.wheel_path.exists(), "{}", built.wheel_path.display());
+        unsafe { std::env::remove_var("RETREAD_WHEEL_STORE") };
+    }
+
+    /// p6s GUARD B (non-vacuity) -- the new rung is gated on the ARTIFACT
+    /// TARGET's compatibility contract, not on "a wheel exists".
+    ///
+    /// Same fixture, but the only wheel on the index needs a glibc the
+    /// target's ceiling does not reach. `pypi::resolve` must reject it, the
+    /// rung must fall through, and the sdist build rung must run and fail on
+    /// the unbuildable sdist -- i.e. exactly the pre-fix behaviour, proving
+    /// guard A is not just "always return a wheel".
+    #[tokio::test]
+    async fn p6s_b_a_wheel_the_target_cannot_use_does_not_short_circuit_the_build() {
+        let _env_guard = crate::TEST_ASYNC_ENV_MUTEX.lock().await;
+        let dir = unique_tmp_dir();
+        let store = dir.join("store");
+        let cache = dir.join("cache");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        // SAFETY: serialized by TEST_ASYNC_ENV_MUTEX.
+        unsafe { std::env::set_var("RETREAD_WHEEL_STORE", &store) };
+
+        let wheel_bytes = make_wheel_bytes("stub", "1.0.0", &[]);
+        let port = spawn_mixed_artifact_index(
+            "stub",
+            vec![
+                // glibc 2.99 is above any ceiling this target can reach
+                // (`max(declared, host)`), on any builder this suite runs on.
+                (
+                    "stub-1.0.0-cp311-none-manylinux_2_99_x86_64.whl".to_string(),
+                    wheel_bytes,
+                ),
+                ("stub-1.0.0.tar.gz".to_string(), b"not a real sdist".to_vec()),
+            ],
+            64,
+        )
+        .await;
+
+        let target = crate::pypi::ResolutionTarget::from_parts("3.11", "linux-64", Some((2, 35)));
+        let error = crate::handler::build_sdist_wheel_with_specifiers(
+            "stub".to_string(),
+            <uv_pep508::uv_pep440::VersionSpecifiers as std::str::FromStr>::from_str("==1.0.0")
+                .unwrap(),
+            vec![format!("http://127.0.0.1:{port}/simple")],
+            target,
+            cache.clone(),
+        )
+        .await
+        .expect_err("no wheel this target can use, so the build rung must run and fail");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("sdist"),
+            "the failure must come from the sdist build rung, not the wheel rung: {rendered}",
+        );
+        unsafe { std::env::remove_var("RETREAD_WHEEL_STORE") };
     }
 
     /// A dependency-free in-tree PEP 517 backend keeps the source/Git BFS

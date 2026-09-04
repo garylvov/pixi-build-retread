@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped whenever the recorded field set changes meaning. A record with a
 /// different schema is ignored, which degrades to today's recompute.
-pub(crate) const SCHEMA: u32 = 3;
+pub(crate) const SCHEMA: u32 = 5;
 
 /// Short digest of the RELAX RULE in force, folded into every record address.
 ///
@@ -71,12 +71,97 @@ pub(crate) struct AdvertisedIdentityRecord {
     /// (`bundle_emitted_constrains`), so it drifts for the same reasons.
     #[serde(default)]
     pub run_constrains: Vec<String>,
+    /// p6u. The Lane C bundles whose detected roots the ADVERTISING pass
+    /// suppressed, canonical conda names, plus the `*` sentinel when the
+    /// resolve-time back-off suppressed every bundle in that request.
+    ///
+    /// This is the field that carries the back-off DECISION across the RPC
+    /// boundary. `conda/build_v1` re-runs the emission `conda/outputs`
+    /// already made; without this it re-derives a plan the back-off had
+    /// already rejected, the ABI invariant refuses the same emission a second
+    /// time, and the request dies as `-32603` (arm `oncert-p6tb` 5757174).
+    /// The suppression is a property of the identity being built, so it
+    /// belongs beside `run_depends`: both answer "what did the pass that
+    /// pixi solved against actually emit".
+    #[serde(default)]
+    pub auto_imports_suppressed_bundles: Vec<String>,
+    /// p6u. The FINDINGS behind that decision: which environment dropped
+    /// which roots, and why. Carried so a build-time refusal can name the
+    /// DELTA rather than say only that something was suppressed, and so an
+    /// ADOPTING run -- which never runs the back-off itself -- can re-publish
+    /// the same rows and take the same strict verdict instead of reading a
+    /// store hit as a clean pass.
+    #[serde(default)]
+    pub auto_imports_suppressed: Vec<SuppressedEnv>,
+    /// p6w. The ATTRIBUTED half of the same plan: per environment, the
+    /// normalized root NAMES uv's conflict report blamed, which the resolve
+    /// withheld one at a time instead of dropping the whole request's
+    /// detections.
+    ///
+    /// `auto_imports_suppressed_bundles` above can only say "this bundle
+    /// injected nothing". Once the back-off withholds SOME of a bundle's
+    /// roots, that is no longer the plan `conda/build_v1` must reproduce --
+    /// it would re-inject the culprit and be refused exactly as p6t-4 was.
+    /// So the finer plan crosses the boundary too, in the shape
+    /// `resolve_all` takes it.
+    #[serde(default)]
+    pub auto_imports_suppressed_roots: Vec<SuppressedRoots>,
+}
+
+/// One environment's ATTRIBUTED drops: the roots uv named, by normalized name.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SuppressedRoots {
+    /// Canonical conda name of the bundle.
+    pub env: String,
+    /// PEP 503-normalized distribution names withheld from that bundle.
+    pub roots: Vec<String>,
+}
+
+/// One environment's dropped Lane C detections.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SuppressedEnv {
+    /// Canonical conda name of the bundle/environment that shipped short.
+    pub env: String,
+    /// The detected roots it shipped WITHOUT.
+    pub roots: Vec<String>,
+    /// `abi-backoff: <violation>` / `resolve-backoff: <error>`. The prefix is
+    /// the machine-readable reason; the tail is the evidence.
+    pub reason: String,
 }
 
 impl AdvertisedIdentityRecord {
     /// A record is usable only when it describes the very output the build
     /// request names, resolved for the very same target. Anything else is a
     /// stale or foreign record and must be ignored rather than trusted.
+    /// p6u: the suppression plan this identity was advertised under, in the
+    /// exact shape `resolve_all` takes it.
+    ///
+    /// An EMPTY set from a present record means "the advertising pass
+    /// suppressed nothing"; no record at all means "unknown". They are not the
+    /// same fact, so the caller reports which one it had rather than letting
+    /// both read as an empty set.
+    pub(crate) fn carried_auto_imports_suppression(&self) -> std::collections::BTreeSet<String> {
+        self.auto_imports_suppressed_bundles
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// p6w: the ATTRIBUTED plan, in the shape `resolve_all` takes it.
+    ///
+    /// A reader for the finer field, for the same reason
+    /// `carried_auto_imports_suppression` is a reader for the coarse one: a
+    /// plan the build pass cannot load is a plan it re-derives, and
+    /// re-deriving this one re-injects the exact root uv refused.
+    pub(crate) fn carried_auto_imports_suppression_roots(
+        &self,
+    ) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
+        self.auto_imports_suppressed_roots
+            .iter()
+            .map(|entry| (entry.env.clone(), entry.roots.iter().cloned().collect()))
+            .collect()
+    }
+
     pub(crate) fn describes(
         &self,
         name: &str,
@@ -335,7 +420,127 @@ mod tests {
                 "python_abi 3.11.* *_cp311".to_string(),
             ],
             run_constrains: vec!["numpy >=1.26".to_string()],
+            auto_imports_suppressed_bundles: vec!["protomotions-deps-pack".to_string()],
+            auto_imports_suppressed: vec![SuppressedEnv {
+                env: "protomotions-deps-pack".to_string(),
+                roots: vec![
+                    "isaacsim-extscache-kit-sdk".to_string(),
+                    "viser".to_string(),
+                ],
+                reason: "abi-backoff: ABI invariant: wheel `contourpy` embeds \
+                         `numpy >=1.0.0` (bare-major)"
+                    .to_string(),
+            }],
+            auto_imports_suppressed_roots: vec![SuppressedRoots {
+                env: "protomotions-deps-pack".to_string(),
+                roots: vec!["viser".to_string()],
+            }],
         }
+    }
+
+    /// p6u GUARD (a). The back-off DECISION crosses the RPC boundary.
+    ///
+    /// Arm `oncert-p6tb` 5757174: `conda/outputs` logged `ABI BACK-OFF
+    /// SUCCEEDED bundle=protomotions-deps-pack`, then `conda/build_v1` re-ran
+    /// the same emission with the roots back in, the ABI invariant refused it
+    /// a second time, and the request died `-32603`. The suppression had
+    /// nowhere to travel. It travels here.
+    ///
+    /// This is a REAL round trip -- serde, a real file at the real address,
+    /// a real `describes` acceptance -- not an assertion about a struct.
+    #[tokio::test]
+    async fn p6u_a_the_backoff_suppression_crosses_the_rpc_boundary_in_the_record() {
+        let dir = tempdir("p6u-carry").canonicalize().unwrap();
+        let cache = dir.join("cache");
+        let source = dir.join("pack");
+        let record = record();
+        assert!(
+            !record.auto_imports_suppressed_bundles.is_empty(),
+            "the fixture must actually carry a suppression, or this proves nothing"
+        );
+        write_record(&cache, &source, &record, TEST_RELAX).await;
+        let loaded = load_record(
+            &cache,
+            &source,
+            &record.name,
+            Some(&record.version),
+            &record.subdir,
+            &record.build,
+            &record.target_identity,
+            &record.python_version,
+            TEST_RELAX,
+        )
+        .await
+        .expect("record must load");
+        assert_eq!(
+            loaded.auto_imports_suppressed_bundles,
+            record.auto_imports_suppressed_bundles,
+        );
+        assert_eq!(loaded.auto_imports_suppressed, record.auto_imports_suppressed);
+        // The shape `resolve_all` takes, which is what makes this a carry
+        // rather than a stored curiosity.
+        let carried = loaded.carried_auto_imports_suppression();
+        assert!(
+            carried.contains("protomotions-deps-pack"),
+            "conda/build_v1 must resolve under the plan conda/outputs reached: {carried:?}"
+        );
+
+        // NON-VACUITY 1: a record that suppressed nothing carries nothing --
+        // the field is not "always full".
+        let mut clean = record.clone();
+        clean.build = "py311_hcleanbuild_loose_0".to_string();
+        clean.auto_imports_suppressed_bundles.clear();
+        clean.auto_imports_suppressed.clear();
+        write_record(&cache, &source, &clean, TEST_RELAX).await;
+        let loaded_clean = load_record(
+            &cache,
+            &source,
+            &clean.name,
+            Some(&clean.version),
+            &clean.subdir,
+            &clean.build,
+            &clean.target_identity,
+            &clean.python_version,
+            TEST_RELAX,
+        )
+        .await
+        .expect("record must load");
+        assert!(loaded_clean.carried_auto_imports_suppression().is_empty());
+
+        // NON-VACUITY 2: bytes written by the PREVIOUS schema, which knew
+        // nothing of the suppression, must be REFUSED rather than read as
+        // "suppressed nothing". A silent `#[serde(default)]` read of an old
+        // record is exactly how a build pass would resolve under the wrong
+        // plan and never say so.
+        let stale_path = record_path(
+            &cache,
+            &source,
+            &record.name,
+            &record.subdir,
+            &record.build,
+            TEST_RELAX,
+        );
+        let mut stale = serde_json::to_value(&record).unwrap();
+        stale["schema"] = serde_json::json!(SCHEMA - 1);
+        stale.as_object_mut().unwrap().remove("auto_imports_suppressed_bundles");
+        std::fs::write(&stale_path, serde_json::to_vec(&stale).unwrap()).unwrap();
+        assert!(
+            load_record(
+                &cache,
+                &source,
+                &record.name,
+                Some(&record.version),
+                &record.subdir,
+                &record.build,
+                &record.target_identity,
+                &record.python_version,
+                TEST_RELAX,
+            )
+            .await
+            .is_none(),
+            "a pre-p6u record must be refused, not read as an empty suppression plan"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Guard (turn 14): the advertised OUTPUT round-trips through the store --
