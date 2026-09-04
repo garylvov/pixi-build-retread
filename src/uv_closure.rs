@@ -6867,11 +6867,19 @@ fn validate_one_built_wheel_source(
             "built-wheel source identity mismatch: request names `{requested_name_canonical}` but filename names `{filename_name}`"
         );
     }
-    // bench (measurement only): read_metadata_strict decompresses every ZIP
-    // member, so its cost tracks the wheel's on-disk size. Record both.
+    // bench (measurement only): the strict read decompresses every ZIP
+    // member, so its cost tracks the wheel's on-disk size. C10 serves it
+    // from an attested content record when the bytes are already
+    // identified, which turns that cost into one central-directory walk;
+    // record both so the two doors stay comparable in the same units.
+    //
+    // p6w merge note: c10's swap landed on the SERIAL loop this branch had
+    // already refactored into this helper, so git could not place it. Both
+    // sides are kept -- the parallel validation above, and c10's content
+    // record door here -- rather than either being dropped to resolve.
     let source_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     let read_metadata_started = std::time::Instant::now();
-    let metadata = crate::wheel::read_metadata_strict(&path)
+    let metadata = crate::wheel_content::read_metadata_verified(&path, None)
         .with_context(|| format!("validating built-wheel source {}", path.display()))?;
     tracing::info!(
         source = %requested_name_canonical,

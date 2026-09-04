@@ -3595,7 +3595,7 @@ pub(crate) async fn fetch_and_parse(
     download_dir: &Path,
 ) -> Result<WheelMetadata> {
     let path = crate::wheel::fetch_wheel(url, sha256_hint, download_dir).await?;
-    tokio::task::spawn_blocking(move || crate::wheel::read_metadata(&path))
+    tokio::task::spawn_blocking(move || crate::wheel_content::read_metadata_recorded(&path))
         .await
         .context("metadata reader panicked")?
 }
@@ -3607,7 +3607,7 @@ async fn fetch_and_parse_cached(
     store_root: &Path,
 ) -> Result<WheelMetadata> {
     let path = crate::wheel::fetch_wheel_cached(url, sha256_hint, download_dir, store_root).await?;
-    tokio::task::spawn_blocking(move || crate::wheel::read_metadata(&path))
+    tokio::task::spawn_blocking(move || crate::wheel_content::read_metadata_recorded(&path))
         .await
         .context("metadata reader panicked")?
 }
@@ -3664,7 +3664,12 @@ async fn metadata_preferring_sidecar_with_store(
                     wheel = %resolved.filename,
                     "wheel metadata cache: hit (persistent store, no download)",
                 );
-                return tokio::task::spawn_blocking(move || crate::wheel::read_metadata(&path))
+                // C10-b: this is the persistent content-addressed store, whose
+                // directory name IS the digest -- 991 of the C10 proof relock's
+                // 1121 full `hash+parse` reads (258.6 s, 29.57 GB) came in here.
+                return tokio::task::spawn_blocking(move || {
+                    crate::wheel_content::read_metadata_recorded(&path)
+                })
                     .await
                     .context("metadata reader panicked")?;
             }
