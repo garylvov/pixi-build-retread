@@ -2100,6 +2100,31 @@ pub(crate) fn read_metadata_strict(wheel_path: &Path) -> Result<WheelMetadata> {
 /// accept them. The marker is honoured only while the wheel is still the
 /// read-only regular file with the exact stat tuple the marker recorded, which
 /// is `inspect_store_entry`'s own rule.
+/// Test-only: file a genuine `retread-wheel-store-integrity-v1` marker beside
+/// a store entry, through the same struct and the same freeze the production
+/// publisher uses, so a guard cannot accidentally test a hand-rolled JSON shape
+/// that [`store_integrity_marker_sha256`] would reject for the wrong reason.
+#[cfg(test)]
+pub(crate) fn write_store_integrity_marker_blocking_for_test(
+    store_path: &Path,
+    sha256: &str,
+) -> Result<()> {
+    let mut permissions = std::fs::symlink_metadata(store_path)?.permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(store_path, permissions)?;
+    let metadata = std::fs::symlink_metadata(store_path)?;
+    let marker = StoreIntegrityMarker {
+        schema: "retread-wheel-store-integrity-v1".to_string(),
+        sha256: sha256.to_string(),
+        fingerprint: fingerprint_metadata(&metadata)?,
+    };
+    std::fs::write(
+        store_integrity_marker_path(store_path),
+        serde_json::to_vec_pretty(&marker)?,
+    )?;
+    Ok(())
+}
+
 pub(crate) fn store_integrity_marker_sha256(store_path: &Path) -> Option<String> {
     let metadata = std::fs::symlink_metadata(store_path).ok()?;
     if !metadata.file_type().is_file()

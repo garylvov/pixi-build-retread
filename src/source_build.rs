@@ -9453,6 +9453,32 @@ version = "0.1.0"
         crate::wheel_content::record_sidecar_path(wheel).unwrap()
     }
 
+    /// C10-c: point the persistent-store root at a temp tree for the duration
+    /// of one guard, without touching a process-wide environment variable.
+    struct StoreRootGuard;
+
+    impl StoreRootGuard {
+        fn set(root: &Path) -> Self {
+            std::fs::create_dir_all(root).unwrap();
+            *crate::wheel_content::WHEEL_STORE_ROOT_OVERRIDE
+                .lock()
+                .unwrap() = Some(root.to_path_buf());
+            StoreRootGuard
+        }
+    }
+
+    impl Drop for StoreRootGuard {
+        fn drop(&mut self) {
+            *crate::wheel_content::WHEEL_STORE_ROOT_OVERRIDE
+                .lock()
+                .unwrap() = None;
+        }
+    }
+
+    fn write_store_integrity_marker_for_test(store_entry: &Path, sha256: &str) {
+        crate::wheel::write_store_integrity_marker_blocking_for_test(store_entry, sha256).unwrap();
+    }
+
     /// Serializes the three guards, which share the process-wide record-root
     /// override and the process-wide content memos.
     static C10_GUARD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -9919,6 +9945,123 @@ version = "0.1.0"
         assert!(
             record.is_file(),
             "the stale record this guard has to defeat must have been filed by the first read",
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// C10-c guard (i). C10's derived-sibling rule excluded every platform
+    /// field containing a `.`, which also excluded the PEP 425 compressed tag
+    /// SET that most real manylinux wheels carry. Measured in run 2 of the
+    /// C10-b proof pair (job 5743374): 118 distinct store wheels, 190
+    /// `hash+parse` rows / 20.0 s, declined for this reason alone and unable to
+    /// hold a record at all. Both halves are asserted here, because a rule that
+    /// admits the compressed tag set by admitting EVERYTHING would pass on the
+    /// first half alone and reopen C10.6's false refusal.
+    #[test]
+    fn i_a_compressed_platform_tag_set_is_content_addressed_but_a_derived_name_is_not() {
+        let base = unique_test_dir("c10c-tag-set");
+        let dir = base
+            .join(".retread-wheel-fetch")
+            .join("v1")
+            .join("sha256")
+            .join("b".repeat(64));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Names taken verbatim from job 5743374's own `hash+parse` rows.
+        for admitted in [
+            "frozenlist-1.5.0-cp312-cp312-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+            "pillow-11.3.0-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+            "psutil-7.2.2-cp36-abi3-manylinux2010_x86_64.manylinux_2_12_x86_64.manylinux_2_28_x86_64.whl",
+            "pkg-1.0.0-py3-none-any.whl",
+        ] {
+            let wheel = dir.join(admitted);
+            write_content_addressed_test_wheel(&wheel, 0x01, 16);
+            assert_eq!(
+                crate::wheel_content::content_addressed_sha256(&wheel),
+                Some("b".repeat(64)),
+                "a real compressed platform tag set must be recognised: {admitted}",
+            );
+        }
+        // ... and the thing the rule exists for is still out.
+        for declined in [
+            "pkg-1.0.0-py3-none-any.relaxed.whl",
+            "pillow-11.3.0-cp311-cp311-manylinux_2_28_x86_64.relaxed.whl",
+        ] {
+            let wheel = dir.join(declined);
+            write_content_addressed_test_wheel(&wheel, 0x02, 16);
+            assert_eq!(
+                crate::wheel_content::content_addressed_sha256(&wheel),
+                None,
+                "a derived sibling must stay out, or phase-2 relax becomes a false \
+                 refusal (C10.6/C10.12): {declined}",
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// C10-c guard (h). One wheel is routinely present twice as two separate
+    /// inodes -- the persistent store entry and the per-workspace pinned fetch
+    /// copy -- so the stat-keyed in-process memo does not join them and a
+    /// sibling record beside one is not beside the other. C10's sha-keyed
+    /// record joined them because it was keyed on the digest alone. Measured
+    /// cost of losing that in run A of the C10-b proof pair (job 5743373): 11
+    /// strict reads / 141.2 s on fetch-directory spellings of wheels the store
+    /// already held a record for.
+    #[test]
+    fn h_a_second_spelling_of_one_digest_spends_the_store_entrys_record() {
+        use std::os::unix::fs::MetadataExt;
+        let _serial = C10_GUARD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let base = unique_test_dir("c10c-second-spelling");
+        std::fs::create_dir_all(&base).unwrap();
+        let _memos = MemoGuard::fresh();
+        let _store = StoreRootGuard::set(&base.join("store"));
+
+        let staged = base.join("staged.whl");
+        write_content_addressed_test_wheel(&staged, 0x9D, 4096);
+        let sha256 = sha256_of_file(&staged);
+        let target = ResolutionTarget::from_parts("3.12", "linux-64", None);
+
+        // Spelling 1: the persistent store entry, `<store root>/<sha>/<file>`.
+        let store_dir = base.join("store").join(&sha256);
+        std::fs::create_dir_all(&store_dir).unwrap();
+        let store_entry = store_dir.join("pkg-1.0.0-py3-none-any.whl");
+        std::fs::copy(&staged, &store_entry).unwrap();
+        write_store_integrity_marker_for_test(&store_entry, &sha256);
+        assert_eq!(
+            crate::wheel_content::content_addressed_sha256(&store_entry),
+            Some(sha256.clone()),
+            "the store entry must be recognised, or this guard tests nothing",
+        );
+
+        let before = hashes_of(&store_entry);
+        validate_wheel_file(&store_entry, &target, None).unwrap();
+        assert!(
+            hashes_of(&store_entry) > before,
+            "non-vacuity: the store spelling must actually pay the strict read",
+        );
+
+        // Spelling 2: a SEPARATE INODE in a per-workspace fetch directory.
+        let fetched = place_content_addressed(&base.join("ws"), &staged);
+        assert_ne!(
+            std::fs::metadata(&fetched).unwrap().ino(),
+            std::fs::metadata(&store_entry).unwrap().ino(),
+            "non-vacuity: the two spellings must be different inodes, or the \
+             in-process memo would carry this and the record would not be tested",
+        );
+        assert!(
+            crate::wheel_content::record_sidecar_path(&fetched)
+                .is_some_and(|path| !path.exists()),
+            "non-vacuity: the fetch spelling must have NO record of its own",
+        );
+
+        crate::wheel_content::reset_memos_for_test();
+        let fetched_before = hashes_of(&fetched);
+        validate_wheel_file(&fetched, &target, None).unwrap();
+        assert_eq!(
+            hashes_of(&fetched),
+            fetched_before,
+            "a second spelling of one digest must spend the store entry's record",
         );
 
         let _ = std::fs::remove_dir_all(&base);

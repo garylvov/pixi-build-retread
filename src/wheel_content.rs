@@ -342,11 +342,22 @@ pub(crate) fn content_addressed_sha256(path: &Path) -> Option<String> {
 ///
 /// `with_extension` replaces the last component, so every derived name puts a
 /// `.` inside what would be the platform tag (`…-py3-none-any.relaxed.whl`).
-/// Requiring a PEP 427 name whose last field carries no `.` excludes them.
-/// It also excludes the rare genuine multi-platform tag
-/// (`…-macosx_10_9_x86_64.macosx_11_0_arm64.whl`), which merely gives up the
-/// fast path for that wheel: conservative in the direction that costs seconds
-/// rather than correctness.
+///
+/// C10 excluded every last field containing a `.`, which is correct for the
+/// derived names and far too broad for real ones: a PEP 425 *compressed tag
+/// set* is dot-separated, and the persistent store is full of
+/// `…-manylinux_2_17_x86_64.manylinux2014_x86_64.whl`. Measured in run 2 of the
+/// C10-b proof pair (job `5743374`): **118 distinct store wheels, 190
+/// `hash+parse` rows / 20.0 s**, every one of them declined for this reason
+/// alone and therefore unable to hold a record at all.
+///
+/// C10-c narrows the rule to what it was actually for: every dot-separated
+/// component of the platform field must READ AS a platform tag. `relaxed` does
+/// not, and neither does any other suffix `Path::with_extension` could graft
+/// on, so the derived siblings stay out while the compressed tag sets come in.
+/// Unknown-but-plausible platforms are admitted deliberately — the recogniser
+/// only decides whether a digest may be read off the directory name, and that
+/// digest is still checked against the bytes before anything is served.
 fn is_plain_wheel_filename(filename: &str) -> bool {
     let Some(stem) = filename.strip_suffix(".whl") else {
         return false;
@@ -356,7 +367,26 @@ fn is_plain_wheel_filename(filename: &str) -> bool {
     {
         return false;
     }
-    stem.rsplit('-').next().is_some_and(|tag| !tag.contains('.'))
+    stem.rsplit('-')
+        .next()
+        .is_some_and(|tag| tag.split('.').all(is_platform_tag))
+}
+
+/// One component of a PEP 425 platform tag set.
+fn is_platform_tag(component: &str) -> bool {
+    if component.is_empty() {
+        return false;
+    }
+    const PREFIXES: [&str; 7] = [
+        "manylinux", "musllinux", "linux_", "macosx_", "win32", "win_", "android_",
+    ];
+    component == "any"
+        || component == "win32"
+        || component == "linux"
+        || component == "ios"
+        || PREFIXES
+            .iter()
+            .any(|prefix| component.starts_with(prefix))
 }
 
 /// SHA-256 over the ZIP central directory as parsed, plus the root
@@ -420,7 +450,7 @@ fn structure_digest_and_metadata(path: &Path) -> Result<(String, Vec<u8>, String
 /// supplied by something that is not this file (the caller's lock entry, the
 /// store integrity marker, or the content-addressed directory name), so a
 /// record that does not answer to it is simply not this file's record.
-fn load_record(wheel_path: &Path, sha256: &str) -> Option<WheelContentRecord> {
+fn load_record_at(wheel_path: &Path, sha256: &str) -> Option<WheelContentRecord> {
     let path = record_sidecar_path(wheel_path)?;
     let file_type = std::fs::symlink_metadata(&path).ok()?.file_type();
     if !file_type.is_file() || file_type.is_symlink() {
@@ -429,6 +459,52 @@ fn load_record(wheel_path: &Path, sha256: &str) -> Option<WheelContentRecord> {
     let bytes = std::fs::read(&path).ok()?;
     let record: WheelContentRecord = serde_json::from_slice(&bytes).ok()?;
     (record.schema == RECORD_SCHEMA && record.sha256 == sha256).then_some(record)
+}
+
+/// Test-only redirect for the persistent wheel store root, so the
+/// second-spelling lookup below can be driven without mutating a process-wide
+/// environment variable that every other test in this binary shares.
+#[cfg(test)]
+pub(crate) static WHEEL_STORE_ROOT_OVERRIDE: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+fn wheel_store_root_for_records() -> PathBuf {
+    #[cfg(test)]
+    if let Some(root) = WHEEL_STORE_ROOT_OVERRIDE
+        .lock()
+        .ok()
+        .and_then(|root| root.clone())
+    {
+        return root;
+    }
+    crate::courier::retread_wheel_store_root()
+}
+
+/// C10-c: the SAME digest reached by a second spelling.
+///
+/// One wheel is routinely present twice — `<store root>/<sha>/<file>.whl` and
+/// the per-workspace `.retread-wheel-fetch/v1/sha256/<sha>/<file>.whl` — as two
+/// separate inodes, so the in-process memo (keyed on the stat tuple) does not
+/// join them and a record filed beside one is not beside the other. C10's
+/// sha-keyed record answered both because it was keyed on the digest alone;
+/// C10-b's sibling record must not lose that. Measured in run A of the C10-b
+/// proof pair (`5743373`): 11 strict reads / 141.2 s paid on fetch-directory
+/// spellings of wheels the store already had.
+///
+/// This is the same statement of strength as looking beside the file itself:
+/// the digest was supplied by something that is not these bytes, and the
+/// record's size and structure digest are still recomputed from the file
+/// actually being read before anything is served.
+fn load_record(wheel_path: &Path, sha256: &str) -> Option<WheelContentRecord> {
+    if let Some(record) = load_record_at(wheel_path, sha256) {
+        return Some(record);
+    }
+    let store_entry = wheel_store_root_for_records()
+        .join(sha256)
+        .join(wheel_path.file_name()?);
+    if store_entry == wheel_path {
+        return None;
+    }
+    load_record_at(&store_entry, sha256)
 }
 
 /// Publish a record beside the wheel, tmp-then-`rename`.
