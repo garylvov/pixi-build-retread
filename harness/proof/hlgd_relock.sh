@@ -315,7 +315,18 @@ stage_rsync_path () {            # the pre-p12 path, unchanged
 stage_manifest () {              # what the mirror holds, minus its own two stamp files.
   # -mindepth 1 drops the mirror root, whose mtime moves whenever a stamp file
   # is written; -F because no real path here contains ".stage-mirror-".
-  find "$1" -mindepth 1 -xdev -printf '%y\t%s\t%T@\t%P\n' | grep -vF '.stage-mirror-' | sort
+  # LC_ALL=C ON THE SORT IS LOAD-BEARING, NOT HYGIENE. This census is written
+  # once by the building job and re-walked later by a DIFFERENT job, and the two
+  # are compared with `diff`. glibc's en_US.UTF-8 collation ignores `_`, `-` and
+  # case at the primary level, so two jobs that inherited different locales sort
+  # the same file set into different orders and the diff is non-empty on a tree
+  # nothing touched. That is what `ml1` 5752248 did: a FALSE FATAL exit 12 that
+  # quarantined the shared stage mirror and cost the next job 459 s / 62 GB of
+  # re-staging, while both censuses diff to 0 lines once C-sorted. Every writer
+  # AND every reader of this census pins LC_ALL=C; the pin is per-command so it
+  # is greppable and cannot be lost when the function is moved.
+  # Reader: phase_template/census_collation_guard.sh.
+  find "$1" -mindepth 1 -xdev -printf '%y\t%s\t%T@\t%P\n' | grep -vF '.stage-mirror-' | LC_ALL=C sort
 }
 
 stage_build_mirror () {          # ONE-TIME per key. Returns non-zero on failure.
@@ -448,7 +459,7 @@ src_tp_fingerprint () {          # a DIRECT reader on the read-only canonical tr
   # write that reaches imprint-data by any route at all -- including one that
   # never touches the mirror -- is caught by the job that did it.
   find "$SRC_WS/third_party" -type f "${STAGE_TP_WRITABLE[@]}" \
-    -printf '%i %T@ %s %P\n' 2>/dev/null | sort
+    -printf '%i %T@ %s %P\n' 2>/dev/null | LC_ALL=C sort
 }
 
 stage_verify_mirror () {         # the READER for stage_build_mirror's writer
@@ -456,13 +467,13 @@ stage_verify_mirror () {         # the READER for stage_build_mirror's writer
   [ -f "$m/.stage-mirror-manifest.tsv" ] || { echo "### stage: no mirror manifest at $m -- cannot verify"; return 0; }
   local now=$A/${TAG}-$J.stage-mirror-now.tsv
   stage_manifest "$m" > "$now"
-  if diff -q "$m/.stage-mirror-manifest.tsv" "$now" >/dev/null; then
+  if LC_ALL=C diff -q "$m/.stage-mirror-manifest.tsv" "$now" >/dev/null; then
     echo "### stage: mirror INTACT ($m)"
   else
     echo "### stage: FATAL-CLASS -- the mirror CHANGED under this job. A hardlinked"
     echo "###        input was written through. Quarantining the mirror; the next"
     echo "###        job rebuilds it. Diff head:"
-    diff "$m/.stage-mirror-manifest.tsv" "$now" | head -20
+    LC_ALL=C diff "$m/.stage-mirror-manifest.tsv" "$now" | head -20
     mv "$m" "$m.DIRTY-$J" 2>/dev/null && echo "### stage: quarantined -> $m.DIRTY-$J"
     MIRROR_DIRTY=1
   fi
@@ -602,6 +613,79 @@ export RUST_BACKTRACE=1
 . "$FAST_ENV"
 retread_fast_env "$WS" || { echo "FATAL: retread_fast_env refused"; exit 7; }
 
+# --- OPTIONAL: JOB-SCOPED WHEEL STORE, SEEDED FROM THE PERSISTENT ONE ---------
+# retread_fast_env just exported RETREAD_WHEEL_STORE=<persist root>/wheels, the
+# SHARED store. That is the right default and it is what buys index authority
+# (see the wheel-store block in retread_fast_env.sh). But a lane whose lock is
+# being killed by a stale `.<wheel>.whl.retread-fill-v1.lock` sidecar in that
+# shared store needs the store's WARMTH without its POISON, and the way to get
+# that is a job-scoped store SEEDED by a byte copy.
+#
+# To turn it on, a harness sets WHEEL_STORE_SEED to the store to seed FROM
+# before it reaches this point, e.g.
+#     WHEEL_STORE_SEED=$RETREAD_PERSIST_CACHE_ROOT/wheels
+# and this block redirects RETREAD_WHEEL_STORE at a fresh job-scoped copy.
+#
+# THE SEED IS `retread_seed_wheel_store`, AND `cp -al` IS REFUSED FOR THIS.
+# A `cp -al` of the wheel store is wrong twice over:
+#   (a) a hardlink shares the inode, so making one bumps the ctime of files
+#       other live lanes are reading and any write through the "isolated" copy
+#       lands in the shared store (the p6k-b burn);
+#   (b) `cp -al` copies the directory whole, fill locks included, so the store
+#       that was supposed to be clean carries exactly the poison it was
+#       isolated from.
+# `retread_seed_wheel_store` does an `rsync -aW` byte copy with the fill locks
+# and quarantine dirs excluded, prints a census line, and REFUSES (non-zero) if
+# a fill lock, a quarantine dir, or a wheel with link count != 1 reached the
+# destination. That link-count assert is the reader for this whole comment.
+#
+# NOTE: the `cp -al` calls elsewhere in this template stage $SRC_WS/third_party
+# and the build mirror. Those are a different argument (read-only shared trees
+# with no lock sidecars in them) and are NOT covered by this refusal.
+if [ -n "${WHEEL_STORE_SEED:-}" ]; then
+  WHEEL_STORE_JOBSCOPED=${WHEEL_STORE_JOBSCOPED:-$C/wheels-seeded}
+  rm -rf "$WHEEL_STORE_JOBSCOPED"
+  echo "### wheel store: seeding job-scoped store from $WHEEL_STORE_SEED (byte copy; cp -al is refused here)"
+  retread_seed_wheel_store "$WHEEL_STORE_SEED" "$WHEEL_STORE_JOBSCOPED" \
+    || { echo "FATAL: retread_seed_wheel_store refused"; exit 7; }
+  export RETREAD_WHEEL_STORE=$WHEEL_STORE_JOBSCOPED
+  echo "### wheel store: RETREAD_WHEEL_STORE=$RETREAD_WHEEL_STORE (job-scoped; seed wall is OUTSIDE the lock span)"
+else
+  echo "### wheel store: SHARED, RETREAD_WHEEL_STORE=$RETREAD_WHEEL_STORE (set WHEEL_STORE_SEED to isolate)"
+fi
+
+# --- WHICH WHEEL STORE THE LOCK ACTUALLY READ --------------------------------
+# WHY THIS EXISTS. Until 2026-09-04 the block above was the only thing a lane
+# log said about the wheel store, and after p6i re-enabled the SHARED export at
+# 15:35 09-03 it was a DEAD LETTER: it announced a job-scoped store and then
+# printed the shared path, so every proof since read the fill-lock-poisoned
+# shared store while its log claimed otherwise. A claim about which store was
+# read is worthless unless it is RESOLVED THE WAY THE BACKEND RESOLVES IT, at
+# the moment the lock runs -- not read back off the variable the harness set.
+#
+# `wheel_store_in_use` is `courier::wheel_store_root_with` in shell:
+# RETREAD_WHEEL_STORE -> XDG_CACHE_HOME -> HOME/.cache, then join retread/wheels.
+# The scope word is derived by COMPARING that resolved path to the shared store,
+# never from WHEEL_STORE_SEED -- so a seed that silently failed to take effect
+# prints SHARED, which is the whole point.
+# Reader: phase_template/wheel_store_census_guard.sh.
+wheel_store_in_use () {
+  if [ -n "${RETREAD_WHEEL_STORE:-}" ]; then printf '%s\n' "$RETREAD_WHEEL_STORE"
+  elif [ -n "${XDG_CACHE_HOME:-}" ];    then printf '%s\n' "$XDG_CACHE_HOME/retread/wheels"
+  else                                       printf '%s\n' "${HOME:-/nonexistent}/.cache/retread/wheels"
+  fi
+}
+wheel_store_census () {          # $1 = when ("BEFORE LOCK" / "AFTER LOCK")
+  local s shared scope
+  s=$(wheel_store_in_use)
+  shared=${RETREAD_PERSIST_CACHE_ROOT:-/oscar/data/stellex/glvov/agrescap/cache/retread}/wheels
+  if [ "$s" = "$shared" ]; then scope=SHARED; else scope=JOB-SCOPED; fi
+  printf '### WHEEL STORE IN USE (%s): scope=%s path=%s shared=%s entries=%s fill_locks=%s\n' \
+    "$1" "$scope" "$s" "$shared" \
+    "$(ls -1U "$s" 2>/dev/null | wc -l)" \
+    "$(find "$s" -mindepth 2 -maxdepth 2 -name '.*.retread-fill-v1.lock' 2>/dev/null | wc -l)"
+}
+
 # backend stderr shim (pixi 0.73 swallows backend stderr behind its expect() panic)
 BLOG=$A/${TAG}-$J.backend.log
 : > "$BLOG"
@@ -663,6 +747,7 @@ SRC_FP_AFTER=$A/${TAG}-$J.src-third_party.after.txt
 src_tp_fingerprint > "$SRC_FP_BEFORE"
 echo "### source-tree write guard: fingerprinted $(wc -l < "$SRC_FP_BEFORE") in-place-writable files under $SRC_WS/third_party"
 
+wheel_store_census 'BEFORE LOCK'
 echo "### lock start $(date -Is)"
 S=$(date +%s)
 /usr/bin/time -v -o "$LTIME" "$PIXI" lock -v > "$LLOG" 2>&1
@@ -670,6 +755,7 @@ LRC=$?
 LW=$(( $(date +%s) - S ))
 echo "### lock rc=$LRC wall=${LW}s end $(date -Is)"
 echo "$LRC" > "$A/${TAG}-$J.rc"; echo "$LW" > "$A/${TAG}-$J.wall"
+wheel_store_census 'AFTER LOCK'
 
 # The READER for the stage mirror's writer. A relock that wrote through a
 # hardlink into the shared mirror has poisoned it for every later batch, and the
@@ -677,11 +763,11 @@ echo "$LRC" > "$A/${TAG}-$J.rc"; echo "$LW" > "$A/${TAG}-$J.wall"
 # or a mirror that was never used) makes this a no-op.
 [ -n "${STAGE_MIRROR:-}" ] && [ -d "${STAGE_MIRROR:-/nonexistent}" ] && stage_verify_mirror "$STAGE_MIRROR"
 src_tp_fingerprint > "$SRC_FP_AFTER"
-if diff -q "$SRC_FP_BEFORE" "$SRC_FP_AFTER" >/dev/null; then
+if LC_ALL=C diff -q "$SRC_FP_BEFORE" "$SRC_FP_AFTER" >/dev/null; then
   echo "### source-tree write guard: $SRC_WS/third_party UNCHANGED across the lock"
 else
   echo "### source-tree write guard: FATAL -- THIS JOB WROTE $SRC_WS. Diff:"
-  diff "$SRC_FP_BEFORE" "$SRC_FP_AFTER" | head -40
+  LC_ALL=C diff "$SRC_FP_BEFORE" "$SRC_FP_AFTER" | head -40
   SRC_WRITTEN=1
 fi
 echo "### /usr/bin/time -v (lock) -> $LTIME"
@@ -702,10 +788,10 @@ if [ -f "$WS/pixi.lock" ]; then
   # the run these four counts were validated against (pypi names 174, conda
   # names 1707, pypi urls 213, conda urls 2584 on the canonical manifest).
   LK=$A/pixi.lock.cert
-  grep -aoE '^\s+- pypi: \S+'  "$LK" | awk '{print $3}' | sort -u > "$A/${TAG}-$J.pypi-urls.txt"
-  grep -aoE '^\s+- conda: \S+' "$LK" | awk '{print $3}' | sort -u > "$A/${TAG}-$J.conda-urls.txt"
-  grep -aoE '^- pypi: \S+'  "$LK" | sed 's|.*/||; s|-[0-9].*||'      | grep -v '^$' | sort -u > "$A/${TAG}-$J.pypi-names.txt"
-  grep -aoE '^- conda: \S+' "$LK" | sed 's|.*/||; s|-[^-]*-[^-]*$||' | grep -v '^$' | sort -u > "$A/${TAG}-$J.conda-names.txt"
+  grep -aoE '^\s+- pypi: \S+'  "$LK" | awk '{print $3}' | LC_ALL=C sort -u > "$A/${TAG}-$J.pypi-urls.txt"
+  grep -aoE '^\s+- conda: \S+' "$LK" | awk '{print $3}' | LC_ALL=C sort -u > "$A/${TAG}-$J.conda-urls.txt"
+  grep -aoE '^- pypi: \S+'  "$LK" | sed 's|.*/||; s|-[0-9].*||'      | grep -v '^$' | LC_ALL=C sort -u > "$A/${TAG}-$J.pypi-names.txt"
+  grep -aoE '^- conda: \S+' "$LK" | sed 's|.*/||; s|-[^-]*-[^-]*$||' | grep -v '^$' | LC_ALL=C sort -u > "$A/${TAG}-$J.conda-names.txt"
   echo "### name/url sets: pypi names=$(wc -l < "$A/${TAG}-$J.pypi-names.txt") conda names=$(wc -l < "$A/${TAG}-$J.conda-names.txt") pypi urls=$(wc -l < "$A/${TAG}-$J.pypi-urls.txt") conda urls=$(wc -l < "$A/${TAG}-$J.conda-urls.txt")"
 else
   echo "### NO pixi.lock produced"
@@ -773,7 +859,7 @@ fi
 echo "### CHECK 2/2 -- probes grep"
 echo "  canonical $PROBES_CANON (untouched, operator-gated)"
 echo "  arm copy  $PROBES_ARM"
-diff "$PROBES_CANON" "$PROBES_ARM" | sed 's/^/  /'
+LC_ALL=C diff "$PROBES_CANON" "$PROBES_ARM" | sed 's/^/  /'
 
 ########## 6. HANDOFF TO THE CERT PHASE ##########
 if [ "$LRC" = 0 ] && [ -f "$A/pixi.lock.cert" ] && [ "$MIRROR_DIRTY" = 0 ] && [ "$SRC_WRITTEN" = 0 ]; then

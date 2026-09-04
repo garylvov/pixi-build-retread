@@ -90,7 +90,35 @@ same node with the same manifest and the same binary.
    bash tools/phase_template/expect_sha_gate_guard.sh    # after any gate edit
    bash tools/phase_template/leftover_check_guard.sh     # after any check edit
    bash tools/phase_template/wedge_triage_guard.sh       # after any triage edit
+   bash tools/phase_template/census_collation_guard.sh   # after any stage-census edit
+   bash tools/phase_template/wheel_store_census_guard.sh # after any wheel-store edit
    ```
+
+   > **The stage census is C-sorted at both ends, and that is load-bearing.**
+   > `stage_manifest` is written by the job that builds the mirror and re-walked
+   > by a later, different job, and the two are compared with `diff`. glibc's
+   > `en_US.UTF-8` collation ignores `_`, `-` and case where C compares bytes,
+   > so two jobs with different inherited locales sort the same file set into
+   > different orders and `stage_verify_mirror` reads the non-empty diff as a
+   > write-through: it quarantines the shared mirror and the harness exits 12.
+   > `ml1` 5752248 did exactly that — a FALSE FATAL whose two censuses differ by
+   > 0 lines once C-sorted, which cost the next job 459 s / 62 GB of re-staging.
+   > Every `sort`/`diff` on that path carries an explicit `LC_ALL=C` prefix so
+   > the pin is greppable and cannot be lost in a refactor.
+   > Guard: `census_collation_guard.sh`.
+
+   > **The lock log says which wheel store it actually read.** The old
+   > "job-scoped wheel store" block became a dead letter when p6i re-enabled the
+   > shared export: it announced a job-scoped store and printed the shared path,
+   > so every proof after 15:35 09-03 read the fill-lock-poisoned shared store
+   > while its log claimed isolation. Now `WHEEL_STORE_SEED` actually calls
+   > `retread_seed_wheel_store`, the no-seed branch names the shared store
+   > plainly, and `wheel_store_census` prints
+   > `### WHEEL STORE IN USE (BEFORE|AFTER LOCK): scope=… path=…` on both sides
+   > of the lock, resolving the store the way `courier::wheel_store_root_with`
+   > does rather than reading back the variable the harness set — so a seed that
+   > silently failed to take effect prints `SHARED`.
+   > Guard: `wheel_store_census_guard.sh`.
 
    > **The check matches the LINE, never "FILENAME:LNO: line".** It used to
    > annotate first and pipe the annotated text to `grep`, so it matched its own

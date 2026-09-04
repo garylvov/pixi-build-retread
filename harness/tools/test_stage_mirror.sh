@@ -113,7 +113,7 @@ check "third_party came across"            "$([ -f "$WSB/third_party/ProtoMotion
 check "DEPTH-1 file came across"           "$([ -f "$WSB/AGENTS.md" ] && echo yes)" yes
 check "DEPTH-2 file came across"           "$([ -f "$WSB/src/mod.py" ] && echo yes)" yes
 check "DEPTH-2 file in another dir"        "$([ -f "$WSB/test/test_a.py" ] && echo yes)" yes
-check "no file is missing vs the mirror"   "$( ( cd "$MIR" && find . -type f | grep -vF '.stage-mirror-' | sort ) > "$ROOT/m.lst"; ( cd "$WSB" && find . -type f | sort ) > "$ROOT/w.lst"; comm -23 "$ROOT/m.lst" "$ROOT/w.lst" | wc -l )" 0
+check "no file is missing vs the mirror"   "$( ( cd "$MIR" && find . -type f | grep -vF '.stage-mirror-' | LC_ALL=C sort ) > "$ROOT/m.lst"; ( cd "$WSB" && find . -type f | LC_ALL=C sort ) > "$ROOT/w.lst"; LC_ALL=C comm -23 "$ROOT/m.lst" "$ROOT/w.lst" | wc -l )" 0
 check ".git came across"                   "$([ -f "$WSB/.git/objects/pack/p.pack" ] && echo yes)" yes
 check "manifest under test is installed"   "$(cat "$WSB/pixi.toml")" 'name = "demo-under-test"'
 check "manifest is NOT shared with mirror" "$(stat -c %h "$WSB/pixi.toml")" 1
