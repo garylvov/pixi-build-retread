@@ -733,6 +733,7 @@ fn pythons_for_rejects_bare_major_variant() {
         ledger_overrides: Default::default(),
         pack_manifest_path: None,
         auto_imports: None,
+        verify_snapshots: None,
         parallel_probes: None,
     };
     let result = pythons_for(&cfg, Some(&variants));
@@ -788,6 +789,7 @@ fn pythons_for_accepts_dotted_variant() {
         ledger_overrides: Default::default(),
         pack_manifest_path: None,
         auto_imports: None,
+        verify_snapshots: None,
         parallel_probes: None,
     };
     let result = pythons_for(&cfg, Some(&variants));
@@ -843,6 +845,7 @@ fn pythons_for_filters_bare_major_keeps_dotted() {
         ledger_overrides: Default::default(),
         pack_manifest_path: None,
         auto_imports: None,
+        verify_snapshots: None,
         parallel_probes: None,
     };
     let result = pythons_for(&cfg, Some(&variants));
@@ -3617,6 +3620,7 @@ fn cfg() -> RetreadConfig {
         ledger_overrides: Default::default(),
         pack_manifest_path: None,
         auto_imports: None,
+        verify_snapshots: None,
         parallel_probes: None,
     }
 }
