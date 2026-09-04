@@ -2195,7 +2195,14 @@ pub struct BuiltSdistWheel {
     pub sha256: String,
     /// Sdist provenance: index, name, version, and the exact resolved
     /// sdist URL (+ `#sha256` when the index advertised one).
-    pub sdist_source: crate::lock::SdistWheelSource,
+    ///
+    /// `None` when the heal did NOT build anything: the index chain already
+    /// published a wheel for this exact `name==version` that satisfies the
+    /// artifact target's compatibility contract, so that wheel was fetched
+    /// and stored instead (p6s wheel-before-build rung). Recording an
+    /// `sdist_source` for such an artifact would put a `.tar.gz` URL in the
+    /// lock for bytes that were never built from one.
+    pub sdist_source: Option<crate::lock::SdistWheelSource>,
 }
 
 /// A transitive PRERELEASE pin the heal injected: the offending package
@@ -2740,7 +2747,7 @@ where
             must_ship: true,
             upstream_url: None,
             git_source: None,
-            sdist_source: Some(w.sdist_source.clone()),
+            sdist_source: w.sdist_source.clone(),
         });
     }
     Ok(closure)
@@ -13416,15 +13423,15 @@ sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
     type NoBuild =
         fn(String, Option<String>) -> futures::future::BoxFuture<'static, Result<BuiltSdistWheel>>;
 
-    fn sdist_source_fixture(name: &str, version: &str) -> crate::lock::SdistWheelSource {
-        crate::lock::SdistWheelSource {
+    fn sdist_source_fixture(name: &str, version: &str) -> Option<crate::lock::SdistWheelSource> {
+        Some(crate::lock::SdistWheelSource {
             index: "https://pypi.org/simple/".to_string(),
             name: name.to_string(),
             version: version.to_string(),
             sdist_url: format!(
                 "https://files.pythonhosted.org/packages/{name}-{version}.tar.gz#sha256=deadbeef"
             ),
-        }
+        })
     }
 
     /// Build a [`HealNeeded`] the way `compute_closure`'s two-pass would.

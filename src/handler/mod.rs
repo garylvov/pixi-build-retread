@@ -8021,6 +8021,65 @@ async fn build_sdist_wheel_with_specifiers(
     target: ResolutionTarget,
     cache_dir: PathBuf,
 ) -> Result<crate::uv_closure::BuiltSdistWheel> {
+    // p6s RUNG 2.5 -- WHEEL BEFORE BUILD.
+    //
+    // The heal's build rung used to be entered without ever asking whether
+    // the index chain publishes a WHEEL for this exact `(name, specifiers)`
+    // that satisfies the artifact target's compatibility contract. The
+    // sibling phase-1 entry path never had that hole: it reaches its sdist
+    // fallback only after `crate::pypi::resolve` returns an index MISS. So
+    // `ResolutionTarget`'s declared-glibc ceiling had a live consumer on one
+    // path and none on the other, and a package whose real wheels live on a
+    // private index while public PyPI carries only a `wheel_stub`
+    // PLACEHOLDER sdist went straight to a PEP 517 build.
+    //
+    // That build can never succeed: the placeholder's whole job is to
+    // re-download the very wheel we can already resolve, and it tests the
+    // candidate filenames against the BUILD HOST's tag set -- so a
+    // `manylinux_2_35` wheel is unreachable from a glibc 2.34 builder no
+    // matter how reachable the index is. Measured on oncert-p6r job 5745086:
+    // `isaacsim-extscache-kit-sdk==5.1.0.0` took this rung, and wheel_stub
+    // reported `Didn't find wheel` while
+    // `isaacsim_extscache_kit_sdk-5.1.0.0-cp311-none-manylinux_2_35_x86_64.whl`
+    // was listed on pypi.nvidia.com the whole time.
+    //
+    // So: try the target-compatible wheel first. A hit means this was never
+    // an sdist-only package and nothing is built; `sdist_source` is `None`
+    // because no sdist produced these bytes.
+    if let Ok((wheel_index, wheel)) = fetch_from_pypi_index_chain(
+        &index_urls,
+        |index| {
+            let name = name.clone();
+            let specifiers = specifiers.clone();
+            let target = target.clone();
+            async move {
+                crate::pypi::resolve(&index, &name, &specifiers, target.wheel_target())
+                    .await
+                    .map(|wheel| (index, wheel))
+            }
+        },
+        format!(
+            "sdist auto-build: no index in the chain has a target-compatible wheel for `{name}`"
+        ),
+    )
+    .await
+    {
+        match index_wheel_instead_of_build(&name, &wheel_index, &wheel, &cache_dir).await {
+            Ok(built) => return Ok(built),
+            Err(error) => {
+                // Fail OPEN to the build rung rather than losing the heal:
+                // the wheel was resolvable but could not be fetched/stored.
+                tracing::warn!(
+                    pkg = %name,
+                    index = %wheel_index,
+                    wheel = %wheel.filename,
+                    error = %format!("{error:#}"),
+                    "wheel-before-build: index wheel resolved but could not be materialized; \
+                     falling through to the sdist auto-build rung",
+                );
+            }
+        }
+    }
     let (index, version, sdist) = fetch_from_pypi_index_chain(
         &index_urls,
         |index| async {
@@ -8073,12 +8132,83 @@ async fn build_sdist_wheel_with_specifiers(
         filename,
         wheel_path: store_path,
         sha256,
-        sdist_source: crate::lock::SdistWheelSource {
+        sdist_source: Some(crate::lock::SdistWheelSource {
             index,
             name: name.clone(),
             version: version.to_string(),
             sdist_url,
-        },
+        }),
+    })
+}
+
+/// PEP 427 version field of a wheel filename
+/// (`{name}-{version}(-{build})?-{py}-{abi}-{platform}.whl`).
+pub(crate) fn wheel_filename_version(filename: &str) -> Result<&str> {
+    let stem = filename
+        .strip_suffix(".whl")
+        .ok_or_else(|| anyhow!("wheel filename `{filename}` does not end in `.whl`"))?;
+    let mut parts = stem.split('-');
+    let _name = parts
+        .next()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow!("wheel filename `{filename}` has no distribution field"))?;
+    parts
+        .next()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow!("wheel filename `{filename}` has no version field"))
+}
+
+/// Materialize an index wheel the heal resolved INSTEAD of building a
+/// placeholder sdist (see the wheel-before-build rung above). Fetches the
+/// exact artifact, persists it content-addressed in the shared wheel store
+/// (same store and same `store_wheel_in_cache` call the build rung uses, so
+/// `retread install` replay is identical), and reports it with no
+/// `sdist_source`.
+async fn index_wheel_instead_of_build(
+    name: &str,
+    index: &str,
+    wheel: &crate::pypi::ResolvedWheel,
+    cache_dir: &Path,
+) -> Result<crate::uv_closure::BuiltSdistWheel> {
+    let version = wheel_filename_version(&wheel.filename)
+        .with_context(|| format!("wheel-before-build: resolving version for `{name}`"))?
+        .to_string();
+    let store_root = crate::courier::retread_wheel_store_root();
+    let dest_dir = cache_dir
+        .join("sdist-auto-build-outputs")
+        .join(canonical_conda_name(name))
+        .join(".retread-index-wheel");
+    tokio::fs::create_dir_all(&dest_dir)
+        .await
+        .with_context(|| format!("wheel-before-build: creating {}", dest_dir.display()))?;
+    let fetched = crate::wheel::fetch_wheel_cached(
+        &wheel.url,
+        wheel.sha256.as_deref(),
+        &dest_dir,
+        &store_root,
+    )
+    .await
+    .with_context(|| format!("wheel-before-build: fetching {}", wheel.url))?;
+    let sha256 = crate::wheel::store_wheel_in_cache(&fetched, &store_root)
+        .await
+        .with_context(|| format!("wheel-before-build: storing index wheel for `{name}`"))?;
+    tracing::info!(
+        pkg = %name,
+        version = %version,
+        index = %index,
+        wheel = %wheel.filename,
+        sha256 = %sha256,
+        url = %wheel.url,
+        "wheel-before-build: the index chain already publishes a target-compatible wheel for \
+         this exact version; using it and building NOTHING",
+    );
+    Ok(crate::uv_closure::BuiltSdistWheel {
+        pypi_name: name.to_string(),
+        version,
+        wheel_path: store_root.join(&sha256).join(&wheel.filename),
+        sha256,
+        filename: wheel.filename.clone(),
+        sdist_source: None,
     })
 }
 
@@ -11151,7 +11281,7 @@ async fn uv_group_closure(
                 must_ship: true,
                 upstream_url: None,
                 git_source: None,
-                sdist_source: Some(w.sdist_source.clone()),
+                sdist_source: w.sdist_source.clone(),
             });
         }
     }
@@ -16095,7 +16225,7 @@ async fn materialize_and_rewrite_with_abi_aliases(
                 })?
             }
             Err(error) if pypi::is_pypi_index_miss(&error) => {
-                let built = build_sdist_wheel_with_specifiers(
+                let built = crate::handler::build_sdist_wheel_with_specifiers(
                     entry_name.to_string(),
                     specifiers,
                     vec![index_url.clone()],
@@ -16109,13 +16239,15 @@ async fn materialize_and_rewrite_with_abi_aliases(
                          (version=`{version}`, index=`{index_url}`)"
                     )
                 })?;
-                url::Url::parse(&built.sdist_source.sdist_url).with_context(|| {
-                    format!(
-                        "phase 1 PyPI sdist fallback for entry `{entry_name}` returned invalid \
-                         sdist URL `{}`",
-                        built.sdist_source.sdist_url,
-                    )
-                })?;
+                if let Some(source) = built.sdist_source.as_ref() {
+                    url::Url::parse(&source.sdist_url).with_context(|| {
+                        format!(
+                            "phase 1 PyPI sdist fallback for entry `{entry_name}` returned invalid \
+                             sdist URL `{}`",
+                            source.sdist_url,
+                        )
+                    })?;
+                }
                 tracing::info!(
                     entry = %entry_name,
                     version = %built.version,
@@ -16130,7 +16262,7 @@ async fn materialize_and_rewrite_with_abi_aliases(
                 // [retread-wheels] version entry whose distribution publishes
                 // no wheel (e.g. compress-json). Same contract as
                 // bfs_fetch_provenance for BFS transitives.
-                sdist_source_captured = Some(built.sdist_source.clone());
+                sdist_source_captured = built.sdist_source.clone();
                 built.wheel_path
             }
             Err(error) => {
@@ -28889,6 +29021,198 @@ mod resolve_bundle_bfs_tests {
         });
 
         port
+    }
+
+
+    /// A PEP 503 index that serves ARBITRARY filenames (wheels with real
+    /// platform tags AND sdists), unlike `spawn_index_server`, which only
+    /// ever publishes `py3-none-any` wheels. The wheel-before-build rung is
+    /// exactly about choosing between a platform-tagged wheel and an sdist
+    /// for the same version, so the fixture has to be able to publish both.
+    async fn spawn_mixed_artifact_index(
+        pkg: &str,
+        artifacts: Vec<(String, Vec<u8>)>,
+        max_requests: u8,
+    ) -> u16 {
+        use std::collections::HashMap;
+        let pkg = pkg.to_string();
+        let mut by_filename: HashMap<String, Vec<u8>> = HashMap::new();
+        let mut links = String::new();
+        for (filename, bytes) in artifacts {
+            let sha = crate::wheel_rewrite::sha256_hex(&bytes);
+            links.push_str(&format!(
+                "<a href=\"/{filename}#sha256={sha}\">{filename}</a>\n"
+            ));
+            by_filename.insert(filename, bytes);
+        }
+        let page = format!("<!DOCTYPE html><html><body>\n{links}</body></html>\n");
+        let by_filename = Arc::new(by_filename);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            for _ in 0..max_requests {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let by_filename = by_filename.clone();
+                let page = page.clone();
+                let pkg = pkg.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let (status, ctype, body) = if let Some(rest) = path.strip_prefix("/simple/") {
+                        if rest.trim_end_matches('/') == pkg {
+                            ("200 OK", "text/html", page.clone().into_bytes())
+                        } else {
+                            ("404 Not Found", "text/plain", b"not found".to_vec())
+                        }
+                    } else if let Some(bytes) = by_filename.get(path.trim_start_matches('/')) {
+                        ("200 OK", "application/octet-stream", bytes.clone())
+                    } else {
+                        ("404 Not Found", "text/plain", b"not found".to_vec())
+                    };
+                    let resp = format!(
+                        "HTTP/1.0 {status}\r\nContent-Length: {}\r\nContent-Type: {ctype}\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                    let _ = stream.write_all(&body).await;
+                });
+            }
+        });
+        port
+    }
+
+    /// p6s GUARD A -- the heal's build rung must ask for a target-compatible
+    /// WHEEL before it builds anything.
+    ///
+    /// Shape taken verbatim from oncert-p6r job 5745086: an index that
+    /// publishes, for ONE version, both a platform-tagged wheel the artifact
+    /// target can use and an sdist that CANNOT be built (in production that
+    /// sdist is NVIDIA's `wheel_stub` placeholder, whose only job is to
+    /// re-download the very wheel next to it, and which fails on any builder
+    /// whose glibc is older than the wheel's manylinux tag). Before this
+    /// fix `build_sdist_wheel_with_specifiers` went straight to
+    /// `pypi::resolve_sdist` and the unbuildable sdist, so this returned the
+    /// build error. It must instead return the WHEEL, with no `sdist_source`
+    /// (nothing was built from an sdist) and the store digest of the exact
+    /// bytes the index served.
+    #[tokio::test]
+    async fn p6s_a_heal_takes_the_target_compatible_index_wheel_and_builds_nothing() {
+        let _env_guard = crate::TEST_ASYNC_ENV_MUTEX.lock().await;
+        let dir = unique_tmp_dir();
+        let store = dir.join("store");
+        let cache = dir.join("cache");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        // SAFETY: serialized by TEST_ASYNC_ENV_MUTEX, like every other
+        // env-touching async test in this crate.
+        unsafe { std::env::set_var("RETREAD_WHEEL_STORE", &store) };
+
+        let wheel_bytes = make_wheel_bytes("stub", "1.0.0", &[]);
+        let wheel_sha = crate::wheel_rewrite::sha256_hex(&wheel_bytes);
+        let wheel_name = "stub-1.0.0-cp311-none-manylinux_2_35_x86_64.whl".to_string();
+        let port = spawn_mixed_artifact_index(
+            "stub",
+            vec![
+                (wheel_name.clone(), wheel_bytes),
+                // Not a tarball at all: any attempt to BUILD it fails, which
+                // is what makes "did it build?" observable.
+                ("stub-1.0.0.tar.gz".to_string(), b"not a real sdist".to_vec()),
+            ],
+            64,
+        )
+        .await;
+
+        let target = crate::pypi::ResolutionTarget::from_parts("3.11", "linux-64", Some((2, 35)));
+        let built = crate::handler::build_sdist_wheel_with_specifiers(
+            "stub".to_string(),
+            <uv_pep508::uv_pep440::VersionSpecifiers as std::str::FromStr>::from_str("==1.0.0")
+                .unwrap(),
+            vec![format!("http://127.0.0.1:{port}/simple")],
+            target,
+            cache.clone(),
+        )
+        .await
+        .expect("the index publishes a target-compatible wheel for this exact version");
+
+        assert_eq!(
+            built.sdist_source, None,
+            "no sdist produced these bytes, so the lock must not carry an sdist provenance",
+        );
+        assert_eq!(built.filename, wheel_name);
+        assert_eq!(built.version, "1.0.0");
+        assert_eq!(
+            built.sha256, wheel_sha,
+            "the stored digest must be the digest of the bytes the index served",
+        );
+        assert!(
+            built.wheel_path.starts_with(&store),
+            "the wheel must be persisted in the shared store like a built one: {}",
+            built.wheel_path.display(),
+        );
+        assert!(built.wheel_path.exists(), "{}", built.wheel_path.display());
+        unsafe { std::env::remove_var("RETREAD_WHEEL_STORE") };
+    }
+
+    /// p6s GUARD B (non-vacuity) -- the new rung is gated on the ARTIFACT
+    /// TARGET's compatibility contract, not on "a wheel exists".
+    ///
+    /// Same fixture, but the only wheel on the index needs a glibc the
+    /// target's ceiling does not reach. `pypi::resolve` must reject it, the
+    /// rung must fall through, and the sdist build rung must run and fail on
+    /// the unbuildable sdist -- i.e. exactly the pre-fix behaviour, proving
+    /// guard A is not just "always return a wheel".
+    #[tokio::test]
+    async fn p6s_b_a_wheel_the_target_cannot_use_does_not_short_circuit_the_build() {
+        let _env_guard = crate::TEST_ASYNC_ENV_MUTEX.lock().await;
+        let dir = unique_tmp_dir();
+        let store = dir.join("store");
+        let cache = dir.join("cache");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        // SAFETY: serialized by TEST_ASYNC_ENV_MUTEX.
+        unsafe { std::env::set_var("RETREAD_WHEEL_STORE", &store) };
+
+        let wheel_bytes = make_wheel_bytes("stub", "1.0.0", &[]);
+        let port = spawn_mixed_artifact_index(
+            "stub",
+            vec![
+                // glibc 2.99 is above any ceiling this target can reach
+                // (`max(declared, host)`), on any builder this suite runs on.
+                (
+                    "stub-1.0.0-cp311-none-manylinux_2_99_x86_64.whl".to_string(),
+                    wheel_bytes,
+                ),
+                ("stub-1.0.0.tar.gz".to_string(), b"not a real sdist".to_vec()),
+            ],
+            64,
+        )
+        .await;
+
+        let target = crate::pypi::ResolutionTarget::from_parts("3.11", "linux-64", Some((2, 35)));
+        let error = crate::handler::build_sdist_wheel_with_specifiers(
+            "stub".to_string(),
+            <uv_pep508::uv_pep440::VersionSpecifiers as std::str::FromStr>::from_str("==1.0.0")
+                .unwrap(),
+            vec![format!("http://127.0.0.1:{port}/simple")],
+            target,
+            cache.clone(),
+        )
+        .await
+        .expect_err("no wheel this target can use, so the build rung must run and fail");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("sdist"),
+            "the failure must come from the sdist build rung, not the wheel rung: {rendered}",
+        );
+        unsafe { std::env::remove_var("RETREAD_WHEEL_STORE") };
     }
 
     /// A dependency-free in-tree PEP 517 backend keeps the source/Git BFS
