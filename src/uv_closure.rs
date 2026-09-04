@@ -3951,14 +3951,76 @@ fn workspace_fact_override_needed(
     None
 }
 
+/// uv's own CONCLUSION, sliced out of a verbose run's stderr.
+///
+/// p6r. The closure runs uv with `-v`, so its stderr carries the resolver's
+/// entire exploration -- every `Adding transitive dependency`, every
+/// `Recording unit propagation conflict`, every candidate it tried and then
+/// backtracked past -- ahead of the report uv finally writes. Those trace
+/// lines name requirements uv CONSIDERED, not requirements that hold, and
+/// attributing a constraint to one of them blames a fact for a conflict that
+/// never happened.
+///
+/// Measured, job `5742776` (`isaaclab-viral-pack`): uv's report named
+/// `datasets` / `fsspec[http]` / `xxhash` / `trl` / `isaacsim[all]` and said
+/// nothing at all about `protobuf`, while its trace carried
+/// `Adding transitive dependency for tensorboard==2.21.0: protobuf>=6.31.1,
+/// <8.0.0` -- a candidate uv itself rejected two hundred lines later
+/// (`Searching for a compatible version of tensorboard (<=2.20.0)` ->
+/// `Selecting: tensorboard==2.20.0`) precisely BECAUSE the learned
+/// `protobuf==5.29.3` constraint was in force. Reading the trace made
+/// [`learned_fact_yield_needed`] drop that constraint and re-lock without it;
+/// the re-lock was free to take `tensorboard 2.21.0`, whose
+/// `Requires-Dist protobuf>=6.31.1,<8` became the emitted conda `constrains`
+/// row that made `viral-gpu` unsolvable. The same run dropped ~130 learned
+/// facts this way, one per re-lock, in provenance (alphabetical) order.
+///
+/// The report is anchored on uv's own summary marker `×`, which opens the
+/// failure block and appears nowhere in the trace. When there is no marker --
+/// a hand-transcribed fixture, a non-resolution failure -- the resolver's own
+/// log lines are stripped by level prefix instead, and if that leaves nothing
+/// the whole text is returned: attribution degrades to today's behaviour
+/// rather than going silent.
+pub fn uv_conflict_report(stderr: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(marker) = stderr.find('\u{d7}') {
+        // Back up to the start of the marker's own line so the report keeps
+        // its leading indentation exactly as uv wrote it.
+        let start = stderr[..marker].rfind('\n').map_or(0, |nl| nl + 1);
+        return std::borrow::Cow::Borrowed(&stderr[start..]);
+    }
+    let kept: Vec<&str> = stderr
+        .lines()
+        .filter(|line| !is_uv_trace_line(line))
+        .collect();
+    if kept.iter().any(|line| !line.trim().is_empty()) && kept.len() != stderr.lines().count() {
+        return std::borrow::Cow::Owned(kept.join("\n"));
+    }
+    std::borrow::Cow::Borrowed(stderr)
+}
+
+/// True for one line of uv's `-v` resolver log, identified by the level token
+/// uv writes at the head of every such line.
+fn is_uv_trace_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    ["TRACE ", "DEBUG ", "INFO ", "WARN ", "ERROR "]
+        .iter()
+        .any(|level| trimmed.starts_with(level))
+}
+
 /// Best-effort join of uv's conflict prose to the constraint provenance
-/// table: any constrained name appearing in the error text is attributed
+/// table: any constrained name appearing in uv's REPORT is attributed
 /// to its conda source package. Degrades gracefully — an unparseable
 /// message still yields records for every constrained name it mentions.
+///
+/// p6r: the text searched is [`uv_conflict_report`], not the raw stderr. A
+/// name that appears only in the resolver's exploration trace is not named in
+/// the conflict and must not be attributed to one.
 pub fn attribute_conflict(
     stderr: &str,
     provenance: &BTreeMap<String, ConstraintProvenance>,
 ) -> Vec<ConflictAttribution> {
+    let report = uv_conflict_report(stderr);
+    let stderr: &str = report.as_ref();
     let mut out = Vec::new();
     for (pypi_name, prov) in provenance {
         if authority(&prov.provenance) != Authority::Authoritative {
@@ -10317,6 +10379,215 @@ Using CPython 3.8.20
     /// the learned `sympy==1.14.0` uncovers the NEXT learned float in the same
     /// chain: `sympy==1.13.1`'s own `Requires-Dist: mpmath>=1.1.0,<1.4` excludes
     /// the learned `mpmath==1.4.1`.
+    /// Job `5742776`, bundle `isaaclab-viral-pack`, python 3.11 / linux-64:
+    /// uv's `-v` stderr, trimmed to the two regions that decide the
+    /// attribution and otherwise verbatim.
+    ///
+    /// The TRACE half is uv exploring `tensorboard 2.21.0` and then
+    /// backtracking off it -- the backtrack happens BECAUSE the learned
+    /// `protobuf==5.29.3` constraint (which uv renders as the
+    /// `protobuf>=5.29.3, <5.29.3+` transitive) is in force. The REPORT half
+    /// is uv's conclusion, and it is about `datasets` / `fsspec[http]` /
+    /// `xxhash` / `trl` / `isaacsim[all]`. **`protobuf` is not in it.**
+    const P6R_VIRAL_GPU_STDERR: &str = "\
+DEBUG Searching for a compatible version of tensorboard (*)
+DEBUG Selecting: tensorboard==2.21.0 [compatible] (tensorboard-2.21.0-py3-none-any.whl)
+DEBUG Adding transitive dependency for tensorboard==2.21.0: protobuf>=6.31.1, <8.0.0
+DEBUG Adding transitive dependency for tensorboard==2.21.0: protobuf>=5.29.3, <5.29.3+
+DEBUG Recording unit propagation conflict of protobuf from incompatibility of (tensorboard)
+DEBUG Searching for a compatible version of tensorboard (<=2.20.0)
+DEBUG Selecting: tensorboard==2.20.0 [compatible] (tensorboard-2.20.0-py3-none-any.whl)
+DEBUG Adding transitive dependency for tensorboard==2.20.0: protobuf!=4.24.0, >=3.19.6
+DEBUG Recording unit propagation conflict of datasets from incompatibility of (fsspec, trl)
+DEBUG Package trl has too many conflicts (culprit), deprioritizing and backtracking
+  \u{d7} No solution found when resolving dependencies for split (markers:
+  \u{2502} python_full_version == '3.11.*' and platform_machine == 'x86_64' and
+  \u{2502} sys_platform == 'linux'):
+  \u{2570}\u{2500}\u{25b6} Because datasets>=3.0.2,<=3.2.0 depends on
+      fsspec[http]>=2023.1.0,<=2024.9.0 and datasets>=3.0.0,<=3.0.1
+      depends on fsspec[http]>=2023.1.0,<=2024.6.1, we can conclude that
+      datasets>=3.0.0,<=3.2.0 depends on fsspec[http]>=2023.1.0,<=2024.9.0.
+      (1)
+
+      Because there is no version of xxhash==0.8.3 and datasets>=3.3.0 depends
+      on xxhash==0.8.3, we can conclude that datasets>=3.3.0 cannot be used.
+      And because we know from (1) that datasets>=3.0.0,<=3.2.0 depends on
+      fsspec[http]>=2023.1.0,<=2024.9.0, we can conclude that datasets>=3.0.0
+      depends on fsspec>=2023.1.0,<=2024.9.0.
+      And because trl==0.17.0 depends on datasets>=3.0.0, we can conclude that
+      trl==0.17.0 depends on fsspec>=2023.1.0,<=2024.9.0.
+      And because isaacsim-core==5.1.0.0 depends on fsspec==2024.10.0 and
+      isaacsim[all]==5.1.0.0 depends on isaacsim-core==5.1.0.0, we can
+      conclude that isaacsim[all]==5.1.0.0 and trl==0.17.0 are incompatible.
+      And because your project depends on isaacsim[all]==5.1.0 and
+      trl==0.17.0, we can conclude that your project's requirements are
+      unsatisfiable.";
+
+    /// The two learned workspace conda facts that mattered in that run:
+    /// `protobuf==5.29.3` (innocent -- uv honoured it) and `xxhash==0.8.3`
+    /// (guilty -- conda's build spelling, which PyPI never published).
+    fn p6r_viral_gpu_learned_constraints() -> ConstraintSet {
+        learned_fact_constraints(
+            &BTreeMap::from([
+                ("protobuf".to_string(), "5.29.3".to_string()),
+                ("xxhash".to_string(), "0.8.3".to_string()),
+            ]),
+            &BTreeMap::new(),
+            &Default::default(),
+            &ConstraintSet::default(),
+            &BTreeSet::new(),
+            "precise-consuming-envs",
+            "3.11",
+        )
+    }
+
+    /// p6r (a). A learned fact uv mentions ONLY while exploring -- and then
+    /// backtracks past, because the fact itself forced the backtrack -- is
+    /// not named in uv's conflict and must keep its constraint. The fact uv
+    /// really did blame still yields, in the same call, so the guard cannot
+    /// pass by making the yield path inert.
+    #[test]
+    fn p6r_a_learned_fact_named_only_in_uvs_resolver_trace_is_not_yielded() {
+        let learned = p6r_viral_gpu_learned_constraints();
+        let attributions = attribute_conflict(P6R_VIRAL_GPU_STDERR, &learned.provenance);
+        let attributed: Vec<&str> = attributions
+            .iter()
+            .map(|a| a.package.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            attributed,
+            vec!["xxhash"],
+            "uv's REPORT blames xxhash and says nothing about protobuf; the \
+             `protobuf>=6.31.1, <8.0.0` line lives in the resolver TRACE, on a \
+             tensorboard candidate uv itself rejected because the learned \
+             protobuf pin was in force (job 5742776)",
+        );
+
+        let needed = learned_fact_yield_needed(&attributions, P6R_VIRAL_GPU_STDERR)
+            .expect("the fact uv DID blame must still yield -- this fix narrows the text \
+                     attribution reads, it does not disarm the yield");
+        assert_eq!(needed.pypi_name, "xxhash");
+        assert_eq!(needed.learned_version, "0.8.3");
+    }
+
+    /// p6r (b), the outcome the arm reads: with the innocent pin kept, the
+    /// closure's own resolution takes the tensorboard whose `Requires-Dist`
+    /// ADMITS conda's `protobuf 5.29.3`, so the conda `constrains` row the
+    /// bundle goes on to emit agrees with the workspace instead of demanding
+    /// `>=6.31.1`.
+    ///
+    /// The stub resolver is uv in miniature over the two candidate wheels the
+    /// run actually saw: `tensorboard 2.21.0` (`protobuf>=6.31.1,<8`) and
+    /// `2.20.0` (`protobuf!=4.24.0,>=3.19.6`), highest-compatible-first
+    /// against whatever protobuf constraint the request carries. It fails
+    /// with the captured stderr for as long as the request still holds the
+    /// genuinely unsatisfiable `xxhash==0.8.3`, which is what made the run
+    /// re-lock over and over.
+    #[tokio::test]
+    async fn p6r_the_closure_keeps_the_learned_pin_and_picks_the_tensorboard_that_admits_it() {
+        let mut req = sample_request();
+        req.constraints = p6r_viral_gpu_learned_constraints();
+
+        let seen = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+        let raw = {
+            let seen = Arc::clone(&seen);
+            move |req: UvClosureRequest| {
+                let seen = Arc::clone(&seen);
+                Box::pin(async move {
+                    seen.lock()
+                        .unwrap()
+                        .push(req.constraints.constraints.clone());
+                    if req
+                        .constraints
+                        .constraints
+                        .iter()
+                        .any(|line| line == "xxhash==0.8.3")
+                    {
+                        let attributions =
+                            attribute_conflict(P6R_VIRAL_GPU_STDERR, &req.constraints.provenance);
+                        return Err(
+                            match learned_fact_yield_needed(&attributions, P6R_VIRAL_GPU_STDERR) {
+                                Some(needed) => anyhow::Error::new(needed),
+                                None => anyhow!("no solution found"),
+                            },
+                        );
+                    }
+                    // uv in miniature: highest tensorboard whose own
+                    // `Requires-Dist` on protobuf agrees with the constraint.
+                    let protobuf_pin = req
+                        .constraints
+                        .constraints
+                        .iter()
+                        .find_map(|line| line.strip_prefix("protobuf=="))
+                        .map(|v| {
+                            uv_pep508::uv_pep440::Version::from_str(v)
+                                .expect("fixture pins a PEP 440 version")
+                        });
+                    let (tensorboard, requires_protobuf) = [
+                        ("2.21.0", ">=6.31.1,<8"),
+                        ("2.20.0", "!=4.24.0,>=3.19.6"),
+                    ]
+                    .into_iter()
+                    .find(|(_, requires)| {
+                        let specs =
+                            uv_pep508::uv_pep440::VersionSpecifiers::from_str(requires)
+                                .expect("fixture specifiers parse");
+                        protobuf_pin
+                            .as_ref()
+                            .is_none_or(|pin| specs.contains(pin))
+                    })
+                    .expect("one of the two candidates always resolves");
+                    Ok(UvClosure {
+                        wheels: vec![],
+                        pins: BTreeMap::from([
+                            ("tensorboard".to_string(), tensorboard.to_string()),
+                            ("requires-protobuf".to_string(), requires_protobuf.to_string()),
+                        ]),
+                        uv_version: "test".to_string(),
+                        auto_routed: vec![],
+                        auto_dropped: BTreeSet::new(),
+                        effective_input_requirements: None,
+                        dependency_graph: UvDependencyGraph::default(),
+                    })
+                }) as futures::future::BoxFuture<'static, Result<UvClosure>>
+            }
+        };
+
+        let yielded = Arc::new(Mutex::new(BTreeSet::new()));
+        let mut solve = with_learned_fact_yields(raw, Arc::clone(&yielded));
+        let closure = solve(req)
+            .await
+            .expect("dropping the guilty xxhash fact must let the closure resolve");
+
+        assert_eq!(
+            closure.pins["tensorboard"], "2.20.0",
+            "with `protobuf==5.29.3` still constraining the closure, 2.21.0's \
+             `protobuf>=6.31.1,<8` is out of reach and 2.20.0 is the pick",
+        );
+        let emitted = uv_pep508::uv_pep440::VersionSpecifiers::from_str(
+            &closure.pins["requires-protobuf"],
+        )
+        .expect("the emitted constrains bound parses");
+        assert!(
+            emitted.contains(
+                &uv_pep508::uv_pep440::Version::from_str("5.29.3").expect("5.29.3 parses")
+            ),
+            "the conda `constrains` row this bundle emits must admit the \
+             workspace's own conda protobuf 5.29.3; got `{emitted}`",
+        );
+        assert_eq!(
+            *yielded.lock().unwrap(),
+            BTreeSet::from(["xxhash".to_string()]),
+            "only the fact uv's report blamed may be given up; job 5742776 gave \
+             up ~130 of them, protobuf among the first, on trace mentions alone",
+        );
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            2,
+            "one retry, not one per learned fact",
+        );
+    }
+
     const SAGE_PASS_B_STDERR_ROUND_2: &str = "\
   x No solution found when resolving dependencies:
   |-> Because sympy==1.13.1 depends on mpmath>=1.1.0,<1.4 and mpmath==1.4.1,
