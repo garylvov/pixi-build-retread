@@ -479,6 +479,30 @@ pub(crate) fn pinned_wheel_store_path(
     Ok(store_root.join(sha256).join(wheel_filename_from_url(url)?))
 }
 
+/// The stat tuple a cached wheel's authoritative digest was admitted under.
+///
+/// **There is no `ctime` here, and that absence is the fix P6X-1 asked for.**
+/// `ctime` moves when any other process changes an inode's LINK COUNT, and the
+/// wheels in this store are hardlinked across concurrent jobs by construction
+/// (`cp -al` of the shared store; p6v's census found 664 of 708 wheels at link
+/// count 3). A field a sibling can move on a file it never opened is not a
+/// property of the artifact -- p6k-b removed it from `WheelFileFingerprint` in
+/// `source_build.rs` for exactly this reason and this struct was missed, so
+/// the same burn came back one layer down: with `ctime` in the tuple,
+/// `stable_file_sha256` saw the fingerprint move mid-hash whenever a sibling
+/// lane linked the file, returned `None`, and `inspect_store_entry` called a
+/// perfectly good wheel `Corrupt`. The p6x proof relock measured that
+/// directly: three evictions, and the quarantined `azure_identity` wheel's
+/// `sha256sum` equals the entry's own digest.
+///
+/// What is still caught: an in-place rewrite moves `mtime` (and normally
+/// `size`), a replacement moves `inode`, and the authoritative SHA-256 is
+/// computed inside the same window regardless.
+///
+/// The serde derive deliberately does NOT `deny_unknown_fields`: markers
+/// already on disk carry the two dropped `changed_*` fields, and they must
+/// keep being readable and compare on the content fields rather than forcing a
+/// full re-hash of every multi-gigabyte entry in the shared store.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct CachedFileFingerprint {
     size: u64,
@@ -487,10 +511,6 @@ struct CachedFileFingerprint {
     device: u64,
     #[cfg(unix)]
     inode: u64,
-    #[cfg(unix)]
-    changed_seconds: i64,
-    #[cfg(unix)]
-    changed_nanoseconds: i64,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -590,8 +610,8 @@ fn fingerprint_metadata(metadata: &std::fs::Metadata) -> Result<CachedFileFinger
             modified_nanos,
             device: metadata.dev(),
             inode: metadata.ino(),
-            changed_seconds: metadata.ctime(),
-            changed_nanoseconds: metadata.ctime_nsec(),
+            // No `ctime`: see `CachedFileFingerprint`. A sibling job's
+            // hardlink moves it on a file nobody wrote.
         })
     }
     #[cfg(not(unix))]
@@ -611,25 +631,140 @@ fn store_integrity_marker_path(store_path: &Path) -> PathBuf {
     store_path.with_file_name(format!(".{filename}.retread-integrity-v1.json"))
 }
 
-async fn stable_file_sha256(path: &Path) -> Result<Option<(String, CachedFileFingerprint)>> {
+/// How many times a fingerprint-stable hash is attempted before the reader
+/// gives up and reports [`StableFileHash::Unstable`].
+///
+/// Instability is a property of the WINDOW, not of the bytes: a sibling lane
+/// linking or re-publishing the file moves the stat tuple for microseconds. A
+/// bounded retry converts almost all of those into a normal read, and the ones
+/// that do not settle are reported as what they are instead of being called
+/// corruption.
+const WHEEL_STORE_STABLE_HASH_ATTEMPTS: usize = 3;
+
+/// Backoff between fingerprint-stable hash attempts, multiplied by the attempt
+/// index. Short on purpose: the racing act (a `rename`, a `link`) is over in
+/// microseconds, and a store read is on the critical path of every relock.
+const WHEEL_STORE_STABLE_HASH_BACKOFF_MS: u64 = 25;
+
+/// What a fingerprint-stable hash of a path found.
+///
+/// The predecessor of this type was `Option<(String, CachedFileFingerprint)>`,
+/// which collapsed three different facts into `None`: the file is not there,
+/// the file moved under the reader, and (at the call site) the bytes are
+/// wrong. `inspect_store_entry` then mapped `None` onto
+/// `StoreEntryState::Corrupt`, so a concurrent `cp -al` was indistinguishable
+/// from bad bytes and got a healthy wheel evicted from a SHARED store. P6X-1.
+#[derive(Debug)]
+enum StableFileHash {
+    /// The path does not exist, is not a regular file, or vanished mid-read.
+    /// A miss, and callers refill.
+    Missing,
+    /// The bytes were hashed inside a window in which the stat tuple did not
+    /// move. This is the only outcome that may be compared against an
+    /// authoritative digest.
+    Stable(String, CachedFileFingerprint),
+    /// Every attempt saw the stat tuple move mid-hash. This says NOTHING about
+    /// the bytes and must never evict, quarantine or delete anything.
+    Unstable {
+        attempts: usize,
+        tuples: Vec<String>,
+    },
+}
+
+fn describe_fingerprint(fingerprint: &CachedFileFingerprint) -> String {
+    #[cfg(unix)]
+    {
+        format!(
+            "dev={} ino={} size={} mtime_ns={}",
+            fingerprint.device, fingerprint.inode, fingerprint.size, fingerprint.modified_nanos,
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        format!(
+            "size={} mtime_ns={}",
+            fingerprint.size, fingerprint.modified_nanos,
+        )
+    }
+}
+
+/// Emit the one row that says a reader refused to judge an entry.
+///
+/// Emitted where the instability is DETECTED, once, for the same reason
+/// `evict_store_entry` emits its row inside itself: p6v's three silent call
+/// sites are how the campaign spent a night unable to say who had emptied an
+/// entry. The row is a MISS notice, never an eviction notice.
+fn report_unstable_entry(path: &Path, sha256: &str, attempts: usize, tuples: &[String]) {
+    tracing::warn!(
+        "wheel_store unstable sha={} attempts={} tuples=[{}] wheel={}",
+        sha256,
+        attempts,
+        tuples.join(" | "),
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("<unknown>"),
+    );
+}
+
+/// Hash a file and prove, from a stat before and a stat after, that nothing
+/// moved under the read -- retrying a bounded number of times before declaring
+/// the window unstable.
+async fn stable_file_sha256(path: &Path) -> Result<StableFileHash> {
+    let mut tuples = Vec::new();
+    for attempt in 1..=WHEEL_STORE_STABLE_HASH_ATTEMPTS {
+        match stable_file_sha256_once(path).await? {
+            StableFileHash::Unstable {
+                tuples: attempt_tuples,
+                ..
+            } => {
+                tuples.extend(attempt_tuples);
+                if attempt < WHEEL_STORE_STABLE_HASH_ATTEMPTS {
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        WHEEL_STORE_STABLE_HASH_BACKOFF_MS * attempt as u64,
+                    ))
+                    .await;
+                }
+            }
+            settled => return Ok(settled),
+        }
+    }
+    Ok(StableFileHash::Unstable {
+        attempts: WHEEL_STORE_STABLE_HASH_ATTEMPTS,
+        tuples,
+    })
+}
+
+async fn stable_file_sha256_once(path: &Path) -> Result<StableFileHash> {
     let path_metadata = match fs::symlink_metadata(path).await {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(StableFileHash::Missing);
+        }
         Err(error) => return Err(error).with_context(|| format!("stating {}", path.display())),
     };
     if !path_metadata.file_type().is_file() || path_metadata.file_type().is_symlink() {
-        return Ok(None);
+        return Ok(StableFileHash::Missing);
     }
     let initial = fingerprint_metadata(&path_metadata)?;
     let mut file = fs::File::open(path)
         .await
         .with_context(|| format!("opening {}", path.display()))?;
-    if fingerprint_metadata(&file.metadata().await?)? != initial {
-        return Ok(None);
+    let opened = fingerprint_metadata(&file.metadata().await?)?;
+    if opened != initial {
+        return Ok(StableFileHash::Unstable {
+            attempts: 1,
+            tuples: vec![describe_fingerprint(&initial), describe_fingerprint(&opened)],
+        });
     }
+    // The window a concurrent `cp -al`, `touch` or re-publish lands in. Under
+    // `cfg(test)` a probe may be armed here so a guard can reproduce that
+    // window deterministically instead of racing a thread.
+    #[cfg(test)]
+    stable_hash_probe::maybe_bump(path);
 
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; 1024 * 1024];
+    let mut hashed: u64 = 0;
     loop {
         let count = file
             .read(&mut buffer)
@@ -638,19 +773,105 @@ async fn stable_file_sha256(path: &Path) -> Result<Option<(String, CachedFileFin
         if count == 0 {
             break;
         }
+        hashed += count as u64;
         hasher.update(&buffer[..count]);
     }
+    // Measurement only, and the reason it is here: the marker fast path exists
+    // so a hardlinked multi-gigabyte entry is NOT re-streamed on every read,
+    // and a guard has to be able to see that it wasn't.
+    note_full_hash(path, hashed, "wheel::stable_file_sha256");
     let final_opened = fingerprint_metadata(&file.metadata().await?)?;
     let final_path = match fs::symlink_metadata(path).await {
         Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
             fingerprint_metadata(&metadata)?
         }
-        _ => return Ok(None),
+        _ => return Ok(StableFileHash::Missing),
     };
     if initial != final_opened || initial != final_path {
-        return Ok(None);
+        return Ok(StableFileHash::Unstable {
+            attempts: 1,
+            tuples: vec![
+                describe_fingerprint(&initial),
+                describe_fingerprint(&final_opened),
+                describe_fingerprint(&final_path),
+            ],
+        });
     }
-    Ok(Some((format!("{:x}", hasher.finalize()), initial)))
+    Ok(StableFileHash::Stable(
+        format!("{:x}", hasher.finalize()),
+        initial,
+    ))
+}
+
+/// Test-only probe that moves a file's `mtime` inside the hash window.
+///
+/// A guard for "the stat tuple changed while the bytes did not" cannot race a
+/// thread and stay non-vacuous -- p6k-b's own first guard passed by accident
+/// because a timestamp did not move inside one millisecond. This makes the
+/// window deterministic: the probe fires between the pre-hash stat and the
+/// read loop, exactly where a sibling's `cp -al` or re-publish lands, and the
+/// guard asserts the armed bumps were all consumed.
+#[cfg(test)]
+pub(crate) mod stable_hash_probe {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static TARGET: Mutex<Option<PathBuf>> = Mutex::new(None);
+    static REMAINING: AtomicUsize = AtomicUsize::new(0);
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    /// The probe is one global, and `cargo test` runs this binary's tests in
+    /// parallel: every guard that arms it holds this for its whole body.
+    pub(crate) fn serialize() -> std::sync::MutexGuard<'static, ()> {
+        SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The next `bumps` hashes of `path` see its `mtime` move mid-read. The
+    /// BYTES are never touched.
+    pub(crate) fn arm(path: &Path, bumps: usize) {
+        *TARGET.lock().unwrap() = Some(path.to_path_buf());
+        REMAINING.store(bumps, Ordering::SeqCst);
+    }
+
+    pub(crate) fn disarm() {
+        *TARGET.lock().unwrap() = None;
+        REMAINING.store(0, Ordering::SeqCst);
+    }
+
+    /// How many armed bumps have NOT been consumed. A guard asserting this is
+    /// zero has proved the instability it claims to simulate actually happened.
+    pub(crate) fn remaining() -> usize {
+        REMAINING.load(Ordering::SeqCst)
+    }
+
+    pub(super) fn maybe_bump(path: &Path) {
+        {
+            let target = TARGET.lock().unwrap();
+            if target.as_deref() != Some(path) {
+                return;
+            }
+        }
+        if REMAINING.load(Ordering::SeqCst) == 0 {
+            return;
+        }
+        let Ok(metadata) = std::fs::symlink_metadata(path) else {
+            return;
+        };
+        let Ok(modified) = metadata.modified() else {
+            return;
+        };
+        let bumped = modified + std::time::Duration::from_secs(1);
+        let Ok(file) = std::fs::File::open(path) else {
+            return;
+        };
+        if file
+            .set_times(std::fs::FileTimes::new().set_modified(bumped))
+            .is_ok()
+        {
+            REMAINING.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
 }
 
 async fn set_store_file_readonly(path: &Path) -> Result<CachedFileFingerprint> {
@@ -710,7 +931,15 @@ async fn write_store_integrity_marker(
 enum StoreEntryState {
     Missing,
     Valid(CachedFileFingerprint),
+    /// The bytes were hashed inside a stable window and are NOT the digest the
+    /// entry claims. This is the only state that may evict.
     Corrupt,
+    /// The reader could not get a stable window over the entry, so it refuses
+    /// to judge it. A miss for this reader, and nothing is touched. P6X-1.
+    Unstable {
+        attempts: usize,
+        tuples: Vec<String>,
+    },
 }
 
 /// Check a persistent-store entry without trusting path existence alone. A
@@ -744,8 +973,18 @@ async fn inspect_store_entry(store_path: &Path, sha256: &str) -> Result<StoreEnt
         return Ok(StoreEntryState::Valid(fingerprint));
     }
 
-    let Some((actual, _)) = stable_file_sha256(store_path).await? else {
-        return Ok(StoreEntryState::Corrupt);
+    let actual = match stable_file_sha256(store_path).await? {
+        StableFileHash::Stable(actual, _) => actual,
+        // The entry vanished between the stat above and the read: a miss, and
+        // the caller refills. It is not evidence about anyone's bytes.
+        StableFileHash::Missing => return Ok(StoreEntryState::Missing),
+        // The tuple never settled. Before P6X-1 this fell into `Corrupt` and a
+        // healthy wheel was evicted from a store every lane on the machine
+        // reads.
+        StableFileHash::Unstable { attempts, tuples } => {
+            report_unstable_entry(store_path, sha256, attempts, &tuples);
+            return Ok(StoreEntryState::Unstable { attempts, tuples });
+        }
     };
     if actual != sha256 {
         return Ok(StoreEntryState::Corrupt);
@@ -775,6 +1014,11 @@ pub(crate) async fn cached_wheel_store_path(
             evict_store_entry(&store_path, "integrity-inspection-corrupt", "cached_wheel_store_path").await;
             Ok(None)
         }
+        // A miss, and NOT an eviction: the row is already out, and the caller
+        // continues down its sidecar/range/download chain into a job-local
+        // path. This is the call site the p6x proof caught evicting three
+        // healthy wheels.
+        StoreEntryState::Unstable { .. } => Ok(None),
         StoreEntryState::Missing => Ok(None),
     }
 }
@@ -1283,20 +1527,27 @@ pub async fn fetch_wheel_cached(
     // generic entry point verifies bytes; callers with a target/source-bound
     // strict attestation can inspect this stable path before calling us.
     if dest.exists() {
-        if let Some((actual, _)) = stable_file_sha256(&dest).await?
-            && actual == sha256
-        {
-            tracing::debug!(
-                wheel = %filename,
-                "wheel cache: already in dest_dir (no fetch needed)",
-            );
-            return Ok(dest);
+        match stable_file_sha256(&dest).await? {
+            StableFileHash::Stable(actual, _) if actual == sha256 => {
+                tracing::debug!(
+                    wheel = %filename,
+                    "wheel cache: already in dest_dir (no fetch needed)",
+                );
+                return Ok(dest);
+            }
+            // An unstable window is not a hash mismatch, so this copy is NOT
+            // removed on it: the store path below re-publishes atomically.
+            StableFileHash::Unstable { attempts, tuples } => {
+                report_unstable_entry(&dest, sha256, attempts, &tuples);
+            }
+            _ => {
+                tracing::debug!(
+                    wheel = %filename,
+                    "wheel cache: dest_dir hash mismatch; removing stale wheel",
+                );
+                fs::remove_file(&dest).await.ok();
+            }
         }
-        tracing::debug!(
-            wheel = %filename,
-            "wheel cache: dest_dir hash mismatch; removing stale wheel",
-        );
-        fs::remove_file(&dest).await.ok();
     }
 
     // Check the persistent store.
@@ -1321,6 +1572,12 @@ pub async fn fetch_wheel_cached(
                     wheel = %filename,
                     "wheel cache: authoritative store entry is corrupt; serializing repair",
                 );
+                break;
+            }
+            Ok(StoreEntryState::Unstable { .. }) => {
+                // Treated exactly as a miss: this reader refills into its own
+                // job-local `dest_dir` and never judges the shared entry.
+                store_was_missing = true;
                 break;
             }
             Ok(StoreEntryState::Missing) => {
@@ -1382,6 +1639,11 @@ pub async fn fetch_wheel_cached(
                     evict_store_entry(&store_path, "corrupt-after-first-fill-wait", "fetch_wheel_cached:under_fill_lock").await;
                     break;
                 }
+                // Unstable under the fill lock means a writer OUTSIDE retread
+                // (a `cp -al` of the store) is moving the tuple. Refill
+                // job-locally; evicting here would delete another lane's wheel
+                // on no evidence at all.
+                Ok(StoreEntryState::Unstable { .. }) => break,
                 Ok(StoreEntryState::Missing) => break,
                 Err(error) => {
                     tracing::warn!(
@@ -1519,6 +1781,11 @@ pub(crate) async fn store_wheel_in_cache(src: &Path, store_root: &Path) -> Resul
         StoreEntryState::Corrupt => {
             evict_store_entry(&store_final, "integrity-inspection-corrupt", "store_wheel_in_cache").await;
         }
+        // The entry EXISTS and something outside this process is moving its
+        // stat tuple. Publishing over it would be a write to a shared store on
+        // no evidence, so this populate is a no-op and the digest is returned
+        // unchanged; the next reader inspects it again.
+        StoreEntryState::Unstable { .. } => return Ok(sha256),
         StoreEntryState::Missing => {}
     }
     fs::create_dir_all(&store_dir)
@@ -1601,6 +1868,10 @@ pub async fn prefetch_url_wheel_as_source(
             StoreEntryState::Corrupt => {
                 evict_store_entry(&store_path, "integrity-inspection-corrupt", "prefetch_url_wheel_as_source").await;
             }
+            // A miss: fall through to the fetch below, which lands in the
+            // job-local `dest_dir` and is returned directly if the store entry
+            // still will not settle.
+            StoreEntryState::Unstable { .. } => {}
             StoreEntryState::Missing => {}
         }
         // Cold store: fetch (verifies the sha, streaming/incremental -- never
@@ -4730,6 +5001,21 @@ mod tests {
         found.pop().unwrap()
     }
 
+    /// The quarantine directory for `sha` if there is one, for the guards
+    /// whose claim is that there is NONE.
+    #[cfg(unix)]
+    fn sole_quarantine_dir_opt(store_root: &Path, sha: &str) -> Option<PathBuf> {
+        let prefix = format!("{sha}.quarantine-");
+        std::fs::read_dir(store_root)
+            .expect("reading the store root")
+            .map(|entry| entry.expect("a store-root entry").path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&prefix))
+            })
+    }
+
     #[cfg(unix)]
     struct CapturedRows(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
 
@@ -4992,6 +5278,305 @@ mod tests {
                 .all(|row| !row.contains("quarantine=none")),
             "an eviction that deleted rather than quarantined is the defect \
              this guard exists for; rows were {evictions:?}",
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// P6X-1, the root cause. RED on the tip, where `CachedFileFingerprint`
+    /// carried `changed_seconds`/`changed_nanoseconds`: a sibling lane's
+    /// `cp -al` bumps the shared inode's `ctime` on a file nobody wrote, the
+    /// tuple "changes", and a healthy wheel is judged corrupt.
+    ///
+    /// Non-vacuity is the p6k-b lesson, stated as a rule there and enforced
+    /// here: a guard about a timestamp field must first PROVE the field moved,
+    /// so this links and unlinks until the RAW `ctime` differs and fails
+    /// outright if a bounded wait never moves it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_hardlink_into_a_store_entry_is_not_a_fingerprint_change() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let bytes = build_test_wheel_zip();
+        let sha = hex_sha256(&bytes);
+        let filename = "foo-1.0-py3-none-any.whl";
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-p6y-hardlink-{}-{}",
+            std::process::id(),
+            line!(),
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let store = tmp.join("store");
+        std::fs::create_dir_all(store.join(&sha)).unwrap();
+        let store_path = store.join(&sha).join(filename);
+        std::fs::write(&store_path, &bytes).unwrap();
+
+        let fingerprint = set_store_file_readonly(&store_path).await.unwrap();
+        write_store_integrity_marker(&store_path, &sha, &fingerprint)
+            .await
+            .unwrap();
+        let before = std::fs::symlink_metadata(&store_path).unwrap();
+        let before_ctime = (before.ctime(), before.ctime_nsec());
+        let needle = store_path.to_string_lossy().to_string();
+        let hashes_before = full_hash_probe::hashes_for(&needle).len();
+
+        // A sibling lane's `cp -al` of the shared store, one link at a time
+        // until the kernel's ctime granularity actually records it.
+        let link = tmp.join("sibling-clone.whl");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut links = 0_u32;
+        let moved_ctime = loop {
+            let _ = std::fs::remove_file(&link);
+            std::fs::hard_link(&store_path, &link).unwrap();
+            links += 1;
+            let now = std::fs::symlink_metadata(&store_path).unwrap();
+            if (now.ctime(), now.ctime_nsec()) != before_ctime {
+                break true;
+            }
+            if std::time::Instant::now() > deadline {
+                break false;
+            }
+        };
+        assert!(
+            moved_ctime,
+            "this guard is vacuous unless ctime actually moved: {links} links \
+             in 5 s left it at {before_ctime:?}",
+        );
+
+        let after = std::fs::symlink_metadata(&store_path).unwrap();
+        assert_eq!(
+            fingerprint_metadata(&after).unwrap(),
+            fingerprint,
+            "a hardlink is not a change to the wheel: no field another process \
+             can move on a file it never opened belongs in a content \
+             fingerprint (p6k-b, and P6X-1 one layer down)",
+        );
+        assert_eq!(
+            std::fs::read(&store_path).unwrap(),
+            bytes,
+            "and the bytes are untouched, which is the whole point",
+        );
+        assert!(
+            matches!(
+                inspect_store_entry(&store_path, &sha).await.unwrap(),
+                StoreEntryState::Valid(_),
+            ),
+            "the marker fast path must still admit the entry after a sibling \
+             links it -- otherwise every hardlinked entry in the shared store \
+             pays a full multi-gigabyte re-hash on every read",
+        );
+        assert_eq!(
+            full_hash_probe::hashes_for(&needle).len(),
+            hashes_before,
+            "and it must admit it WITHOUT re-streaming the payload: a full \
+             hash here is the cost the ctime field was silently charging on \
+             every hardlinked entry in the store",
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// P6X-1(a). RED on the tip, where one unstable read was the verdict:
+    /// `stable_file_sha256` returned `None` and `inspect_store_entry` mapped
+    /// that straight onto `Corrupt`, so the entry was quarantined. The stat
+    /// tuple moves ONCE mid-hash, the bytes never change, and the retry must
+    /// settle it into a HIT with nothing evicted and nothing quarantined.
+    #[cfg(unix)]
+    #[test]
+    fn a_stat_tuple_that_moves_once_mid_hash_is_retried_not_called_corrupt() {
+        let _serial = stable_hash_probe::serialize();
+        let bytes = build_test_wheel_zip();
+        let sha = hex_sha256(&bytes);
+        let filename = "foo-1.0-py3-none-any.whl";
+        let url: url::Url = format!("http://127.0.0.1:1/{filename}").parse().unwrap();
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-p6y-retry-{}-{}",
+            std::process::id(),
+            line!(),
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let store = tmp.join("store");
+        std::fs::create_dir_all(store.join(&sha)).unwrap();
+        let store_path = store.join(&sha).join(filename);
+        std::fs::write(&store_path, &bytes).unwrap();
+        let mtime_before = std::fs::symlink_metadata(&store_path).unwrap().modified().unwrap();
+
+        stable_hash_probe::arm(&store_path, 1);
+        let (hit, rows) = with_captured_rows(async {
+            cached_wheel_store_path(&url, &sha, &store).await.unwrap()
+        });
+        let leftover = stable_hash_probe::remaining();
+        stable_hash_probe::disarm();
+
+        assert_eq!(
+            leftover, 0,
+            "NON-VACUITY: the armed mid-hash bump never fired, so this guard \
+             never simulated an unstable window",
+        );
+        assert_eq!(
+            hit,
+            Some(store_path.clone()),
+            "a bounded retry must settle the window and return a HIT",
+        );
+        let mtime_after = std::fs::symlink_metadata(&store_path).unwrap().modified().unwrap();
+        assert_ne!(
+            mtime_before, mtime_after,
+            "the simulated instability must be visible in the stat tuple",
+        );
+        assert_eq!(
+            std::fs::read(&store_path).unwrap(),
+            bytes,
+            "and the BYTES must be untouched: this is a moved tuple, not a \
+             rewritten wheel",
+        );
+        for forbidden in ["wheel_store evicted", "wheel_store unstable"] {
+            let matching: Vec<&String> =
+                rows.iter().filter(|row| row.contains(forbidden)).collect();
+            assert!(
+                matching.is_empty(),
+                "an instability that SETTLED is an ordinary read: no {forbidden} \
+                 row belongs here; got {matching:?}",
+            );
+        }
+        assert!(
+            sole_quarantine_dir_opt(&store, &sha).is_none(),
+            "nothing may be quarantined for a window that settled",
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// P6X-1(c). RED on the tip for a second reason: an instability that never
+    /// settles was also `Corrupt` there. It is now its own verdict, with its
+    /// own row, treated as a MISS -- the reader refills into its job-local
+    /// path and the shared entry is left exactly as it was found.
+    #[cfg(unix)]
+    #[test]
+    fn an_entry_whose_tuple_never_settles_is_unstable_a_miss_and_never_evicted() {
+        let _serial = stable_hash_probe::serialize();
+        let bytes = build_test_wheel_zip();
+        let sha = hex_sha256(&bytes);
+        let filename = "foo-1.0-py3-none-any.whl";
+        let url: url::Url = format!("http://127.0.0.1:1/{filename}").parse().unwrap();
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-p6y-unstable-{}-{}",
+            std::process::id(),
+            line!(),
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let store = tmp.join("store");
+        std::fs::create_dir_all(store.join(&sha)).unwrap();
+        let store_path = store.join(&sha).join(filename);
+        std::fs::write(&store_path, &bytes).unwrap();
+
+        // More bumps than the reader has attempts, so it can never settle.
+        let armed = WHEEL_STORE_STABLE_HASH_ATTEMPTS + 2;
+        stable_hash_probe::arm(&store_path, armed);
+        let (hit, rows) = with_captured_rows(async {
+            cached_wheel_store_path(&url, &sha, &store).await.unwrap()
+        });
+        let leftover = stable_hash_probe::remaining();
+        stable_hash_probe::disarm();
+
+        assert_eq!(
+            armed - leftover,
+            WHEEL_STORE_STABLE_HASH_ATTEMPTS,
+            "NON-VACUITY: the reader must have made exactly \
+             {WHEEL_STORE_STABLE_HASH_ATTEMPTS} attempts before giving up",
+        );
+        assert!(hit.is_none(), "an unjudgeable entry is a MISS for this reader");
+        let unstable: Vec<&String> = rows
+            .iter()
+            .filter(|row| row.contains("wheel_store unstable"))
+            .collect();
+        assert_eq!(
+            unstable.len(),
+            1,
+            "exactly one unstable row, emitted where it is detected; got {unstable:?}",
+        );
+        for field in [
+            &format!("sha={sha}"),
+            &format!("attempts={WHEEL_STORE_STABLE_HASH_ATTEMPTS}"),
+            &"tuples=[".to_string(),
+        ] {
+            assert!(
+                unstable[0].contains(field.as_str()),
+                "the unstable row must carry {field}; row was {:?}",
+                unstable[0],
+            );
+        }
+        let evictions: Vec<&String> = rows
+            .iter()
+            .filter(|row| row.contains("wheel_store evicted"))
+            .collect();
+        assert!(
+            evictions.is_empty(),
+            "an unstable window must NEVER evict from a shared store; got {evictions:?}",
+        );
+        assert!(
+            sole_quarantine_dir_opt(&store, &sha).is_none(),
+            "and it must never quarantine",
+        );
+        assert!(
+            store_path.is_file() && std::fs::read(&store_path).unwrap() == bytes,
+            "the entry is left exactly as it was found",
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// P6X-1(b), the non-vacuity of the retry: bytes that really are wrong,
+    /// read inside a window nothing moves in, are still `Corrupt` and are
+    /// still quarantined. A retry-everything implementation passes the two
+    /// guards above and fails this one.
+    #[cfg(unix)]
+    #[test]
+    fn changed_bytes_under_a_stable_tuple_are_still_corrupt_and_quarantined() {
+        let _serial = stable_hash_probe::serialize();
+        stable_hash_probe::disarm();
+        let poison: &[u8] = b"poisoned shared-cache bytes";
+        let bytes = build_test_wheel_zip();
+        let sha = hex_sha256(&bytes);
+        let filename = "foo-1.0-py3-none-any.whl";
+        let url: url::Url = format!("http://127.0.0.1:1/{filename}").parse().unwrap();
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-p6y-corrupt-{}-{}",
+            std::process::id(),
+            line!(),
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let store = tmp.join("store");
+        std::fs::create_dir_all(store.join(&sha)).unwrap();
+        let store_path = store.join(&sha).join(filename);
+        std::fs::write(&store_path, poison).unwrap();
+
+        let (hit, rows) = with_captured_rows(async {
+            cached_wheel_store_path(&url, &sha, &store).await.unwrap()
+        });
+
+        assert!(hit.is_none(), "wrong bytes are never a hit");
+        let evictions: Vec<&String> = rows
+            .iter()
+            .filter(|row| row.contains("wheel_store evicted"))
+            .collect();
+        assert_eq!(
+            evictions.len(),
+            1,
+            "a stable read that mismatches the digest MUST still evict; got {evictions:?}",
+        );
+        let unstable: Vec<&String> = rows
+            .iter()
+            .filter(|row| row.contains("wheel_store unstable"))
+            .collect();
+        assert!(
+            unstable.is_empty(),
+            "nothing was unstable here; got {unstable:?}",
+        );
+        let quarantine = sole_quarantine_dir(&store, &sha);
+        assert_eq!(
+            std::fs::read(quarantine.join(filename)).unwrap(),
+            poison,
+            "and the bad bytes are preserved for whoever has to explain them",
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
