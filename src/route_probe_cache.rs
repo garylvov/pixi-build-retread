@@ -48,7 +48,12 @@ use sha2::{Digest, Sha256};
 /// carrying the auto-imports injection gate, so every v2 file -- any of which
 /// may hold verdicts learned with injection ON, written at an OFF run's
 /// address -- is invalidated once.
-const SCHEMA: &str = "v3-route-probe-verdicts";
+///
+/// v4 (fix p6ac): every entry now carries the CLOSURE it was computed from --
+/// the stage tag, the candidate-universe fingerprint and the normalized spec
+/// set -- inside the record, not only hashed into the map key. A v3 entry has
+/// no such stamp, so it cannot be checked and is discarded once.
+const SCHEMA: &str = "v4-route-probe-verdicts";
 
 /// Directory under the retread cache root holding one file per
 /// (bundle, python minor, subdir).
@@ -90,6 +95,75 @@ impl From<CachedVerdict> for crate::uv_closure::CoInstallVerdict {
     }
 }
 
+/// The CLOSURE a verdict was computed from, carried INSIDE the record.
+///
+/// The map key is `sha256(stage, universe, specs)`. Hashing an input into an
+/// address makes a mismatched entry *unreachable* only while every writer
+/// derives the address the same way; it does not make the entry
+/// *unmisreadable*. This campaign runs several binaries concurrently against
+/// one shared pixi cache root, so "every writer derives it the same way" is an
+/// assumption, not a fact -- and a verdict adopted from the wrong closure is
+/// exactly how a bundle's vendored set moves without its closure moving
+/// (p6ab-5: `isaaclab-hover-pack` read `n_wheels` 68 / 76 / 93 on one binary
+/// and one manifest, and the 40 route-probe questions behind that number were
+/// answered 10-hits-0-solves in one run and 37-live-solves in the next).
+///
+/// So the record states its own provenance and [`RouteProbeCache::lookup`]
+/// refuses anything whose stamp disagrees with what the reader computed. Same
+/// shape as `crate::built_output_store::Record` (C11): stamped identity is
+/// checked on read, and a refusal never yields the payload.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct EntryStamp {
+    /// Which probe stage asked (`auto_route_joint_solve`, ...).
+    #[serde(default)]
+    pub(crate) stage: String,
+    /// `crate::conda_solve::reachable_universe_digest_shared` for this
+    /// question: the candidate universe the verdict is only valid within.
+    #[serde(default)]
+    pub(crate) universe: String,
+    /// The normalized, sorted, deduplicated spec set -- the closure the
+    /// co-solve actually ran over -- as a single canonical string.
+    #[serde(default)]
+    pub(crate) question: String,
+}
+
+impl EntryStamp {
+    /// Build the stamp from the same inputs [`probe_digest`] hashes, so the
+    /// address and the record can never describe different questions.
+    pub(crate) fn new<S: AsRef<str>>(
+        stage: &str,
+        universe: &str,
+        specs: impl Iterator<Item = S>,
+    ) -> Self {
+        Self {
+            stage: stage.to_string(),
+            universe: universe.to_string(),
+            question: normalized_question(specs).join("\u{1f}"),
+        }
+    }
+}
+
+/// A stored verdict plus the closure it was computed from.
+///
+/// `stamp` is `serde(default)` so a truncated or hand-edited entry decodes to
+/// an EMPTY stamp rather than failing the whole file -- and an empty stamp can
+/// never equal a reader's stamp, so such an entry is refused, which is the
+/// behaviour we want.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StoredEntry {
+    verdict: CachedVerdict,
+    #[serde(default)]
+    stamp: EntryStamp,
+}
+
+/// The normalized spec list shared by [`probe_digest`] and [`EntryStamp`].
+fn normalized_question<S: AsRef<str>>(specs: impl Iterator<Item = S>) -> Vec<String> {
+    let mut normalized: Vec<String> = specs.map(|s| s.as_ref().trim().to_string()).collect();
+    normalized.sort();
+    normalized.dedup();
+    normalized
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct VerdictFile {
     #[serde(default)]
@@ -99,7 +173,7 @@ struct VerdictFile {
     #[serde(default)]
     key: String,
     #[serde(default)]
-    entries: BTreeMap<String, CachedVerdict>,
+    entries: BTreeMap<String, StoredEntry>,
 }
 
 /// Hex sha256 of one probe ENTRY key: the stage tag, the normalized,
@@ -121,9 +195,7 @@ pub(crate) fn probe_digest<S: AsRef<str>>(
     universe: &str,
     specs: impl Iterator<Item = S>,
 ) -> String {
-    let mut normalized: Vec<String> = specs.map(|s| s.as_ref().trim().to_string()).collect();
-    normalized.sort();
-    normalized.dedup();
+    let normalized = normalized_question(specs);
     let mut h = Sha256::new();
     h.update(b"retread-probe-question\0");
     h.update(stage.as_bytes());
@@ -192,9 +264,13 @@ pub(crate) fn cache_path(cache_dir: &Path, bundle: &str, python: &str, subdir: &
 pub(crate) struct RouteProbeCache {
     path: PathBuf,
     key: String,
-    entries: Mutex<BTreeMap<String, CachedVerdict>>,
+    entries: Mutex<BTreeMap<String, StoredEntry>>,
     hits: AtomicUsize,
     misses: AtomicUsize,
+    /// Entries that were PRESENT at the reader's address but whose stamped
+    /// closure disagreed with the reader's. Counted separately from a miss so
+    /// "this never happens" stays a measurable claim rather than a belief.
+    refusals: AtomicUsize,
 }
 
 impl RouteProbeCache {
@@ -228,31 +304,67 @@ impl RouteProbeCache {
             entries: Mutex::new(entries),
             hits: AtomicUsize::new(0),
             misses: AtomicUsize::new(0),
+            refusals: AtomicUsize::new(0),
         }
     }
 
-    pub(crate) fn lookup(&self, digest: &str) -> Option<CachedVerdict> {
-        let hit = self
+    /// Replay a verdict, but only one whose stamped closure IS the reader's.
+    ///
+    /// An entry at the right address with the wrong stamp is REFUSED: it
+    /// yields `None` (so the caller probes, exactly as on a miss) and is
+    /// counted and logged, never silently adopted.
+    pub(crate) fn lookup(&self, digest: &str, stamp: &EntryStamp) -> Option<CachedVerdict> {
+        let entry = self
             .entries
             .lock()
             .expect("route probe cache mutex")
             .get(digest)
             .cloned();
-        if hit.is_some() {
-            self.hits.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.misses.fetch_add(1, Ordering::Relaxed);
+        match entry {
+            Some(entry) if entry.stamp == *stamp => {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                Some(entry.verdict)
+            }
+            Some(entry) => {
+                self.refusals.fetch_add(1, Ordering::Relaxed);
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    path = %self.path.display(),
+                    digest = %digest,
+                    stored_stage = %entry.stamp.stage,
+                    stored_universe = %entry.stamp.universe,
+                    reader_stage = %stamp.stage,
+                    reader_universe = %stamp.universe,
+                    "route probe cache: refused an entry whose stamped closure is not \
+                     the reader's; probing instead of adopting",
+                );
+                None
+            }
+            None => {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                None
+            }
         }
-        hit
     }
 
-    pub(crate) fn record(&self, digest: &str, verdict: CachedVerdict) {
+    pub(crate) fn record(&self, digest: &str, stamp: &EntryStamp, verdict: CachedVerdict) {
         let snapshot = {
             let mut entries = self.entries.lock().expect("route probe cache mutex");
-            entries.insert(digest.to_string(), verdict);
+            entries.insert(
+                digest.to_string(),
+                StoredEntry {
+                    verdict,
+                    stamp: stamp.clone(),
+                },
+            );
             entries.clone()
         };
         self.persist(snapshot);
+    }
+
+    /// Entries refused for a stamp mismatch since this handle was opened.
+    pub(crate) fn refusals(&self) -> usize {
+        self.refusals.load(Ordering::Relaxed)
     }
 
     /// `(hits, misses)` since this handle was opened.
@@ -288,7 +400,7 @@ impl RouteProbeCache {
     /// The lock is advisory and best-effort: if it cannot be taken the write
     /// still happens. Worst case is the old behaviour (a lost entry, a re-probe
     /// next run), never a wrong verdict.
-    fn persist(&self, entries: BTreeMap<String, CachedVerdict>) {
+    fn persist(&self, entries: BTreeMap<String, StoredEntry>) {
         if let Some(parent) = self.path.parent() {
             if std::fs::create_dir_all(parent).is_err() {
                 return;
@@ -374,12 +486,12 @@ mod tests {
         let path = cache_path(&dir, "isaac-pack-latest", "3.12", "linux-64");
         let key = key_for("strict");
 
-        let questions: Vec<String> = (0..100)
+        let questions: Vec<(String, EntryStamp)> = (0..100)
             .map(|i| {
-                probe_digest(
-                    "auto_route_joint_solve",
-                    "universe-rev-1",
-                    [format!("absl-py=={i}.0")].iter(),
+                let specs = [format!("absl-py=={i}.0")];
+                (
+                    probe_digest("auto_route_joint_solve", "universe-rev-1", specs.iter()),
+                    EntryStamp::new("auto_route_joint_solve", "universe-rev-1", specs.iter()),
                 )
             })
             .collect();
@@ -387,11 +499,12 @@ mod tests {
         let mut cold_executions = 0usize;
         {
             let cache = RouteProbeCache::open(path.clone(), key.clone());
-            for digest in &questions {
-                if cache.lookup(digest).is_none() {
+            for (digest, stamp) in &questions {
+                if cache.lookup(digest, stamp).is_none() {
                     cold_executions += 1;
                     cache.record(
                         digest,
+                        stamp,
                         CachedVerdict::ExactUnsat(vec!["no candidates".into()]),
                     );
                 }
@@ -402,8 +515,8 @@ mod tests {
 
         let mut warm_executions = 0usize;
         let cache = RouteProbeCache::open(path, key);
-        for digest in &questions {
-            match cache.lookup(digest) {
+        for (digest, stamp) in &questions {
+            match cache.lookup(digest, stamp) {
                 Some(verdict) => assert_eq!(
                     verdict,
                     CachedVerdict::ExactUnsat(vec!["no candidates".into()]),
@@ -411,7 +524,7 @@ mod tests {
                 ),
                 None => {
                     warm_executions += 1;
-                    cache.record(digest, CachedVerdict::Sat);
+                    cache.record(digest, stamp, CachedVerdict::Sat);
                 }
             }
         }
@@ -425,19 +538,19 @@ mod tests {
     fn changed_key_reexecutes_every_probe() {
         let dir = tmp_dir("changed-key");
         let path = cache_path(&dir, "isaac-pack-latest", "3.12", "linux-64");
-        let questions: Vec<String> = (0..8)
+        let questions: Vec<(String, EntryStamp)> = (0..8)
             .map(|i| {
-                probe_digest(
-                    "auto_route_joint_solve",
-                    "universe-rev-1",
-                    [format!("absl-py=={i}.0")].iter(),
+                let specs = [format!("absl-py=={i}.0")];
+                (
+                    probe_digest("auto_route_joint_solve", "universe-rev-1", specs.iter()),
+                    EntryStamp::new("auto_route_joint_solve", "universe-rev-1", specs.iter()),
                 )
             })
             .collect();
         {
             let cache = RouteProbeCache::open(path.clone(), key_for("strict"));
-            for digest in &questions {
-                cache.record(digest, CachedVerdict::Sat);
+            for (digest, stamp) in &questions {
+                cache.record(digest, stamp, CachedVerdict::Sat);
             }
             assert_eq!(cache.len(), 8);
         }
@@ -445,8 +558,8 @@ mod tests {
         let cache = RouteProbeCache::open(path.clone(), key_for("disabled"));
         assert_eq!(cache.len(), 0, "a changed key must discard every verdict");
         let mut executions = 0usize;
-        for digest in &questions {
-            if cache.lookup(digest).is_none() {
+        for (digest, stamp) in &questions {
+            if cache.lookup(digest, stamp).is_none() {
                 executions += 1;
             }
         }
@@ -458,6 +571,158 @@ mod tests {
             path,
             cache_path(&dir, "isaac-pack-latest", "3.12", "linux-64"),
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// GUARD (a) -- p6ac. The store's CONTENTS may not decide an answer.
+    ///
+    /// Same question, same universe; one reader over an EMPTY store and one
+    /// over a store already holding 500 unrelated verdicts must replay the
+    /// same verdict, and the extra entries must not turn into hits.
+    ///
+    /// This is the property p6ab-5 needed and could not state: `n_wheels` for
+    /// `isaaclab-hover-pack` read 68 in four canonical relocks and 93 in the
+    /// next two on the same binary and manifest, and the 40 route-probe
+    /// questions behind it were answered 10-hits/0-solves in one run and
+    /// 3-hits/37-live-solves in the next. Whether warmth alone can move an
+    /// answer had to become a test rather than an argument.
+    #[test]
+    fn p6ac_store_contents_beyond_the_question_cannot_change_the_answer() {
+        let dir = tmp_dir("p6ac-contents");
+        let key = key_for("strict");
+        let specs = ["torch==2.5.1".to_string(), "sympy==1.13.1".to_string()];
+        let digest = probe_digest("auto_route_joint_solve", "universe-rev-7", specs.iter());
+        let stamp = EntryStamp::new("auto_route_joint_solve", "universe-rev-7", specs.iter());
+        let answer = CachedVerdict::Unsat(vec!["pytorch 2.7.1 shadows torch".to_string()]);
+
+        // Reader 1: cold store. Misses, solves, records.
+        let cold_path = cache_path(&dir, "cold-pack", "3.11", "linux-64");
+        let cold = RouteProbeCache::open(cold_path.clone(), key.clone());
+        assert_eq!(cold.lookup(&digest, &stamp), None, "a cold store must miss");
+        cold.record(&digest, &stamp, answer.clone());
+        let cold_answer = RouteProbeCache::open(cold_path, key.clone())
+            .lookup(&digest, &stamp)
+            .expect("the recorded verdict replays");
+
+        // Reader 2: the SAME question against a store stuffed with 500
+        // verdicts for other questions, recorded first.
+        let warm_path = cache_path(&dir, "warm-pack", "3.11", "linux-64");
+        {
+            let warm = RouteProbeCache::open(warm_path.clone(), key.clone());
+            for i in 0..500usize {
+                let other = [format!("filler-{i}==1.0")];
+                warm.record(
+                    &probe_digest("auto_route_joint_solve", "universe-rev-7", other.iter()),
+                    &EntryStamp::new("auto_route_joint_solve", "universe-rev-7", other.iter()),
+                    CachedVerdict::Sat,
+                );
+            }
+            warm.record(&digest, &stamp, answer.clone());
+        }
+        let warm = RouteProbeCache::open(warm_path, key);
+        let warm_answer = warm.lookup(&digest, &stamp).expect("warm store replays");
+
+        assert_eq!(
+            cold_answer, warm_answer,
+            "a store holding 500 extra verdicts must answer this question \
+             exactly as an empty one did",
+        );
+        assert_eq!(warm_answer, answer);
+        assert_eq!(
+            warm.stats(),
+            (1, 0),
+            "the 500 unrelated entries must not be consulted for this question",
+        );
+        assert_eq!(warm.refusals(), 0, "nothing here is stamped wrongly");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// GUARD (b) -- p6ac. An entry at the reader's address whose stamped
+    /// closure is NOT the reader's is refused, never adopted.
+    ///
+    /// The address is `sha256(stage, universe, specs)`, so on the tip an entry
+    /// can only be reached by a writer that derived the address the same way.
+    /// That is an assumption about every binary sharing the pixi cache root,
+    /// not a fact -- several binaries run concurrently against one root in
+    /// this campaign. C11 made the built-output store *unmisreadable* rather
+    /// than merely unreachable; this does the same here.
+    #[test]
+    fn p6ac_an_entry_stamped_with_another_closure_is_refused_not_adopted() {
+        let dir = tmp_dir("p6ac-stamp");
+        let path = cache_path(&dir, "isaaclab-hover-pack", "3.11", "linux-64");
+        let _ = std::fs::remove_file(&path);
+        let key = key_for("strict");
+
+        let specs = ["torch==2.5.1".to_string()];
+        let digest = probe_digest("auto_route_joint_solve", "universe-rev-7", specs.iter());
+        let mine = EntryStamp::new("auto_route_joint_solve", "universe-rev-7", specs.iter());
+        // Same address, a DIFFERENT closure behind it: another universe, and
+        // a different spec set. Only a writer with a different address rule
+        // can produce this -- which is exactly the case the stamp is for.
+        let theirs = EntryStamp::new(
+            "auto_route_joint_solve",
+            "universe-rev-2",
+            ["torch==2.7.0".to_string()].iter(),
+        );
+        assert_ne!(mine, theirs);
+
+        {
+            let writer = RouteProbeCache::open(path.clone(), key.clone());
+            writer.record(&digest, &theirs, CachedVerdict::Sat);
+        }
+
+        let reader = RouteProbeCache::open(path.clone(), key.clone());
+        assert_eq!(reader.len(), 1, "the entry IS on disk at our address");
+        assert_eq!(
+            reader.lookup(&digest, &mine),
+            None,
+            "a verdict computed from another closure must never be adopted",
+        );
+        assert_eq!(reader.refusals(), 1, "and the refusal must be counted");
+        assert_eq!(reader.stats(), (0, 1), "a refusal is a miss, not a hit");
+
+        // Control: the SAME store answers the stamp it actually holds.
+        assert_eq!(
+            reader.lookup(&digest, &theirs),
+            Some(CachedVerdict::Sat),
+            "refusal must be about the stamp, not about refusing everything",
+        );
+        assert_eq!(reader.refusals(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A v3 file has no stamps at all. Its entries decode with an EMPTY stamp,
+    /// which can never be a reader's, so nothing from it is adopted -- and the
+    /// SCHEMA bump discards the file outright before that even matters. Both
+    /// belts are asserted here because only one of them survives a future
+    /// schema bump that forgets the other.
+    #[test]
+    fn p6ac_an_unstamped_legacy_entry_is_never_adopted() {
+        let dir = tmp_dir("p6ac-legacy");
+        let path = cache_path(&dir, "legacy-pack", "3.11", "linux-64");
+        let key = key_for("strict");
+        let specs = ["torch==2.5.1".to_string()];
+        let digest = probe_digest("auto_route_joint_solve", "universe-rev-7", specs.iter());
+        let mine = EntryStamp::new("auto_route_joint_solve", "universe-rev-7", specs.iter());
+
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Hand-written v3 shape: the value is the bare verdict, no stamp.
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"schema":"{SCHEMA}","key":"{key}","entries":{{"{digest}":{{"verdict":"Sat"}}}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let reader = RouteProbeCache::open(path.clone(), key);
+        assert_eq!(reader.len(), 1, "the unstamped entry decoded");
+        assert_eq!(
+            reader.lookup(&digest, &mine),
+            None,
+            "an entry that cannot say what it was computed from is not evidence",
+        );
+        assert_eq!(reader.refusals(), 1);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -570,23 +835,34 @@ mod tests {
                 [format!("absl-py=={n}.0")].iter(),
             )
         };
+        let stamp = |n: usize| {
+            EntryStamp::new(
+                "auto_route_joint_solve",
+                "universe-rev-1",
+                [format!("absl-py=={n}.0")].iter(),
+            )
+        };
 
         // --- Part 1: deterministic interleave. ---
         let writer_a = RouteProbeCache::open(path.clone(), key.clone());
         let writer_b = RouteProbeCache::open(path.clone(), key.clone());
-        writer_a.record(&question(1), CachedVerdict::Sat);
+        writer_a.record(&question(1), &stamp(1), CachedVerdict::Sat);
         // B's snapshot still holds nothing of A's; the old persist rendered
         // the file from exactly that snapshot.
-        writer_b.record(&question(2), CachedVerdict::Unsat(vec!["no".to_string()]));
+        writer_b.record(
+            &question(2),
+            &stamp(2),
+            CachedVerdict::Unsat(vec!["no".to_string()]),
+        );
 
         let reader = RouteProbeCache::open(path.clone(), key.clone());
         assert_eq!(
-            reader.lookup(&question(1)),
+            reader.lookup(&question(1), &stamp(1)),
             Some(CachedVerdict::Sat),
             "the first writer's verdict was erased by the second writer's persist",
         );
         assert_eq!(
-            reader.lookup(&question(2)),
+            reader.lookup(&question(2), &stamp(2)),
             Some(CachedVerdict::Unsat(vec!["no".to_string()])),
             "the second writer's own verdict must be on disk",
         );
@@ -600,7 +876,8 @@ mod tests {
                 scope.spawn(move || {
                     let cache = RouteProbeCache::open(path, key);
                     for entry in 0..5usize {
-                        cache.record(&question(100 + writer * 5 + entry), CachedVerdict::Sat);
+                        let n = 100 + writer * 5 + entry;
+                        cache.record(&question(n), &stamp(n), CachedVerdict::Sat);
                     }
                 });
             }
@@ -609,7 +886,7 @@ mod tests {
         let reader = RouteProbeCache::open(path.clone(), key.clone());
         let missing: Vec<usize> = (0..40)
             .map(|i| 100 + i)
-            .filter(|n| reader.lookup(&question(*n)).is_none())
+            .filter(|n| reader.lookup(&question(*n), &stamp(*n)).is_none())
             .collect();
         assert!(
             missing.is_empty(),

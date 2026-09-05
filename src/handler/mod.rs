@@ -9862,7 +9862,18 @@ impl CondaCoSolveContext {
             &universe,
             specs.iter().map(|spec| spec.to_string()),
         );
-        if let Some(cached) = cache.lookup(&digest) {
+        // p6ac: the record states the closure it was computed from, and the
+        // reader checks it. The address alone is not evidence -- several
+        // binaries share one pixi cache root here, so an address derived by a
+        // different rule is a live hazard, and a verdict adopted from the
+        // wrong closure moves the adopting bundle's vendored set without
+        // moving its closure.
+        let stamp = crate::route_probe_cache::EntryStamp::new(
+            stage,
+            &universe,
+            specs.iter().map(|spec| spec.to_string()),
+        );
+        if let Some(cached) = cache.lookup(&digest, &stamp) {
             self.probe_metrics.record_cache_hit();
             tracing::debug!(
                 bundle = %self.bundle.as_str(), stage, digest = %digest,
@@ -9876,7 +9887,7 @@ impl CondaCoSolveContext {
             run().await
         };
         if let Some(cacheable) = crate::route_probe_cache::CachedVerdict::from_verdict(&verdict) {
-            cache.record(&digest, cacheable);
+            cache.record(&digest, &stamp, cacheable);
         }
         verdict
     }
@@ -20785,6 +20796,42 @@ fn resolve_ceded_pypi_bounds(
     Ok(ownership)
 }
 
+/// Digest of the RESOLVED CLOSURE a bundle was built from, plus the platform
+/// and python it was resolved for.
+///
+/// Anchored on `bundle.uv_dependency_graph.selected_versions` -- uv's full
+/// selection, INCLUDING the packages the auto-route moved to the conda side
+/// and the ones omitted from the exported wheel set. That is the property the
+/// vendored set is supposed to be a function of; `bundle.extras` and
+/// `uv_closure_names` are both downstream of the route decisions and would
+/// make the digest a restatement of the thing it is meant to explain.
+///
+/// The legacy (non-uv) path leaves the graph empty; the digest is then the
+/// stable digest of an empty selection, which is honest -- there is no uv
+/// closure to name -- and still comparable between two runs of that path.
+fn resolved_closure_digest(
+    bundle: &Bundle,
+    host_platform: Platform,
+    python_version: &str,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"retread-resolved-closure-v1\0");
+    hasher.update(host_platform.as_str().as_bytes());
+    hasher.update([0xffu8]);
+    hasher.update(python_version.as_bytes());
+    hasher.update([0xffu8]);
+    // BTreeMap: canonical-name order, so the digest is order-independent.
+    for (name, version) in &bundle.uv_dependency_graph.selected_versions {
+        hasher.update(name.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(version.as_bytes());
+        hasher.update([0u8]);
+    }
+    let digest = hasher.finalize();
+    digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
+}
+
 fn produce_output_with_conflicts(
     bundle: &Bundle,
     config: &RetreadConfig,
@@ -20864,10 +20911,24 @@ fn produce_output_with_conflicts(
     } else {
         HashSet::new()
     };
+    // p6ac: the row states the RESOLVED CLOSURE it claims to be derived from.
+    //
+    // Without it, two `computed vendored set` rows are incomparable: p6ab's
+    // proof and control read `n_wheels=93` where four earlier canonical relocks
+    // of the same manifest on the same binary read 68 and a fifth read 76, and
+    // deciding whether the closure had moved took a night of log archaeology.
+    // `bundle.extras` is NOT the closure -- it is the closure minus whatever
+    // the joint conda route validation left on the conda side, and that
+    // validation answers to a candidate universe that moves under us. So print
+    // both: the closure digest (what the set is supposed to be a function of)
+    // and the size of the set actually emitted. Equal digests with unequal
+    // `n_wheels` is the defect, visible in one grep.
+    let closure_digest = resolved_closure_digest(bundle, host_platform, &python_version);
     tracing::debug!(
         bundle = %bundle.conda_name,
         vendored = ?vendored,
         n_wheels = bundle.extras.len() + 1,
+        closure_digest = %closure_digest,
         "computed vendored set"
     );
 

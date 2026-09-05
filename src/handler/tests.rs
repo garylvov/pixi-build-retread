@@ -13632,3 +13632,130 @@ fn p6w_c_a_correctly_pinned_sibling_survives_the_culprit_beside_it() {
         "the platform-fact remedy must still fire when uv really rejected on the tag",
     );
 }
+
+/// GUARD (c) -- p6ac. The `computed vendored set` row NAMES the resolved
+/// closure it claims to be derived from, and that name tracks the CLOSURE,
+/// not the set.
+///
+/// p6ab's proof and its one-variable control both read
+/// `computed vendored set bundle=isaaclab-hover-pack n_wheels=93` where four
+/// earlier canonical relocks of the same manifest read 68 and a fifth read 76,
+/// and the row carried nothing that could say whether the closure had moved
+/// with it. Deciding that took a night and three log sweeps. With the digest
+/// on the row it is one grep: equal digests and unequal `n_wheels` is the
+/// defect; unequal digests is a different closure and needs no investigation.
+///
+/// The assertions are the two halves that make the digest worth printing:
+///   * growing the VENDORED SET (an extra wheel restored out of a rejected
+///     conda route -- exactly how hover-pack went 68 -> 93) must NOT move the
+///     digest, or the row could never expose the defect; and
+///   * moving the CLOSURE must move it, or the digest is a constant.
+#[test]
+fn p6ac_the_vendored_row_names_the_closure_it_claims_to_be_derived_from() {
+    fn row_of(logs: &str) -> String {
+        logs.lines()
+            .find(|line| line.contains("computed vendored set"))
+            .unwrap_or_else(|| panic!("no `computed vendored set` row in:\n{logs}"))
+            .to_string()
+    }
+    fn digest_of(row: &str) -> String {
+        row.split("closure_digest=")
+            .nth(1)
+            .unwrap_or_else(|| panic!("the row must carry a closure digest: {row}"))
+            .split_whitespace()
+            .next()
+            .expect("a non-empty digest")
+            .to_string()
+    }
+
+    let mut base = solo_bundle("hoverish-pack", vec!["sympy>=1.13"]);
+    base.uv_dependency_graph.selected_versions = BTreeMap::from([
+        ("torch".to_string(), "2.5.1".to_string()),
+        ("sympy".to_string(), "1.13.1".to_string()),
+        ("networkx".to_string(), "3.3".to_string()),
+    ]);
+
+    let render = |bundle: &Bundle| {
+        let (_, logs) = capture_debug_logs(|| {
+            produce_output(bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None)
+                .expect("the fixture bundle emits")
+        });
+        let row = row_of(&logs);
+        (digest_of(&row), row)
+    };
+
+    let (digest_before, row_before) = render(&base);
+    assert!(
+        row_before.contains("n_wheels=1"),
+        "fixture sanity: one wheel to start with -- {row_before}"
+    );
+
+    // A conda route the joint validation rejected comes back as a bundled
+    // wheel. The vendored set grows; the closure did not move.
+    let mut restored = base.clone();
+    restored
+        .extras
+        .push(rw("sympy", meta("sympy", "1.13.1", vec![], false)));
+    let (digest_after_restore, row_after_restore) = render(&restored);
+    assert!(
+        row_after_restore.contains("n_wheels=2"),
+        "the vendored set must have grown -- {row_after_restore}"
+    );
+    assert_eq!(
+        digest_before, digest_after_restore,
+        "a wheel restored out of a rejected conda route does not change the \
+         resolved closure, so the digest must not move -- that is the whole \
+         reason it is printed",
+    );
+
+    // A genuinely different closure must be a genuinely different digest.
+    let mut moved = base.clone();
+    moved
+        .uv_dependency_graph
+        .selected_versions
+        .insert("sympy".to_string(), "1.14.0".to_string());
+    let (digest_moved, _) = render(&moved);
+    assert_ne!(
+        digest_before, digest_moved,
+        "a moved closure must move the digest, or the row names a constant",
+    );
+
+    // And the platform + python the closure was resolved FOR are part of its
+    // identity: the same uv selection under another interpreter or another
+    // subdir is not the same closure, and two such rows must not compare
+    // equal. Asserted on the digest function directly -- rendering the same
+    // cp311 fixture under 3.12 is refused by the ABI invariant long before it
+    // reaches the row, which is correct behaviour and not this guard's
+    // subject.
+    assert_ne!(
+        resolved_closure_digest(&base, Platform::Linux64, "3.11"),
+        resolved_closure_digest(&base, Platform::Linux64, "3.12"),
+        "python is part of the resolved closure's identity",
+    );
+    assert_ne!(
+        resolved_closure_digest(&base, Platform::Linux64, "3.11"),
+        resolved_closure_digest(&base, Platform::LinuxAarch64, "3.11"),
+        "the platform is part of the resolved closure's identity",
+    );
+    assert_eq!(
+        resolved_closure_digest(&base, Platform::Linux64, "3.11"),
+        digest_before,
+        "and the row prints exactly what that function computed",
+    );
+}
+
+fn capture_debug_logs<T>(body: impl FnOnce() -> T) -> (T, String) {
+    let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer({
+            let logs = std::sync::Arc::clone(&logs);
+            move || SharedLogWriter(std::sync::Arc::clone(&logs))
+        })
+        .finish();
+    let value = tracing::subscriber::with_default(subscriber, body);
+    let text = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    (value, text)
+}
