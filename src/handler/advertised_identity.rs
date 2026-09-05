@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped whenever the recorded field set changes meaning. A record with a
 /// different schema is ignored, which degrades to today's recompute.
-pub(crate) const SCHEMA: u32 = 5;
+pub(crate) const SCHEMA: u32 = 6;
 
 /// Short digest of the RELAX RULE in force, folded into every record address.
 ///
@@ -71,6 +71,26 @@ pub(crate) struct AdvertisedIdentityRecord {
     /// (`bundle_emitted_constrains`), so it drifts for the same reasons.
     #[serde(default)]
     pub run_constrains: Vec<String>,
+    /// p6ad: the CONDA CANDIDATE UNIVERSE this identity was resolved against
+    /// (`crate::repodata::universe_digest`).
+    ///
+    /// Every other field here describes the QUESTION. This one describes the
+    /// world the answer was true in, and it is the field p6ac-1 said no
+    /// artefact carried. `run_depends` is the list pixi solved the consuming
+    /// environment against; it is downstream of the joint conda route verdicts,
+    /// and those verdicts are only valid within one universe. A record written
+    /// before a mid-flight repodata refresh therefore states what a DIFFERENT
+    /// world advertised, and adopting it is how a build pass emits deps the
+    /// metadata pass would never have emitted.
+    ///
+    /// `serde(default)` so a truncated or pre-p6ad record decodes to an EMPTY
+    /// universe rather than failing the read -- and an empty universe can never
+    /// equal a reader's, so such a record is refused. Same shape as
+    /// `crate::built_output_store::Record` (C11) and
+    /// `crate::route_probe_cache::EntryStamp` (p6ac): stamped identity is
+    /// checked on read, and a refusal never yields the payload.
+    #[serde(default)]
+    pub repodata_universe: String,
     /// p6u. The Lane C bundles whose detected roots the ADVERTISING pass
     /// suppressed, canonical conda names, plus the `*` sentinel when the
     /// resolve-time back-off suppressed every bundle in that request.
@@ -130,9 +150,6 @@ pub(crate) struct SuppressedEnv {
 }
 
 impl AdvertisedIdentityRecord {
-    /// A record is usable only when it describes the very output the build
-    /// request names, resolved for the very same target. Anything else is a
-    /// stale or foreign record and must be ignored rather than trusted.
     /// p6u: the suppression plan this identity was advertised under, in the
     /// exact shape `resolve_all` takes it.
     ///
@@ -162,6 +179,9 @@ impl AdvertisedIdentityRecord {
             .collect()
     }
 
+    /// A record is usable only when it describes the very output the build
+    /// request names, resolved for the very same target. Anything else is a
+    /// stale or foreign record and must be ignored rather than trusted.
     pub(crate) fn describes(
         &self,
         name: &str,
@@ -169,12 +189,14 @@ impl AdvertisedIdentityRecord {
         subdir: &str,
         target_identity: &str,
         python_version: &str,
+        repodata_universe: &str,
     ) -> bool {
         self.schema == SCHEMA
             && self.name == name
             && self.subdir == subdir
             && self.target_identity == target_identity
             && self.python_version == python_version
+            && self.repodata_universe == repodata_universe
             && version.is_none_or(|version| self.version == version)
     }
 }
@@ -289,8 +311,30 @@ pub(crate) async fn load_record(
     let path = record_path(cache_dir, source_dir, name, subdir, build, relax_digest);
     let bytes = tokio::fs::read(&path).await.ok()?;
     let record: AdvertisedIdentityRecord = serde_json::from_slice(&bytes).ok()?;
+    // p6ad: the universe the READER is resolving in, against the one the record
+    // was written in. The refusal is LOUD: a record dropped without a row reads
+    // downstream as "there was no record", and that reading is what made a
+    // moved vendored set look like a code change for a night (p6ab-5).
+    let universe = crate::repodata::universe_digest();
+    if record.repodata_universe != universe {
+        tracing::warn!(
+            path = %path.display(),
+            output = %record.name,
+            record_universe = %record.repodata_universe,
+            reader_universe = %universe,
+            "advertised identity: REFUSED a record resolved against another conda universe",
+        );
+        return None;
+    }
     let record = record
-        .describes(name, version, subdir, target_identity, python_version)
+        .describes(
+            name,
+            version,
+            subdir,
+            target_identity,
+            python_version,
+            &universe,
+        )
         .then_some(record)?;
     // INFO, not DEBUG: whether a build request reproduced its advertised
     // identity from the record or fell back to recompute-and-refuse is the one
@@ -435,6 +479,7 @@ mod tests {
                 env: "protomotions-deps-pack".to_string(),
                 roots: vec!["viser".to_string()],
             }],
+            repodata_universe: crate::repodata::universe_digest(),
         }
     }
 

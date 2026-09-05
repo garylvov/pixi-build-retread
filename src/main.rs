@@ -61,6 +61,19 @@ async fn async_main() -> anyhow::Result<()> {
         };
     }
 
+    // `retread repodata-universe [--cache-root <dir>]` -- print the conda
+    // candidate universe a lock would resolve against, WITHOUT solving,
+    // fetching or refreshing anything.
+    //
+    // It exists so the harness has ONE implementation of the fingerprint. A
+    // shell that folded `sha256sum` output its own way would be a second
+    // implementation of a comparison rule, and the first time the two disagreed
+    // the disagreement would read as a moved universe. This verb and the
+    // backend's own rows call `repodata::universe_digest_of`, so they cannot.
+    if matches!(argv.get(1).map(String::as_str), Some("repodata-universe")) {
+        return run_repodata_universe(&argv[2..]);
+    }
+
     if matches!(argv.get(1).map(String::as_str), Some("migrate-overrides")) {
         return run_migrate_overrides(&argv[2..]);
     }
@@ -531,4 +544,58 @@ fn exec_fast_command(
     }
     let status = command.status()?;
     std::process::exit(status.code().unwrap_or(1));
+}
+
+/// `retread repodata-universe [--cache-root <dir>]`.
+///
+/// `--cache-root` defaults to `$RATTLER_CACHE_DIR`, i.e. exactly what
+/// `repodata::cache_root_from` resolves for the backend, so running the verb
+/// with the harness's own environment reads the harness's own snapshot.
+/// Diagnostics to stderr; the one summary line to stdout so a job header can
+/// capture it.
+fn run_repodata_universe(args: &[String]) -> anyhow::Result<()> {
+    let mut cache_root: Option<PathBuf> = None;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--cache-root" => {
+                cache_root = Some(PathBuf::from(it.next().ok_or_else(|| {
+                    anyhow::anyhow!("retread repodata-universe: --cache-root needs a path")
+                })?));
+            }
+            other => anyhow::bail!("retread repodata-universe: unknown arg {other}"),
+        }
+    }
+    let cache_root = match cache_root {
+        Some(root) => root,
+        None => std::env::var_os("RATTLER_CACHE_DIR")
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "retread repodata-universe: pass --cache-root <dir> or set RATTLER_CACHE_DIR"
+                )
+            })?,
+    };
+    let documents = pixi_build_retread::repodata::universe_from_cache_root(&cache_root)?;
+    if documents.is_empty() {
+        // A snapshot with no documents is not a universe, and a header that
+        // printed a digest for it would be stating a fact nobody has.
+        anyhow::bail!(
+            "retread repodata-universe: no repodata documents under {}/retread-repodata",
+            cache_root.display()
+        );
+    }
+    for document in &documents {
+        eprintln!(
+            "repodata {}  sha256={} bytes={}",
+            document.label(),
+            document.sha256,
+            document.bytes
+        );
+    }
+    println!(
+        "{}",
+        pixi_build_retread::repodata::universe_summary_line(&documents)
+    );
+    Ok(())
 }
