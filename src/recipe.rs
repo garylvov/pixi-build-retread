@@ -1547,6 +1547,8 @@ mod tests {
             verify_snapshots: None,
             git_snapshot_store: None,
             git_snapshot_store_max_age_days: None,
+            shadow_cache_store: None,
+            shadow_cache_store_max_age_days: None,
             path_source_metadata: None,
             path_source_records: None,
             parallel_probes: None,
