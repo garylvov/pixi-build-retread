@@ -5254,6 +5254,15 @@ impl Handler {
         crate::source_build::set_git_snapshot_store(
             pre_key_config.git_snapshot_store.as_deref(),
         );
+        // C18-1: the store is PERSISTENT by default now, so it needs a reaper
+        // or it is a leak. `retread-git-snapshot-store-max-age-days` sizes it
+        // (unset = 14 days, 0 = off), and the reaper runs at most once per
+        // process behind a non-blocking store-wide try-lock — see
+        // `source_build::reap_canonical_git_snapshot_store`.
+        crate::source_build::set_git_snapshot_store_max_age_days(
+            pre_key_config.git_snapshot_store_max_age_days,
+        );
+        crate::source_build::reap_git_snapshot_store_once();
         // The SHARED built-output store, if the pack opted into one. Keyed on
         // content alone, so a workspace staged at a new path can adopt this
         // result instead of recomputing it. Unset = the store does not exist.

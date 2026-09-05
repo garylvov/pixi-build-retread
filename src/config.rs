@@ -240,15 +240,21 @@ pub struct RetreadConfig {
     /// source snapshots — the `canonical-git-sources/v3/<repository
     /// identity>/<ref state>` trees C12/C13/C15 built.
     ///
-    /// Unset (the default) keeps today's location exactly:
+    /// Unset (the default) means `courier::retread_git_snapshot_store_root()`
+    /// — the PERSISTENT root, which is `XDG_CACHE_HOME/retread` (else
+    /// `$HOME/.cache/retread`) and which, exactly like the wheel blob store,
+    /// deliberately has no `RETREAD_CACHE_DIR` branch.
+    ///
+    /// C18-1 CHANGED THAT DEFAULT. It used to be
     /// `courier::retread_cache_root()`, which `fasttmp` redirects into
     /// `$RETREAD_FAST_TMP_ROOT/retread-$USER/<workspace hash>/job-$SLURM_JOB_ID/
-    /// caches/retread`. That redirect is what makes the store JOB-SCOPED, and
+    /// caches/retread`. That redirect is what made the store JOB-SCOPED, and
     /// it was never a decision about Git snapshots: `RETREAD_CACHE_DIR` is on
     /// `fasttmp`'s scratch-cache list, and the only root deliberately kept off
-    /// it is the wheel blob store (`courier::wheel_store_root_with`, whose doc
+    /// it was the wheel blob store (`courier::wheel_store_root_with`, whose doc
     /// comment carries the reason). So every relock on this campaign, warm or
-    /// cold, re-cloned and re-normalized all twelve canonical trees.
+    /// cold, re-cloned and re-normalized all twelve canonical trees — 928.7 s
+    /// of the cold git-snapshot layer against 13.6 s warm (C32).
     ///
     /// A sealed canonical tree is IMMUTABLE by construction — published by
     /// `rename(staging, cache_dir)` after `make_source_tree_read_only`, with
@@ -277,6 +283,32 @@ pub struct RetreadConfig {
         alias = "git_snapshot_store"
     )]
     pub git_snapshot_store: Option<std::path::PathBuf>,
+
+    /// C18-1: how long an entry that no lock has referenced may sit in the
+    /// canonical Git snapshot store before the reaper QUARANTINES it, in days.
+    ///
+    /// Unset is `source_build::GIT_SNAPSHOT_STORE_DEFAULT_MAX_AGE_DAYS` (14).
+    /// `0` turns the reaper off entirely.
+    ///
+    /// The store is now persistent by default, and a persistent store that
+    /// nothing reaps is a leak: one new
+    /// `canonical-git-sources/v3/<repository identity>/<ref state>` entry per
+    /// commit of any git source, each a full worktree. An over-age entry is
+    /// RENAMED into `canonical-git-sources/quarantine/…`, never deleted, and
+    /// each eviction prints one `git_snapshot_store evicted` row. Reclaiming a
+    /// quarantine is a separate, operator-visible act.
+    ///
+    /// ```toml
+    /// [build.config]
+    /// retread-git-snapshot-store-max-age-days = 14
+    /// ```
+    #[serde(
+        default,
+        rename = "retread-git-snapshot-store-max-age-days",
+        alias = "git-snapshot-store-max-age-days",
+        alias = "git_snapshot_store_max_age_days"
+    )]
+    pub git_snapshot_store_max_age_days: Option<u64>,
 
     /// Experimental: run the conda co-solve's resolvo probes on a thread pool
     /// instead of serially.

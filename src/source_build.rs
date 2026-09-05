@@ -68,9 +68,19 @@ fn verify_snapshots_full() -> bool {
     VERIFY_SNAPSHOTS_FULL.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// C18. Where sealed canonical Git snapshots live. `None` — the default —
-/// means `courier::retread_cache_root()`, which is what every job on this
-/// campaign used and which `fasttmp` redirects into a JOB-SCOPED namespace.
+/// C18. Where sealed canonical Git snapshots live. `None` — nothing named —
+/// means [`courier::retread_git_snapshot_store_root`], the PERSISTENT root.
+///
+/// C18-1 CHANGED WHAT `None` MEANS, and that is the whole default flip. It
+/// used to mean `courier::retread_cache_root()`, which consults
+/// `fasttmp::backend_env_override("RETREAD_CACHE_DIR")` FIRST and is therefore
+/// redirected into `…/job-$SLURM_JOB_ID/caches/retread` — so the store died
+/// with the job and every relock on this campaign re-cloned all twelve
+/// canonical trees (C32 priced the cold git-snapshot layer at 928.7 s with 12
+/// clones against 13.6 s warm with 55 hits). It now means the same formula the
+/// wheel blob store uses, which deliberately has no `RETREAD_CACHE_DIR`
+/// branch, because a sealed canonical tree meets the wheel store's persistence
+/// exemption item for item.
 ///
 /// Set from the `retread-git-snapshot-store` config key (an argument, not an
 /// ambient environment variable), with `RETREAD_GIT_SNAPSHOT_STORE` as the
@@ -92,8 +102,12 @@ pub(crate) fn set_git_snapshot_store(configured: Option<&Path>) {
 }
 
 /// Testable core of [`set_git_snapshot_store`]: config key first, then the
-/// `RETREAD_GIT_SNAPSHOT_STORE` fallback, then `None` — which means "keep the
-/// `retread_cache_root()` behaviour", never an invented path.
+/// `RETREAD_GIT_SNAPSHOT_STORE` fallback, then `None` — which means "take the
+/// default root", never an invented path. C18-1 changed only what the default
+/// root IS (see [`canonical_git_snapshot_store_root`]); this precedence is
+/// untouched and its guard,
+/// `the_git_snapshot_store_is_a_config_key_first_and_an_env_fallback_second`,
+/// still holds.
 pub(crate) fn git_snapshot_store_with(
     configured: Option<&Path>,
     env: &dyn Fn(&str) -> Option<String>,
@@ -109,13 +123,364 @@ pub(crate) fn git_snapshot_store_with(
 /// The one formula for the canonical Git snapshot store root. One writer, two
 /// readers: the production wrapper below and the C18 guards, which pass a store
 /// root explicitly so a test never has to mutate a process-global.
+///
+/// C18-1: the fallback is now the PERSISTENT root, not the job-local redirect.
 pub(crate) fn canonical_git_snapshot_store_root() -> std::path::PathBuf {
-    if let Ok(slot) = GIT_SNAPSHOT_STORE.read()
-        && let Some(root) = slot.as_ref()
-    {
-        return root.clone();
+    let slot = GIT_SNAPSHOT_STORE.read().ok().and_then(|slot| slot.clone());
+    canonical_git_snapshot_store_root_with(slot.as_deref(), &|key| std::env::var(key).ok())
+}
+
+/// Testable core of [`canonical_git_snapshot_store_root`]: whatever the config
+/// key / harness fallback resolved to, else the DEFAULT root.
+///
+/// C18-1 IS THIS ONE EXPRESSION. The default arm used to be
+/// `crate::courier::retread_cache_root()`, which consults
+/// `fasttmp::backend_env_override("RETREAD_CACHE_DIR")` and is therefore
+/// job-local under every harness on this campaign. It is now
+/// `crate::courier::git_snapshot_store_root_with`, which has no
+/// `RETREAD_CACHE_DIR` branch at all. Restoring the old arm turns
+/// `the_git_snapshot_store_default_is_persistent_not_the_job_local_redirect`
+/// RED, which is the point of writing it as an injectable function rather than
+/// an ambient lookup.
+pub(crate) fn canonical_git_snapshot_store_root_with(
+    configured: Option<&Path>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> std::path::PathBuf {
+    if let Some(root) = configured {
+        return root.to_path_buf();
     }
-    crate::courier::retread_cache_root()
+    crate::courier::git_snapshot_store_root_with(env)
+}
+
+/// C18-1. How long an entry that no lock has referenced may sit in the store
+/// before the reaper quarantines it, in DAYS.
+///
+/// DEFAULT [`GIT_SNAPSHOT_STORE_DEFAULT_MAX_AGE_DAYS`] = 14, and the reason is
+/// the asymmetry of the two mistakes, not a guess about taste:
+/// * Evicting too early costs exactly ONE clone of that entry, and a clone is
+///   the cheapest term in the layer — C18.5 measured `canonical_git_clone` at
+///   231.2 s over 12 entries on the canonical manifest, i.e. ~19 s each.
+/// * Never evicting costs inodes without bound: a new
+///   `<repository identity>/<ref state>` entry per commit of any git source,
+///   twelve full worktrees per manifest revision, on a filesystem whose quota
+///   this campaign has already driven to its soft limit twice.
+/// So the default is set long enough that no live entry can plausibly be
+/// missed by it — two full weekly cycles, where the canonical manifest is
+/// relocked many times a day — and short enough that a superseded commit's
+/// tree does not outlive the branch it came from by a month.
+///
+/// `0` DISABLES the reaper (nothing is ever quarantined), which is the escape
+/// hatch for an operator who wants the old unbounded behaviour back without
+/// rebuilding a binary.
+pub(crate) const GIT_SNAPSHOT_STORE_DEFAULT_MAX_AGE_DAYS: u64 = 14;
+
+static GIT_SNAPSHOT_STORE_MAX_AGE_DAYS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(GIT_SNAPSHOT_STORE_DEFAULT_MAX_AGE_DAYS);
+
+/// Wire the `retread-git-snapshot-store-max-age-days` config key into the
+/// reaper. Called once per pack from the handler, beside
+/// [`set_git_snapshot_store`].
+pub(crate) fn set_git_snapshot_store_max_age_days(configured: Option<u64>) {
+    GIT_SNAPSHOT_STORE_MAX_AGE_DAYS.store(
+        configured.unwrap_or(GIT_SNAPSHOT_STORE_DEFAULT_MAX_AGE_DAYS),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+fn git_snapshot_store_max_age_days() -> u64 {
+    GIT_SNAPSHOT_STORE_MAX_AGE_DAYS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// C18-1. The reaper runs AT MOST ONCE PER PROCESS. A relock is many backend
+/// processes, and the store's own try-lock (see
+/// [`reap_canonical_git_snapshot_store`]) makes it at most one reaper at a time
+/// across all of them and across nodes; this only stops one process scanning
+/// the store repeatedly as it walks its packs.
+static GIT_SNAPSHOT_STORE_REAP_ONCE: std::sync::Once = std::sync::Once::new();
+
+/// Suffix of the use-stamp sidecar that records when a lock last referenced an
+/// entry. Same dot-sidecar shape as [`artifact_cache_lock_path`]'s
+/// `.{entry}.lock`, in the same parent directory, so it is never mistaken for
+/// an entry by a reader that skips dotfiles.
+const GIT_SNAPSHOT_USE_STAMP_SUFFIX: &str = ".used";
+
+/// Name of the reaper's own try-lock, a dot-sidecar beside the `v3` directory
+/// it scans. NEVER a blocking lock: a process that cannot take it does not
+/// reap, so a concurrent relock is never made to wait on housekeeping.
+const GIT_SNAPSHOT_REAP_LOCK_NAME: &str = ".v3.reap.lock";
+
+/// Where the use-stamp for one entry lives: `<parent>/.<entry>.used`.
+pub(crate) fn git_snapshot_use_stamp_path(cache_dir: &Path) -> Option<PathBuf> {
+    let parent = cache_dir.parent()?;
+    let name = cache_dir.file_name()?.to_str()?;
+    Some(parent.join(format!(".{name}{GIT_SNAPSHOT_USE_STAMP_SUFFIX}")))
+}
+
+/// C18-1, THE READER HALF OF THE REAPER. Record that a lock referenced this
+/// entry, right now.
+///
+/// The stamp is a SIDECAR and never a write inside the tree: a published
+/// canonical tree is read-only and immutable, and the seal would refuse a
+/// write into it. Best-effort by construction — a store on a read-only mount,
+/// or a lost race, must not fail a build — but a missing stamp is not a
+/// licence to evict: [`reap_canonical_git_snapshot_store`] falls back to the
+/// entry's own `source.json` mtime, so an entry published before this code
+/// existed is aged from its publish, not from the epoch.
+pub(crate) fn touch_git_snapshot_use_stamp(cache_dir: &Path) {
+    let Some(stamp) = git_snapshot_use_stamp_path(cache_dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Write through a unique temp sibling and rename, so a reader never sees a
+    // half-written stamp and two writers never interleave bytes.
+    let tmp = stamp.with_extension(format!("used-tmp-{}", std::process::id()));
+    if std::fs::write(&tmp, format!("{now}\n")).is_ok() && std::fs::rename(&tmp, &stamp).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// What the reaper did, so a caller can print it and a guard can assert on it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct GitSnapshotReapReport {
+    pub(crate) scanned: u64,
+    pub(crate) evicted: u64,
+    pub(crate) kept: u64,
+    pub(crate) skipped_locked: u64,
+    /// `true` when another process held the reap try-lock and this one backed
+    /// off without scanning anything.
+    pub(crate) skipped_concurrent: bool,
+}
+
+/// C18-1, THE REAPER. Quarantine every entry that no lock has referenced for
+/// longer than `max_age`.
+///
+/// THREE RULES IT MAY NOT BREAK, each with a guard:
+/// 1. **It never deletes.** An over-age entry is RENAMED into
+///    `<store>/canonical-git-sources/quarantine/<identity>-<ref state>-<unix>-<pid>`,
+///    the shape `wheel::` uses for a quarantined wheel. Reclaiming a quarantine
+///    is a separate, operator-visible act.
+/// 2. **It never blocks anyone.** The store-wide try-lock is non-blocking, and
+///    so is the per-entry lock: an entry whose writer lock is held is a live
+///    publish and is skipped, not waited on. There is no global lock across
+///    nodes — the sidecar is one file in one store, and failing to take it
+///    means "someone else is reaping", not "wait".
+/// 3. **It re-reads the age under the lock.** A hit can land between the scan
+///    and the rename, so the stamp is re-stated after the entry lock is held
+///    and an entry that became fresh in that window is kept.
+pub(crate) fn reap_canonical_git_snapshot_store(
+    store_root: &Path,
+    max_age: std::time::Duration,
+) -> Result<GitSnapshotReapReport> {
+    let mut report = GitSnapshotReapReport::default();
+    if max_age.is_zero() {
+        return Ok(report);
+    }
+    let sources = store_root.join("canonical-git-sources");
+    let versioned = sources.join("v3");
+    if !versioned.is_dir() {
+        return Ok(report);
+    }
+    let reap_lock_path = sources.join(GIT_SNAPSHOT_REAP_LOCK_NAME);
+    let reap_lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&reap_lock_path)
+        .with_context(|| {
+            format!(
+                "opening the git snapshot store reap lock {}",
+                reap_lock_path.display()
+            )
+        })?;
+    if !fs4::fs_std::FileExt::try_lock_exclusive(&reap_lock).unwrap_or(false) {
+        report.skipped_concurrent = true;
+        tracing::info!(
+            store = %store_root.display(),
+            "git_snapshot_store reap skipped=concurrent",
+        );
+        return Ok(report);
+    }
+    let quarantine_root = sources.join("quarantine");
+    let now = std::time::SystemTime::now();
+    for identity in read_dir_names(&versioned)? {
+        let identity_dir = versioned.join(&identity);
+        if !identity_dir.is_dir() {
+            continue;
+        }
+        for ref_state in read_dir_names(&identity_dir)? {
+            let entry_dir = identity_dir.join(&ref_state);
+            if !entry_dir.is_dir() {
+                continue;
+            }
+            report.scanned += 1;
+            let Some(age) = git_snapshot_entry_age(&entry_dir, now) else {
+                report.kept += 1;
+                continue;
+            };
+            if age <= max_age {
+                report.kept += 1;
+                continue;
+            }
+            // Rule 2: an entry a writer holds is a live publish. Try, never wait.
+            let Ok(entry_lock_path) = artifact_cache_lock_path(&entry_dir) else {
+                report.kept += 1;
+                continue;
+            };
+            let Ok(entry_lock) = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&entry_lock_path)
+            else {
+                report.kept += 1;
+                continue;
+            };
+            if !fs4::fs_std::FileExt::try_lock_exclusive(&entry_lock).unwrap_or(false) {
+                report.skipped_locked += 1;
+                report.kept += 1;
+                continue;
+            }
+            // Rule 3: re-state the age now that nobody else can publish here.
+            match git_snapshot_entry_age(&entry_dir, std::time::SystemTime::now()) {
+                Some(fresh) if fresh <= max_age => {
+                    report.kept += 1;
+                    continue;
+                }
+                None => {
+                    report.kept += 1;
+                    continue;
+                }
+                Some(_) => {}
+            }
+            let stamp_unix = now
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let quarantine = quarantine_root.join(format!(
+                "{identity}-{ref_state}-{stamp_unix}-{}",
+                std::process::id()
+            ));
+            if let Err(error) = std::fs::create_dir_all(&quarantine_root) {
+                tracing::warn!(
+                    store = %store_root.display(),
+                    error = %error,
+                    "could not create the git snapshot store quarantine; nothing evicted",
+                );
+                report.kept += 1;
+                continue;
+            }
+            // Rule 1: RENAME. Never `remove_dir_all`, never `remove_owned_cache_entry`.
+            if let Err(error) = std::fs::rename(&entry_dir, &quarantine) {
+                tracing::warn!(
+                    identity = %identity,
+                    ref_state = %ref_state,
+                    error = %error,
+                    "git_snapshot_store eviction could not rename; entry kept",
+                );
+                report.kept += 1;
+                continue;
+            }
+            if let Some(stamp) = git_snapshot_use_stamp_path(&entry_dir) {
+                let _ = std::fs::rename(
+                    &stamp,
+                    quarantine.with_file_name(format!(
+                        "{}{GIT_SNAPSHOT_USE_STAMP_SUFFIX}",
+                        quarantine
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("entry")
+                    )),
+                );
+            }
+            report.evicted += 1;
+            // ONE ROW PER EVICTION, the `wheel_store evicted` shape.
+            tracing::info!(
+                identity = %identity,
+                ref_state = %ref_state,
+                age_days = age.as_secs() / 86_400,
+                max_age_days = max_age.as_secs() / 86_400,
+                reason = "unreferenced",
+                quarantine = %quarantine.display(),
+                "git_snapshot_store evicted",
+            );
+        }
+    }
+    tracing::info!(
+        store = %store_root.display(),
+        scanned = report.scanned,
+        evicted = report.evicted,
+        kept = report.kept,
+        skipped_locked = report.skipped_locked,
+        max_age_days = max_age.as_secs() / 86_400,
+        "git_snapshot_store reap",
+    );
+    Ok(report)
+}
+
+/// How long ago a lock last referenced this entry: the use stamp when there is
+/// one, else the entry's own `source.json` mtime, which is when it was
+/// published. `None` means "cannot tell", and the caller keeps the entry.
+fn git_snapshot_entry_age(
+    entry_dir: &Path,
+    now: std::time::SystemTime,
+) -> Option<std::time::Duration> {
+    let referenced = git_snapshot_use_stamp_path(entry_dir)
+        .and_then(|stamp| std::fs::metadata(stamp).ok())
+        .and_then(|meta| meta.modified().ok())
+        .or_else(|| {
+            std::fs::metadata(entry_dir.join("source.json"))
+                .ok()
+                .and_then(|meta| meta.modified().ok())
+        })?;
+    // A stamp in the future (clock skew across nodes) reads as age zero, which
+    // keeps the entry. Never as a huge age, which would evict it.
+    Some(now.duration_since(referenced).unwrap_or_default())
+}
+
+/// Directory entry names, skipping dotfiles — which is what keeps the reaper
+/// from ever treating a `.lock`, a `.used` stamp or a temp sibling as a store
+/// entry.
+fn read_dir_names(dir: &Path) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in
+        std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))?
+    {
+        let entry = entry.with_context(|| format!("reading an entry of {}", dir.display()))?;
+        let Some(name) = entry.file_name().to_str().map(|s| s.to_string()) else {
+            continue;
+        };
+        if name.starts_with('.') {
+            continue;
+        }
+        names.push(name);
+    }
+    names.sort();
+    Ok(names)
+}
+
+/// C18-1. Run the reaper once for this process, against whatever store root is
+/// live, and never fail a build because housekeeping failed.
+pub(crate) fn reap_git_snapshot_store_once() {
+    GIT_SNAPSHOT_STORE_REAP_ONCE.call_once(|| {
+        let days = git_snapshot_store_max_age_days();
+        if days == 0 {
+            return;
+        }
+        let store_root = canonical_git_snapshot_store_root();
+        let max_age = std::time::Duration::from_secs(days * 86_400);
+        if let Err(error) = reap_canonical_git_snapshot_store(&store_root, max_age) {
+            tracing::warn!(
+                store = %store_root.display(),
+                error = %error,
+                "git_snapshot_store reap failed; nothing evicted",
+            );
+        }
+    });
 }
 const SDIST_BUILD_CONSTRAINTS: &str = "setuptools<81\ncmake<4\n";
 static BUILD_TMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -6135,6 +6500,10 @@ async fn ensure_canonical_git_snapshot_in(
     )
     .await
     {
+        // C18-1: this hit IS the reference the reaper looks for. Stamped on
+        // every path a lock reaches an entry by, or the reaper would age out
+        // the entries the store exists to keep.
+        touch_git_snapshot_use_stamp(&cache_dir);
         tracing::info!(
             repository = %repository_identity,
             commit = %resolved_sha,
@@ -6241,6 +6610,10 @@ async fn ensure_canonical_git_snapshot_in(
                 Err(_) => false,
             };
             let validated = validated.map(|(snapshot, _)| snapshot);
+            // C18-1: the locked hit is a reference too.
+            if validated.is_ok() {
+                touch_git_snapshot_use_stamp(&cache_dir);
+            }
             tracing::info!(
                 repository = %repository_identity,
                 commit = %resolved_sha,
@@ -6486,6 +6859,12 @@ async fn ensure_canonical_git_snapshot_in(
         elapsed_ms = publish_verify_started.elapsed().as_millis() as u64,
         "bench: canonical_git_publish_verify",
     );
+    // C18-1: a publish is the first reference. Without this the entry would
+    // age from its `source.json` mtime only, which is the same instant, but
+    // stamping here keeps ONE source of truth for "when was this last wanted".
+    if published.is_ok() {
+        touch_git_snapshot_use_stamp(&cache_dir);
+    }
     tracing::info!(
         repository = %repository_identity,
         commit = %resolved_sha,
@@ -14117,6 +14496,431 @@ version = "0.1.0"
         );
 
         make_staging_tree_removable(&republished.root);
+        let _ = std::fs::remove_dir_all(&fixture.base);
+    }
+
+    // ── C18-1 guards: the default is ON, and something reaps the store ──────
+    //
+    // The store stopped dying with the job (C18) but stayed off by default and
+    // unbounded, so a truly cold lock still paid ~929 s of clones (C32) while
+    // an on store grew without limit. These five guards hold both halves.
+
+    /// Build a synthetic store with one entry, so the reaper can be tested
+    /// without paying for a git clone. `age` is how long ago a lock last
+    /// referenced it; `None` writes NO use stamp at all, which is the shape of
+    /// an entry published before C18-1 existed and which must age from its own
+    /// `source.json` instead.
+    fn reap_fixture_entry(
+        store: &Path,
+        identity: &str,
+        ref_state: &str,
+        age: Option<std::time::Duration>,
+    ) -> PathBuf {
+        let entry = store
+            .join("canonical-git-sources")
+            .join("v3")
+            .join(identity)
+            .join(ref_state);
+        std::fs::create_dir_all(entry.join("repo")).expect("entry tree");
+        std::fs::write(entry.join("repo").join("base.txt"), "base\n").expect("entry payload");
+        std::fs::write(entry.join("source.json"), b"{}").expect("entry marker");
+        let when = std::time::SystemTime::now() - age.unwrap_or_default();
+        if age.is_some() {
+            let stamp = git_snapshot_use_stamp_path(&entry).expect("stamp path");
+            std::fs::write(&stamp, b"0\n").expect("use stamp");
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&stamp)
+                .expect("reopen stamp");
+            file.set_times(std::fs::FileTimes::new().set_modified(when).set_accessed(when))
+                .expect("age the stamp");
+        } else {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(entry.join("source.json"))
+                .expect("reopen marker");
+            file.set_times(std::fs::FileTimes::new().set_modified(when).set_accessed(when))
+                .expect("age the marker");
+        }
+        entry
+    }
+
+    fn reap_quarantine_dir(store: &Path) -> PathBuf {
+        store.join("canonical-git-sources").join("quarantine")
+    }
+
+    fn reap_scratch(tag: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "retread-c18-1-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&base).expect("scratch");
+        base
+    }
+
+    /// THE DEFAULT FLIP. With NO `RETREAD_GIT_SNAPSHOT_STORE` and no config
+    /// key, the store root must be the PERSISTENT one — and specifically must
+    /// NOT follow `RETREAD_CACHE_DIR`, which is what `fasttmp` redirects into
+    /// `…/job-$SLURM_JOB_ID/caches/retread` and which made the store die with
+    /// the job. The env is injected, so this states the default without
+    /// mutating the process and without any variable being set for real.
+    #[test]
+    fn the_git_snapshot_store_default_is_persistent_not_the_job_local_redirect() {
+        let job_local = "/fast-tmp/retread-user/hash/job-12345/caches/retread";
+        let persistent = "/shared/cache";
+        let env = |key: &str| match key {
+            // Exactly the two variables a harness on this campaign has set in
+            // every job: the fasttmp redirect, and a job-scoped XDG root.
+            "RETREAD_CACHE_DIR" => Some(job_local.to_string()),
+            "XDG_CACHE_HOME" => Some(persistent.to_string()),
+            _ => None,
+        };
+        let resolved = canonical_git_snapshot_store_root_with(None, &env);
+        assert_eq!(
+            resolved,
+            PathBuf::from("/shared/cache/retread"),
+            "unset must mean the persistent root, not an invented path",
+        );
+        assert!(
+            !resolved.starts_with(job_local),
+            "the default must NOT follow RETREAD_CACHE_DIR: that redirect is what \
+             made the store job-scoped and cost ~929 s of clones on a cold lock \
+             (C32); resolved {}",
+            resolved.display(),
+        );
+        // The default shares the wheel blob store's base, because it is the
+        // same persistence argument. If these two ever disagree, one of them
+        // has been reclassified as scratch by accident, which is the exact
+        // mistake C18 found.
+        assert_eq!(
+            resolved.join("wheels"),
+            crate::courier::wheel_store_root_with(&env),
+            "the git snapshot store and the wheel store must share one base",
+        );
+        // And a named store still wins over the default, both ways round.
+        let named = PathBuf::from("/named/store");
+        assert_eq!(
+            canonical_git_snapshot_store_root_with(Some(&named), &env),
+            named,
+            "a configured store must win over the default",
+        );
+    }
+
+    /// THE REAPER. One entry no lock has referenced in a year, one referenced
+    /// an hour ago, same store, one pass: exactly the stale one moves, and it
+    /// moves to QUARANTINE with its bytes intact — never to `rm`.
+    #[test]
+    fn the_reaper_quarantines_the_unreferenced_entry_and_only_that_one() {
+        let base = reap_scratch("reap");
+        let store = base.join("store");
+        let stale = reap_fixture_entry(
+            &store,
+            "identity-stale",
+            "refs-stale",
+            Some(std::time::Duration::from_secs(365 * 86_400)),
+        );
+        let fresh = reap_fixture_entry(
+            &store,
+            "identity-fresh",
+            "refs-fresh",
+            Some(std::time::Duration::from_secs(3_600)),
+        );
+        // An entry with no stamp at all ages from its own marker, so a store
+        // written before C18-1 is reaped correctly rather than either spared
+        // forever or evicted wholesale.
+        let unstamped_old = reap_fixture_entry(&store, "identity-nostamp-old", "refs-a", None);
+        let unstamped_new = reap_fixture_entry(&store, "identity-nostamp-new", "refs-b", None);
+        {
+            let marker = std::fs::OpenOptions::new()
+                .write(true)
+                .open(unstamped_old.join("source.json"))
+                .unwrap();
+            let when = std::time::SystemTime::now() - std::time::Duration::from_secs(400 * 86_400);
+            marker
+                .set_times(std::fs::FileTimes::new().set_modified(when).set_accessed(when))
+                .unwrap();
+        }
+
+        let report = reap_canonical_git_snapshot_store(
+            &store,
+            std::time::Duration::from_secs(14 * 86_400),
+        )
+        .expect("the reaper must run");
+
+        assert_eq!(report.scanned, 4, "every entry must be scanned: {report:?}");
+        assert_eq!(
+            report.evicted, 2,
+            "exactly the two over-age entries must be evicted: {report:?}",
+        );
+        assert_eq!(report.kept, 2, "the referenced entries must be kept: {report:?}");
+        assert!(!report.skipped_concurrent);
+        assert!(
+            !stale.exists(),
+            "the unreferenced entry must leave the store",
+        );
+        assert!(
+            !unstamped_old.exists(),
+            "an unstamped entry must age from its marker, not be spared forever",
+        );
+        assert!(
+            fresh.join("repo").join("base.txt").is_file(),
+            "an entry referenced an hour ago must not be touched",
+        );
+        assert!(
+            unstamped_new.join("repo").join("base.txt").is_file(),
+            "a freshly published unstamped entry must not be evicted",
+        );
+
+        // NEVER `rm`: the bytes must be findable in the quarantine.
+        let quarantine = reap_quarantine_dir(&store);
+        let mut moved: Vec<String> = std::fs::read_dir(&quarantine)
+            .expect("the quarantine must exist once something was evicted")
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| !name.ends_with(GIT_SNAPSHOT_USE_STAMP_SUFFIX))
+            .collect();
+        moved.sort();
+        assert_eq!(moved.len(), 2, "one quarantine dir per eviction: {moved:?}");
+        assert!(
+            moved.iter().any(|n| n.starts_with("identity-stale-refs-stale-")),
+            "the quarantine name must carry the entry it came from: {moved:?}",
+        );
+        let recovered: Vec<String> = moved
+            .iter()
+            .map(|n| {
+                std::fs::read_to_string(quarantine.join(n).join("repo").join("base.txt"))
+                    .expect("a quarantined entry keeps its bytes")
+            })
+            .collect();
+        assert_eq!(recovered, vec!["base\n".to_string(), "base\n".to_string()]);
+
+        // A second pass has nothing left to do, so the reaper is idempotent
+        // and cannot re-quarantine what it already moved.
+        let again = reap_canonical_git_snapshot_store(
+            &store,
+            std::time::Duration::from_secs(14 * 86_400),
+        )
+        .expect("second pass");
+        assert_eq!(again.evicted, 0, "a second pass must evict nothing: {again:?}");
+        assert_eq!(again.scanned, 2, "only the survivors remain: {again:?}");
+
+        // max_age 0 is the documented OFF switch, and it must not evict the
+        // entries a 14-day pass just kept.
+        let off = reap_canonical_git_snapshot_store(&store, std::time::Duration::ZERO)
+            .expect("max_age 0");
+        assert_eq!(off, GitSnapshotReapReport::default(), "0 must disable the reaper");
+        assert!(fresh.join("repo").join("base.txt").is_file());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The reaper NEVER blocks a relock. Another process holding the store's
+    /// reap sidecar means "someone else is reaping", not "wait": this one must
+    /// back off having evicted nothing, even with a year-old entry in front of
+    /// it. The lock is one file in one store — never a global lock across
+    /// nodes.
+    #[test]
+    fn a_second_reaper_backs_off_instead_of_racing_the_store() {
+        let base = reap_scratch("reap-lock");
+        let store = base.join("store");
+        let stale = reap_fixture_entry(
+            &store,
+            "identity-stale",
+            "refs-stale",
+            Some(std::time::Duration::from_secs(365 * 86_400)),
+        );
+        let lock_path = store
+            .join("canonical-git-sources")
+            .join(GIT_SNAPSHOT_REAP_LOCK_NAME);
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open the reap lock");
+        assert!(
+            fs4::fs_std::FileExt::try_lock_exclusive(&held).unwrap_or(false),
+            "the fixture must be the one holding the lock",
+        );
+
+        let report = reap_canonical_git_snapshot_store(
+            &store,
+            std::time::Duration::from_secs(14 * 86_400),
+        )
+        .expect("a contended reap is not an error");
+        assert!(
+            report.skipped_concurrent,
+            "a contended reap must say so: {report:?}",
+        );
+        assert_eq!(report.evicted, 0, "a contended reap must evict nothing");
+        assert_eq!(report.scanned, 0, "a contended reap must not even scan");
+        assert!(stale.exists(), "the entry must survive a contended pass");
+
+        // NON-VACUITY: drop the lock and the same call evicts it, so the
+        // back-off above is a behaviour and not the only behaviour.
+        drop(held);
+        let after = reap_canonical_git_snapshot_store(
+            &store,
+            std::time::Duration::from_secs(14 * 86_400),
+        )
+        .expect("an uncontended reap");
+        assert!(!after.skipped_concurrent);
+        assert_eq!(after.evicted, 1, "the uncontended pass must evict: {after:?}");
+        assert!(!stale.exists());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// An entry whose WRITER lock is held is a live publish. The reaper must
+    /// skip it — with a try, never a wait — no matter how stale its stamp
+    /// reads, or a reap could rename a tree out from under a job that is
+    /// filling it.
+    #[test]
+    fn a_stale_entry_whose_writer_lock_is_held_is_left_alone() {
+        let base = reap_scratch("reap-entry-lock");
+        let store = base.join("store");
+        let stale = reap_fixture_entry(
+            &store,
+            "identity-stale",
+            "refs-stale",
+            Some(std::time::Duration::from_secs(365 * 86_400)),
+        );
+        let entry_lock_path = artifact_cache_lock_path(&stale).expect("entry lock path");
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&entry_lock_path)
+            .expect("open the entry lock");
+        assert!(
+            fs4::fs_std::FileExt::try_lock_exclusive(&held).unwrap_or(false),
+            "the fixture must hold the entry's writer lock",
+        );
+
+        let report = reap_canonical_git_snapshot_store(
+            &store,
+            std::time::Duration::from_secs(14 * 86_400),
+        )
+        .expect("reap");
+        assert_eq!(
+            report.skipped_locked, 1,
+            "a locked entry must be counted as skipped, not silently kept: {report:?}",
+        );
+        assert_eq!(report.evicted, 0);
+        assert!(
+            stale.join("repo").join("base.txt").is_file(),
+            "a live publish must not be renamed away underneath itself",
+        );
+
+        // NON-VACUITY: release the writer and the very same call evicts it.
+        drop(held);
+        let after = reap_canonical_git_snapshot_store(
+            &store,
+            std::time::Duration::from_secs(14 * 86_400),
+        )
+        .expect("reap again");
+        assert_eq!(after.skipped_locked, 0);
+        assert_eq!(after.evicted, 1, "{after:?}");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// THE READER FOR THE WRITER. The reaper's whole notion of "referenced by
+    /// a lock" is the use stamp, and nothing else writes one — so a hit that
+    /// does not stamp would let the reaper quarantine a tree every relock is
+    /// using. Publish an entry, back-date it past the horizon, take a real hit
+    /// through `ensure_canonical_git_snapshot_in`, and the reaper must now
+    /// keep it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_hit_stamps_the_entry_so_the_reaper_stops_seeing_it_as_unreferenced() {
+        let fixture = git_checkout_fixture("c18-1-stamp");
+        let store = fixture.base.join("persistent-store");
+        let cache = fixture.base.join("job-cache");
+        std::fs::create_dir_all(&cache).expect("job cache");
+        let checkout = ensure_git_checkout(&fixture.url, &fixture.rev2, &cache)
+            .await
+            .expect("checkout");
+        let ref_state = canonical_git_ref_state(checkout.root()).await.unwrap();
+        let published = ensure_canonical_git_snapshot_in(
+            &store,
+            checkout.root(),
+            &fixture.url,
+            &fixture.rev2,
+            &ref_state,
+            None,
+        )
+        .await
+        .expect("publish");
+        let entry = published.root.parent().unwrap().to_path_buf();
+        let stamp = git_snapshot_use_stamp_path(&entry).expect("stamp path");
+        assert!(
+            stamp.is_file(),
+            "a publish must stamp the entry it just wrote: {}",
+            stamp.display(),
+        );
+        assert!(
+            !stamp.starts_with(&entry),
+            "the stamp must be a SIDECAR, never a write into a read-only tree",
+        );
+
+        // Back-date the stamp past any plausible horizon and confirm the
+        // reaper would take it: this is the negative arm of the stamping.
+        let ancient = std::time::SystemTime::now() - std::time::Duration::from_secs(365 * 86_400);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&stamp)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(ancient)
+                    .set_accessed(ancient),
+            )
+            .unwrap();
+        let would = git_snapshot_entry_age(&entry, std::time::SystemTime::now())
+            .expect("an aged entry has an age");
+        assert!(
+            would > std::time::Duration::from_secs(14 * 86_400),
+            "the back-dated entry must read as over-age, or the arm below is vacuous",
+        );
+
+        // A REAL HIT through the production entry point.
+        let adopted = ensure_canonical_git_snapshot_in(
+            &store,
+            checkout.root(),
+            &fixture.url,
+            &fixture.rev2,
+            &ref_state,
+            None,
+        )
+        .await
+        .expect("hit");
+        assert_eq!(adopted.root, published.root, "the hit must land on the same tree");
+        let after = git_snapshot_entry_age(&entry, std::time::SystemTime::now())
+            .expect("a hit entry has an age");
+        assert!(
+            after < std::time::Duration::from_secs(600),
+            "the hit must refresh the stamp; age read {after:?}",
+        );
+
+        let report = reap_canonical_git_snapshot_store(
+            &store,
+            std::time::Duration::from_secs(14 * 86_400),
+        )
+        .expect("reap");
+        assert_eq!(
+            report.evicted, 0,
+            "an entry a lock just referenced must not be evicted: {report:?}",
+        );
+        assert_eq!(report.kept, 1, "{report:?}");
+        assert!(published.root.join("base.txt").is_file());
+
+        make_staging_tree_removable(&published.root);
         let _ = std::fs::remove_dir_all(&fixture.base);
     }
 }
