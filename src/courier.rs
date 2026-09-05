@@ -435,6 +435,26 @@ pub fn retread_git_snapshot_store_root() -> std::path::PathBuf {
 pub(crate) fn git_snapshot_store_root_with(
     env: &dyn Fn(&str) -> Option<String>,
 ) -> std::path::PathBuf {
+    persistent_store_root_with(env)
+}
+
+/// L3-1b. THE ONE PERSISTENT-ROOT FORMULA, extracted so the second store to
+/// need it does not become the second copy of it.
+///
+/// `XDG_CACHE_HOME/retread`, else `$HOME/.cache/retread`, and NO
+/// `RETREAD_CACHE_DIR` branch — that absence is the whole property. C18-1
+/// wrote this formula inline in [`git_snapshot_store_root_with`]; that body is
+/// now a call to this and is byte-for-byte the same function of `env`, so
+/// `the_git_snapshot_store_default_is_persistent_not_the_job_local_redirect`
+/// is untouched by the extraction.
+///
+/// Deliberately NOT shared with [`wheel_store_root_with`]: that one has a
+/// `RETREAD_WHEEL_STORE` branch in front and does not filter an empty
+/// `XDG_CACHE_HOME`, so folding it in here would change its behaviour on an
+/// empty variable. One formula per behaviour, not one formula per resemblance.
+pub(crate) fn persistent_store_root_with(
+    env: &dyn Fn(&str) -> Option<String>,
+) -> std::path::PathBuf {
     let base = env("XDG_CACHE_HOME")
         .filter(|s| !s.trim().is_empty())
         .map(std::path::PathBuf::from)
@@ -488,6 +508,410 @@ pub fn expand_wheel_store_path(recorded: &str) -> std::path::PathBuf {
 /// cold lock, for byte-identical outputs.
 fn shadow_cache_dir_in(cache_root: &Path) -> PathBuf {
     cache_root.join("shadow")
+}
+
+// ── L3-1b: the shadow cache is a PERSISTENT store, not job scratch ──────────
+
+/// L3-1b. Where sealed shadow-rewrite entries live. `None` — nothing named —
+/// means [`retread_shadow_cache_store_root`], the PERSISTENT root.
+///
+/// L3-1b CHANGES WHAT `None` MEANS, and that is the whole fix, C18-1's flip
+/// applied to the second store that had the same defect. It used to mean
+/// `retread_cache_root()`, which consults
+/// `fasttmp::backend_env_override("RETREAD_CACHE_DIR")` FIRST and is therefore
+/// redirected into `…/job-$SLURM_JOB_ID/caches/retread` — so the cache died
+/// with the job, and every cold lock rebuilt all ~47 rewritten wheels
+/// (~120 s of `rewrite_wheel_metadata_with` on the canonical manifest,
+/// measured by C32 and L3-1) and then threw them away. It now means the same
+/// formula the wheel blob store and the Git snapshot store use, which
+/// deliberately has no `RETREAD_CACHE_DIR` branch.
+///
+/// A shadow entry meets the wheel store's persistence exemption item for item:
+/// it is IMMUTABLE (published by `rename` after validation, never rewritten in
+/// place), CONTENT-IDENTIFIED by
+/// [`shadow_cache_key_for_input_sha`] — input wheel bytes, applicable override
+/// subset, code version, `EMIT_EPOCH` — and EXPENSIVE to rebuild (a full
+/// decompress + recompress of every ZIP member; 42 s for one CUDA wheel).
+///
+/// Set from the `retread-shadow-cache-store` config key (an argument, not an
+/// ambient environment variable), with `RETREAD_SHADOW_CACHE_STORE` as the
+/// harness-side fallback, for exactly the reason the Git snapshot store and
+/// the built-output store have one: naming the store in a pack manifest moves
+/// that pack's build hash, so a harness that wants to point the store
+/// somewhere cannot use the manifest without changing the thing it measures.
+///
+/// EMIT-NEUTRAL, on `retread_cache_root`'s own licence: this governs only
+/// WHERE the cache lives, never WHAT bytes get emitted. The cache dir never
+/// feeds `inputs_hash`, only the KEY covers the inputs, and every hit is
+/// re-validated by `shadow_cache_stage_validated` (name, version, and the
+/// locked final sha256 where one exists) before it is used.
+static SHADOW_CACHE_STORE: std::sync::RwLock<Option<std::path::PathBuf>> =
+    std::sync::RwLock::new(None);
+
+/// Default root of the persistent shadow-rewrite cache store.
+pub fn retread_shadow_cache_store_root() -> std::path::PathBuf {
+    shadow_cache_store_root_with(&|key| std::env::var(key).ok())
+}
+
+/// Testable core of [`retread_shadow_cache_store_root`]. Note the intentional
+/// ABSENCE of a `RETREAD_CACHE_DIR` branch — that absence IS the L3-1b default
+/// flip, and the guard
+/// `the_shadow_cache_default_root_is_persistent_not_the_job_local_redirect`
+/// fails if it is reinstated.
+pub(crate) fn shadow_cache_store_root_with(
+    env: &dyn Fn(&str) -> Option<String>,
+) -> std::path::PathBuf {
+    persistent_store_root_with(env)
+}
+
+/// Wire the `retread-shadow-cache-store` config key into the shadow cache.
+/// Called once per pack from the handler, beside `set_git_snapshot_store`.
+pub(crate) fn set_shadow_cache_store(configured: Option<&Path>) {
+    let resolved = shadow_cache_store_with(configured, &|key| std::env::var(key).ok());
+    if let Ok(mut slot) = SHADOW_CACHE_STORE.write() {
+        *slot = resolved;
+    }
+}
+
+/// Testable core of [`set_shadow_cache_store`]: config key first, then the
+/// `RETREAD_SHADOW_CACHE_STORE` fallback, then `None` — which means "take the
+/// default root", never an invented path.
+pub(crate) fn shadow_cache_store_with(
+    configured: Option<&Path>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Option<std::path::PathBuf> {
+    if let Some(path) = configured {
+        return Some(path.to_path_buf());
+    }
+    env("RETREAD_SHADOW_CACHE_STORE")
+        .filter(|value| !value.trim().is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// The one formula for the shadow cache DIRECTORY the production staging path
+/// uses. One writer, two readers: the production wrapper and the L3-1b guards,
+/// which pass a root explicitly so a test never has to mutate a process-global.
+pub(crate) fn shadow_cache_dir() -> std::path::PathBuf {
+    let slot = SHADOW_CACHE_STORE.read().ok().and_then(|slot| slot.clone());
+    shadow_cache_dir_with(slot.as_deref(), &|key| std::env::var(key).ok())
+}
+
+/// Testable core of [`shadow_cache_dir`]: whatever the config key / harness
+/// fallback resolved to, else the DEFAULT persistent root — and the `shadow`
+/// segment under either.
+///
+/// L3-1b IS THIS ONE EXPRESSION. The default arm used to be
+/// `retread_cache_root()`, which consults
+/// `fasttmp::backend_env_override("RETREAD_CACHE_DIR")` and is therefore
+/// job-local under every harness on this campaign.
+pub(crate) fn shadow_cache_dir_with(
+    configured: Option<&Path>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> std::path::PathBuf {
+    match configured {
+        Some(root) => shadow_cache_dir_in(root),
+        None => shadow_cache_dir_in(&shadow_cache_store_root_with(env)),
+    }
+}
+
+/// L3-1b. How long a shadow entry that no lock has referenced may sit in the
+/// store before the reaper quarantines it, in DAYS.
+///
+/// DEFAULT 14, and the reason is C18-1's asymmetry argument with this store's
+/// own numbers substituted, not a guess about taste:
+/// * Evicting too early costs exactly ONE re-emit of that wheel. L3-1 measured
+///   the re-emit at 42.0 s for `nvidia_cudnn_cu12` and ~2.6 s for the median
+///   entry (120 s over ~47 wheels) — the most expensive single mistake in this
+///   store is one CUDA wheel.
+/// * Never evicting costs BYTES without bound, and unlike the Git snapshot
+///   store this one is sized in wheels: a new entry per (input wheel bytes,
+///   applicable override subset) pair, so every upstream release of a
+///   multi-gigabyte CUDA wheel and every override edit mints a fresh full-size
+///   copy, on a filesystem whose quota this campaign has already driven to its
+///   soft limit twice.
+/// So the default is two full weekly cycles — long enough that no live entry
+/// can plausibly be missed by it, short enough that a superseded wheel's
+/// rewrite does not outlive the release by a month. Same number as the Git
+/// snapshot store on purpose: two housekeeping horizons that differ for no
+/// stated reason are two things to get wrong.
+///
+/// `0` DISABLES the reaper, the same escape hatch C18-1 has.
+pub(crate) const SHADOW_CACHE_STORE_DEFAULT_MAX_AGE_DAYS: u64 = 14;
+
+static SHADOW_CACHE_STORE_MAX_AGE_DAYS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(SHADOW_CACHE_STORE_DEFAULT_MAX_AGE_DAYS);
+
+/// Wire the `retread-shadow-cache-store-max-age-days` config key into the
+/// reaper. Called once per pack from the handler, beside
+/// [`set_shadow_cache_store`].
+pub(crate) fn set_shadow_cache_store_max_age_days(configured: Option<u64>) {
+    SHADOW_CACHE_STORE_MAX_AGE_DAYS.store(
+        configured.unwrap_or(SHADOW_CACHE_STORE_DEFAULT_MAX_AGE_DAYS),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+fn shadow_cache_store_max_age_days() -> u64 {
+    SHADOW_CACHE_STORE_MAX_AGE_DAYS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// L3-1b. The reaper runs AT MOST ONCE PER PROCESS, for C18-1's reason: a
+/// relock is many backend processes, the store's own try-lock makes it at most
+/// one reaper at a time across all of them and across nodes, and this only
+/// stops one process rescanning as it walks its packs.
+static SHADOW_CACHE_STORE_REAP_ONCE: std::sync::Once = std::sync::Once::new();
+
+/// The two suffixes a published shadow entry can carry. Anything else in the
+/// directory — a `.tmp` from a live miss, a `.used` stamp, the reap lock — is
+/// NOT an entry and the reaper never touches it.
+const SHADOW_ENTRY_SUFFIXES: [&str; 2] = [".changed", ".same"];
+
+/// Suffix of the use-stamp sidecar recording when a lock last referenced an
+/// entry. Same dot-sidecar shape, and the same name, as C18-1's
+/// `GIT_SNAPSHOT_USE_STAMP_SUFFIX`.
+const SHADOW_USE_STAMP_SUFFIX: &str = ".used";
+
+/// Name of the reaper's own try-lock, a dot-sidecar in the directory it scans.
+/// NEVER a blocking lock: a process that cannot take it does not reap, so a
+/// concurrent relock is never made to wait on housekeeping.
+const SHADOW_REAP_LOCK_NAME: &str = ".shadow.reap.lock";
+
+/// Where the use-stamp for one entry lives: `<dir>/.<entry>.used`.
+pub(crate) fn shadow_use_stamp_path(entry: &Path) -> Option<PathBuf> {
+    let parent = entry.parent()?;
+    let name = entry.file_name()?.to_str()?;
+    Some(parent.join(format!(".{name}{SHADOW_USE_STAMP_SUFFIX}")))
+}
+
+/// L3-1b, THE READER HALF OF THE REAPER. Record that a lock referenced this
+/// entry, right now.
+///
+/// The stamp is a SIDECAR and never a write to the entry: a published shadow
+/// wheel is immutable and is hardlinked into staging, so touching the file
+/// itself would move the mtime of a file other jobs hold. Best-effort by
+/// construction — a store on a read-only mount, or a lost race, must not fail
+/// a build — and a missing stamp is not a licence to evict:
+/// [`reap_shadow_cache_store`] falls back to the entry file's own mtime, so an
+/// entry published before this code existed is aged from its publish, not from
+/// the epoch.
+pub(crate) fn touch_shadow_use_stamp(entry: &Path) {
+    let Some(stamp) = shadow_use_stamp_path(entry) else {
+        return;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let tmp = stamp.with_extension(format!("used-tmp-{}", std::process::id()));
+    if std::fs::write(&tmp, format!("{now}\n")).is_ok() && std::fs::rename(&tmp, &stamp).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// What the reaper did, so a caller can print it and a guard can assert on it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ShadowReapReport {
+    pub(crate) scanned: u64,
+    pub(crate) evicted: u64,
+    pub(crate) kept: u64,
+    /// `true` when another process held the reap try-lock and this one backed
+    /// off without scanning anything.
+    pub(crate) skipped_concurrent: bool,
+}
+
+/// L3-1b, THE REAPER. Quarantine every shadow entry no lock has referenced for
+/// longer than `max_age`.
+///
+/// C18-1's three rules, each with a guard:
+/// 1. **It never deletes.** An over-age entry is RENAMED into
+///    `<shadow dir>/quarantine/<entry>-<unix>-<pid>`. Reclaiming a quarantine
+///    is a separate, operator-visible act.
+/// 2. **It never blocks anyone.** The store-wide try-lock is non-blocking.
+/// 3. **It re-reads the age under the lock.** A hit can land between the scan
+///    and the rename, so the stamp is re-stated immediately before the rename
+///    and an entry that became fresh in that window is kept.
+///
+/// WHY THIS IS NOT C18-1's FUNCTION WITH A PARAMETER, and the judgement is
+/// deliberate: the two stores have different SHAPES, not different settings.
+/// C18-1 walks a two-level `v3/<identity>/<ref state>` tree of DIRECTORIES,
+/// each with its own `artifact_cache_lock_path` writer lock and a `source.json`
+/// to age from; this walks a one-level directory of FILES with no per-entry
+/// lock at all (a shadow entry is published by `rename` from a
+/// pid-and-sequence-unique tmp, so there is nothing to hold). Sharing a body
+/// across those would mean a callback for enumeration, a callback for the
+/// lock, a callback for the age and a callback for the quarantine name — four
+/// injection points to save twenty lines, which is the abstraction this
+/// project's doctrine refuses. What IS shared is the SHAPE: the same rule
+/// numbering, the same `.used` suffix, the same non-blocking try-lock, one row
+/// per eviction and one summary row.
+pub(crate) fn reap_shadow_cache_store(
+    shadow_dir: &Path,
+    max_age: std::time::Duration,
+) -> anyhow::Result<ShadowReapReport> {
+    let mut report = ShadowReapReport::default();
+    if max_age.is_zero() || !shadow_dir.is_dir() {
+        return Ok(report);
+    }
+    let reap_lock_path = shadow_dir.join(SHADOW_REAP_LOCK_NAME);
+    let reap_lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&reap_lock_path)
+        .with_context(|| {
+            format!(
+                "opening the shadow cache reap lock {}",
+                reap_lock_path.display()
+            )
+        })?;
+    if !fs4::fs_std::FileExt::try_lock_exclusive(&reap_lock).unwrap_or(false) {
+        report.skipped_concurrent = true;
+        tracing::info!(
+            store = %shadow_dir.display(),
+            "shadow_cache_store reap skipped=concurrent",
+        );
+        return Ok(report);
+    }
+    let quarantine_root = shadow_dir.join("quarantine");
+    let now = std::time::SystemTime::now();
+    let mut names: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(shadow_dir)
+        .with_context(|| format!("reading the shadow cache dir {}", shadow_dir.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("reading an entry of {}", shadow_dir.display()))?;
+        let Some(name) = entry.file_name().to_str().map(|s| s.to_string()) else {
+            continue;
+        };
+        // Dotfiles are sidecars, never entries; and only a published
+        // `.changed`/`.same` file is an entry, so a live miss's `.tmp` and the
+        // `quarantine` directory itself are both invisible here.
+        if name.starts_with('.')
+            || !SHADOW_ENTRY_SUFFIXES
+                .iter()
+                .any(|suffix| name.ends_with(suffix))
+        {
+            continue;
+        }
+        names.push(name);
+    }
+    names.sort();
+    for name in names {
+        let entry_path = shadow_dir.join(&name);
+        if !entry_path.is_file() {
+            continue;
+        }
+        report.scanned += 1;
+        let Some(age) = shadow_entry_age(&entry_path, now) else {
+            report.kept += 1;
+            continue;
+        };
+        if age <= max_age {
+            report.kept += 1;
+            continue;
+        }
+        // Rule 3: re-state the age right before the rename. A hit that landed
+        // during the scan stamped the sidecar and must keep the entry.
+        match shadow_entry_age(&entry_path, std::time::SystemTime::now()) {
+            Some(fresh) if fresh <= max_age => {
+                report.kept += 1;
+                continue;
+            }
+            None => {
+                report.kept += 1;
+                continue;
+            }
+            Some(_) => {}
+        }
+        let stamp_unix = now
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let quarantine =
+            quarantine_root.join(format!("{name}-{stamp_unix}-{}", std::process::id()));
+        if let Err(error) = std::fs::create_dir_all(&quarantine_root) {
+            tracing::warn!(
+                store = %shadow_dir.display(),
+                error = %error,
+                "could not create the shadow cache quarantine; nothing evicted",
+            );
+            report.kept += 1;
+            continue;
+        }
+        // Rule 1: RENAME. Never `remove_file`. A reader already inside the
+        // entry, or holding a hardlink to it, keeps reading valid bytes; the
+        // next reader sees a miss and refills.
+        if let Err(error) = std::fs::rename(&entry_path, &quarantine) {
+            tracing::warn!(
+                entry = %name,
+                error = %error,
+                "shadow_cache_store eviction could not rename; entry kept",
+            );
+            report.kept += 1;
+            continue;
+        }
+        if let Some(stamp) = shadow_use_stamp_path(&entry_path) {
+            let _ = std::fs::remove_file(stamp);
+        }
+        report.evicted += 1;
+        // ONE ROW PER EVICTION, the `wheel_store evicted` / `git_snapshot_store
+        // evicted` shape.
+        tracing::info!(
+            entry = %name,
+            age_days = age.as_secs() / 86_400,
+            max_age_days = max_age.as_secs() / 86_400,
+            reason = "unreferenced",
+            quarantine = %quarantine.display(),
+            "shadow_cache_store evicted",
+        );
+    }
+    tracing::info!(
+        store = %shadow_dir.display(),
+        scanned = report.scanned,
+        evicted = report.evicted,
+        kept = report.kept,
+        max_age_days = max_age.as_secs() / 86_400,
+        "shadow_cache_store reap",
+    );
+    Ok(report)
+}
+
+/// How long ago a lock last referenced this entry: the use stamp when there is
+/// one, else the entry file's own mtime, which is when it was published.
+/// `None` means "cannot tell", and the caller keeps the entry.
+fn shadow_entry_age(entry: &Path, now: std::time::SystemTime) -> Option<std::time::Duration> {
+    let referenced = shadow_use_stamp_path(entry)
+        .and_then(|stamp| std::fs::metadata(stamp).ok())
+        .and_then(|meta| meta.modified().ok())
+        .or_else(|| {
+            std::fs::metadata(entry)
+                .ok()
+                .and_then(|meta| meta.modified().ok())
+        })?;
+    // A stamp in the future (clock skew across nodes) reads as age zero, which
+    // KEEPS the entry. Never as a huge age, which would evict it.
+    Some(now.duration_since(referenced).unwrap_or_default())
+}
+
+/// L3-1b. Run the reaper once for this process, against whatever shadow dir is
+/// live, and never fail a build because housekeeping failed.
+pub(crate) fn reap_shadow_cache_store_once() {
+    SHADOW_CACHE_STORE_REAP_ONCE.call_once(|| {
+        let days = shadow_cache_store_max_age_days();
+        if days == 0 {
+            return;
+        }
+        let shadow_dir = shadow_cache_dir();
+        let max_age = std::time::Duration::from_secs(days * 86_400);
+        if let Err(error) = reap_shadow_cache_store(&shadow_dir, max_age) {
+            tracing::warn!(
+                store = %shadow_dir.display(),
+                error = %error,
+                "shadow_cache_store reap failed; nothing evicted",
+            );
+        }
+    });
 }
 
 /// Compute the shadow-rewrite cache key for one wheel.
@@ -732,6 +1156,10 @@ fn shadow_cache_stage_validated(
                 return Err(err);
             }
         };
+        // L3-1b: a hit is a REFERENCE, and the reaper ages entries by the last
+        // one. Stamp before returning, or a store that is being used every
+        // hour still looks fourteen days idle.
+        touch_shadow_use_stamp(&hit_changed);
         tracing::info!(
             key = %&key[..8],
             dst = %dst.display(),
@@ -757,6 +1185,7 @@ fn shadow_cache_stage_validated(
                 return Err(err);
             }
         };
+        touch_shadow_use_stamp(&hit_same);
         tracing::info!(
             key = %&key[..8],
             dst = %dst.display(),
@@ -815,6 +1244,12 @@ fn shadow_cache_stage_validated(
             cache_dst.display()
         )
     })?;
+
+    // L3-1b: a fresh publish is also a reference. Without this an entry minted
+    // by a cold lock would be aged from its file mtime only, which is the same
+    // instant, so this is belt-and-braces rather than load-bearing -- but it
+    // keeps ONE rule ("the stamp is the age") instead of two.
+    touch_shadow_use_stamp(cache_dst);
 
     // Link cache -> staging.
     hardlink_or_copy(cache_dst, dst)
@@ -1911,7 +2346,12 @@ pub(crate) async fn stage_for_target_with_store_root_and_relaxations(
     // Lives OUTSIDE source_dir/wheels so `rm -rf wheels` does not evict it.
     // Never feeds inputs_hash (the cache dir path is intentionally excluded
     // from the inputs hash -- only the cache KEY covers the relevant inputs).
-    let shadow_cache_dir = shadow_cache_dir_in(&retread_cache_root());
+    //
+    // L3-1b: `shadow_cache_dir()` and NOT `shadow_cache_dir_in(&
+    // retread_cache_root())`. The old expression read the fasttmp-redirected
+    // `RETREAD_CACHE_DIR`, so "persistent, machine-global" was false under
+    // every harness on this campaign and the whole cache died with the job.
+    let shadow_cache_dir = shadow_cache_dir();
     // Best-effort: create the dir now so the first miss doesn't race.
     let _ = std::fs::create_dir_all(&shadow_cache_dir);
     // Bypass: RETREAD_NO_SHADOW_CACHE=<any value> disables the cache entirely
@@ -4116,6 +4556,329 @@ mod tests {
             root.components().count() + 1,
             "the shadow cache dir is exactly <root>/shadow -- no per-target segment"
         );
+    }
+
+    // ── L3-1b guards ────────────────────────────────────────────────────────
+
+    /// L3-1b, THE ONE THAT IS THE FIX. With nothing configured, the shadow
+    /// cache resolves under the PERSISTENT root and IGNORES the job-local
+    /// `RETREAD_CACHE_DIR` redirect that `fasttmp` sets on every job in this
+    /// campaign.
+    ///
+    /// RED ON THE OLD CODE by construction: the pre-L3-1b expression was
+    /// `shadow_cache_dir_in(&retread_cache_root())`, and `retread_cache_root`
+    /// consults `RETREAD_CACHE_DIR` FIRST — so the old resolver returns the
+    /// job-local path this asserts against. Reinstating that arm in
+    /// `shadow_cache_dir_with` turns this test RED.
+    #[test]
+    fn the_shadow_cache_default_root_is_persistent_not_the_job_local_redirect() {
+        let job_local = "/scratch/job-4242/caches/retread";
+        let persistent = "/home/someone/.cache";
+        let env = |key: &str| -> Option<String> {
+            match key {
+                // The variable the defect followed. It must not be read here.
+                "RETREAD_CACHE_DIR" => Some(job_local.to_string()),
+                "XDG_CACHE_HOME" => Some(persistent.to_string()),
+                "HOME" => Some("/home/someone".to_string()),
+                _ => None,
+            }
+        };
+        let dir = shadow_cache_dir_with(None, &env);
+        assert_eq!(
+            dir,
+            std::path::Path::new(persistent).join("retread").join("shadow"),
+            "unset must mean the PERSISTENT root, not the fasttmp redirect",
+        );
+        assert!(
+            !dir.starts_with(job_local),
+            "the shadow cache must not follow RETREAD_CACHE_DIR: {}",
+            dir.display(),
+        );
+        // And it is the SAME formula the git snapshot store got in C18-1, not a
+        // second one that can drift away from it.
+        assert_eq!(
+            shadow_cache_store_root_with(&env),
+            git_snapshot_store_root_with(&env),
+            "the two persistent stores share one root formula",
+        );
+        // HOME fallback when XDG is absent, and an EMPTY XDG is not a root.
+        let home_only = |key: &str| -> Option<String> {
+            match key {
+                "HOME" => Some("/home/someone".to_string()),
+                "XDG_CACHE_HOME" => Some("   ".to_string()),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            shadow_cache_dir_with(None, &home_only),
+            std::path::Path::new("/home/someone/.cache/retread/shadow"),
+        );
+    }
+
+    /// L3-1b. The store is a CONFIG KEY first and an env fallback second —
+    /// C18-1's precedence, not a new one — and "nothing named" means "take the
+    /// default root", never an invented path.
+    #[test]
+    fn the_shadow_cache_store_is_a_config_key_first_and_an_env_fallback_second() {
+        let from_env = |key: &str| -> Option<String> {
+            match key {
+                "RETREAD_SHADOW_CACHE_STORE" => Some("/from/env".to_string()),
+                "XDG_CACHE_HOME" => Some("/persist".to_string()),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            shadow_cache_store_with(Some(std::path::Path::new("/from/config")), &from_env),
+            Some(std::path::PathBuf::from("/from/config")),
+            "the config key wins over the environment fallback",
+        );
+        assert_eq!(
+            shadow_cache_store_with(None, &from_env),
+            Some(std::path::PathBuf::from("/from/env")),
+        );
+        let blank = |key: &str| -> Option<String> {
+            match key {
+                "RETREAD_SHADOW_CACHE_STORE" => Some("   ".to_string()),
+                "XDG_CACHE_HOME" => Some("/persist".to_string()),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            shadow_cache_store_with(None, &blank),
+            None,
+            "a blank fallback is unset, not a store at the empty path",
+        );
+        // ... and unset resolves to the default root, never to a guess.
+        assert_eq!(
+            shadow_cache_dir_with(shadow_cache_store_with(None, &blank).as_deref(), &blank),
+            std::path::Path::new("/persist/retread/shadow"),
+        );
+        assert_eq!(
+            shadow_cache_dir_with(shadow_cache_store_with(None, &from_env).as_deref(), &from_env),
+            std::path::Path::new("/from/env/shadow"),
+        );
+    }
+
+    /// L3-1b, THE POINT OF THE WHOLE LANE: a SECOND process, whose job-local
+    /// cache root is a different directory entirely, hits the entry the first
+    /// one filled.
+    ///
+    /// The two "processes" are simulated by two different `RETREAD_CACHE_DIR`
+    /// values in the injected environment — the exact thing that differs
+    /// between two Slurm jobs, and the exact thing the old code keyed the
+    /// cache directory on. The DECISIVE control is that the input wheel is
+    /// DELETED before the second stage: a miss must read `src` to rewrite it,
+    /// so a successful second stage can only be a hit.
+    #[test]
+    fn a_second_process_hits_the_shadow_cache_the_first_process_filled() {
+        let tmp = make_test_dir("shadow-cross-process");
+        let persist = tmp.join("persist-root");
+        let persist_str = persist.display().to_string();
+        let env_job_a = |key: &str| -> Option<String> {
+            match key {
+                "RETREAD_CACHE_DIR" => Some("/scratch/job-1111/caches/retread".to_string()),
+                "XDG_CACHE_HOME" => Some(persist_str.clone()),
+                _ => None,
+            }
+        };
+        let env_job_b = |key: &str| -> Option<String> {
+            match key {
+                // A DIFFERENT job root. Under the old code this alone moved the
+                // cache directory and guaranteed a miss.
+                "RETREAD_CACHE_DIR" => Some("/scratch/job-2222/caches/retread".to_string()),
+                "XDG_CACHE_HOME" => Some(persist_str.clone()),
+                _ => None,
+            }
+        };
+
+        let dir_a = shadow_cache_dir_with(None, &env_job_a);
+        let dir_b = shadow_cache_dir_with(None, &env_job_b);
+        assert_eq!(
+            dir_a, dir_b,
+            "two jobs must resolve ONE shadow cache directory",
+        );
+
+        let whl = write_wheel(&tmp, "pkg-xproc", "1.0.0", &["dep-x==1.0.0"]);
+        let mut ov = BTreeMap::new();
+        ov.insert("dep-x".to_string(), ">=1.0.0".to_string());
+        let cap: HashSet<String> = HashSet::new();
+        let drop: HashSet<String> = HashSet::new();
+        let key = shadow_cache_key_for_input_sha(
+            &shadow_cache_input_sha(&whl).unwrap(),
+            &["dep-x==1.0.0".to_string()],
+            &ov,
+            &cap,
+            &drop,
+        );
+
+        let dst_a = tmp.join("job-a.whl");
+        let (sha_a, _) = shadow_cache_stage_validated(
+            &whl, &dst_a, &dir_a, &key, "pkg-xproc", "1.0.0", None, &ov, &cap, &drop,
+        )
+        .expect("job A fills the cache");
+
+        // THE CONTROL: with the input gone, only a hit can succeed.
+        std::fs::remove_file(&whl).unwrap();
+        let dst_b = tmp.join("job-b.whl");
+        let (sha_b, _) = shadow_cache_stage_validated(
+            &whl, &dst_b, &dir_b, &key, "pkg-xproc", "1.0.0", None, &ov, &cap, &drop,
+        )
+        .expect("job B must HIT the entry job A published (the input no longer exists)");
+
+        assert_eq!(sha_a, sha_b, "a hit is byte-identical to the fresh rewrite");
+        assert_eq!(
+            std::fs::read(&dst_a).unwrap(),
+            std::fs::read(&dst_b).unwrap(),
+        );
+        // And the entry lives under the PERSISTENT root, not under either job's.
+        assert!(
+            dir_a.starts_with(&persist),
+            "the entry must live under the persistent root: {}",
+            dir_a.display(),
+        );
+        // The hit stamped its own use, which is what keeps the reaper honest.
+        let stamped = shadow_use_stamp_path(&dir_a.join(format!("{key}.changed")))
+            .filter(|p| p.exists())
+            .or_else(|| {
+                shadow_use_stamp_path(&dir_a.join(format!("{key}.same"))).filter(|p| p.exists())
+            });
+        assert!(stamped.is_some(), "a hit must stamp the entry as referenced");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Age a path by rewriting its mtime `days` days into the past.
+    #[cfg(test)]
+    fn age_path_days(path: &Path, days: u64) {
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(days * 86_400);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+    }
+
+    /// L3-1b, THE REAPER. Exactly the stale, unreferenced entry is evicted —
+    /// and eviction is a RENAME into quarantine, never a delete.
+    ///
+    /// Four things sit in the fixture and only one may move: a stale entry with
+    /// no use stamp; a stale entry a lock referenced yesterday (the stamp must
+    /// beat the file mtime); a stale `.tmp` from a live miss (not an entry);
+    /// and a dotfile sidecar (never an entry).
+    #[test]
+    fn the_shadow_reaper_evicts_exactly_the_stale_unreferenced_entry() {
+        let tmp = make_test_dir("shadow-reap");
+        let shadow = tmp.join("shadow");
+        std::fs::create_dir_all(&shadow).unwrap();
+
+        let stale = shadow.join("aaaa.changed");
+        std::fs::write(&stale, b"stale-bytes").unwrap();
+        age_path_days(&stale, 30);
+
+        let referenced = shadow.join("bbbb.same");
+        std::fs::write(&referenced, b"referenced-bytes").unwrap();
+        age_path_days(&referenced, 30);
+        // A lock referenced it just now: the stamp is the age, not the mtime.
+        touch_shadow_use_stamp(&referenced);
+
+        let live_tmp = shadow.join("cccc.4242.0.tmp");
+        std::fs::write(&live_tmp, b"a live miss is mid-rewrite").unwrap();
+        age_path_days(&live_tmp, 30);
+
+        let sidecar = shadow.join(".not-an-entry.changed");
+        std::fs::write(&sidecar, b"dotfile").unwrap();
+        age_path_days(&sidecar, 30);
+
+        let report =
+            reap_shadow_cache_store(&shadow, std::time::Duration::from_secs(14 * 86_400)).unwrap();
+        assert_eq!(
+            report,
+            ShadowReapReport {
+                scanned: 2,
+                evicted: 1,
+                kept: 1,
+                skipped_concurrent: false,
+            },
+            "only published .changed/.same files are entries, and only the \
+             unreferenced stale one is evicted",
+        );
+        assert!(!stale.exists(), "the stale entry left the cache directory");
+        assert!(referenced.is_file(), "a referenced entry is never evicted");
+        assert!(live_tmp.is_file(), "a live miss's tmp is not an entry");
+        assert!(sidecar.is_file(), "a dotfile is not an entry");
+
+        // RULE 1: renamed, not deleted, and the bytes are intact.
+        let quarantined: Vec<_> = std::fs::read_dir(shadow.join("quarantine"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(quarantined.len(), 1);
+        assert!(
+            quarantined[0]
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("aaaa.changed-"),
+            "the quarantine name carries the entry it came from: {}",
+            quarantined[0].display(),
+        );
+        assert_eq!(std::fs::read(&quarantined[0]).unwrap(), b"stale-bytes");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// L3-1b, THE MUTATION CONTROL for the reaper's two refusals: a concurrent
+    /// reaper backs it off without scanning anything, and `max_age = 0` turns
+    /// it off entirely. Both leave the stale entry exactly where it was, so a
+    /// reaper that ignored either would be caught by this test rather than by a
+    /// production store losing entries under a live lock.
+    #[test]
+    fn the_shadow_reaper_backs_off_and_can_be_disabled() {
+        let tmp = make_test_dir("shadow-reap-refusals");
+        let shadow = tmp.join("shadow");
+        std::fs::create_dir_all(&shadow).unwrap();
+        let stale = shadow.join("dddd.changed");
+        std::fs::write(&stale, b"stale-bytes").unwrap();
+        age_path_days(&stale, 30);
+
+        // max_age = 0 DISABLES the reaper: nothing scanned, nothing evicted.
+        let off = reap_shadow_cache_store(&shadow, std::time::Duration::ZERO).unwrap();
+        assert_eq!(off, ShadowReapReport::default());
+        assert!(stale.is_file());
+
+        // A concurrent reaper holds the store-wide try-lock. This one must back
+        // off -- never wait, never evict.
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(shadow.join(SHADOW_REAP_LOCK_NAME))
+            .unwrap();
+        assert!(fs4::fs_std::FileExt::try_lock_exclusive(&held).unwrap());
+        let busy =
+            reap_shadow_cache_store(&shadow, std::time::Duration::from_secs(14 * 86_400)).unwrap();
+        assert_eq!(
+            busy,
+            ShadowReapReport {
+                scanned: 0,
+                evicted: 0,
+                kept: 0,
+                skipped_concurrent: true,
+            },
+        );
+        assert!(stale.is_file(), "a backed-off reaper evicts nothing");
+        assert!(!shadow.join("quarantine").exists());
+
+        // Release it and the same call now evicts -- which is what makes the
+        // assertion above a control and not a tautology.
+        fs4::fs_std::FileExt::unlock(&held).unwrap();
+        drop(held);
+        let freed =
+            reap_shadow_cache_store(&shadow, std::time::Duration::from_secs(14 * 86_400)).unwrap();
+        assert_eq!(freed.evicted, 1);
+        assert!(!stale.exists());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// L3-1 PRECONDITION GUARD. Reuse is only correct because the re-emit is

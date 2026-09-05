@@ -310,6 +310,61 @@ pub struct RetreadConfig {
     )]
     pub git_snapshot_store_max_age_days: Option<u64>,
 
+    /// L3-1b: where the SHADOW-REWRITE cache lives — the content-addressed
+    /// store of wheels whose `Requires-Dist` retread rewrote.
+    ///
+    /// Unset means `courier::retread_shadow_cache_store_root()`, the PERSISTENT
+    /// root (`XDG_CACHE_HOME/retread`, else `$HOME/.cache/retread`), plus a
+    /// `shadow` segment. It used to mean `courier::retread_cache_root()`, which
+    /// `fasttmp` redirects into `…/job-$SLURM_JOB_ID/caches/retread` — so every
+    /// cold lock rebuilt all ~47 rewritten wheels and discarded them.
+    /// `RETREAD_SHADOW_CACHE_STORE` is the harness-side fallback, for the same
+    /// reason the Git snapshot store has one: naming a store in a pack manifest
+    /// moves that pack's build hash.
+    ///
+    /// ```toml
+    /// [build.config]
+    /// retread-shadow-cache-store = "/shared/cache/retread"
+    /// ```
+    ///
+    /// EMIT-NEUTRAL: this names WHERE the cache lives, never WHAT is emitted.
+    /// The path never feeds `inputs_hash`, and every hit is re-validated
+    /// (name, version, and the locked final sha256 where one exists) before it
+    /// is used.
+    #[serde(
+        default,
+        rename = "retread-shadow-cache-store",
+        alias = "shadow-cache-store",
+        alias = "shadow_cache_store"
+    )]
+    pub shadow_cache_store: Option<std::path::PathBuf>,
+
+    /// L3-1b: how long a shadow entry that no lock has referenced may sit in
+    /// the store before the reaper QUARANTINES it, in days.
+    ///
+    /// Unset is `courier::SHADOW_CACHE_STORE_DEFAULT_MAX_AGE_DAYS` (14, the
+    /// same horizon as the Git snapshot store on purpose). `0` turns the
+    /// reaper off entirely.
+    ///
+    /// The store is now persistent by default, and a persistent store that
+    /// nothing reaps is a leak — this one sized in WHEELS: one full-size entry
+    /// per (input wheel bytes, applicable override subset) pair, so every
+    /// upstream release of a multi-gigabyte CUDA wheel mints a fresh copy. An
+    /// over-age entry is RENAMED into `shadow/quarantine/…`, never deleted, and
+    /// each eviction prints one `shadow_cache_store evicted` row.
+    ///
+    /// ```toml
+    /// [build.config]
+    /// retread-shadow-cache-store-max-age-days = 14
+    /// ```
+    #[serde(
+        default,
+        rename = "retread-shadow-cache-store-max-age-days",
+        alias = "shadow-cache-store-max-age-days",
+        alias = "shadow_cache_store_max_age_days"
+    )]
+    pub shadow_cache_store_max_age_days: Option<u64>,
+
     /// Experimental: run the conda co-solve's resolvo probes on a thread pool
     /// instead of serially.
     ///

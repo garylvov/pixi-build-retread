@@ -5263,6 +5263,19 @@ impl Handler {
             pre_key_config.git_snapshot_store_max_age_days,
         );
         crate::source_build::reap_git_snapshot_store_once();
+        // L3-1b: the SHADOW-REWRITE cache is the second store C18 classified as
+        // scratch by collateral. Same flip, same shape:
+        // `retread-shadow-cache-store` names the root (unset = the persistent
+        // one, `RETREAD_SHADOW_CACHE_STORE` the harness fallback), and
+        // `retread-shadow-cache-store-max-age-days` sizes the reaper that a
+        // now-persistent store needs (unset = 14 days, 0 = off). The reaper runs
+        // at most once per process behind a non-blocking try-lock — see
+        // `courier::reap_shadow_cache_store`.
+        crate::courier::set_shadow_cache_store(pre_key_config.shadow_cache_store.as_deref());
+        crate::courier::set_shadow_cache_store_max_age_days(
+            pre_key_config.shadow_cache_store_max_age_days,
+        );
+        crate::courier::reap_shadow_cache_store_once();
         // The SHARED built-output store, if the pack opted into one. Keyed on
         // content alone, so a workspace staged at a new path can adopt this
         // result instead of recomputing it. Unset = the store does not exist.
