@@ -315,7 +315,11 @@ pub(crate) async fn load_record(
     // was written in. The refusal is LOUD: a record dropped without a row reads
     // downstream as "there was no record", and that reading is what made a
     // moved vendored set look like a code change for a night (p6ab-5).
-    let universe = crate::repodata::universe_digest();
+    // p6ad-6: through the primer, not the bare fold. `universe_digest()` now
+    // reads the whole cache-root snapshot, and this is an async hot path -- an
+    // NFS read of ~900 MB inside a `.await`-less statement on a tokio worker
+    // parks the reactor for every other backend task.
+    let universe = crate::repodata::prime_universe_digest().await;
     if record.repodata_universe != universe {
         tracing::warn!(
             path = %path.display(),
@@ -479,11 +483,7 @@ mod tests {
                 env: "protomotions-deps-pack".to_string(),
                 roots: vec!["viser".to_string()],
             }],
-            // p6ad-6: a filesystem-free universe token. `universe_digest()` now
-            // reads the cache-root SNAPSHOT, and a unit test must not hash
-            // whatever documents happen to sit in $RATTLER_CACHE_DIR on the
-            // gate node -- the value here only has to be self-consistent.
-            repodata_universe: crate::repodata::universe_digest_of(&[]),
+            repodata_universe: crate::repodata::universe_digest(),
         }
     }
 

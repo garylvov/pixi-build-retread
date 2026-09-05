@@ -30326,7 +30326,7 @@ mod courier_build_string_tests {
             auto_imports_suppressed_bundles: Vec::new(),
             auto_imports_suppressed: Vec::new(),
             auto_imports_suppressed_roots: Vec::new(),
-            repodata_universe: crate::repodata::universe_digest_of(&[]),
+            repodata_universe: crate::repodata::universe_digest(),
         };
         let from_record = build_for(&workspace_fp_for_build(
             Some(&record),

@@ -7462,11 +7462,7 @@ fn the_advertised_courier_build_gate_resolves_under_the_recorded_fingerprint() {
         auto_imports_suppressed_bundles: Vec::new(),
         auto_imports_suppressed: Vec::new(),
         auto_imports_suppressed_roots: Vec::new(),
-        // p6ad-6: a filesystem-free universe token. `universe_digest()` now
-            // reads the cache-root SNAPSHOT, and a unit test must not hash
-            // whatever documents happen to sit in $RATTLER_CACHE_DIR on the
-            // gate node -- the value here only has to be self-consistent.
-            repodata_universe: crate::repodata::universe_digest_of(&[]),
+        repodata_universe: crate::repodata::universe_digest(),
     };
     let advertising_fp = EffectiveWorkspaceFp::resolve(Some(&record), None, ws, source, &target);
     assert_eq!(
@@ -9726,11 +9722,7 @@ fn advertised_output_record(
         auto_imports_suppressed_bundles: Vec::new(),
         auto_imports_suppressed: Vec::new(),
         auto_imports_suppressed_roots: Vec::new(),
-        // p6ad-6: a filesystem-free universe token. `universe_digest()` now
-            // reads the cache-root SNAPSHOT, and a unit test must not hash
-            // whatever documents happen to sit in $RATTLER_CACHE_DIR on the
-            // gate node -- the value here only has to be self-consistent.
-            repodata_universe: crate::repodata::universe_digest_of(&[]),
+        repodata_universe: crate::repodata::universe_digest(),
     }
 }
 
@@ -11206,11 +11198,7 @@ async fn c11_an_adopted_output_restores_the_cold_passs_advertised_identity() {
         auto_imports_suppressed_bundles: Vec::new(),
         auto_imports_suppressed: Vec::new(),
         auto_imports_suppressed_roots: Vec::new(),
-        // p6ad-6: a filesystem-free universe token. `universe_digest()` now
-            // reads the cache-root SNAPSHOT, and a unit test must not hash
-            // whatever documents happen to sit in $RATTLER_CACHE_DIR on the
-            // gate node -- the value here only has to be self-consistent.
-            repodata_universe: crate::repodata::universe_digest_of(&[]),
+        repodata_universe: crate::repodata::universe_digest(),
     };
 
     // The record travels inside the store record, exactly as production
