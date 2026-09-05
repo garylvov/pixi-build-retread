@@ -384,12 +384,40 @@ retread_freeze_repodata () {
   # in, and a memo copied in describes the SOURCE file's stat tuple -- which is
   # exactly the poisoned-memo case the retread guards refuse. Dotfiles are
   # excluded FIRST.
-  rsync -aW --exclude='.*' --exclude='*.part.*' --include='*.json' \
-        --exclude='*' "$srcd/" "$dstd/"
-  rc=$?
+  # rc 24 ("some files vanished") AND rc 23 ("some files/attrs were not
+  # transferred") are both the CONCURRENT-REPUBLISH RACE, not a broken copy.
+  # Measured 2026-09-04, job 5853901: another lane republished
+  # `conda_forge--noarch--373f6e9e6cea9d02.json` mid-walk and the sender got
+  # `Stale file handle (116)` -> rc 23, and the whole freeze refused. `invalidate`
+  # + `write_atomic` make a document a NEW INODE on every republish, so a reader
+  # holding the old handle sees ESTALE; the file is there and readable on the very
+  # next open. So both codes RETRY rather than fail, and the name-set check below
+  # is what makes the retry safe: a document that is in the source and not in the
+  # snapshot is fatal no matter what rsync returned.
+  local attempt
+  for attempt in 1 2 3; do
+    rsync -aW --exclude='.*' --exclude='*.part.*' --include='*.json' \
+          --exclude='*' "$srcd/" "$dstd/"
+    rc=$?
+    case "$rc" in
+      0) break;;
+      23|24) echo "retread_freeze_repodata: rsync rc=$rc on attempt $attempt (concurrent republish); retrying" >&2;;
+      *) break;;
+    esac
+  done
   wall=$(( $(date +%s) - t0 ))
-  if [ "$rc" != 0 ] && [ "$rc" != 24 ]; then
-    echo "retread_freeze_repodata: FATAL rsync rc=$rc src=$srcd dst=$dstd (only 0 and 24 are OK)" >&2
+  if [ "$rc" != 0 ] && [ "$rc" != 23 ] && [ "$rc" != 24 ]; then
+    echo "retread_freeze_repodata: FATAL rsync rc=$rc src=$srcd dst=$dstd (only 0, 23 and 24 are OK)" >&2
+    return 3
+  fi
+  # THE READER FOR THE RETRY. Every document name the source has must be in the
+  # snapshot; a tolerated rc is only tolerable because this cannot pass without it.
+  local missing
+  missing=$(comm -23 <(cd "$srcd" && ls -1 *.json 2>/dev/null | sort) \
+                     <(cd "$dstd" && ls -1 *.json 2>/dev/null | sort))
+  if [ -n "$missing" ]; then
+    echo "retread_freeze_repodata: FATAL document(s) in $srcd that never reached $dstd:" >&2
+    printf '%s\n' "$missing" >&2
     return 3
   fi
 
@@ -741,14 +769,68 @@ retread_serve_channel_mirror () {
   echo "### channel_mirror serving $RETREAD_MIRROR_URL pid=$RETREAD_MIRROR_PID root=$root"
 }
 
+######## retread_serve_conda_deny_proxy -- BLOCK THE CHANNELS, NOT THE WORLD ###
+# p6af blocked pixi with a dead proxy plus a NO_PROXY allowlist of everything
+# pixi legitimately needs. On the canonical workspace that allowlist has to name
+# the conda->PyPI mapping service, three find-links pages, the GitHub release
+# host and whatever GitHub redirects release assets to -- and every omission is a
+# dead job AFTER the conda half has already resolved (jobs 5853300, 5854363,
+# 5855234, each one a different missing host). State the actual requirement
+# instead: pixi must not reach a CONDA CHANNEL. `conda_deny_proxy.py` refuses
+# exactly those hosts and tunnels the rest, and its log names every host pixi
+# asked for, which is a positive record rather than the absence of an error.
+#
+#     retread_serve_conda_deny_proxy <deny host,host,...> <port> <log path>
+#         # sets RETREAD_DENY_PROXY_URL / _PID / _LOG
+#
+# The caller still exports the proxy variables itself, and must keep
+# NO_PROXY=127.0.0.1 so the loopback channel mirror is reached directly.
+retread_serve_conda_deny_proxy () {
+  local deny=${1:-} port=${2:-} logp=${3:-}
+  [ -n "$deny" ] && [ -n "$port" ] && [ -n "$logp" ] || {
+    echo "retread_serve_conda_deny_proxy: usage: <deny hosts> <port> <log path>" >&2; return 2; }
+  local here; here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+  local prox=$here/conda_deny_proxy.py
+  [ -f "$prox" ] || { echo "retread_serve_conda_deny_proxy: FATAL missing $prox" >&2; return 2; }
+  : > "$logp"
+  python3 "$prox" "$port" "$deny" "$logp" &
+  RETREAD_DENY_PROXY_PID=$!
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    grep -q 'proxy listening' "$logp" && break
+    sleep 1
+  done
+  grep -q 'proxy listening' "$logp" || {
+    echo "retread_serve_conda_deny_proxy: FATAL proxy never came up (see $logp)" >&2
+    kill "$RETREAD_DENY_PROXY_PID" 2>/dev/null; return 3; }
+  RETREAD_DENY_PROXY_URL=http://127.0.0.1:$port
+  RETREAD_DENY_PROXY_LOG=$logp
+  export RETREAD_DENY_PROXY_PID RETREAD_DENY_PROXY_URL RETREAD_DENY_PROXY_LOG
+  echo "### deny_proxy serving $RETREAD_DENY_PROXY_URL pid=$RETREAD_DENY_PROXY_PID deny=$deny log=$logp"
+}
+
 retread_pixi_mirror_config () {
-  local lock=${1:-} jobhome=${2:-}
+  local lock=${1:-} jobhome=${2:-} pixibin=${3:-}
   [ -f "$lock" ] || { echo "retread_pixi_mirror_config: FATAL no lock at $lock" >&2; return 2; }
   [ -n "$jobhome" ] || { echo "retread_pixi_mirror_config: usage: <lock> <job HOME>" >&2; return 2; }
   [ -n "${RETREAD_MIRROR_URL:-}" ] || { echo "retread_pixi_mirror_config: FATAL RETREAD_MIRROR_URL unset -- serve the mirror first" >&2; return 2; }
   case "$jobhome" in
     /users/glvov|/users/glvov/*) echo "retread_pixi_mirror_config: REFUSING to write the real HOME: $jobhome" >&2; return 2;;
   esac
+  # WHERE PIXI ACTUALLY LOOKS, and `$HOME/.pixi/config.toml` ALONE IS NOT IT.
+  # p6af measured the config injection on a spike that let PIXI_HOME default, so
+  # the job HOME was the right place. Every relock harness on this campaign
+  # EXPORTS a job-scoped PIXI_HOME (and XDG_CONFIG_HOME), and pixi reads its
+  # global config out of those, not out of `$HOME/.pixi`. Measured, job 5851478:
+  # the config was written, the seven mirror bases all answered 200, and the lock
+  # still went straight to `https://prefix.dev/conda-forge/linux-64/
+  # repodata_shards.msgpack.zst` and died on the dead proxy in 3 s. So the same
+  # `[mirrors]` block is written to every job-local location pixi consults, and
+  # the `pixi config list` check below is the reader that refuses if pixi still
+  # cannot see it.
+  local dests="$jobhome/.pixi/config.toml"
+  [ -n "${PIXI_HOME:-}" ] && case "$PIXI_HOME" in /users/glvov|/users/glvov/*) ;; *) dests="$dests $PIXI_HOME/config.toml";; esac
+  [ -n "${XDG_CONFIG_HOME:-}" ] && case "$XDG_CONFIG_HOME" in /users/glvov|/users/glvov/*) ;; *) dests="$dests $XDG_CONFIG_HOME/pixi/config.toml";; esac
   mkdir -p "$jobhome/.pixi" || return 2
   # THE KEY MUST BE THE SAME ONE retread_freeze_channel_mirror BUILT: host AND
   # path, scheme stripped, slashes to `__`. Until 2026-09-04 the sed program in
@@ -767,7 +849,12 @@ retread_pixi_mirror_config () {
         echo "\"$c\" = [\"$RETREAD_MIRROR_URL/$(printf '%s' "$c" | sed -e 's|^https\?://||' -e 's|/|__|g')\"]"
       done
   } > "$jobhome/.pixi/config.toml"
-  echo "### channel_mirror config $jobhome/.pixi/config.toml channels=$(grep -c '^"' "$jobhome/.pixi/config.toml")"
+  local dst
+  for dst in $dests; do
+    mkdir -p "$(dirname "$dst")" || return 2
+    [ "$dst" = "$jobhome/.pixi/config.toml" ] || cp "$jobhome/.pixi/config.toml" "$dst" || return 2
+    echo "### channel_mirror config $dst channels=$(grep -c '^"' "$dst")"
+  done
 
   # READER. Every mirror base this config names must be a directory the server
   # actually serves. A config that points at a directory the freeze never wrote
@@ -784,4 +871,20 @@ retread_pixi_mirror_config () {
     fi
   done
   [ "$bad" -eq 0 ] || return 3
+
+  # THE READER FOR THE WHOLE INJECTION. A config pixi does not read is a config
+  # that does not exist, and the only authority on what pixi reads is pixi.
+  if [ -n "$pixibin" ] && [ -x "$pixibin" ]; then
+    local listed
+    listed=$("$pixibin" config list 2>&1)
+    printf '%s\n' "$listed" | sed 's/^/  pixi config list: /'
+    if printf '%s' "$listed" | grep -q "$RETREAD_MIRROR_URL"; then
+      echo "### channel_mirror config VISIBLE to pixi ($RETREAD_MIRROR_URL found in \`pixi config list\`)"
+    else
+      echo "retread_pixi_mirror_config: FATAL pixi does not see the mirrors block -- \`pixi config list\` never names $RETREAD_MIRROR_URL, so the lock would go to the network" >&2
+      return 4
+    fi
+  else
+    echo "retread_pixi_mirror_config: WARNING no pixi binary passed; the mirrors block is NOT confirmed visible to pixi" >&2
+  fi
 }

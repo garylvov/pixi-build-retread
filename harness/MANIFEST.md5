@@ -39,6 +39,7 @@ a465cea86edc07ad5adf9f96b1ebac9e  phase_template/wedge_triage_guard.sh
 09145148ded67bdc997646a6dc2f9836  phase_template/wheel_store_census_guard.sh
 d66ee00827634a6812410b9045519946  proof/hlgd_relock.sh
 34f54e4d6fb24b3cc7b390669ce90993  tools/b2_attribute.sh
+c56251e11ce8ab1bd8b807c395265fd4  tools/conda_deny_proxy.py
 7783cc47f9e8ad2503fd44950cd43013  tools/env_version_delta.py
 f24678ebc84e8d040a0760a7d1dcb946  tools/gate_build.sh
 39e620e807735bdc65b09fb8078d8e82  tools/import_audit.py
@@ -52,7 +53,7 @@ e60de6759f33d1de9f69a5265cc3dfeb  tools/p6ad_negctl.sh
 c34a4e3a1a8834b073b997fc94230a9f  tools/pixi_merge_run_exports.py
 c9f561484d8ef42157ba6a7532f80681  tools/pixi_shard_cache.py
 6960c0ac937f51969cd1d4f1e1af65c2  tools/pixi_trim_repodata.py
-c902f9d032459fcc6d929474ad87d5bb  tools/retread_fast_env.sh
+bc0f8a274d578f8e80a9eb64141ca19e  tools/retread_fast_env.sh
 4555925b41bc08ba5efb7bbb7b40f167  tools/test_stage_mirror.sh
 f4b1d2839ad51722d0f7a84b8482042b  tools/wheel_store_env_guard.sh
 28954e789c5f0b46ab2e976c3e3301d7  tools/wheel_store_reclaim.sh
