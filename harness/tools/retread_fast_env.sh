@@ -291,11 +291,13 @@ retread_fast_env () {
 #   * `--frozen` IS NOT THIS. In pixi it means "install from the lock without
 #     re-solving", so it does not apply to a relock at all; using the word for
 #     both is how this gets miscommunicated.
-#   * The ONE mechanism that genuinely freezes pixi is `mirrors`, mapping the
-#     channel URL to a local `file://` snapshot -- a real static mirror, which
-#     for conda-forge means hosting the repodata (and, under the sharded
-#     protocol, the shard index) locally. That is a bigger build than p6ad and
-#     it is BOARDED, not shipped.
+#   * The ONE mechanism that genuinely freezes pixi is `mirrors`. p6ad wrote
+#     that this means a `file://` snapshot including the shard index. BOTH
+#     HALVES OF THAT SENTENCE ARE WRONG and p6af measured why: pixi refuses a
+#     `file://` mirror outright ("URL scheme is not allowed"), and against a
+#     mirror it falls back from the shard index to plain `repodata.json`, so no
+#     shard index is needed at all. The shipped mechanism is
+#     `retread_freeze_channel_mirror` + `retread_serve_channel_mirror` below.
 #   So: a frozen run freezes the half that decides the vendored set (retread's
 #   route probes and co-solves) and records the other half's provenance rather
 #   than controlling it.
@@ -477,4 +479,210 @@ retread_seed_wheel_store () {
   fi
   [ "$bad" -eq 0 ] || return 4
   return 0
+}
+
+######## retread_freeze_channel_mirror -- FREEZING PIXI'S HALF OF THE UNIVERSE ##
+# p6af. `retread_freeze_repodata` above freezes RETREAD's conda universe and
+# says, correctly, that pixi's half cannot be frozen and that the only candidate
+# mechanism is `mirrors`. It also says that mechanism is a `file://` snapshot.
+# THAT SECOND CLAIM IS WRONG AND IS CORRECTED HERE, measured on the hold
+# (job 5846309, node1829, pixi 0.73.0):
+#
+#   * `mirrors` -> `file:///…` is REFUSED. pixi routes a mirror through its HTTP
+#     client, and the client rejects the scheme:
+#         builder error for url (file:///…/conda-forge/linux-64/
+#           repodata_shards.msgpack.zst)  ...  URL scheme is not allowed
+#     A `file://` CHANNEL (in the manifest) works fine -- but changing the
+#     manifest's channels changes the URLs recorded in the lock, so it can never
+#     produce a lock comparable to a network one. `mirrors` is transparent: the
+#     lock keeps `https://prefix.dev/conda-forge/` whatever the mirror is.
+#   * `mirrors` -> `http://127.0.0.1:<port>/…` WORKS, offline. Measured with the
+#     outside blocked by a dead proxy (HTTPS_PROXY/HTTP_PROXY/ALL_PROXY =
+#     http://127.0.0.1:9, NO_PROXY=127.0.0.1) and the non-vacuity control run
+#     first: the same lock with NO mirror fails in 4 s on
+#     `repodata_shards.msgpack.zst` with `Connection refused (os error 111)`.
+#   * PIXI FALLS BACK TO repodata.json. Against the mirror it asks for exactly
+#     two URLs per subdir -- `repodata_shards.msgpack.zst` (404) then
+#     `repodata.json` (200) -- so a static mirror needs NO shard index and NO
+#     shards. That is the whole protocol requirement.
+#
+# THE ONE THING A CLASSIC DOCUMENT DOES NOT CARRY IS `run_exports`, AND THE
+# CERTIFIED LOCK HAS 2432 OF THEM. prefix.dev publishes run_exports only inside
+# the sharded protocol: `<subdir>/run_exports.json` is a 404 on every channel we
+# use, and retread's own `retread-repodata/*.json` snapshots contain the string
+# `run_exports` zero times. A mirror built from those documents alone locks
+# correctly -- the conda URL set was IDENTICAL to the network lock, 0 diff lines
+# -- but the lock differs in exactly the run_exports blocks (84 diff lines on a
+# 48-package probe manifest, every one of them a run_exports line).
+# pixi DOES honour a `run_exports` key found in a classic repodata.json record:
+# injecting `{"noarch": ["p6af-probe-marker"]}` into one record put the marker
+# in the lock. So the freeze CARRIES THE FIELD ACROSS from the sharded cache,
+# and then:
+#
+#   MEASURED IDENTITY (job 5846309): two offline mirror locks and one same-window
+#   network lock all md5 373d726c8153ac4247905faf3362dd53, diff 0 lines.
+#   Wall 8-9 s offline.
+#
+#     retread_freeze_channel_mirror <lock> <dst mirror root> <pixi repodata cache>
+#
+# <pixi repodata cache> is a `<PIXI_CACHE_DIR>/repodata` directory that has been
+# warmed BY A NETWORK LOCK OF THIS SAME WORKSPACE -- that is where the shards,
+# and therefore the run_exports, come from. The intended shape of a freeze job is
+# one network lock into a job-local PIXI_CACHE_DIR, then this call over its
+# cache: the mirror is then guaranteed to carry run_exports for every name that
+# solve touched, which is every name the lock records.
+#
+# WHAT IT COSTS, measured per channel/subdir (content-length from the live
+# channels, 2026-09-04, the seven channels the certified lock declares):
+#     conda-forge         linux-64 638 505 040   noarch 253 787 755   aarch64 296 780 114
+#     robostack-jazzy     linux-64  10 421 274   noarch         174   aarch64   9 872 784
+#     robostack-humble    linux-64   5 192 968   noarch         174   aarch64   4 479 803
+#     nvidia              linux-64   3 194 395   noarch     449 167   aarch64   2 887 727
+#     pytorch (anaconda)  linux-64   1 367 363   noarch      52 669   aarch64      44 757
+#     pytorch (prefix)    linux-64   1 230 019   noarch      67 490   aarch64      19 251
+#     pixi-build-backends linux-64     513 431   noarch      30 797   aarch64     478 632
+#   linux-64 + noarch only   914 812 716 B (872 MiB)
+#   + linux-aarch64        1 229 375 784 B (1.15 GiB)
+# One mirror per QUEUE, not per job: every lane points at the same frozen root.
+#
+# WHY IT DOES NOT SHIP A TRIMMED UNIVERSE, even though a trim is ~700x smaller
+# (conda-forge's 1794 lock records are 1 270 523 B against 892 292 795 B, and a
+# 33 KB trim of the probe manifest still locked byte-identically): a trimmed
+# document answers "no such package" to retread's route probes, and the route
+# probe verdicts are what decide the vendored set (p6ac). A universe that is
+# smaller than the one the certified lock was solved against is a DIFFERENT
+# universe, which is the C22-3 / p6ac-1 divergence mechanism, not a saving.
+# `pixi_trim_repodata.py` exists to MEASURE that cost; nothing calls it in a
+# production path.
+#
+# WHAT IT STILL DOES NOT FREEZE, boarded not hidden:
+#   * run_exports coverage is the freeze job's shard coverage. A later solve in
+#     the queue that reaches a package NAME the reference lock never selected
+#     gets that package's record from the full document but with no
+#     run_exports, where the network would have supplied one. It cannot fail --
+#     the universe is complete -- but that one record's block can differ. The
+#     reader is the census line: `shards_present` vs `shards_absent`.
+#   * The PyPI side. uv's index is not mirrored by anything here.
+retread_freeze_channel_mirror () {
+  local lock=${1:-} dst=${2:-} pxcache=${3:-}
+  if [ -z "$lock" ] || [ -z "$dst" ] || [ -z "$pxcache" ]; then
+    echo "retread_freeze_channel_mirror: usage: retread_freeze_channel_mirror <lock> <dst mirror root> <pixi repodata cache dir>" >&2
+    return 2
+  fi
+  [ -f "$lock" ]     || { echo "retread_freeze_channel_mirror: FATAL no lock at $lock" >&2; return 2; }
+  [ -d "$pxcache" ]  || { echo "retread_freeze_channel_mirror: FATAL no pixi repodata cache at $pxcache" >&2; return 2; }
+  case "$dst" in
+    /oscar/data/stellex/glvov/agrescap/cache/retread/*)
+      echo "retread_freeze_channel_mirror: REFUSING to write inside the shared persistent cache: $dst" >&2; return 2;;
+  esac
+  local here; here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+  local merge=$here/pixi_merge_run_exports.py
+  [ -f "$merge" ] || { echo "retread_freeze_channel_mirror: FATAL missing $merge" >&2; return 2; }
+
+  # The channels are the lock's own, and the subdirs are the lock's own platforms
+  # plus noarch. Nothing is guessed and nothing is configured twice.
+  local chans subdirs
+  chans=$(grep -o '^ *- url: https://[^ ]*' "$lock" | sed 's/.*url: //' | sed 's:/*$::' | sort -u)
+  # The subdirs come from the RECORD URLs, not from the `platforms:` block: a
+  # lock whose platform name equals its subdir omits the `subdir:` key entirely
+  # (measured -- a `subdir:`-only rule built a mirror with noarch and nothing
+  # else, and the lock then failed on the first linux-64 package).
+  subdirs=$( { grep -o '\- conda: https\?://[^ ]*' "$lock" |
+                 sed 's|.*://||' | awk -F/ '{print $(NF-1)}'; echo noarch; } | sort -u)
+  [ -n "$chans" ] || { echo "retread_freeze_channel_mirror: FATAL no channel urls in $lock" >&2; return 2; }
+
+  mkdir -p "$dst" || return 2
+  local t0 c s name base tmp bytes docs=0 fetched=0 total=0
+  t0=$(date +%s)
+  for c in $chans; do
+    # The mirror directory is keyed on HOST AND PATH, never on the last segment:
+    # this workspace declares BOTH https://prefix.dev/pytorch and
+    # https://conda.anaconda.org/pytorch, and a last-segment key silently merges
+    # two different channels into one directory.
+    name=$(printf '%s' "$c" | sed 's|^https\?://||; s|/|__|g')
+    base=/${c#*://*/}                       # the channel's path, e.g. /conda-forge
+    for s in $subdirs; do
+      mkdir -p "$dst/$name/$s" || return 2
+      tmp=$dst/$name/$s/.repodata.json.raw
+      # Always fetched from the channel itself. Retread's own snapshot holds the
+      # same bytes, but its file names key on the channel's LAST SEGMENT and so
+      # cannot tell the two pytorch channels apart -- reusing it would be a
+      # silent wrong-channel read.
+      curl -fsSL "$c/$s/repodata.json" -o "$tmp" || {
+        echo "retread_freeze_channel_mirror: FATAL fetch failed $c/$s/repodata.json" >&2; return 3; }
+      fetched=$((fetched+1))
+      python3 "$merge" "$tmp" "$dst/$name/$s/repodata.json" "$pxcache" "$base/$s/" \
+        || { echo "retread_freeze_channel_mirror: FATAL run_exports merge failed for $name/$s" >&2; return 3; }
+      rm -f "$tmp"
+      bytes=$(stat -c %s "$dst/$name/$s/repodata.json")
+      total=$((total+bytes)); docs=$((docs+1))
+    done
+  done
+
+  # ONE digest over the mirror, computed the same way every time: sha256 of the
+  # sorted "<relative path> <sha256>" table. A digest over a `find` order would
+  # not be a comparison rule at all.
+  local digest
+  digest=$( (cd "$dst" && find . -name repodata.json -printf '%P\n' | sort | while read -r p; do
+              echo "$p $(sha256sum "$p" | cut -d' ' -f1)"; done) | sha256sum | cut -d' ' -f1)
+  echo "### channel_mirror frozen dst=$dst docs=$docs fetched=$fetched bytes=$total wall=$(( $(date +%s)-t0 ))s digest=$digest"
+  if [ "$docs" -eq 0 ]; then
+    echo "retread_freeze_channel_mirror: FATAL no documents written" >&2; return 4
+  fi
+  export RETREAD_CHANNEL_MIRROR=$dst
+  export RETREAD_CHANNEL_MIRROR_DIGEST=$digest
+  return 0
+}
+
+######## retread_serve_channel_mirror / retread_pixi_mirror_config ############
+# The mirror is served over loopback HTTP because `mirrors` will not take a
+# file:// URL (see above). Both halves must run in the SAME shell as the lock:
+# an `srun --overlap` step reaps detached children, so a server started in one
+# step is gone by the next.
+#
+#     retread_serve_channel_mirror <mirror root> <port>      # sets RETREAD_MIRROR_URL/_PID
+#     retread_pixi_mirror_config   <lock> <job HOME>         # writes $HOME/.pixi/config.toml
+#
+# THE CONFIG GOES IN A JOB-LOCAL HOME AND NOWHERE ELSE. imprint-data's
+# `.pixi/config.toml` is read-only to this campaign and carries
+# `run-post-link-scripts` + `[concurrency]`; pixi MERGES system < global < local,
+# so `[mirrors]` in the job HOME's global config lands beside the workspace's own
+# keys without touching them. Measured: with imprint-data's config.toml copied
+# verbatim into the staged workspace, `pixi config list` showed all three keys
+# and the lock was still md5 373d726c8153ac4247905faf3362dd53.
+retread_serve_channel_mirror () {
+  local root=${1:-} port=${2:-}
+  [ -d "$root" ] || { echo "retread_serve_channel_mirror: FATAL no mirror at $root" >&2; return 2; }
+  [ -n "$port" ] || { echo "retread_serve_channel_mirror: usage: <mirror root> <port>" >&2; return 2; }
+  ( cd "$root" && exec python3 -m http.server "$port" --bind 127.0.0.1 ) > "${TMPDIR:-/tmp}/channel-mirror-$port.log" 2>&1 &
+  RETREAD_MIRROR_PID=$!
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    curl -fs -o /dev/null "http://127.0.0.1:$port/" && break
+    sleep 1
+  done
+  curl -fsS -o /dev/null "http://127.0.0.1:$port/" || {
+    echo "retread_serve_channel_mirror: FATAL server on $port never answered" >&2
+    kill "$RETREAD_MIRROR_PID" 2>/dev/null; return 3; }
+  RETREAD_MIRROR_URL=http://127.0.0.1:$port
+  export RETREAD_MIRROR_PID RETREAD_MIRROR_URL
+  echo "### channel_mirror serving $RETREAD_MIRROR_URL pid=$RETREAD_MIRROR_PID root=$root"
+}
+
+retread_pixi_mirror_config () {
+  local lock=${1:-} jobhome=${2:-}
+  [ -f "$lock" ] || { echo "retread_pixi_mirror_config: FATAL no lock at $lock" >&2; return 2; }
+  [ -n "$jobhome" ] || { echo "retread_pixi_mirror_config: usage: <lock> <job HOME>" >&2; return 2; }
+  [ -n "${RETREAD_MIRROR_URL:-}" ] || { echo "retread_pixi_mirror_config: FATAL RETREAD_MIRROR_URL unset -- serve the mirror first" >&2; return 2; }
+  case "$jobhome" in
+    /users/glvov|/users/glvov/*) echo "retread_pixi_mirror_config: REFUSING to write the real HOME: $jobhome" >&2; return 2;;
+  esac
+  mkdir -p "$jobhome/.pixi" || return 2
+  { echo "[mirrors]"
+    grep -o '^ *- url: https://[^ ]*' "$lock" | sed 's/.*url: //' | sed 's:/*$::' | sort -u |
+      while read -r c; do
+        echo "\"$c\" = [\"$RETREAD_MIRROR_URL/$(printf '%s' "$c" | sed 's|^https\\?://||; s|/|__|g')\"]"
+      done
+  } > "$jobhome/.pixi/config.toml"
+  echo "### channel_mirror config $jobhome/.pixi/config.toml channels=$(grep -c '^"' "$jobhome/.pixi/config.toml")"
 }
