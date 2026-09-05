@@ -365,6 +365,72 @@ pub struct RetreadConfig {
     )]
     pub shadow_cache_store_max_age_days: Option<u64>,
 
+    /// L3-1b-1: where the SOURCE-BUILT WHEEL cache lives — the
+    /// content-addressed store of wheels retread built with `uv build --wheel`
+    /// from a git, sdist or path source.
+    ///
+    /// Unset means `source_build::built_wheel_store_root()`, the PERSISTENT
+    /// root (`XDG_CACHE_HOME/retread`, else `$HOME/.cache/retread`), plus the
+    /// `built-wheels` segment. It used to mean `courier::retread_cache_root()`,
+    /// which `fasttmp` redirects into `…/job-$SLURM_JOB_ID/caches/retread` and
+    /// which is keyed on the WORKSPACE PATH HASH as well as the job — so a
+    /// second lock, in a second workspace, rebuilt every source wheel from
+    /// scratch. C32 priced that at `uv_build_wheel` 49 rows / 938.7 s on a cold
+    /// canonical lock against ZERO rows on a warm one: the single largest
+    /// C18-1-shaped term the L3-1b audit found.
+    ///
+    /// `RETREAD_BUILT_WHEELS_STORE` is the harness-side fallback, for the same
+    /// reason the Git snapshot store and the shadow cache have one: naming a
+    /// store in a pack manifest moves that pack's build hash, so a harness that
+    /// wants the store somewhere else cannot use the manifest without changing
+    /// the thing it measures.
+    ///
+    /// ```toml
+    /// [build.config]
+    /// retread-built-wheels-store = "/shared/cache/retread"
+    /// ```
+    ///
+    /// EMIT-NEUTRAL: this names WHERE the cache lives, never WHAT is emitted.
+    /// The path never feeds `inputs_hash`; the KEY covers the inputs, and every
+    /// hit is re-validated by `validate_cache_entry` (the marker's source
+    /// identity, the target, and the expected name/version) before it is used.
+    #[serde(
+        default,
+        rename = "retread-built-wheels-store",
+        alias = "built-wheels-store",
+        alias = "built_wheels_store"
+    )]
+    pub built_wheels_store: Option<std::path::PathBuf>,
+
+    /// L3-1b-1: how long a built-wheel entry that no lock has referenced may
+    /// sit in the store before the reaper QUARANTINES it, in days.
+    ///
+    /// Unset is `source_build::BUILT_WHEEL_STORE_DEFAULT_MAX_AGE_DAYS` (14, the
+    /// same horizon as the Git snapshot store and the shadow cache on purpose —
+    /// three housekeeping horizons that differ for no stated reason are three
+    /// things to get wrong). `0` turns the reaper off entirely.
+    ///
+    /// The store is persistent by default now, and a persistent store that
+    /// nothing reaps is a leak. This one leaks in BOTH currencies at once: one
+    /// entry DIRECTORY per (kind, target identity, source identity) triple, so
+    /// every commit of every git source and every target partition mints a new
+    /// one, and each holds a full wheel plus — for a git source — the retired
+    /// `git-build-source` tree beside it. An over-age entry is RENAMED into
+    /// `built-wheels/quarantine/…`, never deleted, and each eviction prints one
+    /// `built_wheel_store evicted` row.
+    ///
+    /// ```toml
+    /// [build.config]
+    /// retread-built-wheels-store-max-age-days = 14
+    /// ```
+    #[serde(
+        default,
+        rename = "retread-built-wheels-store-max-age-days",
+        alias = "built-wheels-store-max-age-days",
+        alias = "built_wheels_store_max_age_days"
+    )]
+    pub built_wheels_store_max_age_days: Option<u64>,
+
     /// Experimental: run the conda co-solve's resolvo probes on a thread pool
     /// instead of serially.
     ///

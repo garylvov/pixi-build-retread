@@ -5276,6 +5276,21 @@ impl Handler {
             pre_key_config.shadow_cache_store_max_age_days,
         );
         crate::courier::reap_shadow_cache_store_once();
+        // L3-1b-1: the BUILT-WHEEL cache is the third store C18 classified as
+        // scratch by collateral, and by measured size the largest of them --
+        // C32 priced `uv_build_wheel` at 49 rows / 938.7 s on a truly cold
+        // canonical lock against ZERO rows on a warm one. Same flip, same
+        // shape: `retread-built-wheels-store` names the root (unset = the
+        // persistent one, `RETREAD_BUILT_WHEELS_STORE` the harness fallback),
+        // and `retread-built-wheels-store-max-age-days` sizes the reaper that a
+        // now-persistent store needs (unset = 14 days, 0 = off). The reaper runs
+        // at most once per process behind a non-blocking try-lock -- see
+        // `source_build::reap_built_wheel_store`.
+        crate::source_build::set_built_wheels_store(pre_key_config.built_wheels_store.as_deref());
+        crate::source_build::set_built_wheels_store_max_age_days(
+            pre_key_config.built_wheels_store_max_age_days,
+        );
+        crate::source_build::reap_built_wheel_store_once();
         // The SHARED built-output store, if the pack opted into one. Keyed on
         // content alone, so a workspace staged at a new path can adopt this
         // result instead of recomputing it. Unset = the store does not exist.

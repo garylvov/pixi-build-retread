@@ -1549,6 +1549,8 @@ mod tests {
             git_snapshot_store_max_age_days: None,
             shadow_cache_store: None,
             shadow_cache_store_max_age_days: None,
+            built_wheels_store: None,
+            built_wheels_store_max_age_days: None,
             path_source_metadata: None,
             path_source_records: None,
             parallel_probes: None,

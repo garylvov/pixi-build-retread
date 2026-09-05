@@ -202,32 +202,50 @@ static GIT_SNAPSHOT_STORE_REAP_ONCE: std::sync::Once = std::sync::Once::new();
 /// entry. Same dot-sidecar shape as [`artifact_cache_lock_path`]'s
 /// `.{entry}.lock`, in the same parent directory, so it is never mistaken for
 /// an entry by a reader that skips dotfiles.
-const GIT_SNAPSHOT_USE_STAMP_SUFFIX: &str = ".used";
+///
+/// L3-1b-1: ONE suffix for every store in this module that stamps, not one per
+/// store. C18-1 coined it for the canonical Git snapshot store; the built-wheel
+/// store is the second here, and a second copy of a one-character-from-wrong
+/// constant is how two stores' sidecars silently diverge.
+const USE_STAMP_SUFFIX: &str = ".used";
+
+/// C18-1's spelling of [`USE_STAMP_SUFFIX`], kept because the C18-1 guards and
+/// the snapshot-store walker name it. It IS `USE_STAMP_SUFFIX` and nothing
+/// else, so the extraction cannot change what those tests assert.
+const GIT_SNAPSHOT_USE_STAMP_SUFFIX: &str = USE_STAMP_SUFFIX;
 
 /// Name of the reaper's own try-lock, a dot-sidecar beside the `v3` directory
 /// it scans. NEVER a blocking lock: a process that cannot take it does not
 /// reap, so a concurrent relock is never made to wait on housekeeping.
 const GIT_SNAPSHOT_REAP_LOCK_NAME: &str = ".v3.reap.lock";
 
-/// Where the use-stamp for one entry lives: `<parent>/.<entry>.used`.
-pub(crate) fn git_snapshot_use_stamp_path(cache_dir: &Path) -> Option<PathBuf> {
-    let parent = cache_dir.parent()?;
-    let name = cache_dir.file_name()?.to_str()?;
-    Some(parent.join(format!(".{name}{GIT_SNAPSHOT_USE_STAMP_SUFFIX}")))
+/// L3-1b-1. Where the use-stamp for one entry lives: `<parent>/.<entry>.used`.
+///
+/// THE ONE STAMP-PATH FORMULA IN THIS MODULE, extracted so the second store to
+/// need it does not become the second copy of it. C18-1 wrote this body inline
+/// in [`git_snapshot_use_stamp_path`]; that function is now a call to this one
+/// and is byte-for-byte the same function of its argument, so
+/// `the_reaper_ages_an_entry_from_its_use_stamp_not_its_publish` and every
+/// other C18-1 guard is untouched by the extraction.
+pub(crate) fn use_stamp_path(entry: &Path) -> Option<PathBuf> {
+    let parent = entry.parent()?;
+    let name = entry.file_name()?.to_str()?;
+    Some(parent.join(format!(".{name}{USE_STAMP_SUFFIX}")))
 }
 
-/// C18-1, THE READER HALF OF THE REAPER. Record that a lock referenced this
-/// entry, right now.
+/// L3-1b-1, THE READER HALF OF EVERY REAPER IN THIS MODULE. Record that a lock
+/// referenced this entry, right now.
 ///
-/// The stamp is a SIDECAR and never a write inside the tree: a published
-/// canonical tree is read-only and immutable, and the seal would refuse a
-/// write into it. Best-effort by construction — a store on a read-only mount,
-/// or a lost race, must not fail a build — but a missing stamp is not a
-/// licence to evict: [`reap_canonical_git_snapshot_store`] falls back to the
-/// entry's own `source.json` mtime, so an entry published before this code
+/// The stamp is a SIDECAR and never a write inside the entry: a published
+/// canonical tree is read-only and would refuse the write, and a published
+/// built wheel is immutable content whose mtime other jobs age from. Best-effort
+/// by construction — a store on a read-only mount, or a lost race, must not fail
+/// a build — but a missing stamp is not a licence to evict: both reapers fall
+/// back to a file inside the entry (`source.json` for a Git snapshot,
+/// `artifact.json` for a built wheel), so an entry published before this code
 /// existed is aged from its publish, not from the epoch.
-pub(crate) fn touch_git_snapshot_use_stamp(cache_dir: &Path) {
-    let Some(stamp) = git_snapshot_use_stamp_path(cache_dir) else {
+pub(crate) fn touch_use_stamp(entry: &Path) {
+    let Some(stamp) = use_stamp_path(entry) else {
         return;
     };
     let now = std::time::SystemTime::now()
@@ -240,6 +258,20 @@ pub(crate) fn touch_git_snapshot_use_stamp(cache_dir: &Path) {
     if std::fs::write(&tmp, format!("{now}\n")).is_ok() && std::fs::rename(&tmp, &stamp).is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
+}
+
+/// Where the use-stamp for one canonical Git snapshot entry lives. C18-1's name
+/// for [`use_stamp_path`], retained so its call sites and guards read as C18-1
+/// wrote them.
+pub(crate) fn git_snapshot_use_stamp_path(cache_dir: &Path) -> Option<PathBuf> {
+    use_stamp_path(cache_dir)
+}
+
+/// C18-1, THE READER HALF OF THE SNAPSHOT REAPER. C18-1's name for
+/// [`touch_use_stamp`]; see that function for why the stamp is a sidecar and
+/// why a missing stamp never licenses an eviction.
+pub(crate) fn touch_git_snapshot_use_stamp(cache_dir: &Path) {
+    touch_use_stamp(cache_dir);
 }
 
 /// What the reaper did, so a caller can print it and a guard can assert on it.
@@ -482,6 +514,409 @@ pub(crate) fn reap_git_snapshot_store_once() {
         }
     });
 }
+
+// ── L3-1b-1: the built-wheel cache is a PERSISTENT store, not job scratch ────
+
+/// L3-1b-1. Where sealed source-built wheels live. `None` — nothing named —
+/// means [`built_wheel_store_root`], the PERSISTENT root.
+///
+/// L3-1b-1 CHANGES WHAT `None` MEANS, and that is the whole fix: C18-1's flip
+/// applied to the LARGEST store that still had the defect. It used to mean
+/// `crate::courier::retread_cache_root()`, which consults
+/// `fasttmp::backend_env_override("RETREAD_CACHE_DIR")` FIRST and is therefore
+/// redirected to `<fast-tmp>/<user>/<WORKSPACE PATH HASH>/job-$SLURM_JOB_ID/caches/retread`
+/// — keyed on the workspace AND the job, so the cache died with either. C32
+/// priced the consequence on the canonical manifest: `uv_build_wheel` 49 rows
+/// summing 938.7 s inside a 704.3 s span on a truly cold lock, against ZERO
+/// rows on a warm one. Every cold lock rebuilt all of it and threw it away.
+///
+/// A built-wheel entry meets the wheel store's persistence exemption item for
+/// item: it is IMMUTABLE (published by `rename` of a fully validated staging
+/// directory, never rewritten in place), CONTENT-IDENTIFIED by the (kind,
+/// target artifact identity, source identity) triple in its path plus the
+/// `artifact.json` marker every reader re-validates, and EXPENSIVE to rebuild
+/// (a full PEP 517 `uv build --wheel`, 30 s for the median git member and
+/// 114.5 s for the pole on C32 arm 1).
+static BUILT_WHEELS_STORE: std::sync::RwLock<Option<std::path::PathBuf>> =
+    std::sync::RwLock::new(None);
+
+/// Wire the `retread-built-wheels-store` config key into the built-wheel cache.
+/// Called once per pack from the handler, beside [`set_git_snapshot_store`].
+pub(crate) fn set_built_wheels_store(configured: Option<&Path>) {
+    let resolved = built_wheels_store_with(configured, &|key| std::env::var(key).ok());
+    if let Ok(mut slot) = BUILT_WHEELS_STORE.write() {
+        *slot = resolved;
+    }
+}
+
+/// Testable core of [`set_built_wheels_store`]: config key first, then the
+/// `RETREAD_BUILT_WHEELS_STORE` fallback, then `None` — which means "take the
+/// default root", never an invented path.
+pub(crate) fn built_wheels_store_with(
+    configured: Option<&Path>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Option<std::path::PathBuf> {
+    if let Some(path) = configured {
+        return Some(path.to_path_buf());
+    }
+    env("RETREAD_BUILT_WHEELS_STORE")
+        .filter(|value| !value.trim().is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// The one formula for the built-wheel store root. One writer, two readers:
+/// [`built_wheel_cache_dir`] and the L3-1b-1 guards, which pass a root
+/// explicitly so a test never has to mutate a process-global.
+pub(crate) fn built_wheel_store_root() -> std::path::PathBuf {
+    let slot = BUILT_WHEELS_STORE.read().ok().and_then(|slot| slot.clone());
+    built_wheel_store_root_with(slot.as_deref(), &|key| std::env::var(key).ok())
+}
+
+/// Testable core of [`built_wheel_store_root`]: whatever the config key /
+/// harness fallback resolved to, else the DEFAULT persistent root.
+///
+/// L3-1b-1 IS THIS ONE EXPRESSION. The default arm used to be
+/// `crate::courier::retread_cache_root()`. It is now
+/// `crate::courier::persistent_store_root_with` — L3-1b's extraction of C18-1's
+/// formula, which has NO `RETREAD_CACHE_DIR` branch at all. Restoring the old
+/// arm turns
+/// `the_built_wheel_store_default_is_persistent_not_the_job_local_redirect`
+/// RED, which is why this is written as an injectable function rather than an
+/// ambient lookup.
+pub(crate) fn built_wheel_store_root_with(
+    configured: Option<&Path>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> std::path::PathBuf {
+    if let Some(root) = configured {
+        return root.to_path_buf();
+    }
+    crate::courier::persistent_store_root_with(env)
+}
+
+/// L3-1b-1. How long a built-wheel entry that no lock has referenced may sit in
+/// the store before the reaper quarantines it, in DAYS.
+///
+/// DEFAULT 14, on C18-1's asymmetry argument with this store's own numbers:
+/// * Evicting too early costs exactly ONE `uv build --wheel` of that member.
+///   C32 arm 1 measured the median git member at ~19 s (938.7 s over 49 rows)
+///   and the pole `cached_build` at 114.5 s — the most expensive single mistake
+///   in this store is under two minutes.
+/// * Never evicting costs BOTH inodes and bytes without bound: one entry
+///   DIRECTORY per (kind, target artifact identity, source identity) triple, so
+///   every commit of every git source and every target partition mints a new
+///   one, each holding a full wheel and — for a git source — the retired
+///   `git-build-source` tree beside it. This campaign has driven this
+///   filesystem's inode quota to its soft limit twice.
+/// The same 14 as the Git snapshot store and the shadow cache, on purpose:
+/// three housekeeping horizons that differ for no stated reason are three
+/// things to get wrong.
+///
+/// `0` DISABLES the reaper, the same escape hatch C18-1 and L3-1b have.
+pub(crate) const BUILT_WHEEL_STORE_DEFAULT_MAX_AGE_DAYS: u64 = 14;
+
+static BUILT_WHEEL_STORE_MAX_AGE_DAYS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(BUILT_WHEEL_STORE_DEFAULT_MAX_AGE_DAYS);
+
+/// Wire the `retread-built-wheels-store-max-age-days` config key into the
+/// reaper. Called once per pack from the handler, beside
+/// [`set_built_wheels_store`].
+pub(crate) fn set_built_wheels_store_max_age_days(configured: Option<u64>) {
+    BUILT_WHEEL_STORE_MAX_AGE_DAYS.store(
+        configured.unwrap_or(BUILT_WHEEL_STORE_DEFAULT_MAX_AGE_DAYS),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+fn built_wheel_store_max_age_days() -> u64 {
+    BUILT_WHEEL_STORE_MAX_AGE_DAYS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// L3-1b-1. The reaper runs AT MOST ONCE PER PROCESS, for C18-1's reason: a
+/// relock is many backend processes, the store's own try-lock makes it at most
+/// one reaper at a time across all of them and across nodes, and this only
+/// stops one process rescanning as it walks its packs.
+static BUILT_WHEEL_STORE_REAP_ONCE: std::sync::Once = std::sync::Once::new();
+
+/// Name of the built-wheel reaper's own try-lock, a dot-sidecar beside the
+/// `built-wheels` directory it scans. NEVER a blocking lock.
+const BUILT_WHEEL_REAP_LOCK_NAME: &str = ".built-wheels.reap.lock";
+
+/// The marker file every published built-wheel entry carries, and the ONLY
+/// thing that makes a directory an entry to this reaper. A staging directory
+/// has no marker until the instant before it is renamed into place, and
+/// `git-build-source` — the retired build tree that sits INSIDE an entry — has
+/// none ever, so neither can be mistaken for one.
+const BUILT_WHEEL_MARKER: &str = "artifact.json";
+
+/// Directory name the built-wheel reaper quarantines into, a sibling of the
+/// `<kind>` directories so it can never itself be walked as one.
+const BUILT_WHEEL_QUARANTINE: &str = "quarantine";
+
+/// What the reaper did, so a caller can print it and a guard can assert on it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct BuiltWheelReapReport {
+    pub(crate) scanned: u64,
+    pub(crate) evicted: u64,
+    pub(crate) kept: u64,
+    pub(crate) skipped_locked: u64,
+    /// `true` when another process held the reap try-lock and this one backed
+    /// off without scanning anything.
+    pub(crate) skipped_concurrent: bool,
+}
+
+/// L3-1b-1, THE REAPER. Quarantine every built-wheel entry no lock has
+/// referenced for longer than `max_age`.
+///
+/// C18-1's three rules, each with a guard:
+/// 1. **It never deletes.** An over-age entry is RENAMED into
+///    `built-wheels/quarantine/<kind>-<target>-<source…>-<unix>-<pid>`.
+///    Reclaiming a quarantine is a separate, operator-visible act.
+/// 2. **It never blocks anyone.** The store-wide try-lock is non-blocking, and
+///    so is the per-entry [`artifact_cache_lock_path`] lock: an entry whose
+///    writer lock is held is a live publish and is SKIPPED, not waited on.
+/// 3. **It re-reads the age under the entry lock.** A hit can land between the
+///    scan and the rename, so the stamp is re-stated with the lock held and an
+///    entry that became fresh in that window is kept.
+///
+/// WHY THIS IS NOT [`reap_canonical_git_snapshot_store`] WITH A PARAMETER, and
+/// the judgement is deliberate. The two stores share rules 1-3, the `.used`
+/// sidecar (now literally the same [`use_stamp_path`]) and the per-entry lock —
+/// but not their SHAPE. C18-1 walks a FIXED two-level `v3/<identity>/<ref state>`
+/// tree and ages from `source.json`. This one has a VARIABLE depth: an entry
+/// normally sits at `<kind>/v12/<target>/<source>`, but
+/// [`git_wheel_source_identity`] returns TWO path segments
+/// (`<family>/<ref state>`), so a git entry addressed through it sits one level
+/// deeper. MEASURED, so the variability is not hypothetical in the wrong
+/// direction either: ten production stores on this filesystem hold 441 entries
+/// and every one of them is at the two-segment depth, which is exactly why a
+/// walk that assumed the three-segment shape would find nothing. An entry is
+/// therefore found by DESCENDING UNTIL AN `artifact.json` MARKER APPEARS, never
+/// by counting levels. Folding the two together would take a
+/// callback for enumeration, a callback for the age file and a callback for the
+/// quarantine name — three injection points to save perhaps thirty lines, which
+/// is the abstraction this project's doctrine refuses. What IS shared is shared:
+/// the stamp helpers, the lock path, and the row shapes.
+pub(crate) fn reap_built_wheel_store(
+    store_root: &Path,
+    max_age: std::time::Duration,
+) -> Result<BuiltWheelReapReport> {
+    let mut report = BuiltWheelReapReport::default();
+    if max_age.is_zero() {
+        return Ok(report);
+    }
+    let built_wheels = store_root.join(BUILT_WHEEL_CACHE_ROOT);
+    if !built_wheels.is_dir() {
+        return Ok(report);
+    }
+    let reap_lock_path = built_wheels.join(BUILT_WHEEL_REAP_LOCK_NAME);
+    let reap_lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&reap_lock_path)
+        .with_context(|| {
+            format!(
+                "opening the built-wheel store reap lock {}",
+                reap_lock_path.display()
+            )
+        })?;
+    if !fs4::fs_std::FileExt::try_lock_exclusive(&reap_lock).unwrap_or(false) {
+        report.skipped_concurrent = true;
+        tracing::info!(
+            store = %store_root.display(),
+            "built_wheel_store reap skipped=concurrent",
+        );
+        return Ok(report);
+    }
+    let quarantine_root = built_wheels.join(BUILT_WHEEL_QUARANTINE);
+    let now = std::time::SystemTime::now();
+    let mut entries = Vec::new();
+    for kind in read_dir_names(&built_wheels)? {
+        if kind == BUILT_WHEEL_QUARANTINE {
+            continue;
+        }
+        let versioned = built_wheels.join(&kind).join(BUILT_WHEEL_CACHE_VERSION);
+        if !versioned.is_dir() {
+            continue;
+        }
+        collect_built_wheel_entries(&versioned, &kind, &mut Vec::new(), &mut entries)?;
+    }
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    for (label, entry_dir) in entries {
+        report.scanned += 1;
+        let Some(age) = built_wheel_entry_age(&entry_dir, now) else {
+            report.kept += 1;
+            continue;
+        };
+        if age <= max_age {
+            report.kept += 1;
+            continue;
+        }
+        // Rule 2: an entry a writer holds is a live publish. Try, never wait.
+        let Ok(entry_lock_path) = artifact_cache_lock_path(&entry_dir) else {
+            report.kept += 1;
+            continue;
+        };
+        let Ok(entry_lock) = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&entry_lock_path)
+        else {
+            report.kept += 1;
+            continue;
+        };
+        if !fs4::fs_std::FileExt::try_lock_exclusive(&entry_lock).unwrap_or(false) {
+            report.skipped_locked += 1;
+            report.kept += 1;
+            continue;
+        }
+        // Rule 3: re-state the age now that nobody else can publish here.
+        match built_wheel_entry_age(&entry_dir, std::time::SystemTime::now()) {
+            Some(fresh) if fresh <= max_age => {
+                report.kept += 1;
+                continue;
+            }
+            None => {
+                report.kept += 1;
+                continue;
+            }
+            Some(_) => {}
+        }
+        let stamp_unix = now
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let quarantine =
+            quarantine_root.join(format!("{label}-{stamp_unix}-{}", std::process::id()));
+        if let Err(error) = std::fs::create_dir_all(&quarantine_root) {
+            tracing::warn!(
+                store = %store_root.display(),
+                error = %error,
+                "could not create the built-wheel store quarantine; nothing evicted",
+            );
+            report.kept += 1;
+            continue;
+        }
+        // Rule 1: RENAME. Never `remove_dir_all`, never `remove_owned_cache_entry`.
+        if let Err(error) = std::fs::rename(&entry_dir, &quarantine) {
+            tracing::warn!(
+                entry = %label,
+                error = %error,
+                "built_wheel_store eviction could not rename; entry kept",
+            );
+            report.kept += 1;
+            continue;
+        }
+        if let Some(stamp) = use_stamp_path(&entry_dir) {
+            let _ = std::fs::rename(
+                &stamp,
+                quarantine.with_file_name(format!(
+                    "{}{USE_STAMP_SUFFIX}",
+                    quarantine
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("entry")
+                )),
+            );
+        }
+        report.evicted += 1;
+        // ONE ROW PER EVICTION, the `git_snapshot_store evicted` shape.
+        tracing::info!(
+            entry = %label,
+            age_days = age.as_secs() / 86_400,
+            max_age_days = max_age.as_secs() / 86_400,
+            reason = "unreferenced",
+            quarantine = %quarantine.display(),
+            "built_wheel_store evicted",
+        );
+    }
+    tracing::info!(
+        store = %store_root.display(),
+        scanned = report.scanned,
+        evicted = report.evicted,
+        kept = report.kept,
+        skipped_locked = report.skipped_locked,
+        max_age_days = max_age.as_secs() / 86_400,
+        "built_wheel_store reap",
+    );
+    Ok(report)
+}
+
+/// Descend from `<kind>/v12` until a [`BUILT_WHEEL_MARKER`] appears, and record
+/// that directory as one entry. THE MARKER, NOT THE DEPTH, IS WHAT MAKES AN
+/// ENTRY — see [`reap_built_wheel_store`] for why a depth-counting walk cannot
+/// work over a store that holds both two-segment and three-segment source
+/// identities. Descent STOPS at a marker, so `git-build-source` (which lives
+/// inside an entry) is never walked into and never seen as an entry of its own.
+fn collect_built_wheel_entries(
+    dir: &Path,
+    kind: &str,
+    prefix: &mut Vec<String>,
+    out: &mut Vec<(String, PathBuf)>,
+) -> Result<()> {
+    // A store nested deeper than kind/target/family/ref-state is not a shape
+    // this code writes; refusing to descend past it keeps a hand-made or
+    // corrupted tree from turning housekeeping into an unbounded walk.
+    const MAX_DEPTH: usize = 3;
+    for name in read_dir_names(dir)? {
+        let child = dir.join(&name);
+        if !child.is_dir() {
+            continue;
+        }
+        prefix.push(name);
+        if child.join(BUILT_WHEEL_MARKER).is_file() {
+            out.push((format!("{kind}-{}", prefix.join("-")), child));
+        } else if prefix.len() < MAX_DEPTH {
+            collect_built_wheel_entries(&child, kind, prefix, out)?;
+        }
+        prefix.pop();
+    }
+    Ok(())
+}
+
+/// How long ago a lock last referenced this entry: the use stamp when there is
+/// one, else the entry's own `artifact.json` mtime, which is when it was
+/// published. `None` means "cannot tell", and the caller keeps the entry.
+fn built_wheel_entry_age(
+    entry_dir: &Path,
+    now: std::time::SystemTime,
+) -> Option<std::time::Duration> {
+    let referenced = use_stamp_path(entry_dir)
+        .and_then(|stamp| std::fs::metadata(stamp).ok())
+        .and_then(|meta| meta.modified().ok())
+        .or_else(|| {
+            std::fs::metadata(entry_dir.join(BUILT_WHEEL_MARKER))
+                .ok()
+                .and_then(|meta| meta.modified().ok())
+        })?;
+    // A stamp in the future (clock skew across nodes) reads as age zero, which
+    // KEEPS the entry. Never as a huge age, which would evict it.
+    Some(now.duration_since(referenced).unwrap_or_default())
+}
+
+/// L3-1b-1. Run the reaper once for this process, against whatever store root
+/// is live, and never fail a build because housekeeping failed.
+pub(crate) fn reap_built_wheel_store_once() {
+    BUILT_WHEEL_STORE_REAP_ONCE.call_once(|| {
+        let days = built_wheel_store_max_age_days();
+        if days == 0 {
+            return;
+        }
+        let store_root = built_wheel_store_root();
+        let max_age = std::time::Duration::from_secs(days * 86_400);
+        if let Err(error) = reap_built_wheel_store(&store_root, max_age) {
+            tracing::warn!(
+                store = %store_root.display(),
+                error = %error,
+                "built_wheel_store reap failed; nothing evicted",
+            );
+        }
+    });
+}
+
 const SDIST_BUILD_CONSTRAINTS: &str = "setuptools<81\ncmake<4\n";
 static BUILD_TMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -1039,8 +1474,28 @@ fn validate_sha256(value: &str, label: &str) -> Result<String> {
     Ok(normalized)
 }
 
+/// Where one built-wheel cache entry lives.
+///
+/// L3-1b-1 CHANGED THE ROOT AND NOTHING ELSE. It was
+/// `crate::courier::retread_cache_root()`, which `fasttmp` redirects to a
+/// WORKSPACE- and JOB-scoped namespace; it is now [`built_wheel_store_root`],
+/// which has no `RETREAD_CACHE_DIR` branch at all. The four segments below are
+/// byte-for-byte what they were, so no entry changes address relative to its
+/// root and no cache key moves.
+///
+/// THE `target.artifact_cache_identity()` SEGMENT IS A MEASURED REUSE DEFEATER,
+/// L3-1's own shape one store over, and it is BOARDED (L3-1b-1a) rather than
+/// fixed here. Three production pairs hold byte-identical wheels for ONE source
+/// identity under TWO target identities — `isaaclab_rl-0.4.7` sha `2c98ffe2…`,
+/// `gym-0.26.2` sha `604d7acf…`, `pyperclip-1.8.0` sha `509c5d6c…`, `cmp` rc 0
+/// on all three — and the two `artifact.json` records for a pair differ in
+/// exactly one field, `artifact_target`. It is not fixed in the same commit
+/// because narrowing the term MOVES EVERY ADDRESS IN THE STORE, and a change
+/// that moves addresses cannot be measured in the same job as a change that
+/// only moves the root: the proof of this one is that two runs produce
+/// byte-identical locks.
 fn built_wheel_cache_dir(kind: &str, source_identity: &str, target: &ResolutionTarget) -> PathBuf {
-    crate::courier::retread_cache_root()
+    built_wheel_store_root()
         .join(BUILT_WHEEL_CACHE_ROOT)
         .join(kind)
         .join(BUILT_WHEEL_CACHE_VERSION)
@@ -2399,6 +2854,10 @@ where
                 }
             }
             if !rebuild_hermetically {
+                // L3-1b-1, THE READER HALF OF THE REAPER: a lock referenced
+                // this entry, so it is not unreferenced. Best-effort sidecar,
+                // never a write into the immutable entry.
+                touch_use_stamp(&cache_dir);
                 let wheel_bytes = std::fs::metadata(&wheel.path).map(|m| m.len()).unwrap_or(0);
                 let materialize_started = std::time::Instant::now();
                 let materialized = materialize_validated_wheel(&wheel, &materialized_out).await;
@@ -2606,6 +3065,13 @@ where
             cache_dir.display()
         )
     })?;
+    // L3-1b-1: stamp the entry the instant it becomes visible to other
+    // processes. A publish is a reference — without this the entry would be
+    // aged from its `artifact.json` mtime, which is the same instant, so this
+    // is belt and braces rather than a correction; what it buys is that every
+    // live entry has a stamp, so a MISSING stamp is a signal and not the
+    // ordinary case.
+    touch_use_stamp(&cache_dir);
     let published = ValidatedWheel {
         path: cache_dir.join(&marker.filename),
         marker,
@@ -2655,9 +3121,14 @@ async fn lookup_cached_build(
     .await
     .context("built-wheel cache validation task panicked")?;
     match cached {
-        Ok(Some(wheel)) => Ok(Some(
-            materialize_validated_wheel(&wheel, &materialized_out).await?,
-        )),
+        Ok(Some(wheel)) => {
+            // L3-1b-1, the reader half of the reaper, on the second of the
+            // three doors into this store.
+            touch_use_stamp(&cache_dir);
+            Ok(Some(
+                materialize_validated_wheel(&wheel, &materialized_out).await?,
+            ))
+        }
         Ok(None) => Ok(None),
         Err(error) if is_expected_wheel_mismatch(&error) => Err(error),
         Err(error) => {
@@ -2693,7 +3164,14 @@ async fn probe_cached_build(
     .await
     .context("built-wheel cache probe task panicked")?;
     match cached {
-        Ok(Some(_)) => Ok(true),
+        Ok(Some(_)) => {
+            // L3-1b-1: a PROBE is a reference too. The authorization probe is
+            // what keeps a git family alive across relocks that never reach
+            // the exact leaf, so not stamping here would let the reaper
+            // quarantine exactly the entries the probe depends on.
+            touch_use_stamp(&cache_dir);
+            Ok(true)
+        }
         Ok(None) => Ok(false),
         Err(error) if is_expected_wheel_mismatch(&error) => Ok(false),
         Err(error) => {
@@ -3742,7 +4220,17 @@ fn prepare_source_snapshot_with_hook(
     })?;
     let output = canonicalize_future_path(out_dir)?;
     let cache_root = canonicalize_future_path(&crate::courier::retread_cache_root())?;
-    let mut candidates = vec![output, cache_root];
+    // L3-1b-1: the built-wheel store LEFT `retread_cache_root()`, so it also
+    // left this exclusion, and a snapshot of a path source that happens to
+    // contain the store would otherwise copy the store into itself. The L3-1b
+    // audit named this exact trap for "whoever moves the next store out" and
+    // this is that move, so the list is EXTENDED rather than inherited. Harmless
+    // in every configuration we run -- the default persistent root is
+    // `$XDG_CACHE_HOME`/`$HOME/.cache` and the `filter(starts_with(&source))`
+    // below drops it -- but a `retread-built-wheels-store` pointed inside a
+    // source tree is a supported configuration and must not become a recursion.
+    let built_wheel_store = canonicalize_future_path(&built_wheel_store_root())?;
+    let mut candidates = vec![output, cache_root, built_wheel_store];
     for excluded in additional_excluded_roots {
         candidates.push(canonicalize_future_path(excluded)?);
     }
@@ -14686,6 +15174,370 @@ version = "0.1.0"
             named,
             "a configured store must win over the default",
         );
+    }
+
+    // ── L3-1b-1 guards ──────────────────────────────────────────────────────
+
+    /// Publish one built-wheel entry into `store` at
+    /// `built-wheels/<kind>/v12/<segments…>`, with an optional use stamp
+    /// `age_ago` old. `segments` is the target identity plus the source
+    /// identity's ONE or TWO path segments, so the same helper builds both the
+    /// shape production writes and the deeper shape
+    /// [`git_wheel_source_identity`] can address.
+    fn bw_fixture_entry(
+        store: &Path,
+        kind: &str,
+        segments: &[&str],
+        age_ago: Option<std::time::Duration>,
+    ) -> PathBuf {
+        let mut entry = store.join(BUILT_WHEEL_CACHE_ROOT).join(kind).join(BUILT_WHEEL_CACHE_VERSION);
+        for segment in segments {
+            entry = entry.join(segment);
+        }
+        std::fs::create_dir_all(&entry).expect("entry dir");
+        std::fs::write(entry.join(BUILT_WHEEL_MARKER), b"{\"schema\":\"test\"}\n")
+            .expect("marker");
+        std::fs::write(entry.join("pkg-1.0.0-py3-none-any.whl"), b"wheel-bytes\n")
+            .expect("wheel");
+        // A git entry keeps its retired build tree INSIDE itself. It has no
+        // marker, so the walker must never see it as an entry of its own.
+        let inner = entry.join("git-build-source");
+        std::fs::create_dir_all(&inner).expect("retired build tree");
+        std::fs::write(inner.join("pyproject.toml"), b"[project]\n").expect("inner file");
+        if let Some(age) = age_ago {
+            let stamp = use_stamp_path(&entry).expect("stamp path");
+            std::fs::write(&stamp, b"0\n").expect("stamp");
+            let when = std::time::SystemTime::now() - age;
+            let file = std::fs::OpenOptions::new().write(true).open(&stamp).unwrap();
+            file.set_times(
+                std::fs::FileTimes::new().set_modified(when).set_accessed(when),
+            )
+            .unwrap();
+        }
+        entry
+    }
+
+    /// THE DEFAULT FLIP, L3-1b-1's whole claim in one assertion. With no
+    /// `retread-built-wheels-store` key and no `RETREAD_BUILT_WHEELS_STORE`,
+    /// the built-wheel store root must be the PERSISTENT one, and specifically
+    /// must NOT follow `RETREAD_CACHE_DIR` — the variable `fasttmp` redirects
+    /// to `<fast-tmp>/<user>/<WORKSPACE HASH>/job-$SLURM_JOB_ID/caches/retread`,
+    /// which is what made every cold lock re-run all 49 `uv build --wheel`
+    /// invocations C32 priced at 938.7 s. The env is injected, so this states
+    /// the default without mutating the process.
+    #[test]
+    fn the_built_wheel_store_default_is_persistent_not_the_job_local_redirect() {
+        let job_local = "/fast-tmp/retread-user/hash/job-12345/caches/retread";
+        let persistent = "/shared/cache";
+        let env = |key: &str| match key {
+            "RETREAD_CACHE_DIR" => Some(job_local.to_string()),
+            "XDG_CACHE_HOME" => Some(persistent.to_string()),
+            _ => None,
+        };
+        let resolved = built_wheel_store_root_with(None, &env);
+        assert_eq!(
+            resolved,
+            PathBuf::from("/shared/cache/retread"),
+            "unset must mean the persistent root, not an invented path",
+        );
+        assert!(
+            !resolved.starts_with(job_local),
+            "the default must NOT follow RETREAD_CACHE_DIR: that redirect is what \
+             made the built-wheel cache die with the job and cost 938.7 s of \
+             uv_build_wheel on a cold lock (C32 arm 1); resolved {}",
+            resolved.display(),
+        );
+        // OBSERVABLE WITHOUT ANY ENVIRONMENT AT ALL: with only HOME set — no
+        // XDG, no RETREAD_CACHE_DIR — the store is still persistent, which is
+        // what a developer running retread outside this campaign's harness
+        // gets.
+        let home_only = |key: &str| match key {
+            "HOME" => Some("/home/someone".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            built_wheel_store_root_with(None, &home_only),
+            PathBuf::from("/home/someone/.cache/retread"),
+            "with only HOME the store must be $HOME/.cache/retread",
+        );
+        // The three persistent stores share one base, because it is one
+        // persistence argument. If they ever disagree, one has been
+        // reclassified as scratch by accident — the exact mistake C18 found and
+        // L3-1b found again.
+        assert_eq!(
+            resolved,
+            canonical_git_snapshot_store_root_with(None, &env),
+            "the built-wheel store and the git snapshot store must share one base",
+        );
+        assert_eq!(
+            resolved.join("wheels"),
+            crate::courier::wheel_store_root_with(&env),
+            "the built-wheel store and the wheel blob store must share one base",
+        );
+        // And a named store still wins over the default.
+        let named = PathBuf::from("/named/store");
+        assert_eq!(
+            built_wheel_store_root_with(Some(&named), &env),
+            named,
+            "a configured store must win over the default",
+        );
+    }
+
+    /// The control is a CONFIG KEY first and an environment variable second,
+    /// for the reason the git snapshot store and the shadow cache have the same
+    /// order: a misspelled key is a load error, a misspelled variable is a
+    /// silent no-op. `None` from both must mean "take the default root", never
+    /// an invented path.
+    #[test]
+    fn the_built_wheels_store_is_a_config_key_first_and_an_env_fallback_second() {
+        let configured = PathBuf::from("/from/config");
+        let env = |key: &str| match key {
+            "RETREAD_BUILT_WHEELS_STORE" => Some("/from/env".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            built_wheels_store_with(Some(&configured), &env),
+            Some(configured.clone()),
+            "the config key must win over the environment fallback",
+        );
+        assert_eq!(
+            built_wheels_store_with(None, &env),
+            Some(PathBuf::from("/from/env")),
+            "the environment fallback must be honoured when no key is set",
+        );
+        let blank = |key: &str| match key {
+            "RETREAD_BUILT_WHEELS_STORE" => Some("   ".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            built_wheels_store_with(None, &blank),
+            None,
+            "a blank variable must mean the DEFAULT root, never an empty path",
+        );
+        assert_eq!(
+            built_wheels_store_with(None, &|_| None),
+            None,
+            "unset must mean the default root, not a guess",
+        );
+    }
+
+    /// THE SECOND-PROCESS CLAIM, reduced to the thing this change moved. Two
+    /// jobs, two workspaces, two `RETREAD_CACHE_DIR` values — everything the
+    /// fasttmp redirect keys on — and the built-wheel store must resolve to the
+    /// SAME directory, because that is what lets the second process find the
+    /// first one's wheels. Under the pre-L3-1b-1 formula these two resolve to
+    /// two different roots and this assertion fails, which is the mutation
+    /// control for the whole lane.
+    ///
+    /// The end-to-end second-process evidence is the lane's proof job, not this
+    /// test: a second relock, from a FRESH workspace, hitting the store the
+    /// first one published.
+    #[test]
+    fn the_built_wheel_store_does_not_move_when_the_job_and_the_workspace_move() {
+        let job_a = |key: &str| match key {
+            "RETREAD_CACHE_DIR" => {
+                Some("/fast-tmp/u/aaaaaaaa/job-111/caches/retread".to_string())
+            }
+            "XDG_CACHE_HOME" => Some("/shared/cache".to_string()),
+            _ => None,
+        };
+        let job_b = |key: &str| match key {
+            "RETREAD_CACHE_DIR" => {
+                Some("/fast-tmp/u/bbbbbbbb/job-222/caches/retread".to_string())
+            }
+            "XDG_CACHE_HOME" => Some("/shared/cache".to_string()),
+            _ => None,
+        };
+        let a = built_wheel_store_root_with(None, &job_a);
+        let b = built_wheel_store_root_with(None, &job_b);
+        assert_eq!(
+            a, b,
+            "a second job in a second workspace must resolve to the SAME \
+             built-wheel store, or its wheels are rebuilt from scratch",
+        );
+        // And the two job-local roots really are different, so the assertion
+        // above cannot pass vacuously.
+        assert_ne!(
+            job_a("RETREAD_CACHE_DIR"),
+            job_b("RETREAD_CACHE_DIR"),
+            "the guard would be vacuous if the two job-local roots agreed",
+        );
+    }
+
+    /// THE REAPER. Four entries — one unreferenced for a year, one referenced
+    /// an hour ago, one unstamped and old, one unstamped and new — across TWO
+    /// kinds and BOTH source-identity depths, one pass: exactly the over-age
+    /// ones move, and they move to QUARANTINE with their bytes intact, never to
+    /// `rm`.
+    #[test]
+    fn the_built_wheel_reaper_quarantines_the_unreferenced_entry_and_only_that_one() {
+        let base = reap_scratch("bw-reap");
+        let store = base.join("store");
+        let year = std::time::Duration::from_secs(365 * 86_400);
+        let hour = std::time::Duration::from_secs(3_600);
+        let stale = bw_fixture_entry(&store, "sdist", &["target-a", "source-stale"], Some(year));
+        let fresh = bw_fixture_entry(&store, "sdist", &["target-a", "source-fresh"], Some(hour));
+        // THE DEEPER SHAPE: a git source identity is two segments. An entry is
+        // found by its MARKER, not by counting levels, so this one must be
+        // scanned exactly like the two-segment ones above.
+        let deep_stale =
+            bw_fixture_entry(&store, "git", &["target-b", "family-1", "refs-old"], Some(year));
+        let deep_fresh =
+            bw_fixture_entry(&store, "git", &["target-b", "family-1", "refs-new"], Some(hour));
+        // An entry with no stamp at all ages from its own marker, so a store
+        // written before L3-1b-1 is reaped correctly rather than spared forever
+        // or evicted wholesale.
+        let unstamped_new = bw_fixture_entry(&store, "path", &["target-c", "source-new"], None);
+        let unstamped_old = bw_fixture_entry(&store, "path", &["target-c", "source-old"], None);
+        {
+            let marker = std::fs::OpenOptions::new()
+                .write(true)
+                .open(unstamped_old.join(BUILT_WHEEL_MARKER))
+                .unwrap();
+            let when = std::time::SystemTime::now() - std::time::Duration::from_secs(400 * 86_400);
+            marker
+                .set_times(std::fs::FileTimes::new().set_modified(when).set_accessed(when))
+                .unwrap();
+        }
+
+        let report =
+            reap_built_wheel_store(&store, std::time::Duration::from_secs(14 * 86_400))
+                .expect("the reaper must run");
+
+        assert_eq!(
+            report.scanned, 6,
+            "every entry at BOTH depths must be scanned, and the \
+             `git-build-source` tree inside each must not be counted as one: {report:?}",
+        );
+        assert_eq!(
+            report.evicted, 3,
+            "exactly the three over-age entries must be evicted: {report:?}",
+        );
+        assert_eq!(report.kept, 3, "the referenced entries must be kept: {report:?}");
+        assert_eq!(report.skipped_locked, 0);
+        assert!(!report.skipped_concurrent);
+        assert!(!stale.exists(), "the unreferenced entry must leave the store");
+        assert!(
+            !deep_stale.exists(),
+            "the deeper-shaped entry must be reaped too, or a git family is immortal",
+        );
+        assert!(
+            !unstamped_old.exists(),
+            "an unstamped entry must age from its marker, not be spared forever",
+        );
+        assert!(
+            fresh.join("pkg-1.0.0-py3-none-any.whl").is_file(),
+            "an entry referenced an hour ago must not be touched",
+        );
+        assert!(
+            deep_fresh.join("pkg-1.0.0-py3-none-any.whl").is_file(),
+            "a stamped deep entry must not be touched",
+        );
+        assert!(
+            unstamped_new.join("pkg-1.0.0-py3-none-any.whl").is_file(),
+            "a freshly published unstamped entry must not be evicted",
+        );
+
+        // NEVER `rm`: the bytes must be findable in the quarantine.
+        let quarantine = store.join(BUILT_WHEEL_CACHE_ROOT).join(BUILT_WHEEL_QUARANTINE);
+        let mut moved: Vec<String> = std::fs::read_dir(&quarantine)
+            .expect("the quarantine must exist once something was evicted")
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| !name.ends_with(USE_STAMP_SUFFIX))
+            .collect();
+        moved.sort();
+        assert_eq!(moved.len(), 3, "one quarantine dir per eviction: {moved:?}");
+        assert!(
+            moved.iter().any(|n| n.starts_with("sdist-target-a-source-stale-")),
+            "the quarantine name must carry the kind and the entry: {moved:?}",
+        );
+        assert!(
+            moved.iter().any(|n| n.starts_with("git-target-b-family-1-refs-old-")),
+            "a deep entry's quarantine name must carry every segment: {moved:?}",
+        );
+        for name in &moved {
+            assert_eq!(
+                std::fs::read_to_string(quarantine.join(name).join("pkg-1.0.0-py3-none-any.whl"))
+                    .expect("a quarantined entry keeps its bytes"),
+                "wheel-bytes\n",
+            );
+        }
+
+        // A second pass has nothing left to do: the reaper is idempotent and
+        // cannot re-quarantine what it already moved, and must not walk into
+        // the quarantine it created.
+        let again = reap_built_wheel_store(&store, std::time::Duration::from_secs(14 * 86_400))
+            .expect("second pass");
+        assert_eq!(again.evicted, 0, "a second pass must evict nothing: {again:?}");
+        assert_eq!(again.scanned, 3, "only the survivors remain: {again:?}");
+
+        // max_age 0 is the documented OFF switch, and it must not evict what a
+        // 14-day pass just kept.
+        let off = reap_built_wheel_store(&store, std::time::Duration::ZERO).expect("max_age 0");
+        assert_eq!(off, BuiltWheelReapReport::default(), "0 must disable the reaper");
+        assert!(fresh.join("pkg-1.0.0-py3-none-any.whl").is_file());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// THE REAPER NEVER BLOCKS A RELOCK, on both of its locks. Another process
+    /// holding the store-wide sidecar means "someone else is reaping", not
+    /// "wait"; and an entry whose own writer lock is held is a LIVE PUBLISH and
+    /// must be skipped, not waited on and not evicted — even when it is a year
+    /// over the horizon.
+    #[test]
+    fn the_built_wheel_reaper_backs_off_a_concurrent_reaper_and_a_live_publish() {
+        let base = reap_scratch("bw-lock");
+        let store = base.join("store");
+        let year = std::time::Duration::from_secs(365 * 86_400);
+        let stale = bw_fixture_entry(&store, "sdist", &["target-a", "source-stale"], Some(year));
+        let built_wheels = store.join(BUILT_WHEEL_CACHE_ROOT);
+
+        // (a) the store-wide try-lock, held by "another process".
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(built_wheels.join(BUILT_WHEEL_REAP_LOCK_NAME))
+            .expect("reap lock");
+        assert!(fs4::fs_std::FileExt::try_lock_exclusive(&held).unwrap_or(false));
+        let backed_off = reap_built_wheel_store(&store, std::time::Duration::from_secs(86_400))
+            .expect("a held store lock is not an error");
+        assert!(backed_off.skipped_concurrent, "{backed_off:?}");
+        assert_eq!(backed_off.scanned, 0, "a backed-off reaper scans nothing: {backed_off:?}");
+        assert_eq!(backed_off.evicted, 0);
+        assert!(stale.exists(), "nothing may be evicted while another reaper holds the store");
+        fs4::fs_std::FileExt::unlock(&held).expect("release");
+        drop(held);
+
+        // (b) the PER-ENTRY writer lock, held by a live publish.
+        let entry_lock_path = artifact_cache_lock_path(&stale).expect("entry lock path");
+        let entry_held = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&entry_lock_path)
+            .expect("entry lock");
+        assert!(fs4::fs_std::FileExt::try_lock_exclusive(&entry_held).unwrap_or(false));
+        let skipped = reap_built_wheel_store(&store, std::time::Duration::from_secs(86_400))
+            .expect("a held entry lock is not an error");
+        assert_eq!(skipped.scanned, 1, "{skipped:?}");
+        assert_eq!(skipped.skipped_locked, 1, "a live publish must be SKIPPED: {skipped:?}");
+        assert_eq!(skipped.evicted, 0, "a live publish must never be evicted: {skipped:?}");
+        assert!(stale.exists());
+        fs4::fs_std::FileExt::unlock(&entry_held).expect("release");
+        drop(entry_held);
+
+        // With neither lock held the same entry goes, so neither arm above was
+        // vacuous.
+        let done = reap_built_wheel_store(&store, std::time::Duration::from_secs(86_400))
+            .expect("unlocked pass");
+        assert_eq!(done.evicted, 1, "{done:?}");
+        assert!(!stale.exists());
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// THE REAPER. One entry no lock has referenced in a year, one referenced
