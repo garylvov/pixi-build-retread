@@ -10767,6 +10767,84 @@ version = "0.1.0"
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// L3 GUARD 5 -- THE RECORD IS BYTE-IDENTICAL, MEASURED AS BYTES.
+    ///
+    /// L3 stopped `wheel::read_metadata_strict` inflating every ZIP member.
+    /// The claim that nothing downstream can tell is only worth anything if
+    /// the artefact downstream actually spends -- the `WheelContentRecord`
+    /// sibling, which is what the `(sha, fingerprint)` memo is rebuilt from in
+    /// a later process -- comes out the same. So: two content-addressed copies
+    /// of the SAME fixture bytes, one read by the shipping L3 door and one by
+    /// the pre-L3 inflating reference put through the same record
+    /// construction, and the two sidecar files compared byte for byte.
+    ///
+    /// Run over every shape in the L3 fixture set: METADATA first, METADATA
+    /// last, zip64, data-descriptor, stored.
+    ///
+    /// Non-vacuous: the reference reader is the pre-L3 body verbatim, and the
+    /// assertion is on file bytes, not on a struct this test built.
+    #[test]
+    fn l3_the_record_a_strict_read_files_is_byte_identical_to_the_pre_l3_readers() {
+        let _serial = C10_GUARD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let base = unique_test_dir("l3-record-bytes");
+        std::fs::create_dir_all(&base).unwrap();
+        let _memos = MemoGuard::fresh();
+
+        let fixtures = crate::wheel::tests::l3_fixture_wheels(&base.join("fixtures"));
+        assert_eq!(fixtures.len(), 5, "the L3 fixture set must cover five shapes");
+
+        for (label, source) in &fixtures {
+            let sha256 = sha256_of_file(source);
+            let filename = source.file_name().unwrap();
+
+            let place = |arm: &str| -> PathBuf {
+                let dir = base.join(label).join(arm).join(&sha256);
+                std::fs::create_dir_all(&dir).unwrap();
+                let dest = dir.join(filename);
+                std::fs::copy(source, &dest).unwrap();
+                // `content_addressed_sha256` reads the digest off the parent
+                // directory only when the store's own integrity marker agrees
+                // with it, so the fixture has to carry one to be a store entry
+                // at all -- without it there is no record door to compare.
+                write_store_integrity_marker_for_test(&dest, &sha256);
+                dest
+            };
+
+            // ARM A: the shipping door.
+            crate::wheel_content::reset_memos_for_test();
+            let shipping = place("shipping");
+            let l3 = crate::wheel_content::read_metadata_verified(&shipping, None)
+                .unwrap_or_else(|error| panic!("L3 read of `{label}` failed: {error:#}"));
+            let shipping_record = sidecar_of(&shipping);
+            assert!(
+                shipping_record.is_file(),
+                "`{label}`: the L3 read must leave a record beside the bytes",
+            );
+
+            // ARM B: the reader L3 replaced, through the same construction.
+            crate::wheel_content::reset_memos_for_test();
+            let reference_path = place("reference");
+            let reference =
+                crate::wheel::read_metadata_strict_inflating_reference(&reference_path)
+                    .unwrap_or_else(|error| {
+                        panic!("pre-L3 reference read of `{label}` failed: {error:#}")
+                    });
+            crate::wheel_content::file_record_from_metadata_for_test(&reference_path, &reference)
+                .unwrap();
+            let reference_record = sidecar_of(&reference_path);
+
+            assert_eq!(l3.sha256, reference.sha256, "`{label}`: sha256 moved");
+            assert_eq!(l3.sha256, sha256, "`{label}`: sha256 is not the file's");
+            assert_eq!(
+                std::fs::read(&shipping_record).unwrap(),
+                std::fs::read(&reference_record).unwrap(),
+                "`{label}`: the record L3 files is NOT byte-identical to the pre-L3 one",
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// C10 guard (b). The threat the design names out loud: an in-place
     /// replacement that holds size AND mtime fixed. The stat fingerprint does
     /// not catch it -- the test asserts that first, so the guard cannot pass

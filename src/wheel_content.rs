@@ -760,6 +760,32 @@ fn read_metadata_through_record(
     Ok(metadata)
 }
 
+/// L3, TEST BUILD ONLY: file the record `read_metadata_through_record` would
+/// file for `path`, but from a `WheelMetadata` the caller supplies instead of
+/// one this module read. It exists so a guard can put the PRE-L3 reader's
+/// answer through the exact record construction the shipping path uses and
+/// then compare the two sidecars byte for byte -- which is the only way to
+/// state "the record is byte-identical" as a measurement rather than an
+/// argument. Nothing in the shipping build calls it.
+#[cfg(test)]
+pub(crate) fn file_record_from_metadata_for_test(
+    path: &Path,
+    metadata: &WheelMetadata,
+) -> Result<()> {
+    let fingerprint = content_fingerprint(path)?;
+    let (structure_digest, _, _) = structure_digest_and_metadata(path)?;
+    let record = WheelContentRecord {
+        schema: RECORD_SCHEMA.to_string(),
+        sha256: metadata.sha256.clone(),
+        name: metadata.name.clone(),
+        version: metadata.version.clone(),
+        size: fingerprint.size,
+        structure_digest,
+        read_kind: RecordReadKind::StrictArchive,
+    };
+    write_record(path, &record)
+}
+
 /// The strict local-artifact read (`wheel::read_metadata_strict`), served from
 /// an attested record whenever the bytes can be identified without hashing
 /// them. Spends only `strict-archive` records.

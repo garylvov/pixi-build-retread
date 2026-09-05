@@ -2655,15 +2655,61 @@ impl std::io::Seek for HashingWheelReader {
 /// Strict local-artifact boundary for source-built/path-source wheels.
 /// Besides hashing and parsing METADATA, this rejects symlinks/special files,
 /// requires exactly one root dist-info matching the wheel filename identity,
-/// and streams every ZIP member to EOF so CRC failures cannot enter a cache.
+/// and validates the central directory against the archive it describes.
 ///
-/// p6a: the SHA-256 comes out of the SAME pass that inflates the members --
-/// the ZIP reader runs on top of [`HashingWheelReader`] and the digest is
-/// handed to [`read_metadata_with_trusted_sha`]. Before p6a this function
-/// streamed every member to a sink and THEN called [`read_metadata`], which
-/// streamed the whole file again: two full passes over the payload in one
-/// call. The member walk, the identity checks and their error order are
-/// unchanged.
+/// p6a: the SHA-256 comes out of the SAME pass the ZIP walk performs -- the
+/// ZIP reader runs on top of [`HashingWheelReader`] and the digest is handed
+/// to [`read_metadata_with_trusted_sha`]. Before p6a this function streamed
+/// every member to a sink and THEN called [`read_metadata`], which streamed
+/// the whole file again: two full passes over the payload in one call.
+///
+/// # L3 (C8's third lever): this walk no longer INFLATES the members
+///
+/// The old walk called `by_index` and `std::io::copy`ed every member into a
+/// sink, so a strict read decompressed the whole archive to reach a METADATA
+/// file of a few hundred bytes. Measured on the wheel this campaign keeps
+/// tripping over,
+/// `isaacsim_extscache_kit-6.0.0.1-cp312-none-manylinux_2_35_x86_64.whl`
+/// (5 918 377 270 B, 75 594 members, all Deflated, 30 299 of them zip64, and a
+/// **919-byte** root METADATA), with the file in page cache so only CPU is
+/// being counted:
+///
+/// ```text
+///   SHA-256 of the whole file                     14.130 s
+///   end-of-central-directory + central directory   0.500 s  (and the METADATA)
+///   inflating every member                        48.323 s   <-- deleted here
+/// ```
+///
+/// i.e. **77 % of the CPU of a strict read was member inflation**, and the
+/// same ratio holds across every large wheel in the store (keep-fraction 0.17
+/// to 0.23 over nine measured wheels). The C32 truly-cold profile's own row
+/// for that file is `elapsed_ms=73861`.
+///
+/// What the walk does now, per member, is what `by_index_raw` does: seek to
+/// the local file header, parse it (which checks its `PK\x03\x04` magic and is
+/// how `data_start` is learned) and construct no decompressor. On top of that
+/// this function validates the central directory it just read against the file
+/// it describes -- every member's data extent must lie inside the archive, in
+/// front of the central directory, and must not overlap another member's.
+///
+/// # What that changes, stated rather than buried
+///
+/// The strict door NO LONGER PROVES THAT EVERY MEMBER INFLATES. It proves:
+/// every central-directory entry has a well-formed local header where it says;
+/// no two members claim the same bytes and none reaches past the central
+/// directory; there is exactly one root `.dist-info/METADATA`, it inflates,
+/// its CRC-32 matches the central directory (the `zip` reader checks that on
+/// read-to-end), and its dist-info matches the filename identity; and the
+/// SHA-256 is still the digest of the WHOLE file, from one pass, unchanged.
+///
+/// A member whose deflate stream is corrupt while its central-directory entry
+/// is intact is therefore admitted here where it used to be refused. That is a
+/// deliberate narrowing, not an oversight: it is guarded explicitly by
+/// `strict_metadata_admits_a_corrupt_non_metadata_member` below, and the
+/// residue -- payload corruption inside a member nothing ever reads -- is
+/// caught downstream by the digest wherever an authoritative sha exists for
+/// these bytes (`wheel_content::ContentAddressedShaMismatch`, the store
+/// integrity marker, the lock entry).
 pub(crate) fn read_metadata_strict(wheel_path: &Path) -> Result<WheelMetadata> {
     let file_type = std::fs::symlink_metadata(wheel_path)
         .with_context(|| format!("stating wheel {}", wheel_path.display()))?
@@ -2684,6 +2730,132 @@ pub(crate) fn read_metadata_strict(wheel_path: &Path) -> Result<WheelMetadata> {
             .ok_or_else(|| anyhow!("invalid PEP 427 wheel filename `{filename}`"))?;
 
     let started = std::time::Instant::now();
+    let file = std::fs::File::open(wheel_path)
+        .with_context(|| format!("opening strict wheel ZIP {}", wheel_path.display()))?;
+    let mut archive = zip::ZipArchive::new(HashingWheelReader::new(file))
+        .with_context(|| format!("reading strict wheel ZIP {}", wheel_path.display()))?;
+    // Where the central directory begins. Every member's compressed bytes must
+    // end at or before it: that is what makes "the archive is not truncated and
+    // its directory is not lying about where the payload is" checkable without
+    // touching the payload.
+    let central_directory_start = archive.central_directory_start();
+    let mut root_metadata = Vec::new();
+    let mut extents: Vec<(u64, u64, String)> = Vec::with_capacity(archive.len());
+    for index in 0..archive.len() {
+        // `by_index_raw` seeks to the local header and parses it -- the magic
+        // check and `data_start` come from that -- and builds NO decompressor.
+        // The member's payload is never inflated here; see the L3 note above.
+        let entry = archive
+            .by_index_raw(index)
+            .with_context(|| format!("opening ZIP member {index} in {}", wheel_path.display()))?;
+        let name = entry.name().to_string();
+        if name.ends_with(".dist-info/METADATA") && name.matches('/').count() == 1 {
+            root_metadata.push(name.clone());
+        }
+        let data_start = entry.data_start();
+        let end = data_start.checked_add(entry.compressed_size()).ok_or_else(|| {
+            anyhow!(
+                "ZIP member `{name}` in {} declares a compressed size that overflows the file",
+                wheel_path.display(),
+            )
+        })?;
+        if end > central_directory_start {
+            bail!(
+                "ZIP member `{name}` in {} runs to offset {end}, past the central directory at \
+                 {central_directory_start}",
+                wheel_path.display(),
+            );
+        }
+        extents.push((data_start, end, name));
+    }
+    // The central directory need not list members in offset order, so overlap
+    // is checked after sorting rather than assumed away.
+    let members_walked = extents.len() as u64;
+    extents.sort_by_key(|(start, _, _)| *start);
+    for pair in extents.windows(2) {
+        let (_, previous_end, previous_name) = &pair[0];
+        let (start, _, name) = &pair[1];
+        if start < previous_end {
+            bail!(
+                "ZIP members `{previous_name}` and `{name}` in {} claim overlapping bytes \
+                 ({previous_end} > {start})",
+                wheel_path.display(),
+            );
+        }
+    }
+    if root_metadata.len() != 1 {
+        bail!(
+            "wheel `{filename}` must contain exactly one root .dist-info/METADATA, found {}",
+            root_metadata.len(),
+        );
+    }
+    let dist_info = root_metadata[0]
+        .strip_suffix(".dist-info/METADATA")
+        .expect("root metadata suffix was checked");
+    let (dist_name, dist_version) = dist_info.rsplit_once('-').ok_or_else(|| {
+        anyhow!("root dist-info directory `{dist_info}` has no name/version separator")
+    })?;
+    let dist_version = uv_pep508::uv_pep440::Version::from_str(dist_version)
+        .with_context(|| format!("invalid root dist-info version `{dist_version}`"))?;
+    if crate::relax::canonical_conda_name(dist_name)
+        != crate::relax::canonical_conda_name(&expected_name)
+        || dist_version != expected_version
+    {
+        bail!(
+            "wheel `{filename}` root dist-info `{dist_info}` does not match its filename identity"
+        );
+    }
+    // The walk above touched only the local headers, so most of the payload is
+    // still unhashed: `finish` closes the digest over everything the walk did
+    // not reach, in one sequential pass to EOF. The file is still read exactly
+    // once end to end -- `strict_metadata_streams_the_payload_exactly_once`
+    // asserts that on `bytes_read` -- it is simply never inflated.
+    let (sha256, walk_hashed, total_read) = archive
+        .into_inner()
+        .finish()
+        .with_context(|| format!("hashing strict wheel ZIP {}", wheel_path.display()))?;
+    note_full_hash(wheel_path, total_read, "wheel::read_metadata_strict");
+    tracing::info!(
+        wheel = %wheel_path.display(),
+        bytes = std::fs::metadata(wheel_path).map(|m| m.len()).unwrap_or(0),
+        bytes_read = total_read,
+        hashed_in_walk = walk_hashed,
+        members = members_walked,
+        inflated_members = 1u64,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "bench: wheel_read_metadata_strict",
+    );
+    read_metadata_with_trusted_sha(wheel_path, sha256, "streamed")
+}
+
+/// L3 REFERENCE, TEST BUILD ONLY: [`read_metadata_strict`] EXACTLY as it stood
+/// before L3 -- the walk that called `by_index` and inflated every member into
+/// a sink. It exists so the equivalence guard compares the new reader against
+/// THE CODE IT REPLACED rather than against a hand-written expectation, and so
+/// the behaviour change guard has a live falsifier to point at. Nothing in the
+/// shipping build calls it.
+#[cfg(test)]
+pub(crate) fn read_metadata_strict_inflating_reference(
+    wheel_path: &Path,
+) -> Result<WheelMetadata> {
+    let file_type = std::fs::symlink_metadata(wheel_path)
+        .with_context(|| format!("stating wheel {}", wheel_path.display()))?
+        .file_type();
+    if !file_type.is_file() || file_type.is_symlink() {
+        bail!(
+            "wheel artifact must be a regular file, not a symlink or special file: {}",
+            wheel_path.display(),
+        );
+    }
+    let filename = wheel_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("wheel path has no UTF-8 filename"))?;
+    let standard_filename = crate::emit_pypi::standard_wheel_filename(filename);
+    let (expected_name, expected_version) =
+        crate::pypi::wheel_filename_identity(&standard_filename)
+            .ok_or_else(|| anyhow!("invalid PEP 427 wheel filename `{filename}`"))?;
+
     let file = std::fs::File::open(wheel_path)
         .with_context(|| format!("opening strict wheel ZIP {}", wheel_path.display()))?;
     let mut archive = zip::ZipArchive::new(HashingWheelReader::new(file))
@@ -2727,22 +2899,10 @@ pub(crate) fn read_metadata_strict(wheel_path: &Path) -> Result<WheelMetadata> {
             "wheel `{filename}` root dist-info `{dist_info}` does not match its filename identity"
         );
     }
-    // The walk above already pulled the payload off disk; close the digest over
-    // whatever tail it did not reach (normally just the central directory) and
-    // hand the result to the parse. No second pass.
-    let (sha256, walk_hashed, total_read) = archive
+    let (sha256, _walk_hashed, _total_read) = archive
         .into_inner()
         .finish()
         .with_context(|| format!("hashing strict wheel ZIP {}", wheel_path.display()))?;
-    note_full_hash(wheel_path, total_read, "wheel::read_metadata_strict");
-    tracing::info!(
-        wheel = %wheel_path.display(),
-        bytes = std::fs::metadata(wheel_path).map(|m| m.len()).unwrap_or(0),
-        bytes_read = total_read,
-        hashed_in_walk = walk_hashed,
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "bench: wheel_read_metadata_strict",
-    );
     read_metadata_with_trusted_sha(wheel_path, sha256, "streamed")
 }
 
@@ -3215,7 +3375,7 @@ fn hex_sha256(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4739,8 +4899,195 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// The METADATA every L3 fixture carries. Non-trivial on purpose: the
+    /// equivalence guard compares `requires_dist` and `is_pure_python` too, so
+    /// a reader that got the bytes but mis-parsed them would still be caught.
+    pub(crate) const L3_FIXTURE_METADATA: &[u8] = b"Metadata-Version: 2.1\n\
+Name: foo\n\
+Version: 1.0\n\
+Requires-Dist: bar>=2\n\
+Requires-Dist: baz; extra == 'testing'\n\
+\n\
+long description\n";
+
+    /// L3 FIXTURE SET. Five wheels covering every central-directory shape the
+    /// brief names, each in its own directory under `root` and each named
+    /// `foo-1.0-py3-none-any.whl` so the filename-identity check is satisfied.
+    ///
+    ///   `plain`            METADATA is the FIRST member; deflated and stored
+    ///                      members mixed.
+    ///   `metadata-last`    METADATA is the LAST member -- the case a reader
+    ///                      that stops at the first entry would pass by luck.
+    ///   `zip64`            every member written with `large_file(true)`, so
+    ///                      the central directory carries zip64 extended
+    ///                      information records instead of 32-bit fields.
+    ///   `data-descriptor`  written through `ZipWriter::new_stream`, so each
+    ///                      local header has the streaming flag set and its
+    ///                      crc/size fields are zero, with the real values in
+    ///                      a trailing data descriptor AND in the central
+    ///                      directory. The builder asserts the fixture really
+    ///                      has data descriptors rather than assuming it.
+    ///   `stored`           no compression at all.
+    pub(crate) fn l3_fixture_wheels(root: &Path) -> Vec<(&'static str, std::path::PathBuf)> {
+        use std::io::Write as _;
+
+        let mut out = Vec::new();
+        let deflated: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        let stored: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        let payload = vec![0xa5u8; 4096];
+
+        let make = |label: &'static str| -> std::path::PathBuf {
+            let dir = root.join(label);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir.join("foo-1.0-py3-none-any.whl")
+        };
+
+        // plain
+        let path = make("plain");
+        let mut archive = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        archive
+            .start_file("foo-1.0.dist-info/METADATA", deflated)
+            .unwrap();
+        archive.write_all(L3_FIXTURE_METADATA).unwrap();
+        archive.start_file("foo/__init__.py", deflated).unwrap();
+        archive.write_all(&payload).unwrap();
+        archive.start_file("foo/data.bin", stored).unwrap();
+        archive.write_all(&payload).unwrap();
+        archive.finish().unwrap();
+        out.push(("plain", path));
+
+        // metadata-last
+        let path = make("metadata-last");
+        let mut archive = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        archive.start_file("foo/__init__.py", deflated).unwrap();
+        archive.write_all(&payload).unwrap();
+        archive.start_file("foo/data.bin", stored).unwrap();
+        archive.write_all(&payload).unwrap();
+        archive
+            .start_file("foo-1.0.dist-info/METADATA", deflated)
+            .unwrap();
+        archive.write_all(L3_FIXTURE_METADATA).unwrap();
+        archive.finish().unwrap();
+        out.push(("metadata-last", path));
+
+        // zip64
+        let path = make("zip64");
+        let large: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .large_file(true);
+        let mut archive = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        archive.start_file("foo/__init__.py", large).unwrap();
+        archive.write_all(&payload).unwrap();
+        archive
+            .start_file("foo-1.0.dist-info/METADATA", large)
+            .unwrap();
+        archive.write_all(L3_FIXTURE_METADATA).unwrap();
+        archive.finish().unwrap();
+        out.push(("zip64", path));
+
+        // data-descriptor
+        let path = make("data-descriptor");
+        let mut archive = zip::ZipWriter::new_stream(std::fs::File::create(&path).unwrap());
+        archive.start_file("foo/__init__.py", deflated).unwrap();
+        archive.write_all(&payload).unwrap();
+        archive
+            .start_file("foo-1.0.dist-info/METADATA", deflated)
+            .unwrap();
+        archive.write_all(L3_FIXTURE_METADATA).unwrap();
+        let mut file = archive.finish().unwrap().into_inner();
+        file.flush().unwrap();
+        drop(file);
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(
+            bytes.windows(4).any(|w| w == b"PK\x07\x08"),
+            "the data-descriptor fixture must actually carry data descriptors, \
+             otherwise the guard that reads it proves nothing",
+        );
+        out.push(("data-descriptor", path));
+
+        // stored
+        let path = make("stored");
+        let mut archive = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        archive
+            .start_file("foo-1.0.dist-info/METADATA", stored)
+            .unwrap();
+        archive.write_all(L3_FIXTURE_METADATA).unwrap();
+        archive.start_file("foo/data.bin", stored).unwrap();
+        archive.write_all(&payload).unwrap();
+        archive.finish().unwrap();
+        out.push(("stored", path));
+
+        out
+    }
+
+    /// L3 GUARD 4 -- THE EQUIVALENCE GUARD. Over the whole fixture set, the
+    /// L3 reader's answer is BYTE-IDENTICAL to the answer the reader it
+    /// replaced gave: same SHA-256, same name, same version, same
+    /// `Requires-Dist` list, same purity flag. Those five fields are exactly
+    /// what a `WheelContentRecord` and the `(sha, fingerprint)` memo are built
+    /// out of, so byte-identity here is byte-identity there.
+    ///
+    /// Non-vacuous: `read_metadata_strict_inflating_reference` is the pre-L3
+    /// body verbatim, so a new reader that returned a different digest, missed
+    /// a METADATA that is not the first member, or mis-handled a zip64 or
+    /// data-descriptor central directory fails here.
     #[test]
-    fn strict_metadata_reads_every_member_and_rejects_crc_corruption() {
+    fn strict_metadata_matches_the_inflating_reference_over_the_fixture_set() {
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-l3-fixtures-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let fixtures = l3_fixture_wheels(&tmp);
+        assert_eq!(fixtures.len(), 5, "the fixture set must cover five shapes");
+        for (label, path) in &fixtures {
+            let reference = read_metadata_strict_inflating_reference(path)
+                .unwrap_or_else(|error| panic!("reference read of `{label}` failed: {error:#}"));
+            let metadata = read_metadata_strict(path)
+                .unwrap_or_else(|error| panic!("L3 read of `{label}` failed: {error:#}"));
+            assert_eq!(metadata.sha256, reference.sha256, "sha256 moved on `{label}`");
+            assert_eq!(
+                metadata.sha256,
+                hex_sha256(&std::fs::read(path).unwrap()),
+                "the digest on `{label}` must be the digest of the file on disk",
+            );
+            assert_eq!(metadata.name, reference.name, "name moved on `{label}`");
+            assert_eq!(
+                metadata.version, reference.version,
+                "version moved on `{label}`",
+            );
+            assert_eq!(
+                metadata.requires_dist, reference.requires_dist,
+                "requires_dist moved on `{label}`",
+            );
+            assert_eq!(
+                metadata.is_pure_python, reference.is_pure_python,
+                "is_pure_python moved on `{label}`",
+            );
+            assert_eq!(metadata.requires_dist.len(), 2, "on `{label}`");
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// L3 GUARD 1 -- THE BEHAVIOUR CHANGE, ASSERTED RATHER THAN DISCOVERED.
+    ///
+    /// This test was `strict_metadata_reads_every_member_and_rejects_crc_corruption`
+    /// and it asserted the opposite: that a corrupt non-METADATA member made a
+    /// strict read fail. That refusal was paid for by inflating the whole
+    /// archive -- 48.3 s of the 63.0 s CPU of a strict read of
+    /// `isaacsim_extscache_kit` (5.9 GB) to reach a 919-byte METADATA -- and
+    /// L3 deletes it. The narrowing is written down here, in the suite, so it
+    /// can never be re-introduced or lost silently.
+    ///
+    /// RED on the pre-L3 reader: it returns `Err(... payload.bin ...)`.
+    #[test]
+    fn strict_metadata_admits_a_corrupt_non_metadata_member() {
         use std::io::Write as _;
 
         let tmp = std::env::temp_dir().join(format!(
@@ -4772,13 +5119,145 @@ mod tests {
             .position(|window| window == PAYLOAD)
             .expect("stored payload is present verbatim");
         bytes[offset] ^= 0x01;
-        std::fs::write(&path, bytes).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
         assert!(
             read_metadata(&path).is_ok(),
             "ordinary metadata lookup does not read the corrupt payload"
         );
+
+        // The pre-L3 reader refused this file by name; keep that fact in the
+        // suite as the falsifier, then assert what the L3 reader does instead.
+        let reference = read_metadata_strict_inflating_reference(&path).unwrap_err();
+        assert!(
+            format!("{reference:#}").contains("payload.bin"),
+            "the pre-L3 reference must still refuse: {reference:#}",
+        );
+
+        let metadata = read_metadata_strict(&path).expect(
+            "L3: a corrupt member the strict door never reads no longer refuses the read",
+        );
+        assert_eq!(metadata.name, "foo");
+        assert_eq!(metadata.version, "1.0");
+        // And the digest is still the digest of the bytes ON DISK, corruption
+        // included -- which is what lets an authoritative sha catch this file
+        // downstream.
+        assert_eq!(metadata.sha256, hex_sha256(&bytes));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// L3 GUARD 2 -- the one member the strict door DOES inflate is still
+    /// CRC-checked. RED if the METADATA read stops going through the `zip`
+    /// reader's read-to-end (which is what verifies CRC-32).
+    #[test]
+    fn strict_metadata_refuses_a_corrupt_metadata_member() {
+        use std::io::Write as _;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-strict-mdcrc-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("foo-1.0-py3-none-any.whl");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut archive = zip::ZipWriter::new(file);
+        let options: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        archive
+            .start_file("foo-1.0.dist-info/METADATA", options)
+            .unwrap();
+        const META: &[u8] = b"Metadata-Version: 2.1\nName: foo\nVersion: 1.0\nSummary: XYZZY\n\n";
+        archive.write_all(META).unwrap();
+        archive.start_file("payload.bin", options).unwrap();
+        archive.write_all(b"payload").unwrap();
+        archive.finish().unwrap();
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        let offset = bytes
+            .windows(5)
+            .position(|window| window == b"XYZZY")
+            .expect("stored METADATA is present verbatim");
+        bytes[offset] ^= 0x01;
+        std::fs::write(&path, bytes).unwrap();
+
         let error = read_metadata_strict(&path).unwrap_err();
-        assert!(format!("{error:#}").contains("payload.bin"));
+        assert!(
+            {
+                let text = format!("{error:#}").to_ascii_lowercase();
+                text.contains("crc") || text.contains("invalid checksum")
+            },
+            "a corrupt root METADATA must still refuse: {error:#}",
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// L3 GUARD 3 -- THE MUTATION GUARD THE BRIEF ASKS FOR. Deleting the
+    /// central-directory validation (the `end > central_directory_start`
+    /// refusal and the overlap refusal in `read_metadata_strict`) turns this
+    /// test RED. The pre-L3 reader caught the same file by inflating; the L3
+    /// reader has to catch it from the directory alone, and this is the proof
+    /// that it does.
+    #[test]
+    fn strict_metadata_refuses_a_central_directory_that_lies_about_the_payload() {
+        use std::io::Write as _;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "retread-strict-cdlie-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // (a) a member whose declared compressed size runs past the central
+        //     directory -- the shape a truncated-then-repaired archive has.
+        let overrun = tmp.join("overrun");
+        std::fs::create_dir_all(&overrun).unwrap();
+        let path = overrun.join("foo-1.0-py3-none-any.whl");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut archive = zip::ZipWriter::new(file);
+        let options: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        archive
+            .start_file("foo-1.0.dist-info/METADATA", options)
+            .unwrap();
+        archive
+            .write_all(b"Metadata-Version: 2.1\nName: foo\nVersion: 1.0\n\n")
+            .unwrap();
+        archive.start_file("payload.bin", options).unwrap();
+        archive.write_all(&[0x5au8; 64]).unwrap();
+        archive.finish().unwrap();
+
+        // Rewrite `payload.bin`'s compressed AND uncompressed size, in BOTH
+        // the local header and the central directory, from 64 to 64 << 20 --
+        // a size the file cannot hold. Stored members make both fields the
+        // same value, so the edit is one search-and-replace of the 4-byte LE
+        // pattern that appears exactly four times.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let from = 64u32.to_le_bytes();
+        let to = (64u32 << 20).to_le_bytes();
+        let mut patched = 0;
+        let mut index = 0;
+        while index + 4 <= bytes.len() {
+            if bytes[index..index + 4] == from {
+                bytes[index..index + 4].copy_from_slice(&to);
+                patched += 1;
+                index += 4;
+            } else {
+                index += 1;
+            }
+        }
+        assert!(patched >= 2, "expected the size fields to be patchable");
+        std::fs::write(&path, bytes).unwrap();
+
+        let error = read_metadata_strict(&path).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("past the central directory") || text.contains("overlapping bytes"),
+            "a central directory that overruns the archive must refuse: {text}",
+        );
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
