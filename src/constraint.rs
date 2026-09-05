@@ -599,13 +599,28 @@ fn conflict_from_active(package: &PypiKey, active: &[&Constraint]) -> Conflict {
 //
 // (a) The bundle. `finalize_impl` decides one package's specifier set and has
 //     never known which pack it is deciding for, so a row it wrote could not
-//     have named `flashsac-pack` even if it had written one.
-//     `handler::produce_output_with_conflicts` -- the ONE production entry
-//     into the emission reconciler, and the only caller of
-//     `relax_decision::decide_for_emission` -- enters `ActiveBundleScope` for
-//     the bundle it is producing. The scope is thread-local and restored on
-//     drop, so work that fans out to another thread degrades to `<unknown>`
-//     instead of reporting the wrong pack.
+//     have named `flashsac-pack` even if it had written one. Callers declare
+//     it by entering `ActiveBundleScope`, which is thread-local and restored
+//     on drop.
+//
+//     C30-1. THE SENTENCE THAT USED TO SIT HERE WAS WRONG AND IT COST THE
+//     ROW ITS FIRST TWO PRODUCTION SIGHTINGS. It said
+//     `handler::produce_output_with_conflicts` was "the ONE production entry
+//     into the emission reconciler", and gave it the only scope in the tree.
+//     That is true of `relax_decision::decide_for_emission` and false of the
+//     reconciler: `relax_decision::decide` is a SECOND production entry, and
+//     `handler::auto_bundle::RestoreRequestBuilder::finish_with_suggestion`
+//     -- the restore path that
+//     `auto_bundle::jointly_unroute_unsolvable_with_route_precheck` runs for
+//     every route the joint conda solve rejects -- calls it. It runs BEFORE
+//     emission, so no scope was live, and the first two
+//     `learned_fact_yielded` rows ever emitted in an arm (job 5834618,
+//     `setuptools` and `prettytable`, both restoring into `flashsac-pack`)
+//     could not name the pack whose outcome they changed. Both entries now
+//     declare a scope, and the emitter below REFUSES to write an attributed
+//     row without one rather than inventing a placeholder -- a third entry
+//     added without a scope is a loud defect row, not a nameless audit
+//     record.
 //
 // (b) A bound on volume. Candidate search calls the quiet oracle once per
 //     speculative subset, and a yield that holds for the committed set holds
@@ -626,6 +641,10 @@ fn conflict_from_active(package: &PypiKey, active: &[&Constraint]) -> Conflict {
 /// already written for that bundle. Both die with the scope.
 struct BundleFrame {
     bundle: String,
+    /// The consuming environments the scope's owner resolved this bundle for,
+    /// when it knows them. `finish_with_suggestion` gets them from the joint
+    /// route diagnostic context; the emission reconciler does not carry them.
+    environments: Vec<String>,
     rows_written: std::collections::HashSet<String>,
 }
 
@@ -642,9 +661,17 @@ pub(crate) struct ActiveBundleScope(Option<BundleFrame>);
 
 impl ActiveBundleScope {
     pub(crate) fn enter(bundle: &str) -> Self {
+        Self::enter_for_environments(bundle, &[])
+    }
+
+    /// Enter naming the bundle AND the consuming environments it is being
+    /// resolved for. The restore path knows both, and "which env asked for
+    /// this" is the second question an operator reading the row has.
+    pub(crate) fn enter_for_environments(bundle: &str, environments: &[String]) -> Self {
         Self(ACTIVE_BUNDLE.with(|slot| {
             slot.replace(Some(BundleFrame {
                 bundle: bundle.to_string(),
+                environments: environments.to_vec(),
                 rows_written: std::collections::HashSet::new(),
             }))
         }))
@@ -657,11 +684,17 @@ impl Drop for ActiveBundleScope {
     }
 }
 
-/// The bundle the current thread is finalizing for, or `<unknown>`.
-pub(crate) fn active_bundle() -> String {
-    ACTIVE_BUNDLE.with(|slot| match slot.borrow().as_ref() {
-        Some(frame) => frame.bundle.clone(),
-        None => "<unknown>".to_string(),
+/// The bundle the current thread is finalizing for and the environments it
+/// was entered with, or `None` when no caller declared a scope.
+///
+/// `None` is a DEFECT AT THE CALL SITE, not a value any row may print. The
+/// previous shape returned a placeholder string, every caller printed it, and
+/// the two rows that finally reached an arm named nothing.
+pub(crate) fn active_bundle_scope() -> Option<(String, Vec<String>)> {
+    ACTIVE_BUNDLE.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|frame| (frame.bundle.clone(), frame.environments.clone()))
     })
 }
 
@@ -674,24 +707,68 @@ fn yield_row_is_new(key: &str) -> bool {
     })
 }
 
+/// Refusals already reported, so a caller that forgot its scope inside
+/// candidate search cannot write the same defect notice once per speculative
+/// subset. This one IS process-wide on purpose and the reasoning is the
+/// opposite of the applied-row's: a defect notice is not an audit record, its
+/// job is to reach a human once, and 842 MB of repeated warnings to /oscar is
+/// a measured way to take a node out.
+static UNSCOPED_YIELDS_REPORTED: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::OnceLock::new();
+
+fn unscoped_refusal_is_new(key: &str) -> bool {
+    UNSCOPED_YIELDS_REPORTED
+        .get_or_init(Default::default)
+        .lock()
+        .expect("the unscoped-refusal set is never held across a panic")
+        .insert(key.to_string())
+}
+
 /// The row the yield writes wherever it is APPLIED, quiet or loud.
 ///
-/// `learned_fact_yielded bundle=… package=… clause=… kept=… reason=…`
+/// `learned_fact_yielded bundle=… envs=… package=… clause=… kept=… reason=…`
+///
+/// With NO scope declared the row is REFUSED and a defect notice takes its
+/// place. An audit record whose whole purpose is to say which pack's outcome
+/// a policy changed is worse than useless when it cannot name one: it reads
+/// as evidence that the policy ran somewhere unspecified, which is what the
+/// first two production sightings of this row actually said.
 fn record_learned_fact_yield(package: &PypiKey, yielded: &str, kept: &VersionSpecifiers) {
-    let bundle = active_bundle();
     let kept = if kept.is_empty() {
         "*".to_string()
     } else {
         kept.to_string()
     };
     let key = format!("{package}\u{1f}{yielded}\u{1f}{kept}");
+    let Some((bundle, environments)) = active_bundle_scope() else {
+        if unscoped_refusal_is_new(&key) {
+            tracing::error!(
+                "learned_fact_yield_unattributable package={} clause={} kept={} \
+                 reason=satisfiable-only-without-it defect=the caller entered no \
+                 `constraint::ActiveBundleScope`, so this yield changed a resolution \
+                 that cannot be attributed to a pack; the emitter refuses to name one \
+                 (fix the call site, not this row)",
+                package,
+                yielded,
+                kept,
+            );
+        }
+        return;
+    };
     if !yield_row_is_new(&key) {
         return;
     }
+    let environments = if environments.is_empty() {
+        "not-carried-by-this-caller".to_string()
+    } else {
+        environments.join(",")
+    };
     tracing::warn!(
-        "learned_fact_yielded bundle={} package={} clause={} kept={} \
+        "learned_fact_yielded bundle={} envs={} package={} clause={} kept={} \
          reason=satisfiable-only-without-it (once per distinct yield in this bundle)",
         bundle,
+        environments,
         package,
         yielded,
         kept,
@@ -1422,8 +1499,11 @@ mod tests {
             "a finalization that applied no yield must write no row: {quiet_rows}",
         );
 
-        // NON-VACUITY 2: the scope really is what supplies the name. Outside
-        // one the row is honest about not knowing rather than blaming a pack.
+        // NON-VACUITY 2: the scope really is what supplies the name, and
+        // outside one there is NO attributed row at all. C30-1 replaced the
+        // old placeholder with a refusal: see
+        // `c30_a_the_emitter_refuses_a_yield_it_cannot_attribute`, which owns
+        // that assertion. Here it is enough that the name is not invented.
         let (_, unscoped) = captured_rows(|| {
             finalize_quiet(&PypiKey::from_pypi("setuptools-unscoped-probe"), &{
                 let mut probe = flashsac_measured_clauses();
@@ -1436,9 +1516,9 @@ mod tests {
             })
         });
         assert!(
-            unscoped.contains("bundle=<unknown>"),
-            "with no scope entered the row must say `<unknown>`, never a stale \
-             or invented pack: {unscoped}",
+            !unscoped.contains("learned_fact_yielded"),
+            "with no scope entered the emitter must write no attributed row -- \
+             never a stale or invented pack: {unscoped}",
         );
 
         // NON-VACUITY 3: THE ROW IS ONCE PER SCOPE, NOT ONCE PER PROCESS, AND
@@ -1487,6 +1567,59 @@ mod tests {
         assert!(
             loud_rows.contains("learned_fact_yielded"),
             "and the applied-row is written on the loud path as well: {loud_rows}",
+        );
+    }
+
+    /// C30-1 guard (c). NO PRODUCTION PATH MAY EMIT AN UNATTRIBUTED YIELD ROW.
+    ///
+    /// RED on `c0f1549`, in both halves. That binary printed the campaign's
+    /// first two `learned_fact_yielded` rows (job 5834618) and both named a
+    /// placeholder instead of a pack, because the emitter accepted an absent
+    /// scope and substituted a string. The fix is not a better placeholder:
+    /// an audit record that cannot say whose outcome changed must REFUSE, so
+    /// the defect surfaces at the call site that forgot to declare a scope.
+    ///
+    /// Half 1 is behavioural -- drive the real emission function with no
+    /// scope and read what it writes. Half 2 is textual, and it is the half
+    /// that stops the placeholder being reintroduced by a future edit: the
+    /// needle is BUILT at runtime so this guard's own source cannot satisfy
+    /// the search it performs.
+    #[test]
+    fn c30_a_the_emitter_refuses_a_yield_it_cannot_attribute() {
+        // A package name unique to this guard: the refusal is deduplicated
+        // process-wide (a defect notice reaches a human once), so a shared
+        // key would make this guard depend on what another test did first --
+        // the exact flake p6aa's first design shipped.
+        let package = PypiKey::from_pypi("setuptools-c30-unscoped-refusal-probe");
+        let (result, rows) = captured_rows(|| finalize_quiet(&package, &flashsac_measured_clauses()));
+        result.expect("the LEARNED fact still yields; only the ROW is refused");
+
+        assert!(
+            !rows.contains("learned_fact_yielded "),
+            "an unattributable yield must not write an attributed row: {rows}",
+        );
+        assert!(
+            rows.contains("learned_fact_yield_unattributable"),
+            "and it must not go quiet either -- the yield changed a resolution, \
+             so the refusal is itself the audit record: {rows}",
+        );
+        assert!(
+            rows.contains(&format!("package={package}")),
+            "the refusal must still name the package it could not attribute: {rows}",
+        );
+        assert!(
+            rows.contains("clause=`==84.0.0`"),
+            "and the clause that yielded, so the defect can be traced to a run: {rows}",
+        );
+
+        // Half 2. The placeholder literal is gone from the emitter's file and
+        // may not come back. Built at runtime for the reason above.
+        let placeholder = format!("<{}>", "unknown");
+        let source = include_str!("constraint.rs");
+        assert!(
+            !source.contains(&placeholder),
+            "`{placeholder}` is back in src/constraint.rs; the yield row names a pack \
+             or refuses, and there is no third answer",
         );
     }
 }

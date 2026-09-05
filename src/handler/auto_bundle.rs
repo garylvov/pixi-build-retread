@@ -1328,6 +1328,38 @@ impl RestoreRequestBuilder {
             .map(|context| context.bundle.as_str())
             .unwrap_or(&self.bundle_name)
             .to_string();
+        // C30-1. NAME THE PACK FOR THE RESTORE PATH'S ROWS.
+        //
+        // This is the SECOND production entry into the constraint reconciler
+        // (`relax_decision::decide` -> `constraint::finalize_quiet_detailed`
+        // -> `finalize_impl`), and until now the only one without a scope.
+        // p6z-1 scoped `handler::produce_output_with_conflicts` on the belief
+        // that emission was the only entry; it is the only caller of
+        // `decide_for_emission`, which is not the same claim. Every route the
+        // joint conda solve rejects comes back through here, BEFORE emission,
+        // and that is where the learned-fact yield actually fired in job
+        // 5834618: `setuptools` and `prettytable` restoring into
+        // `flashsac-pack`, both rows unattributed.
+        //
+        // The name comes from the joint-route diagnostic context, which is
+        // the bundle the restore is being performed FOR -- not
+        // `self.bundle_name`, which is `canonical_conda_name(pypi_name)`, the
+        // PACKAGE's own sanitized name. Printing that would have been worse
+        // than printing nothing: a plausible-looking pack that no manifest
+        // declares. Where there is no context the mode still carries the real
+        // `Bundle`; the leaf mode that carries neither is test-only, and it
+        // gets no scope, so the emitter's refusal covers it.
+        let _yield_scope = match (diagnostic_context, suggestion_mode) {
+            (Some(context), _) => Some(crate::constraint::ActiveBundleScope::enter_for_environments(
+                &context.bundle,
+                &context.environments,
+            )),
+            (None, ConflictSuggestionMode::Graph { bundle, .. }) => Some(
+                crate::constraint::ActiveBundleScope::enter(&bundle.conda_name),
+            ),
+            #[cfg(test)]
+            (None, ConflictSuggestionMode::Leaf { .. }) => None,
+        };
         let (specifiers, relaxations) = match decide_relaxation(
             &package,
             &self.constraints,
@@ -8244,5 +8276,228 @@ pillow = ">=10,<13"
             2,
             "both deps should be enqueued; got {enqueued:?}"
         );
+    }
+
+    // ---- C30-1 guards: the restore path's learned-fact yield names its pack ----
+    //
+    // Both are RED on `c0f1549`. That binary printed the campaign's first two
+    // `learned_fact_yielded` rows (job 5834618) and both said the placeholder
+    // instead of a pack name, because the only scope in the tree was entered
+    // by `produce_output_with_conflicts` and the yield happened HERE, on the
+    // route-restore path, before any emission ran.
+    //
+    // These guards drive the same function production drives --
+    // `finish_with_graph_context` -> `finish_with_suggestion` ->
+    // `relax_decision::decide` -> `constraint::finalize_quiet_detailed` --
+    // and read the row the process actually writes. A guard that entered the
+    // scope itself and then called `finalize_quiet` would have been green on
+    // the broken binary, which is precisely how p6aa guard (a) missed this.
+
+    /// Capture the WARN/ERROR rows a body writes, so a guard can assert on
+    /// the row the operator will read rather than on a return value.
+    fn c30_captured_rows<T>(body: impl FnOnce() -> T) -> (T, String) {
+        #[derive(Clone)]
+        struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer({
+                let buffer = std::sync::Arc::clone(&buffer);
+                move || Sink(std::sync::Arc::clone(&buffer))
+            })
+            .finish();
+        let value = tracing::subscriber::with_default(subscriber, body);
+        let text = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+        (value, text)
+    }
+
+    /// A LEARNED workspace conda fact, in the rendered shape the backend
+    /// emits. The sentence CONTAINS `LEARNED_WORKSPACE_FACT_SOURCE` and is
+    /// not equal to it -- `is_learned_advisory_sentence` tests containment,
+    /// and a fixture built on the bare constant proved a yield that never
+    /// fired in an arm once already (p6z pair 1).
+    fn c30_learned_conda_fact(pypi_name: &str, version: &str) -> Constraint {
+        let source = format!(
+            "uv constraint `{pypi_name}=={version}` from {} `precise-consuming-envs` \
+             (conda `{pypi_name}=={version}`)",
+            crate::uv_closure::LEARNED_WORKSPACE_FACT_SOURCE,
+        );
+        assert!(
+            crate::uv_closure::is_learned_advisory_sentence(&source),
+            "non-vacuity: the fixture's sentence must be classified LEARNED, or the \
+             yield under test cannot fire: {source}",
+        );
+        Constraint {
+            specifiers: VersionSpecifiers::from_str(&format!("=={version}")).unwrap(),
+            provenance: Provenance::UvConstraint,
+            source,
+            origin_id: test_origin(
+                &format!("{pypi_name}-learned-conda-fact"),
+                &format!("=={version}"),
+            ),
+        }
+    }
+
+    fn c30_wheel_requirement(pypi_name: &str, specifiers: &str, wheel: &str) -> Constraint {
+        Constraint {
+            specifiers: VersionSpecifiers::from_str(specifiers).unwrap(),
+            provenance: Provenance::IndexWheelMetadata,
+            source: format!("wheel `{wheel}` Requires-Dist `{pypi_name}{specifiers}`"),
+            origin_id: test_origin(&format!("{pypi_name}-{wheel}"), specifiers),
+        }
+    }
+
+    /// Run one restore through the production entry and hand back its rows.
+    fn c30_restore_rows(
+        pypi_name: &str,
+        bundle_name: &str,
+        environments: &[&str],
+        constraints: Vec<Constraint>,
+    ) -> String {
+        let context = JointRouteDiagnosticContext {
+            bundle: bundle_name.to_string(),
+            environments: environments.iter().map(|env| (*env).to_string()).collect(),
+            profiles: vec!["linux-64".to_string()],
+            platform: "linux-64".to_string(),
+            python: "3.10".to_string(),
+        };
+        let mut bundle = test_bundle(&[]);
+        bundle.conda_name = context.bundle.clone();
+        let config: RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-deps-from": "requirements.txt",
+            "retread-wheels": {}
+        }))
+        .unwrap();
+        let target = crate::pypi::WheelTarget::for_subdir(&context.python, &context.platform);
+        let mut builder = RestoreRequestBuilder::new(
+            pypi_name,
+            RelaxPolicy::PatchThenMinorThenMajorThenLastResort,
+        );
+        for constraint in constraints {
+            builder.add_constraint(constraint);
+        }
+        let (request, rows) = c30_captured_rows(|| {
+            builder.finish_with_graph_context(Some(&context), &bundle, &config, &target)
+        });
+        request.expect(
+            "the LEARNED fact must yield and the restore must resolve; a conflict here \
+             means the fixture stopped exercising the yield",
+        );
+        rows
+    }
+
+    /// C30-1 guard (a). The `flashsac-pack` clause set -- the case p6z-1 was
+    /// written for -- must name `flashsac-pack` when it is reached through
+    /// the restore path, not through a scope the guard entered itself.
+    #[test]
+    fn c30_b_flashsac_restore_yield_row_names_the_pack() {
+        let rows = c30_restore_rows(
+            "setuptools",
+            "flashsac-pack",
+            &["flashsac-gpu"],
+            vec![
+                c30_learned_conda_fact("setuptools", "84.0.0"),
+                c30_wheel_requirement("setuptools", ">=41.0.0", "tensorboard==2.21.0"),
+                c30_wheel_requirement("setuptools", "!=50.0.0", "dm_control==1.0.45"),
+                c30_wheel_requirement("setuptools", "<=65", "FlashRL==0.1.0"),
+            ],
+        );
+
+        assert!(
+            rows.contains("learned_fact_yielded"),
+            "the restore path applied the yield and must leave its audit row: {rows}",
+        );
+        assert!(
+            rows.contains("bundle=flashsac-pack"),
+            "the row must name the pack whose outcome the policy changed: {rows}",
+        );
+        assert!(
+            rows.contains("envs=flashsac-gpu"),
+            "and the consuming environment the restore was performed for, which the \
+             joint-route context carries and the emission path does not: {rows}",
+        );
+        assert!(
+            rows.contains("package=setuptools"),
+            "the row must name the package it decided: {rows}",
+        );
+        assert!(
+            !rows.contains("learned_fact_yield_unattributable"),
+            "a scoped caller must never reach the emitter's refusal arm: {rows}",
+        );
+    }
+
+    /// C30-1 guard (b). THE TWO ROWS THE ARM ACTUALLY PRINTED.
+    ///
+    /// Transcribed from job 5834618's backend log (ANSI stripped), the only
+    /// arm in which this row has ever appeared: `setuptools` `==84.0.0` kept
+    /// `>=41.0.0, !=50.0.0, <=65`, and `prettytable` `==3.18.0` kept
+    /// `>=3.3, <3.4`, both from `precise-consuming-envs`, both immediately
+    /// before `restoring PyPI wheel` and `computed vendored set
+    /// bundle=flashsac-pack`. Both printed the placeholder. Both must now
+    /// print the pack, and the SECOND one matters on its own: it proves the
+    /// scope is per-restore and not a name some earlier call left behind.
+    #[test]
+    fn c30_c_the_two_rows_the_c30_arm_printed_name_their_bundle() {
+        let setuptools = c30_restore_rows(
+            "setuptools",
+            "flashsac-pack",
+            &["flashsac-gpu"],
+            vec![
+                c30_learned_conda_fact("setuptools", "84.0.0"),
+                c30_wheel_requirement("setuptools", ">=41.0.0", "tensorboard==2.21.0"),
+                c30_wheel_requirement("setuptools", "!=50.0.0", "dm_control==1.0.45"),
+                c30_wheel_requirement("setuptools", "<=65", "FlashRL==0.1.0"),
+            ],
+        );
+        let prettytable = c30_restore_rows(
+            "prettytable",
+            "flashsac-pack",
+            &["flashsac-gpu"],
+            vec![
+                c30_learned_conda_fact("prettytable", "3.18.0"),
+                c30_wheel_requirement("prettytable", ">=3.3", "sage-agent==0.4.0"),
+                c30_wheel_requirement("prettytable", "<3.4", "sage-agent==0.4.0"),
+            ],
+        );
+
+        for (rows, package, clause, kept) in [
+            (
+                &setuptools,
+                "setuptools",
+                "`==84.0.0`",
+                "kept=>=41.0.0, !=50.0.0, <=65",
+            ),
+            (&prettytable, "prettytable", "`==3.18.0`", "kept=>=3.3, <3.4"),
+        ] {
+            assert!(
+                rows.contains(&format!("package={package}")),
+                "the {package} row must be present: {rows}",
+            );
+            assert!(
+                rows.contains("bundle=flashsac-pack"),
+                "the {package} row printed an unattributed bundle in job 5834618 and \
+                 must now name the pack: {rows}",
+            );
+            assert!(
+                rows.contains(clause),
+                "the {package} row must quote the clause that yielded: {rows}",
+            );
+            assert!(
+                rows.contains(kept),
+                "the {package} row must state what was kept, which is what makes it \
+                 auditable against the lock: {rows}",
+            );
+        }
     }
 }

@@ -20847,12 +20847,20 @@ fn produce_output_with_conflicts(
 ) -> Result<ProducedOutput> {
     // p6z-1. NAME THE PACK FOR THE RECONCILER'S ROWS.
     //
-    // This function is the single production entry into the emission
+    // This function is the single production entry into the EMISSION
     // reconciler (`relax_decision::decide_for_emission` -> `constraint::
     // finalize_*`), and the reconciler decides one PACKAGE at a time with no
     // idea which pack it is deciding for. Without this scope the learned-fact
     // yield's applied-row cannot name `flashsac-pack`, which is the one thing
     // an operator reading it needs. Held for the whole body, restored on drop.
+    //
+    // C30-1. NOT the only entry into the reconciler, and reading this comment
+    // as if it were is what left the row's first two production sightings
+    // unattributed. `relax_decision::decide` is the other one, reached from
+    // `auto_bundle::RestoreRequestBuilder::finish_with_suggestion` on the
+    // route-restore path, which runs before any emission; it now enters its
+    // own scope. `decide_for_emission` is what this function is sole caller
+    // of.
     let _bundle_scope = crate::constraint::ActiveBundleScope::enter(&bundle.conda_name);
     // Python version for the emitted variant/build/`python` dep. Shared with
     // the build recipe via `emit_python_version` so the metadata and the
