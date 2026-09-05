@@ -59,6 +59,12 @@ e60de6759f33d1de9f69a5265cc3dfeb  tools/p6ad_negctl.sh
 2a59e952d4d6701639eaefffe39e5902  tools/p6ad_PREDICTION.md
 88d73e64546ef460325b7b52d2087ba7  tools/p6af2a_pkg_mirror_guard.sh
 7417161af0748a0a57ab42e95152065c  tools/p6af2g_shard_mirror_guard.sh
+68847a4dd23a2d8d08f344c58217c605  tools/p6af2h_measure_pypi.py
+56511fb5012d68b0dea5e73079f055cd  tools/p6af2h_measure.sh
+6677bdcea2c830cc164470f3e3169cc5  tools/p6af2h_probe2_indexurl.sh
+8e981efab4c4537cde144f64af2b4858  tools/p6af2h_probe3_indexurl.sh
+8a38c49488e9193205027b9ebbb2f6de  tools/p6af2h_probe4_uvenv.sh
+30bb5c3819d216fc0b4dd300fb72f2e6  tools/p6af2h_probe5_tls.sh
 8e4f029c593da55601a147f38b693557  tools/p6af_channel_mirror_guard.sh
 c34a4e3a1a8834b073b997fc94230a9f  tools/pixi_merge_run_exports.py
 c9f561484d8ef42157ba6a7532f80681  tools/pixi_shard_cache.py
