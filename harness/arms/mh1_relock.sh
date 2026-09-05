@@ -87,23 +87,6 @@
 #           --job-name=<tag>-p1 --output=<shared path>/slurm-%j.out \
 #           ./phaseN_relock.sh
 #
-#
-# ---- EXACTLY ONE CLEANUP OWNER PER ROOT (measured 2026-09-04, tag AFINAL2) ---
-#   The roots /oscar/data/stellex/glvov/retread/certAFINAL2-5769426 and
-#   ws.AFINAL2-5769426 were cleaned by TWO jobs at once: the dispatch-time
-#   gated cleanup 5770508 and the cert phase's OWN self-submitted cleanup
-#   5776646. Both released on the same dependency, both started 08:39:44 on
-#   node2343, and both walked the same trees. Two concurrent `rm -rf` walks of
-#   one tree unlink entries out from under each other: BOTH returned rc=1 with
-#   pages of "Directory not empty" (5776646 also logged `rm: fts_read failed:
-#   Stale file handle`), both logged `exists_after=YES`, and 590028 + 668715
-#   entries were LEFT ON DISK after 2864 s and 3941 s of wall.
-#   Nothing on disk told the cert phase that an owner already existed. Section 6
-#   now records one: `CLEANUP_JOB=` in the handoff stamp names the dispatch
-#   cleanup's job id, and phaseN_cert.sh's `cleanup_owner` defers to it instead
-#   of submitting a second owner. Empty means nobody owns them and the cert
-#   phase submits and owns exactly one, as it always did.
-#   Guarded by phase_template/cleanup_owner_guard.sh.
 # NEVER edit this file while a job is running it -- copy it aside first.
 ### EVIDENCE END
 set -uo pipefail
@@ -111,15 +94,24 @@ set -uo pipefail
 ### SUBSTITUTE: BEGIN -- MANIFEST, PROBES, EXPECT_*  (edit ONLY between these markers)
 # Every campaign-specific constant in this harness lives here. Nothing below
 # this block names a previous batch; the self-check right after it enforces that.
+#
+# DERIVED BY SUBSTITUTION from c13-work/c13_relock.sh (the newest proof script,
+# which carries p6m's harness knobs and the C12 job-scoped built-output store)
+# with ONE block swapped outside these markers, recorded here so the derivation
+# is not silent: the "SHARED WHEEL STORE -- ON, FOR THIS JOB ONLY" block is
+# replaced VERBATIM by merge-e/me1_relock.sh's "WHEEL STORE -- JOB-SCOPED (the
+# default)" block. Both stores are therefore job-scoped, which is what a merge
+# proof needs: three other lanes are writing the shared wheel store tonight and
+# an adopted or poisoned entry from one of them is not attributable to this tip.
 
-TAG=PHASEN                                   # short batch tag; roots become certPHASEN-<job> / ws.PHASEN-<job>
+TAG=MH1                                      # short batch tag; roots become cert<TAG>-<job> / ws.<TAG>-<job>
 T=/oscar/data/stellex/glvov/agrescap/tasks/retread-4-11
-D=$T/phase-template-example                  # THIS harness's own directory (artifacts land in $D/artifacts)
+D=$T/merge-h                                 # THIS harness's own directory (artifacts land in $D/artifacts)
 
 # --- the manifest under test -------------------------------------------------
 SRC_WS=/oscar/data/stellex/glvov/imprint-data           # READ-ONLY canonical source tree
-CLEANED=$T/b1-scratch/pixi.toml.EXAMPLE                 # the scratch manifest this batch locks
-EXPECT_CLEANED_MD5=00000000000000000000000000000000     # md5sum of $CLEANED
+CLEANED=$T/p7-template-smoke/pixi.toml.canonical         # the CANONICAL manifest, byte-identical to $SRC_WS/pixi.toml
+EXPECT_CLEANED_MD5=9711eb990bfe211d498d1635a60e0d07     # md5sum of $CLEANED
 EXPECT_MANIFEST_LINES=1003                              # wc -l of $CLEANED
 EXPECT_DEL=0                                            # diff SRC_WS/pixi.toml CLEANED : '< ' lines
 EXPECT_ADD=0                                            # diff SRC_WS/pixi.toml CLEANED : '> ' lines
@@ -127,31 +119,27 @@ EXPECT_ENVS=27                                          # envs the manifest decl
 EXPECT_JETSON_ROWS=1                                    # live `jetson = ` rows (0 disables the jetson env)
 
 # --- residual-pin gate: one pattern per deleted pin family, each must be 0 ----
-RESIDUAL_PATTERNS=()                                    # e.g. ('^openmesh = ' '^pillow = "==10.4.0"')
+RESIDUAL_PATTERNS=()
 
 # --- probes ------------------------------------------------------------------
 PROBES_CANON=$T/p1e-certify-lock/artifacts/probes.tsv    # canonical, operator-gated, NEVER edited
-PROBES_ARM=$PROBES_CANON                                 # this batch's copy; point it at a corrected copy
-                                                         # whenever a deleted pin also names a probe module
-PROBE_TOKENS=()                                          # module tokens that must be GONE from $PROBES_ARM
+PROBES_ARM=$PROBES_CANON
+PROBE_TOKENS=()
 
 # --- instruments -------------------------------------------------------------
-ATTRIB=$T/tools/b2_attribute.sh                          # whole-file occurrence delta (secondary, blind by design)
-EVD=$T/b3-phase1/env_version_delta.py                    # PER-ENV PER-PACKAGE version delta (primary CHECK 1)
-EVD_PACKAGES="openmesh networkx pillow sentry-sdk numpy" # packages CHECK 1 adjudicates
-WATCH_PACKAGES="gxx_linux-64 cmake"                      # observed, not touched by this batch
-BASE_LOCK=$SRC_WS/pixi.lock                              # baseline for the occurrence delta
+ATTRIB=$T/tools/b2_attribute.sh
+EVD=$T/b3-phase1/env_version_delta.py
+EVD_PACKAGES="openmesh networkx pillow sentry-sdk numpy"
+WATCH_PACKAGES="gxx_linux-64 cmake"
+BASE_LOCK=$SRC_WS/pixi.lock
 
 # --- toolchain ---------------------------------------------------------------
 PIXI=/users/glvov/.pixi/bin/pixi.real                    # bypass the flock shim
-SNAP=$T/p4l-cert-p4k/artifacts/p4k-binsnap/pixi-build-retread
-# OPTIONAL pin. Leave EMPTY and the gate DERIVES the sha from $SNAP at run
-# time. Set it only to assert a specific binary, and then it MUST match.
-# It used to be a mandatory second constant beside SNAP, and on 2026-09-03 a
-# derivation substituted SNAP and not it, so job 5671529 died exit 8 in 3 s
-# ("snapshot sha 1860e830... != 2dd790bf..."). The leftover-token self-check
-# cannot see that: both values live INSIDE this SUBSTITUTE region, which the
-# check strips by design. One constant cannot disagree with itself.
+SNAP=$T/binsnaps/cand-39d5f23/pixi-build-retread
+# OPTIONAL pin. Left EMPTY on purpose: the binary this run proves is produced by
+# the gate job that runs immediately before it in the same afterok chain, so the
+# sha cannot be known when this file is written. The gate DERIVES it from $SNAP
+# at run time and prints it, and the COMMIT file beside it names the tip.
 EXPECT_SHA_PIN=
 UVBIN=/oscar/data/stellex/glvov/tasks/retread-cold-solve/verify_fixes/artifacts/uvbin
 FAST_ENV=$(dirname "$0")/../retread_fast_env.sh          # persistent caches; fallback below
@@ -160,7 +148,7 @@ FAST_ENV=$(dirname "$0")/../retread_fast_env.sh          # persistent caches; fa
 # --- leftover-token self-check ------------------------------------------------
 # Names of PREVIOUS batches. A hit anywhere outside the three marked regions is
 # a botched derivation, which is what HANDOFF section 2's grep exists to catch.
-LEFTOVER_RE='bfinal|BFP1|BFP2|bfp1|bfp2|b1c|b1-phase|b1b-phase|b2-phase|b2b-phase|b3-phase|ctl-phase|eff-phase|/b1_|/b2_|/b3_|/ctl_|p5sab|P5SAB|p5t_abc|P5TABC|certB3P1|2cfec88d|57105d38'
+LEFTOVER_RE='C13A|c13-work|c13_relock|5584ce6|6de298df|5741341|C12A|c12-work|c12_relock|5f71a14|5ac0df9d|5731815|MG1|merge-g|cand-0ab3f1d|e336f076|MF1|merge-f|cand-614f746|33cc45bc|ME1|ME2|merge-e|cand-c0a87d3|ffd4f6c4|p6i|P6IB|p6h|P6H|p4l|p4k|phase-template-example|PHASEN|bfinal|BFP1|BFP2|bfp1|bfp2|b1c|b1-phase|b1b-phase|b2-phase|b2b-phase|b3-phase|ctl-phase|eff-phase|/b1_|/b2_|/b3_|/ctl_|p5sab|P5SAB|p5t_abc|P5TABC|certB3P1|2cfec88d|57105d38'
 ### SUBSTITUTE: END
 
 ### LEFTOVER-CHECK BEGIN
@@ -213,25 +201,6 @@ EXPECT_SHA=$GOT_SHA
 echo "### backend snapshot OK: $SNAP sha256=$GOT_SHA"
 ls -l "$SNAP"; "$SNAP" --version 2>&1 | head -2
 [ -f "$FAST_ENV" ] || { echo "FATAL: persistent-cache snippet $FAST_ENV missing"; exit 8; }
-
-### HARNESS-DRIFT BEGIN
-# C31-4-1d.  The task tree is not a git repo, so a task copy of this harness can
-# silently fall behind the versioned one -- C31-4-1 found four that had, one of
-# them 779 lines behind.  Set HARNESS_COMMIT to the harness commit this batch is
-# meant to be, and a stale copy REFUSES here in milliseconds instead of
-# certifying the wrong harness three hours from now.  Unset = the check is
-# announced as OFF; it is never silently skipped.
-HARNESS_COMMIT="${HARNESS_COMMIT:-}"
-if [ -n "$HARNESS_COMMIT" ]; then
-  echo "### HARNESS_COMMIT=$HARNESS_COMMIT -- checking the task-dir harness against it"
-  DRIFT_CHECK=$(dirname "$FAST_ENV")/harness_drift_check.sh
-  [ -f "$DRIFT_CHECK" ] || { echo "FATAL: harness_drift_check.sh missing next to $FAST_ENV"; exit 6; }
-  bash "$DRIFT_CHECK" "$HARNESS_COMMIT" || {
-    echo "FATAL: harness drift check REFUSED -- the task-dir harness is not $HARNESS_COMMIT"; exit 6; }
-else
-  echo "### HARNESS_COMMIT unset -- harness drift check OFF for this run"
-fi
-### HARNESS-DRIFT END
 [ -f "$CLEANED" ] || { echo "FATAL: manifest under test $CLEANED missing"; exit 9; }
 echo "### manifest md5: $(md5sum "$CLEANED")"
 GOT_CM=$(md5sum "$CLEANED" | awk '{print $1}')
@@ -364,18 +333,7 @@ stage_rsync_path () {            # the pre-p12 path, unchanged
 stage_manifest () {              # what the mirror holds, minus its own two stamp files.
   # -mindepth 1 drops the mirror root, whose mtime moves whenever a stamp file
   # is written; -F because no real path here contains ".stage-mirror-".
-  # LC_ALL=C ON THE SORT IS LOAD-BEARING, NOT HYGIENE. This census is written
-  # once by the building job and re-walked later by a DIFFERENT job, and the two
-  # are compared with `diff`. glibc's en_US.UTF-8 collation ignores `_`, `-` and
-  # case at the primary level, so two jobs that inherited different locales sort
-  # the same file set into different orders and the diff is non-empty on a tree
-  # nothing touched. That is what `ml1` 5752248 did: a FALSE FATAL exit 12 that
-  # quarantined the shared stage mirror and cost the next job 459 s / 62 GB of
-  # re-staging, while both censuses diff to 0 lines once C-sorted. Every writer
-  # AND every reader of this census pins LC_ALL=C; the pin is per-command so it
-  # is greppable and cannot be lost when the function is moved.
-  # Reader: phase_template/census_collation_guard.sh.
-  find "$1" -mindepth 1 -xdev -printf '%y\t%s\t%T@\t%P\n' | grep -vF '.stage-mirror-' | LC_ALL=C sort
+  find "$1" -mindepth 1 -xdev -printf '%y\t%s\t%T@\t%P\n' | grep -vF '.stage-mirror-' | sort
 }
 
 stage_build_mirror () {          # ONE-TIME per key. Returns non-zero on failure.
@@ -508,7 +466,7 @@ src_tp_fingerprint () {          # a DIRECT reader on the read-only canonical tr
   # write that reaches imprint-data by any route at all -- including one that
   # never touches the mirror -- is caught by the job that did it.
   find "$SRC_WS/third_party" -type f "${STAGE_TP_WRITABLE[@]}" \
-    -printf '%i %T@ %s %P\n' 2>/dev/null | LC_ALL=C sort
+    -printf '%i %T@ %s %P\n' 2>/dev/null | sort
 }
 
 stage_verify_mirror () {         # the READER for stage_build_mirror's writer
@@ -516,13 +474,13 @@ stage_verify_mirror () {         # the READER for stage_build_mirror's writer
   [ -f "$m/.stage-mirror-manifest.tsv" ] || { echo "### stage: no mirror manifest at $m -- cannot verify"; return 0; }
   local now=$A/${TAG}-$J.stage-mirror-now.tsv
   stage_manifest "$m" > "$now"
-  if LC_ALL=C diff -q "$m/.stage-mirror-manifest.tsv" "$now" >/dev/null; then
+  if diff -q "$m/.stage-mirror-manifest.tsv" "$now" >/dev/null; then
     echo "### stage: mirror INTACT ($m)"
   else
     echo "### stage: FATAL-CLASS -- the mirror CHANGED under this job. A hardlinked"
     echo "###        input was written through. Quarantining the mirror; the next"
     echo "###        job rebuilds it. Diff head:"
-    LC_ALL=C diff "$m/.stage-mirror-manifest.tsv" "$now" | head -20
+    diff "$m/.stage-mirror-manifest.tsv" "$now" | head -20
     mv "$m" "$m.DIRTY-$J" 2>/dev/null && echo "### stage: quarantined -> $m.DIRTY-$J"
     MIRROR_DIRTY=1
   fi
@@ -668,102 +626,24 @@ export RUST_BACKTRACE=1
 . "$FAST_ENV"
 retread_fast_env "$WS" || { echo "FATAL: retread_fast_env refused"; exit 7; }
 
-# --- C31-4: JOB-SCOPED sdist BUILD TREES, AND THE GUARD THAT READS THEM -------
-# retread_fast_env just pointed UV_CACHE_DIR and PIXI_CACHE_DIR at the SHARED
-# persistent root. For the byte-keyed buckets that is the whole 41x win and it
-# stays. For `sdists-v9` and `builds-v0` it is a CORRECTNESS BUG: uv builds a
-# source distribution IN PLACE inside `sdists-v9`, so a cmake project leaves a
-# `CMakeCache.txt` there holding the ABSOLUTE compiler paths of whichever
-# workspace built it first, and the next job inherits them. B-cert-4's
-# `pm-newton-gpu` RED-install was exactly that -- a compiler path into
-# `ws.MN1-5761731`, reaped weeks earlier -- while `pm-mujoco` built the SAME
-# sdist green in the same job off the healthy python-3.10 sibling directory.
-# LANE-C-WARM-LOG 31.10-31.12 and 33.
-#
-# `retread_scope_sdist_builds` gives this job its own empty build halves in BOTH
-# uv caches (pixi 0.73.0 does not read UV_CACHE_DIR; its uv cache hangs off
-# PIXI_CACHE_DIR, and THAT is the one that was poisoned) and leaves every
-# byte-keyed bucket a symlink into the shared cache.
-retread_scope_sdist_builds "$C" || { echo "FATAL: retread_scope_sdist_builds refused"; exit 7; }
+########## WHEEL STORE -- JOB-SCOPED (the default) ############################
+# `tools/retread_fast_env.sh` keeps the shared RETREAD_WHEEL_STORE export
+# COMMENTED OUT, so the store resolves through XDG_CACHE_HOME, which the
+# job-scoped block above pointed at $C/xdg-cache. This arm therefore locks
+# against a store no other job can write. It is the CONTROL for the shared-
+# store arm that runs after it.
+echo "### WHEEL STORE: job-scoped, under XDG_CACHE_HOME=$XDG_CACHE_HOME (RETREAD_WHEEL_STORE unset: ${RETREAD_WHEEL_STORE:-<unset>})"
 
-# ITS READER, and it runs BEFORE any install. A criterion with no live producer
-# is a defect; this one names a file and a path and refuses on them.
-SDIST_GUARD=$(dirname "$FAST_ENV")/sdist_build_poison_guard.sh
-[ -f "$SDIST_GUARD" ] || { echo "FATAL: sdist_build_poison_guard.sh missing next to $FAST_ENV"; exit 7; }
-bash "$SDIST_GUARD" || { echo "FATAL: sdist build poison guard refused -- see the rows above"; exit 7; }
-
-# --- OPTIONAL: JOB-SCOPED WHEEL STORE, SEEDED FROM THE PERSISTENT ONE ---------
-# retread_fast_env just exported RETREAD_WHEEL_STORE=<persist root>/wheels, the
-# SHARED store. That is the right default and it is what buys index authority
-# (see the wheel-store block in retread_fast_env.sh). But a lane whose lock is
-# being killed by a stale `.<wheel>.whl.retread-fill-v1.lock` sidecar in that
-# shared store needs the store's WARMTH without its POISON, and the way to get
-# that is a job-scoped store SEEDED by a byte copy.
-#
-# To turn it on, a harness sets WHEEL_STORE_SEED to the store to seed FROM
-# before it reaches this point, e.g.
-#     WHEEL_STORE_SEED=$RETREAD_PERSIST_CACHE_ROOT/wheels
-# and this block redirects RETREAD_WHEEL_STORE at a fresh job-scoped copy.
-#
-# THE SEED IS `retread_seed_wheel_store`, AND `cp -al` IS REFUSED FOR THIS.
-# A `cp -al` of the wheel store is wrong twice over:
-#   (a) a hardlink shares the inode, so making one bumps the ctime of files
-#       other live lanes are reading and any write through the "isolated" copy
-#       lands in the shared store (the p6k-b burn);
-#   (b) `cp -al` copies the directory whole, fill locks included, so the store
-#       that was supposed to be clean carries exactly the poison it was
-#       isolated from.
-# `retread_seed_wheel_store` does an `rsync -aW` byte copy with the fill locks
-# and quarantine dirs excluded, prints a census line, and REFUSES (non-zero) if
-# a fill lock, a quarantine dir, or a wheel with link count != 1 reached the
-# destination. That link-count assert is the reader for this whole comment.
-#
-# NOTE: the `cp -al` calls elsewhere in this template stage $SRC_WS/third_party
-# and the build mirror. Those are a different argument (read-only shared trees
-# with no lock sidecars in them) and are NOT covered by this refusal.
-if [ -n "${WHEEL_STORE_SEED:-}" ]; then
-  WHEEL_STORE_JOBSCOPED=${WHEEL_STORE_JOBSCOPED:-$C/wheels-seeded}
-  rm -rf "$WHEEL_STORE_JOBSCOPED"
-  echo "### wheel store: seeding job-scoped store from $WHEEL_STORE_SEED (byte copy; cp -al is refused here)"
-  retread_seed_wheel_store "$WHEEL_STORE_SEED" "$WHEEL_STORE_JOBSCOPED" \
-    || { echo "FATAL: retread_seed_wheel_store refused"; exit 7; }
-  export RETREAD_WHEEL_STORE=$WHEEL_STORE_JOBSCOPED
-  echo "### wheel store: RETREAD_WHEEL_STORE=$RETREAD_WHEEL_STORE (job-scoped; seed wall is OUTSIDE the lock span)"
-else
-  echo "### wheel store: SHARED, RETREAD_WHEEL_STORE=$RETREAD_WHEEL_STORE (set WHEEL_STORE_SEED to isolate)"
-fi
-
-# --- WHICH WHEEL STORE THE LOCK ACTUALLY READ --------------------------------
-# WHY THIS EXISTS. Until 2026-09-04 the block above was the only thing a lane
-# log said about the wheel store, and after p6i re-enabled the SHARED export at
-# 15:35 09-03 it was a DEAD LETTER: it announced a job-scoped store and then
-# printed the shared path, so every proof since read the fill-lock-poisoned
-# shared store while its log claimed otherwise. A claim about which store was
-# read is worthless unless it is RESOLVED THE WAY THE BACKEND RESOLVES IT, at
-# the moment the lock runs -- not read back off the variable the harness set.
-#
-# `wheel_store_in_use` is `courier::wheel_store_root_with` in shell:
-# RETREAD_WHEEL_STORE -> XDG_CACHE_HOME -> HOME/.cache, then join retread/wheels.
-# The scope word is derived by COMPARING that resolved path to the shared store,
-# never from WHEEL_STORE_SEED -- so a seed that silently failed to take effect
-# prints SHARED, which is the whole point.
-# Reader: phase_template/wheel_store_census_guard.sh.
-wheel_store_in_use () {
-  if [ -n "${RETREAD_WHEEL_STORE:-}" ]; then printf '%s\n' "$RETREAD_WHEEL_STORE"
-  elif [ -n "${XDG_CACHE_HOME:-}" ];    then printf '%s\n' "$XDG_CACHE_HOME/retread/wheels"
-  else                                       printf '%s\n' "${HOME:-/nonexistent}/.cache/retread/wheels"
-  fi
-}
-wheel_store_census () {          # $1 = when ("BEFORE LOCK" / "AFTER LOCK")
-  local s shared scope
-  s=$(wheel_store_in_use)
-  shared=${RETREAD_PERSIST_CACHE_ROOT:-/oscar/data/stellex/glvov/agrescap/cache/retread}/wheels
-  if [ "$s" = "$shared" ]; then scope=SHARED; else scope=JOB-SCOPED; fi
-  printf '### WHEEL STORE IN USE (%s): scope=%s path=%s shared=%s entries=%s fill_locks=%s\n' \
-    "$1" "$scope" "$s" "$shared" \
-    "$(ls -1U "$s" 2>/dev/null | wc -l)" \
-    "$(find "$s" -mindepth 2 -maxdepth 2 -name '.*.retread-fill-v1.lock' 2>/dev/null | wc -l)"
-}
+########## JOB-SCOPED, EMPTY BUILT-OUTPUT STORE ################################
+# `retread_fast_env` points RETREAD_BUILT_OUTPUT_STORE at the SHARED persistent
+# store. This run measures a COLD conda/outputs chain per bundle, and an
+# ADOPTED output is a chain that never executed -- so the store is re-pointed
+# job-scoped and starts empty. That is the same discipline HANDOFF section 0
+# names for anything that must be ATTRIBUTABLE rather than merely survivable.
+export RETREAD_BUILT_OUTPUT_STORE=$C/built-outputs-jobscoped
+rm -rf "$RETREAD_BUILT_OUTPUT_STORE"
+mkdir -p "$RETREAD_BUILT_OUTPUT_STORE" || exit 7
+echo "### JOB-SCOPED built-output store: $RETREAD_BUILT_OUTPUT_STORE (entries $(ls -1U "$RETREAD_BUILT_OUTPUT_STORE" | wc -l), must be 0)"
 
 # backend stderr shim (pixi 0.73 swallows backend stderr behind its expect() panic)
 BLOG=$A/${TAG}-$J.backend.log
@@ -826,7 +706,6 @@ SRC_FP_AFTER=$A/${TAG}-$J.src-third_party.after.txt
 src_tp_fingerprint > "$SRC_FP_BEFORE"
 echo "### source-tree write guard: fingerprinted $(wc -l < "$SRC_FP_BEFORE") in-place-writable files under $SRC_WS/third_party"
 
-wheel_store_census 'BEFORE LOCK'
 echo "### lock start $(date -Is)"
 S=$(date +%s)
 /usr/bin/time -v -o "$LTIME" "$PIXI" lock -v > "$LLOG" 2>&1
@@ -834,7 +713,6 @@ LRC=$?
 LW=$(( $(date +%s) - S ))
 echo "### lock rc=$LRC wall=${LW}s end $(date -Is)"
 echo "$LRC" > "$A/${TAG}-$J.rc"; echo "$LW" > "$A/${TAG}-$J.wall"
-wheel_store_census 'AFTER LOCK'
 
 # The READER for the stage mirror's writer. A relock that wrote through a
 # hardlink into the shared mirror has poisoned it for every later batch, and the
@@ -842,11 +720,11 @@ wheel_store_census 'AFTER LOCK'
 # or a mirror that was never used) makes this a no-op.
 [ -n "${STAGE_MIRROR:-}" ] && [ -d "${STAGE_MIRROR:-/nonexistent}" ] && stage_verify_mirror "$STAGE_MIRROR"
 src_tp_fingerprint > "$SRC_FP_AFTER"
-if LC_ALL=C diff -q "$SRC_FP_BEFORE" "$SRC_FP_AFTER" >/dev/null; then
+if diff -q "$SRC_FP_BEFORE" "$SRC_FP_AFTER" >/dev/null; then
   echo "### source-tree write guard: $SRC_WS/third_party UNCHANGED across the lock"
 else
   echo "### source-tree write guard: FATAL -- THIS JOB WROTE $SRC_WS. Diff:"
-  LC_ALL=C diff "$SRC_FP_BEFORE" "$SRC_FP_AFTER" | head -40
+  diff "$SRC_FP_BEFORE" "$SRC_FP_AFTER" | head -40
   SRC_WRITTEN=1
 fi
 echo "### /usr/bin/time -v (lock) -> $LTIME"
@@ -867,10 +745,10 @@ if [ -f "$WS/pixi.lock" ]; then
   # the run these four counts were validated against (pypi names 174, conda
   # names 1707, pypi urls 213, conda urls 2584 on the canonical manifest).
   LK=$A/pixi.lock.cert
-  grep -aoE '^\s+- pypi: \S+'  "$LK" | awk '{print $3}' | LC_ALL=C sort -u > "$A/${TAG}-$J.pypi-urls.txt"
-  grep -aoE '^\s+- conda: \S+' "$LK" | awk '{print $3}' | LC_ALL=C sort -u > "$A/${TAG}-$J.conda-urls.txt"
-  grep -aoE '^- pypi: \S+'  "$LK" | sed 's|.*/||; s|-[0-9].*||'      | grep -v '^$' | LC_ALL=C sort -u > "$A/${TAG}-$J.pypi-names.txt"
-  grep -aoE '^- conda: \S+' "$LK" | sed 's|.*/||; s|-[^-]*-[^-]*$||' | grep -v '^$' | LC_ALL=C sort -u > "$A/${TAG}-$J.conda-names.txt"
+  grep -aoE '^\s+- pypi: \S+'  "$LK" | awk '{print $3}' | sort -u > "$A/${TAG}-$J.pypi-urls.txt"
+  grep -aoE '^\s+- conda: \S+' "$LK" | awk '{print $3}' | sort -u > "$A/${TAG}-$J.conda-urls.txt"
+  grep -aoE '^- pypi: \S+'  "$LK" | sed 's|.*/||; s|-[0-9].*||'      | grep -v '^$' | sort -u > "$A/${TAG}-$J.pypi-names.txt"
+  grep -aoE '^- conda: \S+' "$LK" | sed 's|.*/||; s|-[^-]*-[^-]*$||' | grep -v '^$' | sort -u > "$A/${TAG}-$J.conda-names.txt"
   echo "### name/url sets: pypi names=$(wc -l < "$A/${TAG}-$J.pypi-names.txt") conda names=$(wc -l < "$A/${TAG}-$J.conda-names.txt") pypi urls=$(wc -l < "$A/${TAG}-$J.pypi-urls.txt") conda urls=$(wc -l < "$A/${TAG}-$J.conda-urls.txt")"
 else
   echo "### NO pixi.lock produced"
@@ -879,6 +757,37 @@ echo "### COUNTERS (all must be 0):"
 for pat in 'retread rpc error' 'courier inputs changed' '0 exact matches' \
            'run dependencies differ' 'panicked'; do
   printf '  %-28s lock.log=%s backend.log=%s\n' "$pat" \
+    "$(grep -c "$pat" "$LLOG" 2>/dev/null)" "$(grep -c "$pat" "$BLOG" 2>/dev/null)"
+done
+echo "### BUILT-OUTPUT STORE (shared; the still-adopting cache):"
+for pat in 'built_output_store hit' 'built_output_store miss' 'built_output_store published' \
+           'built_output_store publish skipped' 'built_output_store unreadable payload'; do
+  printf '  %-46s lock.log=%s backend.log=%s\n' "$pat" \
+    "$(grep -c "$pat" "$LLOG" 2>/dev/null)" "$(grep -c "$pat" "$BLOG" 2>/dev/null)"
+done
+echo "### uv_closure_child SPANS (bundle / elapsed_ms / exit_code), longest 12:"
+grep -aoE 'bench: uv_closure_child bundle=[^ ]+ elapsed_ms=[0-9]+[^\n]*' "$BLOG" 2>/dev/null \
+  | sed -E 's/.*bundle=([^ ]+) elapsed_ms=([0-9]+).*exit_code=([0-9-]+).*/\2 \1 exit=\3/' \
+  | sort -rn | head -12 | sed 's/^/  /'
+printf '  uv_closure_child span COUNT=%s  total_ms=%s  isaac-pack-latest spans=%s\n' \
+  "$(grep -ac 'bench: uv_closure_child' "$BLOG" 2>/dev/null)" \
+  "$(grep -aoE 'bench: uv_closure_child[^\n]*elapsed_ms=[0-9]+' "$BLOG" 2>/dev/null | grep -oE 'elapsed_ms=[0-9]+' | awk -F= '{s+=$2} END{print s+0}')" \
+  "$(grep -ac 'bench: uv_closure_child bundle=isaac-pack-latest' "$BLOG" 2>/dev/null)"
+echo "### p6k closure source stubs (dist-info stand-ins):"
+for pat in 'closure source stub' 'dist-info' 'stub'; do
+  printf '  %-46s backend.log=%s\n' "$pat" "$(grep -ac "$pat" "$BLOG" 2>/dev/null)"
+done
+echo "### WHEEL STORE: hit / miss / published / raced-then-missed / raced-then-hit:"
+for pat in 'wheel cache: hit' 'wheel cache: miss' 'wheel cache: populated persistent store' \
+           'wheel store: raced a shared entry' 'wheel store: entry never filled' \
+           'wheel store: sibling fill completed' 'not a package miss'; do
+  printf '  %-46s lock.log=%s backend.log=%s\n' "$pat" \
+    "$(grep -c "$pat" "$LLOG" 2>/dev/null)" "$(grep -c "$pat" "$BLOG" 2>/dev/null)"
+done
+echo "### RELAXATION RECORD: build-string drift recompute vs refusal:"
+for pat in 'stale or ambiguous relaxation record' 'the build string drifted between the metadata and build' \
+           'advertised identity: loaded'; do
+  printf '  %-46s lock.log=%s backend.log=%s\n' "$pat" \
     "$(grep -c "$pat" "$LLOG" 2>/dev/null)" "$(grep -c "$pat" "$BLOG" 2>/dev/null)"
 done
 echo "### POSITIVE SIGNALS:"
@@ -938,38 +847,9 @@ fi
 echo "### CHECK 2/2 -- probes grep"
 echo "  canonical $PROBES_CANON (untouched, operator-gated)"
 echo "  arm copy  $PROBES_ARM"
-LC_ALL=C diff "$PROBES_CANON" "$PROBES_ARM" | sed 's/^/  /'
+diff "$PROBES_CANON" "$PROBES_ARM" | sed 's/^/  /'
 
 ########## 6. HANDOFF TO THE CERT PHASE ##########
-# WHO OWNS THE JOB-SCOPED ROOTS, recorded here so the cert phase never guesses.
-# Two cleanup jobs once raced on the same two roots and left both on disk; the
-# measurement is in the EVIDENCE header above. The rule is one owner per root,
-# and this is where the owner is written down.
-#
-# Two sources, in order, both facts rather than environment guesses:
-#   1. CLEANUP_AT_DISPATCH in THIS relock job's environment -- set it to the
-#      cleanup's JOB ID. The legacy value `1` is honoured but records only
-#      `unrecorded-id`, which makes for a worse cert log line.
-#   2. $A/cleanup_at_dispatch.jobid, the dispatch note. The launcher submits the
-#      gated cleanup only AFTER both phases are queued, so the id cannot be in
-#      this job's environment; it writes the id into that file instead, any time
-#      before this job reaches the handoff.
-# Nothing recorded => CLEANUP_JOB= is written empty, and the cert phase submits
-# and owns its own cleanup exactly as it did before this rule existed.
-CLEANUP_JOB_RECORD=""
-case "${CLEANUP_AT_DISPATCH:-0}" in
-  ''|0|none|NONE) ;;
-  1) CLEANUP_JOB_RECORD=unrecorded-id ;;
-  *) CLEANUP_JOB_RECORD=$CLEANUP_AT_DISPATCH ;;
-esac
-if [ -z "$CLEANUP_JOB_RECORD" ] && [ -r "$A/cleanup_at_dispatch.jobid" ]; then
-  CLEANUP_JOB_RECORD=$(tr -dc '0-9_' < "$A/cleanup_at_dispatch.jobid" | head -c 32)
-fi
-if [ -n "$CLEANUP_JOB_RECORD" ]; then
-  echo "### CLEANUP OWNER AT DISPATCH: job $CLEANUP_JOB_RECORD -- recorded in the handoff stamp; the cert phase will DEFER to it"
-else
-  echo "### CLEANUP OWNER AT DISPATCH: NONE RECORDED -- the cert phase will submit and own exactly one cleanup"
-fi
 if [ "$LRC" = 0 ] && [ -f "$A/pixi.lock.cert" ] && [ "$MIRROR_DIRTY" = 0 ] && [ "$SRC_WRITTEN" = 0 ]; then
   {
     echo "# written by phaseN_relock.sh (${TAG}) job $J $(date -Is)"
@@ -978,7 +858,6 @@ if [ "$LRC" = 0 ] && [ -f "$A/pixi.lock.cert" ] && [ "$MIRROR_DIRTY" = 0 ] && [ 
     echo "P1_CACHE_ROOT=$C"
     echo "LOCK=$A/pixi.lock.cert"
     echo "EXPECT_LOCK_MD5=$(md5sum < "$A/pixi.lock.cert" | awk '{print $1}')"
-    echo "CLEANUP_JOB=$CLEANUP_JOB_RECORD"
   } > "$A/relock_env.sh"
   echo "### cert-phase handoff written:"; cat "$A/relock_env.sh"
 else
@@ -987,21 +866,9 @@ fi
 
 ########## 7. NO SELF-CLEANUP HERE -- ON PURPOSE ##########
 # See the EVIDENCE header: an `rm -rf` of a job-scoped root on the afterok path
-# cost job 5596128 5152s of held QOS. Cleanup is a separate 1-CPU job hung on
-# `--dependency=afterany:<this job>:<cert job>` -- BOTH phases, `afterany` on
-# both. Submitted at DISPATCH by the launcher, whose job id section 6 records
-# as CLEANUP_JOB= in the handoff stamp, or -- when nothing is recorded -- by
-# the cert phase with the relock job included in the dependency. EXACTLY ONE
-# of the two, never both: two owners racing on one root leaves it on disk.
-#
-# NEVER behind the cert alone. When this relock fails its own lock the block
-# above writes no handoff, Slurm cancels the afterok cert, and a cleanup that
-# depends only on the cert never releases -- so BOTH roots below leak forever.
-# That is exactly what stranded `certC18A-5759225` / `ws.C18A-5759225` and the
-# C18B pair, whose run log reads "the afterok dependency will not release" and
-# "self-cleanup NOT run here by design" on the same page.
-echo "### self-cleanup NOT run here by design -- roots left to the afterany:<relock>:<cert> cleanup job: $C $WS"
-echo "### if no such cleanup job exists for THIS relock, that is the C18 defect: submit one now over those roots"
+# cost job 5596128 5152s of held QOS. The cert phase submits cleanup.sh with
+# --dependency=afterany and exits; that job removes $C and $WS.
+echo "### self-cleanup NOT run here by design -- roots left for the cert phase and cleanup.sh: $C $WS"
 echo "### inode quota AFTER:"; "$CQ" 2>/dev/null | grep -E 'data\+stellex' | head -2
 echo "### ${TAG} RELOCK DONE lock_rc=$LRC wall=${LW}s peak_rss_kb=${LRSS:-unknown} mirror_dirty=$MIRROR_DIRTY src_written=$SRC_WRITTEN $(date -Is)"
 # A job that mutated a shared input can never report rc=0. Until 2026-09-03 the

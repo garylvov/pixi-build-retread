@@ -410,6 +410,22 @@ printf 'env\tinstall_rc\tpeak_rss_kb\twall_s\n' > "$LEDGER"
 for f in "$SNAP" "$LOCK" "$PROBES" "$PROBES_CANON" "$VERDICT" "$CERT_BASELINE" "$FAST_ENV" "$WS/pixi.toml" "$WS/pixi.lock"; do
   [ -e "$f" ] || { echo "### FATAL missing required path: $f"; exit 2; }
 done
+
+### HARNESS-DRIFT BEGIN
+# C31-4-1d.  Same guard as phaseN_relock.sh: HARNESS_COMMIT names the harness
+# commit this batch is meant to be, and a task-dir copy that is not that commit
+# refuses here rather than being certified.  Unset = announced OFF, never silent.
+HARNESS_COMMIT="${HARNESS_COMMIT:-}"
+if [ -n "$HARNESS_COMMIT" ]; then
+  echo "### HARNESS_COMMIT=$HARNESS_COMMIT -- checking the task-dir harness against it"
+  DRIFT_CHECK=$(dirname "$FAST_ENV")/harness_drift_check.sh
+  [ -f "$DRIFT_CHECK" ] || { echo "### FATAL harness_drift_check.sh missing next to $FAST_ENV"; exit 2; }
+  bash "$DRIFT_CHECK" "$HARNESS_COMMIT" || {
+    echo "### FATAL harness drift check REFUSED -- the task-dir harness is not $HARNESS_COMMIT"; exit 2; }
+else
+  echo "### HARNESS_COMMIT unset -- harness drift check OFF for this run"
+fi
+### HARNESS-DRIFT END
 GOT_SHA=$(sha256sum "$SNAP" | awk '{print $1}')
 [ -n "$GOT_SHA" ] || { echo "### FATAL could not sha256sum $SNAP"; exit 2; }
 if [ -n "$EXPECT_SHA_PIN" ]; then

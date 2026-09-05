@@ -1,0 +1,21 @@
+# harness_drift_check.sh allowlist -- task-relative paths this check will NOT
+# compare against the named commit, each with the reason it is exempt.
+#
+# THIS FILE IS LOAD-BEARING AND MUST STAY SHORT.  Every line here is a file the
+# drift check can no longer catch, so a line needs a reason and an owner, and
+# it comes back out the moment the reason expires.  An entry is NOT a way to
+# silence a mismatch: the fix for a mismatch is to re-extract the file from the
+# commit (the refusal prints the exact command).
+#
+# Format: one task-relative path per line; `#` comments and blanks ignored.
+# Anything after the path on a line is ignored, so a short reason can trail it.
+
+# C31-4-1a (2026-09-05).  `cleanup.sh` was the one file C31-4-1 deliberately did
+# not sync: pid 1628087 on node1831 (job 5866477) was EXECUTING the task copy at
+# the time, and replacing a running script is how you get a half-read file.  It
+# is byte-identical to the repo copy anyway (md5 8cc39f42cf0dcda7c93878195cbac569
+# both sides), so this entry costs nothing today -- it exists so the exemption is
+# a recorded decision rather than a coincidence, and so a future lane that DOES
+# have to leave it behind has the row already.
+# REMOVE THIS LINE once no job is executing the task copy and the two are synced.
+tools/phase_template/cleanup.sh   C31-4-1a: live under pid 1628087, identical anyway

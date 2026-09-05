@@ -1,0 +1,27 @@
+# The fix set every binsnap candidate must already carry.
+# Source: HANDOFF.md §0 "MERGE QUEUE EMPTY 17:45 09-03" table, whose
+# `integration/4.12` tip 0ab3f1d is the merge of exactly these four.
+# The tip itself is NOT listed: a candidate lane forks from its parents, so the
+# merge commit is legitimately absent from branches built on it.
+4b3103b p6i shared-cache-atomicity
+8e71eda p6k closure-resolve-only
+5562f7c p6j constrains-origin-coverage
+f0b7bee p6k-b wheel-fingerprint-ctime
+38e3c27 c14-projection (C11 re-key + adoption identity, per-pack manifest projection, p6p store-hit gate)
+5584ce6 c13-snapshot-seal-hardlink (carries the C12 cherry-pick e0ae761; C12's own commit 5f71a14 is a separate parent of this tip)
+5f71a14 c12-git-source-inject-spans
+c1f26a8 c15-lockfree-sealed-hit
+533e39a c16-canonical-tree-build
+f25a695 c10c-record-beside-the-bytes
+0e4eced c18-persistent-git-snapshot-store
+bfdcc83 p6x-quarantine-eviction (carries p6v as the rebased e488a32)
+959f0bf p6m-b-pack-source-shim
+7737cfd p6y-unstable-fingerprint
+1e8a06e test-targets-compile
+f59aa35 p6z-lenient-metadata-and-reconciler-attribution
+616cfec p6ab-uv-closure-transient-index (landed as B11 with the anchor collapse 5d6e2f0 on top)
+7ddbcd2 p6aa-applied-yield-row + p6z-2 report-start anchor (B12 = cherry-picks bca7cd9 f74e8e0 7ddbcd2; the default flip 0509542 stays out)
+0ba8af6 p6ac-vendored-set-provenance (closure digest on the vendored row, probe-cache SCHEMA v4)
+24bf812 p6ae-c30-1-yield-row-bundle-attribution (cherry-picked; the emitter refuses an unnamed scope)
+0b04ba9 p6ad-repodata-universe-provenance (AdvertisedIdentityRecord SCHEMA 6, folding p6u/p6w)
+54b5852 p6ad6-universe-is-the-snapshot (UNIVERSE_SCHEMA v2: repodata_universe = the whole snapshot, consulted_digest = the per-process subset)

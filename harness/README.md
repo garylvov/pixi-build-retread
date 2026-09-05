@@ -18,12 +18,12 @@ here outward.
 | path | what it is |
 | --- | --- |
 | `phase_template/` | `phaseN_relock.sh`, `phaseN_cert.sh`, `cleanup.sh`, `README.md` — the starting point for a new relock/cert pair |
-| `tools/` | `retread_fast_env.sh`, `b2_attribute.sh`, `manifest_audit.py`, `import_audit.py`, `env_version_delta.py`, `test_stage_mirror.sh` |
+| `tools/` | `retread_fast_env.sh`, `b2_attribute.sh`, `manifest_audit.py`, `import_audit.py`, `env_version_delta.py`, `test_stage_mirror.sh`, the merge-queue driver `land.sh`, the binsnap ancestry guard (`binsnap_ancestry_guard.sh` + its `_test.sh` + the declared `binsnap_fixset.txt`) and the task-dir drift check (`harness_drift_check.sh` + `harness_drift_allowlist.txt`) |
 | `inode-cleanup/` | the stale-root sweeper (`delete_stale_roots.v2.sh`), `delete_allowlisted.sh`, the census/characterize/verify scripts and their sbatch wrappers |
 | `instrumented/` | the p6b instrumented relock (`p6b_relock.sh`, `.b2.sh` variant) plus `p6b_stamp.py` / `p6b_extract.py` |
 | `verdict/cert_verdict.sh` | the typed-exit verdict gate |
 | `manifests/a3b/` | the A3b-family pack-manifest cessions (`patch` diffs against `pypi-packs/<pack>/pixi.toml`) — see its README for the md5s and the apply matrix |
-| `arms/` | derived relock harnesses kept verbatim because later arms are derived from them by SUBSTITUTE-only edits (`c29_relock.sh`) |
+| `arms/` | derived relock harnesses kept verbatim because later arms are derived from them by SUBSTITUTE-only edits (`c29_relock.sh`, `mh1_relock.sh`) |
 
 ## How to derive a harness
 
@@ -61,6 +61,17 @@ edit the template in place), change **only** what lies between
   `CERT_PARALLEL=1` restores the old serial behaviour exactly for an A/B. Raise
   it only against the measured per-env peaks, since the worst case is the *sum*
   across concurrent installs under the same QOS cap.
+* **Task-dir drift.** The sync above is a snapshot, and snapshots rot: C31-4-1
+  found four task copies silently BEHIND this directory, one of them 779 lines
+  behind, with nothing on either side detecting it. `tools/harness_drift_check.sh
+  <commit>` is the link — it md5s every mapped task file against
+  `git cat-file blob <commit>:<path>` (the COMMIT, never the checkout, which
+  concurrent lanes are editing) and exits 3 naming the offenders.
+  `tools/harness_drift_allowlist.txt` is the only escape hatch and every line in
+  it needs a reason. Both phase templates call it in their header behind
+  `HARNESS_COMMIT`: set that variable to the harness commit a batch is meant to
+  be and a stale task copy refuses in milliseconds; leave it unset and the
+  templates print that the check is OFF — never silently skipped.
 
 ## What is deliberately not here
 
