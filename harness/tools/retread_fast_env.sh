@@ -204,6 +204,60 @@ retread_fast_env () {
   # against 5/317 without (LANE-C-WARM-LOG 9.4).
   export RETREAD_WHEEL_STORE=$root/wheels
 
+  # C18 -- THE CANONICAL GIT SNAPSHOT STORE. NOT SET HERE, DELIBERATELY, AND
+  # THIS NOTE IS THE READER FOR IT.
+  #   The trees under `<store>/canonical-git-sources/v3/<repository identity>/
+  #   <ref state>/` are what `ensure_canonical_git_snapshot` clones, normalizes,
+  #   seals and publishes. They lived under `courier::retread_cache_root()`,
+  #   which consults `fasttmp::backend_env_override("RETREAD_CACHE_DIR")` first,
+  #   and fasttmp redirects that key into
+  #     $RETREAD_FAST_TMP_ROOT/retread-$USER/<workspace hash>/job-$SLURM_JOB_ID/caches/retread
+  #   -- so the store was JOB-SCOPED in every job of this campaign (C17.1) and
+  #   every relock paid twelve clones. Nobody decided that about Git snapshots:
+  #   RETREAD_CACHE_DIR is on fasttmp's scratch-cache list and the one root
+  #   deliberately exempted is the wheel blob store above.
+  #   MEASURED (LANE-SPEED-LOG C18.5, jobs 5763080 -> 5763081, 8 CPU/72G, SAME
+  #   node2350, one store): `canonical_git_snapshot` 992.0s / 54 rows -> 24.4s /
+  #   55 rows, `span_path="clone"` 12 rows -> ZERO, and the two pixi.lock files
+  #   are BYTE-IDENTICAL (md5 b69a046c1a034868ff6475c2115bbfc6).
+  #   TO TURN IT ON, a harness exports the fallback AFTER calling this function:
+  #     export RETREAD_GIT_SNAPSHOT_STORE=$RETREAD_PERSIST_CACHE_ROOT/git-snapshots
+  #   (the supported control is the pack config key `retread-git-snapshot-store`;
+  #   the env var exists so a harness never edits a pack manifest, which would
+  #   move that pack's build hash -- the same argument as the built-output store).
+  #   NOT SET HERE FOR THREE REASONS, each of which must be closed first:
+  #     (a) CLOSED 2026-09-04 09:20. C18 is MERGED: `integration/4.12` = 75a3357
+  #         carries `0e4eced` (fix set 11), gate 1715/0/21. Binaries from that tip
+  #         onward read the key; older binsnaps still ignore it, so a harness
+  #         pinned to an older binsnap must not quote a saving from setting it.
+  #         MEASURED ACROSS JOBS AND NODES, not within one job (which is all C18's
+  #         own proof showed) -- `bench: canonical_git_snapshot`, ANSI-stripped,
+  #         from the BACKEND log, never the lock.log (which carries only ~6 of the
+  #         ~55 rows and will read 0 clones on a run that cloned twelve times):
+  #             MB3 5765718  no store        55 rows  12 clone  910 829 ms
+  #             MB5 5771099  store, 25 dirs  54 rows   1 clone   27 066 ms
+  #             MB5 5771101  store, 27 dirs  54 rows   0 clone   17 456 ms
+  #         MB3 is the non-vacuity control and lands on C18's own cold reference
+  #         (12 clones / 992 043 ms) almost exactly. All three locks are
+  #         resolution-identical: `env_version_delta` moved=0 over all 27 envs in
+  #         every pairing, including against MI1 5749049 and C18P1 5763080.
+  #         STILL NOT EXPORTED HERE, because of (c) below: this line turns the
+  #         store on for EVERY lane at once, and nothing deletes from it. The
+  #         production call site is `mergeB5/mb5_relock.sh`, which exports it and
+  #         GATES on `stat -c %d` first, and that is the shape to copy.
+  #     (b) HARDLINK/EXDEV. The private per-entry build tree is hardlinked out of
+  #         the canonical tree and `link(2)` returns EXDEV across filesystems, so
+  #         a store on a different device from RETREAD_BUILD_ROOT silently costs
+  #         the farm and falls back to a full checkout. Every harness here has
+  #         both on hpcnfs:/oscar, but a harness that sets this must GATE on
+  #         `stat -c %d` agreeing, not assume it. (C16, merged 09-04, deletes the
+  #         farm -- re-read this clause against that tip before trusting it.)
+  #     (c) NOTHING REAPS IT. **This is now the ONLY thing between the key and a
+  #         default-on export here, and it is boarded as C18-1.** Twelve full worktrees per manifest revision, a new
+  #         entry per commit of any git source, no eviction anywhere, on a
+  #         filesystem whose inode quota read 100.00% on 2026-09-04. See the
+  #         INODES hazard above: rm -rf of this subtree is always safe, only slow.
+  #
   # Measured as no help (805.0s -> 828.2s route-probe union). Opt-in only.
   if [ "${RETREAD_FAST_ENV_PARALLEL_PROBES:-0}" = 1 ]; then
     export RETREAD_PARALLEL_PROBES=1
@@ -592,7 +646,17 @@ retread_freeze_channel_mirror () {
   [ -n "$chans" ] || { echo "retread_freeze_channel_mirror: FATAL no channel urls in $lock" >&2; return 2; }
 
   mkdir -p "$dst" || return 2
-  local t0 c s name base tmp bytes docs=0 fetched=0 total=0
+  # p6af-2. The shard cache only indexes a (channel, subdir) pair some solve on
+  # this machine actually fetched: the canonical workspace declares 21 pairs and
+  # the shared cache carried 19, so a strict merge aborts the whole freeze on two
+  # pairs that contribute no records to the lock either. With
+  # RETREAD_MIRROR_ALLOW_MISSING_INDEX=1 such a pair is mirrored WITHOUT
+  # run_exports and counted in `pairs_no_index` on the census line below -- the
+  # reader, so a pair that lost its run_exports can never be silent. Default is
+  # STRICT, unchanged.
+  local mflags=""
+  [ "${RETREAD_MIRROR_ALLOW_MISSING_INDEX:-0}" = 1 ] && mflags=--allow-missing-index
+  local t0 c s name base tmp bytes docs=0 fetched=0 total=0 noidx=0
   t0=$(date +%s)
   for c in $chans; do
     # The mirror directory is keyed on HOST AND PATH, never on the last segment:
@@ -611,8 +675,12 @@ retread_freeze_channel_mirror () {
       curl -fsSL "$c/$s/repodata.json" -o "$tmp" || {
         echo "retread_freeze_channel_mirror: FATAL fetch failed $c/$s/repodata.json" >&2; return 3; }
       fetched=$((fetched+1))
-      python3 "$merge" "$tmp" "$dst/$name/$s/repodata.json" "$pxcache" "$base/$s/" \
-        || { echo "retread_freeze_channel_mirror: FATAL run_exports merge failed for $name/$s" >&2; return 3; }
+      python3 "$merge" "$tmp" "$dst/$name/$s/repodata.json" "$pxcache" "$base/$s/" $mflags \
+        2> "$dst/$name/$s/.merge.stderr" \
+        || { echo "retread_freeze_channel_mirror: FATAL run_exports merge failed for $name/$s" >&2
+             cat "$dst/$name/$s/.merge.stderr" >&2; return 3; }
+      cat "$dst/$name/$s/.merge.stderr" >&2
+      grep -q 'index=absent' "$dst/$name/$s/.merge.stderr" && noidx=$((noidx+1))
       rm -f "$tmp"
       bytes=$(stat -c %s "$dst/$name/$s/repodata.json")
       total=$((total+bytes)); docs=$((docs+1))
@@ -625,7 +693,7 @@ retread_freeze_channel_mirror () {
   local digest
   digest=$( (cd "$dst" && find . -name repodata.json -printf '%P\n' | sort | while read -r p; do
               echo "$p $(sha256sum "$p" | cut -d' ' -f1)"; done) | sha256sum | cut -d' ' -f1)
-  echo "### channel_mirror frozen dst=$dst docs=$docs fetched=$fetched bytes=$total wall=$(( $(date +%s)-t0 ))s digest=$digest"
+  echo "### channel_mirror frozen dst=$dst docs=$docs fetched=$fetched pairs_no_index=$noidx bytes=$total wall=$(( $(date +%s)-t0 ))s digest=$digest"
   if [ "$docs" -eq 0 ]; then
     echo "retread_freeze_channel_mirror: FATAL no documents written" >&2; return 4
   fi
@@ -678,11 +746,38 @@ retread_pixi_mirror_config () {
     /users/glvov|/users/glvov/*) echo "retread_pixi_mirror_config: REFUSING to write the real HOME: $jobhome" >&2; return 2;;
   esac
   mkdir -p "$jobhome/.pixi" || return 2
+  # THE KEY MUST BE THE SAME ONE retread_freeze_channel_mirror BUILT: host AND
+  # path, scheme stripped, slashes to `__`. Until 2026-09-04 the sed program in
+  # here was written inside a double-quoted string as `s|^https\\?://||`, which
+  # reaches sed as `\\?` -- a literal backslash followed by a literal `?` -- so
+  # the scheme was NOT stripped and every mirror URL named a directory called
+  # `https:____prefix.dev__conda-forge` that the freeze had never created. Every
+  # request would have 404'd. It was never caught because the guard writes its
+  # own `[mirrors]` line inline and so never called this function. The reader is
+  # the 200-check at the bottom of this function, which is only possible because
+  # the mirror is already being served when the config is written.
+  local names=""
   { echo "[mirrors]"
     grep -o '^ *- url: https://[^ ]*' "$lock" | sed 's/.*url: //' | sed 's:/*$::' | sort -u |
       while read -r c; do
-        echo "\"$c\" = [\"$RETREAD_MIRROR_URL/$(printf '%s' "$c" | sed 's|^https\\?://||; s|/|__|g')\"]"
+        echo "\"$c\" = [\"$RETREAD_MIRROR_URL/$(printf '%s' "$c" | sed -e 's|^https\?://||' -e 's|/|__|g')\"]"
       done
   } > "$jobhome/.pixi/config.toml"
   echo "### channel_mirror config $jobhome/.pixi/config.toml channels=$(grep -c '^"' "$jobhome/.pixi/config.toml")"
+
+  # READER. Every mirror base this config names must be a directory the server
+  # actually serves. A config that points at a directory the freeze never wrote
+  # is not a mis-configuration that shows up later as a slow lock -- it is a
+  # lock that cannot resolve a single package, an hour into a job.
+  local bad=0 base
+  names=$(sed -n 's/.*= \["\([^"]*\)"\].*/\1/p' "$jobhome/.pixi/config.toml")
+  for base in $names; do
+    if curl -fs -o /dev/null "$base/"; then
+      echo "### channel_mirror config check 200 $base/"
+    else
+      echo "retread_pixi_mirror_config: FATAL mirror base not served: $base/ (the freeze never wrote this directory)" >&2
+      bad=1
+    fi
+  done
+  [ "$bad" -eq 0 ] || return 3
 }

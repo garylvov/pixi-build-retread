@@ -11,13 +11,24 @@ carry the field across at freeze time.
 
     merge_run_exports.py <src repodata.json> <dst repodata.json> \
                          <pixi repodata cache dir> <base_url prefix>
+                         [--allow-missing-index]
+
+`--allow-missing-index` (p6af-2, 2026-09-04). The shard cache only holds an
+index for a (channel, subdir) pair some solve on this machine actually FETCHED.
+The canonical workspace declares 7 channels x 3 subdirs = 21 pairs and the
+shared cache carried 19 indices, so a strict run aborts the whole freeze on the
+two pairs no solve ever touched -- pairs that, by construction, contribute no
+records to the lock either. With the flag such a pair is copied through with NO
+run_exports and says so on its census line (`index=absent`), which is the reader
+for it: a pair that silently lost its run_exports would otherwise be invisible.
+Strict remains the DEFAULT so the existing guard's behaviour is unchanged.
 """
 import sys, os, glob, json
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pixi_shard_cache import load_index, load_shard
 
 
-def run_exports_map(cache_dir, base_url):
+def run_exports_map(cache_dir, base_url, allow_missing=False):
     idx_path = None
     for p in glob.glob(os.path.join(cache_dir, "*.shards-cache-v1")):
         try:
@@ -28,6 +39,10 @@ def run_exports_map(cache_dir, base_url):
             idx_path = p
             break
     if idx_path is None:
+        if allow_missing:
+            sys.stderr.write("run_exports_map base_url=%s index=absent shards_present=0 "
+                             "shards_absent=0 records=0\n" % base_url)
+            return None
         raise SystemExit("no shard index for base_url %s under %s" % (base_url, cache_dir))
     _, idx = load_index(idx_path)
     shard_dir = os.path.join(cache_dir, "shards-v1")
@@ -49,8 +64,12 @@ def run_exports_map(cache_dir, base_url):
 
 
 def main():
-    src, dst, cache_dir, base_url = sys.argv[1:5]
-    rmap = run_exports_map(cache_dir, base_url)
+    args = [a for a in sys.argv[1:] if a != "--allow-missing-index"]
+    allow_missing = "--allow-missing-index" in sys.argv[1:]
+    src, dst, cache_dir, base_url = args[:4]
+    rmap = run_exports_map(cache_dir, base_url, allow_missing)
+    if rmap is None:
+        rmap = {}
     n = 0
     with open(src) as f, open(dst, "w") as o:
         pending = None
