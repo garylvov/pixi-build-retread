@@ -44,6 +44,18 @@ export XDG_DATA_HOME="$A/privhome/home/.local/share" XDG_CONFIG_HOME="$A/privhom
 export CARGO_HOME=/users/glvov/.cargo RUSTUP_HOME=/users/glvov/.rustup
 export PATH="$CARGO_HOME/bin:$PATH"
 export CARGO_TERM_COLOR=never
+# p6ad-6 ROOT FIX. The gate already redirects HOME/XDG_* at a private tree so a
+# unit test cannot reach the operator's real caches -- but RATTLER_CACHE_DIR
+# OVERRIDES HOME for exactly the cache that matters here (`repodata::
+# dirs_cache_root`), and it arrives from the submit environment through
+# `sbatch --export=ALL`. Measured: it points at
+# /oscar/data/stellex/glvov/.cache/rattler, whose `retread-repodata/` holds the
+# live shared snapshot, so `cargo test --lib` was one call away from hashing
+# ~900 MB of a SHARED, MOVING store -- a test whose value depends on what
+# another lane last fetched. Unset here, with the other rattler/pixi roots that
+# have the same shape, so the private HOME is genuinely the only cache root a
+# test can see.
+unset RATTLER_CACHE_DIR PIXI_CACHE_DIR CONDA_PKGS_DIRS
 J=${JOBS:-8}
 export CARGO_BUILD_JOBS=$J
 unset RUST_LOG
