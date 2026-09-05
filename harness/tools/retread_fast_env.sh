@@ -230,6 +230,159 @@ retread_fast_env () {
   echo "retread_fast_env: RETREAD_BUILT_OUTPUT_STORE=$RETREAD_BUILT_OUTPUT_STORE"
 }
 
+########## retread_freeze_repodata -- A PER-QUEUE FROZEN CONDA UNIVERSE ########
+# Snapshot the repodata cache ONCE per job into a job-scoped root, point retread
+# at it, and stop every refresh for the life of the job.
+#
+#     retread_freeze_repodata <src cache root> <dst cache root>
+#
+# THE DEFECT IT CLOSES (MH-1, boarded 23:50 09-03; p6ac-1, boarded 20:45 09-04).
+# `retread_fast_env` points RATTLER_CACHE_DIR at ONE persistent root that every
+# lane shares, and `repodata::build_sparse` refreshes any document older than
+# `REPODATA_TTL` (30 minutes). So a relock that runs for an hour resolves its
+# first bundles against one conda universe and its later ones against another,
+# and two proof relocks hours apart are not comparable at all. MEASURED tonight
+# while p6ad was being built: `pixi-build-retread repodata-universe` read the
+# shared cache's conda-forge linux-64 document at 638 500 357 B, and fifteen
+# minutes later at 638 505 040 B with a different sha256. Nothing in the lock
+# says which one it used. MH.4 charges this class one 75-minute control; C22-3
+# is the same family with a 503 as the trigger.
+#
+# WHAT IT DOES
+#   1. `rsync -aW` the repodata DOCUMENTS out of <src>/retread-repodata into
+#      <dst>/retread-repodata. Documents only: the `.…retread-fetch-v1.lock`
+#      sidecars and the `.…retread-universe-v1.json` memos are excluded, for the
+#      same reason `retread_seed_wheel_store` excludes fill locks -- a snapshot
+#      must not carry another job's in-flight state. No refresh, no network.
+#   2. Export RATTLER_CACHE_DIR=<dst>, which is exactly what
+#      `repodata::cache_root_from` reads, so retread consults the snapshot.
+#   3. Export RETREAD_REPODATA_FROZEN=1, so `repodata::build_sparse` never
+#      refreshes and a pair MISSING from the snapshot is a loud not-consulted
+#      rather than a quiet fetch that would silently unfreeze the universe.
+#   4. Print the job header with the universe digest, computed BY THE BINARY
+#      (`pixi-build-retread repodata-universe`), not by this script. One
+#      implementation of the fold: a shell that folded `sha256sum` its own way
+#      would be a second comparison rule, and the first time the two disagreed
+#      the disagreement would read as a moved universe.
+#
+# WHY `rsync -aW` AND NEVER `cp -al`, unchanged from `retread_seed_wheel_store`:
+# a hardlink shares the inode, so a write through the "frozen" copy is a write
+# to the shared cache and creating one bumps the ctime of an inode other live
+# lanes are reading (the p6k-b burn). `-W` forces a whole-file byte copy.
+#
+# COST, and it is the honest trade: the two conda-forge documents are ~892 MB,
+# so a freeze costs one 892 MB copy per job and ~0.9 GB of scratch. Measured
+# sha256 of the pair on node2341: 4.01 s + 1.52 s.
+#
+# WHAT IT DOES **NOT** FREEZE -- READ THIS BEFORE CLAIMING A FROZEN RUN.
+#   * PIXI's own repodata is a DIFFERENT CACHE and this function does not touch
+#     it. Retread reads `<RATTLER_CACHE_DIR>/retread-repodata/*.json` (full
+#     decompressed documents, 892 MB on the shared root); pixi reads
+#     `<PIXI_CACHE_DIR>/repodata/*.shards-cache-v1` (the sharded protocol, 2 MB
+#     of index on the same root). Neither reads the other's files.
+#   * Pixi 0.73.0 HAS NO OFFLINE OR NO-REFRESH CONTROL. Measured, not recalled:
+#     `pixi lock --help` offers `--json --check --dry-run` and nothing else, and
+#     the supported config keys are `cache.root`, `cache.repodata`, `mirrors`,
+#     `repodata-config.{disable-bzip2,disable-sharded,disable-zstd}`, … with no
+#     offline key anywhere in the list. `cache.repodata` (or PIXI_CACHE_DIR)
+#     REDIRECTS pixi's repodata cache; it does not stop the gateway
+#     revalidating it over the network on the next solve, so a redirected cache
+#     is reuse, not a freeze.
+#   * `--frozen` IS NOT THIS. In pixi it means "install from the lock without
+#     re-solving", so it does not apply to a relock at all; using the word for
+#     both is how this gets miscommunicated.
+#   * The ONE mechanism that genuinely freezes pixi is `mirrors`, mapping the
+#     channel URL to a local `file://` snapshot -- a real static mirror, which
+#     for conda-forge means hosting the repodata (and, under the sharded
+#     protocol, the shard index) locally. That is a bigger build than p6ad and
+#     it is BOARDED, not shipped.
+#   So: a frozen run freezes the half that decides the vendored set (retread's
+#   route probes and co-solves) and records the other half's provenance rather
+#   than controlling it.
+#
+# It prints exactly ONE census line and then ASSERTS on it: non-zero if no
+# document arrived, if a fetch lock or a memo survived, or if any destination
+# document has a link count other than 1 -- the direct positive reader for the
+# "byte copy, not hardlink" claim above.
+retread_freeze_repodata () {
+  local src=${1:-} dst=${2:-}
+  if [ -z "$src" ] || [ -z "$dst" ]; then
+    echo "retread_freeze_repodata: usage: retread_freeze_repodata <src cache root> <dst cache root>" >&2
+    return 2
+  fi
+  local srcd=$src/retread-repodata dstd=$dst/retread-repodata
+  if [ ! -d "$srcd" ]; then
+    echo "retread_freeze_repodata: FATAL source has no repodata cache: $srcd" >&2
+    return 2
+  fi
+  mkdir -p "$dstd" || { echo "retread_freeze_repodata: FATAL cannot create $dstd" >&2; return 2; }
+
+  local t0 rc wall
+  t0=$(date +%s)
+  # rc 24 ("some files vanished") is ACCEPTED for the same reason as in
+  # retread_seed_wheel_store: a concurrent lane republishing a document races
+  # the walk, and a document that vanished was not part of the frozen set.
+  # RULE ORDER IS LOAD-BEARING: rsync takes the FIRST matching rule, and the
+  # content-hash memo is named `.<doc>.json.retread-universe-v1.json`, i.e. it
+  # ends in `.json`. `--include='*.json'` first would therefore copy the memos
+  # in, and a memo copied in describes the SOURCE file's stat tuple -- which is
+  # exactly the poisoned-memo case the retread guards refuse. Dotfiles are
+  # excluded FIRST.
+  rsync -aW --exclude='.*' --exclude='*.part.*' --include='*.json' \
+        --exclude='*' "$srcd/" "$dstd/"
+  rc=$?
+  wall=$(( $(date +%s) - t0 ))
+  if [ "$rc" != 0 ] && [ "$rc" != 24 ]; then
+    echo "retread_freeze_repodata: FATAL rsync rc=$rc src=$srcd dst=$dstd (only 0 and 24 are OK)" >&2
+    return 3
+  fi
+
+  local docs locks memos hard bytes
+  docs=$(find "$dstd" -maxdepth 1 -type f -name '*.json' ! -name '.*' 2>/dev/null | wc -l)
+  locks=$(find "$dstd" -maxdepth 1 -name '.*retread-fetch-v1.lock' 2>/dev/null | wc -l)
+  memos=$(find "$dstd" -maxdepth 1 -name '.*retread-universe-v1.json' 2>/dev/null | wc -l)
+  bytes=$(du -sb "$dstd" 2>/dev/null | cut -f1)
+  hard=$(find "$dstd" -maxdepth 1 -type f -name '*.json' -printf '%n\n' 2>/dev/null | { grep -vc '^1$' || true; })
+  [ -n "$hard" ] || hard=0
+
+  echo "### repodata frozen src=$srcd dst=$dstd docs=$docs bytes=$bytes fetch_locks=$locks memos=$memos hardlinks=$hard rc=$rc wall=${wall}s"
+
+  local bad=0
+  if [ "$docs" -le 0 ]; then
+    echo "retread_freeze_repodata: FATAL no repodata documents under $dstd -- there is nothing to freeze" >&2
+    bad=1
+  fi
+  if [ "$locks" -ne 0 ]; then
+    echo "retread_freeze_repodata: FATAL $locks fetch-lock sidecar(s) survived into $dstd" >&2
+    bad=1
+  fi
+  if [ "$memos" -ne 0 ]; then
+    echo "retread_freeze_repodata: FATAL $memos content-hash memo(s) survived into $dstd -- a memo copied in describes the SOURCE file's stat tuple, not this one" >&2
+    bad=1
+  fi
+  if [ "$hard" -ne 0 ]; then
+    echo "retread_freeze_repodata: FATAL $hard document(s) under $dstd have a link count != 1 -- a HARDLINK survived, this snapshot is not isolated from $srcd" >&2
+    bad=1
+  fi
+  [ "$bad" -eq 0 ] || return 4
+
+  export RATTLER_CACHE_DIR=$dst
+  export RETREAD_REPODATA_FROZEN=1
+  echo "retread_freeze_repodata: RATTLER_CACHE_DIR=$RATTLER_CACHE_DIR RETREAD_REPODATA_FROZEN=1"
+
+  # THE JOB HEADER. Printed by the binary, so it uses the same fold the backend
+  # rows use. A binary that cannot print it is not fatal to the freeze -- the
+  # freeze is the rsync and the two exports -- but it IS reported, because a
+  # frozen run whose header nobody can read is a run nobody can explain later.
+  local snap=${RETREAD_FREEZE_BINARY:-}
+  if [ -n "$snap" ] && [ -x "$snap" ]; then
+    "$snap" repodata-universe --cache-root "$dst" || \
+      echo "retread_freeze_repodata: WARNING $snap repodata-universe failed; no universe digest in this job header" >&2
+  else
+    echo "retread_freeze_repodata: WARNING RETREAD_FREEZE_BINARY unset or not executable; no universe digest in this job header" >&2
+  fi
+}
+
 ########## retread_seed_wheel_store -- THE ONE WAY TO SEED A WHEEL STORE #######
 # Seed a JOB-SCOPED wheel store from a PERSISTENT one, as a BYTE COPY.
 #
