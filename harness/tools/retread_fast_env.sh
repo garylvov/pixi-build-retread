@@ -282,15 +282,28 @@ retread_fast_env () {
   else
     mkdir -p "$root/git-snapshots" || return 2
     local gs_dev br_dev br_probe
-    br_probe=${RETREAD_BUILD_ROOT:-$ws}
-    mkdir -p "$br_probe" 2>/dev/null || true
-    gs_dev=$(stat -c %d "$root/git-snapshots" 2>/dev/null) || gs_dev=
-    br_dev=$(stat -c %d "$br_probe" 2>/dev/null) || br_dev=
-    if [ -n "$gs_dev" ] && [ "$gs_dev" = "$br_dev" ]; then
-      export RETREAD_GIT_SNAPSHOT_STORE=$root/git-snapshots
-      echo "retread_fast_env: RETREAD_GIT_SNAPSHOT_STORE=$RETREAD_GIT_SNAPSHOT_STORE (dev $gs_dev == build root dev $br_dev)"
+    # C18-1-c, closed by MERGE-L in the same commit set that lands the flip.
+    # This gate used to read `br_probe=${RETREAD_BUILD_ROOT:-$ws}` -- i.e. when
+    # the caller had NOT declared a build root it silently gated against the
+    # WORKSPACE, which is not the directory the hardlink farm lands in. On this
+    # filesystem the two happen to share a device (both 48) so it was measured
+    # harmless, and that is exactly what makes it dangerous: an assumption
+    # wearing the clothes of a gate, correct today by coincidence. A gate that
+    # cannot see its own subject must REFUSE, not guess. The store is then left
+    # at the binary default and the run is slower, never wrong.
+    if [ -z "${RETREAD_BUILD_ROOT:-}" ]; then
+      echo "retread_fast_env: REFUSING the shared git snapshot store -- RETREAD_BUILD_ROOT is unset, so the same-device gate has nothing to compare the store against (it used to fall back to the workspace $ws, which is not where link(2) lands). Export RETREAD_BUILD_ROOT before this call, or set RETREAD_FAST_ENV_GIT_SNAPSHOT_STORE=0 to opt out deliberately." >&2
     else
-      echo "retread_fast_env: REFUSING the shared git snapshot store -- dev $gs_dev != build root ($br_probe) dev $br_dev; EXDEV would cost the hardlink farm" >&2
+      br_probe=$RETREAD_BUILD_ROOT
+      mkdir -p "$br_probe" 2>/dev/null || true
+      gs_dev=$(stat -c %d "$root/git-snapshots" 2>/dev/null) || gs_dev=
+      br_dev=$(stat -c %d "$br_probe" 2>/dev/null) || br_dev=
+      if [ -n "$gs_dev" ] && [ "$gs_dev" = "$br_dev" ]; then
+        export RETREAD_GIT_SNAPSHOT_STORE=$root/git-snapshots
+        echo "retread_fast_env: RETREAD_GIT_SNAPSHOT_STORE=$RETREAD_GIT_SNAPSHOT_STORE (dev $gs_dev == build root dev $br_dev)"
+      else
+        echo "retread_fast_env: REFUSING the shared git snapshot store -- dev $gs_dev != build root ($br_probe) dev $br_dev; EXDEV would cost the hardlink farm" >&2
+      fi
     fi
   fi
 

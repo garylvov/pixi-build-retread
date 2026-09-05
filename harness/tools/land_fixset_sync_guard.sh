@@ -62,6 +62,7 @@ HELPER=$REPO/harness/tools/fixset_land_row.sh
 LAND=$REPO/harness/tools/land.sh
 RREL=harness/tools/binsnap_fixset.txt
 LAND_OLD=${LAND_OLD:-efe74a0}   # the last commit carrying the task-copy-only append
+HELPER_OLD=${HELPER_OLD:-8e5b64a}  # MERGE-L-1: the last commit whose helper left MANIFEST.md5 stale
 LIVE_TASK_FIXSET=/oscar/data/stellex/glvov/agrescap/tasks/retread-4-11/tools/binsnap_fixset.txt
 WORK=${TMPDIR:-/tmp}/land-fixset-sync-guard-$$
 mkdir -p "$WORK"
@@ -90,8 +91,11 @@ mkfixture () {   # mkfixture <name> ; echoes "<repo> <taskdir>"
   git -C "$r" init -q
   git -C "$r" config user.email guard@example.invalid
   git -C "$r" config user.name  'fixset guard'
-  git -C "$r" add -- "$RREL"
-  git -C "$r" commit -q -m base -- "$RREL"
+  # MERGE-L-1: the fixture carries a MANIFEST.md5 with a row for the fix set,
+  # because that row is the thing every landing used to leave stale.
+  { md5sum "$r/$RREL" | awk '{print $1 "  tools/binsnap_fixset.txt"}'; } > "$r/harness/MANIFEST.md5"
+  git -C "$r" add -- "$RREL" harness/MANIFEST.md5
+  git -C "$r" commit -q -m base -- "$RREL" harness/MANIFEST.md5
   echo "$r $t"
 }
 
@@ -191,6 +195,35 @@ grep -qE '^8888888 ' "$RE/$RREL" && [ "$(git -C "$RE" log --oneline | wc -l)" = 
   && ok "the LIVE task fix set is unchanged ($LIVE_BEFORE)" \
   || bad "THE GUARD MODIFIED THE LIVE FIX SET -- was $LIVE_BEFORE"
 
+
+# ---- ARM F: MERGE-L-1 -- the landing must leave MANIFEST.md5 IN STEP ---------
+# The defect this arm exists for is on the record: commit 8e5b64a, the first
+# real landing through this helper, changed `harness/tools/binsnap_fixset.txt`
+# and NOTHING else, so `md5sum -c MANIFEST.md5` in the harness worktree went
+# dirty for a file nobody had hand-edited -- and the next lane inherits a
+# failure it did not cause. F1 asserts the manifest is clean after a landing;
+# F2 is the MUTATION: the PINNED pre-fix helper on the same fixture must leave
+# it dirty, or F1 cannot fail and is worthless.
+read -r RF TF < <(mkfixture F)
+bash "$HELPER" "$RF" "$TF" "$ROW1" > "$WORK/F.log" 2>&1
+( cd "$RF/harness" && md5sum -c MANIFEST.md5 >/dev/null 2>&1 ) \
+  && ok "F1: md5sum -c MANIFEST.md5 is clean after the landing" \
+  || { bad "F1: the landing left MANIFEST.md5 stale -- MERGE-L-1 is not fixed"; sed 's/^/      /' "$WORK/F.log"; }
+[ -z "$(git -C "$RF" status --porcelain -- harness/MANIFEST.md5)" ] \
+  && ok "F1: the manifest row was COMMITTED, not left dirty for a human" \
+  || bad "F1: the manifest row is uncommitted after the landing"
+
+if git -C "$REPO" cat-file blob "$HELPER_OLD:harness/tools/fixset_land_row.sh" > "$WORK/helper_old.sh" 2>/dev/null; then
+  read -r RG TG < <(mkfixture G)
+  bash "$WORK/helper_old.sh" "$RG" "$TG" "$ROW1" > "$WORK/G.log" 2>&1
+  if ( cd "$RG/harness" && md5sum -c MANIFEST.md5 >/dev/null 2>&1 ); then
+    bad "F2: the PINNED pre-fix helper ALSO left the manifest clean -- F1 cannot fail"
+  else
+    ok "F2: the pinned pre-fix helper reproduces the stale manifest, so F1 is a real assertion"
+  fi
+else
+  bad "F2: could not extract $HELPER_OLD:harness/tools/fixset_land_row.sh -- MUTATION ARM DID NOT RUN"
+fi
 echo "### land_fixset_sync_guard: pass=$pass fail=$fail"
 [ "$fail" -eq 0 ] || exit 1
 exit 0

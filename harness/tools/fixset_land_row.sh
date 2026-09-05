@@ -63,6 +63,15 @@ RREL=harness/tools/binsnap_fixset.txt
 RPATH=$REPO/$RREL
 TPATH=$TASK/tools/binsnap_fixset.txt
 KEY=${ROW%% *}
+MREL=harness/MANIFEST.md5
+MPATH=$REPO/$MREL
+MKEY=tools/binsnap_fixset.txt
+# MERGE-L-1. `md5sum -c MANIFEST.md5` has been DIRTY in the harness worktree
+# since the first landing that used this helper (8e5b64a: one file changed,
+# MANIFEST.md5 untouched) -- the manifest is the reader that says the tree is
+# what it claims, and a landing that silently invalidates it hands the next
+# lane a failure it did not cause. The row is rewritten and committed in the
+# SAME path-limited commit as the fix set, so the two can never disagree.
 
 case "$KEY" in
   ''|"$ROW") echo "### FIXSET REFUSE: row '$ROW' is not '<sha> <name>'"; exit 2;;
@@ -86,7 +95,7 @@ fi
 
 # A path-limited commit would sweep in an uncommitted edit somebody else is
 # holding in this file. Refuse instead of stealing it.
-if ! git -C "$REPO" diff --quiet -- "$RREL" || ! git -C "$REPO" diff --cached --quiet -- "$RREL"; then
+if ! git -C "$REPO" diff --quiet -- "$RREL" "$MREL" || ! git -C "$REPO" diff --cached --quiet -- "$RREL" "$MREL"; then
   echo "### FIXSET REFUSE: $RREL has an uncommitted edit in $REPO -- committing the landed row"
   echo "###   would sweep somebody else's work into a merge-queue commit. Commit or drop it first."
   git -C "$REPO" status --porcelain -- "$RREL"
@@ -100,6 +109,16 @@ else
   BACKUP=$(mktemp "${TMPDIR:-/tmp}/fixset_land_row.XXXXXX") || exit 3
   cp -f "$RPATH" "$BACKUP" || exit 3
   printf '%s\n' "$ROW" >> "$RPATH"
+  if [ -f "$MPATH" ] && grep -qE "  ${MKEY}\$" "$MPATH"; then
+    NEWMD5=$(md5sum "$RPATH" | awk '{print $1}')
+    TMPM=$(mktemp "${TMPDIR:-/tmp}/fixset_manifest.XXXXXX") || exit 3
+    awk -v k="$MKEY" -v m="$NEWMD5" '{ if ($2 == k) print m "  " k; else print }' "$MPATH" > "$TMPM" \
+      && mv -f "$TMPM" "$MPATH" || { echo "### FIXSET FATAL: could not rewrite $MPATH"; cp -f "$BACKUP" "$RPATH"; exit 3; }
+    MPATHS=("$RREL" "$MREL")
+  else
+    echo "### FIXSET WARN: no $MKEY row in $MPATH -- committing the fix set alone"
+    MPATHS=("$RREL")
+  fi
   MSG=$(mktemp "${TMPDIR:-/tmp}/fixset_land_msg.XXXXXX") || exit 3
   {
     printf 'harness: carry %s into the versioned fix set (MERGE-K-2)\n\n' "$KEY"
@@ -108,7 +127,7 @@ else
     printf 'row: %s\n' "$ROW"
   } > "$MSG"
   # -F, never -m: a `-m` message with punctuation in it has bitten this campaign.
-  if ! git -C "$REPO" commit -q -F "$MSG" -- "$RREL"; then
+  if ! git -C "$REPO" commit -q -F "$MSG" -- "${MPATHS[@]}"; then
     echo "### FIXSET FATAL: the commit failed -- restoring $RPATH and touching nothing else"
     cp -f "$BACKUP" "$RPATH"; rm -f "$BACKUP" "$MSG"; exit 3
   fi
