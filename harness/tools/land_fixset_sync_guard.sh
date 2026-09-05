@@ -44,7 +44,20 @@
 set -uo pipefail
 export PATH=/users/glvov/.pixi/bin:/users/glvov/.local/bin:$PATH
 HERE=$(cd -- "$(dirname -- "$0")" && pwd)
-REPO=$(cd -- "$HERE/../.." && pwd)
+# WHERE THE REPO IS. `$HERE/../..` is the repo when this guard runs from the
+# harness worktree -- but the task-dir copy the drift check syncs lives at
+# `<task>/tools/`, where `$HERE/../..` is `/oscar/data/stellex/glvov/agrescap/tasks`
+# and every arm died `FATAL: no gate at .../tasks/harness/...`. A synced copy that
+# can only ever FATAL is a file with no reader. `HARNESS_REPO` wins (same variable
+# harness_drift_check.sh uses for the same thing); otherwise the relative guess is
+# TESTED and the campaign worktree is the fallback. The guard always exercises the
+# VERSIONED file -- the drift check is what proves the task copy equals it.
+REPO=${HARNESS_REPO:-}
+[ -n "$REPO" ] || REPO=$(cd -- "$HERE/../.." && pwd)
+if [ ! -d "$REPO/harness/tools" ] || ! git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
+  REPO=/oscar/data/stellex/glvov/agrescap/worktrees/harness-tools
+fi
+[ -d "$REPO/harness/tools" ] || { echo "FATAL: no harness repo at $REPO"; exit 3; }
 HELPER=$REPO/harness/tools/fixset_land_row.sh
 LAND=$REPO/harness/tools/land.sh
 RREL=harness/tools/binsnap_fixset.txt
