@@ -50,7 +50,9 @@ c56251e11ce8ab1bd8b807c395265fd4  tools/conda_deny_proxy.py
 7783cc47f9e8ad2503fd44950cd43013  tools/env_version_delta.py
 6a84c103a8be7b1f24d9fc4d46130379  tools/fast_env_snapshot_gate_guard.sh
 e09842a2b51059632dd6cae8e1263fae  tools/fixset_land_row.sh
-9ef287b13c05205160e79b5d6638bcde  tools/gate_build.sh
+6fd8a3d08d3acd5db8e19ce290e7e8fa  tools/gate_build.sh
+78f0ff8acec5a5036fd78e9cbe406ad3  tools/gate_head_pin_guard.sh
+de2c918a31b7e5fdae517cda1ccba4d4  tools/gate_head_pin.sh
 447037c0b4249d9d3d7c084940be5cc4  tools/harness_drift_allowlist.txt
 5941de23b36deaa3aa72d37cbc3a312b  tools/harness_drift_check.sh
 39e620e807735bdc65b09fb8078d8e82  tools/import_audit.py

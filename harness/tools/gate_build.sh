@@ -28,13 +28,29 @@
 #      debug codegen on top of a build the gate is doing anyway, and the
 #      refusal names EVERY broken target rather than only the first.
 #
+#   5. THE GATE IS PINNED TO A COMMIT, AT BOTH ENDS OF THE BUILD (L3-1b-5).
+#      $EXPECT_HEAD is REQUIRED and stated in the submit command, and
+#      `tools/gate_head_pin.sh` refuses unless the worktree's
+#      `git rev-parse --short HEAD` equals it AND the tree is clean -- once at
+#      entry and AGAIN immediately before the binsnap is named and written.
+#      Until now the dirty check ran once, at entry, and the binsnap took its
+#      name from a `git rev-parse --short HEAD` read fifteen to twenty-five
+#      minutes later: L3-1b's job 5918073 had a commit land in its worktree
+#      mid-build, and 5918567 wrote `binsnaps/cand-9fc0d7d` holding a binary
+#      built from a DIFFERENT commit, exit 0, nothing noticed. A binsnap that
+#      lies about which commit produced it poisons every proof that pins it.
+#
 # usage: WT=<worktree> D=<harness dir> SEED=<target to seed from> \
-#        EXPECT_PASS=<n> [EXPECT_IGNORED=21] bash gate_build.sh
+#        EXPECT_HEAD=<short sha> EXPECT_PASS=<n> [EXPECT_IGNORED=21] \
+#        bash gate_build.sh
 set -u
 T=/oscar/data/stellex/glvov/agrescap/tasks/retread-4-11
 : "${WT:?set WT to the candidate worktree}"
 : "${D:?set D to this harness directory}"
+: "${EXPECT_HEAD:?state the commit this gate is pinned to BEFORE the run (L3-1b-5)}"
 : "${EXPECT_PASS:?state the expected pass count BEFORE the run}"
+HEAD_PIN=$T/tools/gate_head_pin.sh
+[ -f "$HEAD_PIN" ] || { echo "### STOP: no head-pin check at $HEAD_PIN (L3-1b-5)"; exit 4; }
 EXPECT_IGNORED=${EXPECT_IGNORED:-21}
 SEED=${SEED:-}
 A=$D/artifacts
@@ -62,9 +78,12 @@ unset RUST_LOG
 cd "$WT" || exit 3
 echo "### host=$(hostname) $(date -Is) HEAD=$(git rev-parse HEAD) short=$(git rev-parse --short HEAD) dirty=$(git status --porcelain | wc -l) JOBS=$J"
 echo "### EXPECTED SPLIT (stated before the run): $EXPECT_PASS passed; 0 failed; $EXPECT_IGNORED ignored"
+echo "### HEAD PIN (stated before the run): $EXPECT_HEAD"
 
-DIRTY=$(git status --porcelain | wc -l)
-[ "$DIRTY" -eq 0 ] || { echo "### STOP: candidate worktree is dirty ($DIRTY paths) -- law 11"; exit 4; }
+# (5) entry half of the pin. Covers both "this worktree is not the commit the
+# gate was submitted for" and law 11's dirty refusal, in one reader.
+bash "$HEAD_PIN" "$WT" "$EXPECT_HEAD" entry || {
+  echo "### STOP: the candidate worktree is not the pinned commit at entry"; exit 4; }
 
 if [ ! -d "$WT/target" ] && [ -n "$SEED" ] && [ -d "$SEED" ]; then
   echo "### seeding target from $SEED"; S=$(date +%s)
@@ -125,6 +144,17 @@ echo "### split parsed: passed=$GOT_PASS failed=$GOT_FAIL ignored=$GOT_IGNORED"
 [ "${GOT_PASS:-x}" = "$EXPECT_PASS" ] || { echo "### STOP: split $GOT_PASS != predicted $EXPECT_PASS -- the guard sum does not reconcile"; exit 8; }
 [ "${GOT_FAIL:-x}" = "0" ] || { echo "### STOP: $GOT_FAIL failed in-suite"; exit 8; }
 [ "${GOT_IGNORED:-x}" = "$EXPECT_IGNORED" ] || { echo "### STOP: ignored $GOT_IGNORED != $EXPECT_IGNORED"; exit 8; }
+
+# (5) snapshot half of the pin -- the half that did not exist. Everything above
+# this line took fifteen to twenty-five minutes, and the binsnap below takes its
+# NAME from a fresh `rev-parse`. If the worktree moved or went dirty in that
+# window the binary on disk is not the commit the directory claims, so refuse
+# here rather than write the lie. This runs BEFORE the ancestry guard so a moved
+# worktree is named as a moved worktree and not as a missing fix.
+bash "$HEAD_PIN" "$WT" "$EXPECT_HEAD" snapshot || {
+  echo "### STOP: the worktree moved or went dirty DURING the build -- the binary is not $EXPECT_HEAD"
+  echo "### NOTHING IS SNAPSHOTTED. Re-run this gate against a --detach worktree pinned to the commit."
+  exit 12; }
 
 # (3) the ancestry guard, before any binsnap
 bash "$T/tools/binsnap_ancestry_guard.sh" "$WT" HEAD || { echo "### STOP: BINSNAP REFUSED by the ancestry guard"; exit 9; }
