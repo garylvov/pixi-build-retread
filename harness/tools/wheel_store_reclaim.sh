@@ -35,6 +35,7 @@ while [ $# -gt 0 ]; do
 done
 case "$STORE" in */wheels) ;; *) echo "REFUSING: $STORE does not end in /wheels"; exit 2;; esac
 [ -d "$STORE" ] || { echo "REFUSING: $STORE is not a directory"; exit 2; }
+JOB_FATAL=0
 
 TOTAL=0; POISON=0; YOUNG=0; RECLAIMED=0
 for d in "$STORE"/*/; do
@@ -53,8 +54,16 @@ for d in "$STORE"/*/; do
   echo "  RECLAIM $(stat -c '%y' "$lock" | cut -c1-16)  $d"
   if [ "$APPLY" = 1 ]; then
     rm -f "$lock" && rmdir "$d" 2>/dev/null
-    [ -d "$d" ] && echo "    WARN: directory not empty after lock removal, left in place" || RECLAIMED=$((RECLAIMED+1))
+    [ -d "$d" ] && { echo "    WARN: directory not empty after lock removal, left in place"; JOB_FATAL=1; } || RECLAIMED=$((RECLAIMED+1))
   fi
 done
-echo "store=$STORE entries=$TOTAL poisoned=$POISON kept_young=$YOUNG reclaimed=$RECLAIMED apply=$APPLY"
+echo "store=$STORE entries=$TOTAL poisoned=$POISON kept_young=$YOUNG reclaimed=$RECLAIMED apply=$APPLY job_fatal=$JOB_FATAL"
 [ "$APPLY" = 1 ] || echo "DRY RUN -- pass --apply to reclaim"
+# HARNESS-EXIT-2 (law 9). The reclaim's own refusal -- an entry it could not
+# return because something else is in it -- was a printed WARN and nothing
+# else, so a sweep that reclaimed nothing and left debris behind reported
+# COMPLETED 0:0 to Slurm exactly like a clean one. The loop still runs to the
+# end and still returns every entry it can (the WARN is not a stop), and every
+# printed line above is unchanged; the verdict now also reaches the scheduler.
+[ "$JOB_FATAL" = 0 ] || echo "REFUSED to fully reclaim at least one entry -- read the WARN lines above"
+exit "$JOB_FATAL"

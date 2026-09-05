@@ -17,7 +17,10 @@
 # whether the TLS knobs a terminating proxy would need are present -- that is
 # the sizing input for the fallback design.
 set -uo pipefail
-D=/oscar/data/stellex/glvov/agrescap/tasks/retread-4-11/p6af2h-phase1
+# HARNESS-EXIT-2: the root is argv-overridable so `driver_exit_guard.sh` can run
+# THIS FILE, unmodified, over a throwaway root. The default is the lane root and
+# is unchanged, so every existing call site behaves exactly as before.
+D=${1:-/oscar/data/stellex/glvov/agrescap/tasks/retread-4-11/p6af2h-phase1}
 A=$D/artifacts
 W=${SLURM_TMPDIR:-/tmp}/p6af2h-probe4-${SLURM_JOB_ID:-x}
 PIXI=$(command -v pixi || echo /users/glvov/.pixi/bin/pixi)
@@ -83,5 +86,16 @@ printf '[mirrors]\n"https://prefix.dev/conda-forge" = ["http://127.0.0.1:59999/c
 echo "### CONTROL lock rc=$? (want NON-ZERO: proves a dead endpoint IS fatal when the knob is live)"
 tail -6 "$W/ctl.log" | sed 's/^/###     /'
 
+
+# HARNESS-EXIT-2 (law 9). This probe used to end on an `echo`, so its exit
+# status was the echo's and Slurm recorded 0:0 even when the probe never ran at
+# all -- the same shape that let c181-dryrun (rc=8) and l3-2arm (job_fatal=1)
+# report COMPLETED. The per-arm rcs above are DATA (arms pointed at a dead port
+# are MEANT to fail and are not a job failure); what is fatal is the probe
+# itself not producing the baseline artifact it exists to compare against.
+# Every printed line above is unchanged.
+PROBE_FATAL=0
+[ -f "$W/ws-base/pixi.lock" ] || { echo "### PROBE4 FATAL: the BASELINE arm produced no lock -- every env-knob arm above is uninterpretable"; PROBE_FATAL=1; }
 rm -rf "$W"
-echo "### P6AF2H PROBE4 DONE $(date -Is)"
+echo "### P6AF2H PROBE4 DONE $(date -Is) probe_fatal=$PROBE_FATAL"
+exit "$PROBE_FATAL"

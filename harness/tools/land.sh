@@ -88,3 +88,9 @@ echo "### private now at: $(git -C "$REPO" ls-remote private refs/heads/integrat
 echo "### origin still carries none of our refs:"
 git -C "$REPO" ls-remote origin 'refs/heads/integration/*' 'refs/heads/fix/*' 2>&1 | head -3
 echo "### LANDED integration/4.12 $OLD -> $FULL"
+# HARNESS-EXIT-2 (law 9). Every refusal above exits non-zero, but the LAST
+# command here was an informational `git ls-remote origin`: a network blip on
+# that read used to decide the job's exit code, so a landing that fully
+# succeeded could report FAILED and a landing could not report anything else.
+# The verdict is the landing, and it is stated here.
+exit 0

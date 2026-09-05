@@ -23,7 +23,10 @@
 # Nothing here is a workaround and nothing is left running: it is three locks of
 # a two-package fixture in a scratch dir, read-only against everything of ours.
 set -uo pipefail
-D=/oscar/data/stellex/glvov/agrescap/tasks/retread-4-11/p6af2h-phase1
+# HARNESS-EXIT-2: the root is argv-overridable so `driver_exit_guard.sh` can run
+# THIS FILE, unmodified, over a throwaway root. The default is the lane root and
+# is unchanged, so every existing call site behaves exactly as before.
+D=${1:-/oscar/data/stellex/glvov/agrescap/tasks/retread-4-11/p6af2h-phase1}
 A=$D/artifacts
 W=${SLURM_TMPDIR:-/tmp}/p6af2h-probe2-${SLURM_JOB_ID:-x}
 PIXI=$(command -v pixi || echo /users/glvov/.pixi/bin/pixi)
@@ -88,4 +91,15 @@ for a in A B C; do
               || echo "###   arm=$a NO LOCK"
 done
 rm -rf "$W"
-echo "### P6AF2H PROBE2 DONE $(date -Is)"
+
+# HARNESS-EXIT-2 (law 9). This probe used to end on an `echo`, so its exit
+# status was the echo's and Slurm recorded 0:0 even when the probe never ran at
+# all -- the same shape that let c181-dryrun (rc=8) and l3-2arm (job_fatal=1)
+# report COMPLETED. The per-arm rcs above are DATA (arms pointed at a dead port
+# are MEANT to fail and are not a job failure); what is fatal is the probe
+# itself not producing the baseline artifact it exists to compare against.
+# Every printed line above is unchanged.
+PROBE_FATAL=0
+[ -f "$A/probe2-A.pixi.lock" ] || { echo "### PROBE2 FATAL: the BASELINE arm A produced no lock -- nothing above is a comparison"; PROBE_FATAL=1; }
+echo "### P6AF2H PROBE2 DONE $(date -Is) probe_fatal=$PROBE_FATAL"
+exit "$PROBE_FATAL"

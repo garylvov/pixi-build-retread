@@ -7,6 +7,7 @@
 #
 # It edits a COPY of the worktree under $ARMS and never touches the branch.
 set +u
+JOB_FATAL=0
 WT=${WT:-/oscar/data/stellex/glvov/agrescap/worktrees/fix-p6ad}
 ARMS=${ARMS:-/oscar/data/stellex/glvov/agrescap/tasks/retread-4-11/p6ad-work/arms}
 export PATH="$HOME/.cargo/bin:$PATH"
@@ -19,7 +20,7 @@ run_arm () {                       # run_arm <name> <python mutation script or -
   # purpose (one build cache, many arms) via CARGO_TARGET_DIR.
   cp -a "$WT/src" "$WT/Cargo.toml" "$WT/Cargo.lock" "$WT/build.rs" \
         "$WT/rust-toolchain.toml" "$WT/recipe" "$WT/tests" "$WT/examples" "$dir/" 2>/dev/null
-  if [ "$mutate" != "--" ]; then python3 "$mutate" "$dir/src" || { echo "$name: MUTATION DID NOT APPLY"; return 9; }; fi
+  if [ "$mutate" != "--" ]; then python3 "$mutate" "$dir/src" || { echo "$name: MUTATION DID NOT APPLY"; JOB_FATAL=1; return 9; }; fi
   ( cd "$dir" && CARGO_TARGET_DIR="$ARMS/target" cargo test --lib p6ad 2>&1 | tail -25 ) > "$dir/out.txt" 2>&1
   echo "--- $name ---"
   grep -E '^test (repodata|handler)::tests::p6ad|^test result|^error' "$dir/out.txt" | tail -20
@@ -90,3 +91,12 @@ case "${1:-all}" in
   *) run_arm baseline --
      run_arm mutA "$A"; run_arm mutB "$B"; run_arm mutC "$C"; run_arm mutD "$D"; run_arm mutE "$E" ;;
 esac
+
+# HARNESS-EXIT-2 (law 9). Before this block the script's exit status was the rc
+# of whichever arm happened to run LAST, so an arm that could not even be built
+# -- `MUTATION DID NOT APPLY`, the one failure that makes every verdict above
+# meaningless -- was thrown away for arms A..D and the job reported 0:0 to
+# Slurm. Every printed line above is unchanged; the verdict now reaches the
+# scheduler as well as the log.
+echo "### p6ad_negctl JOB_FATAL=$JOB_FATAL"
+exit "$JOB_FATAL"

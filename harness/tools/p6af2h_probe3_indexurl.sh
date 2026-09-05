@@ -11,7 +11,10 @@
 #      fail (nothing can serve `idna`); if it locks anyway from pypi.org, the
 #      key is inert for locking. Either answer is decisive; a silent pass is not.
 set -uo pipefail
-D=/oscar/data/stellex/glvov/agrescap/tasks/retread-4-11/p6af2h-phase1
+# HARNESS-EXIT-2: the root is argv-overridable so `driver_exit_guard.sh` can run
+# THIS FILE, unmodified, over a throwaway root. The default is the lane root and
+# is unchanged, so every existing call site behaves exactly as before.
+D=${1:-/oscar/data/stellex/glvov/agrescap/tasks/retread-4-11/p6af2h-phase1}
 A=$D/artifacts
 W=${SLURM_TMPDIR:-/tmp}/p6af2h-probe3-${SLURM_JOB_ID:-x}
 PIXI=$(command -v pixi || echo /users/glvov/.pixi/bin/pixi)
@@ -90,4 +93,17 @@ echo "### ARM G lock rc=$?"
   || { echo "### ARM G NO LOCK -- tail:"; tail -15 "$W/G.log" | sed 's/^/###     /'; }
 
 rm -rf "$W"
-echo "### P6AF2H PROBE3 DONE $(date -Is)"
+
+# HARNESS-EXIT-2 (law 9). This probe used to end on an `echo`, so its exit
+# status was the echo's and Slurm recorded 0:0 even when the probe never ran at
+# all -- the same shape that let c181-dryrun (rc=8) and l3-2arm (job_fatal=1)
+# report COMPLETED. The per-arm rcs above are DATA (arms pointed at a dead port
+# are MEANT to fail and are not a job failure); what is fatal is the probe
+# itself not producing the baseline artifact it exists to compare against.
+# Every printed line above is unchanged.
+PROBE_FATAL=0
+for a in D G; do
+  [ -f "$A/probe3-$a.pixi.lock" ] || { echo "### PROBE3 FATAL: baseline arm $a produced no lock -- nothing above is a comparison"; PROBE_FATAL=1; }
+done
+echo "### P6AF2H PROBE3 DONE $(date -Is) probe_fatal=$PROBE_FATAL"
+exit "$PROBE_FATAL"

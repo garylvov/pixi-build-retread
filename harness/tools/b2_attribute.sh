@@ -27,3 +27,8 @@ for p in cyclonedds networkx etils opencv-python mujoco onnxruntime gym pillow \
   vn=$(grep -oE "/${p}-[0-9][^-]*" "$B2"   | sed "s#/${p}-##" | sort -u | tr '\n' ',')
   [ "$vb" = "$vn" ] || printf '  %-16s baseline=[%s] b2=[%s]\n' "$p" "$vb" "$vn"
 done
+# HARNESS-EXIT-2 (law 9). This is a READER: its only refusal is the missing
+# baseline above (exit 2). Its last command was the version-drift loop, whose
+# rc is whatever the final `printf`/`[` happened to return -- an accident, not
+# a verdict. Stated explicitly so the accident cannot be read as one.
+exit 0
