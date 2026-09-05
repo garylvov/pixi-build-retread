@@ -750,11 +750,32 @@ retread_freeze_channel_mirror () {
 # keys without touching them. Measured: with imprint-data's config.toml copied
 # verbatim into the staged workspace, `pixi config list` showed all three keys
 # and the lock was still md5 373d726c8153ac4247905faf3362dd53.
+#
+# THE THIRD ARGUMENT (p6af-2a) IS WHAT MAKES A CANONICAL RELOCK POSSIBLE AT ALL.
+# `mirrors` is transparent for PACKAGE urls, not only for repodata: `pixi lock`
+# on the canonical workspace installs a conda-backed build environment to
+# resolve the pypi half of `pm-newton-gpu`, and job 5855746 died at wall 1634 s
+# on `GET /prefix.dev__conda-forge/linux-64/libcudnn-9.13.1.26-hf7e9902_0.conda
+# 404`.  With a <package store> the mirror fills such a request LAZILY from the
+# real channel, after checking the file against the sha256 in its OWN FROZEN
+# repodata document and refusing anything the frozen universe does not declare
+# (`channel_mirror_server.py` carries the full argument).  Without it the server
+# is static and byte-for-byte the old `python3 -m http.server` behaviour, which
+# is what `p6af_channel_mirror_guard.sh` calls.
+#
+# THE FIX p6af-2.2 SIZED -- "seed pixi's pkgs from the reference lock's conda
+# URLs" -- WOULD NOT HAVE CLOSED THIS, and that is measured, not argued: the
+# reference lock names libcudnn 9.10.2.21 and the 404 was for 9.13.1.26.  The
+# archive pixi wants is in a build environment resolved fresh against the frozen
+# repodata; no lock enumerates it.
 retread_serve_channel_mirror () {
-  local root=${1:-} port=${2:-}
+  local root=${1:-} port=${2:-} store=${3:-}
   [ -d "$root" ] || { echo "retread_serve_channel_mirror: FATAL no mirror at $root" >&2; return 2; }
-  [ -n "$port" ] || { echo "retread_serve_channel_mirror: usage: <mirror root> <port>" >&2; return 2; }
-  ( cd "$root" && exec python3 -m http.server "$port" --bind 127.0.0.1 ) > "${TMPDIR:-/tmp}/channel-mirror-$port.log" 2>&1 &
+  [ -n "$port" ] || { echo "retread_serve_channel_mirror: usage: <mirror root> <port> [package store]" >&2; return 2; }
+  local here; here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+  local srv=$here/channel_mirror_server.py
+  [ -f "$srv" ] || { echo "retread_serve_channel_mirror: FATAL missing $srv" >&2; return 2; }
+  python3 "$srv" "$root" "$port" "$store" > "${TMPDIR:-/tmp}/channel-mirror-$port.log" 2>&1 &
   RETREAD_MIRROR_PID=$!
   local i
   for i in 1 2 3 4 5 6 7 8 9 10; do
@@ -765,8 +786,50 @@ retread_serve_channel_mirror () {
     echo "retread_serve_channel_mirror: FATAL server on $port never answered" >&2
     kill "$RETREAD_MIRROR_PID" 2>/dev/null; return 3; }
   RETREAD_MIRROR_URL=http://127.0.0.1:$port
-  export RETREAD_MIRROR_PID RETREAD_MIRROR_URL
-  echo "### channel_mirror serving $RETREAD_MIRROR_URL pid=$RETREAD_MIRROR_PID root=$root"
+  RETREAD_MIRROR_ACCESS_LOG=${TMPDIR:-/tmp}/channel-mirror-$port.log
+  RETREAD_MIRROR_PKG_STORE=$store
+  export RETREAD_MIRROR_PID RETREAD_MIRROR_URL RETREAD_MIRROR_ACCESS_LOG RETREAD_MIRROR_PKG_STORE
+  echo "### channel_mirror serving $RETREAD_MIRROR_URL pid=$RETREAD_MIRROR_PID root=$root pkg_store=${store:-none}"
+}
+
+######## retread_assert_mirror_no_stray_404 -- THE READER FOR ALL OF IT ########
+# p6af-2's whole finding is one 404 in an access log that nobody was asserting
+# on.  The lock's own rc would have been the reader, and it was: rc=1 at 1634 s,
+# three hours after the thing that caused it was already written down.  So the
+# assertion is a function with a name.
+#
+#     retread_assert_mirror_no_stray_404 <access log>   # rc=0 clean, rc=1 red
+#
+# EXACTLY ONE 404 IS LEGITIMATE and it is the protocol's own fallback trigger:
+# pixi asks for `repodata_shards.msgpack.zst`, the mirror does not carry a shard
+# index by design (p6af.1), pixi falls back to `repodata.json`.  Any OTHER 404
+# from the mirror is a hole in the frozen universe -- a package archive, a
+# document the freeze never wrote, a channel directory the config misnamed --
+# and every one of those is a job-length failure discovered late.
+#
+# It is deliberately NOT "the lock passed": a 404 the solver happens to tolerate
+# is still a byte pixi went looking for and did not get from the frozen mirror,
+# and p6af-1 already boards the way a partially-served universe changes a lock
+# without failing it.
+retread_assert_mirror_no_stray_404 () {
+  local log=${1:-}
+  [ -f "$log" ] || { echo "retread_assert_mirror_no_stray_404: FATAL no access log at $log" >&2; return 2; }
+  local stray shards
+  # BaseHTTPRequestHandler's format: `… "GET /path HTTP/1.1" 404 -`.  The status
+  # is read from the field AFTER the quoted request line, never by grepping the
+  # number anywhere on the line -- a path can contain `404`.
+  stray=$(awk -F'"' '/"(GET|HEAD) /{split($2,r," "); split($3,c," ");
+            if (c[1]=="404" && r[2] !~ /repodata_shards\.msgpack\.zst$/) print r[2]}' "$log")
+  shards=$(awk -F'"' '/"(GET|HEAD) /{split($2,r," "); split($3,c," ");
+            if (c[1]=="404" && r[2] ~ /repodata_shards\.msgpack\.zst$/) c2++} END{print c2+0}' "$log")
+  if [ -z "$stray" ]; then
+    echo "### mirror_404_gate PASS: 0 stray 404s (shard-index 404s, the p6af.1 fallback trigger, = $shards)"
+    return 0
+  fi
+  echo "### mirror_404_gate FAIL: the frozen mirror did not carry these, and pixi asked for them:" >&2
+  printf '%s\n' "$stray" | sort | uniq -c | sort -rn | sed 's/^/###   /' >&2
+  echo "### mirror_404_gate FAIL: $(printf '%s\n' "$stray" | wc -l) stray 404 request(s); shard-index 404s = $shards" >&2
+  return 1
 }
 
 ######## retread_serve_conda_deny_proxy -- BLOCK THE CHANNELS, NOT THE WORLD ###
