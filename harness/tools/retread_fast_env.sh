@@ -974,3 +974,187 @@ retread_pixi_mirror_config () {
     echo "retread_pixi_mirror_config: WARNING no pixi binary passed; the mirrors block is NOT confirmed visible to pixi" >&2
   fi
 }
+
+######## retread_scope_sdist_builds -- JOB-SCOPE THE sdist BUILD TREES #########
+#
+#     retread_scope_sdist_builds <job-scoped root>
+#
+# THE DEFECT IT CLOSES (C31-4, LANE-C-WARM-LOG 31.10-31.12 and 33).
+# `phaseN_cert.sh`'s own comment says the shared download caches are safe
+# because they "carry no resolution, only bytes keyed by url and hash". **THAT
+# IS FALSE FOR AN sdist BUILD TREE.** uv unpacks a source distribution into
+# `<uv cache>/sdists-v9/pypi/<name>/<version>/<rev>/src/` and BUILDS IN PLACE,
+# so a cmake project leaves a `CMakeCache.txt` there recording the ABSOLUTE
+# compiler paths of whichever workspace built it first. That file is a
+# resolution of the build environment, not bytes keyed by url and hash, and the
+# next job to build the same sdist inherits it. B-cert-4's `pm-newton-gpu` row
+# is the counter-example: the cached openmesh 1.2.1 CMakeCache named
+# `/oscar/data/stellex/glvov/retread/ws.MN1-5761731/.pixi/envs/pm-newton-gpu/bin/
+# x86_64-conda-linux-gnu-c++`, a workspace reaped weeks earlier, and cmake
+# refused; `pm-mujoco` in the SAME job built the SAME sdist green in 78 s
+# because python 3.10 selects the sibling `temp.linux-x86_64-cpython-310`
+# directory, which happens to name `/usr/bin/c++`.
+#
+# WHICH CACHE. MEASURED, and it is NOT the one the sizing named. There are TWO
+# uv caches reachable by a job here:
+#   * `$UV_CACHE_DIR` = `<persist root>/uv`, retread's own uv (RETREAD_UV).
+#     Its `sdists-v9` is EMPTY, exactly as this file's HAZARDS note claims.
+#   * `$PIXI_CACHE_DIR/uv-cache`, PIXI's internal uv. **This is the poisoned
+#     one**, and pixi 0.73.0 does not read `UV_CACHE_DIR` at all (`strings` of
+#     the binary: 0 occurrences), it derives the path from `PIXI_CACHE_DIR`.
+#   So scoping `UV_CACHE_DIR` alone would have fixed nothing. Both are scoped.
+#
+# WHY AN OVERLAY AND NOT A uv FLAG. Read out of the PINNED uv 0.12.5's own
+# `uv help` / `uv help pip install` / `uv help cache`, not from memory: the ONLY
+# cache controls it offers are
+#       -n, --no-cache               Avoid reading from or writing to the cache,
+#                                    instead using a temporary directory
+#           --cache-dir <CACHE_DIR>  Path to the cache directory [env: UV_CACHE_DIR=]
+# and the only build knobs are `--no-build`, `--no-build-isolation`,
+# `--no-build-isolation-package`, `--build-constraints`. **There is no
+# build-directory knob and no per-bucket knob.** `--no-cache` would throw away
+# `archive-v0`/`simple-v*` too and cost the 41x warmth this file exists for. So
+# the only shape available is the one the wheel store already uses: keep the
+# byte-keyed halves shared and give the job its own build halves.
+#
+# WHAT IT DOES, per uv cache:
+#   every top-level entry of the shared cache is SYMLINKED into the overlay --
+#   `archive-v0`, `wheels-v6`, `simple-v*`, `interpreter-v4`, and any bucket a
+#   later uv adds -- EXCEPT `sdists-v9` and `builds-v0`, which are created as
+#   real, EMPTY, job-local directories. Regular files (`CACHEDIR.TAG`,
+#   `.gitignore`, `.lock`) are copied, so nothing writes through them.
+#   For pixi the same rule is applied one level up: every top-level entry of the
+#   shared pixi cache (`pkgs`, `repodata`, `backends-v0`, `conda-pypi-mapping`)
+#   is symlinked, and only `uv-cache` becomes an overlay.
+#
+# THE SAME-DEVICE GATE, AND IT IS NOT THEORETICAL. uv stages a download in
+# `<uv cache>/.tmpXXXX` at the cache ROOT and `rename(2)`s it into
+# `archive-v0`. If the overlay root and the shared `archive-v0` are on different
+# filesystems that rename is EXDEV and EVERY download dies. Measured on job
+# 5869427, which built the first fixture pair under node-local `/tmp`:
+#   `failed to rename file from /tmp/.../cache/.tmpUqvSiY to
+#    /tmp/.../cache/archive-v0/fRTNkoHPRRCnl3Wo: Invalid cross-device link (os error 18)`
+# So this function REFUSES unless `stat -c %d` of the overlay root equals
+# `stat -c %d` of the shared cache root. That is the same discipline the C18 git
+# snapshot store note above demands, arrived at here by being bitten.
+#
+# WHAT IT COSTS: nothing but a cold sdist build per job for the handful of
+# packages that build from source, and that is the price of the build being a
+# function of THIS job's toolchain rather than of whoever built it last.
+#
+# ITS READER is `tools/sdist_build_poison_guard.sh`, which every phase runs
+# BEFORE any install: it walks every `CMakeCache.txt` reachable by this job and
+# REFUSES if one names a compiler path that does not exist. With this function
+# called the job-local `sdists-v9` is empty and the guard is trivially green;
+# without it the guard is what turns a mystified RED-install four hours in into
+# a refusal in the job header.
+retread_scope_sdist_builds () {
+  local job_root=${1:-}
+  if [ -z "$job_root" ]; then
+    echo "retread_scope_sdist_builds: usage: retread_scope_sdist_builds <job-scoped root>" >&2
+    return 2
+  fi
+  if [ -z "${UV_CACHE_DIR:-}" ] || [ -z "${PIXI_CACHE_DIR:-}" ]; then
+    echo "retread_scope_sdist_builds: FATAL call me AFTER retread_fast_env -- UV_CACHE_DIR and PIXI_CACHE_DIR must already be exported" >&2
+    return 2
+  fi
+  mkdir -p "$job_root" || return 2
+
+  local n_link=0 n_local=0 n_copy=0
+
+  # _overlay <shared uv cache root> <dst>
+  _retread_uv_overlay () {
+    local src=$1 dst=$2 e b
+    if [ ! -d "$src" ]; then
+      echo "retread_scope_sdist_builds: FATAL shared uv cache absent: $src" >&2
+      return 3
+    fi
+    mkdir -p "$dst" || return 3
+    # THE EXDEV GATE. rename(2) out of <dst>/.tmpXXXX into a symlinked
+    # archive-v0 must stay on one filesystem.
+    local dsrc ddst
+    dsrc=$(stat -c %d "$src") || return 3
+    ddst=$(stat -c %d "$dst") || return 3
+    if [ "$dsrc" != "$ddst" ]; then
+      echo "retread_scope_sdist_builds: FATAL overlay $dst (dev $ddst) is on a different filesystem from the shared cache $src (dev $dsrc) -- uv renames <cache>/.tmpXXXX into archive-v0 and that rename would be EXDEV" >&2
+      return 3
+    fi
+    for e in "$src"/* "$src"/.[!.]*; do
+      [ -e "$e" ] || continue
+      b=${e##*/}
+      case "$b" in
+        sdists-v9|builds-v0) continue;;   # the BUILD halves; created below, job-local
+      esac
+      if [ -d "$e" ]; then
+        ln -sfn "$e" "$dst/$b" || return 3
+        n_link=$((n_link+1))
+      else
+        cp -f "$e" "$dst/$b" 2>/dev/null && n_copy=$((n_copy+1))
+      fi
+    done
+    # THE BUILD HALVES: real, empty, job-local, always -- even if the shared
+    # cache has none, so a job that is the first to build one still gets its own.
+    for b in sdists-v9 builds-v0; do
+      rm -rf "$dst/$b"
+      mkdir -p "$dst/$b" || return 3
+      n_local=$((n_local+1))
+    done
+  }
+
+  local shared_uv=$UV_CACHE_DIR shared_pixi=$PIXI_CACHE_DIR
+  local ov_uv=$job_root/uv-overlay ov_pixi=$job_root/pixi-overlay
+  local rc=0
+
+  _retread_uv_overlay "$shared_uv" "$ov_uv" || rc=$?
+  [ "$rc" = 0 ] || { unset -f _retread_uv_overlay; return "$rc"; }
+
+  # PIXI: same rule one level up. Everything shared except `uv-cache`.
+  mkdir -p "$ov_pixi" || { unset -f _retread_uv_overlay; return 3; }
+  local e b
+  for e in "$shared_pixi"/* "$shared_pixi"/.[!.]*; do
+    [ -e "$e" ] || continue
+    b=${e##*/}
+    [ "$b" = uv-cache ] && continue
+    if [ -d "$e" ]; then ln -sfn "$e" "$ov_pixi/$b" && n_link=$((n_link+1))
+    else cp -f "$e" "$ov_pixi/$b" 2>/dev/null && n_copy=$((n_copy+1)); fi
+  done
+  if [ -d "$shared_pixi/uv-cache" ]; then
+    _retread_uv_overlay "$shared_pixi/uv-cache" "$ov_pixi/uv-cache" || rc=$?
+  else
+    mkdir -p "$ov_pixi/uv-cache/sdists-v9" "$ov_pixi/uv-cache/builds-v0" || rc=3
+    n_local=$((n_local+2))
+  fi
+  unset -f _retread_uv_overlay
+  [ "$rc" = 0 ] || return "$rc"
+
+  export UV_CACHE_DIR=$ov_uv
+  export PIXI_CACHE_DIR=$ov_pixi
+
+  # THE CENSUS LINE, and then the asserts on it. A build half that is not a real
+  # empty directory of our own, or a byte-keyed half that is not a symlink into
+  # the shared cache, means this function did not do what it says.
+  local builds_local=0 builds_nonempty=0 shared_links=0 d
+  for d in "$ov_uv/sdists-v9" "$ov_uv/builds-v0" "$ov_pixi/uv-cache/sdists-v9" "$ov_pixi/uv-cache/builds-v0"; do
+    if [ -d "$d" ] && [ ! -L "$d" ]; then builds_local=$((builds_local+1)); fi
+    if [ -n "$(find "$d" -maxdepth 1 -mindepth 1 -print -quit 2>/dev/null)" ]; then builds_nonempty=$((builds_nonempty+1)); fi
+  done
+  shared_links=$(find "$ov_uv" "$ov_pixi" "$ov_pixi/uv-cache" -maxdepth 1 -mindepth 1 -type l 2>/dev/null | wc -l)
+
+  echo "### sdist builds scoped uv=$ov_uv pixi=$ov_pixi shared_uv=$shared_uv shared_pixi=$shared_pixi symlinked=$n_link copied=$n_copy build_dirs_local=$builds_local/4 build_dirs_nonempty=$builds_nonempty shared_links_seen=$shared_links"
+
+  local bad=0
+  if [ "$builds_local" -ne 4 ]; then
+    echo "retread_scope_sdist_builds: FATAL only $builds_local of 4 build directories are real job-local directories" >&2; bad=1
+  fi
+  if [ "$builds_nonempty" -ne 0 ]; then
+    echo "retread_scope_sdist_builds: FATAL $builds_nonempty build directory/ies are NOT empty -- this overlay carries another job's build state" >&2; bad=1
+  fi
+  if [ "$shared_links" -le 0 ]; then
+    echo "retread_scope_sdist_builds: FATAL no byte-keyed bucket was symlinked -- the overlay would be a COLD cache, not an isolation of the build halves" >&2; bad=1
+  fi
+  [ "$bad" = 0 ] || return 3
+
+  echo "retread_scope_sdist_builds: UV_CACHE_DIR=$UV_CACHE_DIR"
+  echo "retread_scope_sdist_builds: PIXI_CACHE_DIR=$PIXI_CACHE_DIR"
+  return 0
+}

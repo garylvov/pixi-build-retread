@@ -513,6 +513,23 @@ case "$CERT_UV_LINK_MODE" in
   copy|hardlink) export UV_LINK_MODE=$CERT_UV_LINK_MODE ;;
   *) echo "### FATAL CERT_UV_LINK_MODE must be copy|hardlink, got '$CERT_UV_LINK_MODE'"; exit 2 ;;
 esac
+
+# --- C31-4: JOB-SCOPED sdist BUILD TREES, AND THE GUARD THAT READS THEM -------
+# This block is why B-cert-4's `pm-newton-gpu` row measured a stale entry in a
+# shared cache instead of the artefact under certification. The comment at the
+# top of this file says the shared download caches "carry no resolution, only
+# bytes keyed by url and hash" -- TRUE for `archive-v0`/`wheels-v6`/`simple-v*`,
+# FALSE for `sdists-v9`, where uv builds a source distribution in place and a
+# cmake project leaves a `CMakeCache.txt` naming the ABSOLUTE compiler paths of
+# whichever workspace built it first. LANE-C-WARM-LOG 31.10-31.12 and 33.
+# The build halves become job-local; the byte-keyed halves stay shared.
+retread_scope_sdist_builds "$C" || { echo "### FATAL retread_scope_sdist_builds refused"; exit 2; }
+
+# ITS READER, BEFORE THE FIRST INSTALL. Four hours of cert to reach a RED whose
+# whole content was one absolute path is what this turns into a header refusal.
+SDIST_GUARD=$(dirname "$FAST_ENV")/sdist_build_poison_guard.sh
+[ -f "$SDIST_GUARD" ] || { echo "### FATAL sdist_build_poison_guard.sh missing next to $FAST_ENV"; exit 2; }
+bash "$SDIST_GUARD" || { echo "### FATAL sdist build poison guard refused -- see the rows above"; exit 2; }
 echo "### UV_LINK_MODE=$UV_LINK_MODE (CERT_UV_LINK_MODE=$CERT_UV_LINK_MODE) UV_CACHE_DIR=$UV_CACHE_DIR"
 
 # Every env writes its OWN row files here; the driver concatenates them in

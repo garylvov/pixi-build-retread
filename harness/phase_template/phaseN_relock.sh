@@ -649,6 +649,30 @@ export RUST_BACKTRACE=1
 . "$FAST_ENV"
 retread_fast_env "$WS" || { echo "FATAL: retread_fast_env refused"; exit 7; }
 
+# --- C31-4: JOB-SCOPED sdist BUILD TREES, AND THE GUARD THAT READS THEM -------
+# retread_fast_env just pointed UV_CACHE_DIR and PIXI_CACHE_DIR at the SHARED
+# persistent root. For the byte-keyed buckets that is the whole 41x win and it
+# stays. For `sdists-v9` and `builds-v0` it is a CORRECTNESS BUG: uv builds a
+# source distribution IN PLACE inside `sdists-v9`, so a cmake project leaves a
+# `CMakeCache.txt` there holding the ABSOLUTE compiler paths of whichever
+# workspace built it first, and the next job inherits them. B-cert-4's
+# `pm-newton-gpu` RED-install was exactly that -- a compiler path into
+# `ws.MN1-5761731`, reaped weeks earlier -- while `pm-mujoco` built the SAME
+# sdist green in the same job off the healthy python-3.10 sibling directory.
+# LANE-C-WARM-LOG 31.10-31.12 and 33.
+#
+# `retread_scope_sdist_builds` gives this job its own empty build halves in BOTH
+# uv caches (pixi 0.73.0 does not read UV_CACHE_DIR; its uv cache hangs off
+# PIXI_CACHE_DIR, and THAT is the one that was poisoned) and leaves every
+# byte-keyed bucket a symlink into the shared cache.
+retread_scope_sdist_builds "$C" || { echo "FATAL: retread_scope_sdist_builds refused"; exit 7; }
+
+# ITS READER, and it runs BEFORE any install. A criterion with no live producer
+# is a defect; this one names a file and a path and refuses on them.
+SDIST_GUARD=$(dirname "$FAST_ENV")/sdist_build_poison_guard.sh
+[ -f "$SDIST_GUARD" ] || { echo "FATAL: sdist_build_poison_guard.sh missing next to $FAST_ENV"; exit 7; }
+bash "$SDIST_GUARD" || { echo "FATAL: sdist build poison guard refused -- see the rows above"; exit 7; }
+
 # --- OPTIONAL: JOB-SCOPED WHEEL STORE, SEEDED FROM THE PERSISTENT ONE ---------
 # retread_fast_env just exported RETREAD_WHEEL_STORE=<persist root>/wheels, the
 # SHARED store. That is the right default and it is what buys index authority

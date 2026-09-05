@@ -30,8 +30,8 @@ e893ee7f20e181181bb8205ab7edda0c  phase_template/cleanup_owner_guard.sh
 883d517a614357c59a463f8cdbd9ba4d  phase_template/expect_sha_gate_guard.sh
 992d975ad816f4b4b82a7056df2fa255  phase_template/leftover_check_guard.sh
 063ba387f091f6c66eb73ccdc632c70d  phase_template/link_mode_guard.sh
-28492fb0be8103a785fa8d6e58ee317f  phase_template/phaseN_cert.sh
-f6bb2a0403094f7cf8d23588e937b995  phase_template/phaseN_relock.sh
+e2a65cf4eb431df7f776ca0014222c84  phase_template/phaseN_cert.sh
+ef136bd20738f271d73b961015e0f55c  phase_template/phaseN_relock.sh
 cb117753b14c12c0f55deeb91e7a3dd0  phase_template/README.md
 a465cea86edc07ad5adf9f96b1ebac9e  phase_template/wedge_triage_guard.sh
 c26805a4a64f89749fe352bf5aaa8381  phase_template/wedge_triage.sh
@@ -55,7 +55,9 @@ e60de6759f33d1de9f69a5265cc3dfeb  tools/p6ad_negctl.sh
 c34a4e3a1a8834b073b997fc94230a9f  tools/pixi_merge_run_exports.py
 c9f561484d8ef42157ba6a7532f80681  tools/pixi_shard_cache.py
 6960c0ac937f51969cd1d4f1e1af65c2  tools/pixi_trim_repodata.py
-359d8d899eb8fba846afc0b6aebf0ff7  tools/retread_fast_env.sh
+57bb430f9c62012a88b992ea618e2034  tools/retread_fast_env.sh
+bdd93cc2798a27301e793bdc6931be06  tools/sdist_build_poison_guard.sh
+da8aed178eda8db9d349a23d784bd8b6  tools/sdist_build_scope_guard.sh
 4555925b41bc08ba5efb7bbb7b40f167  tools/test_stage_mirror.sh
 f4b1d2839ad51722d0f7a84b8482042b  tools/wheel_store_env_guard.sh
 955d184896115e611a763c60c490b5d8  tools/wheel_store_reclaim_guard.sh
