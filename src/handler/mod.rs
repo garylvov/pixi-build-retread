@@ -6392,6 +6392,8 @@ impl Handler {
                                     roots: roots.iter().cloned().collect(),
                                 })
                                 .collect(),
+                            // p6ad: the world this advertisement was true in.
+                            repodata_universe: crate::repodata::universe_digest(),
                         };
                         // Also carried into the shared built-output store, so
                         // an ADOPTING run leaves the same record this cold pass
@@ -9543,6 +9545,7 @@ impl Drop for BundleProbeMetrics {
             probes,
             rounds = timing.rounds,
             wall_ms,
+            repodata_universe = %crate::repodata::universe_digest(),
             "bench: bundle route probes finished",
         );
         tracing::info!(
@@ -9550,6 +9553,7 @@ impl Drop for BundleProbeMetrics {
             hits,
             misses,
             total = hits + misses,
+            repodata_universe = %crate::repodata::universe_digest(),
             "route probe cache: hit/miss",
         );
     }
@@ -9821,6 +9825,7 @@ impl CondaCoSolveContext {
         );
         tracing::debug!(
             path = %path.display(), key = %key,
+            repodata_universe = %crate::repodata::universe_digest(),
             "route probe cache: opened",
         );
         self.verdict_cache = Some(Arc::new(crate::route_probe_cache::RouteProbeCache::open(
@@ -20932,11 +20937,25 @@ fn produce_output_with_conflicts(
     // and the size of the set actually emitted. Equal digests with unequal
     // `n_wheels` is the defect, visible in one grep.
     let closure_digest = resolved_closure_digest(bundle, host_platform, &python_version);
+    // p6ad: the row names the CONDA UNIVERSE the route decisions answered to.
+    //
+    // `n_wheels` is the closure minus whatever the joint conda route validation
+    // left on the conda side, and that validation solves against repodata any
+    // lane can refresh mid-flight (MH-1). p6ac proved the mechanism -- one
+    // binary, one manifest, one harness read 68 at 16:11 and 93 at 23:20,
+    // because 37 route probes ran live against a moved universe instead of
+    // replaying a cache -- and boarded as p6ac-1 that NOTHING PINS THE UNIVERSE
+    // ANYWHERE. So print it here, where the number that decides 27 lock rows is
+    // decided: a moved `repodata_universe` with a moved `n_wheels` is the
+    // universe legitimately moving and needs no investigation; an UNMOVED
+    // `repodata_universe` with a moved `n_wheels` is a retread defect. One
+    // grep, and the night p6ab-5 cost does not happen again.
     tracing::debug!(
         bundle = %bundle.conda_name,
         vendored = ?vendored,
         n_wheels = bundle.extras.len() + 1,
         closure_digest = %closure_digest,
+        repodata_universe = %crate::repodata::universe_digest(),
         "computed vendored set"
     );
 
@@ -30307,6 +30326,7 @@ mod courier_build_string_tests {
             auto_imports_suppressed_bundles: Vec::new(),
             auto_imports_suppressed: Vec::new(),
             auto_imports_suppressed_roots: Vec::new(),
+            repodata_universe: crate::repodata::universe_digest(),
         };
         let from_record = build_for(&workspace_fp_for_build(
             Some(&record),
