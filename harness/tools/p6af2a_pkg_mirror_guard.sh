@@ -81,10 +81,17 @@ LOG=$RETREAD_MIRROR_ACCESS_LOG
 U=$RETREAD_MIRROR_URL
 trap 'kill "$RETREAD_MIRROR_PID" 2>/dev/null' EXIT
 
-# ---- A: the shard index 404 the protocol depends on --------------------------
-A=$(curl -s -o /dev/null -w '%{http_code}' "$U/$CHAN/$SUB/repodata_shards.msgpack.zst")
-say "A shard index -> $A (want 404)"
-[ "$A" = 404 ] || red "A: shard index answered $A, not 404"
+# ---- A: the whole fallback CHAIN the protocol depends on ---------------------
+# Three names, not one. p6af.1's summary counted only the shard index, and a
+# reader written from that summary goes RED on a perfect run: two full canonical
+# solves (5855746, 5858679) show 16 of EACH of these per run, because the freeze
+# writes the plain document and nothing else. All three must be tolerated, and
+# arm E is what keeps that tolerance from becoming a hole.
+for n in repodata_shards.msgpack.zst repodata.json.zst repodata.json.bz2; do
+  A=$(curl -s -o /dev/null -w '%{http_code}' "$U/$CHAN/$SUB/$n")
+  say "A fallback $n -> $A (want 404)"
+  [ "$A" = 404 ] || red "A: $n answered $A, not 404"
+done
 
 # ---- B: the classic document -------------------------------------------------
 B=$(curl -s -o /dev/null -w '%{http_code}' "$U/$CHAN/$SUB/repodata.json")
@@ -105,7 +112,7 @@ grep -q "^\[.*\] PKGFETCH .*$PKG " "$RETREAD_MIRROR_FETCH_LOG" \
 
 # ---- D: the reader, over a clean log ----------------------------------------
 if retread_assert_mirror_no_stray_404 "$LOG"; then
-  say "D reader PASS over A+B+C (as it must: the only 404 is the shard index)"
+  say "D reader PASS over A+B+C (as it must: every 404 so far is a fallback name)"
 else
   red "D: the reader went RED on a clean log -- it is over-strict"
 fi
@@ -121,6 +128,16 @@ if retread_assert_mirror_no_stray_404 "$LOG"; then
 else
   say "E reader RED as required, and it named the request"
 fi
+
+# ---- E2: `.tar.bz2` is not `.bz2` -------------------------------------------
+# The tolerated fallback name `repodata.json.bz2` and the conda archive suffix
+# `.tar.bz2` are one character class apart. Matched as a SUFFIX rather than as a
+# whole basename, the gate would wave a missing package through -- so the miss is
+# probed and the counter is read: the fallback tally must not have absorbed it.
+curl -s -o /dev/null "$U/$CHAN/$SUB/p6af2a-ghost-1.0-h0.tar.bz2"
+E2=$(retread_assert_mirror_no_stray_404 "$LOG" 2>&1 | grep -c 'p6af2a-ghost-1.0-h0\.tar\.bz2')
+say "E2 missing .tar.bz2 package named by the reader -> $E2 (want 1)"
+[ "$E2" = 1 ] || red "E2: a missing .tar.bz2 PACKAGE was not named -- the .bz2 rule is a suffix rule, not a whole-name rule"
 
 # ---- F: mutation control -- the sha check must not be decorative -------------
 kill "$RETREAD_MIRROR_PID" 2>/dev/null; wait "$RETREAD_MIRROR_PID" 2>/dev/null

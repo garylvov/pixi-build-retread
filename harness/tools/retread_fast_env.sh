@@ -800,12 +800,24 @@ retread_serve_channel_mirror () {
 #
 #     retread_assert_mirror_no_stray_404 <access log>   # rc=0 clean, rc=1 red
 #
-# EXACTLY ONE 404 IS LEGITIMATE and it is the protocol's own fallback trigger:
-# pixi asks for `repodata_shards.msgpack.zst`, the mirror does not carry a shard
-# index by design (p6af.1), pixi falls back to `repodata.json`.  Any OTHER 404
-# from the mirror is a hole in the frozen universe -- a package archive, a
-# document the freeze never wrote, a channel directory the config misnamed --
-# and every one of those is a job-length failure discovered late.
+# THREE 404s ARE LEGITIMATE, and p6af.1 named only the first because its summary
+# lines counted only that one. Measured on two full canonical solves (jobs
+# 5855746 and 5858679, 16 of each in both): pixi walks a fallback CHAIN per
+# (channel, subdir) --
+#     repodata_shards.msgpack.zst   404   the sharded protocol
+#     repodata.json.zst             404   the compressed classic document
+#     repodata.json.bz2             404   the older compressed classic document
+#     repodata.json                 200   what the freeze actually writes
+# `retread_freeze_channel_mirror` writes the plain document and NOTHING else, by
+# design (p6af.1: no shard index, no shards, no re-compression), so all three
+# misses are the mirror working as built. A gate naming only the shard index goes
+# RED on a perfect run -- the `ml1` 5752248 false-FATAL shape, caught here by
+# reading the live access log instead of the summary written about it.
+# Any OTHER 404 is a hole in the frozen universe -- a package archive, a document
+# the freeze never wrote, a channel directory the config misnamed -- and every
+# one of those is a job-length failure discovered late. The three are matched as
+# WHOLE BASENAMES: the conda archive suffix is `.tar.bz2`, one character class
+# away from a suffix rule that would wave a missing package through.
 #
 # It is deliberately NOT "the lock passed": a 404 the solver happens to tolerate
 # is still a byte pixi went looking for and did not get from the frozen mirror,
@@ -814,21 +826,32 @@ retread_serve_channel_mirror () {
 retread_assert_mirror_no_stray_404 () {
   local log=${1:-}
   [ -f "$log" ] || { echo "retread_assert_mirror_no_stray_404: FATAL no access log at $log" >&2; return 2; }
-  local stray shards
+  local stray chain
   # BaseHTTPRequestHandler's format: `… "GET /path HTTP/1.1" 404 -`.  The status
   # is read from the field AFTER the quoted request line, never by grepping the
   # number anywhere on the line -- a path can contain `404`.
-  stray=$(awk -F'"' '/"(GET|HEAD) /{split($2,r," "); split($3,c," ");
-            if (c[1]=="404" && r[2] !~ /repodata_shards\.msgpack\.zst$/) print r[2]}' "$log")
-  shards=$(awk -F'"' '/"(GET|HEAD) /{split($2,r," "); split($3,c," ");
-            if (c[1]=="404" && r[2] ~ /repodata_shards\.msgpack\.zst$/) c2++} END{print c2+0}' "$log")
+  # The three names are compared as WHOLE BASENAMES with `==`, not as a regex:
+  # awk's -v does its own backslash processing, so a `\.`-bearing pattern handed
+  # in that way silently degrades to "any character" and `.tar.bz2` would start
+  # matching `repodata.json.bz2`'s rule. Equality cannot degrade.
+  local prog='function base(p,  n,a){n=split(p,a,"/"); return a[n]}
+    function chainable(p){ b=base(p);
+      return (b=="repodata_shards.msgpack.zst" || b=="repodata.json.zst" || b=="repodata.json.bz2") }
+    /"(GET|HEAD) /{split($2,r," "); split($3,c," ");
+      if (c[1]!="404") next
+      if (chainable(r[2])) { t[base(r[2])]++; n++ } else { print "STRAY " r[2] } }
+    END{ printf "CHAIN %d\n", n+0; for (k in t) printf "CHAINK %s %d\n", k, t[k] }'
+  local out; out=$(awk -F'"' "$prog" "$log")
+  stray=$(printf '%s\n' "$out" | sed -n 's/^STRAY //p')
+  chain=$(printf '%s\n' "$out" | sed -n 's/^CHAIN //p')
   if [ -z "$stray" ]; then
-    echo "### mirror_404_gate PASS: 0 stray 404s (shard-index 404s, the p6af.1 fallback trigger, = $shards)"
+    echo "### mirror_404_gate PASS: 0 stray 404s (protocol-fallback 404s -- shard index, .json.zst, .json.bz2 -- = $chain)"
+    printf '%s\n' "$out" | sed -n 's/^CHAINK /###   fallback 404 /p'
     return 0
   fi
   echo "### mirror_404_gate FAIL: the frozen mirror did not carry these, and pixi asked for them:" >&2
   printf '%s\n' "$stray" | sort | uniq -c | sort -rn | sed 's/^/###   /' >&2
-  echo "### mirror_404_gate FAIL: $(printf '%s\n' "$stray" | wc -l) stray 404 request(s); shard-index 404s = $shards" >&2
+  echo "### mirror_404_gate FAIL: $(printf '%s\n' "$stray" | wc -l) stray 404 request(s); protocol-fallback 404s = $chain" >&2
   return 1
 }
 
