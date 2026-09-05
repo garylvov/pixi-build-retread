@@ -55,6 +55,29 @@ is not decomposed is worthless:
   * pixi's own network access to a channel is still zero.  This process is not
     pixi.
 
+p6af-2g ADDS THE SHARDED PROTOCOL, AND THAT IS THE POINT OF THE WHOLE LANE.
+p6af-2e's same-window control killed the shard-cache-staleness explanation for
+`moved(M vs N)=16`; what survived is that pixi SPEAKS the sharded protocol and
+this mirror ANSWERED with the classic document, so the universe it served
+carried `run_exports` only for the names some earlier solve had shards for.
+When `<mirror root>/INDEX-STATE.json` exists (written by `shard_mirror.freeze`)
+this server:
+
+  * serves the FROZEN, byte-verbatim `repodata_shards.msgpack.zst` for every
+    pair the state calls `sharded`, and re-verifies each one's sha256 against
+    the freeze's record AT STARTUP -- an index that moved on disk is a refusal
+    to start, not a quietly different universe;
+  * serves each `<sha>.msgpack.zst` shard LAZILY: fetched upstream, sha256 of
+    the COMPRESSED bytes checked against the name the FROZEN INDEX gives it,
+    cached, served -- and REFUSES, with a `NOSHARD` row, any sha the frozen
+    indexes do not name;
+  * DOES NOT serve a classic `repodata.json` for a sharded pair at all, so pixi
+    cannot silently downgrade to the document whose incompleteness is the thing
+    under test.  Such a request is a `CLASSIC-DOWNGRADE` row and a 404, and the
+    row is written whether or not anything asks.
+  * fills a package request for a sharded pair out of the SHARD's record rather
+    than a classic document's -- same sha256+size refusal, different authority.
+
 Usage:
     channel_mirror_server.py <mirror root> <port> [package store dir]
 
@@ -75,7 +98,12 @@ import urllib.request
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import shard_mirror  # noqa: E402  (beside this file; see its module docstring)
+
 PKG_SUFFIXES = (".conda", ".tar.bz2")
+SHARD_SUFFIX = ".msgpack.zst"
+HEX = set("0123456789abcdef")
 
 
 def _scrub_proxy_env() -> None:
@@ -153,6 +181,11 @@ class MirrorHandler(SimpleHTTPRequestHandler):
     mirror_root = None
     fetch_log = None
     protocol_version = "HTTP/1.0"
+    # p6af-2g, all set by main() when INDEX-STATE.json is present.
+    shard_up = None       # sha -> the real upstream url of that shard
+    shard_dirs = None     # sha -> {mirror-relative directory it is served from}
+    name_shard = None     # (slug, subdir) -> {package name: sha}
+    sharded_pairs = None  # {(slug, subdir)} that MUST NOT be served classically
 
     # ---- logging -----------------------------------------------------------
     def _note(self, kind: str, detail: str) -> None:
@@ -171,12 +204,132 @@ class MirrorHandler(SimpleHTTPRequestHandler):
     def send_head(self):
         # Both GET and HEAD funnel through send_head, so filling here covers
         # whichever verb pixi picks.
+        path = self.path.split("?", 1)[0].split("#", 1)[0]
+        parts = [p for p in path.split("/") if p]
+        if self.shard_up is not None:
+            # The downgrade reader.  A sharded pair has no classic document to
+            # serve; saying so out loud is the difference between "pixi used the
+            # sharded protocol" and "pixi quietly fell back and nobody noticed".
+            if len(parts) == 3 and parts[2] == "repodata.json" \
+                    and (parts[0], parts[1]) in self.sharded_pairs:
+                self._note("CLASSIC-DOWNGRADE",
+                           "%s/%s -- this pair is SHARDED; no classic document is served"
+                           % (parts[0], parts[1]))
+            try:
+                self._maybe_fill_shard(path, parts)
+            except Exception as exc:            # never take the server down
+                self._note("SHARDERROR", "%s %r" % (self.path, exc))
         if self.pkg_store:
             try:
                 self._maybe_fill()
             except Exception as exc:            # never take the server down
                 self._note("PKGERROR", "%s %r" % (self.path, exc))
         return super().send_head()
+
+    # ---- p6af-2g: the shard route -----------------------------------------
+    def _maybe_fill_shard(self, path: str, parts) -> None:
+        """`…/<64 hex>.msgpack.zst` -> the shard, if the FROZEN INDEX names it.
+
+        The frozen index is the only authority.  A sha it does not carry is
+        refused (`NOSHARD`), and a sha served from a directory the index does
+        not place it in is refused too (`SHARD-MISPLACED`) -- two channels'
+        shard spaces are separate namespaces on `shards.prefix.dev` and merging
+        them would be the same silent substitution the package half refuses.
+        """
+        if not path.endswith(SHARD_SUFFIX) or len(parts) < 2:
+            return
+        stem = parts[-1][:-len(SHARD_SUFFIX)]
+        if len(stem) != 64 or not set(stem) <= HEX:
+            return
+        rel_dir = "/".join(parts[:-1])
+        local = os.path.join(self.mirror_root, rel_dir, parts[-1])
+        if os.path.exists(local):
+            return
+        url = self.shard_up.get(stem)
+        if url is None:
+            self._note("NOSHARD", "%s (no frozen index names this shard)" % path)
+            return
+        if rel_dir not in self.shard_dirs.get(stem, set()):
+            self._note("SHARD-MISPLACED", "%s (the frozen index places it in %s)"
+                       % (path, sorted(self.shard_dirs.get(stem, set()))))
+            return
+        blob = self._fetch_shard(stem, url)
+        if blob is None:
+            return
+        self._store(local, blob)
+
+    def _fetch_shard(self, stem: str, url: str):
+        """Fetch one shard and verify sha256 OF THE COMPRESSED BYTES.
+
+        Measured on every live pair (probe 5870870): the index's value is the
+        sha256 of the published, still-zstd-compressed shard, which is also what
+        `rattler_repodata_gateway` names the file after in its own cache.  So
+        the check is on the wire bytes, untouched.
+        """
+        t0 = time.time()
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "retread-channel-mirror/1.0 (+p6af-2g)",
+            "Accept": "*/*",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=600) as resp:
+                blob = resp.read()
+        except Exception as exc:
+            self._note("SHARDFETCH-FAIL", "%s %r" % (url, exc))
+            return None
+        got = hashlib.sha256(blob).hexdigest()
+        if got != stem:
+            self._note("SHARD-SHA-MISMATCH", "%s want=%s got=%s" % (url, stem, got))
+            return None
+        self._note("SHARDFETCH", "%s bytes=%d sha256=%s wall_ms=%d"
+                   % (url, len(blob), got, int((time.time() - t0) * 1000)))
+        return blob
+
+    def _store(self, local: str, blob: bytes) -> None:
+        os.makedirs(os.path.dirname(local), exist_ok=True)
+        tmp = local + ".part.%d" % os.getpid()
+        with open(tmp, "wb") as fh:
+            fh.write(blob)
+        os.replace(tmp, local)
+
+    def _shard_record(self, chan: str, subdir: str, fname: str):
+        """The frozen SHARDED universe's record for one package file name.
+
+        The classic document is not consulted and for a sharded pair does not
+        exist.  The package name is the file name minus its version and build,
+        which is how a conda archive is named; the index keys are rattler's
+        NORMALIZED names, so a lower-cased retry is tried before giving up.
+        """
+        table = self.name_shard.get((chan, subdir))
+        if not table:
+            return None
+        stem = fname
+        for suf in PKG_SUFFIXES:
+            if stem.endswith(suf):
+                stem = stem[:-len(suf)]
+                break
+        name = stem.rsplit("-", 2)[0]
+        sha = table.get(name) or table.get(name.lower())
+        if sha is None:
+            return None
+        local = os.path.join(self.mirror_root,
+                             sorted(self.shard_dirs[sha])[0], sha + SHARD_SUFFIX)
+        if os.path.exists(local):
+            with open(local, "rb") as fh:
+                blob = fh.read()
+        else:
+            blob = self._fetch_shard(sha, self.shard_up[sha])
+            if blob is None:
+                return None
+            self._store(local, blob)
+        shard = shard_mirror.decode_shard(blob)
+        for key in ("packages.conda", "packages"):
+            rec = (shard.get(key) or {}).get(fname)
+            if rec is not None:
+                return {"sha256": shard_mirror.sha_hex(rec.get("sha256"))
+                        if rec.get("sha256") is not None else None,
+                        "size": rec.get("size")}
+        return None
 
     def _maybe_fill(self) -> None:
         path = self.path.split("?", 1)[0].split("#", 1)[0]
@@ -191,18 +344,25 @@ class MirrorHandler(SimpleHTTPRequestHandler):
             return
 
         doc = os.path.join(self.mirror_root, chan, subdir, "repodata.json")
-        if not os.path.isfile(doc):
+        if self.shard_up is not None and (chan, subdir) in self.sharded_pairs:
+            rec = self._shard_record(chan, subdir, fname)
+            if rec is None:
+                self._note("NORECORD", "%s/%s/%s (absent from the frozen SHARD index)"
+                           % (chan, subdir, fname))
+                return
+        elif not os.path.isfile(doc):
             self._note("NORECORD", "%s/%s/%s (no frozen document)" % (chan, subdir, fname))
             return
-        with open(doc, "rb") as fh:
-            rec = _record_slice(fh.read(), fname)
-        if rec is None:
-            # NOT in the frozen universe.  Refusing is the point: a package the
-            # frozen documents never declared is a different universe, which is
-            # the C22-3 / p6ac-1 substitution mechanism.
-            self._note("NORECORD", "%s/%s/%s (absent from the frozen document)"
-                       % (chan, subdir, fname))
-            return
+        else:
+            with open(doc, "rb") as fh:
+                rec = _record_slice(fh.read(), fname)
+            if rec is None:
+                # NOT in the frozen universe.  Refusing is the point: a package the
+                # frozen documents never declared is a different universe, which is
+                # the C22-3 / p6ac-1 substitution mechanism.
+                self._note("NORECORD", "%s/%s/%s (absent from the frozen document)"
+                           % (chan, subdir, fname))
+                return
         want_sha = rec.get("sha256")
         want_size = rec.get("size")
 
@@ -270,6 +430,25 @@ def main(argv) -> int:
     MirrorHandler.pkg_store = store
     MirrorHandler.mirror_root = root
     MirrorHandler.fetch_log = os.environ.get("RETREAD_MIRROR_FETCH_LOG") or None
+    # p6af-2g.  The sharded half arms itself off the state file the freeze
+    # wrote, so a static p6af-shaped mirror keeps behaving exactly as before and
+    # `p6af_channel_mirror_guard.sh` is unaffected.
+    if os.path.isfile(os.path.join(root, shard_mirror.STATE_FILENAME)):
+        state = shard_mirror.load_state(root)
+        up, dirs, names = shard_mirror.load_frozen_shards(root, state)
+        MirrorHandler.shard_up = up
+        MirrorHandler.shard_dirs = dirs
+        MirrorHandler.name_shard = names
+        MirrorHandler.sharded_pairs = set(names)
+        sys.stderr.write(
+            "channel_mirror_server SHARDED pairs=%d sharded=%d classic=%d "
+            "distinct_shards=%d index_bytes=%d\n"
+            % (state["totals"]["pairs"], state["totals"]["sharded"],
+               state["totals"]["classic"], len(up), state["totals"]["index_bytes"]))
+        for row in state["pairs"]:
+            sys.stderr.write("channel_mirror_server pair %-46s %s shards=%s\n"
+                             % (row["slug"] + "/" + row["subdir"], row["mode"],
+                                row.get("n_shards")))
     sys.stderr.write("channel_mirror_server root=%s port=%d pkg_store=%s\n"
                      % (root, port, store or "(none: static only)"))
     sys.stderr.flush()

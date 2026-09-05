@@ -43,7 +43,7 @@ bc8126b98d81c3f0f706311cc9df9baa  README.md
 552d0bb34c32e248185694542da0e767  tools/binsnap_ancestry_guard.sh
 62e2b386e47ce1d93d7bb92ce758d124  tools/binsnap_ancestry_guard_test.sh
 9967730f4c8c8058f80225df80fc2b35  tools/binsnap_fixset.txt
-16875a9dab92345041d283ab8efed441  tools/channel_mirror_server.py
+338c5d78067aa05577ed082dea895211  tools/channel_mirror_server.py
 c56251e11ce8ab1bd8b807c395265fd4  tools/conda_deny_proxy.py
 7783cc47f9e8ad2503fd44950cd43013  tools/env_version_delta.py
 9ef287b13c05205160e79b5d6638bcde  tools/gate_build.sh
@@ -58,13 +58,16 @@ f8ef0afb0693e81ddd1e2c45135e1b8f  tools/manifest_audit.py
 e60de6759f33d1de9f69a5265cc3dfeb  tools/p6ad_negctl.sh
 2a59e952d4d6701639eaefffe39e5902  tools/p6ad_PREDICTION.md
 88d73e64546ef460325b7b52d2087ba7  tools/p6af2a_pkg_mirror_guard.sh
+7417161af0748a0a57ab42e95152065c  tools/p6af2g_shard_mirror_guard.sh
 8e4f029c593da55601a147f38b693557  tools/p6af_channel_mirror_guard.sh
 c34a4e3a1a8834b073b997fc94230a9f  tools/pixi_merge_run_exports.py
 c9f561484d8ef42157ba6a7532f80681  tools/pixi_shard_cache.py
 6960c0ac937f51969cd1d4f1e1af65c2  tools/pixi_trim_repodata.py
 57bb430f9c62012a88b992ea618e2034  tools/retread_fast_env.sh
+46b5ede95808302e562b66b2e1a2201a  tools/retread_shard_mirror.sh
 bdd93cc2798a27301e793bdc6931be06  tools/sdist_build_poison_guard.sh
 da8aed178eda8db9d349a23d784bd8b6  tools/sdist_build_scope_guard.sh
+1c3729ccc1e9ba22803430aee01dc279  tools/shard_mirror.py
 4555925b41bc08ba5efb7bbb7b40f167  tools/test_stage_mirror.sh
 f4b1d2839ad51722d0f7a84b8482042b  tools/wheel_store_env_guard.sh
 955d184896115e611a763c60c490b5d8  tools/wheel_store_reclaim_guard.sh
