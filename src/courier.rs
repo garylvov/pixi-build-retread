@@ -4887,8 +4887,16 @@ mod tests {
         unsafe { std::env::remove_var("RETREAD_NO_SHADOW_CACHE") };
         crate::wheel_rewrite::re_emit_probe::reset();
 
+        // The two bundles must resolve to DIFFERENT target artifact identities,
+        // or the guard would pass on the old code for the wrong reason: one
+        // cold canonical lock carries FOUR distinct identities (measured on
+        // C32 arm 1: four distinct `retread-cache/shadow/<64 hex>` dirs), and
+        // it is precisely a shared wheel crossing that boundary that used to
+        // be re-emitted. `artifact_cache_identity` covers the wheel target, so
+        // two python versions are two identities; the fixture wheels are
+        // `py3-none-any` and compatible with both.
         let mut staged_bytes: Vec<Vec<u8>> = Vec::new();
-        for bundle in ["bundle-alpha", "bundle-beta"] {
+        for (bundle, python) in [("bundle-alpha", "3.11"), ("bundle-beta", "3.12")] {
             let staging = tmp.join(format!("staging-{bundle}"));
             let dep_wheel = make_emit_wheel(
                 target_name,
@@ -4912,7 +4920,7 @@ mod tests {
                 &minimal_config(bundle),
                 bundle,
                 "2.0.0",
-                "3.11",
+                python,
                 &[dep_wheel, shared_wheel],
                 &conda_capable,
                 &[],
