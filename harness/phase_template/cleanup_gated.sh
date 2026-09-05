@@ -72,6 +72,11 @@
 #            --export=ALL,D=<harness dir>,TAG=<tag>,RJ=<relock job> \
 #            --wrap 'bash <this file> <root> [<root> ...]'
 #
+#   Since 2026-09-05 the three variables are DERIVED from the root arguments
+#   when they are not exported -- see ROOT FIX (d) below -- so the `--export`
+#   clause is now a way to OVERRIDE the derivation, not a way to make the gate
+#   run at all. A `--wrap` with no `--export` is no longer a silent death.
+#
 #   afterany on BOTH phases, never afterok on the cert: a relock that fails its
 #   own lock leaves a cert that Slurm cancels, and a cleanup chained behind the
 #   cert alone then never runs at all. That is how C18A/C18B (job 5759225) were
@@ -82,9 +87,92 @@ CLEANUP=$(dirname "$0")/cleanup.sh
 [ -f "$CLEANUP" ] || CLEANUP=$T/tools/phase_template/cleanup.sh
 PERSISTENT_CACHE=/oscar/data/stellex/glvov/agrescap/cache/retread
 ISO_CACHE_PREFIX=/oscar/data/stellex/glvov/agrescap/cache/retread-injection-on-
-: "${D:?set D to the harness directory whose artifacts/ must already hold the evidence}"
-: "${TAG:?set TAG}"
-: "${RJ:?set RJ to the relock job id these roots belong to}"
+# 2026-09-05 ROOT FIX (p6ad-4). A FOURTH instance of the same family, and this
+# one is in the SUBMIT contract rather than in a name shape.
+#
+#   (d) `D`, `TAG` and `RJ` arrived ONLY through `--export`, and a `--wrap`
+#       without that clause died on bash's own `${D:?...}` at line 85 -- before
+#       the gate printed a single row, before the roots were even parsed, with a
+#       message that names the variable and not the fix. TWO LANES HIT IT ON THE
+#       SAME NIGHT: B-cert-4's cleanup 5841112 (boarded C31-2) and p6ad-4's
+#       5879244, which stranded certP6AD4-5879243-{A,B} and ws.P6AD4-5879243-{A,B}.
+#       Two independent lanes failing the same way on the same contract is a
+#       harness defect, not two operator errors.
+#
+#       THE THREE VALUES ARE ALREADY IN THE ARGUMENTS. Every root this gate
+#       accepts is `cert<TAG>-<JID>[-<arm>]` or `ws.<TAG>-<JID>[-<arm>]` -- that
+#       is condition 2's OWNERSHIP proof, so the basename that proves ownership
+#       also NAMES the tag and the job. `D` is the harness directory whose
+#       `artifacts/` holds `<TAG>-<RJ>*`, and there is exactly one of those.
+#       So an unset variable is now DERIVED and the derivation is PRINTED; an
+#       explicitly exported value always wins, and nothing about the three
+#       conditions below changes. If a value cannot be derived the gate still
+#       refuses -- but it refuses with the exact `--export` clause to add, not
+#       with a bash parameter-expansion error.
+#
+#       Reader: cleanup_gate_env_derivation_guard.sh, which runs this file with
+#       no D/TAG/RJ at all and requires the derivation, runs it against a root
+#       naming a harness that does not exist and requires the printed export
+#       line, and runs the PREVIOUS version of the same file to show it dying at
+#       line 85 -- the mutation that proves the guard can fail.
+derive_from_roots() {
+  # First root that parses wins; every root is required to agree later anyway,
+  # because condition 2 queue-checks every job-id token it finds in each one.
+  local r base rest
+  for r in "$@"; do
+    base=${r##*/}
+    case "$base" in
+      cert*) rest=${base#cert};;
+      ws.*)  rest=${base#ws.};;
+      *) continue;;
+    esac
+    # `<TAG>-<JID>` with an optional `-<arm>` tail: take the FIRST all-digit
+    # dash-token as the job id and everything before it as the tag.
+    local field i n tag="" jid=""
+    n=$(awk -F- '{print NF}' <<<"$rest")
+    for i in $(seq 2 "$n"); do
+      field=$(awk -F- -v k="$i" '{print $k}' <<<"$rest")
+      case "$field" in
+        ''|*[!0-9]*) ;;
+        *) jid=$field; tag=$(awk -F- -v k="$i" '{s=$1; for(j=2;j<k;j++) s=s"-"$j; print s}' <<<"$rest"); break;;
+      esac
+    done
+    [ -n "$jid" ] || continue
+    DERIVED_TAG=$tag; DERIVED_RJ=$jid; DERIVED_FROM=$r
+    return 0
+  done
+  return 1
+}
+derive_harness_dir() {
+  # The unique directory under the task root whose artifacts/ already holds the
+  # evidence for this tag+job. `find -maxdepth` per HANDOFF section 2; a
+  # full-tree walk here would cross every job root under the task directory.
+  local tag=$1 rj=$2 hits
+  hits=$(find "$T" -maxdepth 3 -type f -path "*/artifacts/$tag-$rj*" -printf '%h\n' 2>/dev/null | sort -u)
+  [ "$(printf '%s\n' "$hits" | grep -c .)" = 1 ] || return 1
+  printf '%s\n' "${hits%/artifacts}"
+}
+if [ -z "${D:-}" ] || [ -z "${TAG:-}" ] || [ -z "${RJ:-}" ]; then
+  DERIVED_TAG=; DERIVED_RJ=; DERIVED_FROM=
+  if derive_from_roots "$@"; then
+    [ -n "${TAG:-}" ] || { TAG=$DERIVED_TAG; echo "### DERIVED TAG=$TAG from root $DERIVED_FROM"; }
+    [ -n "${RJ:-}"  ] || { RJ=$DERIVED_RJ;  echo "### DERIVED RJ=$RJ from root $DERIVED_FROM"; }
+  fi
+  if [ -z "${D:-}" ] && [ -n "${TAG:-}" ] && [ -n "${RJ:-}" ]; then
+    D=$(derive_harness_dir "$TAG" "$RJ") \
+      && echo "### DERIVED D=$D (the one directory under $T whose artifacts/ holds $TAG-$RJ*)" \
+      || D=
+  fi
+fi
+if [ -z "${D:-}" ] || [ -z "${TAG:-}" ] || [ -z "${RJ:-}" ]; then
+  echo "### REFUSE: could not derive the submit contract, and nothing was deleted."
+  echo "###   D='${D:-<unset>}' TAG='${TAG:-<unset>}' RJ='${RJ:-<unset>}'"
+  echo "###   Roots given: $*"
+  echo "###   Add this to the sbatch line and resubmit (fill in what is <unset>):"
+  echo "###     --export=ALL,D=<harness dir>,TAG=${TAG:-<tag>},RJ=${RJ:-<relock job>}"
+  echo "###   D is the directory whose artifacts/ already holds ${TAG:-<tag>}-${RJ:-<job>}*.rc/.wall/.lock.log."
+  exit 2
+fi
 case "$RJ" in ''|*[!0-9]*) echo "### REFUSE: RJ='$RJ' is not a job id"; exit 2;; esac
 A=$D/artifacts
 hostname; date -Is
