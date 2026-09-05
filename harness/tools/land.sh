@@ -10,6 +10,10 @@
 #
 #   usage: CAND=<sha> GATE_JOB=<id> RELOCK_JOB=<id> FIXSET_ADD="<sha> <name>" \
 #          bash land.sh
+#
+# It prints a new `HARNESS_COMMIT=<sha>` (see the MERGE-K-2 block below): the
+# landed row is committed in the harness worktree, so every job submitted after
+# this landing must carry that commit, not the one before it.
 set -uo pipefail
 export PATH=/users/glvov/.pixi/bin:/users/glvov/.local/bin:$PATH   # git-lfs, or push dies
 T=/oscar/data/stellex/glvov/agrescap/tasks/retread-4-11
@@ -31,9 +35,25 @@ SHORT=$(git -C "$REPO" rev-parse --short "$FULL")
 SNAPC=$T/binsnaps/cand-$SHORT
 [ -f "$SNAPC/pixi-build-retread" ] || { echo "### REFUSE: no candidate binsnap at $SNAPC"; exit 5; }
 
-# the fix set the NEXT candidate must carry now includes what this step landed
-grep -qE "^${FIXSET_ADD%% *} " "$T/tools/binsnap_fixset.txt" || \
-  printf '%s\n' "$FIXSET_ADD" >> "$T/tools/binsnap_fixset.txt"
+# The fix set the NEXT candidate must carry now includes what this step landed.
+#
+# MERGE-K-2. This used to be a two-line append into the TASK copy alone, which
+# left the versioned copy `harness/tools/binsnap_fixset.txt` one row behind at
+# every single landing -- and that file is MAPPED by `harness_drift_check.sh`,
+# so the next job to run behind `$HARNESS_COMMIT` died at its drift gate on a
+# file nobody had edited. efe74a0 re-synced it by hand for B17; a hand sync is a
+# snapshot, not a link. `fixset_land_row.sh` commits the row in the harness
+# worktree BY PATH and re-extracts the task copy FROM THAT COMMIT, so the two
+# copies are identical by construction and it PRINTS the new HARNESS_COMMIT the
+# following jobs must carry. Read its header for why that shape and not a
+# print-the-command-for-a-human shape.
+#
+# THIS RUNS BEFORE THE FAST-FORWARD ON PURPOSE: a refusal here is a refusal with
+# nothing moved, and the ancestry guard below has to read the EXTENDED fix set.
+HARNESS_REPO_DIR=${HARNESS_REPO:-/oscar/data/stellex/glvov/agrescap/worktrees/harness-tools}
+bash "$T/tools/fixset_land_row.sh" "$HARNESS_REPO_DIR" "$T" "$FIXSET_ADD" || {
+  echo "### REFUSE: the landed row did not reach BOTH copies of the fix set -- nothing has moved"
+  exit 11; }
 
 # ff, then re-run the guard against the LANDED tip with the extended fix set
 # `integration/4.12` is CHECKED OUT in its own worktree, so `branch -f` refuses

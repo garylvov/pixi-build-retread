@@ -18,7 +18,7 @@ here outward.
 | path | what it is |
 | --- | --- |
 | `phase_template/` | `phaseN_relock.sh`, `phaseN_cert.sh`, `cleanup.sh`, `README.md` — the starting point for a new relock/cert pair |
-| `tools/` | `retread_fast_env.sh`, `b2_attribute.sh`, `manifest_audit.py`, `import_audit.py`, `env_version_delta.py`, `test_stage_mirror.sh`, the merge-queue driver `land.sh`, the binsnap ancestry guard (`binsnap_ancestry_guard.sh` + its `_test.sh` + the declared `binsnap_fixset.txt`) and the task-dir drift check (`harness_drift_check.sh` + `harness_drift_allowlist.txt`) |
+| `tools/` | `retread_fast_env.sh`, `b2_attribute.sh`, `manifest_audit.py`, `import_audit.py`, `env_version_delta.py`, `test_stage_mirror.sh`, the merge-queue driver `land.sh` and its fix-set sync `fixset_land_row.sh` (+ `land_fixset_sync_guard.sh`), the binsnap ancestry guard (`binsnap_ancestry_guard.sh` + its `_test.sh` + the declared `binsnap_fixset.txt`) and the task-dir drift check (`harness_drift_check.sh` + `harness_drift_allowlist.txt`) |
 | `inode-cleanup/` | the stale-root sweeper (`delete_stale_roots.v2.sh`), `delete_allowlisted.sh`, the census/characterize/verify scripts and their sbatch wrappers |
 | `instrumented/` | the p6b instrumented relock (`p6b_relock.sh`, `.b2.sh` variant) plus `p6b_stamp.py` / `p6b_extract.py` |
 | `verdict/cert_verdict.sh` | the typed-exit verdict gate |
