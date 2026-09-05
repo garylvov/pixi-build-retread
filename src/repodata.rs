@@ -218,7 +218,9 @@ async fn build_sparse(channel_url: String, subdir: String) -> Option<Arc<SparseR
                 );
                 // p6ad-6: an eviction removes a document from the snapshot, so
                 // the memoized universe digest no longer names what is on disk.
-                invalidate_snapshot_digest();
+                // p6ad-4-3: the eviction touches THIS path and no other, so the
+                // other nine documents keep their memoized hashes.
+                invalidate_snapshot_digest(&path);
                 if let Err(error) = tokio::fs::remove_file(&path).await {
                     tracing::warn!(
                         path = %path.display(), error = %error,
@@ -290,7 +292,11 @@ async fn refresh_disk_cache(channel_url: &str, subdir: &str, path: &PathBuf) -> 
     // p6ad-6: this process just changed its own snapshot. The memoized universe
     // digest names the bytes that were there BEFORE this write, so it is dropped
     // by the writer and never left to age out.
-    invalidate_snapshot_digest();
+    // p6ad-4-3: `write_atomic` replaced exactly `path` and published a NEW
+    // inode for it, so only `path`'s memo entries are dropped -- the other nine
+    // documents in the snapshot were not touched by this write and their
+    // hashes, which carry 99.2 % of the bytes, survive the refresh.
+    invalidate_snapshot_digest(path);
     Ok(())
 }
 
@@ -693,7 +699,63 @@ fn snapshot_digest_memo() -> &'static Mutex<Option<(PathBuf, String)>> {
 /// sha256, `SNAPSHOT_DIGEST` holds the fold of all of them -- so a writer that
 /// cleared only the fold would leave the very hash the next fold reads for the
 /// bytes it just replaced. One writer, one invalidation, both memos.
-pub fn invalidate_snapshot_digest() {
+///
+/// p6ad-4-3: `changed` IS THE DOCUMENT THE CALLER JUST REPLACED, and only that
+/// document's entries leave the per-document memo. p6ad-4 `clear()`ed the whole
+/// map because that made the invalidation obviously correct, and MEASURED the
+/// price on its own arm: 374 memo hits against 222 misses is 62.8 % by COUNT
+/// and **12.05 %** by BYTES (7.145 GB served of 59.286 GB attempted), because
+/// the documents a refresh replaces are precisely conda-forge's `linux-64`
+/// (638 520 052 B) and `noarch` (253 824 887 B) -- 892 of 899 MB, 99.2 % of the
+/// bytes -- so every whole-map clear threw away exactly the entries worth
+/// keeping.
+///
+/// WHY SCOPING IT IS STILL SOUND, and it is soundER, not weaker:
+///
+///   * The two production writers each replace exactly ONE document and know
+///     its path (`refresh_disk_cache`'s `write_atomic` target, and the
+///     corrupt-cache eviction's `path`). Nothing else under this root changes
+///     because of them.
+///   * A document changed by ANOTHER process was never covered by the
+///     `clear()` either -- no writer in this process runs -- and it is covered
+///     the way it always was, by `stat_key`'s ctime term (p6k-b/p6y): a
+///     same-length in-place rewrite moves `ctime`, which cannot be set from
+///     userspace, so the key misses and the bytes are read.
+///   * Removal is BY PATH AND EVERY STAT TUPLE, not by the key the caller could
+///     compute: `write_atomic` publishes a new inode, so at the moment the
+///     writer calls this the entry it must kill is the one under the OLD stat
+///     tuple, which is no longer derivable from the file on disk.
+///
+/// `SNAPSHOT_DIGEST` -- the fold of all ten documents -- is still dropped
+/// WHOLESALE, because one changed document changes the fold. Only which
+/// documents have to be re-hashed to rebuild that fold changes here; the fold
+/// itself is untouched, so the universe digest is byte-identical to what the
+/// whole-map clear produced. That is
+/// `p6ad43_only_the_replaced_document_is_rehashed`, which asserts the tally AND
+/// the equality with a full re-hash in one test. The other two guards are
+/// `p6ad43_invalidation_is_scoped_to_the_replaced_document` (the scoping, with
+/// no byte changing on disk) and
+/// `p6ad43_a_same_length_rewrite_with_preserved_mtime_still_invalidates` (the
+/// ctime term, with its own mutation control).
+pub fn invalidate_snapshot_digest(changed: &std::path::Path) {
+    *snapshot_digest_memo().lock().unwrap() = None;
+    document_identity_memo()
+        .lock()
+        .unwrap()
+        .retain(|(path, _stat_tuple), _| path.as_path() != changed);
+}
+
+/// Test-only: drop BOTH memos in their entirety.
+///
+/// p6ad-4-3 removed the whole-map clear from the production invalidator, and
+/// two guards need it back for a reason production never has: they drive
+/// several temp roots in ONE process and have to start from a memo that carries
+/// nothing from a previous test. It is `#[cfg(test)]` on purpose -- a
+/// production caller that wants this wants the scoped invalidator instead, and
+/// a whole-map clear with a production call site would put p6ad-4-3's 99.2 %
+/// straight back on the floor.
+#[cfg(test)]
+pub fn reset_snapshot_memos() {
     *snapshot_digest_memo().lock().unwrap() = None;
     document_identity_memo().lock().unwrap().clear();
 }
@@ -941,6 +1003,24 @@ pub fn document_identity_memo_get(path: &std::path::Path) -> Option<(String, u64
         .unwrap()
         .get(&(path.to_path_buf(), stat_key(&meta)))
         .cloned()
+}
+
+/// Test-only: how many entries the memo holds for `path` ACROSS ALL STAT
+/// TUPLES.
+///
+/// p6ad-4-3's invalidator removes by PATH, not by the key the caller could
+/// compute, and the reason is visible only through this reader: after an
+/// in-place rewrite the entry that must die is filed under the OLD stat tuple,
+/// which no longer exists on disk, so `document_identity_memo_get` (which stats
+/// the file) cannot see it and cannot prove it was removed.
+#[cfg(test)]
+pub fn document_identity_memo_entries_for(path: &std::path::Path) -> usize {
+    document_identity_memo()
+        .lock()
+        .unwrap()
+        .keys()
+        .filter(|(p, _)| p.as_path() == path)
+        .count()
 }
 
 /// Test-only: put a SENTINEL hash in the memo for `path`'s current stat tuple.
@@ -1239,9 +1319,18 @@ pub fn universe_from_cache_root(cache_root: &std::path::Path) -> Result<Vec<Repo
 /// p6ad-4: the walk, parameterised by which identity function reads each
 /// document, so the RULE has exactly one implementation and the memoized and
 /// unmemoized folds can never diverge in anything but the hashing.
+///
+/// p6ad-4-3 widens the parameter from a bare `fn` pointer to `impl Fn` for ONE
+/// reason, and it is a guard reason: `p6ad43_only_the_replaced_document_is_
+/// rehashed` has to count WHICH documents this fold re-read, and a counting
+/// closure captures its own tally. The alternative -- asserting on the process-
+/// global `HASH_CALLS`/`MEMO_HITS` counters -- is ruled out by the note on
+/// `document_identity_memo_poison`: `cargo test` runs the suite in one process,
+/// so a counter another test can move is a guard that cannot fail for the right
+/// reason. Both production callers still pass a plain `fn` item.
 fn universe_from_cache_root_inner(
     cache_root: &std::path::Path,
-    identity: fn(&std::path::Path) -> Result<(String, u64)>,
+    identity: impl Fn(&std::path::Path) -> Result<(String, u64)>,
 ) -> Result<Vec<RepodataDocument>> {
     let dir = cache_root.join("retread-repodata");
     let mut documents = Vec::new();
@@ -1420,6 +1509,26 @@ mod tests {
 
     /// `FROZEN_ENV` is process-global; the one test that flips it holds this so
     /// it can never switch another test's production path underneath it.
+    ///
+    /// p6ad-4-3 ROOT FIX, AND IT IS A FLAKE THIS CAMPAIGN ALREADY PAID FOR.
+    /// Holding it in the WRITER alone is not enough: `with_frozen` decides
+    /// whether `document_identity_uncached` consults the sidecar AT ALL, so any
+    /// test running in parallel with it reads a different production path than
+    /// the one it was written against. MEASURED: gate 5918015 went RED with
+    /// `p6ad_one_changed_byte_in_one_subdir_moves_the_universe_digest` failing
+    /// on "the changed document must rehash" -- a sidecar written moments
+    /// earlier for the OLD bytes, believed because the freeze was on and the
+    /// stat tuple had not moved -- and the gate's own isolation re-run printed
+    /// `ISOLATED_GREEN` for it, which is the signature of exactly this race and
+    /// not of a real defect. The same gate on the same tree had been GREEN an
+    /// hour earlier (5917002), so it is a coin flip, and a guard that fails for
+    /// the wrong reason half the time is a guard nobody can read.
+    ///
+    /// So EVERY test that reads a document through the identity functions --
+    /// `document_identity_uncached`, `document_identity_blocking`, and the four
+    /// folds that call them -- takes this lock now, not only the one that flips
+    /// the variable. It costs the suite the serialisation of fifteen tests that
+    /// each run in milliseconds.
     static FROZEN_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Run `body` with the freeze on, and put the variable back however `body`
@@ -1459,6 +1568,11 @@ mod tests {
     /// 5611846 when nothing upstream had moved.
     #[test]
     fn p6ad_identical_repodata_bytes_are_the_same_universe_whatever_the_mtime_or_path() {
+        // p6ad-4-3 ROOT FIX (see the note on FROZEN_TEST_LOCK): every test that
+        // reads a document through the identity functions takes this lock, because
+        // `with_frozen` flips a PROCESS-GLOBAL env var that decides whether the
+        // sidecar is consulted at all.
+        let _freeze_guard = FROZEN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let a = unique_tmp_dir("p6ad-same-a");
         let b = unique_tmp_dir("p6ad-same-b");
         let body = br#"{"packages":{"zlib-1.3-h1.conda":{"name":"zlib"}}}"#;
@@ -1491,6 +1605,11 @@ mod tests {
     /// single opaque bit.
     #[test]
     fn p6ad_one_changed_byte_in_one_subdir_moves_the_universe_digest() {
+        // p6ad-4-3 ROOT FIX (see the note on FROZEN_TEST_LOCK): every test that
+        // reads a document through the identity functions takes this lock, because
+        // `with_frozen` flips a PROCESS-GLOBAL env var that decides whether the
+        // sidecar is consulted at all.
+        let _freeze_guard = FROZEN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_tmp_dir("p6ad-onebyte");
         let linux = write_doc(&dir, "conda_forge--linux-64--a.json", br#"{"packages":{"a":1}}"#);
         let noarch_before = write_doc(&dir, "conda_forge--noarch--b.json", br#"{"packages":{"b":1}}"#);
@@ -1657,6 +1776,11 @@ mod tests {
     /// sha, not the sentinel.
     #[test]
     fn p6ad4_two_consumers_of_one_document_hash_it_once() {
+        // p6ad-4-3 ROOT FIX (see the note on FROZEN_TEST_LOCK): every test that
+        // reads a document through the identity functions takes this lock, because
+        // `with_frozen` flips a PROCESS-GLOBAL env var that decides whether the
+        // sidecar is consulted at all.
+        let _freeze_guard = FROZEN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let root = unique_tmp_dir("p6ad4-once");
         let dir = root.join("retread-repodata");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1720,6 +1844,11 @@ mod tests {
     /// on `54b5852` clears only `SNAPSHOT_DIGEST`.
     #[test]
     fn p6ad4_a_mutated_document_invalidates_the_memo() {
+        // p6ad-4-3 ROOT FIX (see the note on FROZEN_TEST_LOCK): every test that
+        // reads a document through the identity functions takes this lock, because
+        // `with_frozen` flips a PROCESS-GLOBAL env var that decides whether the
+        // sidecar is consulted at all.
+        let _freeze_guard = FROZEN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_tmp_dir("p6ad4-mutate");
         let path = write_doc(&dir, "conda_forge--noarch--bb.json", br#"{"packages":{"b":1}}"#);
         let truth = document_identity_blocking(&path).unwrap().0;
@@ -1745,7 +1874,7 @@ mod tests {
         // the invalidation can be what clears it.
         document_identity_memo_poison(&path, &sentinel, 26);
         assert_eq!(document_identity_blocking(&path).unwrap().0, sentinel);
-        invalidate_snapshot_digest();
+        invalidate_snapshot_digest(&path);
         assert_eq!(
             document_identity_memo_get(&path),
             None,
@@ -1768,6 +1897,11 @@ mod tests {
     /// asserted warm, so the equality is not the equality of two cold folds.
     #[test]
     fn p6ad4_the_memo_does_not_move_the_digest() {
+        // p6ad-4-3 ROOT FIX (see the note on FROZEN_TEST_LOCK): every test that
+        // reads a document through the identity functions takes this lock, because
+        // `with_frozen` flips a PROCESS-GLOBAL env var that decides whether the
+        // sidecar is consulted at all.
+        let _freeze_guard = FROZEN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let root = unique_tmp_dir("p6ad4-digest");
         let dir = root.join("retread-repodata");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1798,12 +1932,296 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// p6ad-4-3 GUARD 1 — A ONE-DOCUMENT REFRESH RE-HASHES EXACTLY ONE
+    /// DOCUMENT, AND THE UNIVERSE DIGEST DOES NOT MOVE.
+    ///
+    /// This is the whole of p6ad-4-3 in one test. p6ad-4 measured the price of
+    /// the whole-map `clear()` on its own arm: 374 memo hits against 222 misses
+    /// is 62.8 % by COUNT but 12.05 % by BYTES, because the two documents a
+    /// refresh replaces (conda-forge `linux-64` 638 520 052 B + `noarch`
+    /// 253 824 887 B) carry 99.2 % of the snapshot's bytes and the clear threw
+    /// away every other document's hash along with them.
+    ///
+    /// RED ON THE OLD CODE: with `invalidate_snapshot_digest` clearing the
+    /// whole map, the tally below is all FOUR documents, not one. (The
+    /// mutation control for this lane is exactly that: put `clear()` back in
+    /// the invalidator's body, keep the signature, and this assert fires.)
+    ///
+    /// THE TALLY IS A CAPTURED CLOSURE, NOT THE PROCESS-GLOBAL COUNTERS, for
+    /// the reason `document_identity_memo_poison` already states: `cargo test`
+    /// runs the suite in one process and a counter another test can move is a
+    /// guard that cannot fail for the right reason.
+    #[test]
+    fn p6ad43_only_the_replaced_document_is_rehashed() {
+        // p6ad-4-3 ROOT FIX (see the note on FROZEN_TEST_LOCK): every test that
+        // reads a document through the identity functions takes this lock, because
+        // `with_frozen` flips a PROCESS-GLOBAL env var that decides whether the
+        // sidecar is consulted at all.
+        let _freeze_guard = FROZEN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = unique_tmp_dir("p6ad43-scope");
+        let dir = root.join("retread-repodata");
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = write_doc(&dir, "conda_forge--linux-64--aa.json", br#"{"packages":{"a":1}}"#);
+        let b = write_doc(&dir, "conda_forge--noarch--bb.json", br#"{"packages":{"b":1}}"#);
+        let c = write_doc(&dir, "nvidia--linux-64--cc.json", br#"{"packages":{"c":1}}"#);
+        let d = write_doc(&dir, "nvidia--noarch--dd.json", br#"{"packages":{"d":1}}"#);
+
+        // Warm every entry through the PRODUCTION fold, and assert it warm --
+        // otherwise "only one was re-hashed" is four cold misses in disguise.
+        let warm = snapshot_digest_memoized_at(&root);
+        assert_ne!(warm, UNIVERSE_UNAVAILABLE, "{warm}");
+        for path in [&a, &b, &c, &d] {
+            assert!(
+                document_identity_memo_get(path).is_some(),
+                "the production fold must populate the memo for {}",
+                path.display()
+            );
+        }
+
+        // ONE writer replaces ONE document, which is what `refresh_disk_cache`
+        // and the corrupt-cache eviction each do, and it names what it changed.
+        std::fs::write(&a, br#"{"packages":{"a":2,"a2":3}}"#).unwrap();
+        invalidate_snapshot_digest(&a);
+
+        // The three it did not touch keep their memoized hashes.
+        for path in [&b, &c, &d] {
+            assert!(
+                document_identity_memo_get(path).is_some(),
+                "p6ad-4-3: a one-document refresh must not evict {}",
+                path.display()
+            );
+        }
+
+        // And the next fold reads exactly one document off disk.
+        let rehashed: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+        let documents = universe_from_cache_root_inner(&root, |p| {
+            if document_identity_memo_get(p).is_none() {
+                rehashed.lock().unwrap().push(p.to_path_buf());
+            }
+            document_identity_blocking(p)
+        })
+        .unwrap();
+        let rehashed = rehashed.into_inner().unwrap();
+        assert_eq!(
+            rehashed,
+            vec![a.clone()],
+            "exactly ONE document may be re-hashed after a one-document refresh; re-hashed {rehashed:?}"
+        );
+        assert_eq!(documents.len(), 4, "all four documents are still in the fold");
+
+        // THE VALUE IS THE SAME VALUE. The fold through the scoped memo is
+        // byte-identical to a full re-hash of the same bytes -- which is the
+        // one thing this change is not allowed to move.
+        let full_rehash = snapshot_digest_at(&root);
+        assert_ne!(full_rehash, UNIVERSE_UNAVAILABLE, "{full_rehash}");
+        assert_eq!(
+            universe_digest_of(&documents),
+            full_rehash,
+            "the scoped-memo fold must equal a full re-hash"
+        );
+        assert_eq!(
+            snapshot_digest_memoized_at(&root),
+            full_rehash,
+            "and so must the production entry point"
+        );
+        assert_ne!(full_rehash, warm, "NON-VACUITY: the replacement did move the digest");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// p6ad-4-3 GUARD 2 — THE INVALIDATION IS SCOPED, WITH NOT ONE BYTE
+    /// CHANGING ON DISK.
+    ///
+    /// Two documents, two sentinels, one invalidation naming ONE of them. No
+    /// file is written between the sentinels and the assertions, so the
+    /// invalidation is the only thing that can move either entry: this is the
+    /// half that isolates the fix from the stat key entirely.
+    ///
+    /// RED ON THE OLD CODE: `clear()` takes the kept document's sentinel with
+    /// it and the second assertion fires.
+    #[test]
+    fn p6ad43_invalidation_is_scoped_to_the_replaced_document() {
+        // p6ad-4-3 ROOT FIX (see the note on FROZEN_TEST_LOCK): every test that
+        // reads a document through the identity functions takes this lock, because
+        // `with_frozen` flips a PROCESS-GLOBAL env var that decides whether the
+        // sidecar is consulted at all.
+        let _freeze_guard = FROZEN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tmp_dir("p6ad43-scoped");
+        let replaced = write_doc(&dir, "conda_forge--linux-64--aa.json", br#"{"packages":{"a":1}}"#);
+        let kept = write_doc(&dir, "conda_forge--noarch--bb.json", br#"{"packages":{"b":1}}"#);
+        let sentinel_replaced = "d".repeat(64);
+        let sentinel_kept = "e".repeat(64);
+
+        // NON-VACUITY FIRST: both sentinels are genuinely reachable through the
+        // production entry point, so both assertions below are real.
+        document_identity_memo_poison(&replaced, &sentinel_replaced, 20);
+        document_identity_memo_poison(&kept, &sentinel_kept, 20);
+        assert_eq!(
+            document_identity_blocking(&replaced).unwrap().0,
+            sentinel_replaced,
+            "the memo must genuinely be consulted for the replaced document"
+        );
+        assert_eq!(
+            document_identity_blocking(&kept).unwrap().0,
+            sentinel_kept,
+            "the memo must genuinely be consulted for the kept document"
+        );
+
+        invalidate_snapshot_digest(&replaced);
+
+        assert_eq!(
+            document_identity_memo_get(&replaced),
+            None,
+            "the replaced document's entry must go"
+        );
+        assert_eq!(
+            document_identity_memo_get(&kept).map(|(sha256, _)| sha256),
+            Some(sentinel_kept),
+            "p6ad-4-3: a writer that replaced ONE document must not throw away another \
+             document's hash -- on the production shape that is 99.2 % of the bytes"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// p6ad-4-3 GUARD 3 — A SAME-LENGTH IN-PLACE REWRITE WITH mtime RESTORED
+    /// MUST STILL INVALIDATE, WHETHER OR NOT THE STAT TUPLE MOVED.
+    ///
+    /// The document is rewritten to DIFFERENT BYTES at the SAME LENGTH, in
+    /// place (same inode), and its mtime/atime are put back where they were, so
+    /// `len`, `ino` and `mtime` all match the memo's key. Whether `ctime` moves
+    /// is a property of the FILESYSTEM AND THE CLOCK, not of this code, and
+    /// MEASURED: gate 5917002 (node2341) saw it move, gate 5918015 (node2338)
+    /// and mutation arm BASE (node2341) saw it NOT move -- the whole sequence
+    /// lands inside one ctime tick when the box is quiet, and
+    /// `stat_key(before) == stat_key(after)` byte for byte
+    /// (`20:78490866:1788642585:910882335:1788642585:910882335`, both sides).
+    /// A guard that asserts "ctime moved" is therefore a guard that fails for
+    /// the wrong reason on a quiet node, and the first version of this one did
+    /// exactly that.
+    ///
+    /// So it asserts the thing that is TRUE IN BOTH WORLDS and is p6ad-4-3's
+    /// own claim: the writer names the document it replaced, and after that
+    /// call the memo holds NOTHING for that path under ANY stat tuple. Which
+    /// branch the filesystem took is printed, and each branch carries its own
+    /// assertion about what the memo held BEFORE the invalidation -- so the
+    /// non-vacuity is real either way:
+    ///
+    ///   * ctime moved   -> the stat key missed on its own and the memo was
+    ///     already cold for the current tuple, but the STALE entry is still in
+    ///     the map under the old one (`entries_for` = 2 after a re-read).
+    ///   * ctime did not -> the stat key MATCHES and the memo is genuinely
+    ///     STALE: it hands back the hash of bytes that are no longer on disk.
+    ///     This is the exact shape the brief names, and the only thing that can
+    ///     save it is the writer's invalidation.
+    ///
+    /// The MUTATION CONTROL on the ctime term stays, in the form that does not
+    /// depend on the clock: the key built WITHOUT the ctime term is asserted
+    /// UNCHANGED across the rewrite, so `stat_key` minus ctime is demonstrably
+    /// blind here. (The ctime term's own RED-on-removal arm is p6ad-4's M3 in
+    /// `p6ad4-work/mutations.sh`, against
+    /// `p6ad4_a_mutated_document_invalidates_the_memo` half (a); this lane does
+    /// not duplicate it.)
+    #[test]
+    fn p6ad43_a_same_length_rewrite_with_preserved_mtime_still_invalidates() {
+        // p6ad-4-3 ROOT FIX (see the note on FROZEN_TEST_LOCK): every test that
+        // reads a document through the identity functions takes this lock, because
+        // `with_frozen` flips a PROCESS-GLOBAL env var that decides whether the
+        // sidecar is consulted at all.
+        let _freeze_guard = FROZEN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = unique_tmp_dir("p6ad43-ctime");
+        let path = write_doc(&dir, "conda_forge--linux-64--aa.json", br#"{"packages":{"a":1}}"#);
+        let before = std::fs::metadata(&path).unwrap();
+        let (truth, bytes) = document_identity_blocking(&path).unwrap();
+        assert!(
+            document_identity_memo_get(&path).is_some(),
+            "warm the memo before rewriting under it"
+        );
+        assert_eq!(document_identity_memo_entries_for(&path), 1);
+
+        std::fs::write(&path, br#"{"packages":{"a":9}}"#).unwrap();
+        let handle = std::fs::File::options().write(true).open(&path).unwrap();
+        handle
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_accessed(before.accessed().unwrap())
+                    .set_modified(before.modified().unwrap()),
+            )
+            .unwrap();
+        drop(handle);
+        let after = std::fs::metadata(&path).unwrap();
+
+        // MUTATION CONTROL ON THE CTIME TERM, clock-independent: every other
+        // field of the key is unchanged, so a `stat_key` without ctime is blind
+        // to this rewrite by construction.
+        let key_without_ctime = |m: &std::fs::Metadata| {
+            format!("{}:{}:{}:{}", m.len(), m.ino(), m.mtime(), m.mtime_nsec())
+        };
+        assert_eq!(
+            key_without_ctime(&before),
+            key_without_ctime(&after),
+            "the rewrite must be invisible to len/ino/mtime -- otherwise this guard proves nothing"
+        );
+
+        let ctime_moved = stat_key(&before) != stat_key(&after);
+        eprintln!(
+            "p6ad43 guard 3: ctime_moved={ctime_moved} before={} after={}",
+            stat_key(&before),
+            stat_key(&after)
+        );
+        if ctime_moved {
+            // The ctime term saw it with no invalidation call at all, and the
+            // re-read files a SECOND entry under the new tuple.
+            assert_eq!(
+                document_identity_memo_get(&path),
+                None,
+                "the ctime term must miss on a same-length in-place rewrite"
+            );
+            let seen = document_identity_blocking(&path).unwrap();
+            assert_ne!(seen.0, truth, "the re-hash must name the new bytes");
+            assert_eq!(seen.1, bytes, "which are the same length as the old ones");
+            assert_eq!(
+                document_identity_memo_entries_for(&path),
+                2,
+                "the OLD stat tuple's entry is still in the map, unreachable by key"
+            );
+        } else {
+            // THE STAT TUPLE IS UNCHANGED AND THE BYTES DIFFER: the memo is
+            // stale and there is nothing in the key that can tell.
+            assert_eq!(
+                document_identity_memo_get(&path).map(|(sha256, _)| sha256),
+                Some(truth.clone()),
+                "with the whole stat tuple unchanged the memo must still be answering \
+                 -- that staleness is the reason the writer has to invalidate"
+            );
+            assert_eq!(document_identity_memo_entries_for(&path), 1);
+        }
+
+        // THE CLAIM UNDER TEST, TRUE IN BOTH BRANCHES: the writer names the
+        // document it replaced, and the memo then holds NOTHING for that path
+        // under ANY stat tuple -- including the stale one.
+        invalidate_snapshot_digest(&path);
+        assert_eq!(
+            document_identity_memo_entries_for(&path),
+            0,
+            "p6ad-4-3 removes by path across every stat tuple, including the stale one"
+        );
+        let fresh = document_identity_blocking(&path).unwrap();
+        assert_ne!(fresh.0, truth, "and the next read names the bytes on disk");
+        assert_eq!(fresh.1, bytes, "at the same length as the bytes it replaced");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
 
     /// The verb reads the snapshot on disk and nothing else: dotfiles (the
     /// fetch locks and the sha sidecars) are not documents, and the summary
     /// line names every pair it found with the digest it folded.
     #[test]
     fn p6ad_the_summary_names_every_document_the_snapshot_actually_holds() {
+        // p6ad-4-3 ROOT FIX (see the note on FROZEN_TEST_LOCK): every test that
+        // reads a document through the identity functions takes this lock, because
+        // `with_frozen` flips a PROCESS-GLOBAL env var that decides whether the
+        // sidecar is consulted at all.
+        let _freeze_guard = FROZEN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let root = unique_tmp_dir("p6ad-verb");
         let dir = root.join("retread-repodata");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1853,6 +2271,11 @@ mod tests {
     /// was consulted" is precisely the state a reader most needs named.
     #[test]
     fn p6ad_an_empty_universe_still_has_a_digest() {
+        // p6ad-4-3 ROOT FIX (see the note on FROZEN_TEST_LOCK): every test that
+        // reads a document through the identity functions takes this lock, because
+        // `with_frozen` flips a PROCESS-GLOBAL env var that decides whether the
+        // sidecar is consulted at all.
+        let _freeze_guard = FROZEN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let empty = universe_digest_of(&[]);
         assert_eq!(empty.len(), 16, "{empty}");
         assert_ne!(
@@ -1894,6 +2317,11 @@ mod tests {
     /// asserted to fold them to one.
     #[test]
     fn p6ad6_two_bundles_sharing_one_snapshot_yield_one_universe_digest() {
+        // p6ad-4-3 ROOT FIX (see the note on FROZEN_TEST_LOCK): every test that
+        // reads a document through the identity functions takes this lock, because
+        // `with_frozen` flips a PROCESS-GLOBAL env var that decides whether the
+        // sidecar is consulted at all.
+        let _freeze_guard = FROZEN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let root = snapshot_root(
             "p6ad6-share",
             &[
@@ -1929,6 +2357,11 @@ mod tests {
     /// every `record_document` moved it, which is what invented 17 of the 20.
     #[test]
     fn p6ad6_the_universe_digest_does_not_move_while_the_fan_out_accumulates() {
+        // p6ad-4-3 ROOT FIX (see the note on FROZEN_TEST_LOCK): every test that
+        // reads a document through the identity functions takes this lock, because
+        // `with_frozen` flips a PROCESS-GLOBAL env var that decides whether the
+        // sidecar is consulted at all.
+        let _freeze_guard = FROZEN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let root = snapshot_root(
             "p6ad6-accum",
             &[
@@ -1960,6 +2393,11 @@ mod tests {
     /// p6ad property the new input set must not have cost us.
     #[test]
     fn p6ad6_one_changed_byte_in_the_snapshot_still_moves_the_snapshot_digest() {
+        // p6ad-4-3 ROOT FIX (see the note on FROZEN_TEST_LOCK): every test that
+        // reads a document through the identity functions takes this lock, because
+        // `with_frozen` flips a PROCESS-GLOBAL env var that decides whether the
+        // sidecar is consulted at all.
+        let _freeze_guard = FROZEN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let root = snapshot_root(
             "p6ad6-byte",
             &[
@@ -1982,6 +2420,11 @@ mod tests {
     /// empty" are different facts and a row must not conflate them.
     #[test]
     fn p6ad6_an_unreadable_snapshot_is_not_the_empty_universe() {
+        // p6ad-4-3 ROOT FIX (see the note on FROZEN_TEST_LOCK): every test that
+        // reads a document through the identity functions takes this lock, because
+        // `with_frozen` flips a PROCESS-GLOBAL env var that decides whether the
+        // sidecar is consulted at all.
+        let _freeze_guard = FROZEN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let root = unique_tmp_dir("p6ad6-missing");
         let digest = snapshot_digest_at(&root);
         assert_eq!(digest, UNIVERSE_UNAVAILABLE, "{digest}");
@@ -1996,6 +2439,11 @@ mod tests {
     /// production's cache.
     #[test]
     fn p6ad6_the_snapshot_memo_is_keyed_on_the_root_and_dropped_by_the_writer() {
+        // p6ad-4-3 ROOT FIX (see the note on FROZEN_TEST_LOCK): every test that
+        // reads a document through the identity functions takes this lock, because
+        // `with_frozen` flips a PROCESS-GLOBAL env var that decides whether the
+        // sidecar is consulted at all.
+        let _freeze_guard = FROZEN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let a = snapshot_root(
             "p6ad6-memo-a",
             &[("conda_forge--linux-64--aa.json", r#"{"packages":{"a":1}}"#)],
@@ -2004,7 +2452,7 @@ mod tests {
             "p6ad6-memo-b",
             &[("conda_forge--linux-64--aa.json", r#"{"packages":{"z":9}}"#)],
         );
-        invalidate_snapshot_digest();
+        reset_snapshot_memos();
 
         let digest_a = universe_digest_at(&a);
         assert_eq!(digest_a, snapshot_digest_at(&a), "the memo returned something else");
@@ -2022,10 +2470,12 @@ mod tests {
         );
         assert_eq!(universe_digest_at(&b), digest_b, "the memo is supposed to be a memo");
         // ...and after the writer drops it, the digest names the bytes on disk.
-        invalidate_snapshot_digest();
+        // p6ad-4-3: the writer names the document it replaced, which is exactly
+        // the one `write_doc` just rewrote under root b.
+        invalidate_snapshot_digest(&b.join("retread-repodata").join("conda_forge--linux-64--aa.json"));
         assert_ne!(universe_digest_at(&b), digest_b, "an invalidated memo still answered");
 
-        invalidate_snapshot_digest();
+        reset_snapshot_memos();
         std::fs::remove_dir_all(&a).ok();
         std::fs::remove_dir_all(&b).ok();
     }
