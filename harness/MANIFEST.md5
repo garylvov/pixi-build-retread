@@ -42,7 +42,7 @@ d66ee00827634a6812410b9045519946  proof/hlgd_relock.sh
 16875a9dab92345041d283ab8efed441  tools/channel_mirror_server.py
 c56251e11ce8ab1bd8b807c395265fd4  tools/conda_deny_proxy.py
 7783cc47f9e8ad2503fd44950cd43013  tools/env_version_delta.py
-f24678ebc84e8d040a0760a7d1dcb946  tools/gate_build.sh
+9ef287b13c05205160e79b5d6638bcde  tools/gate_build.sh
 39e620e807735bdc65b09fb8078d8e82  tools/import_audit.py
 f8ef0afb0693e81ddd1e2c45135e1b8f  tools/manifest_audit.py
 00e4cbab1c56c0f8cdd613bf116bec8c  tools/msgpack_min_guard.py
