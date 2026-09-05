@@ -27,3 +27,4 @@ f59aa35 p6z-lenient-metadata-and-reconciler-attribution
 54b5852 p6ad6-universe-is-the-snapshot (UNIVERSE_SCHEMA v2: repodata_universe = the whole snapshot, consulted_digest = the per-process subset)
 a10b6e1 p6ad4-hash-each-document-once
 3fd0a6b c8l3-strict-central-directory
+add6cc4 c18-1-git-snapshot-store-default-and-reaper (landed as B19 = merge 076fa87 onto 3fd0a6b, ort, zero conflicts)
