@@ -1546,6 +1546,7 @@ mod tests {
             auto_imports_strict: None,
             verify_snapshots: None,
             git_snapshot_store: None,
+            git_snapshot_store_max_age_days: None,
             path_source_metadata: None,
             path_source_records: None,
             parallel_probes: None,

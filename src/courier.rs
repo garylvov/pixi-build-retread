@@ -391,6 +391,62 @@ pub(crate) fn wheel_store_root_with(env: &dyn Fn(&str) -> Option<String>) -> std
     base.join("retread").join("wheels")
 }
 
+// ── Persistent canonical Git snapshot store ─────────────────────────────────
+
+/// C18-1. Default root of the PERSISTENT canonical Git snapshot store — the
+/// directory under which `canonical-git-sources/v3/<repository identity>/<ref
+/// state>` trees live.
+///
+/// Priority (first wins):
+///   1. `XDG_CACHE_HOME/retread`.
+///   2. `$HOME/.cache/retread` (POSIX fallback).
+///
+/// DELIBERATELY independent of `RETREAD_CACHE_DIR` / [`retread_cache_root`],
+/// for exactly the reason [`retread_wheel_store_root`] is: `fasttmp` redirects
+/// `RETREAD_CACHE_DIR` into a JOB-LOCAL namespace, and a sealed canonical Git
+/// tree is a blob with a PERSISTENCE CONTRACT, not a scratch cache. It is
+/// immutable, content-identified by (upstream url, resolved sha, submodule
+/// policy) plus its ref state, published by `rename` after being made
+/// read-only, and expensive to rebuild — the wheel store's exemption test,
+/// met item for item. C18 classified it as scratch by collateral (nobody
+/// decided anything about Git snapshots; the whole of `RETREAD_CACHE_DIR` was
+/// classified at once) and every relock on this campaign therefore re-cloned
+/// all twelve canonical trees.
+///
+/// The `retread-git-snapshot-store` config key still wins over this, and
+/// `RETREAD_GIT_SNAPSHOT_STORE` still wins over the default; this is only what
+/// happens when NEITHER is set, which used to be "follow the job-local
+/// redirect" and is now "stay persistent".
+///
+/// EMIT-NEUTRAL, on `retread_cache_root`'s own licence: this location governs
+/// only WHERE content-addressed caches live, never WHAT bytes get emitted. It
+/// never feeds `inputs_hash`, and a hit is byte-identical to a fresh rewrite
+/// (proved in production: C18.5's two relocks, one cold and one adopting the
+/// other's trees, produced byte-identical `pixi.lock` files).
+pub fn retread_git_snapshot_store_root() -> std::path::PathBuf {
+    git_snapshot_store_root_with(&|key| std::env::var(key).ok())
+}
+
+/// Testable core of [`retread_git_snapshot_store_root`]; `env` is the variable
+/// lookup. Note the intentional ABSENCE of a `RETREAD_CACHE_DIR` branch — that
+/// absence IS the C18-1 default flip, and the guard
+/// `the_git_snapshot_store_default_is_persistent_not_the_job_local_redirect`
+/// fails if it is reinstated.
+pub(crate) fn git_snapshot_store_root_with(
+    env: &dyn Fn(&str) -> Option<String>,
+) -> std::path::PathBuf {
+    let base = env("XDG_CACHE_HOME")
+        .filter(|s| !s.trim().is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            env("HOME")
+                .filter(|s| !s.trim().is_empty())
+                .map(|h| std::path::PathBuf::from(h).join(".cache"))
+                .unwrap_or_else(|| std::env::temp_dir().join(".retread-cache-fallback"))
+        });
+    base.join("retread")
+}
+
 /// Portable form of a wheel-store path for the committed lock: a store under
 /// the producer's `$HOME` is recorded as `~/...` so the lock stays
 /// byte-identical across users/machines (the store default is per-user; the
