@@ -106,7 +106,7 @@ retread_fast_env () {
     *) echo "retread_fast_env: REFUSING unexpected cache root $root" >&2; return 2;;
   esac
   local d
-  for d in uv rattler pixi verdicts built-outputs wheels; do mkdir -p "$root/$d" || return 2; done
+  for d in uv rattler pixi verdicts built-outputs wheels git-snapshots; do mkdir -p "$root/$d" || return 2; done
 
   export PIXI_CACHE_DIR=$root/pixi
   export RATTLER_CACHE_DIR=$root/rattler
@@ -252,12 +252,48 @@ retread_fast_env () {
   #         both on hpcnfs:/oscar, but a harness that sets this must GATE on
   #         `stat -c %d` agreeing, not assume it. (C16, merged 09-04, deletes the
   #         farm -- re-read this clause against that tip before trusting it.)
-  #     (c) NOTHING REAPS IT. **This is now the ONLY thing between the key and a
-  #         default-on export here, and it is boarded as C18-1.** Twelve full worktrees per manifest revision, a new
-  #         entry per commit of any git source, no eviction anywhere, on a
-  #         filesystem whose inode quota read 100.00% on 2026-09-04. See the
-  #         INODES hazard above: rm -rf of this subtree is always safe, only slow.
+  #     (c) NOTHING REAPS IT. **CLOSED 2026-09-05 by C18-1** (branch
+  #         `fix/c18-1-git-snapshot-store-default-and-reaper`). Binaries from
+  #         that commit onward carry a reaper: an entry no lock has referenced
+  #         for `retread-git-snapshot-store-max-age-days` (unset = 14, 0 = off)
+  #         is RENAMED into `<store>/canonical-git-sources/quarantine/`, never
+  #         deleted, one `git_snapshot_store evicted` row apiece and one
+  #         `git_snapshot_store reap scanned=/evicted=/kept=` summary. It runs
+  #         at most once per backend process behind a NON-BLOCKING try-lock on
+  #         `<store>/canonical-git-sources/.v3.reap.lock`, so a concurrent
+  #         relock is never made to wait on housekeeping, and it skips any
+  #         entry whose own writer lock is held. AN OLDER BINSNAP HAS NO
+  #         REAPER: a harness pinned to one must not assume the store is
+  #         bounded.
   #
+  # THE EXPORT IS NOW DEFAULT-ON, and this is the C18-1 flip on the harness
+  # side. `RETREAD_GIT_SNAPSHOT_STORE` already set (a job-scoped store seeded by
+  # `rsync -aW`, the C32 cold-arm shape) WINS and is left exactly alone; set
+  # RETREAD_FAST_ENV_GIT_SNAPSHOT_STORE=0 to opt out entirely and get the
+  # pre-C18-1 job-scoped behaviour back.
+  # GATED, not assumed: the EXDEV hazard in (b) means a store on a different
+  # filesystem from RETREAD_BUILD_ROOT silently costs the hardlink farm, so the
+  # device ids must agree before the export happens. This is `mb5_relock.sh`'s
+  # shape, lifted into the one place every harness calls.
+  if [ "${RETREAD_FAST_ENV_GIT_SNAPSHOT_STORE:-1}" = 0 ]; then
+    echo "retread_fast_env: git snapshot store left at the binary default (opt-out set)"
+  elif [ -n "${RETREAD_GIT_SNAPSHOT_STORE:-}" ]; then
+    echo "retread_fast_env: RETREAD_GIT_SNAPSHOT_STORE preset, left alone: $RETREAD_GIT_SNAPSHOT_STORE"
+  else
+    mkdir -p "$root/git-snapshots" || return 2
+    local gs_dev br_dev br_probe
+    br_probe=${RETREAD_BUILD_ROOT:-$ws}
+    mkdir -p "$br_probe" 2>/dev/null || true
+    gs_dev=$(stat -c %d "$root/git-snapshots" 2>/dev/null) || gs_dev=
+    br_dev=$(stat -c %d "$br_probe" 2>/dev/null) || br_dev=
+    if [ -n "$gs_dev" ] && [ "$gs_dev" = "$br_dev" ]; then
+      export RETREAD_GIT_SNAPSHOT_STORE=$root/git-snapshots
+      echo "retread_fast_env: RETREAD_GIT_SNAPSHOT_STORE=$RETREAD_GIT_SNAPSHOT_STORE (dev $gs_dev == build root dev $br_dev)"
+    else
+      echo "retread_fast_env: REFUSING the shared git snapshot store -- dev $gs_dev != build root ($br_probe) dev $br_dev; EXDEV would cost the hardlink farm" >&2
+    fi
+  fi
+
   # Measured as no help (805.0s -> 828.2s route-probe union). Opt-in only.
   if [ "${RETREAD_FAST_ENV_PARALLEL_PROBES:-0}" = 1 ]; then
     export RETREAD_PARALLEL_PROBES=1
