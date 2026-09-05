@@ -3939,26 +3939,6 @@ const UV_CLOSURE_TRANSIENT_ATTEMPTS: usize = 3;
 /// under `cfg(test)` so the guard can exercise the policy without a real wait.
 const UV_CLOSURE_TRANSIENT_BASE_DELAY_MS: u64 = if cfg!(test) { 10 } else { 2_000 };
 
-/// Offset at which uv's own CONFLICT REPORT begins, if it wrote one.
-///
-/// p6r's [`uv_conflict_report`] (fix/p6z, not yet on this line) slices uv's
-/// summary block off the end of a `-v` child's stderr by anchoring on uv's
-/// report marker `×`. This is the same anchor expressed as an OFFSET, because
-/// the transient classifier needs the text BEFORE the report, not the report
-/// itself. When the p6z line lands, this collapses into that function.
-///
-/// The ASCII opener is accepted too: every hand-transcribed fixture in this
-/// file (`SAGE_PASS_B_STDERR` and friends) writes `x No solution found`, and a
-/// classifier that only understood the real `×` would read those fixtures'
-/// prose as if it were transport noise.
-fn uv_conflict_report_offset(stderr: &str) -> Option<usize> {
-    let line_start = |byte: usize| stderr[..byte].rfind('\n').map_or(0, |nl| nl + 1);
-    if let Some(marker) = stderr.find('\u{d7}') {
-        return Some(line_start(marker));
-    }
-    stderr.find("No solution found").map(line_start)
-}
-
 /// Classify a failed Pass-A `uv lock` stderr as a KNOWN-TRANSIENT INDEX-IO
 /// failure, or not (p6ab / C22-4).
 ///
@@ -3997,13 +3977,10 @@ fn uv_conflict_report_offset(stderr: &str) -> Option<usize> {
 ///    to the same stream, and that report quotes package names, URLs and
 ///    whatever a `Caused by:` chain said earlier in the run. Classification
 ///    therefore reads only the text BEFORE
-///    [`uv_conflict_report_offset`]: a transport signature that appears only
-///    inside a real report is part of the report, not a blip.
+///    [`uv_conflict_report`]'s PRELUDE half: a transport signature that
+///    appears only inside a real report is part of the report, not a blip.
 pub(crate) fn uv_closure_transient_class(stderr: &str) -> Option<&'static str> {
-    let prelude = match uv_conflict_report_offset(stderr) {
-        Some(offset) => &stderr[..offset],
-        None => stderr,
-    };
+    let (prelude, _report) = uv_conflict_report(stderr);
     // p5t's list first: one owner for the classes both paths share.
     if let Some(class) = crate::source_build::uv_transient_failure_class(prelude) {
         return Some(class);
@@ -4210,21 +4187,47 @@ fn workspace_fact_override_needed(
 /// log lines are stripped by level prefix instead, and if that leaves nothing
 /// the whole text is returned: attribution degrades to today's behaviour
 /// rather than going silent.
-pub fn uv_conflict_report(stderr: &str) -> std::borrow::Cow<'_, str> {
+/// p6ab COLLAPSED ITS OWN COPY OF THIS ANCHOR INTO THIS FUNCTION (B11). The
+/// transient-index classifier [`uv_closure_transient_class`] needs the text
+/// BEFORE uv's report, not the report itself -- a transport phrase quoted
+/// inside a real `No solution found` block is part of the report, not a blip --
+/// and on p6ab's base this function did not exist, so p6ab carried
+/// `uv_conflict_report_offset`, a SECOND copy of the same `×` anchor. Two copies
+/// of one anchor is one of them drifting later. There is now exactly one, and
+/// it returns BOTH halves: `(prelude, report)`.
+///
+/// The halves keep the fallbacks they were each given, because they answer
+/// different questions and neither answer changes here:
+///
+/// * the PRELUDE also accepts the ASCII opener `x No solution found`. Every
+///   hand-transcribed fixture in this file (`SAGE_PASS_B_STDERR` and friends)
+///   writes the ASCII `x`, and a classifier that only understood the real `×`
+///   would read those fixtures' conflict prose as if it were transport noise.
+/// * the REPORT keeps p6r's level-prefix strip when there is no `×`, so no
+///   attribution moves as a result of this collapse.
+pub fn uv_conflict_report(stderr: &str) -> (&str, std::borrow::Cow<'_, str>) {
+    let line_start = |byte: usize| stderr[..byte].rfind('\n').map_or(0, |nl| nl + 1);
     if let Some(marker) = stderr.find('\u{d7}') {
         // Back up to the start of the marker's own line so the report keeps
         // its leading indentation exactly as uv wrote it.
-        let start = stderr[..marker].rfind('\n').map_or(0, |nl| nl + 1);
-        return std::borrow::Cow::Borrowed(&stderr[start..]);
+        let start = line_start(marker);
+        return (
+            &stderr[..start],
+            std::borrow::Cow::Borrowed(&stderr[start..]),
+        );
     }
+    let prelude = match stderr.find("No solution found") {
+        Some(byte) => &stderr[..line_start(byte)],
+        None => stderr,
+    };
     let kept: Vec<&str> = stderr
         .lines()
         .filter(|line| !is_uv_trace_line(line))
         .collect();
     if kept.iter().any(|line| !line.trim().is_empty()) && kept.len() != stderr.lines().count() {
-        return std::borrow::Cow::Owned(kept.join("\n"));
+        return (prelude, std::borrow::Cow::Owned(kept.join("\n")));
     }
-    std::borrow::Cow::Borrowed(stderr)
+    (prelude, std::borrow::Cow::Borrowed(stderr))
 }
 
 /// True for one line of uv's `-v` resolver log, identified by the level token
@@ -4248,7 +4251,7 @@ pub fn attribute_conflict(
     stderr: &str,
     provenance: &BTreeMap<String, ConstraintProvenance>,
 ) -> Vec<ConflictAttribution> {
-    let report = uv_conflict_report(stderr);
+    let (_prelude, report) = uv_conflict_report(stderr);
     let stderr: &str = report.as_ref();
     let mut out = Vec::new();
     for (pypi_name, prov) in provenance {
@@ -4499,7 +4502,7 @@ pub fn attribute_auto_imports_failure(
     let primary = error_text
         .split_once(PASS_B_BANNER)
         .map_or(error_text, |(pass_a, _)| pass_a);
-    let sliced = uv_conflict_report(primary);
+    let (_prelude, sliced) = uv_conflict_report(primary);
     let report: String = sliced
         .lines()
         .filter(|line| !is_uv_trace_line(line))
@@ -16526,9 +16529,11 @@ DEBUG Fetching metadata for pybullet
       HTTP status server error (503 Service Unavailable) shim is unsatisfiable,
       we can conclude that your project's requirements are unsatisfiable.
 ";
+        let (prelude, report) = uv_conflict_report(mixed);
         assert!(
-            uv_conflict_report_offset(mixed).is_some(),
-            "the fixture must actually contain uv's report marker",
+            report.contains("No solution found") && !prelude.contains("No solution found"),
+            "the fixture must actually contain uv's report marker AND the one anchor must \
+             put the report on the report side of the split",
         );
         assert_eq!(
             uv_closure_transient_class(mixed),
