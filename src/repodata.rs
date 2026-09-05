@@ -687,8 +687,15 @@ fn snapshot_digest_memo() -> &'static Mutex<Option<(PathBuf, String)>> {
 /// root changes while this process is alive. A memo that outlived the bytes it
 /// names would be the p6y failure in a new costume -- a stale key producing a
 /// VERDICT -- so it is cleared by the writer, not trusted to age out.
+///
+/// p6ad-4: it drops the per-document content memo too. The two memos name the
+/// same bytes at two granularities -- `DOCUMENT_IDENTITY` holds each document's
+/// sha256, `SNAPSHOT_DIGEST` holds the fold of all of them -- so a writer that
+/// cleared only the fold would leave the very hash the next fold reads for the
+/// bytes it just replaced. One writer, one invalidation, both memos.
 pub fn invalidate_snapshot_digest() {
     *snapshot_digest_memo().lock().unwrap() = None;
+    document_identity_memo().lock().unwrap().clear();
 }
 
 /// **The conda repodata universe this lock was resolved against.**
@@ -780,20 +787,51 @@ pub fn universe_digest_at(cache_root: &std::path::Path) -> String {
             return digest.clone();
         }
     }
-    let digest = snapshot_digest_at(cache_root);
+    // p6ad-4: the PRODUCTION recompute folds through the per-document memo, so
+    // a document `record_document` already hashed in this process is not
+    // streamed through `Sha256` a second time here. `snapshot_digest_at` below
+    // stays memo-free on purpose -- see its doc comment.
+    let digest = snapshot_digest_memoized_at(cache_root);
     *snapshot_digest_memo().lock().unwrap() = Some((cache_root.to_path_buf(), digest.clone()));
     digest
 }
 
-/// The fold itself, with NO memo: read the snapshot under `cache_root` and
-/// return its digest, or [`UNIVERSE_UNAVAILABLE`] if it cannot be read at all.
+/// The fold itself, with NO memo of any kind: read the snapshot under
+/// `cache_root`, HASH EVERY DOCUMENT, and return its digest, or
+/// [`UNIVERSE_UNAVAILABLE`] if it cannot be read at all.
 ///
 /// Separate from [`universe_digest_at`] so the guards can assert the RULE
 /// without touching a process-global memo -- a global that two parallel tests
 /// would race, and a flaky guard is a guard that cannot fail for the right
 /// reason.
+///
+/// p6ad-4 EXTENDS THAT CONTRACT RATHER THAN BREAKING IT. This function now also
+/// bypasses the per-document memo, because several guards rewrite a document
+/// IN PLACE and re-fold with no invalidation call -- exactly the shape a stat
+/// tuple is not guaranteed to see. Production goes through
+/// [`snapshot_digest_memoized_at`]; the rule is asserted here, on the bytes.
 pub fn snapshot_digest_at(cache_root: &std::path::Path) -> String {
     match universe_from_cache_root(cache_root) {
+        Ok(documents) => universe_digest_of(&documents),
+        Err(error) => {
+            tracing::warn!(
+                cache_root = %cache_root.display(),
+                error = %format!("{error:#}"),
+                "repodata: the universe snapshot could not be read; rows will say unavailable",
+            );
+            UNIVERSE_UNAVAILABLE.to_string()
+        }
+    }
+}
+
+/// p6ad-4: [`snapshot_digest_at`]'s rule, folded through the per-document memo.
+///
+/// The ONE production entry to the fold. It returns the same value
+/// [`snapshot_digest_at`] returns for the same bytes -- that is
+/// `p6ad4_the_memo_does_not_move_the_digest`, asserted on a fixture -- while
+/// hashing each document at most once per process instead of once per caller.
+pub fn snapshot_digest_memoized_at(cache_root: &std::path::Path) -> String {
+    match universe_from_cache_root_inner(cache_root, document_identity_blocking) {
         Ok(documents) => universe_digest_of(&documents),
         Err(error) => {
             tracing::warn!(
@@ -814,6 +852,115 @@ fn universe_sidecar_path(document: &std::path::Path) -> Option<PathBuf> {
     let filename = document.file_name()?.to_str()?;
     Some(parent.join(format!(".{filename}.retread-universe-v1.json")))
 }
+
+
+/// p6ad-4: the per-process content-hash memo, keyed on `(path, stat tuple)`.
+///
+/// MEASURED, `P6AF2G-5872517-N.backend.log` (a cold canonical relock, arm N,
+/// unfrozen by construction): a repodata document is hashed TWICE by every
+/// backend process that consults it, because two callers reach
+/// [`document_identity_blocking`] with the same path --
+/// [`record_document`] (once per consulted pair, the 76 `document
+/// fingerprinted` rows, 12.52 GB in aggregate) and
+/// [`universe_from_cache_root`] under the snapshot fold (all 10 documents,
+/// 899 198 366 B per process, 12.59 GB in aggregate, and it emits no row at
+/// all). 25.11 GB per relock, exactly half of it a re-read of bytes this same
+/// process has already hashed. The whole repodata phase is 45.9 s of that
+/// run's 1646 s wall, and the decisive row pair is a 52 669 B document whose
+/// `bench: sparse repodata handle built` row lands 34.4 s after its own
+/// fingerprint row with nothing between them but `prime_universe_digest()`.
+///
+/// WHY THIS IS NOT THE SIDECAR, AND WHY p6ad's REFUSAL STANDS. The sidecar
+/// (`.<file>.retread-universe-v1.json`) is a CROSS-PROCESS, CROSS-JOB store on
+/// a shared NFS root, and p6ad's guards MEASURED it unsound outside a freeze:
+/// RED with `(len, ino, mtime)`, RED intermittently under a loaded parallel
+/// run even with `ctime`, because a cached NFS attribute is not a fresh one.
+/// That refusal is untouched -- the sidecar is still consulted only under
+/// [`frozen`]. This memo is strictly narrower in every direction:
+///
+///   * it lives in ONE process's address space for that process's lifetime,
+///     never on disk, so no other job's writer can populate it;
+///   * it is keyed on the SAME [`stat_key`] tuple, so a document rewritten
+///     under this process misses and is rehashed;
+///   * it is cleared by [`invalidate_snapshot_digest`], i.e. by exactly the
+///     two writers -- a successful `refresh_disk_cache` and the corrupt-cache
+///     eviction -- that already clear [`SNAPSHOT_DIGEST`];
+///   * and its exposure is therefore STRICTLY SMALLER than the memo already in
+///     production: `SNAPSHOT_DIGEST` caches the FOLD of all ten documents for
+///     the whole process lifetime keyed on the cache root ALONE, with no stat
+///     check of any kind. Anything this memo could get wrong, that one already
+///     gets wrong first and more coarsely.
+///
+/// The p6y rule applies the right way round, as it did for [`stat_key`]: an
+/// unstable stat costs a REHASH and nothing else. It can never produce a
+/// verdict, a refusal or an eviction, and it can never supply a hash for bytes
+/// whose stat tuple it does not describe.
+///
+/// THE DIGEST DOES NOT MOVE. [`universe_digest_of`] folds
+/// `(channel, subdir, sha256, bytes)`, and a memo hit returns the same
+/// `(sha256, bytes)` the rehash would have computed from the same bytes. The
+/// value is byte-identical by construction, and
+/// `p6ad4_the_memo_does_not_move_the_digest` asserts it on a fixture.
+static DOCUMENT_IDENTITY: OnceLock<Mutex<HashMap<(PathBuf, String), (String, u64)>>> =
+    OnceLock::new();
+
+fn document_identity_memo() -> &'static Mutex<HashMap<(PathBuf, String), (String, u64)>> {
+    DOCUMENT_IDENTITY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Bytes this process actually streamed through `Sha256`, and bytes it served
+/// from the memo instead. The READER for the fix: without these two counters
+/// the saving is invisible in a production log, and p6ad-4 was boarded for a
+/// year precisely because the silent half of the hashing emitted no row.
+static HASHED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MEMOIZED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static HASH_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MEMO_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SIDECAR_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(hashes, memo hits, sidecar hits, bytes hashed, bytes served from the
+/// memo)` for this process. Public so a guard can assert the count rather than
+/// grep a log for it.
+pub fn document_identity_counters() -> (u64, u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        HASH_CALLS.load(Relaxed),
+        MEMO_HITS.load(Relaxed),
+        SIDECAR_HITS.load(Relaxed),
+        HASHED_BYTES.load(Relaxed),
+        MEMOIZED_BYTES.load(Relaxed),
+    )
+}
+
+/// Test-only: what the memo holds for `path` AT ITS CURRENT STAT TUPLE.
+#[cfg(test)]
+pub fn document_identity_memo_get(path: &std::path::Path) -> Option<(String, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    document_identity_memo()
+        .lock()
+        .unwrap()
+        .get(&(path.to_path_buf(), stat_key(&meta)))
+        .cloned()
+}
+
+/// Test-only: put a SENTINEL hash in the memo for `path`'s current stat tuple.
+///
+/// This is how the p6ad-4 guards prove a caller consulted the memo instead of
+/// re-reading the file, and it is the same idiom
+/// `p6ad_the_memo_is_consulted_only_under_a_freeze_and_never_as_an_authority`
+/// already uses for the sidecar. It is deliberately NOT a counter assertion:
+/// the counters are process-global, `cargo test` runs the suite in one process,
+/// and a guard whose value another test can move is a guard that cannot fail
+/// for the right reason.
+#[cfg(test)]
+pub fn document_identity_memo_poison(path: &std::path::Path, sha256: &str, bytes: u64) {
+    let meta = std::fs::metadata(path).unwrap();
+    document_identity_memo()
+        .lock()
+        .unwrap()
+        .insert((path.to_path_buf(), stat_key(&meta)), (sha256.to_string(), bytes));
+}
+
 
 /// The stat tuple the sidecar memo is keyed on. NOT an identity -- only a
 /// "has this file certainly not been rewritten" check that decides whether a
@@ -891,7 +1038,43 @@ fn hash_file_blocking(path: &std::path::Path) -> Result<(String, u64)> {
 /// The p6y rule applies and applies the right way round: the stat tuple can
 /// only ever cost a REHASH. It never produces a verdict, a refusal or an
 /// eviction, and it can never supply a hash for bytes it does not describe.
+/// p6ad-4: THE PRODUCTION ENTRY POINT — [`document_identity_uncached`] behind
+/// the per-process memo described on [`DOCUMENT_IDENTITY`].
+///
+/// The split follows the idiom this module already uses for
+/// [`snapshot_digest_at`] versus [`universe_digest_at`]: the RULE lives in a
+/// function no process-global can shadow, so the guards that assert the rule
+/// (the sidecar's freeze gating, the one-changed-byte detection) drive the
+/// uncached function and can never go intermittently RED because of a memo they
+/// are not testing. The memo's own three guards drive THIS function.
 fn document_identity_blocking(path: &std::path::Path) -> Result<(String, u64)> {
+    let meta = std::fs::metadata(path)
+        .with_context(|| format!("stat {} for its content hash", path.display()))?;
+    let memo_key = (path.to_path_buf(), stat_key(&meta));
+    if let Some((sha256, bytes)) = document_identity_memo()
+        .lock()
+        .unwrap()
+        .get(&memo_key)
+        .cloned()
+    {
+        MEMO_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        MEMOIZED_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        return Ok((sha256, bytes));
+    }
+    let (sha256, bytes) = document_identity_uncached(path)?;
+    // Insert under the key computed from the stat taken BEFORE the read. If the
+    // file was rewritten between the two, the next caller's stat differs from
+    // this key and misses -- the entry is dead weight, never a wrong answer.
+    document_identity_memo()
+        .lock()
+        .unwrap()
+        .insert(memo_key, (sha256.clone(), bytes));
+    Ok((sha256, bytes))
+}
+
+/// The rule itself, with NO per-process memo: stat, consult the sidecar under a
+/// freeze only, otherwise hash the bytes, and write the sidecar either way.
+fn document_identity_uncached(path: &std::path::Path) -> Result<(String, u64)> {
     let meta = std::fs::metadata(path)
         .with_context(|| format!("stat {} for its content hash", path.display()))?;
     let key = stat_key(&meta);
@@ -906,9 +1089,12 @@ fn document_identity_blocking(path: &std::path::Path) -> Result<(String, u64)> {
         && sha.len() == 64
         && sha.chars().all(|c| c.is_ascii_hexdigit())
     {
+        SIDECAR_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Ok((sha.to_string(), meta.len()));
     }
     let (sha256, bytes) = hash_file_blocking(path)?;
+    HASH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    HASHED_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
     // The memo is WRITTEN whether or not this process is frozen: the process
     // that populates a snapshot is usually not the one that later reads it
     // frozen, and a memo nobody may write is a memo nobody can use.
@@ -1006,6 +1192,24 @@ pub fn emit_universe_summary() {
         digests = %format!("[{}]", digests.join(",")),
         "conda_universe",
     );
+    // p6ad-4 THE READER. Without this row the cost of fingerprinting is
+    // invisible in a production log: the snapshot fold emits nothing at all, so
+    // half of a cold relock's 25 GB of hashing had no writer and no reader for
+    // the whole campaign. `bytes_hashed` is what this process actually streamed
+    // through Sha256; `bytes_memoized` is what the p6ad-4 memo served instead;
+    // `sidecar_hits` is the frozen path. Summing `bytes_hashed` over a relock's
+    // backend log is the aggregate p6ad-4 was boarded to measure.
+    let (hashes, memo_hits, sidecar_hits, bytes_hashed, bytes_memoized) =
+        document_identity_counters();
+    tracing::info!(
+        hashes,
+        memo_hits,
+        sidecar_hits,
+        bytes_hashed,
+        bytes_memoized,
+        frozen = frozen(),
+        "bench: repodata document identity",
+    );
 }
 
 /// Human-readable form of the summary, for the `repodata-universe` verb. The
@@ -1029,6 +1233,16 @@ pub fn universe_summary_line(documents: &[RepodataDocument]) -> String {
 /// `repodata-universe` verb runs, and what a frozen snapshot's job header
 /// prints.
 pub fn universe_from_cache_root(cache_root: &std::path::Path) -> Result<Vec<RepodataDocument>> {
+    universe_from_cache_root_inner(cache_root, document_identity_uncached)
+}
+
+/// p6ad-4: the walk, parameterised by which identity function reads each
+/// document, so the RULE has exactly one implementation and the memoized and
+/// unmemoized folds can never diverge in anything but the hashing.
+fn universe_from_cache_root_inner(
+    cache_root: &std::path::Path,
+    identity: fn(&std::path::Path) -> Result<(String, u64)>,
+) -> Result<Vec<RepodataDocument>> {
     let dir = cache_root.join("retread-repodata");
     let mut documents = Vec::new();
     let entries = std::fs::read_dir(&dir)
@@ -1049,7 +1263,7 @@ pub fn universe_from_cache_root(cache_root: &std::path::Path) -> Result<Vec<Repo
         if parts.len() != 3 {
             continue;
         }
-        let (sha256, bytes) = document_identity_blocking(&path)?;
+        let (sha256, bytes) = identity(&path)?;
         documents.push(RepodataDocument {
             // MEASURED on the live shared cache: the slug alone COLLIDES --
             // two distinct pytorch channel URLs both render `pytorch` and the
@@ -1259,8 +1473,8 @@ mod tests {
             .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000))
             .unwrap();
 
-        let (sha_a, len_a) = document_identity_blocking(&path_a).unwrap();
-        let (sha_b, len_b) = document_identity_blocking(&path_b).unwrap();
+        let (sha_a, len_a) = document_identity_uncached(&path_a).unwrap();
+        let (sha_b, len_b) = document_identity_uncached(&path_b).unwrap();
         assert_eq!(sha_a, sha_b, "identical bytes must fingerprint identically");
         assert_eq!(len_a, len_b);
         assert_eq!(
@@ -1281,8 +1495,8 @@ mod tests {
         let linux = write_doc(&dir, "conda_forge--linux-64--a.json", br#"{"packages":{"a":1}}"#);
         let noarch_before = write_doc(&dir, "conda_forge--noarch--b.json", br#"{"packages":{"b":1}}"#);
 
-        let (linux_sha, linux_len) = document_identity_blocking(&linux).unwrap();
-        let (noarch_sha, noarch_len) = document_identity_blocking(&noarch_before).unwrap();
+        let (linux_sha, linux_len) = document_identity_uncached(&linux).unwrap();
+        let (noarch_sha, noarch_len) = document_identity_uncached(&noarch_before).unwrap();
         let before = universe_digest_of(&[
             doc("https://c/conda-forge", "linux-64", &linux_sha, linux_len),
             doc("https://c/conda-forge", "noarch", &noarch_sha, noarch_len),
@@ -1291,9 +1505,9 @@ mod tests {
         // One byte, in noarch only. The sidecar must NOT be believed here --
         // it was written moments ago for the old bytes.
         std::fs::write(&noarch_before, br#"{"packages":{"b":2}}"#).unwrap();
-        let (noarch_sha2, noarch_len2) = document_identity_blocking(&noarch_before).unwrap();
+        let (noarch_sha2, noarch_len2) = document_identity_uncached(&noarch_before).unwrap();
         assert_ne!(noarch_sha, noarch_sha2, "the changed document must rehash");
-        let (linux_sha2, linux_len2) = document_identity_blocking(&linux).unwrap();
+        let (linux_sha2, linux_len2) = document_identity_uncached(&linux).unwrap();
         assert_eq!(linux_sha, linux_sha2, "the untouched subdir must not move");
 
         let after = universe_digest_of(&[
@@ -1349,7 +1563,7 @@ mod tests {
         let _guard = FROZEN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_tmp_dir("p6ad-sidecar");
         let path = write_doc(&dir, "conda_forge--noarch--c.json", br#"{"packages":{"c":1}}"#);
-        let truth = document_identity_blocking(&path).unwrap().0;
+        let truth = document_identity_uncached(&path).unwrap().0;
 
         let sidecar = universe_sidecar_path(&path).unwrap();
 
@@ -1370,14 +1584,14 @@ mod tests {
         std::fs::write(&sidecar, stamp(&sentinel)).unwrap();
         with_frozen(|| {
             assert_eq!(
-                document_identity_blocking(&path).unwrap().0,
+                document_identity_uncached(&path).unwrap().0,
                 sentinel,
                 "under a freeze the memo must actually be consulted"
             );
         });
         // And with NO freeze the same sidecar is inert: the bytes decide.
         assert_eq!(
-            document_identity_blocking(&path).unwrap().0,
+            document_identity_uncached(&path).unwrap().0,
             truth,
             "with no freeze the memo must not be consulted at all"
         );
@@ -1397,7 +1611,7 @@ mod tests {
         .unwrap();
         with_frozen(|| {
             assert_eq!(
-                document_identity_blocking(&path).unwrap().0,
+                document_identity_uncached(&path).unwrap().0,
                 truth,
                 "a sidecar whose stat tuple does not match must not supply the hash"
             );
@@ -1414,14 +1628,176 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        with_frozen(|| assert_eq!(document_identity_blocking(&path).unwrap().0, truth));
+        with_frozen(|| assert_eq!(document_identity_uncached(&path).unwrap().0, truth));
 
         // Garbage is inert too, and never fatal.
         std::fs::write(&sidecar, b"not json at all").unwrap();
-        with_frozen(|| assert_eq!(document_identity_blocking(&path).unwrap().0, truth));
-        assert_eq!(document_identity_blocking(&path).unwrap().0, truth);
+        with_frozen(|| assert_eq!(document_identity_uncached(&path).unwrap().0, truth));
+        assert_eq!(document_identity_uncached(&path).unwrap().0, truth);
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    /// p6ad-4 GUARD 1 — TWO CONSUMERS OF ONE DOCUMENT HASH IT ONCE.
+    ///
+    /// The fix, stated as the thing that used to be false. On `54b5852` the two
+    /// consumers of a repodata document's identity in one backend process --
+    /// `record_document` for each consulted pair, and the snapshot fold over
+    /// every document in the cache root -- each stream the file through
+    /// `Sha256`. MEASURED on a cold canonical relock (`P6AF2G-5872517-N`, arm N,
+    /// unfrozen): 12.52 GB on the rowed path plus 12.59 GB silently under the
+    /// fold = 25.11 GB, of which exactly half is this duplicate.
+    ///
+    /// PROVED BY POISON, NOT BY A COUNTER. A sentinel hash is planted in the
+    /// memo for the document's current stat tuple; the fold must return the
+    /// SENTINEL, which it can only do by consulting the memo instead of reading
+    /// the file. The unmemoized fold over the same root returns the truth in the
+    /// same breath, so the assertion is non-vacuous.
+    ///
+    /// RED ON THE OLD CODE: with no memo the fold rehashes and returns the true
+    /// sha, not the sentinel.
+    #[test]
+    fn p6ad4_two_consumers_of_one_document_hash_it_once() {
+        let root = unique_tmp_dir("p6ad4-once");
+        let dir = root.join("retread-repodata");
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = br#"{"packages":{"a":1,"b":2,"c":3}}"#;
+        let path = write_doc(&dir, "conda_forge--linux-64--aa.json", body);
+
+        // CONSUMER 1: the `record_document` path, through the production entry
+        // point. It must both answer correctly AND populate the memo.
+        let (truth, bytes) = document_identity_blocking(&path).unwrap();
+        assert_eq!(bytes, body.len() as u64);
+        assert_eq!(
+            document_identity_memo_get(&path),
+            Some((truth.clone(), bytes)),
+            "the first consumer must leave the hash in the memo"
+        );
+
+        // Plant the sentinel for the file's OWN stat tuple.
+        let sentinel = "a".repeat(64);
+        document_identity_memo_poison(&path, &sentinel, bytes);
+
+        // CONSUMER 2: the snapshot fold, over the SAME document, in the SAME
+        // process, driven through the production function.
+        let memoized = universe_from_cache_root_inner(&root, document_identity_blocking).unwrap();
+        assert_eq!(memoized.len(), 1, "one document in the fixture root");
+        assert_eq!(
+            memoized[0].sha256, sentinel,
+            "TWO consumers, ONE hash: the fold must take the memo, not the bytes"
+        );
+
+        // NON-VACUITY: the unmemoized fold reads the file and gets the truth,
+        // so the assertion above is about a live path and a real difference.
+        let plain = universe_from_cache_root(&root).unwrap();
+        assert_eq!(plain[0].sha256, truth, "the unmemoized fold reads the bytes");
+        assert_ne!(truth, sentinel);
+
+        // And the reader row's counters moved in the right direction. Monotonic
+        // only: other tests share this process and may add to them.
+        let (_, memo_hits, _, _, bytes_memoized) = document_identity_counters();
+        assert!(memo_hits >= 1, "the memo hit must be counted for the row");
+        assert!(bytes_memoized >= bytes, "and the bytes it saved recorded");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// p6ad-4 GUARD 2 — A MUTATED DOCUMENT INVALIDATES THE MEMO, BOTH WAYS.
+    ///
+    /// The memo has two invalidators and a guard that exercised one would leave
+    /// the other free to hand back a stale hash:
+    ///
+    ///   (a) THE STAT KEY. A document rewritten at a different length is a
+    ///       different key, so the planted sentinel is unreachable and the bytes
+    ///       are read, with no invalidation call at all.
+    ///   (b) THE WRITER'S INVALIDATION. `invalidate_snapshot_digest` is what
+    ///       `refresh_disk_cache` calls after `write_atomic` and what the
+    ///       corrupt-cache eviction calls, and it must drop the per-document
+    ///       memo as well as the fold -- otherwise the next fold reads this memo
+    ///       for the bytes the writer just replaced. This is the half that
+    ///       covers the one shape a stat tuple is NOT guaranteed to see, the
+    ///       same-length in-place rewrite p6ad's own guards went RED on.
+    ///
+    /// RED ON THE OLD CODE: half (b) fails, because `invalidate_snapshot_digest`
+    /// on `54b5852` clears only `SNAPSHOT_DIGEST`.
+    #[test]
+    fn p6ad4_a_mutated_document_invalidates_the_memo() {
+        let dir = unique_tmp_dir("p6ad4-mutate");
+        let path = write_doc(&dir, "conda_forge--noarch--bb.json", br#"{"packages":{"b":1}}"#);
+        let truth = document_identity_blocking(&path).unwrap().0;
+        let sentinel = "c".repeat(64);
+
+        // NON-VACUITY: with the sentinel planted the production entry point
+        // returns it, so both misses below are real misses.
+        document_identity_memo_poison(&path, &sentinel, 20);
+        assert_eq!(
+            document_identity_blocking(&path).unwrap().0,
+            sentinel,
+            "the memo must genuinely be consulted"
+        );
+
+        // (a) A DIFFERENT LENGTH: the stat key alone must miss.
+        std::fs::write(&path, br#"{"packages":{"b":1,"c":2}}"#).unwrap();
+        let grown = document_identity_blocking(&path).unwrap();
+        assert_ne!(grown.0, sentinel, "a rewritten document must not take the memo");
+        assert_ne!(grown.0, truth, "and must report its own bytes");
+        assert_eq!(grown.1, 26);
+
+        // (b) THE WRITER'S INVALIDATION, with the file untouched so that ONLY
+        // the invalidation can be what clears it.
+        document_identity_memo_poison(&path, &sentinel, 26);
+        assert_eq!(document_identity_blocking(&path).unwrap().0, sentinel);
+        invalidate_snapshot_digest();
+        assert_eq!(
+            document_identity_memo_get(&path),
+            None,
+            "invalidate_snapshot_digest must drop the per-document memo too"
+        );
+        assert_eq!(
+            document_identity_blocking(&path).unwrap().0,
+            grown.0,
+            "and the next read must name the bytes on disk"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// p6ad-4 GUARD 3 — THE MEMO DOES NOT MOVE THE DIGEST.
+    ///
+    /// The one thing a speed fix on this path is not allowed to do. The same
+    /// fixture root is folded twice -- `snapshot_digest_at`, which hashes every
+    /// document, and `snapshot_digest_memoized_at`, which is what production
+    /// calls -- and the two must be byte-identical. The memo is warmed first and
+    /// asserted warm, so the equality is not the equality of two cold folds.
+    #[test]
+    fn p6ad4_the_memo_does_not_move_the_digest() {
+        let root = unique_tmp_dir("p6ad4-digest");
+        let dir = root.join("retread-repodata");
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = write_doc(&dir, "conda_forge--linux-64--aa.json", br#"{"packages":{"a":1}}"#);
+        let b = write_doc(&dir, "conda_forge--noarch--bb.json", br#"{"packages":{"b":1}}"#);
+        let c = write_doc(&dir, "nvidia--linux-64--cc.json", br#"{"packages":{"c":1}}"#);
+
+        let unmemoized = snapshot_digest_at(&root);
+        assert_ne!(unmemoized, UNIVERSE_UNAVAILABLE, "{unmemoized}");
+
+        // Warm the memo through the production entry point, and assert it IS
+        // warm -- otherwise the equality below is two cold folds agreeing.
+        let memoized_cold = snapshot_digest_memoized_at(&root);
+        for path in [&a, &b, &c] {
+            assert!(
+                document_identity_memo_get(path).is_some(),
+                "the production fold must populate the memo for {}",
+                path.display()
+            );
+        }
+        let memoized_warm = snapshot_digest_memoized_at(&root);
+
+        assert_eq!(
+            unmemoized, memoized_cold,
+            "the memoized fold must be byte-identical to the unmemoized one"
+        );
+        assert_eq!(memoized_cold, memoized_warm, "and stable across a warm memo");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
 
     /// The verb reads the snapshot on disk and nothing else: dotfiles (the
     /// fetch locks and the sha sidecars) are not documents, and the summary
