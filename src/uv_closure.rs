@@ -3926,6 +3926,205 @@ pub(crate) fn strip_child_log_lines(stderr: &str) -> String {
         .join("\n")
 }
 
+/// Total attempts for ONE Pass-A `uv lock` whose failure is a KNOWN-TRANSIENT
+/// index-io failure (p6ab / C22-4).
+///
+/// Three, matching `source_build::UV_TRANSIENT_BUILD_ATTEMPTS`: an index that
+/// 503s three times in a row across a backoff is not having a blip, and the
+/// operator must hear about it rather than get a lock resolved under a policy
+/// nobody asked for.
+const UV_CLOSURE_TRANSIENT_ATTEMPTS: usize = 3;
+
+/// First backoff before a transient Pass-A retry; doubled per attempt. Short
+/// under `cfg(test)` so the guard can exercise the policy without a real wait.
+const UV_CLOSURE_TRANSIENT_BASE_DELAY_MS: u64 = if cfg!(test) { 10 } else { 2_000 };
+
+/// Offset at which uv's own CONFLICT REPORT begins, if it wrote one.
+///
+/// p6r's [`uv_conflict_report`] (fix/p6z, not yet on this line) slices uv's
+/// summary block off the end of a `-v` child's stderr by anchoring on uv's
+/// report marker `×`. This is the same anchor expressed as an OFFSET, because
+/// the transient classifier needs the text BEFORE the report, not the report
+/// itself. When the p6z line lands, this collapses into that function.
+///
+/// The ASCII opener is accepted too: every hand-transcribed fixture in this
+/// file (`SAGE_PASS_B_STDERR` and friends) writes `x No solution found`, and a
+/// classifier that only understood the real `×` would read those fixtures'
+/// prose as if it were transport noise.
+fn uv_conflict_report_offset(stderr: &str) -> Option<usize> {
+    let line_start = |byte: usize| stderr[..byte].rfind('\n').map_or(0, |nl| nl + 1);
+    if let Some(marker) = stderr.find('\u{d7}') {
+        return Some(line_start(marker));
+    }
+    stderr.find("No solution found").map(line_start)
+}
+
+/// Classify a failed Pass-A `uv lock` stderr as a KNOWN-TRANSIENT INDEX-IO
+/// failure, or not (p6ab / C22-4).
+///
+/// WHY THIS EXISTS. `compute_closure_for_target` had exactly one classifier on
+/// the Pass A failure branch -- `installer::is_platform_tag_conflict` -- so
+/// EVERY other Pass A failure escalated into Pass B, and Pass B runs
+/// `--prerelease allow` ([`LockRelaxations::PASS_B_AUTO`] /
+/// [`LockRelaxations::PASS_B_NEVER`]). Measured, C22 arm A5 (job `5804122`,
+/// `bundle=robogen-pack`): one child exited 2 with
+/// `HTTP status server error (503 Service Unavailable) for url
+/// (https://pypi.nvidia.com/pybullet/)`, the successor child ran Pass B, and
+/// Pass B took `pydantic==2.14.0b1` where Pass A had taken `2.13.5`.
+///
+/// HOW THAT REACHES THE LOCK, precisely -- Pass B's own resolution does NOT
+/// ship (`invalidate_cached_closure` runs unconditionally after it and the
+/// arm always returns `Err`). What ships is the HEAL: Pass B's offenders are
+/// read structurally out of its relaxed pylock and re-injected into the next,
+/// restricted Pass A as explicit first-party `name==version` pins -- the
+/// `transitive prerelease ... pinned as an explicit first-party requirement`
+/// row. In C22, `transitive prerelease pydantic==2.14.0b1 pinned ...` appears
+/// on `robogen-pack` in arm A5 and in NONE of the other nine arms. `pydantic
+/// -core==2.48.0` then had no conda build to pin, the auto-router left four
+/// packages un-routed, the pack's generated recipe's depends/constrains
+/// changed, its build hash changed, and the LOCK differed by 46 lines. The 503
+/// was on `pybullet`; the version that moved was `pydantic`. Ten arms, one
+/// transient, one divergent lock -- 10 of 10.
+///
+/// TWO RULES, both earned:
+///
+/// 1. **Index-io classes only.** A resolution conflict is not transient and
+///    retrying it just pays for it twice. This function delegates first to
+///    `source_build::uv_transient_failure_class` (p5t) so the two paths cannot
+///    drift, then adds the transport classes a RESOLVER child can hit that a
+///    BUILD child could not.
+/// 2. **Never read the resolver's own prose.** uv writes its conflict report
+///    to the same stream, and that report quotes package names, URLs and
+///    whatever a `Caused by:` chain said earlier in the run. Classification
+///    therefore reads only the text BEFORE
+///    [`uv_conflict_report_offset`]: a transport signature that appears only
+///    inside a real report is part of the report, not a blip.
+pub(crate) fn uv_closure_transient_class(stderr: &str) -> Option<&'static str> {
+    let prelude = match uv_conflict_report_offset(stderr) {
+        Some(offset) => &stderr[..offset],
+        None => stderr,
+    };
+    // p5t's list first: one owner for the classes both paths share.
+    if let Some(class) = crate::source_build::uv_transient_failure_class(prelude) {
+        return Some(class);
+    }
+    // 5xx from an index. `HTTP status server error` is uv's own wording for
+    // the whole 5xx family; the bare codes catch a reqwest chain that printed
+    // the status without that prefix.
+    if prelude.contains("HTTP status server error")
+        || prelude.contains("500 Internal Server Error")
+        || prelude.contains("502 Bad Gateway")
+        || prelude.contains("503 Service Unavailable")
+        || prelude.contains("504 Gateway Timeout")
+    {
+        return Some("uv-index-http-5xx");
+    }
+    if prelude.contains("Connection reset by peer")
+        || prelude.contains("connection closed before message completed")
+        || prelude.contains("connection error")
+    {
+        return Some("uv-index-connection-reset");
+    }
+    if prelude.contains("operation timed out")
+        || prelude.contains("Operation timed out")
+        || prelude.contains("request or operation took longer than the configured timeout")
+    {
+        return Some("uv-index-timeout");
+    }
+    if prelude.contains("failed to lookup address information")
+        || prelude.contains("Temporary failure in name resolution")
+        || prelude.contains("dns error")
+    {
+        return Some("uv-index-dns");
+    }
+    None
+}
+
+/// Run Pass A, re-running the SAME command on a classified transient index
+/// failure, and REFUSING to hand a transient to Pass B (p6ab / C22-4).
+///
+/// Returns the child's `Output` for every outcome Pass B is allowed to see: a
+/// success, or a failure that is NOT a known transient. A transient that
+/// survives [`UV_CLOSURE_TRANSIENT_ATTEMPTS`] returns `Err` naming the class,
+/// so the caller never reaches the escalation at all.
+///
+/// Generic over the runner so the guard can drive it with a recorder: the
+/// thing that must be asserted is the ARGV the child receives on the second
+/// invocation, and that no invocation ever carries `--prerelease allow`.
+async fn run_pass_a_with_transient_retry<F, Fut>(
+    bundle: &str,
+    lock_args: &[String],
+    mut run: F,
+) -> Result<std::process::Output>
+where
+    F: FnMut(Vec<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<std::process::Output>>,
+{
+    let started = std::time::Instant::now();
+    let mut recovered_class: Option<&'static str> = None;
+    for attempt in 1..=UV_CLOSURE_TRANSIENT_ATTEMPTS {
+        let out = run(lock_args.to_vec()).await?;
+        if out.status.success() {
+            if let Some(class) = recovered_class {
+                tracing::warn!(
+                    class,
+                    attempts = attempt,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    bundle = %bundle,
+                    "uv_closure transient class={class} attempt={attempt}/{max} bundle={bundle} \
+                     RECOVERED; Pass A resolved unrelaxed and Pass B was never entered",
+                    max = UV_CLOSURE_TRANSIENT_ATTEMPTS,
+                );
+            }
+            return Ok(out);
+        }
+        // Classify on the child's ERROR text, never on its own DEBUG/TRACE
+        // rows (p6f) -- the same rule every other classifier on this branch
+        // follows.
+        let raw = String::from_utf8_lossy(&out.stderr).into_owned();
+        let error_text = strip_child_log_lines(&raw);
+        let Some(class) = uv_closure_transient_class(&error_text) else {
+            // Not transient: this is Pass B's to classify, exactly as before.
+            return Ok(out);
+        };
+        if attempt == UV_CLOSURE_TRANSIENT_ATTEMPTS {
+            tracing::error!(
+                class,
+                attempts = attempt,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                bundle = %bundle,
+                stderr = %error_text.trim_end(),
+                "uv_closure transient class={class} attempt={attempt}/{max} bundle={bundle} \
+                 EXHAUSTED",
+                max = UV_CLOSURE_TRANSIENT_ATTEMPTS,
+            );
+            bail!(
+                "uv closure Pass A for bundle `{bundle}` failed on all {max} attempts with the \
+                 known-transient index class `{class}`, so it is no longer transient. REFUSING to \
+                 escalate to Pass B: Pass B resolves under `--prerelease allow`, and an index \
+                 outage must never be what chooses a lock's prerelease policy (C22-4). Last \
+                 error:\n{}",
+                error_text.trim_end(),
+                max = UV_CLOSURE_TRANSIENT_ATTEMPTS,
+            );
+        }
+        let delay_ms = UV_CLOSURE_TRANSIENT_BASE_DELAY_MS * (1_u64 << (attempt - 1));
+        tracing::warn!(
+            class,
+            attempt,
+            max_attempts = UV_CLOSURE_TRANSIENT_ATTEMPTS,
+            delay_ms,
+            bundle = %bundle,
+            "uv_closure transient class={class} attempt={attempt}/{max} bundle={bundle}; \
+             re-running the SAME Pass A command after backoff instead of relaxing to Pass B",
+            max = UV_CLOSURE_TRANSIENT_ATTEMPTS,
+        );
+        recovered_class = Some(class);
+        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+    }
+    unreachable!("the Pass A transient retry loop returns on its final attempt")
+}
+
 fn workspace_fact_override_needed(
     req: &UvClosureRequest,
     attributions: &[ConflictAttribution],
@@ -7686,7 +7885,10 @@ pub(crate) async fn compute_closure_for_target(
         invalidate_cached_closure(project_dir)?;
     }
 
-    let lock_out = run(lock_args).await?;
+    // Pass A runs through the transient-index retry (p6ab / C22-4): a 503 from
+    // an extra index must re-run the SAME unrelaxed command, never fall through
+    // to Pass B's `--prerelease allow`.
+    let lock_out = run_pass_a_with_transient_retry(&req.bundle, &lock_args, &run).await?;
     if !lock_out.status.success() {
         let stderr = String::from_utf8_lossy(&lock_out.stderr).into_owned();
         // CLASSIFY ON THE ERROR, NOT ON THE LOG. `stderr` still holds every
@@ -16131,6 +16333,234 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
         }
         assert!(!clean.contains("DEBUG a"));
         assert!(!clean.contains("TRACE b"));
+    }
+
+    // ---- p6ab / C22-4: a transient index failure must NOT relax Pass A -----
+
+    /// The row C22 measured, verbatim from `C22-5804122-a5.backend.log.gz`
+    /// (`bundle=robogen-pack`, pid 1922394, `exit_code=2`), with the child's
+    /// own DEBUG rows around it so the guard exercises the strip too.
+    const C22_TRANSIENT_503_STDERR: &str = "\
+DEBUG Searching for a compatible version of pybullet (>=3.2.5)
+  x Failed to fetch: `https://pypi.nvidia.com/pybullet/`
+  |-> Caused by: HTTP status server error (503 Service Unavailable) for url (https://pypi.nvidia.com/pybullet/)
+";
+
+    fn fake_output(code: i32, stderr: &str) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    /// Pass A's real argument vector, so the guards assert on the flag the
+    /// child actually receives rather than on a string a test invented.
+    fn pass_a_args() -> Vec<String> {
+        build_lock_args(
+            Path::new("/tmp/p6ab-project"),
+            "3.11",
+            &["https://pypi.nvidia.com/simple".to_string()],
+            None,
+            false,
+            LockRelaxations::PASS_A,
+        )
+    }
+
+    fn pass_b_args() -> Vec<String> {
+        build_lock_args(
+            Path::new("/tmp/p6ab-project"),
+            "3.11",
+            &["https://pypi.nvidia.com/simple".to_string()],
+            None,
+            false,
+            LockRelaxations::PASS_B_AUTO,
+        )
+    }
+
+    /// `--prerelease <value>` as the child would read it off the argv.
+    fn prerelease_flag(args: &[String]) -> Option<&str> {
+        let index = args.iter().position(|a| a == "--prerelease")?;
+        args.get(index + 1).map(String::as_str)
+    }
+
+    /// Drive `run_pass_a_with_transient_retry` with a scripted runner that
+    /// records every argv it is handed.
+    fn drive_pass_a(
+        script: Vec<std::process::Output>,
+    ) -> (
+        Result<std::process::Output>,
+        std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    ) {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let script = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(
+            script,
+        )));
+        let args = pass_a_args();
+        let result = {
+            let seen = std::sync::Arc::clone(&seen);
+            let script = std::sync::Arc::clone(&script);
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("test runtime")
+                .block_on(async move {
+                    run_pass_a_with_transient_retry("robogen-pack", &args, |argv| {
+                        let seen = std::sync::Arc::clone(&seen);
+                        let script = std::sync::Arc::clone(&script);
+                        async move {
+                            seen.lock().unwrap().push(argv);
+                            script
+                                .lock()
+                                .unwrap()
+                                .pop_front()
+                                .context("the scripted runner ran out of outputs, which means \
+                                          the loop invoked uv more times than the guard allows")
+                        }
+                    })
+                    .await
+                })
+        };
+        (result, seen)
+    }
+
+    /// GUARD (a). The live 503 must produce a SECOND invocation, and that
+    /// invocation must still be Pass A: `--prerelease if-necessary-or-explicit`.
+    #[test]
+    fn a_transient_index_503_reruns_pass_a_unrelaxed() {
+        let (result, seen) = drive_pass_a(vec![
+            fake_output(2, C22_TRANSIENT_503_STDERR),
+            fake_output(0, "Resolved 95 packages in 3.75s"),
+        ]);
+        let out = result.expect("a recovered transient must return the successful Pass A output");
+        assert!(out.status.success());
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen.len(),
+            2,
+            "a classified transient must re-run Pass A exactly once more, not fall through",
+        );
+        for (n, argv) in seen.iter().enumerate() {
+            assert_eq!(
+                prerelease_flag(argv),
+                Some(LockRelaxations::PASS_A.prerelease),
+                "invocation {} must still carry Pass A's prerelease policy; a 503 on \
+                 pypi.nvidia.com/pybullet is not a reason to let uv pick pydantic 2.14.0b1 \
+                 (C22-4)",
+                n + 1,
+            );
+            assert_ne!(
+                prerelease_flag(argv),
+                Some(LockRelaxations::PASS_B_AUTO.prerelease),
+            );
+        }
+        assert_eq!(seen[0], seen[1], "the retry must re-run the SAME command");
+    }
+
+    /// GUARD (b). Repeated to exhaustion the closure must BAIL naming the
+    /// class, and must never have invoked anything under `--prerelease allow`.
+    #[test]
+    fn an_exhausted_transient_bails_and_never_reaches_pass_b() {
+        let (result, seen) = drive_pass_a(vec![
+            fake_output(2, C22_TRANSIENT_503_STDERR),
+            fake_output(2, C22_TRANSIENT_503_STDERR),
+            fake_output(2, C22_TRANSIENT_503_STDERR),
+        ]);
+        let error = format!(
+            "{:#}",
+            result.expect_err("three transients in a row is no longer transient"),
+        );
+        assert!(
+            error.contains("uv-index-http-5xx"),
+            "the bail must NAME the class it exhausted on; got: {error}",
+        );
+        assert!(
+            error.contains("robogen-pack"),
+            "the bail must name the bundle; got: {error}",
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), UV_CLOSURE_TRANSIENT_ATTEMPTS);
+        assert!(
+            seen.iter()
+                .all(|argv| prerelease_flag(argv) == Some(LockRelaxations::PASS_A.prerelease)),
+            "no invocation on an exhausted transient may carry Pass B's relaxation",
+        );
+    }
+
+    /// GUARD (c), NON-VACUITY. A genuine resolution conflict is not transient:
+    /// the driver hands the failed output straight back so the caller escalates,
+    /// and the escalation it reaches is `--prerelease allow`.
+    #[test]
+    fn a_real_resolution_conflict_still_reaches_pass_b() {
+        assert_eq!(
+            uv_closure_transient_class(SAGE_PASS_B_STDERR),
+            None,
+            "a classifier that refuses everything would pass guards (a) and (b) by \
+             doing nothing useful",
+        );
+        let (result, seen) = drive_pass_a(vec![fake_output(1, SAGE_PASS_B_STDERR)]);
+        let out = result.expect("a non-transient failure is Pass B's to classify, not an error here");
+        assert!(!out.status.success());
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "a resolution conflict must not be retried; that just pays for it twice",
+        );
+        assert_eq!(
+            prerelease_flag(&pass_b_args()),
+            Some("allow"),
+            "the escalation this failure is allowed to reach is still the relaxed one",
+        );
+    }
+
+    /// GUARD (d). A transport signature that appears only INSIDE uv's conflict
+    /// report is part of the report. The report slice decides, not the first
+    /// substring match anywhere in the stream.
+    #[test]
+    fn a_transient_phrase_inside_a_conflict_report_is_not_transient() {
+        let mixed = "\
+DEBUG Fetching metadata for pybullet
+  \u{d7} No solution found when resolving dependencies:
+  |-> Because sage-pack depends on retry-on-503-Service-Unavailable and the
+      HTTP status server error (503 Service Unavailable) shim is unsatisfiable,
+      we can conclude that your project's requirements are unsatisfiable.
+";
+        assert!(
+            uv_conflict_report_offset(mixed).is_some(),
+            "the fixture must actually contain uv's report marker",
+        );
+        assert_eq!(
+            uv_closure_transient_class(mixed),
+            None,
+            "the 503 text here is quoted by uv's own conflict report; retrying it three \
+             times would burn a full resolve per attempt and then bail on a conflict that \
+             was never going to clear",
+        );
+        // ... and the SAME phrase ahead of the report still classifies, so the
+        // slice is what changed the answer and not the phrase.
+        let before = format!("  |-> Caused by: HTTP status server error (503 Service Unavailable) for url (https://pypi.nvidia.com/pybullet/)\n{mixed}");
+        assert_eq!(
+            uv_closure_transient_class(&before),
+            Some("uv-index-http-5xx"),
+        );
+    }
+
+    /// The classifier must still own p5t's classes rather than re-deriving
+    /// them: one owner for the signatures both uv paths can hit.
+    #[test]
+    fn the_closure_classifier_delegates_to_the_source_build_class_list() {
+        let hardlink_race = "error: Failed to install: pybullet-3.2.5-cp311.whl\n  \
+                             Caused by: failed to hardlink file from /cache/builds-v0/x \
+                             to /cache/wheels/x: No such file or directory (os error 2)\n";
+        assert_eq!(
+            crate::source_build::uv_transient_failure_class(hardlink_race),
+            Some("uv-cache-hardlink-race"),
+        );
+        assert_eq!(
+            uv_closure_transient_class(hardlink_race),
+            Some("uv-cache-hardlink-race"),
+        );
     }
 
 }
