@@ -127,6 +127,8 @@ pub async fn sparse_pairs(
     // exit because a backend that dies mid-solve still has to have said what it
     // resolved against.
     if !pairs.is_empty() {
+        // p6ad-6: prime off the reactor before the summary formats the digest.
+        prime_universe_digest().await;
         emit_universe_summary();
     }
     pairs
@@ -194,11 +196,17 @@ async fn build_sparse(channel_url: String, subdir: String) -> Option<Arc<SparseR
                 // success path only. A pair that failed to open is not part of
                 // the universe and must not be named as if it were.
                 record_document(&channel_url, &subdir, path.clone()).await;
+                // p6ad-6: the snapshot fold is seconds of NFS read on a cold memo
+                // and this is a tokio worker thread. Prime it on the blocking
+                // pool, so `universe_digest()` below is a memo hit and no row's
+                // formatting can park the reactor.
+                let universe = prime_universe_digest().await;
                 tracing::info!(
                     channel = %channel_url,
                     subdir = %subdir,
                     elapsed_ms = t.elapsed().as_millis() as u64,
-                    repodata_universe = %universe_digest(),
+                    repodata_universe = %universe,
+                    consulted_digest = %consulted_digest(),
                     "bench: sparse repodata handle built",
                 );
                 return Some(handle);
@@ -208,6 +216,9 @@ async fn build_sparse(channel_url: String, subdir: String) -> Option<Arc<SparseR
                     channel = %channel_url, subdir = %subdir, path = %path.display(),
                     "repodata: evicting corrupt disk cache and refetching",
                 );
+                // p6ad-6: an eviction removes a document from the snapshot, so
+                // the memoized universe digest no longer names what is on disk.
+                invalidate_snapshot_digest();
                 if let Err(error) = tokio::fs::remove_file(&path).await {
                     tracing::warn!(
                         path = %path.display(), error = %error,
@@ -275,7 +286,12 @@ async fn refresh_disk_cache(channel_url: &str, subdir: &str, path: &PathBuf) -> 
         return Ok(());
     }
     let bytes = fetch_repodata_bytes(channel_url, subdir).await?;
-    write_atomic(path, &bytes).await
+    write_atomic(path, &bytes).await?;
+    // p6ad-6: this process just changed its own snapshot. The memoized universe
+    // digest names the bytes that were there BEFORE this write, so it is dropped
+    // by the writer and never left to age out.
+    invalidate_snapshot_digest();
+    Ok(())
 }
 
 struct RepodataFetchLock(std::fs::File);
@@ -535,7 +551,12 @@ fn cache_root_from(
 /// Wire tag of the universe fingerprint. Bumped when the folding rule changes
 /// meaning; a row or a record carrying a different tag describes a different
 /// rule and must not be compared with this one.
-pub const UNIVERSE_SCHEMA: &str = "retread-conda-universe-v1";
+///
+/// v1 -> v2 (p6ad-6): the fold is unchanged, the INPUT SET is not. v1 folded
+/// the documents one process had consulted so far; v2 folds every document in
+/// the cache-root snapshot. A v1 row and a v2 row are not comparable and the
+/// tag is what says so.
+pub const UNIVERSE_SCHEMA: &str = "retread-conda-universe-v2";
 
 /// Sidecar wire tag. Separate from [`UNIVERSE_SCHEMA`] because the sidecar is a
 /// pure memo of one file's content hash and can change shape without the
@@ -632,12 +653,157 @@ pub fn universe_documents() -> Vec<RepodataDocument> {
         .collect()
 }
 
-/// The digest of what this process has consulted so far. An EMPTY registry
+/// The digest of what THIS PROCESS has consulted so far. An EMPTY registry
 /// folds to the digest of the empty set rather than to `""`: "no repodata was
 /// consulted" is itself a universe, and a row that prints nothing is a row a
 /// grep cannot find.
-pub fn universe_digest() -> String {
+///
+/// p6ad-6: THIS IS NOT THE LOCK'S UNIVERSE AND MUST NOT BE PRINTED AS IF IT
+/// WERE. It is the universe INTERSECTED with one process's channel needs, at
+/// one instant in one fan-out. See [`universe_digest`].
+pub fn consulted_digest() -> String {
     universe_digest_of(&universe_documents())
+}
+
+/// The token a row carries when the snapshot could not be read at all. It is
+/// deliberately not a hex digest: a grep for a digest can never match it, and
+/// nobody can mistake it for "the empty universe", which is a real state with
+/// a real digest.
+pub const UNIVERSE_UNAVAILABLE: &str = "unavailable";
+
+/// Memo of the snapshot digest, KEYED ON THE CACHE ROOT it was computed from,
+/// so a guard driving a temp root can never poison production's value and vice
+/// versa. `None` = never computed, or invalidated by a write to the snapshot.
+static SNAPSHOT_DIGEST: OnceLock<Mutex<Option<(PathBuf, String)>>> = OnceLock::new();
+
+fn snapshot_digest_memo() -> &'static Mutex<Option<(PathBuf, String)>> {
+    SNAPSHOT_DIGEST.get_or_init(|| Mutex::new(None))
+}
+
+/// Drop the memoized snapshot digest.
+///
+/// Called on every successful `refresh_disk_cache` and on the corrupt-cache
+/// eviction, which are the only two ways a document under this process's cache
+/// root changes while this process is alive. A memo that outlived the bytes it
+/// names would be the p6y failure in a new costume -- a stale key producing a
+/// VERDICT -- so it is cleared by the writer, not trusted to age out.
+pub fn invalidate_snapshot_digest() {
+    *snapshot_digest_memo().lock().unwrap() = None;
+}
+
+/// **The conda repodata universe this lock was resolved against.**
+///
+/// p6ad-6 ROOT FIX. Until this commit the field printed on every lock-deciding
+/// row was [`consulted_digest`] -- the fold of the process-local registry --
+/// and MEASURED on the first canonical relock that ever carried it
+/// (`mBH-relock` 5851226, 269 rows) that produced **20 distinct digests inside
+/// ONE relock off ONE unmoved snapshot**. Two inputs folded in, neither of them
+/// the channel:
+///
+///   1. THE PER-PROCESS CHANNEL SUBSET. 14 backend processes consulted three
+///      different nested channel sets (4, 8 and 10 pairs), so the three digests
+///      on the lock-deciding rows were three subsets of one snapshot. Every
+///      one of the 10 `(channel, subdir)` pairs had exactly ONE sha256 across
+///      all 76 `document fingerprinted` rows -- the universe never moved.
+///   2. THE MID-FAN-OUT PREFIX. `build_sparse` logged the digest immediately
+///      after `record_document`, i.e. from inside the fan-out, so it folded
+///      whatever prefix of that process's own pairs had landed at that instant.
+///      Two rows 48 ms apart, same process, no document changed, different
+///      digest. That input alone invented 17 of the 20.
+///
+/// A number that moves when nothing moved cannot adjudicate a lock delta, which
+/// is the one job this field has. So the digest is now a function of the
+/// SNAPSHOT ON DISK under this process's cache root and of nothing else: the
+/// same rule [`universe_from_cache_root`] and the `repodata-universe` verb
+/// already fold, which additionally makes a backend row and a verb header
+/// COMPARABLE for the first time (the warning in `universe_from_cache_root`
+/// about cross-comparing the two is retired by this commit).
+///
+/// COST, and why this is not the regression it looks like: the snapshot fold
+/// hashes every document in the cache root, not just the ones this process
+/// opened. On the measured production shape that is 10 documents / 899 MB
+/// against the 892 MB (`conda-forge` linux-64 + noarch) that EVERY process
+/// already hashed -- 14 x 899 MB vs 14 x 892 MB, a 0.8 % change. Under a freeze
+/// the sidecar memo makes each document a stat, and the root is job-scoped and
+/// holds exactly the job's documents.
+///
+/// THE PRICE, BOARDED AS p6ad-6-1 AND NOT HIDDEN: on the SHARED cache root the
+/// digest now also moves when an unrelated lane drops an unrelated document in.
+/// That is a false positive this rule cannot avoid and a freeze
+/// (`RETREAD_REPODATA_FROZEN` + a job-scoped root, p6ad / p6af) removes.
+pub fn universe_digest() -> String {
+    universe_digest_at(&dirs_cache_root())
+}
+
+/// Compute [`universe_digest`] ON THE BLOCKING POOL and return it.
+///
+/// The snapshot fold is an NFS read of every document in the cache root -- 899
+/// MB and ~5.5 s on the measured production shape when the memo is cold and the
+/// sidecars are absent. `universe_digest()` is called from inside `tracing`
+/// macro arguments on tokio worker threads, and doing that read there parks the
+/// reactor for the whole fan-out. Every async caller goes through this instead;
+/// the synchronous entry point stays for the verb, the tests and the identity
+/// record, which are not on the reactor.
+pub async fn prime_universe_digest() -> String {
+    let root = dirs_cache_root();
+    match tokio::task::spawn_blocking(move || universe_digest_at(&root)).await {
+        Ok(digest) => digest,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "repodata: universe snapshot task failed; rows will say unavailable",
+            );
+            UNIVERSE_UNAVAILABLE.to_string()
+        }
+    }
+}
+
+/// [`universe_digest`] against an explicit cache root. Production always passes
+/// [`dirs_cache_root`]; the guards pass a temp root, so no test has to reach
+/// for `set_var` on a process-global (the idiom `cache_root_from` already sets
+/// in this module).
+///
+/// Two threads racing a cold memo both compute, and both compute the same
+/// value from the same bytes -- the lock is deliberately NOT held across the
+/// hashing, because a re-entrant `lock()` on a `std::sync::Mutex` is a deadlock
+/// and seconds of NFS read under a held global lock is worse than a duplicated
+/// hash.
+pub fn universe_digest_at(cache_root: &std::path::Path) -> String {
+    {
+        // Scoped so the guard is DEFINITELY dropped before the recompute
+        // below: `universe_from_cache_root` is seconds of NFS read, and a
+        // global lock held across it would serialise every backend task.
+        let memo = snapshot_digest_memo().lock().unwrap();
+        if let Some((root, digest)) = memo.as_ref()
+            && root.as_path() == cache_root
+        {
+            return digest.clone();
+        }
+    }
+    let digest = snapshot_digest_at(cache_root);
+    *snapshot_digest_memo().lock().unwrap() = Some((cache_root.to_path_buf(), digest.clone()));
+    digest
+}
+
+/// The fold itself, with NO memo: read the snapshot under `cache_root` and
+/// return its digest, or [`UNIVERSE_UNAVAILABLE`] if it cannot be read at all.
+///
+/// Separate from [`universe_digest_at`] so the guards can assert the RULE
+/// without touching a process-global memo -- a global that two parallel tests
+/// would race, and a flaky guard is a guard that cannot fail for the right
+/// reason.
+pub fn snapshot_digest_at(cache_root: &std::path::Path) -> String {
+    match universe_from_cache_root(cache_root) {
+        Ok(documents) => universe_digest_of(&documents),
+        Err(error) => {
+            tracing::warn!(
+                cache_root = %cache_root.display(),
+                error = %format!("{error:#}"),
+                "repodata: the universe snapshot could not be read; rows will say unavailable",
+            );
+            UNIVERSE_UNAVAILABLE.to_string()
+        }
+    }
 }
 
 /// Sidecar path for one document: `.<filename>.retread-universe-v1.json`,
@@ -832,7 +998,8 @@ pub fn emit_universe_summary() {
     let digests: Vec<String> = documents.iter().map(RepodataDocument::short).collect();
     tracing::info!(
         schema = UNIVERSE_SCHEMA,
-        digest = %universe_digest_of(&documents),
+        digest = %universe_digest(),
+        consulted_digest = %universe_digest_of(&documents),
         pairs = documents.len(),
         frozen = frozen(),
         channels = %format!("[{}]", channels.join(",")),
@@ -891,12 +1058,14 @@ pub fn universe_from_cache_root(cache_root: &std::path::Path) -> Result<Vec<Repo
             // (`disk_cache_path`), so appending it makes the label injective
             // again without inventing a URL the filename does not carry.
             //
-            // The slug is still a lossy rendering of the channel URL: the
-            // backend's own rows carry the full URL, the verb carries this.
-            // Both fold the SAME rule, so a verb digest is comparable with
-            // another VERB digest and a backend digest with another BACKEND
-            // digest. Cross-comparing the two is not a defect the digest can
-            // catch, and this comment is the warning.
+            // The slug is still a lossy rendering of the channel URL, and the
+            // backend's `conda_universe` row carries full URLs in its
+            // `channels=[..]` list. p6ad-6 RETIRES the warning that used to
+            // stand here ("a verb digest is only comparable with another VERB
+            // digest"): the backend's `repodata_universe` is now folded from
+            // THIS function's output too, so a verb header and a backend row
+            // print the same number for the same snapshot, and a disagreement
+            // between them is now a real finding rather than a category error.
             channel: format!("{}#{}", parts[0], parts[2]),
             subdir: parts[1].to_string(),
             sha256,
@@ -1315,6 +1484,184 @@ mod tests {
             universe_digest_of(&[doc("https://c/conda-forge", "linux-64", &"a".repeat(64), 1)]),
         );
     }
+
+    // -----------------------------------------------------------------
+    // p6ad-6 GUARDS. The defect these pin: `repodata_universe` was the fold
+    // of the PROCESS-LOCAL CONSULTED REGISTRY, so it moved when a process's
+    // channel subset moved and when a fan-out was only half done. MEASURED on
+    // mBH-relock 5851226: 20 distinct digests across 269 rows inside ONE
+    // relock, off a snapshot where every one of the 10 (channel, subdir)
+    // pairs had exactly ONE sha256. Every guard below is RED on that rule.
+    //
+    // All but one drive `snapshot_digest_at`, the fold with no memo, so they
+    // are safe under `cargo test`'s parallelism. The single guard that has to
+    // exercise the process-global memo is the ONLY test that touches it.
+    // -----------------------------------------------------------------
+
+    /// Build a cache root holding the named documents.
+    fn snapshot_root(tag: &str, documents: &[(&str, &str)]) -> PathBuf {
+        let root = unique_tmp_dir(tag);
+        let dir = root.join("retread-repodata");
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, body) in documents {
+            write_doc(&dir, name, body.as_bytes());
+        }
+        root
+    }
+
+    /// THE FIXTURE. Two bundles resolved against ONE snapshot must carry ONE
+    /// digest, whether or not they consulted the same channels.
+    ///
+    /// RED ON THE OLD RULE, and the fixture proves itself DISCRIMINATING
+    /// rather than merely passing: the two consulted sets are asserted to fold
+    /// to two different values under the old rule before the new rule is
+    /// asserted to fold them to one.
+    #[test]
+    fn p6ad6_two_bundles_sharing_one_snapshot_yield_one_universe_digest() {
+        let root = snapshot_root(
+            "p6ad6-share",
+            &[
+                ("conda_forge--linux-64--aa.json", r#"{"packages":{"a":1}}"#),
+                ("conda_forge--noarch--bb.json", r#"{"packages":{"b":1}}"#),
+                ("nvidia--linux-64--cc.json", r#"{"packages":{"c":1}}"#),
+                ("nvidia--noarch--dd.json", r#"{"packages":{"d":1}}"#),
+            ],
+        );
+        let all = universe_from_cache_root(&root).unwrap();
+        assert_eq!(all.len(), 4, "{all:?}");
+
+        // Bundle A consulted 2 pairs, bundle B all 4 -- the production shape
+        // exactly (pairs=4 / pairs=8 / pairs=10 in one relock).
+        let bundle_a = all[..2].to_vec();
+        let bundle_b = all.clone();
+        assert_ne!(
+            universe_digest_of(&bundle_a),
+            universe_digest_of(&bundle_b),
+            "the OLD rule must disagree here, or this fixture proves nothing",
+        );
+
+        let digest_a = snapshot_digest_at(&root);
+        let digest_b = snapshot_digest_at(&root);
+        assert_eq!(digest_a, digest_b, "the snapshot digest is not a function of the root");
+        // ...and it is the number the `repodata-universe` verb prints, which is
+        // what makes a backend row and a job header comparable at all.
+        assert_eq!(digest_a, universe_digest_of(&all), "verb and backend fold different sets");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The digest must not move while a fan-out accumulates. On the old rule
+    /// every `record_document` moved it, which is what invented 17 of the 20.
+    #[test]
+    fn p6ad6_the_universe_digest_does_not_move_while_the_fan_out_accumulates() {
+        let root = snapshot_root(
+            "p6ad6-accum",
+            &[
+                ("conda_forge--linux-64--aa.json", r#"{"packages":{"a":1}}"#),
+                ("conda_forge--noarch--bb.json", r#"{"packages":{"b":1}}"#),
+                ("pytorch--linux-64--ee.json", r#"{"packages":{"e":1}}"#),
+            ],
+        );
+        let all = universe_from_cache_root(&root).unwrap();
+        let stable = snapshot_digest_at(&root);
+        let mut consulted = Vec::new();
+        let mut old_rule = Vec::new();
+        for document in &all {
+            consulted.push(document.clone());
+            old_rule.push(universe_digest_of(&consulted));
+            assert_eq!(
+                snapshot_digest_at(&root),
+                stable,
+                "the snapshot digest moved while only the consulted set grew",
+            );
+        }
+        old_rule.sort();
+        old_rule.dedup();
+        assert_eq!(old_rule.len(), 3, "the OLD rule must move on every accumulation step");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// One changed byte anywhere in the snapshot still moves the digest -- the
+    /// p6ad property the new input set must not have cost us.
+    #[test]
+    fn p6ad6_one_changed_byte_in_the_snapshot_still_moves_the_snapshot_digest() {
+        let root = snapshot_root(
+            "p6ad6-byte",
+            &[
+                ("conda_forge--linux-64--aa.json", r#"{"packages":{"a":1}}"#),
+                ("conda_forge--noarch--bb.json", r#"{"packages":{"b":1}}"#),
+            ],
+        );
+        let before = snapshot_digest_at(&root);
+        write_doc(
+            &root.join("retread-repodata"),
+            "conda_forge--noarch--bb.json",
+            br#"{"packages":{"b":2}}"#,
+        );
+        assert_ne!(before, snapshot_digest_at(&root), "a changed document did not move the digest");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A cache root with no snapshot at all is NOT the empty universe: it gets
+    /// a token no grep for a digest can match. "Could not be read" and "is
+    /// empty" are different facts and a row must not conflate them.
+    #[test]
+    fn p6ad6_an_unreadable_snapshot_is_not_the_empty_universe() {
+        let root = unique_tmp_dir("p6ad6-missing");
+        let digest = snapshot_digest_at(&root);
+        assert_eq!(digest, UNIVERSE_UNAVAILABLE, "{digest}");
+        assert_ne!(digest, universe_digest_of(&[]), "{digest}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The MEMO, both directions, and the only test that touches the
+    /// process-global one. A memo that outlives the bytes it names would be
+    /// the p6y failure in a new costume, so the writer drops it; and it is
+    /// keyed on the root, so a guard's temp root can never answer for
+    /// production's cache.
+    #[test]
+    fn p6ad6_the_snapshot_memo_is_keyed_on_the_root_and_dropped_by_the_writer() {
+        let a = snapshot_root(
+            "p6ad6-memo-a",
+            &[("conda_forge--linux-64--aa.json", r#"{"packages":{"a":1}}"#)],
+        );
+        let b = snapshot_root(
+            "p6ad6-memo-b",
+            &[("conda_forge--linux-64--aa.json", r#"{"packages":{"z":9}}"#)],
+        );
+        invalidate_snapshot_digest();
+
+        let digest_a = universe_digest_at(&a);
+        assert_eq!(digest_a, snapshot_digest_at(&a), "the memo returned something else");
+        // A different root must never be answered from another root's entry.
+        let digest_b = universe_digest_at(&b);
+        assert_eq!(digest_b, snapshot_digest_at(&b), "root b was answered from root a's memo");
+        assert_ne!(digest_a, digest_b, "two roots with different bytes share one digest");
+
+        // Rewrite root b under the memo. Without an invalidation the memo is
+        // supposed to still answer -- that is what makes it a memo...
+        write_doc(
+            &b.join("retread-repodata"),
+            "conda_forge--linux-64--aa.json",
+            br#"{"packages":{"z":10}}"#,
+        );
+        assert_eq!(universe_digest_at(&b), digest_b, "the memo is supposed to be a memo");
+        // ...and after the writer drops it, the digest names the bytes on disk.
+        invalidate_snapshot_digest();
+        assert_ne!(universe_digest_at(&b), digest_b, "an invalidated memo still answered");
+
+        invalidate_snapshot_digest();
+        std::fs::remove_dir_all(&a).ok();
+        std::fs::remove_dir_all(&b).ok();
+    }
+
+    /// The wire tag must say the rule changed: a v1 row folded a consulted
+    /// subset, a v2 row folds a snapshot, and comparing them is a category
+    /// error a reader has to be stopped from making.
+    #[test]
+    fn p6ad6_the_schema_tag_records_that_the_input_set_changed() {
+        assert_eq!(UNIVERSE_SCHEMA, "retread-conda-universe-v2");
+    }
+
 }
 
 /// Drop every cached view of `(channel_url, subdir)` so the next

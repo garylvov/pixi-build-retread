@@ -479,7 +479,11 @@ mod tests {
                 env: "protomotions-deps-pack".to_string(),
                 roots: vec!["viser".to_string()],
             }],
-            repodata_universe: crate::repodata::universe_digest(),
+            // p6ad-6: a filesystem-free universe token. `universe_digest()` now
+            // reads the cache-root SNAPSHOT, and a unit test must not hash
+            // whatever documents happen to sit in $RATTLER_CACHE_DIR on the
+            // gate node -- the value here only has to be self-consistent.
+            repodata_universe: crate::repodata::universe_digest_of(&[]),
         }
     }
 
