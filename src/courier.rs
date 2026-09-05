@@ -13,7 +13,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 use std::io::{Read, Seek};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr as _;
 
 use anyhow::Context as _;
@@ -475,14 +475,28 @@ pub fn expand_wheel_store_path(recorded: &str) -> std::path::PathBuf {
 
 // ── Shadow-rewrite cache helpers ────────────────────────────────────────────
 
+/// Where the shadow-rewrite cache lives under a cache root.
+///
+/// L3-1: this used to be `<root>/shadow/<target artifact identity>`. The
+/// target segment is GONE, and its removal is the whole lever: the rewritten
+/// bytes are a pure function of (input bytes, applicable override subset,
+/// code version, EMIT_EPOCH) — the target is not an input to the function, so
+/// putting it in the path (and in the key) meant two bundles that apply the
+/// SAME edit to the SAME wheel each paid the full re-emit. On C32 arm 1 that
+/// was `nvidia_cudnn_cu12` twice at 42.0 s and 42.2 s, `nvidia_cusparse_cu12`
+/// twice, `nvidia_cusolver_cu12` twice and `nvidia_cufft_cu12` twice, in one
+/// cold lock, for byte-identical outputs.
+fn shadow_cache_dir_in(cache_root: &Path) -> PathBuf {
+    cache_root.join("shadow")
+}
+
 /// Compute the shadow-rewrite cache key for one wheel.
 ///
 /// Key = sha256 of:
-///   b"retread-shadow-v2\n"
+///   b"retread-shadow-v3\n"
 ///   || EMIT_EPOCH (u32 le)
 ///   || CARGO_PKG_VERSION bytes || b"\n"
-///   || target_artifact_identity || b"\n"
-///   || input_wheel_sha256 (hex of relaxed.whl bytes) || b"\n"
+///   || input_wheel_sha256 (hex of the input wheel's bytes) || b"\n"
 ///   || applicable_overrides_conda_and_url_drops_serialized
 ///
 /// CRITICAL: only the APPLICABLE subset of overrides/conda_capable is
@@ -492,14 +506,27 @@ pub fn expand_wheel_store_path(recorded: &str) -> std::path::PathBuf {
 /// hit correct: the output is a pure function of exactly this subset +
 /// the input bytes + the code version.
 ///
+/// L3-1: the TARGET ARTIFACT IDENTITY is deliberately NOT hashed, and the
+/// domain tag moved `v2` -> `v3` so no pre-L3-1 entry can be read as one of
+/// these. `rewrite_wheel_with` is driven by `override_line_map(overrides,
+/// conda_capable, drop_url)` and nothing else, so two targets whose
+/// APPLICABLE subsets agree produce byte-identical output from identical
+/// input; keying on the target only split that one answer into N copies. A
+/// hit is still re-validated (name, version, and the locked final sha256
+/// where one exists) by `shadow_cache_stage_validated` before it is used.
+///
+/// The input digest is passed in as HEX rather than as bytes: the caller
+/// streams it (`wheel_rewrite::sha256_file_hex`) instead of slurping a
+/// multi-GB wheel into RAM to hash it. The digest, and therefore the key, is
+/// identical either way.
+///
 /// NOTE: this key is INTERNAL-ONLY. It MUST NOT feed `compute_inputs_hash`.
-fn shadow_cache_key_for_target(
-    input_wheel_bytes: &[u8],
+fn shadow_cache_key_for_input_sha(
+    input_sha: &str,
     requires_dist: &[String],
     overrides: &BTreeMap<String, String>,
     conda_capable: &HashSet<String>,
     drop_url: &HashSet<String>,
-    target_artifact_identity: &str,
 ) -> String {
     // Collect dep names from Requires-Dist (PEP 508 parse, same as override_line_map).
     let dep_names: HashSet<String> = requires_dist
@@ -536,14 +563,10 @@ fn shadow_cache_key_for_target(
     applicable_parts.extend(drop_parts);
     let applicable_serialized = applicable_parts.join("\n");
 
-    let input_sha = crate::wheel_rewrite::sha256_hex(input_wheel_bytes);
-
     let mut h = Sha256::new();
-    h.update(b"retread-shadow-v2\n");
+    h.update(b"retread-shadow-v3\n");
     h.update(crate::lock::EMIT_EPOCH.to_le_bytes());
     h.update(env!("CARGO_PKG_VERSION").as_bytes());
-    h.update(b"\n");
-    h.update(target_artifact_identity.as_bytes());
     h.update(b"\n");
     h.update(input_sha.as_bytes());
     h.update(b"\n");
@@ -556,6 +579,16 @@ fn shadow_cache_key_for_target(
     out
 }
 
+/// Streaming input digest for [`shadow_cache_key_for_input_sha`].
+///
+/// The whole point of taking a PATH rather than bytes: the three courier call
+/// sites used to `tokio::fs::read` the wheel purely to hash it, which made the
+/// key cost one full resident copy of a wheel that can be 5.9 GB.
+fn shadow_cache_input_sha(src: &Path) -> anyhow::Result<String> {
+    crate::wheel_rewrite::sha256_file_hex(src)
+        .with_context(|| format!("hashing shadow-cache input {}", src.display()))
+}
+
 #[cfg(test)]
 fn shadow_cache_key(
     input_wheel_bytes: &[u8],
@@ -563,13 +596,12 @@ fn shadow_cache_key(
     overrides: &BTreeMap<String, String>,
     conda_capable: &HashSet<String>,
 ) -> String {
-    shadow_cache_key_for_target(
-        input_wheel_bytes,
+    shadow_cache_key_for_input_sha(
+        &crate::wheel_rewrite::sha256_hex(input_wheel_bytes),
         requires_dist,
         overrides,
         conda_capable,
         &HashSet::new(),
-        "legacy-linux-64-test-target",
     )
 }
 
@@ -700,10 +732,11 @@ fn shadow_cache_stage_validated(
                 return Err(err);
             }
         };
-        tracing::debug!(
+        tracing::info!(
             key = %&key[..8],
             dst = %dst.display(),
-            "shadow cache: hit (changed)",
+            path = "hit/changed",
+            "bench: shadow_cache",
         );
         return Ok((sha, true));
     }
@@ -724,19 +757,21 @@ fn shadow_cache_stage_validated(
                 return Err(err);
             }
         };
-        tracing::debug!(
+        tracing::info!(
             key = %&key[..8],
             dst = %dst.display(),
-            "shadow cache: hit (same)",
+            path = "hit/same",
+            "bench: shadow_cache",
         );
         return Ok((sha, false));
     }
 
     // Cache miss: rewrite ONCE into the cache file, then link to dst.
-    tracing::debug!(
+    tracing::info!(
         key = %&key[..8],
         dst = %dst.display(),
-        "shadow cache: miss",
+        path = "miss",
+        "bench: shadow_cache",
     );
     // Process+sequence-unique tmp so concurrent installs sharing this
     // machine-global cache don't race the same tmp path (avoids spurious
@@ -1876,10 +1911,7 @@ pub(crate) async fn stage_for_target_with_store_root_and_relaxations(
     // Lives OUTSIDE source_dir/wheels so `rm -rf wheels` does not evict it.
     // Never feeds inputs_hash (the cache dir path is intentionally excluded
     // from the inputs hash -- only the cache KEY covers the relevant inputs).
-    let target_artifact_identity = target.artifact_cache_identity();
-    let shadow_cache_dir = retread_cache_root()
-        .join("shadow")
-        .join(&target_artifact_identity);
+    let shadow_cache_dir = shadow_cache_dir_in(&retread_cache_root());
     // Best-effort: create the dir now so the first miss doesn't race.
     let _ = std::fs::create_dir_all(&shadow_cache_dir);
     // Bypass: RETREAD_NO_SHADOW_CACHE=<any value> disables the cache entirely
@@ -1977,16 +2009,21 @@ pub(crate) async fn stage_for_target_with_store_root_and_relaxations(
             let dst = staging_dir.join(&std_name);
 
             if use_shadow_cache {
-                let src_bytes = tokio::fs::read(src)
-                    .await
-                    .with_context(|| format!("reading must_ship wheel {}", src.display()))?;
-                let key = shadow_cache_key_for_target(
-                    &src_bytes,
+                let input_sha = {
+                    let src_h = src.clone();
+                    let name_h = w.pypi_name.clone();
+                    tokio::task::spawn_blocking(move || shadow_cache_input_sha(&src_h))
+                        .await
+                        .with_context(|| {
+                            format!("spawn_blocking hash of must_ship wheel {name_h}")
+                        })??
+                };
+                let key = shadow_cache_key_for_input_sha(
+                    &input_sha,
                     &w.requires_dist,
                     &overrides_owned,
                     &conda_cap_owned,
                     &drop_url_owned,
-                    &target_artifact_identity,
                 );
                 let cache_dir = shadow_cache_dir.clone();
                 let src_b = src.clone();
@@ -2114,16 +2151,21 @@ pub(crate) async fn stage_for_target_with_store_root_and_relaxations(
                 } else if use_shadow_cache {
                     // Single-pass through cache: rewrite_wheel_with returns
                     // (sha, did_change). No probe-then-rewrite double pass.
-                    let src_bytes = tokio::fs::read(src)
-                        .await
-                        .with_context(|| format!("reading index wheel {}", src.display()))?;
-                    let key = shadow_cache_key_for_target(
-                        &src_bytes,
+                    let input_sha = {
+                        let src_h = src.clone();
+                        let name_h = w.pypi_name.clone();
+                        tokio::task::spawn_blocking(move || shadow_cache_input_sha(&src_h))
+                            .await
+                            .with_context(|| {
+                                format!("spawn_blocking hash of index wheel {name_h}")
+                            })??
+                    };
+                    let key = shadow_cache_key_for_input_sha(
+                        &input_sha,
                         &w.requires_dist,
                         &overrides_owned,
                         &conda_cap_owned,
                         &drop_url_owned,
-                        &target_artifact_identity,
                     );
                     let cache_dir = shadow_cache_dir.clone();
                     let src_c = src.clone();
@@ -2457,6 +2499,16 @@ pub(crate) async fn stage_for_target_with_store_root_and_relaxations(
                     // Relax changed this index wheel's METADATA (raw bytes, not yet
                     // rewritten): ship it as a build-tagged shadow wheel, running
                     // rewrite_wheel_with on the raw bytes first.
+                    //
+                    // L3-1: this arm reached `rewrite_wheel_with` DIRECTLY and was
+                    // the only rewrite door with no cache behind it. It is also the
+                    // most expensive one: it is where the force-downloaded
+                    // remote-only relax-changed wheels land (the CUDA runtime
+                    // wheels), and on C32 arm 1 it was 16 of the 54 `changed/rewrite`
+                    // rows and 179.9 s of their 248.3 s -- with four of those wheels
+                    // re-emitted verbatim for a SECOND bundle. It now goes through
+                    // the same content-addressed cache the other two doors use, so
+                    // the second bundle hard-links the first's answer.
                     let shadow_name = insert_build_tag(&std_name, "999retread")?;
                     let dst = staging_dir.join(&shadow_name);
                     let dst_blocking = dst.clone();
@@ -2464,14 +2516,59 @@ pub(crate) async fn stage_for_target_with_store_root_and_relaxations(
                     let overrides_c2 = overrides_owned.clone();
                     let conda_cap_c2 = conda_cap_owned.clone();
                     let drop_c2 = drop_url_owned.clone();
-                    tokio::task::spawn_blocking(move || {
-                        let m = override_line_map(&overrides_c2, &conda_cap_c2, &drop_c2);
-                        crate::wheel_rewrite::rewrite_wheel_with(&src_blocking, &dst_blocking, &m)
-                    })
-                    .await
-                    .with_context(|| {
-                        format!("spawn_blocking shadow-rewrite of {}", w.pypi_name)
-                    })??;
+                    if use_shadow_cache {
+                        let input_sha = {
+                            let src_h = src.clone();
+                            let name_h = w.pypi_name.clone();
+                            tokio::task::spawn_blocking(move || shadow_cache_input_sha(&src_h))
+                                .await
+                                .with_context(|| {
+                                    format!("spawn_blocking hash of raw shadow wheel {name_h}")
+                                })??
+                        };
+                        let key = shadow_cache_key_for_input_sha(
+                            &input_sha,
+                            &w.requires_dist,
+                            &overrides_owned,
+                            &conda_cap_owned,
+                            &drop_url_owned,
+                        );
+                        let cache_dir = shadow_cache_dir.clone();
+                        let expected_name_r = w.pypi_name.clone();
+                        let expected_version_r = w.version.clone();
+                        let expected_sha_r = w.locked_final_sha256.clone();
+                        tokio::task::spawn_blocking(move || {
+                            shadow_cache_stage_validated(
+                                &src_blocking,
+                                &dst_blocking,
+                                &cache_dir,
+                                &key,
+                                &expected_name_r,
+                                &expected_version_r,
+                                expected_sha_r.as_deref(),
+                                &overrides_c2,
+                                &conda_cap_c2,
+                                &drop_c2,
+                            )
+                        })
+                        .await
+                        .with_context(|| {
+                            format!("spawn_blocking shadow-cache (raw) {}", w.pypi_name)
+                        })??;
+                    } else {
+                        tokio::task::spawn_blocking(move || {
+                            let m = override_line_map(&overrides_c2, &conda_cap_c2, &drop_c2);
+                            crate::wheel_rewrite::rewrite_wheel_with(
+                                &src_blocking,
+                                &dst_blocking,
+                                &m,
+                            )
+                        })
+                        .await
+                        .with_context(|| {
+                            format!("spawn_blocking shadow-rewrite of {}", w.pypi_name)
+                        })??;
+                    }
                     let staged_metadata = validate_wheel_file_metadata_and_sha(
                         &w.pypi_name,
                         &w.version,
@@ -3894,32 +3991,197 @@ mod tests {
         let _ = std::fs::remove_dir_all(tmp);
     }
 
+    /// L3-1 GUARD. Two bundles that apply the same edit to the same wheel must
+    /// land on ONE cache entry, and the second must not re-emit.
+    ///
+    /// The old code qualified BOTH the key and the cache directory by the
+    /// target artifact identity, so this scenario produced two directories,
+    /// two keys and two full re-emits of identical bytes. Restoring either
+    /// qualification turns this red: the two inputs are separate files (as
+    /// they are in production -- each bundle force-downloads into its own
+    /// `.dl-courier`), and removing the second before it stages makes a miss
+    /// impossible to fake.
     #[test]
-    fn shadow_cache_key_is_target_qualified() {
-        let bytes = b"wheel bytes";
-        let requires = vec!["demo>=1".to_string()];
-        let overrides = BTreeMap::new();
-        let conda_capable = HashSet::new();
-        let drop_url = HashSet::new();
-        let x86 = shadow_cache_key_for_target(
-            bytes,
-            &requires,
-            &overrides,
-            &conda_capable,
-            &drop_url,
-            &"a".repeat(64),
+    fn two_bundles_rewriting_the_same_wheel_share_one_cache_entry() {
+        let tmp = make_test_dir("shadow-cross-bundle");
+        // ONE cache root for the whole process, as in production: the dir no
+        // longer carries a target segment.
+        let cache = shadow_cache_dir_in(&tmp.join("retread-cache"));
+
+        let mut ov = BTreeMap::new();
+        ov.insert("dep-x".to_string(), ">=6.0.0".to_string());
+        let cap: HashSet<String> = HashSet::new();
+        let drop: HashSet<String> = HashSet::new();
+        let requires = vec!["dep-x==6.0.0".to_string()];
+
+        // Bundle A's copy and bundle B's copy of the same upstream wheel.
+        let dir_a = tmp.join("bundle-a");
+        let dir_b = tmp.join("bundle-b");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        let src_a = write_wheel(&dir_a, "pkg-shared", "1.0.0", &["dep-x==6.0.0"]);
+        let src_b = dir_b.join("pkg_shared-1.0.0-py3-none-any.whl");
+        std::fs::copy(&src_a, &src_b).unwrap();
+        assert_eq!(
+            std::fs::read(&src_a).unwrap(),
+            std::fs::read(&src_b).unwrap(),
+            "the two bundles must start from byte-identical inputs"
         );
-        let arm = shadow_cache_key_for_target(
-            bytes,
+
+        let key_a = shadow_cache_key_for_input_sha(
+            &shadow_cache_input_sha(&src_a).unwrap(),
             &requires,
-            &overrides,
-            &conda_capable,
-            &drop_url,
-            &"b".repeat(64),
+            &ov,
+            &cap,
+            &drop,
         );
-        assert_ne!(x86, arm);
-        assert_eq!(x86.len(), 64);
-        assert_eq!(arm.len(), 64);
+        let key_b = shadow_cache_key_for_input_sha(
+            &shadow_cache_input_sha(&src_b).unwrap(),
+            &requires,
+            &ov,
+            &cap,
+            &drop,
+        );
+        assert_eq!(
+            key_a, key_b,
+            "the same input bytes + the same applicable override subset is ONE key, \
+             whichever bundle asks for it"
+        );
+
+        // `shadow_cache_stage_validated` is the production door: it is handed
+        // the expected name/version rather than reading them off `src`, so on a
+        // hit it never opens `src` at all -- which is what makes the deleted
+        // input below a sound miss-detector.
+        let stage_one = |src: &Path, dst: &Path, key: &str| {
+            shadow_cache_stage_validated(
+                src,
+                dst,
+                &cache,
+                key,
+                "pkg-shared",
+                "1.0.0",
+                None,
+                &ov,
+                &cap,
+                &drop,
+            )
+        };
+
+        let dst_a = tmp.join("staged-a.whl");
+        let (sha_a, changed_a) = stage_one(&src_a, &dst_a, &key_a).unwrap();
+        assert!(changed_a, "dep-x==6.0.0 -> >=6.0.0 must be a change");
+
+        // Bundle B's input is DELETED before B stages. A miss would have to
+        // read it and would fail; only a hit on A's entry can succeed.
+        std::fs::remove_file(&src_b).unwrap();
+        let dst_b = tmp.join("staged-b.whl");
+        let (sha_b, changed_b) = stage_one(&src_b, &dst_b, &key_b).unwrap();
+
+        let bytes_a = std::fs::read(&dst_a).unwrap();
+        let bytes_b = std::fs::read(&dst_b).unwrap();
+        let entries: Vec<String> = std::fs::read_dir(&cache)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".changed") || n.ends_with(".same"))
+            .collect();
+
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(changed_a, changed_b, "did_change must agree across bundles");
+        assert_eq!(sha_a, sha_b, "sha256 must agree across bundles");
+        assert_eq!(
+            bytes_a, bytes_b,
+            "the reused entry must be byte-identical to the freshly rewritten one"
+        );
+        assert_eq!(
+            entries.len(),
+            1,
+            "one input + one applicable subset must occupy exactly ONE cache entry, got {entries:?}"
+        );
+    }
+
+    /// L3-1 GUARD. The cache directory itself carries no target segment.
+    ///
+    /// Red under the mutation that restores `.join(target_artifact_identity)`:
+    /// two targets would then resolve to two different directories and share
+    /// nothing even with an identical key.
+    #[test]
+    fn the_shadow_cache_directory_does_not_split_by_target() {
+        let root = std::path::PathBuf::from("/scratch/retread-cache");
+        let dir = shadow_cache_dir_in(&root);
+        assert_eq!(dir, root.join("shadow"));
+        assert_eq!(
+            dir.components().count(),
+            root.components().count() + 1,
+            "the shadow cache dir is exactly <root>/shadow -- no per-target segment"
+        );
+    }
+
+    /// L3-1 PRECONDITION GUARD. Reuse is only correct because the re-emit is
+    /// byte-deterministic: two rewrites of one input, in one process, must
+    /// produce identical bytes, or handing a caller a stored answer would be a
+    /// different answer from the one it would have computed.
+    #[test]
+    fn two_re_emits_of_one_wheel_are_byte_identical() {
+        let tmp = make_test_dir("rewrite-determinism");
+        let whl = write_wheel(&tmp, "pkg-det", "2.0.0", &["dep-d==3.0.0"]);
+        let mut ov = BTreeMap::new();
+        ov.insert("dep-d".to_string(), ">=3.0.0".to_string());
+        let cap: HashSet<String> = HashSet::new();
+        let drop: HashSet<String> = HashSet::new();
+        let m = override_line_map(&ov, &cap, &drop);
+
+        let one = tmp.join("one.whl");
+        let two = tmp.join("two.whl");
+        let (sha_one, changed_one) =
+            crate::wheel_rewrite::rewrite_wheel_with(&whl, &one, &m).expect("first re-emit");
+        let (sha_two, changed_two) =
+            crate::wheel_rewrite::rewrite_wheel_with(&whl, &two, &m).expect("second re-emit");
+        let bytes_one = std::fs::read(&one).unwrap();
+        let bytes_two = std::fs::read(&two).unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert!(changed_one && changed_two, "both re-emits must have changed");
+        assert_eq!(sha_one, sha_two, "the re-emit must be byte-deterministic");
+        assert_eq!(
+            bytes_one, bytes_two,
+            "the re-emit must be byte-deterministic"
+        );
+    }
+
+    /// L3-1 GUARD. A mutated rewrite spec must MISS, never quietly reuse a
+    /// wheel rewritten under different overrides.
+    #[test]
+    fn a_mutated_rewrite_spec_misses_the_cache() {
+        let tmp = make_test_dir("shadow-spec-mutation");
+        let cache = shadow_cache_dir_in(&tmp.join("retread-cache"));
+        let whl = write_wheel(&tmp, "pkg-mut", "1.0.0", &["dep-m==6.0.0"]);
+        let requires = vec!["dep-m==6.0.0".to_string()];
+        let cap: HashSet<String> = HashSet::new();
+        let drop: HashSet<String> = HashSet::new();
+        let input_sha = shadow_cache_input_sha(&whl).unwrap();
+
+        let mut ov1 = BTreeMap::new();
+        ov1.insert("dep-m".to_string(), ">=6.0.0".to_string());
+        let mut ov2 = BTreeMap::new();
+        ov2.insert("dep-m".to_string(), ">=6.0.0,<7".to_string());
+
+        let key1 = shadow_cache_key_for_input_sha(&input_sha, &requires, &ov1, &cap, &drop);
+        let key2 = shadow_cache_key_for_input_sha(&input_sha, &requires, &ov2, &cap, &drop);
+        assert_ne!(key1, key2, "a different applicable override must miss");
+
+        let dst1 = tmp.join("s1.whl");
+        let dst2 = tmp.join("s2.whl");
+        shadow_cache_stage(&whl, &dst1, &cache, &key1, &ov1, &cap, &drop).unwrap();
+        shadow_cache_stage(&whl, &dst2, &cache, &key2, &ov2, &cap, &drop).unwrap();
+        let bytes1 = std::fs::read(&dst1).unwrap();
+        let bytes2 = std::fs::read(&dst2).unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_ne!(
+            bytes1, bytes2,
+            "two different specs must produce two different wheels, not one reused answer"
+        );
     }
 
     #[test]
@@ -3931,14 +4193,14 @@ mod tests {
         let no_drop = HashSet::new();
         let drop_dep = HashSet::from(["dep".to_string()]);
         let drop_other = HashSet::from(["other".to_string()]);
+        let input_sha = crate::wheel_rewrite::sha256_hex(bytes);
         let key = |drop_url: &HashSet<String>| {
-            shadow_cache_key_for_target(
-                bytes,
+            shadow_cache_key_for_input_sha(
+                &input_sha,
                 &requires,
                 &overrides,
                 &conda_capable,
                 drop_url,
-                &"a".repeat(64),
             )
         };
         assert_ne!(key(&no_drop), key(&drop_dep));
@@ -4548,6 +4810,156 @@ mod tests {
         );
     }
 
+
+    /// L3-1 GUARD — the one that counts the WORK, not the shape of the code.
+    ///
+    /// Two bundles both force-download the same remote-only relax-changed
+    /// wheel (the shape of the CUDA runtime wheels on a cold canonical lock:
+    /// `nvidia_cudnn_cu12` landed in `.dl-courier` for BOTH `flashsac-pack`
+    /// and `robojudo-pack` on C32 arm 1 and was fully re-emitted twice, 42.154 s
+    /// and 41.998 s, for byte-identical output). With the shadow cache ON, that
+    /// must cost exactly ONE re-emit.
+    ///
+    /// RED on the old code for two independent reasons, either of which alone
+    /// makes it two: `ShadowSrc::Raw` reached `rewrite_wheel_with` directly with
+    /// no cache behind it, and both the cache key and the cache directory were
+    /// qualified by the target artifact identity, so two bundles could not share
+    /// an entry even if the Raw arm had consulted one.
+    #[tokio::test]
+    async fn two_bundles_force_downloading_one_wheel_re_emit_it_once() {
+        let _env_guard = crate::TEST_ASYNC_ENV_MUTEX.lock().await;
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let tmp = make_test_dir("raw-arm-cross-bundle");
+        let target_name = "dep-target";
+        let target_version = "1.0.0";
+        let dep_target_whl_name = format!(
+            "{}-{target_version}-py3-none-any.whl",
+            wheel_dist_name(target_name)
+        );
+        let dep_target_whl = tmp.join(&dep_target_whl_name);
+        std::fs::write(
+            &dep_target_whl,
+            make_wheel_bytes(target_name, target_version, &[]),
+        )
+        .unwrap();
+
+        // The shared wheel: a URL requirement plan() will pin, so the rewrite
+        // changes bytes and the wheel must ship as a 999retread shadow.
+        let url_req = format!("{target_name} @ https://example.com/{dep_target_whl_name}");
+        let shared_name = "sharedwheel-2.0.0-py3-none-any.whl".to_string();
+        let raw_wheel_bytes = make_wheel_bytes("sharedwheel", "2.0.0", &[url_req.as_str()]);
+
+        // Serve the wheel to both bundles.
+        let served = Arc::new(raw_wheel_bytes.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let wheel_url = format!("http://127.0.0.1:{port}/{shared_name}");
+        let served_srv = served.clone();
+        let _server = tokio::spawn(async move {
+            for _ in 0..8u8 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let bytes = served_srv.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf).await;
+                    let resp = format!(
+                        "HTTP/1.0 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\n\r\n",
+                        bytes.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                    let _ = stream.write_all(&bytes).await;
+                });
+            }
+        });
+
+        let conda_capable: HashSet<String> = HashSet::new();
+        let index_urls = ["https://pypi.org/simple/".to_string()];
+
+        // ONE cache root for both bundles, as in production: a single process
+        // stages every bundle of the lock.
+        let cache_root = tmp.join("retread-cache");
+        // SAFETY: the async env mutex is held for the whole test.
+        unsafe { std::env::set_var("RETREAD_CACHE_DIR", &cache_root) };
+        unsafe { std::env::remove_var("RETREAD_NO_SHADOW_CACHE") };
+        crate::wheel_rewrite::re_emit_probe::reset();
+
+        let mut staged_bytes: Vec<Vec<u8>> = Vec::new();
+        for bundle in ["bundle-alpha", "bundle-beta"] {
+            let staging = tmp.join(format!("staging-{bundle}"));
+            let dep_wheel = make_emit_wheel(
+                target_name,
+                target_version,
+                &[],
+                Some(&dep_target_whl),
+                None,
+            );
+            // local_path = None + remote_url = Some -> the force-download arm.
+            let mut shared_wheel = make_emit_wheel(
+                "sharedwheel",
+                "2.0.0",
+                &[url_req.as_str()],
+                None,
+                Some(&wheel_url),
+            );
+            // The raw ingress is identity-checked against the declared digest.
+            shared_wheel.sha256 =
+                Some(crate::wheel_rewrite::sha256_hex(&raw_wheel_bytes));
+            let result = stage(
+                &minimal_config(bundle),
+                bundle,
+                "2.0.0",
+                "3.11",
+                &[dep_wheel, shared_wheel],
+                &conda_capable,
+                &[],
+                &index_urls,
+                "",
+                &tmp,
+                &staging,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{bundle} must stage: {e:#}"));
+            let built: Vec<&LockWheel> = result
+                .lock
+                .wheels
+                .iter()
+                .filter(|w| w.name == "sharedwheel")
+                .collect();
+            assert_eq!(built.len(), 1, "{bundle}: one sharedwheel row");
+            assert_eq!(
+                built[0].origin,
+                Origin::Built,
+                "{bundle}: the relax-changed wheel must ship as a shadow"
+            );
+            staged_bytes.push(std::fs::read(staging.join(&built[0].filename)).unwrap());
+        }
+
+        let re_emits = crate::wheel_rewrite::re_emit_probe::re_emits_for("sharedwheel");
+        unsafe { std::env::remove_var("RETREAD_CACHE_DIR") };
+        crate::wheel_rewrite::re_emit_probe::reset();
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_ne!(
+            staged_bytes[0], raw_wheel_bytes,
+            "the shadow must be the REWRITTEN bytes, not the raw download"
+        );
+        assert_eq!(
+            staged_bytes[0], staged_bytes[1],
+            "both bundles must ship byte-identical shadow wheels"
+        );
+        assert_eq!(
+            re_emits.len(),
+            1,
+            "two bundles rewriting one wheel must cost ONE full re-emit, paid {} \
+             (sources: {:?})",
+            re_emits.len(),
+            re_emits.iter().map(|(p, _)| p.display().to_string()).collect::<Vec<_>>()
+        );
+    }
     /// Step-0 regression guard: ShadowSrc::Raw (no-cache path and force-download
     /// path) must go through rewrite_wheel_with, producing RELAXED bytes that
     /// differ from the raw input.

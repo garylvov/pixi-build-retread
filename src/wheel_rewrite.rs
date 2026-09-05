@@ -118,7 +118,7 @@ pub(crate) fn rewrite_wheel_with(
 /// file in RAM: isaacsim extscache wheels are ~5.9 GB, and the previous
 /// `std::fs::read` + `sha256_hex` pair paid that in resident memory on every
 /// rewrite, including the overwhelmingly common no-op one.
-fn sha256_file_hex(path: &Path) -> Result<String> {
+pub(crate) fn sha256_file_hex(path: &Path) -> Result<String> {
     let mut file =
         std::fs::File::open(path).with_context(|| format!("hashing {}", path.display()))?;
     let mut hasher = Sha256::new();
@@ -313,6 +313,7 @@ fn rewrite_wheel_metadata_with(
     // sha256 of the rewritten wheel file (for recipe.yaml's source: sha256),
     // streamed so a multi-GB rewrite never doubles as a multi-GB allocation.
     let dst_sha = sha256_file_hex(dst)?;
+    note_wheel_re_emit(src, src_bytes);
     tracing::info!(
         src = %src.display(),
         dst = %dst.display(),
@@ -1850,3 +1851,52 @@ site-packages/mujoco/libmujoco.so.3.11.0",
     }
 
 }
+
+/// Test-only probe over FULL wheel re-emits (`rewrite_wheel_metadata_with`'s
+/// `changed/rewrite` path), so a guard can count the work a run actually does
+/// rather than inspect the shape of the code that decides to do it. Mirrors
+/// `wheel::full_hash_probe`; L3-1 exists because two bundles were each paying
+/// for the same re-emit and nothing counted it.
+#[cfg(test)]
+pub(crate) mod re_emit_probe {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    /// (source wheel re-emitted, input bytes).
+    pub(crate) static RE_EMITTED: Mutex<Vec<(PathBuf, u64)>> = Mutex::new(Vec::new());
+
+    pub(crate) fn record(src: &Path, bytes: u64) {
+        if let Ok(mut seen) = RE_EMITTED.lock() {
+            seen.push((src.to_path_buf(), bytes));
+        }
+    }
+
+    /// Every re-emit recorded so far whose source path contains `needle`.
+    pub(crate) fn re_emits_for(needle: &str) -> Vec<(PathBuf, u64)> {
+        RE_EMITTED
+            .lock()
+            .map(|seen| {
+                seen.iter()
+                    .filter(|(src, _)| src.to_string_lossy().contains(needle))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Drop every recorded re-emit. Callers hold the async env mutex.
+    pub(crate) fn reset() {
+        if let Ok(mut seen) = RE_EMITTED.lock() {
+            seen.clear();
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn note_wheel_re_emit(src: &Path, bytes: u64) {
+    re_emit_probe::record(src, bytes);
+}
+
+#[cfg(not(test))]
+#[inline]
+pub(crate) fn note_wheel_re_emit(_src: &Path, _bytes: u64) {}
