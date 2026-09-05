@@ -25,3 +25,4 @@ f59aa35 p6z-lenient-metadata-and-reconciler-attribution
 24bf812 p6ae-c30-1-yield-row-bundle-attribution (cherry-picked; the emitter refuses an unnamed scope)
 0b04ba9 p6ad-repodata-universe-provenance (AdvertisedIdentityRecord SCHEMA 6, folding p6u/p6w)
 54b5852 p6ad6-universe-is-the-snapshot (UNIVERSE_SCHEMA v2: repodata_universe = the whole snapshot, consulted_digest = the per-process subset)
+a10b6e1 p6ad4-hash-each-document-once
