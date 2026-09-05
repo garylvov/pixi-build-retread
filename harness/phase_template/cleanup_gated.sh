@@ -113,8 +113,14 @@ ISO_CACHE_PREFIX=/oscar/data/stellex/glvov/agrescap/cache/retread-injection-on-
 #       Reader: cleanup_gate_env_derivation_guard.sh, which runs this file with
 #       no D/TAG/RJ at all and requires the derivation, runs it against a root
 #       naming a harness that does not exist and requires the printed export
-#       line, and runs the PREVIOUS version of the same file to show it dying at
-#       line 85 -- the mutation that proves the guard can fail.
+#       line, runs it over a harness nested two deep and requires D anyway
+#       (SWEEP-3-1), runs it over TWO harnesses holding the same evidence and
+#       requires a refusal that names both, and runs PINNED PREVIOUS versions of
+#       this same file -- ececead for the derivation, efe74a0 for the depth --
+#       to show each defect reproducing. Those mutations are pinned to CONSTANTS,
+#       not to HEAD: an arm that extracts `HEAD:<itself>` asserts against the fix
+#       the moment the fix is committed, which is how arm B silently died between
+#       d2ba3fd and 5891315 (13/2, not the 15/15 it was signed off at).
 derive_from_roots() {
   # First root that parses wins; every root is required to agree later anyway,
   # because condition 2 queue-checks every job-id token it finds in each one.
@@ -147,9 +153,37 @@ derive_harness_dir() {
   # The unique directory under the task root whose artifacts/ already holds the
   # evidence for this tag+job. `find -maxdepth` per HANDOFF section 2; a
   # full-tree walk here would cross every job root under the task directory.
-  local tag=$1 rj=$2 hits
-  hits=$(find "$T" -maxdepth 3 -type f -path "*/artifacts/$tag-$rj*" -printf '%h\n' 2>/dev/null | sort -u)
-  [ "$(printf '%s\n' "$hits" | grep -c .)" = 1 ] || return 1
+  #
+  # SWEEP-3-1 (2026-09-05). The depth was 3, which reaches exactly one shape:
+  # `<T>/<harness>/artifacts/<file>`. Merge and sweep lanes routinely nest the
+  # harness one level deeper -- `<T>/c2-merged/a/artifacts/<file>`, a
+  # per-candidate subdirectory under a batch directory -- and at depth 3 `find`
+  # never sees the file, so `derive_harness_dir` returned 1 and the gate refused
+  # with D unset. FOUR lanes with COMPLETE evidence were refused that way and
+  # their roots could not be reclaimed. Depth 4 reaches both shapes.
+  #
+  # It is not widened past 4 on purpose: `<T>/<batch>/<cand>/artifacts/` is the
+  # deepest layout any harness of this campaign writes, while depth 5 would start
+  # matching artifacts trees COPIED inside a job root, and the uniqueness rule
+  # below would then refuse cases that work today. Depth is a bound on the shapes
+  # we accept, not a search budget.
+  #
+  # UNIQUENESS IS THE WHOLE POINT and it survives the widening: two candidate
+  # directories is a REFUSAL that names both, never a guess. Naming one of two
+  # would point this gate -- and `cleanup.sh` behind it -- at another lane's
+  # evidence and delete another lane's roots. The list goes to stderr because
+  # this function's stdout IS the derived value.
+  local tag=$1 rj=$2 hits n
+  hits=$(find "$T" -maxdepth 4 -type f -path "*/artifacts/$tag-$rj*" -printf '%h\n' 2>/dev/null | sort -u)
+  n=$(printf '%s\n' "$hits" | grep -c .)
+  if [ "$n" != 1 ]; then
+    if [ "$n" -gt 1 ]; then
+      echo "### AMBIGUOUS D: $n directories under $T hold $tag-$rj* -- naming NONE of them:" >&2
+      printf '%s\n' "$hits" | sed 's|/artifacts$||; s|^|###   candidate: |' >&2
+      echo "###   Pick one and pass it: --export=ALL,D=<harness dir>,TAG=$tag,RJ=$rj" >&2
+    fi
+    return 1
+  fi
   printf '%s\n' "${hits%/artifacts}"
 }
 if [ -z "${D:-}" ] || [ -z "${TAG:-}" ] || [ -z "${RJ:-}" ]; then

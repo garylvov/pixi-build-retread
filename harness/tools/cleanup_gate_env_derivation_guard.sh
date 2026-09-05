@@ -27,12 +27,34 @@
 #      printed `--export=ALL,D=...` line, never a bash error.
 #   E  derivable tag+job but NO harness directory holds the evidence -> exit 2
 #      with the export line, and D reported unset.
+#   F  SWEEP-3-1: the harness is nested TWO deep under the task root
+#      (`<T>/c2-merged/a/artifacts/`), the shape every merge lane writes -> the
+#      gate still derives D and still runs its conditions.
+#   FR SWEEP-3-1 MUTATION: the SAME nested fixture against the PINNED previous
+#      file ($SWEEP3_OLD), whose `derive_harness_dir` searched at `-maxdepth 3`
+#      -> D is never derived and the gate refuses with exit 2. This is the defect
+#      that refused four lanes whose evidence was complete.
+#   G  TWO harness directories hold the same TAG-RJ evidence -> the gate refuses
+#      with exit 2 and NAMES BOTH candidates. Widening the depth widens what can
+#      collide, so the uniqueness rule is now guarded, not merely retained.
+#
+# MUTATION ARMS ARE PINNED TO COMMIT CONSTANTS, NEVER TO `HEAD`. Arm B used to
+# read `HEAD:harness/phase_template/cleanup_gated.sh`; the moment d2ba3fd
+# committed the p6ad-4 fix, HEAD carried the FIXED file and the arm began
+# asserting the fix against itself. It was signed off at 15/15 and measured at
+# 13/2 (job 5891315, node2315) with two arm-B failures and nothing else changed.
+# A mutation arm must name the commit that carries the defect.
 set -uo pipefail
 HERE=$(cd -- "$(dirname -- "$0")" && pwd)
 REPO=$(cd -- "$HERE/../.." && pwd)
 GATE=$REPO/harness/phase_template/cleanup_gated.sh
 T=/oscar/data/stellex/glvov/agrescap/tasks/retread-4-11
 WORK=${TMPDIR:-/tmp}/cleanup-gate-env-guard-$$
+# The two PINNED mutation sources. Each names the last commit that carries the
+# defect its arm reproduces; neither is `HEAD`, and neither may be changed to
+# `HEAD` (see the note above the arm list).
+DERIV_OLD=${DERIV_OLD:-ececead}   # d2ba3fd^ -- the gate before p6ad-4's derivation
+SWEEP3_OLD=${SWEEP3_OLD:-efe74a0} # the gate while derive_harness_dir was -maxdepth 3
 mkdir -p "$WORK"
 pass=0; fail=0
 ok()  { echo "PASS  $*"; pass=$((pass+1)); }
@@ -47,19 +69,45 @@ echo "### work $WORK"
 # collide with a live lane's artifacts.
 TAG=GUARDENVDERIV$$
 RJ=999$$
-HDIR=$T/guard-envderiv-$$   # ONE level under the task root: that is where every harness
-                            # directory of this campaign lives, and it is what
-                            # `derive_harness_dir`s `-maxdepth 3` is sized for.
-                            # A fixture nested deeper would be testing a layout
-                            # no harness has.
-mkdir -p "$HDIR/artifacts"
-printf '0\n'   > "$HDIR/artifacts/$TAG-$RJ.rc"
-printf '123\n' > "$HDIR/artifacts/$TAG-$RJ.wall"
-printf 'x\n'   > "$HDIR/artifacts/$TAG-$RJ.lock.log"
-printf 'x\n'   > "$HDIR/artifacts/$TAG-$RJ.pixi.lock.cert"
+HDIR=$T/guard-envderiv-$$   # ONE level under the task root -- the FLAT shape.
+mk_evidence () {            # mk_evidence <harness dir> <tag> <rj>
+  mkdir -p "$1/artifacts"
+  printf '0\n'   > "$1/artifacts/$2-$3.rc"
+  printf '123\n' > "$1/artifacts/$2-$3.wall"
+  printf 'x\n'   > "$1/artifacts/$2-$3.lock.log"
+  printf 'x\n'   > "$1/artifacts/$2-$3.pixi.lock.cert"
+}
+mk_evidence "$HDIR" "$TAG" "$RJ"
 ROOT=/oscar/data/stellex/glvov/retread/cert$TAG-$RJ-A
 [ -e "$ROOT" ] && { echo "FATAL: fixture root $ROOT exists on disk -- refusing to run"; exit 3; }
-cleanup_fixture() { rm -rf "$HDIR" "$WORK"; }
+
+# SWEEP-3-1 fixture: the NESTED shape, `<T>/c2-merged/a/artifacts/`. This is not
+# a hypothetical layout -- it is what a merge lane writes when a batch directory
+# carries one subdirectory per candidate, and four lanes with complete evidence
+# were refused by the gate because `-maxdepth 3` could not see one level further
+# down. Its tag is distinct from the flat fixture's so the two can never collide
+# and make arm G pass for the wrong reason.
+NTAG=GUARDNESTED$$
+NRJ=888$$
+NBASE=$T/guard-nested-$$
+NDIR=$NBASE/a
+mk_evidence "$NDIR" "$NTAG" "$NRJ"
+NROOT=/oscar/data/stellex/glvov/retread/cert$NTAG-$NRJ-A
+[ -e "$NROOT" ] && { echo "FATAL: fixture root $NROOT exists on disk -- refusing to run"; exit 3; }
+
+# ARM G fixture: the SAME tag+job written under TWO harness directories, one
+# flat and one nested. Widening the depth widens what can collide, so uniqueness
+# has to be asserted, not assumed.
+DTAG=GUARDDUP$$
+DRJ=777$$
+DDIR1=$T/guard-dup1-$$
+DDIR2=$T/guard-dup2-$$/a
+mk_evidence "$DDIR1" "$DTAG" "$DRJ"
+mk_evidence "$DDIR2" "$DTAG" "$DRJ"
+DROOT=/oscar/data/stellex/glvov/retread/cert$DTAG-$DRJ-A
+[ -e "$DROOT" ] && { echo "FATAL: fixture root $DROOT exists on disk -- refusing to run"; exit 3; }
+
+cleanup_fixture() { rm -rf "$HDIR" "$NBASE" "$DDIR1" "$T/guard-dup2-$$" "$WORK"; }
 trap cleanup_fixture EXIT
 
 run_gate() {   # run_gate <logfile> <script> [VAR=VAL ...] -- <roots...>
@@ -86,7 +134,7 @@ grep -qi "set D to the harness directory" "$WORK/A.log" \
 
 # ---- ARM B: THE MUTATION -- the previous version of the same file ------------
 OLD=$WORK/cleanup_gated.OLD.sh
-if git -C "$REPO" show "HEAD:harness/phase_template/cleanup_gated.sh" > "$OLD" 2>/dev/null && [ -s "$OLD" ]; then
+if git -C "$REPO" show "$DERIV_OLD:harness/phase_template/cleanup_gated.sh" > "$OLD" 2>/dev/null && [ -s "$OLD" ]; then
   rcB=$(run_gate "$WORK/B.log" "$OLD" -- "$ROOT")
   if grep -q "### DERIVED" "$WORK/B.log"; then
     bad "B: the OLD file already derived -- this guard cannot fail and is worthless"
@@ -99,7 +147,7 @@ if git -C "$REPO" show "HEAD:harness/phase_template/cleanup_gated.sh" > "$OLD" 2
     bad "B: the OLD file did not reproduce the defect (rc=$rcB) -- read $WORK/B.log"
   fi
 else
-  bad "B: could not extract HEAD:harness/phase_template/cleanup_gated.sh -- MUTATION ARM DID NOT RUN"
+  bad "B: could not extract $DERIV_OLD:harness/phase_template/cleanup_gated.sh -- MUTATION ARM DID NOT RUN"
 fi
 
 # ---- ARM C: an explicit export WINS over the derivation ----------------------
@@ -123,8 +171,43 @@ rcE=$(run_gate "$WORK/E.log" "$GATE" -- "/oscar/data/stellex/glvov/retread/certN
 grep -q "D='<unset>'" "$WORK/E.log" \
   && ok "E: the refusal names D as the value it could not derive" || bad "E: the refusal does not name D"
 
+# ---- ARM F: SWEEP-3-1 -- the harness is nested two deep ----------------------
+rcF=$(run_gate "$WORK/F.log" "$GATE" -- "$NROOT")
+grep -q "### DERIVED D=$NDIR " "$WORK/F.log" \
+  && ok "F: D derived for a harness nested two deep ($NDIR)" || bad "F: D not derived for the nested harness"
+grep -q "### CLEANUP GATE tag=$NTAG relock_job=$NRJ" "$WORK/F.log" \
+  && ok "F: the gate ran its conditions on the nested harness (rc=$rcF)" || bad "F: the gate never reached its conditions"
+
+# ---- ARM FR: THE SWEEP-3-1 MUTATION -- the same fixture, the -maxdepth 3 file --
+OLD3=$WORK/cleanup_gated.DEPTH3.sh
+if git -C "$REPO" show "$SWEEP3_OLD:harness/phase_template/cleanup_gated.sh" > "$OLD3" 2>/dev/null && [ -s "$OLD3" ]; then
+  grep -q -- "-maxdepth 3 -type f -path" "$OLD3" \
+    && ok "FR: the pinned $SWEEP3_OLD file really does search at -maxdepth 3" \
+    || bad "FR: $SWEEP3_OLD does not carry the -maxdepth 3 search -- WRONG PIN, the mutation is not the defect"
+  rcFR=$(run_gate "$WORK/FR.log" "$OLD3" -- "$NROOT")
+  grep -q "### DERIVED D=" "$WORK/FR.log" \
+    && bad "FR: the -maxdepth 3 file derived D for a nested harness -- this arm cannot fail" \
+    || ok "FR: the -maxdepth 3 file never derives D for a nested harness (the guard can fail)"
+  [ "$rcFR" = 2 ] \
+    && ok "FR: it refuses with exit 2 -- the defect that stranded four lanes, reproduced" \
+    || bad "FR: exit $rcFR, want 2 -- read $WORK/FR.log"
+else
+  bad "FR: could not extract $SWEEP3_OLD:harness/phase_template/cleanup_gated.sh -- MUTATION ARM DID NOT RUN"
+fi
+
+# ---- ARM G: two harnesses hold the same evidence -> refuse, naming both ------
+rcG=$(run_gate "$WORK/G.log" "$GATE" -- "$DROOT")
+[ "$rcG" = 2 ] && ok "G: two candidate harness dirs refuse with exit 2" || bad "G: exit $rcG, want 2"
+grep -q "### AMBIGUOUS D: 2 directories" "$WORK/G.log" \
+  && ok "G: the refusal says the derivation was ambiguous" || bad "G: the refusal does not say it was ambiguous"
+grep -q "candidate: $DDIR1$" "$WORK/G.log" && grep -q "candidate: $DDIR2$" "$WORK/G.log" \
+  && ok "G: it names BOTH candidates and picks neither" || bad "G: it did not name both candidates"
+grep -q "### DERIVED D=" "$WORK/G.log" \
+  && bad "G: it guessed a D from an ambiguous set" || ok "G: no D was guessed"
+
 # ---- nothing was deleted ----------------------------------------------------
-[ -s "$HDIR/artifacts/$TAG-$RJ.rc" ] \
+[ -s "$HDIR/artifacts/$TAG-$RJ.rc" ] && [ -s "$NDIR/artifacts/$NTAG-$NRJ.rc" ] \
+  && [ -s "$DDIR1/artifacts/$DTAG-$DRJ.rc" ] && [ -s "$DDIR2/artifacts/$DTAG-$DRJ.rc" ] \
   && ok "no fixture evidence was removed by any arm" || bad "the guard deleted its own fixture"
 
 echo "### cleanup_gate_env_derivation_guard: pass=$pass fail=$fail"
