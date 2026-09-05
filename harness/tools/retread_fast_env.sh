@@ -675,7 +675,11 @@ retread_freeze_channel_mirror () {
       curl -fsSL "$c/$s/repodata.json" -o "$tmp" || {
         echo "retread_freeze_channel_mirror: FATAL fetch failed $c/$s/repodata.json" >&2; return 3; }
       fetched=$((fetched+1))
-      python3 "$merge" "$tmp" "$dst/$name/$s/repodata.json" "$pxcache" "$base/$s/" $mflags \
+      # The channel HOST is passed as well as its path: two of this workspace's
+      # channels have the SAME path (`/pytorch`) on different hosts, and the
+      # shard index keys on the path alone.
+      python3 "$merge" "$tmp" "$dst/$name/$s/repodata.json" "$pxcache" "$base/$s/" \
+        "$(printf '%s' "$c" | sed -e 's|^https\?://||' -e 's|/.*$||')" $mflags \
         2> "$dst/$name/$s/.merge.stderr" \
         || { echo "retread_freeze_channel_mirror: FATAL run_exports merge failed for $name/$s" >&2
              cat "$dst/$name/$s/.merge.stderr" >&2; return 3; }

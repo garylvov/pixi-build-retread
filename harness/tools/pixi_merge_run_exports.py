@@ -11,7 +11,7 @@ carry the field across at freeze time.
 
     merge_run_exports.py <src repodata.json> <dst repodata.json> \
                          <pixi repodata cache dir> <base_url prefix>
-                         [--allow-missing-index]
+                         [<channel host>] [--allow-missing-index]
 
 `--allow-missing-index` (p6af-2, 2026-09-04). The shard cache only holds an
 index for a (channel, subdir) pair some solve on this machine actually FETCHED.
@@ -25,19 +25,45 @@ Strict remains the DEFAULT so the existing guard's behaviour is unchanged.
 """
 import sys, os, glob, json
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from pixi_shard_cache import load_index, load_shard
+from pixi_shard_cache import load_index, load_shard, shard_hex
 
 
-def run_exports_map(cache_dir, base_url, allow_missing=False):
+def _host(url):
+    u = url.split("://", 1)[-1]
+    return u.split("/", 1)[0]
+
+
+def run_exports_map(cache_dir, base_url, channel_host="", allow_missing=False):
+    """The shard index for one (channel, subdir), or None when there is none.
+
+    THE HOST CHECK IS LOAD-BEARING, measured 2026-09-04. An index's `base_url`
+    is a PATH -- `/pytorch/linux-64` -- and this workspace declares TWO channels
+    with that path, `https://prefix.dev/pytorch` and
+    `https://conda.anaconda.org/pytorch`. Matching on the path alone hands
+    prefix.dev's run_exports to anaconda.org's mirror document, which is the same
+    silent wrong-channel read `retread_freeze_channel_mirror` already refuses in
+    its DIRECTORY naming. An index that publishes shards names them in
+    `shards_base_url` (`https://shards.prefix.dev/<channel>`), so the rule is:
+    the shards host must be the channel's host or `shards.<channel host>`.
+    anaconda.org publishes no shards at all, so its pairs correctly come back as
+    index=absent and are mirrored with no run_exports -- which is exactly what
+    the network would have given them.
+    """
     idx_path = None
     for p in glob.glob(os.path.join(cache_dir, "*.shards-cache-v1")):
         try:
             _, idx = load_index(p)
         except Exception:
             continue
-        if idx.get("info", {}).get("base_url", "").rstrip("/") == base_url.rstrip("/"):
-            idx_path = p
-            break
+        info = idx.get("info", {})
+        if info.get("base_url", "").rstrip("/") != base_url.rstrip("/"):
+            continue
+        if channel_host:
+            sh = _host(info.get("shards_base_url", "") or "")
+            if sh and sh != channel_host and sh != "shards." + channel_host:
+                continue
+        idx_path = p
+        break
     if idx_path is None:
         if allow_missing:
             sys.stderr.write("run_exports_map base_url=%s index=absent shards_present=0 "
@@ -48,7 +74,7 @@ def run_exports_map(cache_dir, base_url, allow_missing=False):
     shard_dir = os.path.join(cache_dir, "shards-v1")
     out, have, miss = {}, 0, 0
     for name, sha in idx["shards"].items():
-        h = sha.hex() if isinstance(sha, bytes) else sha
+        h = shard_hex(sha)
         shard = load_shard(shard_dir, h)
         if shard is None:
             miss += 1
@@ -67,7 +93,8 @@ def main():
     args = [a for a in sys.argv[1:] if a != "--allow-missing-index"]
     allow_missing = "--allow-missing-index" in sys.argv[1:]
     src, dst, cache_dir, base_url = args[:4]
-    rmap = run_exports_map(cache_dir, base_url, allow_missing)
+    channel_host = args[4] if len(args) > 4 else ""
+    rmap = run_exports_map(cache_dir, base_url, channel_host, allow_missing)
     if rmap is None:
         rmap = {}
     n = 0
