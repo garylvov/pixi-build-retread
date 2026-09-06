@@ -136,10 +136,41 @@ else
   echo "### FIXSET appended $KEY and committed it as $HC"
 fi
 
-# The task copy is the COMMIT's bytes, not a parallel write that happens to
-# match. This is the whole fix.
-if ! git -C "$REPO" cat-file blob "$HC:$RREL" > "$TPATH"; then
-  echo "### FIXSET FATAL: could not re-extract $HC:$RREL into $TPATH"; exit 3
+# LAND-SYNC-1. The task copy is installed BY THE ONE WRITER, not by this script.
+#
+# This block used to be a bare `git cat-file blob "$HC:$RREL" > "$TPATH"`, which
+# is precisely the shape HARNESS-SYNC-1 abolished one layer up: it writes ONE
+# task file from a commit, records nothing, and knows nothing about the queue.
+# The consequences were both real and both observed on 2026-09-06. (a) A landing
+# left `tools/.harness_synced_commit` naming the PREVIOUS commit while
+# `tools/binsnap_fixset.txt` carried the new one, so `harness_sync.sh --check`
+# reported the fix set as EDITED -- a landing making the drift reader accuse the
+# next lane of a hand edit nobody made. (b) The rest of the mapped set stayed at
+# whatever commit it was already at, so a job pinned to the printed
+# `HARNESS_COMMIT` could still die at its drift gate on a file this landing
+# never touched.
+#
+# Calling the writer fixes both by construction: it installs THE WHOLE MAPPED
+# SET at `$HC`, md5-verifies every file against the blob, rename-installs so a
+# live job keeps its inode, records `.harness_synced_commit`, and prints the
+# drift line from the new state.
+#
+# AND IT CAN REFUSE, WHICH IS THE POINT, NOT A REGRESSION. `harness_sync.sh`
+# exits 4 when a PENDING job of ours is pinned to a different commit -- a
+# landing that would strand a queued job now says so, by name, at the moment it
+# happens, instead of that job dying three hours later on "drift". land.sh
+# treats a non-zero here as its exit-11 refusal WITH NOTHING MOVED except the
+# harness commit, which is idempotent: re-running the landing after the queue
+# drains finds the row already present and takes the `already carries` arm.
+SYNC=$TASK/tools/harness_sync.sh
+[ -f "$SYNC" ] || SYNC=$REPO/harness/tools/harness_sync.sh
+[ -f "$SYNC" ] || { echo "### FIXSET FATAL: no harness_sync.sh at $TASK/tools or $REPO/harness/tools"; exit 3; }
+if ! HARNESS_TASK_DIR="$TASK" HARNESS_REPO="$REPO" bash "$SYNC" "$HC"; then
+  src=$?
+  echo "### FIXSET FATAL: harness_sync.sh $HC exited $src -- the task copies were NOT advanced to this landing's commit."
+  echo "###   rc 4 means a PENDING job of ours is pinned to a different commit and this sync would strand it;"
+  echo "###   let it start or drain, then re-run the landing (the fix-set row is idempotent)."
+  exit 3
 fi
 if ! cmp "$RPATH" "$TPATH"; then
   echo "### FIXSET FATAL: the two copies differ AFTER the sync -- read them both by hand"; exit 3

@@ -94,8 +94,22 @@ mkfixture () {   # mkfixture <name> ; echoes "<repo> <taskdir>"
   # MERGE-L-1: the fixture carries a MANIFEST.md5 with a row for the fix set,
   # because that row is the thing every landing used to leave stale.
   { md5sum "$r/$RREL" | awk '{print $1 "  tools/binsnap_fixset.txt"}'; } > "$r/harness/MANIFEST.md5"
-  git -C "$r" add -- "$RREL" harness/MANIFEST.md5
-  git -C "$r" commit -q -m base -- "$RREL" harness/MANIFEST.md5
+  # LAND-SYNC-1: the fixture carries the WRITER and its mapping library in both
+  # homes, because the landing now installs the task copy THROUGH harness_sync.sh
+  # instead of writing it itself. Without them the helper cannot run at all, and
+  # a fixture that cannot exercise the call site would guard nothing. The empty
+  # allowlist is seeded BEFORE the landing on purpose: created afterwards it is
+  # itself an unsynced write and `--check` correctly calls it edited.
+  cp -f "$REPO/harness/tools/harness_sync.sh" "$REPO/harness/tools/harness_drift_check.sh" "$r/harness/tools/"
+  : > "$r/harness/tools/harness_drift_allowlist.txt"
+  local f
+  for f in binsnap_fixset.txt harness_sync.sh harness_drift_check.sh harness_drift_allowlist.txt; do
+    cp -f "$r/harness/tools/$f" "$t/tools/$f"
+  done
+  git -C "$r" add -- "$RREL" harness/MANIFEST.md5 harness/tools/harness_sync.sh \
+      harness/tools/harness_drift_check.sh harness/tools/harness_drift_allowlist.txt
+  git -C "$r" commit -q -m base -- "$RREL" harness/MANIFEST.md5 harness/tools/harness_sync.sh \
+      harness/tools/harness_drift_check.sh harness/tools/harness_drift_allowlist.txt
   echo "$r $t"
 }
 
@@ -223,6 +237,61 @@ if git -C "$REPO" cat-file blob "$HELPER_OLD:harness/tools/fixset_land_row.sh" >
   fi
 else
   bad "F2: could not extract $HELPER_OLD:harness/tools/fixset_land_row.sh -- MUTATION ARM DID NOT RUN"
+fi
+# ---- ARM H: LAND-SYNC-1 -- a landing leaves the task dir SYNCED, not EDITED --
+# THE DEFECT, observed live on 2026-09-06 immediately after B28 landed. This
+# helper installed the task copy with a bare
+#     git cat-file blob "$HC:harness/tools/binsnap_fixset.txt" > "$TPATH"
+# which is the exact shape HARNESS-SYNC-1 abolished one level up: it writes ONE
+# file, records nothing in `tools/.harness_synced_commit`, and knows nothing
+# about the queue. So `harness_sync.sh --check` -- the FIRST line of both phase
+# templates' drift block -- reported `tools/binsnap_fixset.txt` as EDITED after
+# every landing, i.e. the landing itself made the drift reader accuse the next
+# lane of a hand edit nobody made.
+#
+# H1 is the fix: after a fixture landing, `--check` reads CLEAN and the recorded
+# commit IS the landing's commit. H2 is the MUTATION and it is what makes H1
+# mean anything -- the PINNED pre-fix helper, replayed on an identical fixture,
+# must leave `--check` REFUSING. A guard that cannot fail is a defect.
+read -r RH TH < <(mkfixture H)
+bash "$HELPER" "$RH" "$TH" "$ROW1" > "$WORK/H.log" 2>&1; rcH=$?
+HC_H=$(git -C "$RH" rev-parse HEAD)
+[ "$rcH" = 0 ] && ok "H1: the landing succeeded through the writer (rc=0)" \
+  || { bad "H1: rc=$rcH"; sed 's/^/      /' "$WORK/H.log"; }
+grep -q '### SYNC SUMMARY' "$WORK/H.log" \
+  && ok "H1: the landing ran harness_sync.sh (its SUMMARY row is in the log)" \
+  || bad "H1: no SYNC SUMMARY row -- the landing did not go through the ONE writer"
+[ -f "$TH/tools/.harness_synced_commit" ] && [ "$(cat "$TH/tools/.harness_synced_commit")" = "$HC_H" ] \
+  && ok "H1: .harness_synced_commit records the landing's own commit $HC_H" \
+  || bad "H1: the recorded sync commit is '$(cat "$TH/tools/.harness_synced_commit" 2>/dev/null)', want $HC_H"
+HARNESS_TASK_DIR="$TH" HARNESS_REPO="$RH" bash "$TH/tools/harness_sync.sh" --check > "$WORK/H.check" 2>&1
+rcHC=$?
+grep -q '### SYNC CHECK CLEAN' "$WORK/H.check" && [ "$rcHC" = 0 ] \
+  && ok "H1: harness_sync.sh --check reads CLEAN after the landing" \
+  || { bad "H1: --check is not clean after the landing (rc=$rcHC)"; sed 's/^/      /' "$WORK/H.check"; }
+# COMMENT-STRIPPED, for the same reason arm B strips prose from land.sh: the fix
+# is DOCUMENTED in the helper by quoting the very line it removed, and a grep
+# over the whole file would match that explanation and fail forever.
+grep -vE "^[[:space:]]*#" "$HELPER" | grep -qE 'cat-file blob "\$HC:\$RREL"' \
+  && bad "H1: the helper still re-extracts the task copy itself" \
+  || ok "H1: the helper no longer writes the task copy with a bare cat-file"
+
+if [ -s "$WORK/helper_old.sh" ]; then
+  read -r RI TI < <(mkfixture I)
+  bash "$WORK/helper_old.sh" "$RI" "$TI" "$ROW1" > "$WORK/I.log" 2>&1
+  # The pre-fix helper never wrote the marker, so seed it with the fixture's
+  # BASE commit -- which is the live shape: the task dir was last synced at some
+  # earlier commit and the landing moved one file out from under it.
+  git -C "$RI" rev-parse 'HEAD^' > "$TI/tools/.harness_synced_commit" 2>/dev/null \
+    || git -C "$RI" rev-parse HEAD > "$TI/tools/.harness_synced_commit"
+  HARNESS_TASK_DIR="$TI" HARNESS_REPO="$RI" bash "$TI/tools/harness_sync.sh" --check > "$WORK/I.check" 2>&1
+  if grep -q '### SYNC CHECK CLEAN' "$WORK/I.check"; then
+    bad "H2: the PINNED pre-fix helper ALSO left --check clean -- H1 cannot fail and is worthless"
+  else
+    ok "H2: the pinned pre-fix helper leaves --check REFUSING, so H1 is a real assertion"
+  fi
+else
+  bad "H2: no pinned pre-fix helper blob ($HELPER_OLD) -- MUTATION ARM DID NOT RUN"
 fi
 echo "### land_fixset_sync_guard: pass=$pass fail=$fail"
 [ "$fail" -eq 0 ] || exit 1
