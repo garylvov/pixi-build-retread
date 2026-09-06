@@ -346,6 +346,22 @@ export RETREAD_UV=$SMOKE_UVBIN/uv
 UVVER=$("$RETREAD_UV" --version 2>&1 | awk '{print $2}')
 echo "### SMOKE uv: $RETREAD_UV -> $UVVER (retread's uv_closure::REQUIRED_UV wants $SMOKE_REQUIRED_UV)"
 [ "$UVVER" = "$SMOKE_REQUIRED_UV" ] || smoke_setup_failed "uv is $UVVER, retread's preflight wants $SMOKE_REQUIRED_UV -- every backend call would fail 'preflight: uv version mismatch' and the smoke would blame the binary"
+# FAST-TMP GETS A JOB-SCOPED ROOT ON DISK, WHICH IS WHAT EVERY DRIVER GIVES IT.
+# MEASURED on `psmoke-guards` 5993931 arm A, with the uv fixed and fast-tmp left
+# at its default: `fast-tmp backend engage: retread fast-tmp budget too small:
+# estimated need 85899345920 bytes > budget 77309411328 bytes from SLURM memory
+# environment` -- 80 GiB wanted against a 72 GiB budget derived from --mem=96G,
+# because an unrooted fast-tmp is charged to RAM.  Every driver exports a DISK
+# root (det1_proof2.sh: `RETREAD_FAST_TMP_ROOT=$G/fast-tmp` under its own cache
+# root) and none of them meets this budget.  Raising --mem would be treating the
+# symptom; the smoke's environment must be the driver's.
+export RETREAD_SCRATCH_ROOT=$CACHE/g/scratch
+export RETREAD_FAST_TMP_ROOT=$CACHE/g/fast-tmp
+export XDG_STATE_HOME=$CACHE/g/xdg-state
+export XDG_CONFIG_HOME=$CACHE/g/xdg-config
+mkdir -p "$RETREAD_SCRATCH_ROOT" "$RETREAD_FAST_TMP_ROOT" "$XDG_STATE_HOME" "$XDG_CONFIG_HOME" \
+  || smoke_setup_failed "cannot create the job-scoped scratch/fast-tmp roots under $CACHE/g"
+echo "### SMOKE fast-tmp root (DISK, job-scoped): $RETREAD_FAST_TMP_ROOT"
 export CONDA_OVERRIDE_CUDA=12
 export CONDA_OVERRIDE_GLIBC=2.35
 export OMNI_KIT_ACCEPT_EULA=YES

@@ -207,17 +207,30 @@ tail -6 "$FOUT"
 { [ "$frc" = 3 ] && grep -q '^### SMOKE SETUP_FAILED ' "$FOUT" && grep -q 'retread.s preflight wants 99.99.99' "$FOUT"; }
 chk F1 $? "an unsatisfiable REQUIRED_UV is SETUP_FAILED rc=3, naming both versions -- not a verdict about the binary" "rc=$frc $(grep -m1 '^### SMOKE [A-Z_]* binary=' "$FOUT" || echo '<no verdict row>')"
 
+# ---- the scratch goes FIRST, and the verdict is the LAST thing on the page --
+# ORDER MATTERS HERE AND IT IS NOT STYLE.  In `psmoke-guards` 5993691 the
+# removal ran for FIVE MINUTES (a `cp -al` workspace of 44k entries over NFS)
+# and the three rows after it -- including `### PSG FINAL` -- never reached the
+# log, while the wrapper printed `### LANE_EXIT=0` over a `fail=4` summary: the
+# HARNESS-EXIT-1 picture exactly.  So the long operation happens BEFORE the
+# summary, and the verdict rows are the last thing written.
+#
+# AND NO `chmod -R` ON THE SCRATCH.  `$SCR/w` is a `cp -al` clone of the shared
+# stage mirror, so a recursive chmod there changes the mode of the MIRROR'S OWN
+# INODES -- p6x rule (2), "a hardlink clone is not isolation", read from the
+# permissions side.  Nothing in this guard's scratch is sealed; `rm -rf` alone
+# is correct, and its stderr is counted rather than thrown away (ORDER-1-1).
+rmerr=$( rm -rf "$SCR" 2>&1 | wc -l )
+[ "$rmerr" -eq 0 ] || fail=$((fail+1))
+
 # ---- out --------------------------------------------------------------------
 echo ""
-echo "### PSG SUMMARY pass=$pass fail=$fail (predicted pass=13 fail=0)"
+echo "### PSG scratch removed errors=$rmerr root=$SCR"
 echo "### PSG per-arm verdicts:"
-for f in "$AOUT" "$BOUT" "$COUT"; do
+for f in "$AOUT" "$BOUT" "$COUT" "$FOUT"; do
   printf '###   %-28s %s\n' "$(basename "$f")" "$(grep -m1 '^### SMOKE [A-Z_]* binary=' "$f" 2>/dev/null || echo '<none>')"
 done
-# the scratch is this guard's own and nothing else writes it; it is removed
-# SYNCHRONOUSLY with the rc counted, never `( rm -rf ) &` (ORDER-1-1).
-rmerr=$( { chmod -R u+w "$SCR" >/dev/null 2>&1; rm -rf "$SCR"; } 2>&1 | wc -l )
-echo "### PSG scratch removed errors=$rmerr root=$SCR"
-[ "$rmerr" -eq 0 ] || fail=$((fail+1))
+echo "### PSG SUMMARY pass=$pass fail=$fail (predicted pass=13 fail=0)"
 echo "### PSG FINAL pass=$pass fail=$fail"
-[ "$fail" -eq 0 ]
+if [ "$fail" -eq 0 ]; then exit 0; fi
+exit 1
