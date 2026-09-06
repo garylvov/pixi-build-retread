@@ -11,9 +11,9 @@
 #   Everything this guard creates lives under a SHORT scratch root it owns and
 #   is removed on the way out.
 #
-#   PREDICTED: pass=13 fail=0  (state this in the sbatch before submitting)
+#   PREDICTED: pass=14 fail=0  (state this in the sbatch before submitting)
 #
-# ── THE THIRTEEN CHECKS ────────────────────────────────────────────────────────
+# ── THE FOURTEEN CHECKS ────────────────────────────────────────────────────────
 #   A1  the known-good binsnap reaches the frontend            REACHED_FRONTEND
 #   A2  ... and proof_smoke.sh exits 0
 #   B1  a stub that prints a panic and exits 1                 BACKEND_DIED
@@ -21,6 +21,10 @@
 #   B3  ... and the stub's own panic line is QUOTED in the output
 #   C1  a stub that sleeps forever                             TIMEOUT
 #   C2  ... and proof_smoke.sh exits 2
+#   C3  ... and the TIMEOUT is caused by the BACKEND half: that stub DOES score a
+#       frontend row (the source-free `cpu` environment), so frontend_rows>=1
+#       and backend_work_rows=0 is what holds the verdict -- the non-vacuity
+#       control for requiring both halves.
 #   D1  the length rule REFUSES a root long enough to compose > 256
 #   D2  ... and PASSES the short root (the non-vacuity control: without D2,
 #       "it refused" and "it always refuses" are the same picture)
@@ -63,7 +67,7 @@ chk () {  # chk <name> <condition-rc> <what was wanted> <what was seen>
 echo "### PSG proof_smoke_guard.sh  $(date -Is)  host=$(hostname -s) job=$J"
 echo "### PSG scratch=$SCR  job_root=$JOB_ROOT"
 echo "### PSG good binsnap=$GOOD"
-echo "### PSG PREDICTED pass=13 fail=0"
+echo "### PSG PREDICTED pass=14 fail=0"
 
 # ---- the stubs --------------------------------------------------------------
 # They live at a path ENDING `/pixi-build-retread` because the shim readback
@@ -119,6 +123,14 @@ crc=$?
 tail -25 "$COUT"
 grep -q '^### SMOKE TIMEOUT ' "$COUT"; chk C1 $? "arm C prints '### SMOKE TIMEOUT'" "$(grep -m1 '^### SMOKE [A-Z_]* binary=' "$COUT" || echo '<no verdict row>')"
 [ "$crc" = 2 ]; chk C2 $? "arm C rc=2" "rc=$crc"
+# C3 IS WHY C IS A REAL CONTROL AND NOT AN ACCIDENT.  This stub DOES score a
+# frontend row -- 5994177 measured it at four seconds, `resolve_pypi{group=cpu
+# platform=linux-64-base}`, an environment with no source at all -- and it is
+# the MISSING BACKEND HALF that holds the verdict at TIMEOUT.  Without this
+# check, "C timed out" and "C never got anywhere" are the same picture.
+CROW=$(grep -m1 'lock ended verdict=' "$COUT")
+{ echo "$CROW" | grep -qE 'frontend_rows=[1-9]' && echo "$CROW" | grep -q 'backend_work_rows=0'; }
+chk C3 $? "arm C's TIMEOUT is caused by the BACKEND half: frontend_rows>=1 AND backend_work_rows=0" "${CROW:-<no lock-ended row>}"
 
 # ---- D: the length rule, RED and GREEN -------------------------------------
 echo ""; echo "########## PSG ARM D -- the composed-prefix rule ##########"
@@ -230,7 +242,7 @@ echo "### PSG per-arm verdicts:"
 for f in "$AOUT" "$BOUT" "$COUT" "$FOUT"; do
   printf '###   %-28s %s\n' "$(basename "$f")" "$(grep -m1 '^### SMOKE [A-Z_]* binary=' "$f" 2>/dev/null || echo '<none>')"
 done
-echo "### PSG SUMMARY pass=$pass fail=$fail (predicted pass=13 fail=0)"
+echo "### PSG SUMMARY pass=$pass fail=$fail (predicted pass=14 fail=0)"
 echo "### PSG FINAL pass=$pass fail=$fail"
 if [ "$fail" -eq 0 ]; then exit 0; fi
 exit 1
