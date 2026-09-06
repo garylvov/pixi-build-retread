@@ -78,11 +78,12 @@ async fn async_main() -> anyhow::Result<()> {
         return run_migrate_overrides(&argv[2..]);
     }
 
-    // `retread store-reap [--store built-wheels|git-snapshots|shadow|all]
-    //                     [--root <dir>]... [--dry-run|--apply]
-    //                     [--max-age-days <n>] [--bytes]`
+    // `retread store-reap
+    //      [--store built-wheels|git-snapshots|shadow|build-requirements|all]
+    //      [--root <dir>]... [--dry-run|--apply]
+    //      [--max-age-days <n>] [--bytes]`
     //
-    // STORE-REAP-2, and it exists because of law 2. The three persistent-store
+    // STORE-REAP-2, and it exists because of law 2. The persistent-store
     // reapers had no production caller that could ever reach a persistent
     // store: the only call site is the backend's `initialize`, and every
     // relock this harness runs job-scopes `XDG_CACHE_HOME`, so the root that

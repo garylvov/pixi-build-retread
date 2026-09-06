@@ -1,5 +1,7 @@
-//! STORE-REAP-2: `retread store-reap` — THE PRODUCTION CALL SITE OF THE THREE
-//! PERSISTENT-STORE REAPERS.
+//! STORE-REAP-2: `retread store-reap` — THE PRODUCTION CALL SITE OF THE
+//! PERSISTENT-STORE REAPERS. L3-1b-3B took the list from three to FOUR by
+//! persisting the build-requirements store, whose shape is
+//! `<root>/build-requirements/<version>/<identity>/requirements.txt`.
 //!
 //! # Why this verb exists (STORE-REAP-1-1, law 2)
 //!
@@ -43,6 +45,8 @@ pub enum Store {
     BuiltWheels,
     GitSnapshots,
     Shadow,
+    /// L3-1b-3B.
+    BuildRequirements,
 }
 
 impl Store {
@@ -52,12 +56,22 @@ impl Store {
             Store::BuiltWheels => "built-wheels",
             Store::GitSnapshots => "git-snapshots",
             Store::Shadow => "shadow",
+            Store::BuildRequirements => "build-requirements",
         }
     }
 
     /// ALL of them, in the order the rows print. `--store all` is exactly this
     /// slice, never a re-listing of the names somewhere else.
-    pub const ALL: [Store; 3] = [Store::BuiltWheels, Store::GitSnapshots, Store::Shadow];
+    ///
+    /// L3-1b-3B appended one and did not reorder the first three: the merge
+    /// gate's readers grep summary rows by position in some places, and a
+    /// reordering would move rows that this landing has no reason to move.
+    pub const ALL: [Store; 4] = [
+        Store::BuiltWheels,
+        Store::GitSnapshots,
+        Store::Shadow,
+        Store::BuildRequirements,
+    ];
 
     fn parse(value: &str) -> Option<Vec<Store>> {
         if value == "all" {
@@ -77,6 +91,9 @@ impl Store {
             Store::BuiltWheels => crate::source_build::BUILT_WHEEL_STORE_DEFAULT_MAX_AGE_DAYS,
             Store::GitSnapshots => crate::source_build::GIT_SNAPSHOT_STORE_DEFAULT_MAX_AGE_DAYS,
             Store::Shadow => crate::courier::SHADOW_CACHE_STORE_DEFAULT_MAX_AGE_DAYS,
+            Store::BuildRequirements => {
+                crate::source_build::BUILD_REQUIREMENTS_STORE_DEFAULT_MAX_AGE_DAYS
+            }
         }
     }
 }
@@ -137,7 +154,8 @@ pub fn parse_args(args: &[String]) -> anyhow::Result<Args> {
                 stores = Some(Store::parse(value).ok_or_else(|| {
                     anyhow::anyhow!(
                         "store-reap: --store {value}: expected one of \
-                         built-wheels, git-snapshots, shadow, all"
+                         built-wheels, git-snapshots, shadow, \
+                         build-requirements, all"
                     )
                 })?);
             }
@@ -184,9 +202,9 @@ pub struct StoreOutcome {
     /// STORE-REAP-3. How many on-disk LAYOUTS of this store the walk
     /// enumerated. Only the shadow store has ever had more than one (L3-1 moved
     /// the target identity out of the path and left the old directories where
-    /// they were), so the other two stores report 0 here — the same way the
+    /// they were), so the other three stores report 0 here — the same way the
     /// shadow store reports 0 for `versions_walked`, because it has no
-    /// generation segment. ONE row format for all three stores; a field that
+    /// generation segment. ONE row format for all four stores; a field that
     /// does not apply reads 0 rather than being absent, so a parser never has
     /// to know which store it is looking at.
     pub layouts_walked: u64,
@@ -317,6 +335,22 @@ fn reap_one(
             outcome.skipped_concurrent = report.skipped_concurrent;
             report.entries
         }
+        // L3-1b-3B. Takes the STORE ROOT and appends its own directory
+        // segment inside the reaper, like the built-wheel and git-snapshot
+        // arms and unlike the shadow arm, whose entries are files in one flat
+        // directory the caller has to name. It has ONE layout and reports
+        // `layouts_walked` 0, the way the built-wheel and git-snapshot arms do.
+        Store::BuildRequirements => {
+            let report = crate::source_build::reap_build_requirements_store(root, max_age, mode)?;
+            outcome.scanned = report.scanned;
+            outcome.selected = report.evicted;
+            outcome.stale_version = report.evicted_stale_version;
+            outcome.kept = report.kept;
+            outcome.skipped_locked = report.skipped_locked;
+            outcome.versions_walked = report.versions_walked;
+            outcome.skipped_concurrent = report.skipped_concurrent;
+            report.entries
+        }
     };
     for entry in &entries {
         let entry_bytes = if bytes {
@@ -436,6 +470,24 @@ mod tests {
         let marker = entry.join("source.json");
         std::fs::write(&marker, b"{}").expect("marker");
         set_mtime(&marker, age(ago));
+        entry
+    }
+
+    /// L3-1b-3B. One marker-store entry under
+    /// `<root>/<dir>/<version>/<identity>`, aged by its own marker file.
+    fn marker_store_entry(
+        root: &Path,
+        dir: &str,
+        version: &str,
+        identity: &str,
+        marker: &str,
+        ago: u64,
+    ) -> PathBuf {
+        let entry = root.join(dir).join(version).join(identity);
+        std::fs::create_dir_all(&entry).expect("entry");
+        let marker_path = entry.join(marker);
+        std::fs::write(&marker_path, vec![b'm'; 48]).expect("marker");
+        set_mtime(&marker_path, age(ago));
         entry
     }
 
@@ -691,14 +743,37 @@ mod tests {
     }
 
     /// GUARD 6. THE PARSE. Dry run is the default with no flag at all, `all`
-    /// is exactly the three stores, an unknown store is a refusal and not a
-    /// silent skip, and `--root` accumulates.
+    /// is exactly EVERY store and not a subset frozen when the list was
+    /// shorter, every spelling round-trips through `--store`, an unknown store
+    /// is a refusal and not a silent skip, and `--root` accumulates.
     #[test]
-    fn the_parse_defaults_to_a_dry_run_of_all_three_stores_and_refuses_a_bad_name() {
+    fn the_parse_defaults_to_a_dry_run_of_every_store_and_refuses_a_bad_name() {
         let empty = parse_args(&[]).expect("no args");
         assert_eq!(empty.mode, ReapMode::DryRun, "THE DEFAULT IS THE SAFE ONE");
         assert_eq!(empty.stores, Store::ALL.to_vec());
         assert!(empty.roots.is_empty() && !empty.bytes && empty.max_age_days.is_none());
+
+        // L3-1b-3B. `all` is FOUR, and each of the four is reachable by name.
+        // A hard 4 here rather than `Store::ALL.len()` on both sides, which
+        // would be an identity and would pass on a list that lost a store.
+        assert_eq!(Store::ALL.len(), 4, "all four stores are in the fan-out");
+        assert_eq!(
+            parse_args(&["--store".into(), "all".into()])
+                .expect("all")
+                .stores
+                .len(),
+            4,
+        );
+        for store in Store::ALL {
+            assert_eq!(
+                parse_args(&["--store".into(), store.as_str().to_string()])
+                    .expect("by name")
+                    .stores,
+                vec![store],
+                "--store {} must select exactly that store",
+                store.as_str(),
+            );
+        }
 
         let args: Vec<String> = [
             "--store",
@@ -913,5 +988,70 @@ mod tests {
              same-key pair does not collide",
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// L3-1b-3B GUARD 8. THE NEW STORE REACHES THE VERB, AND IT REACHES IT
+    /// THROUGH `--store all` RATHER THAN ONLY BY NAME — which is the half that
+    /// matters, because `tools/store_reap_census.sh` only ever calls `all`, so
+    /// a store the fan-out missed would be invisible to the census that is its
+    /// only production reader.
+    ///
+    /// RED on the tip in the strongest possible way: `Store` had no such
+    /// variant, so this does not compile there.
+    ///
+    /// The stale-generation arm is not decoration. The store puts the
+    /// generation in the PATH, so a `v1` -> `v2` bump is exactly the event that
+    /// orphaned 1 187 202 225 B of built wheels before STORE-REAP-1; this
+    /// asserts the walk descends into BOTH generations (`versions_walked = 2`)
+    /// and labels the retired one `stale-version`.
+    #[test]
+    fn the_marker_store_is_reached_by_store_all_and_walks_every_generation() {
+        let root = scratch("marker");
+        marker_store_entry(&root, "build-requirements", "v1", "cur", "requirements.txt", 30);
+        marker_store_entry(&root, "build-requirements", "v0", "old", "requirements.txt", 30);
+        marker_store_entry(&root, "build-requirements", "v1", "fresh", "requirements.txt", 1);
+        // A directory with NO marker is not an entry. Discovery is by marker,
+        // never by counting levels, so this must be neither scanned nor moved.
+        std::fs::create_dir_all(root.join("build-requirements/v1/half-published"))
+            .expect("half-published");
+        let before = tree(&root);
+
+        let br = dry_run(&root, Store::BuildRequirements);
+        assert_eq!(
+            (br.scanned, br.selected, br.stale_version, br.versions_walked),
+            (3, 2, 1, 2),
+            "three MARKED entries scanned, the two over-age ones selected, the \
+             `v0` one labelled stale-version, and BOTH generations walked"
+        );
+        assert_eq!(
+            tree(&root),
+            before,
+            "a dry run creates nothing and moves nothing"
+        );
+
+        // Non-vacuity: the apply arm on the SAME fixture DOES move them, so the
+        // dry run's "unchanged" above is not the trivial truth of a walk that
+        // selected nothing.
+        let applied = reap_one(&root, Store::BuildRequirements, 14, ReapMode::Apply, true)
+            .expect("apply");
+        assert_eq!(applied.selected, 2);
+        assert!(applied.bytes > 0, "--bytes must charge the moved entries");
+        assert!(
+            root.join("build-requirements/quarantine").is_dir(),
+            "an eviction RENAMES into quarantine; it never deletes"
+        );
+        assert!(
+            !root.join("build-requirements/v1/cur").exists()
+                && !root.join("build-requirements/v0/old").exists(),
+            "both over-age entries left their addresses"
+        );
+        assert!(
+            root.join("build-requirements/v1/fresh/requirements.txt").is_file(),
+            "the fresh entry is untouched"
+        );
+        assert!(
+            root.join("build-requirements/v1/half-published").is_dir(),
+            "a directory with no marker is not an entry and must not be moved"
+        );
     }
 }

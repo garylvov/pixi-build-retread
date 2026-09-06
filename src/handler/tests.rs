@@ -741,6 +741,10 @@ fn pythons_for_rejects_bare_major_variant() {
         shadow_cache_store_max_age_days: None,
         built_wheels_store: None,
         built_wheels_store_max_age_days: None,
+        // L3-1b-3B: the two marker stores. `None` on both pairs means "take the
+        // persistent default", which is what every one of these fixtures wants.
+        build_requirements_store: None,
+        build_requirements_store_max_age_days: None,
         path_source_metadata: None,
         path_source_records: None,
         parallel_probes: None,
@@ -806,6 +810,10 @@ fn pythons_for_accepts_dotted_variant() {
         shadow_cache_store_max_age_days: None,
         built_wheels_store: None,
         built_wheels_store_max_age_days: None,
+        // L3-1b-3B: the two marker stores. `None` on both pairs means "take the
+        // persistent default", which is what every one of these fixtures wants.
+        build_requirements_store: None,
+        build_requirements_store_max_age_days: None,
         path_source_metadata: None,
         path_source_records: None,
         parallel_probes: None,
@@ -871,6 +879,10 @@ fn pythons_for_filters_bare_major_keeps_dotted() {
         shadow_cache_store_max_age_days: None,
         built_wheels_store: None,
         built_wheels_store_max_age_days: None,
+        // L3-1b-3B: the two marker stores. `None` on both pairs means "take the
+        // persistent default", which is what every one of these fixtures wants.
+        build_requirements_store: None,
+        build_requirements_store_max_age_days: None,
         path_source_metadata: None,
         path_source_records: None,
         parallel_probes: None,
@@ -3655,6 +3667,10 @@ fn cfg() -> RetreadConfig {
         shadow_cache_store_max_age_days: None,
         built_wheels_store: None,
         built_wheels_store_max_age_days: None,
+        // L3-1b-3B: the two marker stores. `None` on both pairs means "take the
+        // persistent default", which is what every one of these fixtures wants.
+        build_requirements_store: None,
+        build_requirements_store_max_age_days: None,
         path_source_metadata: None,
         path_source_records: None,
         parallel_probes: None,

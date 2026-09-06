@@ -5291,6 +5291,28 @@ impl Handler {
             pre_key_config.built_wheels_store_max_age_days,
         );
         crate::source_build::reap_built_wheel_store_once();
+        // L3-1b-3B: the MARKER-FILE build-requirements store, the fourth cache
+        // C18 classified as scratch by collateral. Same flip, same shape:
+        // `<root>/build-requirements/<version>/<identity>/requirements.txt`.
+        //
+        // C32 5887194 priced `resolve_build_requirements` at 56 rows /
+        // 24.787 s truly cold against 55 rows / 1.531 s warm — the rows persist
+        // (the term is emitted on hit and miss alike) and the SECONDS collapse.
+        // Proof 5971315 measured the flip itself across two processes: rows
+        // 54 -> 54, sum 46.869 s -> 2.804 s, `.used` stamps 11 -> 59.
+        //
+        // L3-1b-3B's first cut flipped a strict-wheel-attestation store beside
+        // this one. It is NOT here: 5971315 showed it takes zero production
+        // writes, because `validate_pinned_wheel_for_target_async` returns
+        // through C10's content-record hit before its own attestation write, so
+        // C10 already answers every strict admission (L3-1b-3B-2).
+        crate::source_build::set_build_requirements_store(
+            pre_key_config.build_requirements_store.as_deref(),
+        );
+        crate::source_build::set_build_requirements_store_max_age_days(
+            pre_key_config.build_requirements_store_max_age_days,
+        );
+        crate::source_build::reap_build_requirements_store_once();
         // The SHARED built-output store, if the pack opted into one. Keyed on
         // content alone, so a workspace staged at a new path can adopt this
         // result instead of recomputing it. Unset = the store does not exist.

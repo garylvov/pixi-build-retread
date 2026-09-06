@@ -1188,6 +1188,473 @@ pub(crate) fn reap_built_wheel_store_once() {
     });
 }
 
+
+// ── L3-1b-3B: the MARKER-FILE build-requirements store is PERSISTENT, and a
+//    reaper walks it ───────────────────────────────────────────────────────
+
+/// THE SHAPE OF THIS STORE, named in constants rather than injected.
+///
+/// It is `<root>/build-requirements/<version>/<identity>/requirements.txt`: a
+/// fixed depth of TWO below the store directory, one generation segment, one
+/// marker FILE per entry. L3-1b-3B's first cut carried a `MarkerStoreSpec` of
+/// five `&'static str` fields and one generic walk so a SECOND store — the
+/// strict wheel attestations — could share it. That second store is gone
+/// (L3-1b-3B-READ proved it takes zero production writes: every pinned
+/// admission returns through C10's content record before the attestation is
+/// written, so C10 already answers what it was for), and a parameterisation
+/// with one instantiation is a callback with nothing on the other end. The
+/// five constants are therefore named here and read directly by the walk.
+/// [`reap_built_wheel_store`] and [`reap_canonical_git_snapshot_store`] stay
+/// separate for the reason that doc comment gives — they differ in SHAPE — and
+/// they are untouched.
+const BUILD_REQUIREMENTS_STORE_DIR: &str = "build-requirements";
+
+/// The `<prefix> reap` / `<prefix> evicted` row stem, so an operator greps one
+/// word for this store.
+const BUILD_REQUIREMENTS_STORE_ROW: &str = "build_requirements_store";
+
+/// The store-wide reap try-lock, a dotfile beside the generations so
+/// [`read_dir_names`] can never mistake it for one.
+const BUILD_REQUIREMENTS_STORE_REAP_LOCK: &str = ".build-requirements.reap.lock";
+
+/// The generation segment of the build-requirements store. It has never been
+/// bumped; STORE-REAP-1's walk means a bump would not orphan the old one.
+const BUILD_REQUIREMENTS_CACHE_VERSION: &str = "v1";
+
+/// The file [`resolve_build_requirements`] publishes and reads back — the
+/// compiled lock itself, which is why it is also the marker.
+const BUILD_REQUIREMENTS_MARKER: &str = "requirements.txt";
+
+/// L3-1b-3B. Where the PEP 517 build-requirements store lives. `None` —
+/// nothing named — means [`build_requirements_store_root`], the PERSISTENT
+/// root.
+///
+/// L3-1b-3B CHANGES WHAT `None` MEANS, C18-1's flip applied to the fourth
+/// store with the defect. It used to be `crate::courier::retread_cache_root()`,
+/// which consults `fasttmp::backend_env_override("RETREAD_CACHE_DIR")` and is
+/// therefore redirected into `…/job-$SLURM_JOB_ID/caches/retread` — so the
+/// store died with the job and every cold lock re-ran every `uv pip compile`.
+/// C32 5887194 priced the consequence on the canonical manifest:
+/// `resolve_build_requirements` 56 rows / **24.787 s** on the truly cold arm
+/// against 55 rows / **1.531 s** warm. The row COUNT barely moves, because the
+/// term is emitted on hit and on miss alike — the SUM is the whole signal.
+///
+/// A build-requirements entry meets the wheel store's persistence exemption
+/// test: it is IMMUTABLE (the lock is written once under the entry lock and
+/// never rewritten), CONTENT-IDENTIFIED by
+/// `retread-pep517-build-requirements-input-v1` over (source identity, target
+/// identity, the sorted requirements, the legacy-setuptools constraints), and
+/// EXPENSIVE to rebuild (a `uv pip compile` against a live index, max_row
+/// 17.830 s on C32 arm 1).
+///
+/// ONE HONEST QUALIFICATION, which L3-1b-23-4 boarded and which belongs beside
+/// the horizon rather than in a log: unlike every store persisted before it,
+/// an entry here is NOT a pure function of its key, because `uv pip compile`
+/// resolves against an index that moves. The 14-day horizon is still the right
+/// one and the reason is that the entry is what the LOCK pinned — the lock is
+/// the artifact, a build reproduced from it must use the requirements it was
+/// built with, and a fresh resolve inside the horizon would be the change, not
+/// the cache. An operator who wants the index re-read sets the key to `0`.
+static BUILD_REQUIREMENTS_STORE: std::sync::RwLock<Option<std::path::PathBuf>> =
+    std::sync::RwLock::new(None);
+
+/// Wire the `retread-build-requirements-store` config key into the store.
+/// Called once per pack from the handler, beside [`set_built_wheels_store`].
+pub(crate) fn set_build_requirements_store(configured: Option<&Path>) {
+    let resolved = build_requirements_store_with(configured, &|key| std::env::var(key).ok());
+    if let Ok(mut slot) = BUILD_REQUIREMENTS_STORE.write() {
+        *slot = resolved;
+    }
+}
+
+/// Testable core of [`set_build_requirements_store`]: config key first, then
+/// the `RETREAD_BUILD_REQUIREMENTS_STORE` fallback, then `None` — which means
+/// "take the default root", never an invented path.
+pub(crate) fn build_requirements_store_with(
+    configured: Option<&Path>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Option<std::path::PathBuf> {
+    if let Some(path) = configured {
+        return Some(path.to_path_buf());
+    }
+    env("RETREAD_BUILD_REQUIREMENTS_STORE")
+        .filter(|value| !value.trim().is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// The one formula for the build-requirements store root.
+pub(crate) fn build_requirements_store_root() -> std::path::PathBuf {
+    let slot = BUILD_REQUIREMENTS_STORE
+        .read()
+        .ok()
+        .and_then(|slot| slot.clone());
+    build_requirements_store_root_with(slot.as_deref(), &|key| std::env::var(key).ok())
+}
+
+/// Testable core of [`build_requirements_store_root`]: whatever the config key
+/// / harness fallback resolved to, else the DEFAULT persistent root.
+///
+/// L3-1b-3B IS THIS ONE EXPRESSION for this store. The default arm used to be
+/// `crate::courier::retread_cache_root()`; it is now
+/// [`crate::courier::persistent_store_root_with`], which has NO
+/// `RETREAD_CACHE_DIR` branch at all. Restoring the old arm turns
+/// `the_build_requirements_store_default_is_persistent_not_the_job_local_redirect`
+/// RED, which is why this is an injectable function and not an ambient lookup.
+pub(crate) fn build_requirements_store_root_with(
+    configured: Option<&Path>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> std::path::PathBuf {
+    match configured {
+        Some(root) => root.to_path_buf(),
+        None => crate::courier::persistent_store_root_with(env),
+    }
+}
+
+/// L3-1b-3B. How long an unreferenced build-requirements entry may sit before
+/// the reaper quarantines it, in DAYS. 14, the same horizon as the Git
+/// snapshot, shadow and built-wheel stores, on the standing argument that
+/// housekeeping horizons which differ for no stated reason are separate things
+/// to get wrong. `0` disables the reaper.
+pub(crate) const BUILD_REQUIREMENTS_STORE_DEFAULT_MAX_AGE_DAYS: u64 = 14;
+
+static BUILD_REQUIREMENTS_STORE_MAX_AGE_DAYS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(BUILD_REQUIREMENTS_STORE_DEFAULT_MAX_AGE_DAYS);
+static BUILD_REQUIREMENTS_STORE_REAP_ONCE: std::sync::Once = std::sync::Once::new();
+
+/// Wire `retread-build-requirements-store-max-age-days` into the reaper.
+pub(crate) fn set_build_requirements_store_max_age_days(configured: Option<u64>) {
+    BUILD_REQUIREMENTS_STORE_MAX_AGE_DAYS.store(
+        configured.unwrap_or(BUILD_REQUIREMENTS_STORE_DEFAULT_MAX_AGE_DAYS),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+fn build_requirements_store_max_age_days() -> u64 {
+    BUILD_REQUIREMENTS_STORE_MAX_AGE_DAYS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// What a marker-store reap did. The SAME field set the other three reports
+/// carry, so a reader that can read one summary row can read all five.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct MarkerStoreReapReport {
+    pub(crate) scanned: u64,
+    pub(crate) evicted: u64,
+    pub(crate) kept: u64,
+    pub(crate) skipped_locked: u64,
+    /// A SUBSET of `evicted`: how many came from a generation other than the
+    /// spec's `version`.
+    pub(crate) evicted_stale_version: u64,
+    pub(crate) versions_walked: u64,
+    pub(crate) skipped_concurrent: bool,
+    pub(crate) entries: Vec<crate::courier::ReapedEntry>,
+}
+
+/// L3-1b-3B, THE REAPER FOR BOTH MARKER STORES.
+///
+/// C18-1's rules, unchanged, each with a guard:
+/// 1. **It never deletes.** An over-age entry is RENAMED into
+///    `<dir>/quarantine/<version>-<identity>-<unix>-<pid>`. The generation
+///    leads the name for L3-1b-1a-1's reason: two generations can hold the same
+///    identity, and two entries quarantined in one pass share `now` and the
+///    pid, so without it the second `rename` would target a non-empty
+///    directory, fail, and silently KEEP the entry.
+/// 2. **It never blocks anyone.** Store-wide try-lock and per-entry try-lock,
+///    both non-blocking; an entry a writer holds is a live publish and is
+///    SKIPPED.
+/// 3. **It re-reads the age under the entry lock**, so a hit that lands between
+///    the scan and the rename keeps the entry.
+/// 4. **It walks EVERY generation** (STORE-REAP-1). An entry under a generation
+///    this binary no longer addresses is aged by the SAME rule and quarantined
+///    by the SAME rename, with `reason="stale-version"`. It is emphatically not
+///    evicted on sight: an older binary still reading and stamping that
+///    generation is a live user, and racing it would be a cross-version bug.
+/// 5. **BOTH refusals print their summary row** (MERGE-N-5). `reason="disabled"`
+///    when the horizon is `0` and `reason="store-absent"` when the directory is
+///    not there — and the absent arm is the ORDINARY arm of a production
+///    relock, not an edge case, because every versioned harness job-scopes
+///    `XDG_CACHE_HOME`. A reaper that ran and found nothing must not be
+///    indistinguishable in the log from one that was never called.
+///
+/// STORE-REAP-2's `mode`: a dry run walks and decides identically and then
+/// stops one statement before the first write, and creates no lock sidecar.
+pub(crate) fn reap_build_requirements_store(
+    store_root: &Path,
+    max_age: std::time::Duration,
+    mode: crate::courier::ReapMode,
+) -> Result<MarkerStoreReapReport> {
+    use crate::courier::ReapLockOutcome;
+    let mut report = MarkerStoreReapReport::default();
+    let store_dir = store_root.join(BUILD_REQUIREMENTS_STORE_DIR);
+    if max_age.is_zero() {
+        tracing::info!(
+            store = %store_dir.display(),
+            scanned = 0,
+            evicted = 0,
+            evicted_stale_version = 0,
+            versions_walked = 0,
+            current_version = BUILD_REQUIREMENTS_CACHE_VERSION,
+            kept = 0,
+            skipped_locked = 0,
+            max_age_days = 0,
+            mode = mode.as_str(),
+            reason = "disabled",
+            "{} reap",
+            BUILD_REQUIREMENTS_STORE_ROW,
+        );
+        return Ok(report);
+    }
+    if !store_dir.is_dir() {
+        tracing::info!(
+            store = %store_dir.display(),
+            scanned = 0,
+            evicted = 0,
+            evicted_stale_version = 0,
+            versions_walked = 0,
+            current_version = BUILD_REQUIREMENTS_CACHE_VERSION,
+            kept = 0,
+            skipped_locked = 0,
+            max_age_days = max_age.as_secs() / 86_400,
+            mode = mode.as_str(),
+            reason = "store-absent",
+            "{} reap",
+            BUILD_REQUIREMENTS_STORE_ROW,
+        );
+        return Ok(report);
+    }
+    let reap_lock_path = store_dir.join(BUILD_REQUIREMENTS_STORE_REAP_LOCK);
+    let _reap_lock = match crate::courier::take_reap_lock(&reap_lock_path, mode)? {
+        ReapLockOutcome::Held(lock) => Some(lock),
+        ReapLockOutcome::Absent => None,
+        ReapLockOutcome::Busy | ReapLockOutcome::Unopenable => {
+            report.skipped_concurrent = true;
+            tracing::info!(
+                store = %store_dir.display(),
+                mode = mode.as_str(),
+                "{} reap skipped=concurrent",
+                BUILD_REQUIREMENTS_STORE_ROW,
+            );
+            return Ok(report);
+        }
+    };
+    let quarantine_root = store_dir.join(MARKER_STORE_QUARANTINE);
+    let now = std::time::SystemTime::now();
+    for version in read_dir_names(&store_dir)? {
+        if version == MARKER_STORE_QUARANTINE {
+            continue;
+        }
+        let versioned = store_dir.join(&version);
+        if !versioned.is_dir() {
+            continue;
+        }
+        report.versions_walked += 1;
+        let reason = if version == BUILD_REQUIREMENTS_CACHE_VERSION {
+            REAP_REASON_UNREFERENCED
+        } else {
+            REAP_REASON_STALE_VERSION
+        };
+        for identity in read_dir_names(&versioned)? {
+            let entry_dir = versioned.join(&identity);
+            if !entry_dir.is_dir() {
+                continue;
+            }
+            // DISCOVERY IS BY MARKER, never by counting levels. A directory
+            // without one is a half-published entry or something that is not an
+            // entry at all, and either way it is not this reaper's to move.
+            if !entry_dir.join(BUILD_REQUIREMENTS_MARKER).is_file() {
+                continue;
+            }
+            report.scanned += 1;
+            let Some(age) = marker_store_entry_age(&entry_dir, now) else {
+                report.kept += 1;
+                continue;
+            };
+            if age <= max_age {
+                report.kept += 1;
+                continue;
+            }
+            let Ok(entry_lock_path) = artifact_cache_lock_path(&entry_dir) else {
+                report.kept += 1;
+                continue;
+            };
+            let _entry_lock = match crate::courier::take_entry_lock(&entry_lock_path, mode) {
+                ReapLockOutcome::Held(lock) => Some(lock),
+                ReapLockOutcome::Absent => None,
+                ReapLockOutcome::Unopenable => {
+                    report.kept += 1;
+                    continue;
+                }
+                ReapLockOutcome::Busy => {
+                    report.skipped_locked += 1;
+                    report.kept += 1;
+                    continue;
+                }
+            };
+            match marker_store_entry_age(&entry_dir, std::time::SystemTime::now()) {
+                Some(fresh) if fresh <= max_age => {
+                    report.kept += 1;
+                    continue;
+                }
+                None => {
+                    report.kept += 1;
+                    continue;
+                }
+                Some(_) => {}
+            }
+            let stamp_unix = now
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let label = format!("{version}-{identity}");
+            let quarantine =
+                quarantine_root.join(format!("{label}-{stamp_unix}-{}", std::process::id()));
+            // THE DRY RUN STOPS HERE, one statement before the first write.
+            if mode.is_dry_run() {
+                report.evicted += 1;
+                if reason == REAP_REASON_STALE_VERSION {
+                    report.evicted_stale_version += 1;
+                }
+                report.entries.push(crate::courier::ReapedEntry {
+                    label: label.clone(),
+                    path: entry_dir.clone(),
+                    quarantine: None,
+                    age_days: age.as_secs() / 86_400,
+                    reason,
+                });
+                tracing::info!(
+                    version = %version,
+                    identity = %identity,
+                    age_days = age.as_secs() / 86_400,
+                    max_age_days = max_age.as_secs() / 86_400,
+                    reason = reason,
+                    mode = mode.as_str(),
+                    "{} would-evict",
+                    BUILD_REQUIREMENTS_STORE_ROW,
+                );
+                continue;
+            }
+            if let Err(error) = std::fs::create_dir_all(&quarantine_root) {
+                tracing::warn!(
+                    store = %store_dir.display(),
+                    error = %error,
+                    "could not create the {} quarantine; nothing evicted",
+                    BUILD_REQUIREMENTS_STORE_ROW,
+                );
+                report.kept += 1;
+                continue;
+            }
+            if let Err(error) = std::fs::rename(&entry_dir, &quarantine) {
+                tracing::warn!(
+                    identity = %identity,
+                    error = %error,
+                    "{} eviction could not rename; entry kept",
+                    BUILD_REQUIREMENTS_STORE_ROW,
+                );
+                report.kept += 1;
+                continue;
+            }
+            if let Some(stamp) = use_stamp_path(&entry_dir) {
+                let _ = std::fs::rename(
+                    &stamp,
+                    quarantine.with_file_name(format!(
+                        "{}{USE_STAMP_SUFFIX}",
+                        quarantine
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("entry")
+                    )),
+                );
+            }
+            report.evicted += 1;
+            if reason == REAP_REASON_STALE_VERSION {
+                report.evicted_stale_version += 1;
+            }
+            report.entries.push(crate::courier::ReapedEntry {
+                label: label.clone(),
+                path: entry_dir.clone(),
+                quarantine: Some(quarantine.clone()),
+                age_days: age.as_secs() / 86_400,
+                reason,
+            });
+            tracing::info!(
+                version = %version,
+                identity = %identity,
+                age_days = age.as_secs() / 86_400,
+                max_age_days = max_age.as_secs() / 86_400,
+                reason = reason,
+                quarantine = %quarantine.display(),
+                mode = mode.as_str(),
+                "{} evicted",
+                BUILD_REQUIREMENTS_STORE_ROW,
+            );
+        }
+    }
+    tracing::info!(
+        store = %store_dir.display(),
+        scanned = report.scanned,
+        evicted = report.evicted,
+        evicted_stale_version = report.evicted_stale_version,
+        versions_walked = report.versions_walked,
+        current_version = BUILD_REQUIREMENTS_CACHE_VERSION,
+        kept = report.kept,
+        skipped_locked = report.skipped_locked,
+        max_age_days = max_age.as_secs() / 86_400,
+        mode = mode.as_str(),
+        "{} reap",
+        BUILD_REQUIREMENTS_STORE_ROW,
+    );
+    Ok(report)
+}
+
+/// Quarantine directory for a marker store, a sibling of the generation
+/// directories and named so [`read_dir_names`] can never walk it as one.
+const MARKER_STORE_QUARANTINE: &str = "quarantine";
+
+/// How long ago a lock last referenced this entry: the `.used` sidecar when
+/// there is one, else the entry's own MARKER mtime, which is when it was
+/// published. `None` means "cannot tell", and the caller KEEPS the entry.
+///
+/// The marker fallback is what lets a store minted before this reaper existed
+/// age from its publish rather than from the epoch — a store full of entries
+/// that all read as infinitely old on the reaper's first run would be a
+/// wipe-out dressed as housekeeping.
+fn marker_store_entry_age(
+    entry_dir: &Path,
+    now: std::time::SystemTime,
+) -> Option<std::time::Duration> {
+    let referenced = use_stamp_path(entry_dir)
+        .and_then(|stamp| std::fs::metadata(stamp).ok())
+        .and_then(|meta| meta.modified().ok())
+        .or_else(|| {
+            std::fs::metadata(entry_dir.join(BUILD_REQUIREMENTS_MARKER))
+                .ok()
+                .and_then(|meta| meta.modified().ok())
+        })?;
+    // A stamp in the future (clock skew across nodes) reads as age ZERO, which
+    // KEEPS the entry. Never as a huge age, which would evict it.
+    Some(now.duration_since(referenced).unwrap_or_default())
+}
+
+/// Run the build-requirements reaper once for this process, and never fail a
+/// build because housekeeping failed.
+pub(crate) fn reap_build_requirements_store_once() {
+    BUILD_REQUIREMENTS_STORE_REAP_ONCE.call_once(|| {
+        let days = build_requirements_store_max_age_days();
+        let store_root = build_requirements_store_root();
+        let max_age = std::time::Duration::from_secs(days * 86_400);
+        if let Err(error) = reap_build_requirements_store(
+            &store_root,
+            max_age,
+            crate::courier::ReapMode::Apply,
+        ) {
+            tracing::warn!(
+                store = %store_root.display(),
+                error = %error,
+                "build_requirements_store reap failed; nothing evicted",
+            );
+        }
+    });
+}
+
 const SDIST_BUILD_CONSTRAINTS: &str = "setuptools<81\ncmake<4\n";
 static BUILD_TMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -1562,13 +2029,24 @@ async fn resolve_build_requirements(
             },
         ],
     );
-    let root = crate::courier::retread_cache_root()
-        .join("build-requirements")
-        .join("v1")
+    // L3-1b-3B. The root used to be `crate::courier::retread_cache_root()`,
+    // which `fasttmp` redirects into `…/job-$SLURM_JOB_ID/caches/retread`, so
+    // the store died with the job and every cold lock re-ran every
+    // `uv pip compile`. It is now the PERSISTENT root; the four path segments
+    // below it are unchanged, so no key and no address moves.
+    let root = build_requirements_store_root()
+        .join(BUILD_REQUIREMENTS_STORE_DIR)
+        .join(BUILD_REQUIREMENTS_CACHE_VERSION)
         .join(input_identity);
-    let lock_path = root.join("requirements.txt");
+    let lock_path = root.join(BUILD_REQUIREMENTS_MARKER);
     let _lock = acquire_artifact_cache_lock(&root).await?;
-    if !lock_path.is_file() {
+    if lock_path.is_file() {
+        // THE HIT ARM, and the reader half of the reaper: a store that is
+        // persistent must be able to tell "nobody has wanted this for 14 days"
+        // from "published 14 days ago and used every day since". Best-effort,
+        // a sidecar, and never a write inside the entry.
+        touch_use_stamp(&root);
+    } else {
         remove_owned_cache_entry(&root)?;
         std::fs::create_dir_all(&root)
             .with_context(|| format!("creating build-requirements cache {}", root.display()))?;
@@ -2387,7 +2865,45 @@ fn wheel_file_fingerprint(path: &Path) -> Result<WheelFileFingerprint> {
     })
 }
 
+/// L3-1b-23-1. The whole-file SHA-256 pass of the strict pinned-wheel path,
+/// AND THE ONE `bench:` ROW IT WENT WITHOUT.
+///
+/// This is the second full read of a pinned wheel on an attestation miss:
+/// `validate_pinned_wheel_for_target_async` runs it over the same bytes BEFORE
+/// `validate_wheel_file` opens the ZIP. `wheel::read_metadata_strict` has
+/// carried a `bench: wheel_read_metadata_strict` row and a `note_full_hash`
+/// call since L3; this pass carried NEITHER, so every cold measurement of the
+/// strict path this campaign made — C32 5887194 arm 1's 13 rows / 150.8 s, L3
+/// 5902252's 13 rows / 93.235 s — priced ONE of the two reads and silently
+/// omitted the other. L3-1b-23 row 5 boarded exactly that and forbade any lane
+/// from quoting a saving for the attestation store until the row existed,
+/// because a persisted hit skips BOTH passes and nobody could say how much the
+/// second one was.
+///
+/// The row's fields are `wheel_read_metadata_strict`'s, deliberately, so one
+/// `zgrep` of a backend log sums the two halves in the same units: `wheel=`,
+/// `bytes=` (the file's own length) and `elapsed_ms=`. `path_class=` is this
+/// row's own — `ingress` for a wheel under a `<sha256>/<filename>` store entry,
+/// `built` for one inside a build staging tree, `other` otherwise — because
+/// L3-1b-23 row 5's whole finding was that the strict term's 72 rows partition
+/// into 13 that matter and 59 that do not, and that partition had to be
+/// recovered by re-reading paths out of a compressed log. It is a field now.
+/// NO `note_full_hash` CALL, AND THAT ABSENCE IS DELIBERATE — IT IS A FINDING
+/// THIS LANE BOARDED RATHER THAN A THING IT FORGOT. This pass IS a full-file
+/// hash and belongs in that accounting, but adding it turns two p5z guards RED:
+/// `no_op_relax_hashes_the_wheel_payload_at_most_once` and
+/// `changed_relax_yields_the_rewritten_files_own_sha` assert
+/// `full_hash_probe::hashes_for(dist).len() == 1` and comment that the one is
+/// "phase 1's strict identity validation of the downloaded file". They are
+/// counting ONE of TWO real reads — the same blindness L3-1b-23 row 5 found in
+/// the `bench:` tables — and their `1` is wrong by exactly this pass. Making
+/// that visible CHANGES WHAT p5z's COUNTER MEANS, which is a key move dressed
+/// as instrumentation and belongs to p5z's own lane, not to a store-persistence
+/// landing whose whole claim is that it moves no lock. Boarded as L3-1b-3B-1.
+/// The `bench:` row below is the reader L3-1b-23-1 actually asked for and it is
+/// enough to price the pass.
 fn raw_file_sha256(path: &Path) -> Result<String> {
+    let started = std::time::Instant::now();
     let mut file = File::open(path).with_context(|| {
         format!(
             "opening wheel for authoritative hash check {}",
@@ -2396,6 +2912,7 @@ fn raw_file_sha256(path: &Path) -> Result<String> {
     })?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 1024 * 1024];
+    let mut total_read: u64 = 0;
     loop {
         let read = file
             .read(&mut buffer)
@@ -2403,9 +2920,45 @@ fn raw_file_sha256(path: &Path) -> Result<String> {
         if read == 0 {
             break;
         }
+        total_read += read as u64;
         hasher.update(&buffer[..read]);
     }
+    tracing::info!(
+        wheel = %path.display(),
+        bytes = total_read,
+        path_class = raw_file_sha256_path_class(path),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "bench: raw_file_sha256",
+    );
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// L3-1b-23-1. Which population a `bench: raw_file_sha256` row belongs to.
+///
+/// A pinned INGRESS wheel is addressed `<wheel store>/<sha256>/<filename>`, so
+/// its parent directory name is 64 lowercase hex characters — that is the test,
+/// not a substring of the path, because a store may live anywhere the operator
+/// points `RETREAD_WHEEL_STORE`. A BUILT wheel is one this process just made
+/// and sits under a `built-wheels` staging tree. Anything else is `other`
+/// rather than being forced into one of the two.
+fn raw_file_sha256_path_class(path: &Path) -> &'static str {
+    let parent_is_sha = path
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.len() == 64 && name.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        });
+    if parent_is_sha {
+        return "ingress";
+    }
+    if path
+        .components()
+        .any(|component| component.as_os_str() == "built-wheels")
+    {
+        return "built";
+    }
+    "other"
 }
 
 /// Strictly admit a pinned ingress wheel once, then reuse the attestation only
@@ -15204,7 +15757,7 @@ version = "0.1.0"
         let configured = PathBuf::from("/from/config");
         assert_eq!(
             git_snapshot_store_with(Some(&configured), &|_| Some("/from/env".to_string())),
-            Some(configured.clone()),
+            Some(configured),
             "the config key must win over the environment",
         );
         assert_eq!(
@@ -15817,7 +16370,7 @@ version = "0.1.0"
         };
         assert_eq!(
             built_wheels_store_with(Some(&configured), &env),
-            Some(configured.clone()),
+            Some(configured),
             "the config key must win over the environment fallback",
         );
         assert_eq!(
@@ -16891,5 +17444,591 @@ version = "0.1.0"
 
         make_staging_tree_removable(&published.root);
         let _ = std::fs::remove_dir_all(&fixture.base);
+    }
+
+    // ── L3-1b-3B guards: two more stores stop dying with the job, one reaper
+    //    walks both, and the whole-file hash pass is finally visible ─────────
+
+    /// Keep every row a body emits, so a guard can assert on what an OPERATOR
+    /// would have been able to grep out of a backend log. Same shape as
+    /// `courier::tests::with_captured_rows`.
+    struct CapturedMarkerRows(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl std::io::Write for CapturedMarkerRows {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(buf).to_string());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn with_marker_rows<T>(body: impl FnOnce() -> T) -> (T, Vec<String>) {
+        let rows = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer({
+                let rows = std::sync::Arc::clone(&rows);
+                move || CapturedMarkerRows(std::sync::Arc::clone(&rows))
+            })
+            .finish();
+        let value = tracing::subscriber::with_default(subscriber, body);
+        let rows = rows.lock().unwrap().clone();
+        (value, rows)
+    }
+
+    /// One marker-store entry at `<root>/<dir>/<version>/<identity>`. `stamp`
+    /// is how long ago a lock referenced it; `None` writes NO `.used` sidecar
+    /// at all, which is the shape of an entry published before this reaper
+    /// existed and which must age from its own MARKER instead of from the
+    /// epoch.
+    fn marker_fixture(
+        root: &Path,
+        version: &str,
+        identity: &str,
+        stamp: Option<std::time::Duration>,
+        marker_age: std::time::Duration,
+    ) -> PathBuf {
+        let entry = root.join(BUILD_REQUIREMENTS_STORE_DIR).join(version).join(identity);
+        std::fs::create_dir_all(&entry).expect("entry");
+        let marker = entry.join(BUILD_REQUIREMENTS_MARKER);
+        std::fs::write(&marker, b"payload\n").expect("marker");
+        let age_file = |path: &Path, ago: std::time::Duration| {
+            let when = std::time::SystemTime::now() - ago;
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .expect("reopen to age");
+            file.set_times(std::fs::FileTimes::new().set_modified(when).set_accessed(when))
+                .expect("age");
+        };
+        age_file(&marker, marker_age);
+        if let Some(ago) = stamp {
+            let path = use_stamp_path(&entry).expect("stamp path");
+            std::fs::write(&path, b"0\n").expect("stamp");
+            age_file(&path, ago);
+        }
+        entry
+    }
+
+    /// THE DEFAULT FLIP, BUILD-REQUIREMENTS HALF. With no config key and no
+    /// `RETREAD_BUILD_REQUIREMENTS_STORE`, the root must be the PERSISTENT one
+    /// and must NOT follow `RETREAD_CACHE_DIR` — the variable `fasttmp`
+    /// redirects into `…/job-$SLURM_JOB_ID/caches/retread`, which is what made
+    /// this store die with the job and cost `resolve_build_requirements`
+    /// 24.787 s over 56 rows on C32 5887194's truly cold arm against 1.531 s
+    /// over 55 warm. The env is injected, so the default is stated without
+    /// mutating the process and without any variable being set for real.
+    #[test]
+    fn the_build_requirements_store_default_is_persistent_not_the_job_local_redirect() {
+        let job_local = "/fast-tmp/retread-user/hash/job-12345/caches/retread";
+        let env = |key: &str| match key {
+            "RETREAD_CACHE_DIR" => Some(job_local.to_string()),
+            "XDG_CACHE_HOME" => Some("/shared/cache".to_string()),
+            _ => None,
+        };
+        let resolved = build_requirements_store_root_with(None, &env);
+        assert_eq!(resolved, PathBuf::from("/shared/cache/retread"));
+        assert!(
+            !resolved.starts_with(job_local),
+            "the default must NOT follow RETREAD_CACHE_DIR; resolved {}",
+            resolved.display(),
+        );
+        // With only HOME — no XDG, no redirect — it is still persistent, which
+        // is what a developer outside this campaign's harness gets.
+        let home_only = |key: &str| match key {
+            "HOME" => Some("/home/someone".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            build_requirements_store_root_with(None, &home_only),
+            PathBuf::from("/home/someone/.cache/retread"),
+        );
+        // FOUR STORES, ONE BASE. If they ever disagree, one has been
+        // reclassified as scratch by accident — the mistake C18 found, L3-1b
+        // found again, and this landing is the fourth instance of.
+        assert_eq!(resolved, built_wheel_store_root_with(None, &env));
+        assert_eq!(resolved, canonical_git_snapshot_store_root_with(None, &env));
+        assert_eq!(
+            resolved.join("wheels"),
+            crate::courier::wheel_store_root_with(&env),
+        );
+        let named = PathBuf::from("/named/store");
+        assert_eq!(build_requirements_store_root_with(Some(&named), &env), named);
+    }
+
+    /// The control is a CONFIG KEY first and an environment variable second,
+    /// for the new store and for the reason the other three have that order:
+    /// a misspelled key is a load error, a misspelled variable is a silent
+    /// no-op. A blank variable is NOT a store — it means "unset" — because a
+    /// harness that exports an empty string would otherwise point the store at
+    /// the filesystem root.
+    #[test]
+    fn the_build_requirements_store_is_config_key_first_and_env_fallback_second() {
+        let configured = PathBuf::from("/from/config");
+        let br_env = |key: &str| match key {
+            "RETREAD_BUILD_REQUIREMENTS_STORE" => Some("/from/env".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            build_requirements_store_with(Some(&configured), &br_env),
+            Some(configured),
+        );
+        assert_eq!(
+            build_requirements_store_with(None, &br_env),
+            Some(PathBuf::from("/from/env")),
+        );
+        let br_blank = |key: &str| match key {
+            "RETREAD_BUILD_REQUIREMENTS_STORE" => Some("   ".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            build_requirements_store_with(None, &br_blank),
+            None,
+            "a blank variable means UNSET, not the filesystem root",
+        );
+        assert_eq!(build_requirements_store_with(None, &|_| None), None);
+    }
+
+    /// THE REAPER, ALL FOUR RULES. Keeps a stamped entry,
+    /// evicts an unstamped over-age one, ages a pre-reaper entry from its
+    /// MARKER rather than from the epoch, walks EVERY generation and labels the
+    /// retired one, and RENAMES rather than deleting.
+    ///
+    /// A FOURTH FATE, added after mutation arm M5 of job 5975231 SURVIVED: an
+    /// entry whose stamp is in the FUTURE. See the fixture for why.
+    ///
+    /// The stamped/over-age pair is the whole reason `.used` exists: the two
+    /// entries here have IDENTICAL marker mtimes — both published 30 days
+    /// ago — and differ only in whether a lock touched them yesterday. A
+    /// reaper that aged from the marker alone would evict both, which is what
+    /// "persistent store" without a reader half actually means.
+    #[test]
+    fn the_marker_reaper_keeps_a_stamped_entry_evicts_a_stale_one_and_walks_generations() {
+        {
+            let root = unique_test_dir(&format!("marker-reap-{}", BUILD_REQUIREMENTS_STORE_DIR));
+            let day = std::time::Duration::from_secs(86_400);
+            let used_yesterday =
+                marker_fixture(&root, BUILD_REQUIREMENTS_CACHE_VERSION, "used", Some(day), 30 * day);
+            let never_used =
+                marker_fixture(&root, BUILD_REQUIREMENTS_CACHE_VERSION, "cold", Some(30 * day), 30 * day);
+            // No `.used` at all: a pre-reaper entry, aged from its marker.
+            let pre_reaper = marker_fixture(&root, BUILD_REQUIREMENTS_CACHE_VERSION, "old", None, 30 * day);
+            let pre_reaper_young =
+                marker_fixture(&root, BUILD_REQUIREMENTS_CACHE_VERSION, "young", None, day);
+            // A RETIRED generation. Same rule, different reason.
+            let retired = marker_fixture(&root, "v0", "retired", Some(30 * day), 30 * day);
+            // A FUTURE STAMP, AND IT IS HERE BECAUSE A MUTANT SURVIVED WITHOUT
+            // IT. `marker_store_entry_age` clamps a stamp in the future to age
+            // ZERO with `unwrap_or_default()`, which KEEPS the entry; the
+            // alternative -- reading the `SystemTimeError` as a huge age -- is
+            // one character away and EVICTS an entry a lock touched seconds
+            // ago. Clock skew across this cluster's nodes makes that a real
+            // event, not a hypothetical. Mutation arm M5 of job 5975231
+            // replaced that clamp with `Duration::from_secs(u64::MAX / 2)` and
+            // the whole suite still passed `8 passed; 0 failed`, so the
+            // property was stated in the code and in the design and guarded by
+            // nothing. This entry's marker is 30 days old -- over the horizon
+            // on its own -- and its stamp is an HOUR IN THE FUTURE, so it can
+            // only survive through the clamp.
+            let skewed =
+                marker_fixture(&root, BUILD_REQUIREMENTS_CACHE_VERSION, "skewed", Some(day), 30 * day);
+            {
+                let stamp = use_stamp_path(&skewed).expect("stamp path");
+                let ahead = std::time::SystemTime::now() + std::time::Duration::from_secs(3_600);
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&stamp)
+                    .expect("reopen the stamp")
+                    .set_times(
+                        std::fs::FileTimes::new()
+                            .set_modified(ahead)
+                            .set_accessed(ahead),
+                    )
+                    .expect("push the stamp into the future");
+            }
+
+            let report = reap_build_requirements_store(
+                &root,
+                std::time::Duration::from_secs(14 * 86_400),
+                crate::courier::ReapMode::Apply,
+            )
+            .expect("reap");
+
+            assert_eq!(report.scanned, 6, "{}: {report:?}", BUILD_REQUIREMENTS_STORE_DIR);
+            assert_eq!(report.evicted, 3, "{}: {report:?}", BUILD_REQUIREMENTS_STORE_DIR);
+            assert_eq!(report.kept, 3, "{}: {report:?}", BUILD_REQUIREMENTS_STORE_DIR);
+            assert_eq!(
+                report.versions_walked, 2,
+                "{}: the walk must descend into the RETIRED generation too — \
+                 that is STORE-REAP-1's whole fix, and a store whose only \
+                 generation is retired must still be reachable: {report:?}",
+                BUILD_REQUIREMENTS_STORE_DIR,
+            );
+            assert_eq!(
+                report.evicted_stale_version, 1,
+                "{}: the `v0` entry is a SUBSET of evicted, labelled \
+                 stale-version: {report:?}",
+                BUILD_REQUIREMENTS_STORE_DIR,
+            );
+            assert!(
+                used_yesterday.join(BUILD_REQUIREMENTS_MARKER).is_file(),
+                "{}: an entry a lock referenced yesterday must SURVIVE, even \
+                 though its marker is 30 days old — that is what the `.used` \
+                 sidecar is for",
+                BUILD_REQUIREMENTS_STORE_DIR,
+            );
+            assert!(
+                pre_reaper_young.join(BUILD_REQUIREMENTS_MARKER).is_file(),
+                "{}: an entry with no stamp ages from its MARKER, so a store \
+                 minted before this reaper existed is not wiped on first run",
+                BUILD_REQUIREMENTS_STORE_DIR,
+            );
+            assert!(
+                skewed.join(BUILD_REQUIREMENTS_MARKER).is_file(),
+                "{}: a stamp in the FUTURE must read as age ZERO and KEEP the \
+                 entry. Reading the `SystemTimeError` as a huge age instead \
+                 evicts an entry a lock touched seconds ago, and clock skew \
+                 across this cluster's nodes makes that a real event. Mutation \
+                 arm M5 of 5975231 made exactly that change and the suite \
+                 stayed green; this assertion is why it cannot again",
+                BUILD_REQUIREMENTS_STORE_DIR,
+            );
+            for gone in [&never_used, &pre_reaper, &retired] {
+                assert!(
+                    !gone.exists(),
+                    "{}: {} should have been quarantined",
+                    BUILD_REQUIREMENTS_STORE_DIR,
+                    gone.display(),
+                );
+            }
+            // RULE 1: renamed, never deleted, and the payload is still readable
+            // in the quarantine.
+            let quarantine = root.join(BUILD_REQUIREMENTS_STORE_DIR).join("quarantine");
+            // The ENTRIES only. A quarantined entry's `.used` sidecar is renamed
+            // beside it (C18-1's shape, so the stamp does not outlive the entry
+            // it describes), and counting those as entries is what made the
+            // first run of this guard read 5 where the truth is 3 — a defect in
+            // the reader, caught by running it.
+            let survivors: Vec<_> = std::fs::read_dir(&quarantine)
+                .expect("quarantine")
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .filter(|name| !name.ends_with(USE_STAMP_SUFFIX))
+                .collect();
+            assert_eq!(survivors.len(), 3, "{}: {survivors:?}", BUILD_REQUIREMENTS_STORE_DIR);
+            // And the sidecars DID come with them, which is the other half of
+            // the rule: two of the three carried a stamp, so two stamps moved.
+            let moved_stamps = std::fs::read_dir(&quarantine)
+                .expect("quarantine")
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().ends_with(USE_STAMP_SUFFIX))
+                .count();
+            assert_eq!(
+                moved_stamps, 2,
+                "{}: a quarantined entry's `.used` sidecar must travel with it, \
+                 or a reclaimed quarantine would come back looking unreferenced",
+                BUILD_REQUIREMENTS_STORE_DIR,
+            );
+            assert!(
+                survivors.iter().any(|name| name.starts_with("v0-retired-")),
+                "{}: THE GENERATION LEADS THE QUARANTINE NAME, or two \
+                 generations holding one identity collide on the rename and \
+                 the second is silently kept: {survivors:?}",
+                BUILD_REQUIREMENTS_STORE_DIR,
+            );
+            for name in &survivors {
+                let moved = quarantine.join(name);
+                if moved.is_dir() {
+                    assert!(
+                        moved.join(BUILD_REQUIREMENTS_MARKER).is_file(),
+                        "{}: an eviction must RENAME the entry, not delete it",
+                        BUILD_REQUIREMENTS_STORE_DIR,
+                    );
+                }
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// BOTH REFUSALS PRINT THEIR SUMMARY ROW (MERGE-N-5, one store over and
+    /// then another). A reaper that RAN and found nothing must not be
+    /// indistinguishable in a job log from one that was never called — and the
+    /// STORE-ABSENT arm is the ORDINARY arm of a production relock, not an edge
+    /// case, because every versioned harness job-scopes `XDG_CACHE_HOME` to a
+    /// fresh directory the cleanup deletes.
+    ///
+    /// The assertion is on the ROW and not on the report, because the report
+    /// was never the thing missing. All three arms are here so it cannot pass
+    /// by accident.
+    #[test]
+    fn both_marker_reaper_refusals_print_a_summary_row_with_a_reason() {
+        let base = unique_test_dir("marker-refusals");
+        let day = std::time::Duration::from_secs(86_400);
+
+        let absent = base.join("absent");
+        std::fs::create_dir_all(&absent).expect("absent root");
+        let (report, rows) = with_marker_rows(|| {
+            reap_build_requirements_store(&absent, 14 * day, crate::courier::ReapMode::Apply)
+        });
+        assert_eq!(report.expect("absent").scanned, 0);
+        let absent_row = rows
+            .iter()
+            .find(|row| row.contains("build_requirements_store reap"))
+            .unwrap_or_else(|| panic!("no summary row for an ABSENT store: {rows:?}"));
+        assert!(
+            absent_row.contains("reason=\"store-absent\"") || absent_row.contains("reason=store-absent"),
+            "the absent arm must NAME itself: {absent_row}",
+        );
+
+        let live = base.join("live");
+        marker_fixture(&live, BUILD_REQUIREMENTS_CACHE_VERSION, "e", Some(30 * day), 30 * day);
+        let (report, rows) = with_marker_rows(|| {
+            reap_build_requirements_store(
+                &live,
+                std::time::Duration::ZERO,
+                crate::courier::ReapMode::Apply,
+            )
+        });
+        assert_eq!(
+            report.expect("disabled").evicted,
+            0,
+            "a `0` horizon must evict NOTHING, and it must say so",
+        );
+        let disabled_row = rows
+            .iter()
+            .find(|row| row.contains("build_requirements_store reap"))
+            .unwrap_or_else(|| panic!("no summary row for a DISABLED reaper: {rows:?}"));
+        assert!(
+            disabled_row.contains("reason=\"disabled\"") || disabled_row.contains("reason=disabled"),
+            "the disabled arm must NAME itself: {disabled_row}",
+        );
+
+        // NON-VACUITY: the ordinary arm prints the same row WITHOUT a reason
+        // and with a real scan behind it, so the two above are refusals and not
+        // just "the row always says that".
+        let (report, rows) = with_marker_rows(|| {
+            reap_build_requirements_store(&live, 14 * day, crate::courier::ReapMode::Apply)
+        });
+        let report = report.expect("live");
+        assert_eq!((report.scanned, report.evicted), (1, 1), "{report:?}");
+        let live_row = rows
+            .iter()
+            .find(|row| row.contains("build_requirements_store reap"))
+            .unwrap_or_else(|| panic!("no summary row for a LIVE store: {rows:?}"));
+        assert!(
+            !live_row.contains("reason="),
+            "the ordinary arm carries no refusal reason: {live_row}",
+        );
+        assert!(live_row.contains("scanned=1"), "{live_row}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A DRY RUN OVER A MARKER STORE IS READ-ONLY BY CONSTRUCTION: it names
+    /// what it would move, moves nothing, and — the part that is easy to get
+    /// wrong — CREATES nothing either, so no zero-byte `.reap.lock` or
+    /// per-entry `.lock` is left behind in a store it promised not to touch.
+    #[test]
+    fn a_marker_store_dry_run_names_the_entry_and_creates_no_sidecar() {
+        let root = unique_test_dir("marker-dry");
+        let day = std::time::Duration::from_secs(86_400);
+        marker_fixture(&root, BUILD_REQUIREMENTS_CACHE_VERSION, "stale", Some(30 * day), 30 * day);
+        let before = sorted_tree(&root);
+
+        let dry = reap_build_requirements_store(&root, 14 * day, crate::courier::ReapMode::DryRun)
+            .expect("dry run");
+        assert_eq!((dry.scanned, dry.evicted), (1, 1), "{dry:?}");
+        assert_eq!(dry.entries.len(), 1, "a dry run must NAME what it selects");
+        assert!(
+            dry.entries[0].quarantine.is_none(),
+            "a dry-run report carrying a quarantine path is a dry run that moved \
+             something: {:?}",
+            dry.entries[0],
+        );
+        assert_eq!(
+            sorted_tree(&root),
+            before,
+            "a dry run must leave the store byte-for-byte the tree it found",
+        );
+
+        // NON-VACUITY: the apply arm on the SAME fixture moves it and DOES
+        // create the lock sidecar, so the two zeros above are not trivial.
+        let applied = reap_build_requirements_store(&root, 14 * day, crate::courier::ReapMode::Apply)
+            .expect("apply");
+        assert_eq!(applied.evicted, 1);
+        assert_ne!(sorted_tree(&root), before);
+        assert!(
+            root.join(BUILD_REQUIREMENTS_STORE_DIR).join(BUILD_REQUIREMENTS_STORE_REAP_LOCK).is_file(),
+            "the apply path DOES create the reap lock",
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Every path under a root, sorted — the reader that makes "renames
+    /// nothing" and "creates nothing" ONE assertion instead of two adjectives.
+    fn sorted_tree(root: &Path) -> Vec<String> {
+        fn walk(dir: &Path, base: &Path, out: &mut Vec<String>) {
+            let Ok(children) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for child in children.flatten() {
+                let path = child.path();
+                out.push(
+                    path.strip_prefix(base)
+                        .unwrap_or(&path)
+                        .display()
+                        .to_string(),
+                );
+                if path.is_dir() {
+                    walk(&path, base, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, root, &mut out);
+        out.sort();
+        out
+    }
+
+    /// L3-1b-23-1, THE READER THIS LANE OWED BEFORE IT COULD QUOTE A SAVING.
+    /// `raw_file_sha256` is the whole-file pass the strict pinned path runs
+    /// BEFORE it opens the ZIP, and it carried no `bench:` row at all — so
+    /// every cold measurement of that path this campaign made (C32 5887194
+    /// arm 1's 13 rows / 150.8 s, L3 5902252's 13 rows / 93.235 s) priced ONE
+    /// of the two full reads and silently omitted the other.
+    ///
+    /// The row must carry `bytes` that equals the file's real length (a row
+    /// that reports 0 for a 5.9 GB read is worse than no row) and a
+    /// `path_class` that separates the pinned-ingress population from the
+    /// built-staging one, because L3-1b-23 row 5's entire finding was that the
+    /// strict term's 72 rows split 13/59 along exactly that line and the split
+    /// had to be recovered by re-reading paths out of a compressed log.
+    #[cfg(unix)]
+    #[test]
+    fn the_whole_file_hash_pass_emits_a_bench_row_with_bytes_and_a_path_class() {
+        let base = unique_test_dir("raw-sha-bench");
+        // An INGRESS-shaped path: `<store>/<64 hex>/<filename>`, which is how
+        // `wheel::pinned_wheel_store_path` addresses a pinned wheel.
+        let sha_dir = base.join("a".repeat(64));
+        std::fs::create_dir_all(&sha_dir).expect("ingress dir");
+        let ingress = sha_dir.join("pkg-1.0.0-py3-none-any.whl");
+        let payload = vec![b'z'; 3 * 1024 * 1024 + 7];
+        std::fs::write(&ingress, &payload).expect("payload");
+
+        let (hash, rows) = with_marker_rows(|| raw_file_sha256(&ingress).expect("hash"));
+        assert_eq!(hash.len(), 64);
+        let row = rows
+            .iter()
+            .find(|row| row.contains("bench: raw_file_sha256"))
+            .unwrap_or_else(|| panic!("the whole-file hash pass emitted NO bench row: {rows:?}"));
+        assert!(
+            row.contains(&format!("bytes={}", payload.len())),
+            "the row must carry the bytes actually read, not 0: {row}",
+        );
+        assert!(
+            row.contains("path_class=\"ingress\"") || row.contains("path_class=ingress"),
+            "a wheel under a <sha256>/ entry is INGRESS — the population whose \
+             thirteen rows are 99.4 % of the strict term: {row}",
+        );
+        assert!(row.contains("elapsed_ms="), "{row}");
+
+        // The classifier is the whole value of the field, so it is checked
+        // against all three populations rather than only the one above.
+        assert_eq!(raw_file_sha256_path_class(&ingress), "ingress");
+        assert_eq!(
+            raw_file_sha256_path_class(
+                &base.join("built-wheels/git/v13/t/.tmp/build/pkg-1.0-py3-none-any.whl")
+            ),
+            "built",
+            "a wheel this process just built is NOT attestation-guarded and must \
+             not be counted with the thirteen",
+        );
+        assert_eq!(
+            raw_file_sha256_path_class(&base.join("somewhere/pkg-1.0-py3-none-any.whl")),
+            "other",
+        );
+        // A 64-character parent that is not hex is not a store entry.
+        assert_eq!(
+            raw_file_sha256_path_class(&base.join("Z".repeat(64)).join("pkg.whl")),
+            "other",
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// THE BUILD-REQUIREMENTS FLIP, THROUGH THE PRODUCTION READER RATHER THAN
+    /// THROUGH ITS ROOT FORMULA. `resolve_build_requirements` must publish into
+    /// the STORE, not into `courier::retread_cache_root()` — the same reader/
+    /// writer pairing law 2 demands, because a persistent root nothing resolves
+    /// through is a writer with no reader.
+    ///
+    /// `requires = []` takes the `requirements.is_empty()` arm, which writes an
+    /// empty lock and never runs `uv`, so this guard is hermetic and costs no
+    /// network. It still exercises the real address, the real entry lock, the
+    /// real marker and the real hit arm.
+    #[tokio::test]
+    async fn resolve_build_requirements_publishes_into_the_persistent_store_not_the_job_cache() {
+        let base = unique_test_dir("br-store");
+        let store = base.join("store");
+        set_build_requirements_store(Some(&store));
+
+        let target = ResolutionTarget::from_parts("3.11", crate::glibc::current_pixi_platform(), None);
+        let pyproject = "[build-system]\nrequires = []\n";
+        let identity = format!("l3-1b-3b-{}", std::process::id());
+        let first = resolve_build_requirements(Some(pyproject), &identity, &target, false)
+            .await
+            .expect("first resolve");
+
+        let generation = store
+            .join(BUILD_REQUIREMENTS_STORE_DIR)
+            .join(BUILD_REQUIREMENTS_CACHE_VERSION);
+        assert!(
+            first.lock_path.starts_with(&generation),
+            "the lock must be published under the STORE ({}), not under the \
+             job-local cache root; got {}",
+            generation.display(),
+            first.lock_path.display(),
+        );
+        assert!(
+            !first
+                .lock_path
+                .starts_with(crate::courier::retread_cache_root()),
+            "publishing under `retread_cache_root()` IS the defect: `fasttmp` \
+             redirects it into …/job-$SLURM_JOB_ID/caches/retread and the store \
+             dies with the job; got {}",
+            first.lock_path.display(),
+        );
+        let entry = first.lock_path.parent().expect("entry dir").to_path_buf();
+        assert!(entry.join(BUILD_REQUIREMENTS_MARKER).is_file());
+
+        // A HIT stamps the entry. Remove any stamp the publish left, so what is
+        // asserted below can only have been written by the hit arm.
+        let stamp = use_stamp_path(&entry).expect("stamp path");
+        let _ = std::fs::remove_file(&stamp);
+        let second = resolve_build_requirements(Some(pyproject), &identity, &target, false)
+            .await
+            .expect("second resolve");
+        assert_eq!(
+            (second.lock_path, second.digest),
+            (first.lock_path, first.digest),
+            "the second resolution must be the SAME entry: same address, same \
+             digest",
+        );
+        assert!(
+            stamp.is_file(),
+            "the hit arm must touch the `.used` sidecar at {} — without it a \
+             persistent entry ages from its publish and the reaper cannot tell \
+             a live entry from an abandoned one",
+            stamp.display(),
+        );
+
+        // Same reason as the attestation guard above: the slot is a process
+        // global and the suite is parallel, so the scratch store is left where
+        // it is rather than deleted out from under a concurrent reader.
+        set_build_requirements_store(None);
     }
 }

@@ -431,6 +431,68 @@ pub struct RetreadConfig {
     )]
     pub built_wheels_store_max_age_days: Option<u64>,
 
+    /// L3-1b-3B: where the PEP 517 BUILD-REQUIREMENTS store lives — the
+    /// content-addressed store of `uv pip compile` answers for a source's
+    /// `[build-system] requires`.
+    ///
+    /// Unset means `source_build::build_requirements_store_root()`, the
+    /// PERSISTENT root (`XDG_CACHE_HOME/retread`, else `$HOME/.cache/retread`),
+    /// plus the `build-requirements` segment. It used to mean
+    /// `courier::retread_cache_root()`, which `fasttmp` redirects into
+    /// `…/job-$SLURM_JOB_ID/caches/retread`, so the store died with the job.
+    /// C32 5887194 priced that on the canonical manifest:
+    /// `resolve_build_requirements` 56 rows / 24.787 s truly cold against 55
+    /// rows / 1.531 s warm. The row COUNT barely moves — the term is emitted on
+    /// hit and on miss alike — so the SUM is the whole signal.
+    ///
+    /// `RETREAD_BUILD_REQUIREMENTS_STORE` is the harness-side fallback, for the
+    /// same reason the other three stores have one: naming a store in a pack
+    /// manifest moves that pack's build hash.
+    ///
+    /// ```toml
+    /// [build.config]
+    /// retread-build-requirements-store = "/shared/cache/retread"
+    /// ```
+    ///
+    /// EMIT-NEUTRAL: this names WHERE the store lives, never WHAT is emitted.
+    /// The path never feeds `inputs_hash`; the KEY covers the inputs, and the
+    /// lock read back from a hit is re-checked for `--hash=sha256:` before use.
+    #[serde(
+        default,
+        rename = "retread-build-requirements-store",
+        alias = "build-requirements-store",
+        alias = "build_requirements_store"
+    )]
+    pub build_requirements_store: Option<std::path::PathBuf>,
+
+    /// L3-1b-3B: how long an unreferenced build-requirements entry may sit
+    /// before the reaper QUARANTINES it, in days.
+    ///
+    /// Unset is `source_build::BUILD_REQUIREMENTS_STORE_DEFAULT_MAX_AGE_DAYS`
+    /// (14 — the same horizon as the Git snapshot, shadow and built-wheel
+    /// stores on purpose). `0` turns the reaper off entirely.
+    ///
+    /// ONE QUALIFICATION THAT BELONGS BESIDE THE NUMBER (L3-1b-23-4): unlike
+    /// every other persisted store, an entry here is NOT a pure function of its
+    /// key, because `uv pip compile` resolves against an index that moves. The
+    /// horizon is still defensible, and the reason is that the entry is what
+    /// the LOCK pinned — the lock is the artifact, and a build reproduced from
+    /// it must use the requirements it was built with, so a fresh resolve
+    /// inside the horizon would be the change rather than the cache. An
+    /// operator who wants the index re-read sets this to `0`.
+    ///
+    /// ```toml
+    /// [build.config]
+    /// retread-build-requirements-store-max-age-days = 14
+    /// ```
+    #[serde(
+        default,
+        rename = "retread-build-requirements-store-max-age-days",
+        alias = "build-requirements-store-max-age-days",
+        alias = "build_requirements_store_max_age_days"
+    )]
+    pub build_requirements_store_max_age_days: Option<u64>,
+
     /// Experimental: run the conda co-solve's resolvo probes on a thread pool
     /// instead of serially.
     ///
