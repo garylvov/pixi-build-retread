@@ -231,6 +231,24 @@ const GIT_SNAPSHOT_USE_STAMP_SUFFIX: &str = USE_STAMP_SUFFIX;
 /// reap, so a concurrent relock is never made to wait on housekeeping.
 const GIT_SNAPSHOT_REAP_LOCK_NAME: &str = ".v3.reap.lock";
 
+/// L3-1b-1a-1. The generation directory the canonical Git snapshot store WRITES
+/// under, named once instead of spelled `"v3"` at each of its sites. C18-1 wrote
+/// the literal in the writer ([`create_canonical_git_snapshot`]) and again in
+/// the reaper, and that is the same shape the built-wheel store's v12 -> v13
+/// bump turned into 1 187 202 225 B of orphans: two copies of a generation
+/// string, one of which someone will bump. The reaper no longer reads this to
+/// decide WHAT TO WALK — it walks every generation directory — only to decide
+/// which of them is CURRENT, and therefore which reason its rows carry.
+const GIT_SNAPSHOT_CACHE_VERSION: &str = "v3";
+
+/// Directory the snapshot reaper quarantines into, a sibling of the generation
+/// directories, named so the walk can never mistake it for one.
+const GIT_SNAPSHOT_QUARANTINE: &str = "quarantine";
+
+/// Directory under the store root that holds every generation of the canonical
+/// Git snapshot store.
+const GIT_SNAPSHOT_SOURCES_ROOT: &str = "canonical-git-sources";
+
 /// L3-1b-1. Where the use-stamp for one entry lives: `<parent>/.<entry>.used`.
 ///
 /// THE ONE STAMP-PATH FORMULA IN THIS MODULE, extracted so the second store to
@@ -293,6 +311,13 @@ pub(crate) struct GitSnapshotReapReport {
     pub(crate) evicted: u64,
     pub(crate) kept: u64,
     pub(crate) skipped_locked: u64,
+    /// L3-1b-1a-1. A SUBSET of `evicted`: how many came from a generation
+    /// directory other than [`GIT_SNAPSHOT_CACHE_VERSION`].
+    pub(crate) evicted_stale_version: u64,
+    /// L3-1b-1a-1. How many generation directories the walk descended into. The
+    /// READER half: without it a log cannot distinguish "one generation exists"
+    /// from "the walk only ever looks at one".
+    pub(crate) versions_walked: u64,
     /// `true` when another process held the reap try-lock and this one backed
     /// off without scanning anything.
     pub(crate) skipped_concurrent: bool,
@@ -322,9 +347,10 @@ pub(crate) fn reap_canonical_git_snapshot_store(
     if max_age.is_zero() {
         return Ok(report);
     }
-    let sources = store_root.join("canonical-git-sources");
-    let versioned = sources.join("v3");
-    if !versioned.is_dir() {
+    let sources = store_root.join(GIT_SNAPSHOT_SOURCES_ROOT);
+    // L3-1b-1a-1. The gate is the SOURCES root, not one generation under it: a
+    // store whose only generation is a retired one must still be reachable.
+    if !sources.is_dir() {
         return Ok(report);
     }
     let reap_lock_path = sources.join(GIT_SNAPSHOT_REAP_LOCK_NAME);
@@ -348,116 +374,153 @@ pub(crate) fn reap_canonical_git_snapshot_store(
         );
         return Ok(report);
     }
-    let quarantine_root = sources.join("quarantine");
+    let quarantine_root = sources.join(GIT_SNAPSHOT_QUARANTINE);
     let now = std::time::SystemTime::now();
-    for identity in read_dir_names(&versioned)? {
-        let identity_dir = versioned.join(&identity);
-        if !identity_dir.is_dir() {
+    // L3-1b-1a-1. EVERY generation directory, not just the current one. Same
+    // defect and same fix as the built-wheel store one function down; this one
+    // has not fired yet only because `v3` has not been bumped since C18-1 wrote
+    // it, and "has not been bumped yet" is not a property, it is a delay.
+    for version in read_dir_names(&sources)? {
+        if version == GIT_SNAPSHOT_QUARANTINE {
             continue;
         }
-        for ref_state in read_dir_names(&identity_dir)? {
-            let entry_dir = identity_dir.join(&ref_state);
-            if !entry_dir.is_dir() {
+        let versioned = sources.join(&version);
+        if !versioned.is_dir() {
+            continue;
+        }
+        report.versions_walked += 1;
+        // A retired generation is aged by the SAME rule and quarantined by the
+        // SAME rename. Only the row's reason differs, so a reader can tell
+        // "nobody wanted this" from "nobody CAN want this any more". It is not
+        // evicted on sight: an older checkout still reading and stamping that
+        // generation is a live user, and a reaper that raced one would be a
+        // cross-version bug, not housekeeping.
+        let reason = if version == GIT_SNAPSHOT_CACHE_VERSION {
+            REAP_REASON_UNREFERENCED
+        } else {
+            REAP_REASON_STALE_VERSION
+        };
+        for identity in read_dir_names(&versioned)? {
+            let identity_dir = versioned.join(&identity);
+            if !identity_dir.is_dir() {
                 continue;
             }
-            report.scanned += 1;
-            let Some(age) = git_snapshot_entry_age(&entry_dir, now) else {
-                report.kept += 1;
-                continue;
-            };
-            if age <= max_age {
-                report.kept += 1;
-                continue;
-            }
-            // Rule 2: an entry a writer holds is a live publish. Try, never wait.
-            let Ok(entry_lock_path) = artifact_cache_lock_path(&entry_dir) else {
-                report.kept += 1;
-                continue;
-            };
-            let Ok(entry_lock) = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .open(&entry_lock_path)
-            else {
-                report.kept += 1;
-                continue;
-            };
-            if !fs4::fs_std::FileExt::try_lock_exclusive(&entry_lock).unwrap_or(false) {
-                report.skipped_locked += 1;
-                report.kept += 1;
-                continue;
-            }
-            // Rule 3: re-state the age now that nobody else can publish here.
-            match git_snapshot_entry_age(&entry_dir, std::time::SystemTime::now()) {
-                Some(fresh) if fresh <= max_age => {
+            for ref_state in read_dir_names(&identity_dir)? {
+                let entry_dir = identity_dir.join(&ref_state);
+                if !entry_dir.is_dir() {
+                    continue;
+                }
+                report.scanned += 1;
+                let Some(age) = git_snapshot_entry_age(&entry_dir, now) else {
+                    report.kept += 1;
+                    continue;
+                };
+                if age <= max_age {
                     report.kept += 1;
                     continue;
                 }
-                None => {
+                // Rule 2: an entry a writer holds is a live publish. Try, never wait.
+                let Ok(entry_lock_path) = artifact_cache_lock_path(&entry_dir) else {
+                    report.kept += 1;
+                    continue;
+                };
+                let Ok(entry_lock) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .read(true)
+                    .write(true)
+                    .open(&entry_lock_path)
+                else {
+                    report.kept += 1;
+                    continue;
+                };
+                if !fs4::fs_std::FileExt::try_lock_exclusive(&entry_lock).unwrap_or(false) {
+                    report.skipped_locked += 1;
                     report.kept += 1;
                     continue;
                 }
-                Some(_) => {}
-            }
-            let stamp_unix = now
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let quarantine = quarantine_root.join(format!(
-                "{identity}-{ref_state}-{stamp_unix}-{}",
-                std::process::id()
-            ));
-            if let Err(error) = std::fs::create_dir_all(&quarantine_root) {
-                tracing::warn!(
-                    store = %store_root.display(),
-                    error = %error,
-                    "could not create the git snapshot store quarantine; nothing evicted",
-                );
-                report.kept += 1;
-                continue;
-            }
-            // Rule 1: RENAME. Never `remove_dir_all`, never `remove_owned_cache_entry`.
-            if let Err(error) = std::fs::rename(&entry_dir, &quarantine) {
-                tracing::warn!(
+                // Rule 3: re-state the age now that nobody else can publish here.
+                match git_snapshot_entry_age(&entry_dir, std::time::SystemTime::now()) {
+                    Some(fresh) if fresh <= max_age => {
+                        report.kept += 1;
+                        continue;
+                    }
+                    None => {
+                        report.kept += 1;
+                        continue;
+                    }
+                    Some(_) => {}
+                }
+                let stamp_unix = now
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                // L3-1b-1a-1: the GENERATION leads the quarantine name. Two
+                // generations can hold the same (identity, ref state) pair, and two
+                // entries quarantined in one pass share `now` and the pid — without
+                // the version the second `rename` would target a non-empty directory
+                // and fail, and the entry would silently be kept.
+                let quarantine = quarantine_root.join(format!(
+                    "{version}-{identity}-{ref_state}-{stamp_unix}-{}",
+                    std::process::id()
+                ));
+                if let Err(error) = std::fs::create_dir_all(&quarantine_root) {
+                    tracing::warn!(
+                        store = %store_root.display(),
+                        error = %error,
+                        "could not create the git snapshot store quarantine; nothing evicted",
+                    );
+                    report.kept += 1;
+                    continue;
+                }
+                // Rule 1: RENAME. Never `remove_dir_all`, never `remove_owned_cache_entry`.
+                if let Err(error) = std::fs::rename(&entry_dir, &quarantine) {
+                    tracing::warn!(
+                        identity = %identity,
+                        ref_state = %ref_state,
+                        error = %error,
+                        "git_snapshot_store eviction could not rename; entry kept",
+                    );
+                    report.kept += 1;
+                    continue;
+                }
+                if let Some(stamp) = git_snapshot_use_stamp_path(&entry_dir) {
+                    let _ = std::fs::rename(
+                        &stamp,
+                        quarantine.with_file_name(format!(
+                            "{}{GIT_SNAPSHOT_USE_STAMP_SUFFIX}",
+                            quarantine
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("entry")
+                        )),
+                    );
+                }
+                report.evicted += 1;
+                if reason == REAP_REASON_STALE_VERSION {
+                    report.evicted_stale_version += 1;
+                }
+                // ONE ROW PER EVICTION, the `wheel_store evicted` shape.
+                tracing::info!(
+                    version = %version,
                     identity = %identity,
                     ref_state = %ref_state,
-                    error = %error,
-                    "git_snapshot_store eviction could not rename; entry kept",
-                );
-                report.kept += 1;
-                continue;
-            }
-            if let Some(stamp) = git_snapshot_use_stamp_path(&entry_dir) {
-                let _ = std::fs::rename(
-                    &stamp,
-                    quarantine.with_file_name(format!(
-                        "{}{GIT_SNAPSHOT_USE_STAMP_SUFFIX}",
-                        quarantine
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("entry")
-                    )),
+                    age_days = age.as_secs() / 86_400,
+                    max_age_days = max_age.as_secs() / 86_400,
+                    reason = reason,
+                    quarantine = %quarantine.display(),
+                    "git_snapshot_store evicted",
                 );
             }
-            report.evicted += 1;
-            // ONE ROW PER EVICTION, the `wheel_store evicted` shape.
-            tracing::info!(
-                identity = %identity,
-                ref_state = %ref_state,
-                age_days = age.as_secs() / 86_400,
-                max_age_days = max_age.as_secs() / 86_400,
-                reason = "unreferenced",
-                quarantine = %quarantine.display(),
-                "git_snapshot_store evicted",
-            );
         }
     }
     tracing::info!(
         store = %store_root.display(),
         scanned = report.scanned,
         evicted = report.evicted,
+        evicted_stale_version = report.evicted_stale_version,
+        versions_walked = report.versions_walked,
+        current_version = GIT_SNAPSHOT_CACHE_VERSION,
         kept = report.kept,
         skipped_locked = report.skipped_locked,
         max_age_days = max_age.as_secs() / 86_400,
@@ -664,6 +727,19 @@ const BUILT_WHEEL_MARKER: &str = "artifact.json";
 /// `<kind>` directories so it can never itself be walked as one.
 const BUILT_WHEEL_QUARANTINE: &str = "quarantine";
 
+/// L3-1b-1a-1. The eviction reason for an entry that sits under the CURRENT
+/// cache version and simply has not been referenced inside `max_age`.
+const REAP_REASON_UNREFERENCED: &str = "unreferenced";
+
+/// L3-1b-1a-1. The eviction reason for an entry that sits under a cache version
+/// this binary no longer addresses. It is aged by exactly the same rule — a
+/// stale-version entry a lock referenced an hour ago is STILL LIVE to whichever
+/// binary is holding the old generation, and killing it would be a cross-version
+/// race, not housekeeping. Only the ROW differs, so an operator grepping a
+/// backend log can tell "nobody wanted this" from "nobody CAN want this any
+/// more".
+const REAP_REASON_STALE_VERSION: &str = "stale-version";
+
 /// What the reaper did, so a caller can print it and a guard can assert on it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct BuiltWheelReapReport {
@@ -671,6 +747,16 @@ pub(crate) struct BuiltWheelReapReport {
     pub(crate) evicted: u64,
     pub(crate) kept: u64,
     pub(crate) skipped_locked: u64,
+    /// L3-1b-1a-1. How many of `evicted` came from a cache-version directory
+    /// other than [`BUILT_WHEEL_CACHE_VERSION`]. A SUBSET of `evicted`, never a
+    /// second bucket beside it, so `evicted` stays the one number that answers
+    /// "how much left the store".
+    pub(crate) evicted_stale_version: u64,
+    /// L3-1b-1a-1. How many cache-version directories the walk actually
+    /// descended into, summed over the `<kind>` directories. The READER half of
+    /// the fix: without it a log cannot distinguish "there is only one
+    /// generation on disk" from "the walk only ever looks at one".
+    pub(crate) versions_walked: u64,
     /// `true` when another process held the reap try-lock and this one backed
     /// off without scanning anything.
     pub(crate) skipped_concurrent: bool,
@@ -689,6 +775,18 @@ pub(crate) struct BuiltWheelReapReport {
 /// 3. **It re-reads the age under the entry lock.** A hit can land between the
 ///    scan and the rename, so the stamp is re-stated with the lock held and an
 ///    entry that became fresh in that window is kept.
+/// 4. **L3-1b-1a-1: it walks EVERY cache-version directory, not the current
+///    one.** `<kind>/<version>/…` is enumerated, and an entry under a version
+///    other than [`BUILT_WHEEL_CACHE_VERSION`] is aged by the SAME rule and
+///    quarantined by the SAME rename, with `reason="stale-version"` instead of
+///    `reason="unreferenced"` on its row. It is emphatically NOT evicted on
+///    sight: another binary — an older checkout, a running job, a rolled-back
+///    tip — may still be reading and stamping that generation, and a reaper
+///    that deleted a live older generation would be a cross-version race, not
+///    housekeeping. What the fix buys is that the generation is REACHABLE at
+///    all. Before it, the v12 -> v13 bump in L3-1b-1a orphaned
+///    1 187 202 225 B over 20 068 files in eleven stores from the only code
+///    that could ever have reclaimed them.
 ///
 /// WHY THIS IS NOT [`reap_canonical_git_snapshot_store`] WITH A PARAMETER, and
 /// the judgement is deliberate. The two stores share rules 1-3, the `.used`
@@ -730,6 +828,9 @@ pub(crate) fn reap_built_wheel_store(
             store = %store_root.display(),
             scanned = 0,
             evicted = 0,
+            evicted_stale_version = 0,
+            versions_walked = 0,
+            current_version = BUILT_WHEEL_CACHE_VERSION,
             kept = 0,
             skipped_locked = 0,
             max_age_days = 0,
@@ -744,6 +845,9 @@ pub(crate) fn reap_built_wheel_store(
             store = %store_root.display(),
             scanned = 0,
             evicted = 0,
+            evicted_stale_version = 0,
+            versions_walked = 0,
+            current_version = BUILT_WHEEL_CACHE_VERSION,
             kept = 0,
             skipped_locked = 0,
             max_age_days = max_age.as_secs() / 86_400,
@@ -780,14 +884,49 @@ pub(crate) fn reap_built_wheel_store(
         if kind == BUILT_WHEEL_QUARANTINE {
             continue;
         }
-        let versioned = built_wheels.join(&kind).join(BUILT_WHEEL_CACHE_VERSION);
-        if !versioned.is_dir() {
+        let kind_dir = built_wheels.join(&kind);
+        if !kind_dir.is_dir() {
             continue;
         }
-        collect_built_wheel_entries(&versioned, &kind, &mut Vec::new(), &mut entries)?;
+        // L3-1b-1a-1. EVERY cache-version directory, not just the current one.
+        // This used to be a single `join(BUILT_WHEEL_CACHE_VERSION)`, and the
+        // consequence was not theoretical: L3-1b-1a bumped
+        // `BUILT_WHEEL_CACHE_VERSION` v12 -> v13 WITH NO OLD-ADDRESS FALLBACK
+        // (deliberately — a narrowing makes two old addresses one new one, so a
+        // fallback read would reintroduce the ambiguity the bump removes), and
+        // the instant that landed, every v12 entry on this filesystem became
+        // unreachable to the writer AND invisible to the reaper. Measured at the
+        // bump: 1 187 202 225 B over 20 068 files in eleven v12 stores, orphaned
+        // forever by a reaper that could never see them. A store the code stops
+        // writing is exactly the store that most needs reaping.
+        for version in read_dir_names(&kind_dir)? {
+            let versioned = kind_dir.join(&version);
+            if !versioned.is_dir() {
+                continue;
+            }
+            report.versions_walked += 1;
+            let reason = if version == BUILT_WHEEL_CACHE_VERSION {
+                REAP_REASON_UNREFERENCED
+            } else {
+                REAP_REASON_STALE_VERSION
+            };
+            // The version is part of the LABEL, and therefore of the quarantine
+            // directory name, for a reason that is not cosmetic: the same
+            // (kind, target, source) triple can exist under two generations, and
+            // two entries quarantined in one pass share `now` and the pid — so a
+            // label without the version would name one destination twice and the
+            // second `rename` would fail against a non-empty directory.
+            collect_built_wheel_entries(
+                &versioned,
+                &format!("{kind}-{version}"),
+                reason,
+                &mut Vec::new(),
+                &mut entries,
+            )?;
+        }
     }
     entries.sort_by(|left, right| left.0.cmp(&right.0));
-    for (label, entry_dir) in entries {
+    for (label, entry_dir, reason) in entries {
         report.scanned += 1;
         let Some(age) = built_wheel_entry_age(&entry_dir, now) else {
             report.kept += 1;
@@ -867,12 +1006,15 @@ pub(crate) fn reap_built_wheel_store(
             );
         }
         report.evicted += 1;
+        if reason == REAP_REASON_STALE_VERSION {
+            report.evicted_stale_version += 1;
+        }
         // ONE ROW PER EVICTION, the `git_snapshot_store evicted` shape.
         tracing::info!(
             entry = %label,
             age_days = age.as_secs() / 86_400,
             max_age_days = max_age.as_secs() / 86_400,
-            reason = "unreferenced",
+            reason = reason,
             quarantine = %quarantine.display(),
             "built_wheel_store evicted",
         );
@@ -881,6 +1023,9 @@ pub(crate) fn reap_built_wheel_store(
         store = %store_root.display(),
         scanned = report.scanned,
         evicted = report.evicted,
+        evicted_stale_version = report.evicted_stale_version,
+        versions_walked = report.versions_walked,
+        current_version = BUILT_WHEEL_CACHE_VERSION,
         kept = report.kept,
         skipped_locked = report.skipped_locked,
         max_age_days = max_age.as_secs() / 86_400,
@@ -889,7 +1034,7 @@ pub(crate) fn reap_built_wheel_store(
     Ok(report)
 }
 
-/// Descend from `<kind>/v12` until a [`BUILT_WHEEL_MARKER`] appears, and record
+/// Descend from `<kind>/<version>` until a [`BUILT_WHEEL_MARKER`] appears, and record
 /// that directory as one entry. THE MARKER, NOT THE DEPTH, IS WHAT MAKES AN
 /// ENTRY — see [`reap_built_wheel_store`] for why a depth-counting walk cannot
 /// work over a store that holds both two-segment and three-segment source
@@ -897,9 +1042,10 @@ pub(crate) fn reap_built_wheel_store(
 /// inside an entry) is never walked into and never seen as an entry of its own.
 fn collect_built_wheel_entries(
     dir: &Path,
-    kind: &str,
+    label_prefix: &str,
+    reason: &'static str,
     prefix: &mut Vec<String>,
-    out: &mut Vec<(String, PathBuf)>,
+    out: &mut Vec<(String, PathBuf, &'static str)>,
 ) -> Result<()> {
     // A store nested deeper than kind/target/family/ref-state is not a shape
     // this code writes; refusing to descend past it keeps a hand-made or
@@ -912,9 +1058,13 @@ fn collect_built_wheel_entries(
         }
         prefix.push(name);
         if child.join(BUILT_WHEEL_MARKER).is_file() {
-            out.push((format!("{kind}-{}", prefix.join("-")), child));
+            out.push((
+                format!("{label_prefix}-{}", prefix.join("-")),
+                child,
+                reason,
+            ));
         } else if prefix.len() < MAX_DEPTH {
-            collect_built_wheel_entries(&child, kind, prefix, out)?;
+            collect_built_wheel_entries(&child, label_prefix, reason, prefix, out)?;
         }
         prefix.pop();
     }
@@ -7051,8 +7201,8 @@ async fn ensure_canonical_git_snapshot_in(
     let repository_identity =
         canonical_git_repository_identity(upstream_url, resolved_sha, submodules);
     let cache_dir = store_root
-        .join("canonical-git-sources")
-        .join("v3")
+        .join(GIT_SNAPSHOT_SOURCES_ROOT)
+        .join(GIT_SNAPSHOT_CACHE_VERSION)
         .join(&repository_identity)
         .join(ref_state);
     // C15: the sealed hit, with no lock at all. See
@@ -15349,9 +15499,21 @@ version = "0.1.0"
         ref_state: &str,
         age: Option<std::time::Duration>,
     ) -> PathBuf {
+        reap_fixture_entry_in(store, GIT_SNAPSHOT_CACHE_VERSION, identity, ref_state, age)
+    }
+
+    /// L3-1b-1a-1. The same fixture, under a NAMED generation, so a guard can
+    /// build a store that holds more than one.
+    fn reap_fixture_entry_in(
+        store: &Path,
+        version: &str,
+        identity: &str,
+        ref_state: &str,
+        age: Option<std::time::Duration>,
+    ) -> PathBuf {
         let entry = store
-            .join("canonical-git-sources")
-            .join("v3")
+            .join(GIT_SNAPSHOT_SOURCES_ROOT)
+            .join(version)
             .join(identity)
             .join(ref_state);
         std::fs::create_dir_all(entry.join("repo")).expect("entry tree");
@@ -15457,7 +15619,21 @@ version = "0.1.0"
         segments: &[&str],
         age_ago: Option<std::time::Duration>,
     ) -> PathBuf {
-        let mut entry = store.join(BUILT_WHEEL_CACHE_ROOT).join(kind).join(BUILT_WHEEL_CACHE_VERSION);
+        bw_fixture_entry_in(store, kind, BUILT_WHEEL_CACHE_VERSION, segments, age_ago)
+    }
+
+    /// L3-1b-1a-1. The same fixture, under a NAMED cache version, so a guard can
+    /// build a store that holds more than one generation at once — which is
+    /// exactly the shape every store on this filesystem took the moment
+    /// `BUILT_WHEEL_CACHE_VERSION` was bumped v12 -> v13.
+    fn bw_fixture_entry_in(
+        store: &Path,
+        kind: &str,
+        version: &str,
+        segments: &[&str],
+        age_ago: Option<std::time::Duration>,
+    ) -> PathBuf {
+        let mut entry = store.join(BUILT_WHEEL_CACHE_ROOT).join(kind).join(version);
         for segment in segments {
             entry = entry.join(segment);
         }
@@ -15841,11 +16017,16 @@ version = "0.1.0"
         moved.sort();
         assert_eq!(moved.len(), 3, "one quarantine dir per eviction: {moved:?}");
         assert!(
-            moved.iter().any(|n| n.starts_with("sdist-target-a-source-stale-")),
-            "the quarantine name must carry the kind and the entry: {moved:?}",
+            moved.iter().any(|n| n.starts_with(
+                &format!("sdist-{BUILT_WHEEL_CACHE_VERSION}-target-a-source-stale-")
+            )),
+            "the quarantine name must carry the kind, THE GENERATION (L3-1b-1a-1) \
+             and the entry: {moved:?}",
         );
         assert!(
-            moved.iter().any(|n| n.starts_with("git-target-b-family-1-refs-old-")),
+            moved.iter().any(|n| n.starts_with(
+                &format!("git-{BUILT_WHEEL_CACHE_VERSION}-target-b-family-1-refs-old-")
+            )),
             "a deep entry's quarantine name must carry every segment: {moved:?}",
         );
         for name in &moved {
@@ -15869,6 +16050,384 @@ version = "0.1.0"
         let off = reap_built_wheel_store(&store, std::time::Duration::ZERO).expect("max_age 0");
         assert_eq!(off, BuiltWheelReapReport::default(), "0 must disable the reaper");
         assert!(fresh.join("pkg-1.0.0-py3-none-any.whl").is_file());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// L3-1b-1a-1. A generation directory name that is guaranteed not to be the
+    /// current one, whichever tip this file is compiled on. Written as a
+    /// function of [`BUILT_WHEEL_CACHE_VERSION`] rather than as the literal
+    /// `"v12"` on purpose: this guard has to keep meaning the same thing across
+    /// the very bump it exists because of. On `integration/4.12` at `ff1e6e5`
+    /// the current generation is `v12` and this returns `v11`; once L3-1b-1a's
+    /// `v13` lands it returns `v12`, i.e. literally the generation whose
+    /// 1 187 202 225 B this item is about.
+    fn retired_built_wheel_version() -> &'static str {
+        if BUILT_WHEEL_CACHE_VERSION == "v12" {
+            "v11"
+        } else {
+            "v12"
+        }
+    }
+
+    /// L3-1b-1a-1, AND IT IS RED ON THE TIP. `reap_built_wheel_store` walked
+    /// `<kind>/<BUILT_WHEEL_CACHE_VERSION>` and nothing else, so the instant the
+    /// generation was bumped every entry of the previous one became invisible to
+    /// the only code that could ever reclaim it — measured at the bump as
+    /// 1 187 202 225 B over 20 068 files in eleven stores. On the pre-fix code
+    /// this test scans 2 of the 4 entries below and never sees the retired
+    /// generation at all.
+    ///
+    /// FOUR THINGS ASSERTED, and the middle two are what stop the fix being a
+    /// licence to delete:
+    /// * every generation directory is WALKED (`versions_walked`, the reader
+    ///   half — a log that only ever prints one cannot distinguish "one
+    ///   generation exists" from "the walk only looks at one");
+    /// * a retired-generation entry with a FRESH `.used` stamp is KEPT. Another
+    ///   binary may still be reading and stamping that generation; the age rule
+    ///   is the same rule, not a weaker one;
+    /// * an over-age retired entry is RENAMED to quarantine, never removed, and
+    ///   its row says `reason="stale-version"` so an operator can tell it apart
+    ///   from `reason="unreferenced"`;
+    /// * the two generations' quarantine names DIFFER even though the entries
+    ///   share a (kind, target, source) triple — without the generation in the
+    ///   label both evictions in one pass name one destination, and the second
+    ///   `rename` fails against a non-empty directory and silently keeps the
+    ///   entry.
+    #[test]
+    fn the_built_wheel_reaper_walks_every_cache_version_and_names_the_stale_ones() {
+        let base = reap_scratch("bw-reap-versions");
+        let store = base.join("store");
+        let year = std::time::Duration::from_secs(365 * 86_400);
+        let hour = std::time::Duration::from_secs(3_600);
+        let max_age = std::time::Duration::from_secs(14 * 86_400);
+        let retired = retired_built_wheel_version();
+        assert_ne!(
+            retired, BUILT_WHEEL_CACHE_VERSION,
+            "the fixture's retired generation must not BE the current one, or \
+             every assertion below passes for the wrong reason",
+        );
+
+        // The SAME (kind, target, source) triple in both generations, which is
+        // what a narrowing bump produces on a real store.
+        let current_stale = bw_fixture_entry_in(
+            &store,
+            "sdist",
+            BUILT_WHEEL_CACHE_VERSION,
+            &["target-a", "src-stale"],
+            Some(year),
+        );
+        let current_fresh = bw_fixture_entry_in(
+            &store,
+            "sdist",
+            BUILT_WHEEL_CACHE_VERSION,
+            &["target-a", "src-fresh"],
+            Some(hour),
+        );
+        let retired_stale = bw_fixture_entry_in(
+            &store,
+            "sdist",
+            retired,
+            &["target-a", "src-stale"],
+            Some(year),
+        );
+        let retired_fresh = bw_fixture_entry_in(
+            &store,
+            "sdist",
+            retired,
+            &["target-a", "src-fresh"],
+            Some(hour),
+        );
+
+        let (report, rows) =
+            with_captured_built_wheel_rows(|| reap_built_wheel_store(&store, max_age));
+        let report = report.expect("a two-generation store reaps");
+
+        assert_eq!(
+            report.versions_walked, 2,
+            "BOTH generation directories must be walked; the pre-fix walk reaches \
+             exactly one: {report:?}",
+        );
+        assert_eq!(
+            report.scanned, 4,
+            "every entry of every generation is scanned; the pre-fix walk scans \
+             the 2 current ones and orphans the rest: {report:?}",
+        );
+        assert_eq!(report.evicted, 2, "one over-age entry per generation: {report:?}");
+        assert_eq!(
+            report.evicted_stale_version, 1,
+            "`evicted_stale_version` is a SUBSET of `evicted`, and exactly one of \
+             the two came from the retired generation: {report:?}",
+        );
+        assert_eq!(report.kept, 2, "{report:?}");
+
+        assert!(
+            !retired_stale.exists(),
+            "an over-age entry in a retired generation must be reaped, not \
+             orphaned forever",
+        );
+        assert!(
+            retired_fresh.join("pkg-1.0.0-py3-none-any.whl").is_file(),
+            "A RETIRED GENERATION IS NOT A LICENCE TO DELETE: an entry stamped an \
+             hour ago is live to whichever binary stamped it, and the age rule is \
+             the same rule",
+        );
+        assert!(!current_stale.exists());
+        assert!(current_fresh.join("pkg-1.0.0-py3-none-any.whl").is_file());
+
+        let joined = rows.join("");
+        assert!(
+            joined.contains("reason=\"stale-version\""),
+            "the retired-generation eviction must carry its own reason: {joined}",
+        );
+        assert!(
+            joined.contains("reason=\"unreferenced\""),
+            "and the current-generation eviction must keep the old one, or the \
+             two are indistinguishable in the other direction: {joined}",
+        );
+        assert!(
+            joined.contains("versions_walked=2")
+                && joined.contains("evicted_stale_version=1")
+                && joined.contains(&format!(
+                    "current_version=\"{BUILT_WHEEL_CACHE_VERSION}\""
+                )),
+            "the summary row must say how many generations it walked, how many \
+             stale-generation entries it moved, and which generation is current: \
+             {joined}",
+        );
+
+        // NEVER `rm`, and the two triples must not have collided.
+        let quarantine = store.join(BUILT_WHEEL_CACHE_ROOT).join(BUILT_WHEEL_QUARANTINE);
+        let mut moved: Vec<String> = std::fs::read_dir(&quarantine)
+            .expect("the quarantine must exist once something was evicted")
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| !name.ends_with(USE_STAMP_SUFFIX))
+            .collect();
+        moved.sort();
+        assert_eq!(
+            moved.len(),
+            2,
+            "two entries sharing a (kind, target, source) triple across two \
+             generations must land in two DISTINCT quarantine directories — with \
+             the generation missing from the label they name one destination, and \
+             the second rename fails against a non-empty directory: {moved:?}",
+        );
+        assert!(
+            moved
+                .iter()
+                .any(|n| n.starts_with(&format!("sdist-{retired}-target-a-src-stale-"))),
+            "the retired entry's quarantine name must name its generation: {moved:?}",
+        );
+        assert!(
+            moved.iter().any(|n| n
+                .starts_with(&format!("sdist-{BUILT_WHEEL_CACHE_VERSION}-target-a-src-stale-"))),
+            "and so must the current one: {moved:?}",
+        );
+        for name in &moved {
+            assert_eq!(
+                std::fs::read_to_string(quarantine.join(name).join("pkg-1.0.0-py3-none-any.whl"))
+                    .expect("a quarantined entry keeps its bytes"),
+                "wheel-bytes\n",
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// L3-1b-1a-1, AND IT EXISTS BECAUSE A MUTATION GOT AWAY. Mutation run 1
+    /// (job 5961869) declared an arm RED that came out GREEN: it bypassed the
+    /// age rule for a stale-version entry AT THE SCAN-TIME CHECK ONLY, and
+    /// nothing failed, because the reaper reads the age a SECOND time under the
+    /// entry lock (rule 3) and that unmutated read kept the entry. A mutation no
+    /// guard can fail is a missing guard, not a matrix accident (law 3), so this
+    /// is the guard.
+    ///
+    /// WHAT IT PINS, and it is the observable difference that arm left behind:
+    /// an entry the SCAN-TIME check keeps is never locked at all — the `continue`
+    /// happens before `artifact_cache_lock_path` — so no `.<entry>.lock` sidecar
+    /// appears beside it. Let the scan-time check fall through and the reaper
+    /// CREATES that sidecar (the open is `create(true)`) on its way to being
+    /// overruled by rule 3. The sidecar is therefore a witness that the first
+    /// gate stopped working even when the second one covers for it, and this
+    /// asserts on the witness.
+    ///
+    /// It is a real property and not only a mutation detector: taking a lock on
+    /// every fresh entry of a large store is a write per entry against a shared
+    /// cache directory, which is the kind of housekeeping cost C18-1's rule 2
+    /// exists to refuse.
+    #[test]
+    fn a_fresh_entry_is_kept_by_the_scan_and_is_never_locked_at_all() {
+        let base = reap_scratch("bw-reap-nolock");
+        let store = base.join("store");
+        let hour = std::time::Duration::from_secs(3_600);
+        let year = std::time::Duration::from_secs(365 * 86_400);
+        let max_age = std::time::Duration::from_secs(14 * 86_400);
+        let retired = retired_built_wheel_version();
+
+        let current_fresh = bw_fixture_entry_in(
+            &store,
+            "sdist",
+            BUILT_WHEEL_CACHE_VERSION,
+            &["target-a", "src-fresh"],
+            Some(hour),
+        );
+        let retired_fresh =
+            bw_fixture_entry_in(&store, "sdist", retired, &["target-a", "src-fresh"], Some(hour));
+        // THE NON-VACUITY CONTROL. An entry that really is over age MUST be
+        // locked, so the assertion below cannot pass because the reaper never
+        // locks anything.
+        let retired_stale =
+            bw_fixture_entry_in(&store, "sdist", retired, &["target-a", "src-stale"], Some(year));
+
+        let lock_of = |entry: &Path| artifact_cache_lock_path(entry).expect("lock path");
+        for entry in [&current_fresh, &retired_fresh, &retired_stale] {
+            assert!(
+                !lock_of(entry).exists(),
+                "the fixture must start with no lock sidecar: {}",
+                lock_of(entry).display(),
+            );
+        }
+
+        let report = reap_built_wheel_store(&store, max_age).expect("the reaper must run");
+        assert_eq!(report.scanned, 3, "{report:?}");
+        assert_eq!(report.evicted, 1, "only the over-age entry moves: {report:?}");
+        assert_eq!(report.skipped_locked, 0, "{report:?}");
+
+        assert!(
+            !lock_of(&current_fresh).exists(),
+            "a fresh CURRENT-generation entry must be kept by the scan and never \
+             locked; a lock sidecar at {} means the scan-time age check stopped \
+             deciding and rule 3 is silently carrying it",
+            lock_of(&current_fresh).display(),
+        );
+        assert!(
+            !lock_of(&retired_fresh).exists(),
+            "and a fresh RETIRED-generation entry must be kept by the SAME scan, \
+             on the same rule; a lock sidecar at {} is the mutation run 1's M3 \
+             let through",
+            lock_of(&retired_fresh).display(),
+        );
+        // The control: the reaper DOES lock what it is about to move, so the two
+        // assertions above are not true of every input.
+        assert!(
+            lock_of(&retired_stale).exists(),
+            "an over-age entry must have been locked before it was renamed, or \
+             this guard passes because the reaper locks nothing at all: expected \
+             {}",
+            lock_of(&retired_stale).display(),
+        );
+        assert!(!retired_stale.exists(), "and it must actually have moved");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// L3-1b-1a-1, THE SIBLING STORE. C18-1's snapshot reaper had the identical
+    /// shape defect — `sources.join("v3")`, one generation, with the literal
+    /// spelled a second time in the writer — and it has not bitten only because
+    /// `v3` has not been bumped since it was written. "Has not been bumped yet"
+    /// is a delay, not a property, and the built-wheel store is what it looks
+    /// like when the delay runs out.
+    ///
+    /// The third reaper, `courier::reap_shadow_cache_store`, is DELIBERATELY not
+    /// changed and this is where that is recorded: its store is
+    /// `<root>/shadow/<entry file>` with NO generation directory at all — the
+    /// code version is folded into the entry KEY instead — so every entry it
+    /// will ever have is already in the one directory it already walks, and a
+    /// code-version bump retires entries by making them unreferenced, which the
+    /// age rule already reaps. There is nothing there to walk wider.
+    #[test]
+    fn the_git_snapshot_reaper_walks_every_schema_version_and_names_the_stale_ones() {
+        let base = reap_scratch("gs-reap-versions");
+        let store = base.join("store");
+        let year = std::time::Duration::from_secs(365 * 86_400);
+        let hour = std::time::Duration::from_secs(3_600);
+        let max_age = std::time::Duration::from_secs(14 * 86_400);
+        let retired = if GIT_SNAPSHOT_CACHE_VERSION == "v2" { "v1" } else { "v2" };
+        assert_ne!(retired, GIT_SNAPSHOT_CACHE_VERSION, "non-vacuity");
+
+        let current_stale = reap_fixture_entry_in(
+            &store,
+            GIT_SNAPSHOT_CACHE_VERSION,
+            "identity-a",
+            "refs-stale",
+            Some(year),
+        );
+        let retired_stale =
+            reap_fixture_entry_in(&store, retired, "identity-a", "refs-stale", Some(year));
+        let retired_fresh =
+            reap_fixture_entry_in(&store, retired, "identity-a", "refs-fresh", Some(hour));
+
+        let (report, rows) = with_captured_built_wheel_rows(|| {
+            reap_canonical_git_snapshot_store(&store, max_age)
+        });
+        let report = report.expect("a two-generation snapshot store reaps");
+
+        assert_eq!(
+            report.versions_walked, 2,
+            "both generation directories must be walked: {report:?}",
+        );
+        assert_eq!(
+            report.scanned, 3,
+            "the pre-fix walk scans the single current entry and orphans the two \
+             retired ones: {report:?}",
+        );
+        assert_eq!(report.evicted, 2, "{report:?}");
+        assert_eq!(report.evicted_stale_version, 1, "{report:?}");
+        assert!(!current_stale.exists());
+        assert!(!retired_stale.exists());
+        assert!(
+            retired_fresh.join("repo").join("base.txt").is_file(),
+            "a retired generation is not a licence to delete a freshly stamped \
+             entry",
+        );
+
+        let joined = rows.join("");
+        assert!(
+            joined.contains("reason=\"stale-version\"")
+                && joined.contains("reason=\"unreferenced\""),
+            "both reasons must appear, or the two evictions are indistinguishable: \
+             {joined}",
+        );
+        assert!(
+            joined.contains("versions_walked=2")
+                && joined.contains(&format!(
+                    "current_version=\"{GIT_SNAPSHOT_CACHE_VERSION}\""
+                )),
+            "the summary row must name the generations it walked and the current \
+             one: {joined}",
+        );
+
+        let quarantine = reap_quarantine_dir(&store);
+        let mut moved: Vec<String> = std::fs::read_dir(&quarantine)
+            .expect("the quarantine must exist once something was evicted")
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| !name.ends_with(GIT_SNAPSHOT_USE_STAMP_SUFFIX))
+            .collect();
+        moved.sort();
+        assert_eq!(
+            moved.len(),
+            2,
+            "the two generations' entries share an (identity, ref state) pair and \
+             must still land in two distinct quarantine directories: {moved:?}",
+        );
+        assert!(
+            moved
+                .iter()
+                .any(|n| n.starts_with(&format!("{retired}-identity-a-refs-stale-"))),
+            "{moved:?}",
+        );
+        assert!(
+            moved.iter().any(|n| n
+                .starts_with(&format!("{GIT_SNAPSHOT_CACHE_VERSION}-identity-a-refs-stale-"))),
+            "{moved:?}",
+        );
+        for name in &moved {
+            assert_eq!(
+                std::fs::read_to_string(quarantine.join(name).join("repo").join("base.txt"))
+                    .expect("a quarantined entry keeps its bytes"),
+                "base\n",
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -16008,8 +16567,11 @@ version = "0.1.0"
         moved.sort();
         assert_eq!(moved.len(), 2, "one quarantine dir per eviction: {moved:?}");
         assert!(
-            moved.iter().any(|n| n.starts_with("identity-stale-refs-stale-")),
-            "the quarantine name must carry the entry it came from: {moved:?}",
+            moved.iter().any(|n| n.starts_with(
+                &format!("{GIT_SNAPSHOT_CACHE_VERSION}-identity-stale-refs-stale-")
+            )),
+            "the quarantine name must carry THE GENERATION (L3-1b-1a-1) and the \
+             entry it came from: {moved:?}",
         );
         let recovered: Vec<String> = moved
             .iter()
