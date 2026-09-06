@@ -701,11 +701,43 @@ pub(crate) fn reap_built_wheel_store(
     max_age: std::time::Duration,
 ) -> Result<BuiltWheelReapReport> {
     let mut report = BuiltWheelReapReport::default();
+    // MERGE-N-5. BOTH refusals emit the summary row before returning, and this
+    // is MERGE-M-2's defect one store over -- boarded in the very commit that
+    // landed this reaper. It used to be two silent `return Ok(report)`s, so a job
+    // in which the reaper RAN and found nothing was INDISTINGUISHABLE IN THE LOG
+    // from a job in which it was never called. B22's proof (mBP/mBR-relock) is
+    // the case, measured: `built_wheel_store` appears in ZERO of 391 890 stripped
+    // lines, and the only way that lane could show the block had executed was to
+    // point at the SIBLING `reap_git_snapshot_store_once`, which printed 15 rows.
+    // The ABSENT-STORE arm is the ORDINARY arm of a cold run, not an edge case:
+    // `reap_built_wheel_store_once` is a `call_once` that fires BEFORE the first
+    // publish creates `<store root>/built-wheels`, so on every cold job the one
+    // arm that ran was the one arm that said nothing.
     if max_age.is_zero() {
+        tracing::info!(
+            store = %store_root.display(),
+            scanned = 0,
+            evicted = 0,
+            kept = 0,
+            skipped_locked = 0,
+            max_age_days = 0,
+            reason = "disabled",
+            "built_wheel_store reap",
+        );
         return Ok(report);
     }
     let built_wheels = store_root.join(BUILT_WHEEL_CACHE_ROOT);
     if !built_wheels.is_dir() {
+        tracing::info!(
+            store = %store_root.display(),
+            scanned = 0,
+            evicted = 0,
+            kept = 0,
+            skipped_locked = 0,
+            max_age_days = max_age.as_secs() / 86_400,
+            reason = "store-absent",
+            "built_wheel_store reap",
+        );
         return Ok(report);
     }
     let reap_lock_path = built_wheels.join(BUILT_WHEEL_REAP_LOCK_NAME);
@@ -15362,6 +15394,132 @@ version = "0.1.0"
             job_b("RETREAD_CACHE_DIR"),
             "the guard would be vacuous if the two job-local roots agreed",
         );
+    }
+
+    /// Keep every row a body emits, so a test can assert on what an OPERATOR
+    /// would have been able to grep out of a job's backend log. Same shape as
+    /// `courier::tests::with_captured_rows` (MERGE-M-2's reader), because this
+    /// is the same defect one store over and the same evidence answers it.
+    struct CapturedBuiltWheelRows(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl std::io::Write for CapturedBuiltWheelRows {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(buf).to_string());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn with_captured_built_wheel_rows<T>(body: impl FnOnce() -> T) -> (T, Vec<String>) {
+        let rows = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer({
+                let rows = std::sync::Arc::clone(&rows);
+                move || CapturedBuiltWheelRows(std::sync::Arc::clone(&rows))
+            })
+            .finish();
+        let value = tracing::subscriber::with_default(subscriber, body);
+        let rows = rows.lock().unwrap().clone();
+        (value, rows)
+    }
+
+    /// MERGE-N-5, AND IT IS RED ON THE TIP. `reap_built_wheel_store` opened with
+    /// two SILENT `return Ok(report)`s — `max_age.is_zero()` and
+    /// `!built_wheels.is_dir()` — so a cold job could not tell "the reaper ran
+    /// against a store that does not exist yet" from "the reaper was never
+    /// called". That is not an edge case: `reap_built_wheel_store_once` is a
+    /// `call_once` that fires BEFORE the first publish creates
+    /// `<store root>/built-wheels`, so the absent-store arm is the ORDINARY arm
+    /// of every cold run. B22's proof had ZERO `built_wheel_store` rows in
+    /// 391 890 stripped lines and had to prove the block ran by pointing at the
+    /// SIBLING `git_snapshot_store` reap rows.
+    ///
+    /// This is MERGE-M-2's fix one store over, and the assertion is the same:
+    /// on the ROW, not on the report. The report was already right; the row was
+    /// the thing missing. All three arms are here so the test cannot pass by
+    /// accident — an absent store, a disabled reaper, and, as the non-vacuity
+    /// control, a real store that must keep printing the row it always printed.
+    #[test]
+    fn every_built_wheel_reap_prints_its_summary_row_including_the_two_refusals() {
+        let base = reap_scratch("bw-reap-rows");
+        let max_age = std::time::Duration::from_secs(14 * 86_400);
+
+        // (1) THE STORE DOES NOT EXIST YET -- a cold job, every time.
+        let absent = base.join("never-created");
+        assert!(!absent.join(BUILT_WHEEL_CACHE_ROOT).exists());
+        let (report, rows) =
+            with_captured_built_wheel_rows(|| reap_built_wheel_store(&absent, max_age));
+        assert_eq!(
+            report.expect("an absent store is not an error"),
+            BuiltWheelReapReport::default(),
+            "an absent store reaps nothing -- the BEHAVIOUR is unchanged",
+        );
+        let joined = rows.join("");
+        assert!(
+            joined.contains("built_wheel_store reap"),
+            "an absent store must still print the summary row, or the reader \
+             cannot tell it ran: rows were {rows:?}",
+        );
+        assert!(
+            joined.contains("scanned=0") && joined.contains("reason=\"store-absent\""),
+            "the absent-store row carries scanned=0 and names why: {joined}",
+        );
+        assert!(
+            joined.contains(absent.display().to_string().as_str()),
+            "the row names the store root it looked under: {joined}",
+        );
+
+        // (2) THE REAPER IS TURNED OFF. Same requirement, different reason.
+        let store = base.join("store");
+        let live = bw_fixture_entry(
+            &store,
+            "sdist",
+            &["target-a", "source-fresh"],
+            Some(std::time::Duration::from_secs(3_600)),
+        );
+        let (off, rows) = with_captured_built_wheel_rows(|| {
+            reap_built_wheel_store(&store, std::time::Duration::ZERO)
+        });
+        assert_eq!(
+            off.expect("max_age 0 is the OFF switch, not an error"),
+            BuiltWheelReapReport::default(),
+        );
+        let joined = rows.join("");
+        assert!(
+            joined.contains("built_wheel_store reap") && joined.contains("reason=\"disabled\""),
+            "a disabled reaper says so instead of saying nothing: {joined}",
+        );
+        assert!(
+            live.join("pkg-1.0.0-py3-none-any.whl").is_file(),
+            "and the OFF switch still evicts nothing",
+        );
+
+        // (3) NON-VACUITY CONTROL. A real store still prints the row it always
+        // printed, so arms 1 and 2 are not passing because the assertion is
+        // trivially true of every input.
+        let (populated, rows) =
+            with_captured_built_wheel_rows(|| reap_built_wheel_store(&store, max_age));
+        let populated = populated.expect("a populated store reaps");
+        assert_eq!(populated.scanned, 1);
+        assert_eq!(populated.evicted, 0);
+        let joined = rows.join("");
+        assert!(
+            joined.contains("built_wheel_store reap") && joined.contains("scanned=1"),
+            "the populated arm still prints its own row: {joined}",
+        );
+        assert!(
+            !joined.contains("reason=\"store-absent\"") && !joined.contains("reason=\"disabled\""),
+            "and it is NOT one of the refusal rows: {joined}",
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// THE REAPER. Four entries — one unreferenced for a year, one referenced
