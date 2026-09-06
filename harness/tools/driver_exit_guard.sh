@@ -482,7 +482,7 @@ if [ "$WHICH" = all ] || [ "$WHICH" = B ]; then
       case "$vk" in
         COVERED)    printf '%s\t%s\n' "$va" "$vb" >> "$rec/binds.tsv" ;;
         UNCOVERED)  unc="$unc $vb(basename '$va' is not a command the seam stubs)" ;;
-        UNRESOLVED) unres="$unres \$$va at line $vb: $vc;" ;;
+        UNRESOLVED) unres="$unres [$va] at line $vb: $vc;" ;;
       esac
     done < <(deg_scan_path_verdicts "$f")
     if [ -n "$unres" ]; then

@@ -157,6 +157,12 @@ if [ "$WHICH" = all ] || [ "$WHICH" = 4 ]; then
     git -C "$REPO" cat-file blob "$SEAM_PREFIX_COMMIT:harness/tools/driver_exit_scan.sh" \
       > "$W/seamarm/old_scan.sh" 2>/dev/null
     BINP=/oscar/data/stellex/glvov/agrescap/tasks/retread-4-11/binsnaps/integration-cbed649/pixi-build-retread
+    # NOT `.sbatch`, and measured rather than assumed: DEG_ARMS_DIR is normally
+    # inside the task tree (the arms job wants its logs kept as evidence), and
+    # the first version of this arm wrote TIP.sbatch / RETREAD_BIN.sbatch there
+    # -- two files at depth 5, which turned the guard's own "depth 3 is
+    # complete" control RED in every arm run afterwards. An arm must not add
+    # members to the set the guard discovers.
     for vn in TIP RETREAD_BIN; do
       {
         echo '#!/bin/bash'
@@ -165,7 +171,7 @@ if [ "$WHICH" = all ] || [ "$WHICH" = 4 ]; then
         echo "\"\$$vn\" store-reap --store shadow --dry-run"
         echo 'rc=$?'
         echo 'exit "$rc"'
-      } > "$W/seamarm/$vn.sbatch"
+      } > "$W/seamarm/$vn.wrapper"
     done
     # THE OLD FILE. Its verdict function is deg_path_token_covered <token>.
     old_tip=$(bash -c '. "$1" >/dev/null 2>&1; deg_path_token_covered "$2"; echo $?' _ "$W/seamarm/old_scan.sh" '"$TIP"')
@@ -175,8 +181,8 @@ if [ "$WHICH" = all ] || [ "$WHICH" = 4 ]; then
     [ "$old_rb" = 0 ] && ok "ARM 4 PRE-FIX: '\$RETREAD_BIN' was ACCEPTED on the same resolved binary -- name, not capability" \
                       || no "ARM 4 PRE-FIX: '\$RETREAD_BIN' was refused too, so the old verdicts do not differ and the arm proves nothing"
     # THE NEW FILE. Same two tokens, same resolved value, one verdict.
-    new_tip=$(bash "$REPO/harness/tools/driver_exit_scan.sh" verdicts "$W/seamarm/TIP.sbatch")
-    new_rb=$(bash "$REPO/harness/tools/driver_exit_scan.sh" verdicts "$W/seamarm/RETREAD_BIN.sbatch")
+    new_tip=$(bash "$REPO/harness/tools/driver_exit_scan.sh" verdicts "$W/seamarm/TIP.wrapper")
+    new_rb=$(bash "$REPO/harness/tools/driver_exit_scan.sh" verdicts "$W/seamarm/RETREAD_BIN.wrapper")
     tipv=$(printf '%s' "$new_tip" | cut -f1); tipp=$(printf '%s' "$new_tip" | cut -f3)
     rbv=$(printf '%s' "$new_rb" | cut -f1);  rbp=$(printf '%s' "$new_rb" | cut -f3)
     [ "$tipv" = COVERED ] && [ "$rbv" = COVERED ] \
@@ -220,7 +226,10 @@ if [ "$WHICH" = all ] || [ "$WHICH" = 5 ]; then
   rc5=$(run_guard arm5 DEG_EXPLORATORY=1 DEG_ONLY='harnessseam1/mutarm/*.sbatch')
   d_bypath=$(grep -c 'BYPATH  B harnessseam1/mutarm/derived.sbatch' "$W/arm5.log")
   d_ref=$(grep -c 'REFUSE  B harnessseam1/mutarm/derived.sbatch' "$W/arm5.log")
-  d_pay=$(grep -c 'PAYLOAD.*pixi-build-retread' "$W/arm5.log")
+  # THE ARGV RECORDER'S OWN SUMMARY, which is what the guard prints. A raw
+  # `PAYLOAD` row lives in argv-all.log inside the guard's temp dir and never
+  # reaches this log, so grepping for one here passes only by accident.
+  d_pay=$(grep -cE '^###[[:space:]]+[0-9]+ pixi-build-retread' "$W/arm5.log")
   u_ref=$(grep -c 'REFUSE  B harnessseam1/mutarm/unresolvable.sbatch: payload invoked by path through a variable that cannot be resolved' "$W/arm5.log")
   u_named=$(grep -c 'ZOGGLE_PAYLOAD_2026' "$W/arm5.log")
   can5=$(grep -c 'CANARY FIRED' "$W/arm5.log")
@@ -239,35 +248,56 @@ if [ "$WHICH" = all ] || [ "$WHICH" = 5 ]; then
 fi
 
 # ---------------------------------------------------------------- ARM 6 -----
-# HARNESS-SEAM-1. A LITERAL by-path payload -- the real cargo, at the real
-# path sr2-work/check.sbatch puts on its PATH -- must be STUBBED, and removing
-# the cargo stub must turn that same wrapper into a REFUSAL. This is ARM 2's
-# assertion for the half PATH and functions cannot reach.
+# HARNESS-SEAM-1. A LITERAL by-path payload -- no variable anywhere -- must be
+# STUBBED, and dropping the cargo stub must turn that same wrapper into a
+# REFUSAL. That is ARM 2's assertion for the half PATH and functions cannot
+# reach. A THIRD half, measured rather than assumed: a resolved path the seam
+# CANNOT place a stub at is a refusal too, never an execution -- on this host
+# `/users` is a separate mount and bwrap will not bind into it (the same reason
+# the `/users/glvov/.cache` tmpfs candidate is DROPPED), and the first version
+# of this arm used /users/glvov/.cargo/bin/cargo as its control and got exactly
+# that refusal. The refusal is right; the fixture was wrong.
 if [ "$WHICH" = all ] || [ "$WHICH" = 6 ]; then
   echo "=== ARM 6 -- a payload invoked by its literal path"
   mkdir -p "$MUTDIR2" || { echo "ARMS FATAL: cannot write $MUTDIR2"; exit 4; }
+  CARGOLIT=$TASK/binsnaps/hs1-bypath-fixture/cargo
   {
     echo '#!/bin/bash'
     echo '#SBATCH --job-name=hs1-mutarm-bypath-cargo'
     echo 'set -u'
-    echo '/users/glvov/.cargo/bin/cargo check --all-targets -j 1'
+    echo "$CARGOLIT check --all-targets -j 1"
     echo 'rc=$?'
     echo 'exit "$rc"'
   } > "$MUTDIR2/bypath_cargo.sbatch"
+  {
+    echo '#!/bin/bash'
+    echo '#SBATCH --job-name=hs1-mutarm-unplaceable'
+    echo 'set -u'
+    echo '/users/glvov/.cargo/bin/cargo check --all-targets -j 1'
+    echo 'rc=$?'
+    echo 'exit "$rc"'
+  } > "$MUTDIR2/unplaceable.sbatch"
   rc6c=$(run_guard arm6ctl DEG_EXPLORATORY=1 DEG_ONLY='harnessseam1/mutarm/bypath_cargo.sbatch')
   rc6m=$(run_guard arm6mut DEG_EXPLORATORY=1 DEG_ONLY='harnessseam1/mutarm/bypath_cargo.sbatch' DEG_DROP_STUBS=cargo)
-  c_pay=$(grep -cE 'PAYLOAD[[:space:]]+cargo' "$W/arm6ctl.log")
+  rc6u=$(run_guard arm6unp DEG_EXPLORATORY=1 DEG_ONLY='harnessseam1/mutarm/unplaceable.sbatch')
+  c_pay=$(grep -cE '^###[[:space:]]+[0-9]+ cargo' "$W/arm6ctl.log")
   c_can=$(grep -c 'CANARY FIRED' "$W/arm6ctl.log")
   m_ref=$(grep -c 'REFUSE  B harnessseam1/mutarm/bypath_cargo.sbatch' "$W/arm6mut.log")
   m_can=$(grep -c 'CANARY FIRED' "$W/arm6mut.log")
-  [ "$c_pay" -gt 0 ] && ok "ARM 6 CONTROL: the LITERAL /users/glvov/.cargo/bin/cargo was intercepted and stubbed, not run" \
-                     || no "ARM 6 CONTROL: no cargo PAYLOAD row -- the by-path seam did not intercept (log $W/arm6ctl.log)"
+  u_ref=$(grep -c 'REFUSE  B harnessseam1/mutarm/unplaceable.sbatch: the seam cannot PLACE its stub' "$W/arm6unp.log")
+  u_can=$(grep -c 'CANARY FIRED' "$W/arm6unp.log")
+  [ "$c_pay" -gt 0 ] && ok "ARM 6 CONTROL: a LITERAL path with no variable in it was intercepted and stubbed, not run" \
+                     || no "ARM 6 CONTROL: no cargo in the recorder -- the by-path seam did not intercept (log $W/arm6ctl.log)"
   [ "$c_can" -eq 0 ] && ok "ARM 6 CONTROL: no canary fired" \
                      || no "ARM 6 CONTROL: THE CANARY FIRED -- a real cargo was reachable"
   [ "$m_ref" -gt 0 ] && ok "ARM 6 MUTANT: with the cargo stub dropped the same wrapper is REFUSED, not run" \
                      || no "ARM 6 MUTANT: no refusal -- by-path coverage is not derived from the stub (log $W/arm6mut.log)"
   [ "$m_can" -eq 0 ] && ok "ARM 6 MUTANT: no canary fired either" \
                      || no "ARM 6 MUTANT: THE CANARY FIRED"
+  [ "$u_ref" -gt 0 ] && ok "ARM 6 UNPLACEABLE: a path bwrap will not bind into is a REFUSAL naming the path, not a run" \
+                     || no "ARM 6 UNPLACEABLE: no such refusal -- an unstubable by-path payload was run or passed (log $W/arm6unp.log)"
+  [ "$u_can" -eq 0 ] && ok "ARM 6 UNPLACEABLE: no canary fired -- the real cargo was never reached" \
+                     || no "ARM 6 UNPLACEABLE: THE CANARY FIRED -- a real cargo ran"
   rm -rf "$MUTDIR2"
 fi
 

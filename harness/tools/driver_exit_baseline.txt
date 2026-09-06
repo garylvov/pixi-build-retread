@@ -32,8 +32,8 @@ SWALLOW harnessexit2/proof-control.sbatch            # HARNESS-EXIT-2's control,
 # payload it cannot intercept. A refusal costs one row; an execution costs a
 # lane (STORE-REAP-2 ran a real `cargo check` and a real store-reap dry run on
 # the login node exactly this way).
-UNCOVERED p2e-candidate-scope/artifacts/p2e_cert_install.sbatch  # command-position `"$C"` / `"$WS"`: the scanner cannot prove those are directories and not binaries
-UNCOVERED p2f-routed-channel/artifacts/p2f_gate.sbatch           # same two tokens, same file family
+UNCOVERED p2e-candidate-scope/artifacts/p2e_cert_install.sbatch  # HARNESS-SEAM-1: command-position `"$C"` / `"$WS"` RESOLVE (to /oscar/.../certc25p2e-999999 and ws.P2E-999999) and their basenames are not commands the seam stubs -- an over-report of command position, refused for a stated value
+UNCOVERED p2f-routed-channel/artifacts/p2f_gate.sbatch           # same two tokens, same file family, same resolved-basename verdict
 
 # NOT HERE, and deliberately: `l3-work/hold.sbatch` and `l31-work/hold.sbatch`.
 # They were baselined as swallowers in the first draft of this file and that
