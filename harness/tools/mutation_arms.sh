@@ -1,0 +1,210 @@
+#!/usr/bin/env bash
+# mutation_arms.sh -- THE VERSIONED MUTATION-ARM TEMPLATE.  L3-1b-1a-2.
+#
+# Law 3: "every change lands with its guard test; a guard that cannot fail is a
+# defect".  The way this campaign shows a guard CAN fail is a mutation matrix --
+# one arm per single-variable mutation of the code under guard, each arm a FRESH
+# COPY of the worktree so the worktree itself is never dirtied and law 11 never
+# comes near it.  Every lane that has done this (L3-1b-1, L3-1b-1a, p6ad-4,
+# p6ad-4-3, MERGE-N-5) wrote its own `mutations.sh` BY COPYING THE PREVIOUS
+# LANE'S COPY OUT OF A TASK DIRECTORY -- and `agrescap/tasks` is not a git
+# repository (CLAUDE.md law 7), so the whole derivation chain lived in
+# unversioned files, one `rm` from gone, with every lane's bug fix stranded in
+# the copy that fixed it.  L3-1b-1a fixed the arm-cleanup defect in ITS copy and
+# BOARDED that `l31b1-work/mutations.sh` still had it.  This file ends that: the
+# template is versioned here, a lane SOURCES it and declares only its arms, and
+# a fix lands once.
+#
+#   usage, from a lane's own matrix script:
+#
+#     source "$T/tools/mutation_arms.sh"
+#     JOB_ROOT=$T/<lane>-work  WT=<worktree>  A_DIR=$JOB_ROOT/mut  MUT_JOBS=1 \
+#       mut_init
+#     GUARDS=( name_of_guard_one name_of_guard_two )
+#     run_arm BASE src/foo.rs ""            GREEN || bad=$((bad+1))
+#     run_arm M1   src/foo.rs 's|a|b|'      RED   || bad=$((bad+1))
+#     mut_done "$bad"
+#
+# ── THE TWO DEFECTS THIS TEMPLATE EXISTS TO MAKE UNREPEATABLE ────────────────
+#
+# (1) ARM SCRATCH LANDED IN `/tmp`, AND `/tmp` IS NOT ALWAYS A DISK.  The
+#     inherited `run_arm` put every arm's full worktree-plus-`target/` copy under
+#     `${SLURM_TMPDIR:-/tmp}` and removed an arm directory only at the START of
+#     an arm OF THE SAME NAME, so nine differently-named arms accumulated nine
+#     copies.  Job 5954481 died `OUT_OF_MEMORY 0:125` in arm M7 at `MaxRSS
+#     100662600K` = 96.0 GiB exactly against `ReqMem 96G`.
+#
+#     THE HONEST HISTORY, because a fix built on a wrong diagnosis is the next
+#     defect: the FIRST diagnosis of 5954481 was "/tmp is RAM-backed and nine
+#     accumulated copies are the cause", and `df -PT` on that node says `/tmp`
+#     is DISK, so on THAT node the copies cost inodes and bytes and not one byte
+#     of RSS.  The OOM was `JOBS=4` -- four concurrent rustc codegen jobs in one
+#     arm, when one retread test build already needs the whole 96 G on its own.
+#     BOTH are real and this template holds both: `MUT_JOBS` defaults to 1, the
+#     arm directory is removed on EVERY exit path, the scratch root is the JOB
+#     ROOT ON DISK rather than anything temp-shaped, and -- because the first
+#     diagnosis was wrong ONLY on this cluster's nodes and would be right on a
+#     node whose `/tmp` is `tmpfs` -- `mut_init` MEASURES the filesystem and
+#     REFUSES rather than assuming either way.
+#
+# (2) NOTHING MEASURED THE FILESYSTEM AT THE POINT OF USE.  CLAUDE.md law 5.
+#     `mut_init` prints `df -PT` of the real scratch and `stat -f` of its
+#     filesystem type, and refuses on `tmpfs`/`ramfs`/`devtmpfs`.
+#
+# ── REFUSALS (nothing is created before they are all passed) ─────────────────
+#   rc 3  `JOB_ROOT` or `WT` unset, or `JOB_ROOT` cannot be created
+#   rc 4  the scratch root is on a RAM-backed filesystem, or it resolves under a
+#         RAM-backed `/tmp` or `$TMPDIR`
+#   rc 5  `WT` is not a directory
+# and from `run_arm`:
+#   rc 99 the mutation changed nothing -- a mutation that does not mutate proves
+#         nothing
+#   rc 98 the arm printed no `test result:` line -- it did not run
+#   rc 1  the arm's colour is not the one declared
+#
+# Sourcing this file defines functions and touches nothing.  `mut_init` is what
+# acts.
+set -uo pipefail
+
+# Filesystem types that are RAM.  A scratch root on one of these charges every
+# byte an arm writes to the job's RSS, which is the failure mode above.
+MUT_RAM_FSTYPES="tmpfs ramfs devtmpfs"
+
+# One place that answers "what filesystem is this path on".  `stat -f -c %T`
+# first because it names the type directly; `df -PT` as the fallback and as the
+# row a reader actually greps.
+mut_fstype() {
+  local p="$1" t=""
+  t="$(stat -f -c %T "$p" 2>/dev/null)" || t=""
+  if [ -z "$t" ]; then
+    t="$(df -PT "$p" 2>/dev/null | awk 'NR==2 {print $2}')"
+  fi
+  printf '%s' "${t:-unknown}"
+}
+
+mut_is_ram_fs() {
+  local t; t="$(mut_fstype "$1")"
+  case " $MUT_RAM_FSTYPES " in
+    *" $t "*) return 0 ;;
+    *)        return 1 ;;
+  esac
+}
+
+# Is `$1` inside `$2`, as resolved paths?  Used to catch a JOB_ROOT that is
+# itself a symlink into /tmp.
+mut_path_inside() {
+  local child parent
+  child="$(readlink -f -- "$1" 2>/dev/null)" || return 1
+  parent="$(readlink -f -- "$2" 2>/dev/null)" || return 1
+  [ -n "$child" ] && [ -n "$parent" ] || return 1
+  case "$child/" in "$parent"/*) return 0 ;; *) return 1 ;; esac
+}
+
+# Declare where the arms run, prove it is not RAM, and print the proof.
+# Exports MUT_SCRATCH, MUT_JOBS, A_DIR.
+mut_init() {
+  # Spelled out rather than as `${JOB_ROOT:?...}` on purpose: in a
+  # non-interactive shell that construct EXITS the shell with rc 1 instead of
+  # returning, so the refusal could neither be tested nor distinguished from any
+  # other failure. A refusal has to be a return code a guard can assert on.
+  if [ -z "${JOB_ROOT:-}" ]; then
+    echo "### MUT REFUSED: set JOB_ROOT to this lane's work directory ON DISK (L3-1b-1a-2)"
+    return 3
+  fi
+  if [ -z "${WT:-}" ]; then
+    echo "### MUT REFUSED: set WT to the worktree the arms copy from"
+    return 5
+  fi
+  [ -d "$WT" ] || { echo "### MUT REFUSED: WT is not a directory: $WT"; return 5; }
+  mkdir -p "$JOB_ROOT" 2>/dev/null || {
+    echo "### MUT REFUSED: cannot create JOB_ROOT $JOB_ROOT"; return 3; }
+  [ -d "$JOB_ROOT" ] || { echo "### MUT REFUSED: JOB_ROOT is not a directory: $JOB_ROOT"; return 3; }
+
+  MUT_SCRATCH="$JOB_ROOT/mut"
+  A_DIR="${A_DIR:-$JOB_ROOT/mut-artifacts}"
+  MUT_JOBS="${MUT_JOBS:-1}"
+
+  # THE REFUSALS, all measured, and BEFORE anything is created under the root.
+  local jt; jt="$(mut_fstype "$JOB_ROOT")"
+  echo "### MUT scratch root=$MUT_SCRATCH fstype=$jt"
+  echo "### MUT df -PT JOB_ROOT: $(df -PT "$JOB_ROOT" 2>/dev/null | tail -1)"
+  if mut_is_ram_fs "$JOB_ROOT"; then
+    echo "### MUT REFUSED: JOB_ROOT $JOB_ROOT is on $jt, which is RAM."
+    echo "### MUT   Every byte an arm writes would count against the job's RSS."
+    echo "### MUT   Job 5954481 died OUT_OF_MEMORY at MaxRSS 100662600K = 96.0 GiB."
+    return 4
+  fi
+  # ...and the same refusal for the two places a scratch root drifts back to,
+  # but ONLY when they really are RAM here -- on this cluster's batch nodes
+  # `/tmp` measured as DISK, and refusing a disk-backed /tmp on a stored belief
+  # would be exactly the "measure, don't quote" defect in the other direction.
+  local shadow
+  for shadow in "${TMPDIR:-/tmp}" /tmp; do
+    [ -d "$shadow" ] || continue
+    if mut_path_inside "$JOB_ROOT" "$shadow" && mut_is_ram_fs "$shadow"; then
+      echo "### MUT REFUSED: JOB_ROOT $JOB_ROOT resolves under $shadow, which is $(mut_fstype "$shadow")."
+      return 4
+    fi
+  done
+
+  mkdir -p "$MUT_SCRATCH" "$A_DIR" || {
+    echo "### MUT REFUSED: cannot create $MUT_SCRATCH / $A_DIR"; return 3; }
+  echo "### MUT INIT ok host=$(hostname) $(date -Is) scratch=$MUT_SCRATCH artifacts=$A_DIR MUT_JOBS=$MUT_JOBS"
+  echo "### MUT worktree WT=$WT HEAD=$(git -C "$WT" rev-parse --short HEAD 2>/dev/null) dirty=$(git -C "$WT" status --porcelain 2>/dev/null | wc -l)"
+  export MUT_SCRATCH A_DIR MUT_JOBS
+  return 0
+}
+
+# What one arm actually runs, in the arm's own directory.  A lane redefines this
+# ONLY when its arms are not `cargo test --lib`; the guard for this template
+# redefines it so the guard needs no compiler.
+mut_arm_command() {
+  local dir="$1"
+  ( cd "$dir" && timeout --foreground --kill-after=60s "${MUT_ARM_TIMEOUT:-2400}s" \
+      cargo test --lib -j "$MUT_JOBS" -- "${GUARDS[@]}" )
+}
+
+# run_arm <name> <file relative to src/> <sed expression or ""> <GREEN|RED>
+run_arm() {
+  local name="$1" file="$2" sedexpr="$3" expect="$4"
+  local dir="$MUT_SCRATCH/$name"
+  # ON EVERY EXIT PATH.  Nine full `target/` copies left behind is a real
+  # inode-quota defect on a filesystem this campaign has driven to its soft
+  # limit twice, and it is a defect regardless of whether the scratch is RAM.
+  arm_done() { local rc="$1"; rm -rf "$dir"; return "$rc"; }
+  rm -rf "$dir"; mkdir -p "$dir" || { echo "### $name FATAL: cannot create $dir"; return 97; }
+  cp -a "$WT"/. "$dir"/ 2>/dev/null
+  rm -rf "$dir/target"
+  [ -d "$WT/target" ] && cp -a "$WT/target" "$dir/target" 2>/dev/null
+  if [ -n "$sedexpr" ]; then
+    sed -i "$sedexpr" "$dir/src/$file"
+    if cmp -s "$WT/src/$file" "$dir/src/$file"; then
+      echo "### $name FATAL: the mutation changed NOTHING -- a mutation that does not mutate proves nothing"
+      arm_done 99; return 99
+    fi
+  fi
+  mut_arm_command "$dir" > "$A_DIR/$name.log" 2>&1
+  local rc=$?
+  local split; split=$(grep -E '^test result:' "$A_DIR/$name.log" | tail -1)
+  echo "### $name file=$file rc=$rc expect=$expect split=${split:-<none printed>}"
+  grep -E "^test .*(${MUT_ROW_FILTER:-.})" "$A_DIR/$name.log" | sed "s/^/###   $name /"
+  [ -n "$split" ] || { echo "### $name FATAL: no test-result line -- it did not run"; arm_done 98; return 98; }
+  if [ "$expect" = GREEN ]; then
+    [ "$rc" -eq 0 ] || { echo "### $name FAILED: expected GREEN, got rc=$rc"; arm_done 1; return 1; }
+  else
+    [ "$rc" -ne 0 ] || { echo "### $name FAILED: expected RED, the mutation passed the guards"; arm_done 1; return 1; }
+  fi
+  echo "### $name OK"
+  arm_done 0
+  return 0
+}
+
+# Close out: prove nothing was left behind, and exit on the tally.
+mut_done() {
+  local bad="${1:-0}"
+  local left; left=$(find "$MUT_SCRATCH" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l)
+  echo "### MUT arm directories left behind: $left (must be 0)"
+  rm -rf "$MUT_SCRATCH"
+  echo "### MUT DONE bad=$bad $(date -Is)"
+  [ "$bad" -eq 0 ] && [ "$left" -eq 0 ]
+}
