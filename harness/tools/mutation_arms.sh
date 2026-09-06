@@ -55,7 +55,7 @@
 #   rc 3  `JOB_ROOT` or `WT` unset, or `JOB_ROOT` cannot be created
 #   rc 4  the scratch root is on a RAM-backed filesystem, or it resolves under a
 #         RAM-backed `/tmp` or `$TMPDIR`
-#   rc 5  `WT` is not a directory
+#   rc 5  `WT` is unset or is not a directory
 # and from `run_arm`:
 #   rc 99 the mutation changed nothing -- a mutation that does not mutate proves
 #         nothing
@@ -116,6 +116,16 @@ mut_init() {
     return 5
   fi
   [ -d "$WT" ] || { echo "### MUT REFUSED: WT is not a directory: $WT"; return 5; }
+  # STORE-REAP-2 ROOT FIX. `run_arm` used to read $WT directly, and bash
+  # DISCARDS a `WT=... mut_init` prefix assignment when the function returns --
+  # so the shape this file own USAGE COMMENT showed (`JOB_ROOT=... WT=...
+  # mut_init`) initialised fine and then died `WT: unbound variable` in the
+  # first arm, under `set -u`, after the fixture had already been built.
+  # Measured: sr2-mut 5966771, rc 1, zero arms run. The guard knew the quirk and
+  # worked around it with plain assignments; the template did not, so every
+  # lane that copied the usage line inherited the trap. `mut_init` now OWNS the
+  # value: it records it in a global the arms read, and both call shapes work.
+  MUT_WT="$WT"
   mkdir -p "$JOB_ROOT" 2>/dev/null || {
     echo "### MUT REFUSED: cannot create JOB_ROOT $JOB_ROOT"; return 3; }
   [ -d "$JOB_ROOT" ] || { echo "### MUT REFUSED: JOB_ROOT is not a directory: $JOB_ROOT"; return 3; }
@@ -173,12 +183,12 @@ run_arm() {
   # limit twice, and it is a defect regardless of whether the scratch is RAM.
   arm_done() { local rc="$1"; rm -rf "$dir"; return "$rc"; }
   rm -rf "$dir"; mkdir -p "$dir" || { echo "### $name FATAL: cannot create $dir"; return 97; }
-  cp -a "$WT"/. "$dir"/ 2>/dev/null
+  cp -a "$MUT_WT"/. "$dir"/ 2>/dev/null
   rm -rf "$dir/target"
-  [ -d "$WT/target" ] && cp -a "$WT/target" "$dir/target" 2>/dev/null
+  [ -d "$MUT_WT/target" ] && cp -a "$MUT_WT/target" "$dir/target" 2>/dev/null
   if [ -n "$sedexpr" ]; then
     sed -i "$sedexpr" "$dir/src/$file"
-    if cmp -s "$WT/src/$file" "$dir/src/$file"; then
+    if cmp -s "$MUT_WT/src/$file" "$dir/src/$file"; then
       echo "### $name FATAL: the mutation changed NOTHING -- a mutation that does not mutate proves nothing"
       arm_done 99; return 99
     fi

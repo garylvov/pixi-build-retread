@@ -29,6 +29,7 @@ ff372fca5de0277efa02c3d65e1cea7e  phase_template/census_collation_guard.sh
 e893ee7f20e181181bb8205ab7edda0c  phase_template/cleanup_owner_guard.sh
 8cc39f42cf0dcda7c93878195cbac569  phase_template/cleanup.sh
 883d517a614357c59a463f8cdbd9ba4d  phase_template/expect_sha_gate_guard.sh
+7a1fc4ce6b54ac46828fed8f7906f252  phase_template/lane_wrapper.sbatch
 a2515c75fe18f95fda20b4d8156728ea  phase_template/leftover_check_guard.sh
 063ba387f091f6c66eb73ccdc632c70d  phase_template/link_mode_guard.sh
 2c7594f28f008b368dc95169229dd3c6  phase_template/phaseN_cert.sh
@@ -49,7 +50,7 @@ f60ea7f2564d383ef1d45d13d0cb2232  tools/b2_attribute.sh
 3837765ced274b315ce84ad3695f8b5b  tools/cleanup_absent_root_guard.sh
 d46e02ed51852f281f89d4d98184e0f4  tools/cleanup_gate_env_derivation_guard.sh
 c56251e11ce8ab1bd8b807c395265fd4  tools/conda_deny_proxy.py
-4eaffbea3cc40c235216cf562de939a1  tools/driver_exit_guard.sh
+44a5c303a0e5f1fdccafaa101c674492  tools/driver_exit_guard.sh
 7783cc47f9e8ad2503fd44950cd43013  tools/env_version_delta.py
 6a84c103a8be7b1f24d9fc4d46130379  tools/fast_env_snapshot_gate_guard.sh
 e09842a2b51059632dd6cae8e1263fae  tools/fixset_land_row.sh
@@ -70,8 +71,8 @@ e02808a84a7409e9b96a577fbae3dfe9  tools/moved_rows_match_guard.sh
 62db5ba03d4644ccd514f1727db6f7c3  tools/moved_rows_match.sh
 00e4cbab1c56c0f8cdd613bf116bec8c  tools/msgpack_min_guard.py
 5d4435226ca639942f2227c290e09953  tools/msgpack_min.py
-db37efd651d2d6d8f12823f16672348c  tools/mutation_arms_guard.sh
-71bfdfae0139fd7a1bd9bd1a2322d207  tools/mutation_arms.sh
+606e483ee1bc4cb0b9f804ea1a6da9bc  tools/mutation_arms_guard.sh
+cd1cd4914b67e94f15b85dfa1a73f59d  tools/mutation_arms.sh
 1fa8e8023be66e2f6cffbb86905f1b42  tools/p6ad_freeze_guard.sh
 3232909035475da53f3762d6c4dee5ce  tools/p6ad_negctl.sh
 2a59e952d4d6701639eaefffe39e5902  tools/p6ad_PREDICTION.md

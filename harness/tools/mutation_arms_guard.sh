@@ -114,6 +114,30 @@ MUT_ARM_NAME=A1 run_arm A1 lib.rs "" GREEN \
 MUT_ARM_NAME=A2 run_arm A2 lib.rs 's|original|mutated|' RED \
   || fail "arm A2 (mutated, declared RED) did not come out red"
 
+# ── 5. THE PREFIX-ASSIGNMENT CALL SHAPE, WHICH IS THE ONE THIS FILE'S OWN
+#      USAGE COMMENT SHOWS, MUST REACH THE ARMS. bash discards a prefix
+#      assignment when a function returns, so `WT=... mut_init` used to leave
+#      `run_arm` reading an unbound `$WT` and every lane copying the usage line
+#      died in its FIRST arm under `set -u` (measured: sr2-mut 5966771, rc 1,
+#      zero arms run). `mut_init` now records the value itself. The control
+#      below is what makes this non-vacuous: `WT` is UNSET in the caller after
+#      the prefix call, so an arm that passes proves the recording, not a
+#      leftover variable.
+( set -uo pipefail
+  unset WT MUT_WT
+  JOB_ROOT="$BASE/job-prefix" WT="$FAKE_WT" A_DIR="$BASE/job-prefix/arts" MUT_JOBS=1 \
+    mut_init >/dev/null 2>&1 || { echo "### GUARD FATAL: prefix-form mut_init refused"; exit 2; }
+  [ -z "${WT:-}" ] || echo "### note: this bash DID keep the prefix assignment; the arm below still proves the recording"
+  GUARDS=(dummy)
+  MUT_ARM_NAME=P1 run_arm P1 lib.rs "" GREEN >/dev/null 2>&1
+) || fail "the prefix-assignment call shape (this file's documented usage) cannot run an arm"
+if grep -q "^P1" "$PROBE"; then
+  ok "the prefix-assignment call shape reaches the arms (arm P1 actually ran)"
+else
+  fail "arm P1 never ran -- the prefix-assignment call shape does not reach the arms"
+fi
+rm -rf "$BASE/job-prefix"
+
 while IFS=$'\t' read -r who where; do
   case "$who" in
     A1|A2)

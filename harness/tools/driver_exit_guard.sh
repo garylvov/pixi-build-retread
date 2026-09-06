@@ -208,7 +208,21 @@ harnessfix1/guards.sbatch
 harnessfix1/baseline.sbatch
 harnessfix1/verify.sbatch
 harnessfix1/verify2.sbatch
+sr2-work/gate.sbatch
+sr2-work/mut.sbatch
 "
+# STORE-REAP-2, AND THIS LIST HAS A PRECONDITION THAT WAS NOT WRITTEN DOWN
+# UNTIL IT BIT. `mk_bash_shim` stubs `bash`, so FAMILY B can only drive a
+# wrapper whose payload is invoked AS `bash <driver>`. A wrapper whose payload
+# is `cargo ...` or a retread binary is NOT stubbed by the shim: adding one to
+# this list does not test it, it RUNS IT FOR REAL, on whatever host the guard
+# is running on. Measured the moment sr2-work/check.sbatch and
+# sr2-work/census.sbatch were added here -- the guard executed a real `cargo
+# check` and a real `store-reap` dry run on the login node, then reported
+# rc=0 and scored them as swallowers, which they are not. They are out of the
+# list, and closing the gap for real needs per-wrapper payload injection
+# rather than one `bash` shim: boarded with the discovery ratchet as
+# HARNESS-EXIT-3.
 
 mk_bash_shim () {
   mkdir -p "$W/bshim"
@@ -247,6 +261,27 @@ if [ "$WHICH" = all ] || [ "$WHICH" = B ]; then
   run_wrapper "$PRE" >"$W/B0.log" 2>&1; s=$?
   [ "$s" -eq 0 ] && ok "B0 the pinned PRE-FIX wrapper epilogue still swallows: rc=0" \
                  || no "B0 the pinned PRE-FIX epilogue reported $s, not 0 -- every arm below is vacuous"
+  # STORE-REAP-2. THE VERSIONED SHAPE ITSELF, run like any wrapper. A template
+  # every lane is told to copy that does not itself re-raise would propagate
+  # the defect it exists to stop, so it is an arm and not a document.
+  LW=$REPO/harness/phase_template/lane_wrapper.sbatch
+  if [ -f "$LW" ]; then
+    run_wrapper "$LW" >"$W/lane_wrapper.log" 2>&1; s=$?
+    [ "$s" -ne 0 ] && ok "B phase_template/lane_wrapper.sbatch (the shape lanes copy) re-raises: rc=$s" \
+                   || no "B phase_template/lane_wrapper.sbatch swallowed a failing payload: rc=0"
+  else
+    no "B phase_template/lane_wrapper.sbatch is missing -- lanes have no versioned shape to copy"
+  fi
+  # STORE-REAP-2, BOARDED AS HARNESS-EXIT-3 AND PRINTED RATHER THAN HIDDEN: the
+  # list above is a HAND-MAINTAINED SNAPSHOT, and that is why sr2-work's
+  # wrappers were invisible to this guard until they were typed in. The task
+  # tree holds far more `.sbatch` files than this list names; the count is
+  # printed on every run so the gap cannot be forgotten, and closing it needs a
+  # baseline file of known swallowers (a ratchet), which is more than one
+  # commit and is boarded, not attempted here.
+  listed=$(printf '%s\n' $WRAPPERS | grep -c .)
+  live=$(find "$TASK" -maxdepth 2 -name '*.sbatch' -type f 2>/dev/null | wc -l)
+  echo "### FAMILY B COVERAGE: $listed wrappers named here, $live live .sbatch in the task tree (HARNESS-EXIT-3: make this DISCOVERED with a swallower baseline)"
   for w in $WRAPPERS; do
     f=$TASK/$w
     [ -f "$f" ] || { no "B $w: no such file"; continue; }
