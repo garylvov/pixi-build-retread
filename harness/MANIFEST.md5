@@ -38,7 +38,7 @@ a465cea86edc07ad5adf9f96b1ebac9e  phase_template/wedge_triage_guard.sh
 c26805a4a64f89749fe352bf5aaa8381  phase_template/wedge_triage.sh
 09145148ded67bdc997646a6dc2f9836  phase_template/wheel_store_census_guard.sh
 0e84c07132b8e87b296cfc1dabb30b02  proof/hlgd_relock.sh
-624357de17f6491aaa08c2ad5835330f  README.md
+c23efe77fe89da4494785474ed573498  README.md
 252a6cf77606e900a65ded3d59c06124  tools/arm_lock_sha_count_guard.sh
 5f70649013b2bf100dfb91dcc49bef44  tools/arm_lock_sha_count.sh
 f60ea7f2564d383ef1d45d13d0cb2232  tools/b2_attribute.sh
