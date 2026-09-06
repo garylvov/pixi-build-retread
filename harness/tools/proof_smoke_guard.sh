@@ -21,10 +21,11 @@
 #   B3  ... and the stub's own panic line is QUOTED in the output
 #   C1  a stub that sleeps forever                             TIMEOUT
 #   C2  ... and proof_smoke.sh exits 2
-#   C3  ... and the TIMEOUT is caused by the BACKEND half: that stub DOES score a
-#       frontend row (the source-free `cpu` environment), so frontend_rows>=1
-#       and backend_work_rows=0 is what holds the verdict -- the non-vacuity
-#       control for requiring both halves.
+#   C3  ... and the TIMEOUT is held by the BACKEND half, not by chance:
+#       a sleeping backend serves ZERO `conda/outputs`, so backend_work_rows=0
+#       is what holds the verdict, and both counters must be reported -- the
+#       non-vacuity control for requiring both halves.  (The frontend half is
+#       racy and measured so: 1 row in 5994177, 0 in 5994392, same stub.)
 #   D1  the length rule REFUSES a root long enough to compose > 256
 #   D2  ... and PASSES the short root (the non-vacuity control: without D2,
 #       "it refused" and "it always refuses" are the same picture)
@@ -123,14 +124,16 @@ crc=$?
 tail -25 "$COUT"
 grep -q '^### SMOKE TIMEOUT ' "$COUT"; chk C1 $? "arm C prints '### SMOKE TIMEOUT'" "$(grep -m1 '^### SMOKE [A-Z_]* binary=' "$COUT" || echo '<no verdict row>')"
 [ "$crc" = 2 ]; chk C2 $? "arm C rc=2" "rc=$crc"
-# C3 IS WHY C IS A REAL CONTROL AND NOT AN ACCIDENT.  This stub DOES score a
-# frontend row -- 5994177 measured it at four seconds, `resolve_pypi{group=cpu
-# platform=linux-64-base}`, an environment with no source at all -- and it is
-# the MISSING BACKEND HALF that holds the verdict at TIMEOUT.  Without this
-# check, "C timed out" and "C never got anywhere" are the same picture.
-CROW=$(grep -m1 'lock ended verdict=' "$COUT")
-{ echo "$CROW" | grep -qE 'frontend_rows=[1-9]' && echo "$CROW" | grep -q 'backend_work_rows=0'; }
-chk C3 $? "arm C's TIMEOUT is caused by the BACKEND half: frontend_rows>=1 AND backend_work_rows=0" "${CROW:-<no lock-ended row>}"
+# C3 IS WHY C IS A REAL CONTROL AND NOT AN ACCIDENT: the verdict is held by the
+# MISSING BACKEND HALF, and the row has to say so.  THE FRONTEND HALF IS RACY AND
+# WAS MEASURED TO BE: the same sleeping stub at the same 15 s cap scored
+# frontend_rows=1 in 5994177 (the source-free `cpu` environment resolving) and
+# frontend_rows=0 in 5994392, so an assertion on it would be a flaky guard.  What
+# is NOT racy is that a sleeping backend serves ZERO `conda/outputs` -- so C3
+# asserts backend_work_rows=0 and that BOTH counters are reported at all.
+CROW=$(grep -m1 "lock ended verdict=" "$COUT")
+{ echo "$CROW" | grep -q 'backend_work_rows=0' && echo "$CROW" | grep -q 'frontend_rows='; }
+chk C3 $? "arm C's TIMEOUT row reports BOTH counters and backend_work_rows=0 -- the backend half is what holds the verdict" "${CROW:-<no lock-ended row>}"
 
 # ---- D: the length rule, RED and GREEN -------------------------------------
 echo ""; echo "########## PSG ARM D -- the composed-prefix rule ##########"

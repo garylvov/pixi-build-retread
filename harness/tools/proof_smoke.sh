@@ -379,13 +379,30 @@ echo "### SMOKE uv: $RETREAD_UV -> $UVVER (retread's uv_closure::REQUIRED_UV wan
 # root (det1_proof2.sh: `RETREAD_FAST_TMP_ROOT=$G/fast-tmp` under its own cache
 # root) and none of them meets this budget.  Raising --mem would be treating the
 # symptom; the smoke's environment must be the driver's.
-export RETREAD_SCRATCH_ROOT=$CACHE/g/scratch
-export RETREAD_FAST_TMP_ROOT=$CACHE/g/fast-tmp
-export XDG_STATE_HOME=$CACHE/g/xdg-state
-export XDG_CONFIG_HOME=$CACHE/g/xdg-config
+export RETREAD_SCRATCH_ROOT=$ROOT/s
+export RETREAD_FAST_TMP_ROOT=$ROOT/f
+export XDG_STATE_HOME=$ROOT/t
+export XDG_CONFIG_HOME=$ROOT/n
 mkdir -p "$RETREAD_SCRATCH_ROOT" "$RETREAD_FAST_TMP_ROOT" "$XDG_STATE_HOME" "$XDG_CONFIG_HOME" \
-  || smoke_setup_failed "cannot create the job-scoped scratch/fast-tmp roots under $CACHE/g"
-echo "### SMOKE fast-tmp root (DISK, job-scoped): $RETREAD_FAST_TMP_ROOT"
+  || smoke_setup_failed "cannot create the job-scoped scratch/fast-tmp roots under $ROOT"
+echo "### SMOKE fast-tmp root (DISK, job-scoped, ONE LETTER ON PURPOSE): $RETREAD_FAST_TMP_ROOT"
+# AND THE SECOND MEASUREMENT, WHICH IS WHY THESE NAMES ARE ONE LETTER.  With
+# `$CACHE/g/fast-tmp` (57 bytes) the KNOWN-GOOD binary `integration-569b0ac`
+# died at `directories.rs:181` with `string of length 260` -- 5994392 arm A,
+# `BACKEND_DIED reason=PREFIX_PANIC_256 backend_work_rows=16` at 75 s, on a
+# binary that is fine.  MEASURED on that job: the hermetic store does NOT live
+# under XDG_CACHE_HOME at all when fast-tmp is on; it lives at
+# `<fast-tmp>/retread-$USER/<12 hex>/job-<jid>/caches/retread/hermetic-build-envs`
+# -- 131 bytes of directory before the entry.  `$ROOT/f` is twelve bytes shorter
+# than `$CACHE/g/fast-tmp` and buys exactly that back.
+# BOARDED PROOF-SMOKE-1-2, AND NOT SHIPPED AS A GUESS: the pre-lock budget check
+# still measures XDG_CACHE_HOME, which is the L3-1b-4 default root and NOT the
+# root a fast-tmp job uses, so it did not refuse this before the lock -- the
+# PREFIX_PANIC_256 backstop caught it after 75 s instead.  Modelling the fast-tmp
+# chain was tried on paper and REJECTED: the arithmetic that fits DET-1-FIX-1
+# (root + 100 + 92) predicts 284 for a configuration that is measured at 260, so
+# a modelled refusal would refuse working jobs.  The reader that closes it is one
+# job that prints the composed prefix retread actually built, not more algebra.
 export CONDA_OVERRIDE_CUDA=12
 export CONDA_OVERRIDE_GLIBC=2.35
 export OMNI_KIT_ACCEPT_EULA=YES
