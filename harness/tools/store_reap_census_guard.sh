@@ -47,7 +47,7 @@ cat > "$STUB" <<'STUBEOF'
 #!/usr/bin/env bash
 # carries the verb marker the census probes for statically: store-reap: --store 
 printf '%s\n' "$*" >> "$ARGV_FILE"
-echo "### store-reap TOTAL roots=1 stores=3 mode=dry-run scanned=0 would_evict=0 bytes=0 refused=false"
+echo "### store-reap TOTAL roots=1 stores=5 mode=dry-run scanned=0 would_evict=0 bytes=0 refused=false"
 exit "${STUB_RC:-0}"
 STUBEOF
 chmod +x "$STUB"
@@ -87,7 +87,7 @@ chk "every invocation carries --dry-run" \
   "$(grep -c -- '--dry-run' "$ARGV")" 2
 chk "no invocation carries --apply" \
   "$(grep -c -- '--apply' "$ARGV")" 0
-chk "every invocation asks for all three stores" \
+chk "every invocation asks for ALL stores, never a frozen subset" \
   "$(grep -c -- '--store all' "$ARGV")" 2
 
 # ---- 3. an absent root is skipped, not invoked against ----------------------

@@ -2,8 +2,11 @@
 # store_reap_census.sh -- THE HARNESS HALF OF `retread store-reap`.  STORE-REAP-2.
 #
 # WHAT IT IS FOR (law 2, and the debt it closes).  STORE-REAP-1 boarded
-# STORE-REAP-1-1: the three persistent-store reapers (C18-1 git snapshots,
-# L3-1b shadow, L3-1b-1 built wheels) have exactly one production caller --
+# STORE-REAP-1-1: the persistent-store reapers (C18-1 git snapshots, L3-1b
+# shadow, L3-1b-1 built wheels, and -- since L3-1b-3B -- build-requirements and
+# strict-wheel-attestations, the last two walked by ONE reaper because they are
+# the same `<root>/<dir>/<version>/<identity>/<marker>` shape) have exactly one
+# production caller --
 # the backend's `initialize` -- and every relock this harness runs job-scopes
 # `XDG_CACHE_HOME` to `$C/xdg-cache`, so the root that caller resolves is a
 # fresh empty directory the job's own cleanup deletes.  The reapers therefore
