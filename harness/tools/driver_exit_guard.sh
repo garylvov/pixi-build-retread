@@ -400,7 +400,8 @@ if [ "$WHICH" = all ] || [ "$WHICH" = B ]; then
     exit 4
   fi
 
-  : > "$W/live_swallow.txt"; : > "$W/live_uncovered.txt"; : > "$W/live_timeout.txt"; live_reraise=0
+  : > "$W/live_swallow.txt"; : > "$W/live_uncovered.txt"; : > "$W/live_timeout.txt"
+  : > "$W/live_nopayload.txt"; live_reraise=0
   while IFS= read -r f; do
     rel=${f#"$TASK"/}
     # DEG_ONLY narrows the sweep to one wrapper. It exists for the mutation
@@ -448,19 +449,38 @@ if [ "$WHICH" = all ] || [ "$WHICH" = B ]; then
       echo "  TIMEOUT B $rel: still running after ${DEG_WRAPPER_BUDGET_S:-60}s -- NOT SCORED (rc=$s)"
       continue
     fi
+    # THE SCORING RULE. A wrapper is judged ONLY once the seam has actually
+    # handed it a FAILING payload. Without that, a 0 says nothing: the sandbox
+    # empties the stores, so a census whose loop finds no roots never reaches
+    # any payload at all and exits 0 having demonstrated NOTHING. Scoring that
+    # as a swallow is how a guard grows false rows -- four of them on this
+    # lane's own first scoring run (p1b closure_metadata, char3, sr1 census,
+    # sr2 bytes), every one of which re-raises correctly on a real failure.
+    # PRECOND rows (the drift check, the harness-commit reader) are not
+    # injected failures and do not count.
+    inj=$(grep -c '^PAYLOAD' "$rec/argv.log" 2>/dev/null || echo 0)
+    if [ "${inj:-0}" -eq 0 ]; then
+      echo "$rel" >> "$W/live_nopayload.txt"
+      continue
+    fi
     if [ "$s" -eq 0 ]; then echo "$rel" >> "$W/live_swallow.txt"
     else live_reraise=$((live_reraise + 1)); fi
   done < "$W/discovered.txt"
 
   n_live_s=$(grep -c . "$W/live_swallow.txt"); n_live_u=$(grep -c . "$W/live_uncovered.txt")
   n_live_t=$(grep -c . "$W/live_timeout.txt")
-  echo "### FAMILY B LIVE: $live_reraise re-raise, $n_live_s swallow, $n_live_u refused-uncovered, $n_live_t timed-out, of $nd discovered (budget ${DEG_WRAPPER_BUDGET_S:-60}s, snapshot $SNAP_MD5)"
+  n_live_n=$(grep -c . "$W/live_nopayload.txt")
+  echo "### FAMILY B LIVE: $live_reraise re-raise, $n_live_s swallow, $n_live_u refused-uncovered, $n_live_t timed-out, $n_live_n no-payload-reached, of $nd discovered (budget ${DEG_WRAPPER_BUDGET_S:-60}s, snapshot $SNAP_MD5)"
   if [ "$n_live_t" -eq 0 ]; then
     ok "B no wrapper timed out -- every bucket below is a function of the wrapper's bytes"
   else
     no "B $n_live_t wrapper(s) timed out and are UNSCORED: $(tr '\n' ' ' < "$W/live_timeout.txt")-- raise DEG_WRAPPER_BUDGET_S or tmpfs the root they scan; a timing-dependent bucket is not a verdict"
   fi
 
+  if [ "$n_live_n" -gt 0 ]; then
+    echo "### NO PAYLOAD REACHED (unscored -- the seam never handed these a failing payload; a 0 from them proves nothing):"
+    sed 's/^/###   /' "$W/live_nopayload.txt"
+  fi
   # new swallowers -- the only thing that may turn this family red
   comm -23 <(sort -u "$W/live_swallow.txt") <(printf '%s\n' "$bl_swallow" | sort -u) > "$W/new_swallow.txt"
   comm -23 <(sort -u "$W/live_uncovered.txt") <(printf '%s\n' "$bl_uncov" | sort -u) > "$W/new_uncovered.txt"
@@ -500,7 +520,7 @@ if [ "$WHICH" = all ] || [ "$WHICH" = B ]; then
   if [ -n "${DEG_EVIDENCE_DIR:-}" ]; then
     mkdir -p "$DEG_EVIDENCE_DIR"
     cp -f "$W/snapshot.tsv" "$W/live_swallow.txt" "$W/live_uncovered.txt" \
-          "$W/live_timeout.txt" "$W/new_swallow.txt" "$W/new_uncovered.txt" \
+          "$W/live_timeout.txt" "$W/live_nopayload.txt" "$W/new_swallow.txt" "$W/new_uncovered.txt" \
           "$W/argv-all.log" "$DEG_EVIDENCE_DIR/" 2>/dev/null
     for keep in ${DEG_EVIDENCE_LOGS:-}; do
       cp -f "$W/$(printf '%s' "$keep" | tr / _).log" "$DEG_EVIDENCE_DIR/" 2>/dev/null

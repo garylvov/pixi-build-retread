@@ -100,15 +100,23 @@ EOS
   # read into `HC=$(bash ...)` and gates on being non-empty.
   cat > "$DEG_SHIM/bash" <<'EOS'
 #!/bin/sh
-printf 'PAYLOAD\tbash\t%s\n' "$*" >> "$DEG_REC/argv.log"
+# The drift check and the harness-commit reader are PRECONDITIONS, not
+# payloads: several wrappers refuse early on a dirty drift, and a refusal that
+# fires before the payload makes the broken and the fixed shape agree, which is
+# a vacuous fixture. They are recorded as PRECOND, NOT as PAYLOAD -- the
+# scoring rule is that a wrapper is only judged once the seam has actually
+# handed it a FAILING payload, and a wrapper that saw only these saw none.
 for a in "$@"; do
   case "$a" in
     *harness_drift_check.sh)
+      printf 'PRECOND\tbash\t%s\n' "$*" >> "$DEG_REC/argv.log"
       echo "### [guard shim] drift check stubbed CLEAN"; exit 0;;
     *harness_commit_resolve.sh)
+      printf 'PRECOND\tbash\t%s\n' "$*" >> "$DEG_REC/argv.log"
       echo "${DEG_FAKE_COMMIT:-0000000}"; exit 0;;
   esac
 done
+printf 'PAYLOAD\tbash\t%s\n' "$*" >> "$DEG_REC/argv.log"
 echo "### [payload shim] bash $* -- STUBBED FAILING rc=${DEG_INJECT:-7}"
 exit ${DEG_INJECT:-7}
 EOS
