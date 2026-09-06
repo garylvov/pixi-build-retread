@@ -233,6 +233,17 @@ fi
 #   wrapper nobody typed into the list is invisible to the guard that exists to
 #   find it. The list is gone; the set is DISCOVERED.
 #
+#   HARNESS-SEAM-1 then removed the THIRD list, one layer down. The static
+#   by-path check decided coverage from a hand-typed set of VARIABLE NAMES
+#   (`DEG_SCAN_COVERED_VARS`), so a wrapper that called its payload variable
+#   anything else was refused, and STORE-REAP-3's fix for that was to RENAME
+#   ITS VARIABLE to one on the list. Coverage is now DERIVED: the value is
+#   resolved statically from the wrapper's own text and the seam's own exported
+#   environment, classified by the BASENAME of the resolved value against the
+#   stubs the seam actually built, and the stub is BOUND OVER THE RESOLVED PATH
+#   so the by-path invocation is intercepted instead of merely permitted. A
+#   value that cannot be resolved statically is refused, naming the variable.
+#
 #   the shim -- it stubbed `bash` and nothing else, so a listed wrapper whose
 #   payload is `cargo ...` or a retread binary was EXECUTED FOR REAL on the
 #   guard's host. Measured: adding sr2-work/check.sbatch and census.sbatch ran
@@ -272,10 +283,9 @@ DEG_SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # (`find ... > "$A/tree-before.txt"`) cannot overwrite another lane's artifacts.
 # This is additive to the payload seam, not a substitute for it.
 deg_run_wrapper () {
-  local f=$1 rec=$2 envs=() line binds=()
+  local f=$1 rec=$2 bindfile=${3:-} envs=() line binds=() bname bpath
   mkdir -p "$rec/tmp"
   while IFS= read -r line; do envs+=("$line"); done < <(deg_shim_env "$rec")
-  envs+=("SLURM_JOB_ID=999999" "SLURM_JOB_NAME=driver-exit-guard" "HOME=$rec/tmp")
   # The task tree is a tmpfs so a wrapper's ordinary redirection cannot land on
   # another lane's artifacts. THE PERSISTENT STORES ARE TMPFS FOR A SECOND
   # REASON: several wrappers open with a `find` or a census over a store with
@@ -290,7 +300,42 @@ deg_run_wrapper () {
   binds=(--dev-bind / / --tmpfs "$TASK" --bind "$W" "$W")
   [ -n "${DEG_TMPFS_OK:-}" ] && binds+=($DEG_TMPFS_OK)
   case "$f" in "$TASK"/*) binds+=(--ro-bind "$f" "$f");; esac
+  # HARNESS-SEAM-1: THE BY-PATH HALF OF THE SEAM.
+  # A wrapper that runs `"$RETREAD_BIN" store-reap ...` reaches its payload
+  # through a PATH, and neither a function nor $PATH nor
+  # command_not_found_handle is in that road. The old code exported eight
+  # variable NAMES pointed at a stub and hoped the wrapper used one of them --
+  # which a plain `RETREAD_BIN=<path>` on the wrapper's own first line simply
+  # overwrites. So the seam places the stub WHERE THE WRAPPER WILL LOOK: the
+  # scanner resolves the value statically, and each resolved path gets the
+  # matching stub bound over it inside the sandbox. Nothing outside the sandbox
+  # is touched, and a wrapper whose path the seam CANNOT bind is refused by
+  # deg_probe_binds before it is started, never run uncovered.
+  if [ -n "$bindfile" ] && [ -s "$bindfile" ]; then
+    while IFS=$'\t' read -r bname bpath; do
+      [ -n "$bname" ] && [ -n "$bpath" ] || continue
+      binds+=(--ro-bind "$DEG_SHIM/$bname" "$bpath")
+    done < "$bindfile"
+  fi
   command timeout -k 5 "${DEG_WRAPPER_BUDGET_S:-60}" env "${envs[@]}" "$DEG_BWRAP" "${binds[@]}" /bin/bash "$f"
+}
+
+# deg_probe_binds <bindfile> -- CAN the seam actually place these stubs?
+# A bind bwrap cannot make does not fail that bind, it ABORTS THE WHOLE SANDBOX
+# at rc 1 -- the defect that once scored 101 wrappers as re-raising with zero
+# intercepted invocations. So coverage is not a claim about a path, it is a
+# MEASUREMENT: build the identical sandbox and run /bin/true in it. rc 0 means
+# the stubs are placeable and the wrapper may be driven; anything else means the
+# seam cannot cover this wrapper and it is refused.
+deg_probe_binds () {   # $1 = bindfile ; rc 0 = the seam can place every stub
+  local bindfile=$1 binds=() bname bpath
+  binds=(--dev-bind / / --tmpfs "$TASK" --bind "$W" "$W")
+  [ -n "${DEG_TMPFS_OK:-}" ] && binds+=($DEG_TMPFS_OK)
+  while IFS=$'\t' read -r bname bpath; do
+    [ -n "$bname" ] && [ -n "$bpath" ] || continue
+    binds+=(--ro-bind "$DEG_SHIM/$bname" "$bpath")
+  done < "$bindfile"
+  "$DEG_BWRAP" "${binds[@]}" /bin/true >/dev/null 2>&1
 }
 
 # deg_probe_tmpfs -- keep only the extra tmpfs mounts this host's bwrap can
@@ -420,18 +465,43 @@ if [ "$WHICH" = all ] || [ "$WHICH" = B ]; then
     tag=$(printf '%s' "$rel" | tr / _)
     rec=$W/rec-$tag; mkdir -p "$rec"
     # STATIC HALF: a command invoked BY PATH cannot be reached by a PATH shim
-    # or a function. Such a wrapper is refused BEFORE it starts.
-    unc=""
-    while IFS= read -r tokline; do
-      [ -n "$tokline" ] || continue
-      deg_path_token_covered "$tokline" || unc="$unc $tokline"
-    done < <(deg_scan_paths "$f")
+    # or a function. HARNESS-SEAM-1: coverage is DERIVED, never listed. The
+    # scanner resolves each path-position token from the wrapper's own
+    # assignments and the seam's own exported environment, and classifies it by
+    # the BASENAME of the resolved value against the stubs the seam has
+    # actually built. Three outcomes, and two of them are refusals that name
+    # what they refused on:
+    #   COVERED    -- the seam has a stub for that basename; it is bound over
+    #                 the resolved path and the wrapper is driven.
+    #   UNCOVERED  -- resolved, but the seam has no stub for that basename
+    #                 (a directory, a lane's own tool). Refused.
+    #   UNRESOLVED -- the value cannot be known statically. Refused, NAMING THE
+    #                 VARIABLE AND THE LINE. Never executed, never passed.
+    unc=""; unres=""; : > "$rec/binds.tsv"
+    while IFS=$'\t' read -r vk va vb vc; do
+      case "$vk" in
+        COVERED)    printf '%s\t%s\n' "$va" "$vb" >> "$rec/binds.tsv" ;;
+        UNCOVERED)  unc="$unc $vb(basename '$va' is not a command the seam stubs)" ;;
+        UNRESOLVED) unres="$unres \$$va at line $vb: $vc;" ;;
+      esac
+    done < <(deg_scan_path_verdicts "$f")
+    if [ -n "$unres" ]; then
+      echo "$rel" >> "$W/live_uncovered.txt"
+      echo "  REFUSE  B $rel: payload invoked by path through a variable that cannot be resolved statically:$unres (NOT executed)"
+      continue
+    fi
     if [ -n "$unc" ]; then
       echo "$rel" >> "$W/live_uncovered.txt"
       echo "  REFUSE  B $rel: payload invoked by path, seam does not cover:$unc (NOT executed)"
       continue
     fi
-    deg_run_wrapper "$f" "$rec" >"$W/$tag.log" 2>&1; s=$?
+    if [ -s "$rec/binds.tsv" ] && ! deg_probe_binds "$rec/binds.tsv"; then
+      echo "$rel" >> "$W/live_uncovered.txt"
+      echo "  REFUSE  B $rel: the seam cannot PLACE its stub at $(awk '{printf "%s ", $2}' "$rec/binds.tsv")-- bwrap refuses the bind (NOT executed)"
+      continue
+    fi
+    [ -s "$rec/binds.tsv" ] && echo "  BYPATH  B $rel: $(awk '{printf "%s->%s ", $2, $1}' "$rec/binds.tsv")"
+    deg_run_wrapper "$f" "$rec" "$rec/binds.tsv" >"$W/$tag.log" 2>&1; s=$?
     # RUNTIME HALF: a name the seam did not stub reached command_not_found_handle.
     if [ -s "$rec/uncovered.log" ]; then
       echo "$rel" >> "$W/live_uncovered.txt"

@@ -67,10 +67,37 @@ csplit pwd file"
 DEG_CANARY_NAMES="cargo pixi python python3 uv conda retread pixi-build-retread
 srun sbatch rustc"
 
-# Variables a wrapper uses to name a payload BINARY BY PATH. A PATH shim cannot
-# reach those, so they are pointed at the payload stub instead. A path-position
-# token naming any other variable is UNCOVERED and its wrapper is refused.
-DEG_OVERRIDE_VARS="BIN PIXI RETREAD RETREAD_BIN PIXI_BIN BINARY EXE CARGO"
+# HARNESS-SEAM-1 DELETED `DEG_OVERRIDE_VARS` FROM HERE.
+# It was the second copy of `driver_exit_scan.sh`'s hand-typed
+# `DEG_SCAN_COVERED_VARS`: eight variable NAMES, exported pointed at the
+# `pixi-build-retread` stub, in the hope that a wrapper naming its payload
+# binary one of those eight would pick the stub up. It only ever worked for the
+# `VAR=${VAR:-default}` shape -- a wrapper writing a PLAIN `VAR=<path>`
+# overwrites the export on its first line, and its by-path invocation went
+# straight past the seam. STORE-REAP-3's `sr3-work/census.sbatch` is exactly
+# that: `RETREAD_BIN=$T/binsnaps/integration-cbed649/pixi-build-retread`, passed
+# by the old NAME check and then never intercepted by anything.
+#
+# The seam now covers a by-path invocation the only way that is not a hope:
+# `driver_exit_scan.sh` RESOLVES the value statically and the caller BINDS THE
+# STUB OVER THE RESOLVED PATH inside the sandbox (deg_wrapper_binds /
+# deg_probe_binds in driver_exit_guard.sh). No variable name appears anywhere.
+
+# The environment the seam really exports to every wrapper, minus the per-run
+# record directory. It is ONE definition because two readers need it: the
+# runtime (deg_shim_env) and the static resolver, which must resolve a
+# `${SLURM_JOB_ID}` in a wrapper's path to the value the wrapper will actually
+# see. A variable dropped from here stops resolving statically at the same
+# moment it stops being exported.
+deg_static_env_pairs () {
+  printf '%s\n' \
+    "DEG_INJECT=$DEG_INJECT" \
+    "DEG_FAKE_COMMIT=0000000" \
+    "CARGO_HOME=${DEG_HOME:-}" \
+    "RUSTUP_HOME=${DEG_HOME:-}" \
+    "SLURM_JOB_ID=999999" \
+    "SLURM_JOB_NAME=driver-exit-guard"
+}
 
 deg_build_shim () {   # $1 = root dir (created)
   local root=$1
@@ -199,17 +226,14 @@ EOS
 
 # deg_shim_env <record-dir> -- echoes the env assignments for one wrapper run.
 deg_shim_env () {
-  local rec=$1 v
+  local rec=$1
   printf '%s\n' \
     "PATH=$DEG_SHIM:$DEG_SAFEBIN:$DEG_CANARY" \
     "BASH_ENV=$DEG_ROOT/preamble.sh" \
     "DEG_REC=$rec" \
-    "DEG_INJECT=$DEG_INJECT" \
-    "DEG_FAKE_COMMIT=0000000" \
-    "CARGO_HOME=$DEG_HOME" \
-    "RUSTUP_HOME=$DEG_HOME" \
-    "TMPDIR=$rec/tmp"
-  for v in $DEG_OVERRIDE_VARS; do printf '%s=%s\n' "$v" "$DEG_SHIM/pixi-build-retread"; done
+    "TMPDIR=$rec/tmp" \
+    "HOME=$rec/tmp"
+  deg_static_env_pairs
 }
 
 # DEG_DROP_STUBS -- the MUTATION ARM for the seam itself. A guard whose shim

@@ -14,7 +14,13 @@
 # Each arm MUTATES one thing and requires the guard's verdict to FLIP. An arm
 # whose two sides agree is a FAILURE, not a pass.
 #
-#   usage: bash driver_exit_mutation_arms.sh [1|2|3|all]
+#   ARM 4  HARNESS-SEAM-1: the by-path check decides coverage from a VARIABLE'S
+#          NAME, so two wrappers naming the same binary get opposite verdicts.
+#   ARM 5  a payload variable no list has ever held is refused instead of
+#          scored, or a value nothing can resolve is passed instead of refused.
+#   ARM 6  a payload invoked by its LITERAL path is executed instead of stubbed.
+#
+#   usage: bash driver_exit_mutation_arms.sh [1|2|3|4|5|6|all]
 #   rc 0 every arm flipped;  rc 1 an arm did not;  rc 4 fixture fatal.
 set -uo pipefail
 
@@ -38,7 +44,8 @@ mkdir -p "$W" || { echo "ARMS FATAL: no work dir at $W"; exit 4; }
 # removed on every exit path, including a kill, so the tree never keeps a
 # deliberate swallower that the next lane would have to baseline.
 MUTDIR=$TASK/harnessexit3/mutarm
-trap 'if [ -z "${DEG_ARMS_DIR:-}" ]; then rm -rf "$W"; fi; rm -rf "$MUTDIR"' EXIT
+MUTDIR2=$TASK/harnessseam1/mutarm
+trap 'if [ -z "${DEG_ARMS_DIR:-}" ]; then rm -rf "$W"; fi; rm -rf "$MUTDIR" "$MUTDIR2"' EXIT
 echo "### driver_exit_mutation_arms  guard=$GUARD  task=$TASK  host=$(hostname)  $(date -Is)"
 
 pass=0; fail=0
@@ -128,6 +135,140 @@ if [ "$WHICH" = all ] || [ "$WHICH" = 3 ]; then
                       || no "ARM 3 MUTANT: a grown baseline was accepted (rc=$rc_mut, log $W/arm3mut.log)"
   [ "$rc_ctl" -ne 4 ] && ok "ARM 3 CONTROL: the same run on the real baseline does not refuse (rc=$rc_ctl)" \
                       || no "ARM 3 VACUOUS: the control refused too, so rc 4 says nothing about the pin"
+fi
+
+# ---------------------------------------------------------------- ARM 4 -----
+# HARNESS-SEAM-1. THE DEFECT ITSELF, against the PINNED PRE-FIX BLOB.
+# `driver_exit_scan.sh` decided by-path coverage from a hand-typed list of
+# VARIABLE NAMES, so two wrappers whose payload variables resolve to THE SAME
+# BINARY got opposite verdicts purely because of what the variable was called.
+# STORE-REAP-3 hit it and renamed `TIP` to `RETREAD_BIN` to get past it.
+# The arm runs the OLD file, extracted from the pinned commit constant, and
+# requires it to disagree with itself; then it runs the NEW file and requires
+# the same two tokens to agree, on identical resolved values.
+SEAM_PREFIX_COMMIT=a9b6283a2c21c28c285ae6508f355fe8d4dd0656
+if [ "$WHICH" = all ] || [ "$WHICH" = 4 ]; then
+  echo "=== ARM 4 -- the pre-fix scanner decided by the variable's NAME"
+  REPO_OK=1
+  git -C "$REPO" rev-parse --verify "$SEAM_PREFIX_COMMIT^{commit}" >/dev/null 2>&1 \
+    || { no "ARM 4 $SEAM_PREFIX_COMMIT is not a commit in $REPO"; REPO_OK=0; }
+  if [ "$REPO_OK" = 1 ]; then
+    mkdir -p "$W/seamarm"
+    git -C "$REPO" cat-file blob "$SEAM_PREFIX_COMMIT:harness/tools/driver_exit_scan.sh" \
+      > "$W/seamarm/old_scan.sh" 2>/dev/null
+    BINP=/oscar/data/stellex/glvov/agrescap/tasks/retread-4-11/binsnaps/integration-cbed649/pixi-build-retread
+    for vn in TIP RETREAD_BIN; do
+      {
+        echo '#!/bin/bash'
+        echo 'set -u'
+        echo "$vn=$BINP"
+        echo "\"\$$vn\" store-reap --store shadow --dry-run"
+        echo 'rc=$?'
+        echo 'exit "$rc"'
+      } > "$W/seamarm/$vn.sbatch"
+    done
+    # THE OLD FILE. Its verdict function is deg_path_token_covered <token>.
+    old_tip=$(bash -c '. "$1" >/dev/null 2>&1; deg_path_token_covered "$2"; echo $?' _ "$W/seamarm/old_scan.sh" '"$TIP"')
+    old_rb=$(bash -c '. "$1" >/dev/null 2>&1; deg_path_token_covered "$2"; echo $?' _ "$W/seamarm/old_scan.sh" '"$RETREAD_BIN"')
+    [ "$old_tip" != 0 ] && ok "ARM 4 PRE-FIX: '\$TIP' was REFUSED as uncovered (rc=$old_tip) -- the defect, reproduced from $SEAM_PREFIX_COMMIT" \
+                        || no "ARM 4 PRE-FIX: '\$TIP' was accepted by the old scanner -- the arm is vacuous, the defect is not in this blob"
+    [ "$old_rb" = 0 ] && ok "ARM 4 PRE-FIX: '\$RETREAD_BIN' was ACCEPTED on the same resolved binary -- name, not capability" \
+                      || no "ARM 4 PRE-FIX: '\$RETREAD_BIN' was refused too, so the old verdicts do not differ and the arm proves nothing"
+    # THE NEW FILE. Same two tokens, same resolved value, one verdict.
+    new_tip=$(bash "$REPO/harness/tools/driver_exit_scan.sh" verdicts "$W/seamarm/TIP.sbatch")
+    new_rb=$(bash "$REPO/harness/tools/driver_exit_scan.sh" verdicts "$W/seamarm/RETREAD_BIN.sbatch")
+    tipv=$(printf '%s' "$new_tip" | cut -f1); tipp=$(printf '%s' "$new_tip" | cut -f3)
+    rbv=$(printf '%s' "$new_rb" | cut -f1);  rbp=$(printf '%s' "$new_rb" | cut -f3)
+    [ "$tipv" = COVERED ] && [ "$rbv" = COVERED ] \
+      && ok "ARM 4 FIXED: both tokens are COVERED ($tipv / $rbv) -- the variable's name is not consulted" \
+      || no "ARM 4 FIXED: verdicts still differ or are not COVERED (TIP=$tipv RETREAD_BIN=$rbv)"
+    [ -n "$tipp" ] && [ "$tipp" = "$rbp" ] \
+      && ok "ARM 4 the two verdicts are on IDENTICAL RESOLVED VALUES: $tipp" \
+      || no "ARM 4 the resolved values differ ('$tipp' vs '$rbp') -- the comparison is not like for like"
+  fi
+fi
+
+# ---------------------------------------------------------------- ARM 5 -----
+# HARNESS-SEAM-1. COVERAGE IS DERIVED, so a payload variable NOBODY HAS EVER
+# TYPED must be scored, and a variable whose value cannot be known statically
+# must be REFUSED BY NAME rather than run. Both halves are driven through the
+# live guard over a wrapper written into the tree.
+if [ "$WHICH" = all ] || [ "$WHICH" = 5 ]; then
+  echo "=== ARM 5 -- a payload variable nobody has thought of, and one that cannot be resolved"
+  mkdir -p "$MUTDIR2" || { echo "ARMS FATAL: cannot write $MUTDIR2"; exit 4; }
+  BINP=/oscar/data/stellex/glvov/agrescap/tasks/retread-4-11/binsnaps/integration-cbed649/pixi-build-retread
+  {
+    echo '#!/bin/bash'
+    echo '#SBATCH --job-name=hs1-mutarm-derived'
+    echo 'set -u'
+    echo "ZOGGLE_PAYLOAD_2026=$BINP"
+    echo 'echo "### about to run the payload"'
+    echo '"$ZOGGLE_PAYLOAD_2026" store-reap --store shadow --dry-run'
+    echo 'rc=$?'
+    echo 'echo "### VERB_RC=$rc"'
+    echo 'exit "$rc"'
+  } > "$MUTDIR2/derived.sbatch"
+  {
+    echo '#!/bin/bash'
+    echo '#SBATCH --job-name=hs1-mutarm-unresolvable'
+    echo 'set -u'
+    echo 'ZOGGLE_PAYLOAD_2026=$(cat /dev/null)/pixi-build-retread'
+    echo '"$ZOGGLE_PAYLOAD_2026" store-reap --store shadow --dry-run'
+    echo 'rc=$?'
+    echo 'exit "$rc"'
+  } > "$MUTDIR2/unresolvable.sbatch"
+  rc5=$(run_guard arm5 DEG_EXPLORATORY=1 DEG_ONLY='harnessseam1/mutarm/*.sbatch')
+  d_bypath=$(grep -c 'BYPATH  B harnessseam1/mutarm/derived.sbatch' "$W/arm5.log")
+  d_ref=$(grep -c 'REFUSE  B harnessseam1/mutarm/derived.sbatch' "$W/arm5.log")
+  d_pay=$(grep -c 'PAYLOAD.*pixi-build-retread' "$W/arm5.log")
+  u_ref=$(grep -c 'REFUSE  B harnessseam1/mutarm/unresolvable.sbatch: payload invoked by path through a variable that cannot be resolved' "$W/arm5.log")
+  u_named=$(grep -c 'ZOGGLE_PAYLOAD_2026' "$W/arm5.log")
+  can5=$(grep -c 'CANARY FIRED' "$W/arm5.log")
+  [ "$d_bypath" -gt 0 ] && [ "$d_ref" -eq 0 ] \
+    && ok "ARM 5 DERIVED: a variable named ZOGGLE_PAYLOAD_2026 -- in no list anywhere -- is COVERED and driven" \
+    || no "ARM 5 DERIVED: the wrapper was not covered (bypath=$d_bypath refuse=$d_ref, log $W/arm5.log)"
+  [ "$d_pay" -gt 0 ] && ok "ARM 5 DERIVED: the by-path invocation was INTERCEPTED (a pixi-build-retread PAYLOAD row exists)" \
+                     || no "ARM 5 DERIVED: no PAYLOAD row -- the wrapper was covered on paper and reached nothing (log $W/arm5.log)"
+  [ "$u_ref" -gt 0 ] && ok "ARM 5 UNRESOLVABLE: refused, not executed" \
+                     || no "ARM 5 UNRESOLVABLE: no refusal -- an unknowable payload was passed or run (log $W/arm5.log)"
+  [ "$u_named" -gt 0 ] && ok "ARM 5 UNRESOLVABLE: the refusal NAMES the variable" \
+                       || no "ARM 5 UNRESOLVABLE: the refusal did not name ZOGGLE_PAYLOAD_2026, so nobody can act on it"
+  [ "$can5" -eq 0 ] && ok "ARM 5 no canary fired -- nothing reached a real binary" \
+                    || no "ARM 5 THE CANARY FIRED"
+  rm -rf "$MUTDIR2"
+fi
+
+# ---------------------------------------------------------------- ARM 6 -----
+# HARNESS-SEAM-1. A LITERAL by-path payload -- the real cargo, at the real
+# path sr2-work/check.sbatch puts on its PATH -- must be STUBBED, and removing
+# the cargo stub must turn that same wrapper into a REFUSAL. This is ARM 2's
+# assertion for the half PATH and functions cannot reach.
+if [ "$WHICH" = all ] || [ "$WHICH" = 6 ]; then
+  echo "=== ARM 6 -- a payload invoked by its literal path"
+  mkdir -p "$MUTDIR2" || { echo "ARMS FATAL: cannot write $MUTDIR2"; exit 4; }
+  {
+    echo '#!/bin/bash'
+    echo '#SBATCH --job-name=hs1-mutarm-bypath-cargo'
+    echo 'set -u'
+    echo '/users/glvov/.cargo/bin/cargo check --all-targets -j 1'
+    echo 'rc=$?'
+    echo 'exit "$rc"'
+  } > "$MUTDIR2/bypath_cargo.sbatch"
+  rc6c=$(run_guard arm6ctl DEG_EXPLORATORY=1 DEG_ONLY='harnessseam1/mutarm/bypath_cargo.sbatch')
+  rc6m=$(run_guard arm6mut DEG_EXPLORATORY=1 DEG_ONLY='harnessseam1/mutarm/bypath_cargo.sbatch' DEG_DROP_STUBS=cargo)
+  c_pay=$(grep -cE 'PAYLOAD[[:space:]]+cargo' "$W/arm6ctl.log")
+  c_can=$(grep -c 'CANARY FIRED' "$W/arm6ctl.log")
+  m_ref=$(grep -c 'REFUSE  B harnessseam1/mutarm/bypath_cargo.sbatch' "$W/arm6mut.log")
+  m_can=$(grep -c 'CANARY FIRED' "$W/arm6mut.log")
+  [ "$c_pay" -gt 0 ] && ok "ARM 6 CONTROL: the LITERAL /users/glvov/.cargo/bin/cargo was intercepted and stubbed, not run" \
+                     || no "ARM 6 CONTROL: no cargo PAYLOAD row -- the by-path seam did not intercept (log $W/arm6ctl.log)"
+  [ "$c_can" -eq 0 ] && ok "ARM 6 CONTROL: no canary fired" \
+                     || no "ARM 6 CONTROL: THE CANARY FIRED -- a real cargo was reachable"
+  [ "$m_ref" -gt 0 ] && ok "ARM 6 MUTANT: with the cargo stub dropped the same wrapper is REFUSED, not run" \
+                     || no "ARM 6 MUTANT: no refusal -- by-path coverage is not derived from the stub (log $W/arm6mut.log)"
+  [ "$m_can" -eq 0 ] && ok "ARM 6 MUTANT: no canary fired either" \
+                     || no "ARM 6 MUTANT: THE CANARY FIRED"
+  rm -rf "$MUTDIR2"
 fi
 
 echo "### driver_exit_mutation_arms: pass=$pass fail=$fail  $(date -Is)"
