@@ -683,6 +683,103 @@ const SHADOW_USE_STAMP_SUFFIX: &str = ".used";
 /// concurrent relock is never made to wait on housekeeping.
 const SHADOW_REAP_LOCK_NAME: &str = ".shadow.reap.lock";
 
+/// STORE-REAP-3. The two on-disk LAYOUTS this store has ever written, and the
+/// word each one puts in a row and in a quarantine name.
+///
+/// Before L3-1 the cache directory was `<root>/shadow/<target artifact
+/// identity>/<key>.changed`: BOTH the key and the directory were qualified by
+/// [`crate::pypi::ResolutionTarget::artifact_cache_identity`], which is why
+/// L3-1's own doc comment on [`shadow_cache_dir_in`] says "the target segment
+/// is GONE". L3-1 removed the segment from the writer — it did not, and could
+/// not, remove the directories already on this filesystem. The reaper that
+/// L3-1b then wrote walks only the flat layout, so on 2026-09-06 it reported
+/// `scanned=0` against two real persistent roots that between them hold 85
+/// pre-L3-1 entries and 1.42 GB (STORE-REAP-2-1). A reaper that cannot see a
+/// layout its own store wrote is not a clean store, it is a blind spot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ShadowLayout {
+    /// L3-1 onward: an entry file directly in the shadow directory.
+    Flat,
+    /// Pre-L3-1: an entry file one level down, under the target artifact
+    /// identity the key used to be qualified by.
+    Legacy { target: String },
+}
+
+impl ShadowLayout {
+    /// The word that goes in the `layout=` field of every row this reaper
+    /// prints, so a reader can tell the two walks apart in one job log.
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            ShadowLayout::Flat => "flat",
+            ShadowLayout::Legacy { .. } => "legacy",
+        }
+    }
+
+    /// The reason an entry of this layout is selected.
+    ///
+    /// WHY `stale-layout` AND NOT THE EXISTING `stale-version`: the other two
+    /// stores' `stale-version` means "this entry sits under a CACHE-VERSION
+    /// generation directory (`v12`, `v3`) the current code no longer
+    /// addresses", and it is carried in a dedicated `stale_version=` counter
+    /// that `store-reap`'s SUMMARY row prints and that STORE-REAP-1's reader
+    /// asserts on. The shadow store's retired segment is not a version, it is
+    /// a TARGET IDENTITY, and folding a target into a counter whose every
+    /// other row means a version is the same conflation
+    /// [`ReapLockOutcome::Unopenable`] exists to refuse. It also has a
+    /// concrete reader cost: MERGE-Q's version-walk reader asserts that
+    /// `shadow_cache_store` rows have NOT grown `versions_walked` /
+    /// `evicted_stale_version`, and reusing the word would turn that reader
+    /// RED for a reason that is not a defect.
+    pub(crate) fn reason(&self) -> &'static str {
+        match self {
+            ShadowLayout::Flat => "unreferenced",
+            ShadowLayout::Legacy { .. } => "stale-layout",
+        }
+    }
+
+    /// The quarantine stem for one entry of this layout. THE LAYOUT AND THE
+    /// TARGET ARE BOTH IN THE NAME: quarantine is flat and shared by both
+    /// walks, so without the target two legacy entries with the same key under
+    /// different targets would collide on the same second in the same process.
+    pub(crate) fn quarantine_stem(&self, entry_name: &str) -> String {
+        match self {
+            ShadowLayout::Flat => entry_name.to_string(),
+            ShadowLayout::Legacy { target } => format!("legacy-{target}-{entry_name}"),
+        }
+    }
+}
+
+/// Whether a child directory of the shadow directory is a pre-L3-1 target
+/// segment. `artifact_cache_identity` is `format!("{:x}", Sha256::finalize())`,
+/// so the name is EXACTLY 64 lowercase hex digits and nothing else in this
+/// directory can be mistaken for one — not `quarantine`, not a dotfile, not a
+/// future segment someone adds.
+///
+/// ONE EXPRESSION, deliberately: this is the predicate that decides whether the
+/// reaper descends into a directory at all, so its mutation arm must be a
+/// one-line substitution that cannot also change something else.
+pub(crate) fn is_shadow_legacy_target_dir(name: &str) -> bool {
+    name.len() == SHADOW_LEGACY_TARGET_NAME_LEN && name.bytes().all(is_lower_hex_digit)
+}
+
+/// Length of a `artifact_cache_identity` string: a sha256 in lowercase hex.
+const SHADOW_LEGACY_TARGET_NAME_LEN: usize = 64;
+
+fn is_lower_hex_digit(byte: u8) -> bool {
+    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+}
+
+/// Whether a directory entry NAME is a published shadow entry: not a dotfile
+/// sidecar, and ending in one of [`SHADOW_ENTRY_SUFFIXES`]. One predicate, two
+/// walks — a legacy directory holds exactly the same `.changed`/`.same` files
+/// the flat one does, because L3-1 moved the directory and not the file names.
+fn is_shadow_entry_name(name: &str) -> bool {
+    !name.starts_with('.')
+        && SHADOW_ENTRY_SUFFIXES
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
+}
+
 /// Where the use-stamp for one entry lives: `<dir>/.<entry>.used`.
 pub(crate) fn shadow_use_stamp_path(entry: &Path) -> Option<PathBuf> {
     let parent = entry.parent()?;
@@ -854,6 +951,20 @@ pub(crate) struct ShadowReapReport {
     /// `true` when another process held the reap try-lock and this one backed
     /// off without scanning anything.
     pub(crate) skipped_concurrent: bool,
+    /// STORE-REAP-3. How many of this store's on-disk LAYOUTS this walk
+    /// enumerated. The flat layout is the shadow directory itself, so it counts
+    /// 1 whenever the store is present; the legacy layout counts 1 more when at
+    /// least one pre-L3-1 target directory is there to descend into. The same
+    /// shape as `versions_walked` in the other two stores: it counts what was
+    /// PRESENT, not what held entries, so an empty legacy directory still says
+    /// the walk reached it.
+    pub(crate) layouts_walked: u64,
+    /// STORE-REAP-3. Of `evicted`, how many were selected with
+    /// `reason="stale-layout"` — i.e. sat in the pre-L3-1 target-scoped layout.
+    /// Reported separately for `evicted_stale_version`'s reason in the other
+    /// two stores: "this generation is retired" and "nothing referenced this"
+    /// are different facts and one counter for both lies.
+    pub(crate) evicted_stale_layout: u64,
     /// STORE-REAP-2. One element per selected entry, in scan order.
     pub(crate) entries: Vec<ReapedEntry>,
 }
@@ -912,6 +1023,7 @@ pub(crate) fn reap_shadow_cache_store(
             scanned = 0,
             evicted = 0,
             kept = 0,
+            layouts_walked = 0,
             max_age_days = 0,
             mode = mode.as_str(),
             reason = "disabled",
@@ -925,6 +1037,7 @@ pub(crate) fn reap_shadow_cache_store(
             scanned = 0,
             evicted = 0,
             kept = 0,
+            layouts_walked = 0,
             max_age_days = max_age.as_secs() / 86_400,
             mode = mode.as_str(),
             reason = "store-absent",
@@ -951,7 +1064,12 @@ pub(crate) fn reap_shadow_cache_store(
     };
     let quarantine_root = shadow_dir.join("quarantine");
     let now = std::time::SystemTime::now();
-    let mut names: Vec<String> = Vec::new();
+    // STORE-REAP-3. ONE candidate list over BOTH layouts, so there is exactly
+    // one age rule, one re-age-under-the-lock, one quarantine and one set of
+    // counters. A second walk with its own copy of the rules is the shape
+    // `ReapMode` refuses for the dry run, for the same reason.
+    let mut names: Vec<(String, ShadowLayout)> = Vec::new();
+    let mut legacy_dirs: Vec<String> = Vec::new();
     for entry in std::fs::read_dir(shadow_dir)
         .with_context(|| format!("reading the shadow cache dir {}", shadow_dir.display()))?
     {
@@ -960,21 +1078,74 @@ pub(crate) fn reap_shadow_cache_store(
         let Some(name) = entry.file_name().to_str().map(|s| s.to_string()) else {
             continue;
         };
+        // A pre-L3-1 target segment is a DIRECTORY of 64 hex digits. It is
+        // checked before the entry-name test because it can never satisfy it.
+        if is_shadow_legacy_target_dir(&name) && shadow_dir.join(&name).is_dir() {
+            legacy_dirs.push(name);
+            continue;
+        }
         // Dotfiles are sidecars, never entries; and only a published
         // `.changed`/`.same` file is an entry, so a live miss's `.tmp` and the
         // `quarantine` directory itself are both invisible here.
-        if name.starts_with('.')
-            || !SHADOW_ENTRY_SUFFIXES
-                .iter()
-                .any(|suffix| name.ends_with(suffix))
-        {
+        if !is_shadow_entry_name(&name) {
             continue;
         }
-        names.push(name);
+        names.push((name, ShadowLayout::Flat));
     }
-    names.sort();
-    for name in names {
-        let entry_path = shadow_dir.join(&name);
+    // BY NAME ONLY: `ShadowLayout` carries a target and is deliberately not
+    // `Ord` — the scan order is flat entries by name, then each legacy target
+    // by name with its own entries by name, which is what the two loops below
+    // produce.
+    names.sort_by(|left, right| left.0.cmp(&right.0));
+    legacy_dirs.sort();
+    // PRESENT, not non-empty: an emptied legacy directory still says the walk
+    // reached that layout, exactly as `versions_walked` counts an empty
+    // generation directory. The directories themselves are NEVER removed —
+    // rule 1 is rename-only and that applies to what is left behind too.
+    report.layouts_walked = 1 + u64::from(!legacy_dirs.is_empty());
+    for target in &legacy_dirs {
+        let dir = shadow_dir.join(target);
+        let mut legacy_names: Vec<String> = Vec::new();
+        let children = match std::fs::read_dir(&dir) {
+            Ok(children) => children,
+            Err(error) => {
+                // Law 9: a legacy directory we cannot open is stated, never
+                // silently counted as empty.
+                tracing::warn!(
+                    store = %shadow_dir.display(),
+                    layout = "legacy",
+                    target = %target,
+                    error = %error,
+                    "shadow_cache_store could not read a legacy target directory; nothing evicted from it",
+                );
+                continue;
+            }
+        };
+        for child in children.flatten() {
+            let Some(name) = child.file_name().to_str().map(|s| s.to_string()) else {
+                continue;
+            };
+            if !is_shadow_entry_name(&name) {
+                continue;
+            }
+            legacy_names.push(name);
+        }
+        legacy_names.sort();
+        names.extend(legacy_names.into_iter().map(|name| {
+            (
+                name,
+                ShadowLayout::Legacy {
+                    target: target.clone(),
+                },
+            )
+        }));
+    }
+    for (name, layout) in names {
+        let entry_path = match &layout {
+            ShadowLayout::Flat => shadow_dir.join(&name),
+            ShadowLayout::Legacy { target } => shadow_dir.join(target).join(&name),
+        };
+        let reason = layout.reason();
         if !entry_path.is_file() {
             continue;
         }
@@ -1004,8 +1175,11 @@ pub(crate) fn reap_shadow_cache_store(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let quarantine =
-            quarantine_root.join(format!("{name}-{stamp_unix}-{}", std::process::id()));
+        let quarantine = quarantine_root.join(format!(
+            "{}-{stamp_unix}-{}",
+            layout.quarantine_stem(&name),
+            std::process::id()
+        ));
         // STORE-REAP-2. THE DRY RUN STOPS HERE, one statement before the first
         // thing that writes: the entry has been scanned, aged, re-aged and
         // selected by exactly the rules the apply path uses, and the only
@@ -1013,18 +1187,22 @@ pub(crate) fn reap_shadow_cache_store(
         // renamed.
         if mode.is_dry_run() {
             report.evicted += 1;
+            if matches!(&layout, ShadowLayout::Legacy { .. }) {
+                report.evicted_stale_layout += 1;
+            }
             report.entries.push(ReapedEntry {
-                label: name.clone(),
+                label: layout.quarantine_stem(&name),
                 path: entry_path.clone(),
                 quarantine: None,
                 age_days: age.as_secs() / 86_400,
-                reason: "unreferenced",
+                reason,
             });
             tracing::info!(
                 entry = %name,
+                layout = layout.as_str(),
                 age_days = age.as_secs() / 86_400,
                 max_age_days = max_age.as_secs() / 86_400,
-                reason = "unreferenced",
+                reason = reason,
                 mode = mode.as_str(),
                 "shadow_cache_store would-evict",
             );
@@ -1045,30 +1223,38 @@ pub(crate) fn reap_shadow_cache_store(
         if let Err(error) = std::fs::rename(&entry_path, &quarantine) {
             tracing::warn!(
                 entry = %name,
+                layout = layout.as_str(),
                 error = %error,
                 "shadow_cache_store eviction could not rename; entry kept",
             );
             report.kept += 1;
             continue;
         }
+        // The stamp is a sidecar of the entry's OWN parent, so this reaches a
+        // legacy entry's stamp inside the target directory and not one in the
+        // flat directory with the same name.
         if let Some(stamp) = shadow_use_stamp_path(&entry_path) {
             let _ = std::fs::remove_file(stamp);
         }
         report.evicted += 1;
+        if matches!(&layout, ShadowLayout::Legacy { .. }) {
+            report.evicted_stale_layout += 1;
+        }
         report.entries.push(ReapedEntry {
-            label: name.clone(),
+            label: layout.quarantine_stem(&name),
             path: entry_path.clone(),
             quarantine: Some(quarantine.clone()),
             age_days: age.as_secs() / 86_400,
-            reason: "unreferenced",
+            reason,
         });
         // ONE ROW PER EVICTION, the `wheel_store evicted` / `git_snapshot_store
         // evicted` shape.
         tracing::info!(
             entry = %name,
+            layout = layout.as_str(),
             age_days = age.as_secs() / 86_400,
             max_age_days = max_age.as_secs() / 86_400,
-            reason = "unreferenced",
+            reason = reason,
             quarantine = %quarantine.display(),
             mode = mode.as_str(),
             "shadow_cache_store evicted",
@@ -1078,7 +1264,9 @@ pub(crate) fn reap_shadow_cache_store(
         store = %shadow_dir.display(),
         scanned = report.scanned,
         evicted = report.evicted,
+        evicted_stale_layout = report.evicted_stale_layout,
         kept = report.kept,
+        layouts_walked = report.layouts_walked,
         max_age_days = max_age.as_secs() / 86_400,
         mode = mode.as_str(),
         "shadow_cache_store reap",
@@ -5047,6 +5235,78 @@ mod tests {
             quarantined[0].display(),
         );
         assert_eq!(std::fs::read(&quarantined[0]).unwrap(), b"stale-bytes");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// STORE-REAP-3. THE AGE RULE IS THE SAME ONE IN BOTH LAYOUTS, and a
+    /// `.used` sidecar inside a pre-L3-1 target directory is honoured exactly
+    /// as one in the flat directory is.
+    ///
+    /// On the two real persistent roots this lane censused, NOT ONE legacy
+    /// entry carries a stamp — `touch_shadow_use_stamp` did not exist when they
+    /// were written, and the flat directories hold zero dotfiles of any kind.
+    /// So the age source that actually applies to all 85 of them is
+    /// `shadow_entry_age`'s FALLBACK, the entry file's own mtime, which for a
+    /// published entry is its publish time. That is the correct floor: an entry
+    /// nothing has referenced since it was written is aged from when it was
+    /// written, never from the epoch. This guard proves the stamp branch is
+    /// nevertheless live in the legacy layout, so a store that starts carrying
+    /// stamps (a mixed-layout run of this very binary) cannot lose a hot entry.
+    #[test]
+    fn a_legacy_shadow_entry_is_aged_by_its_own_use_stamp_and_then_by_its_mtime() {
+        let tmp = make_test_dir("shadow-legacy-age");
+        let shadow = tmp.join("shadow");
+        let target = "0".repeat(64);
+        let dir = shadow.join(&target);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let referenced = dir.join("hot.changed");
+        std::fs::write(&referenced, b"hot-bytes").unwrap();
+        age_path_days(&referenced, 30);
+        // The stamp is a sidecar of THIS directory, not of the flat one.
+        touch_shadow_use_stamp(&referenced);
+        assert!(
+            dir.join(".hot.changed.used").is_file(),
+            "the stamp lands beside the entry it stamps",
+        );
+
+        let cold = dir.join("cold.same");
+        std::fs::write(&cold, b"cold-bytes").unwrap();
+        age_path_days(&cold, 30);
+
+        // A directory that is NOT a 64-hex target identity is not a layout, and
+        // its contents are invisible — the reaper never invents a walk.
+        let not_a_target = shadow.join("quarantine-ish");
+        std::fs::create_dir_all(&not_a_target).unwrap();
+        let hidden = not_a_target.join("zzz.changed");
+        std::fs::write(&hidden, b"not an entry").unwrap();
+        age_path_days(&hidden, 30);
+
+        let report = reap_shadow_cache_store(
+            &shadow,
+            std::time::Duration::from_secs(14 * 86_400),
+            ReapMode::Apply,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                report.scanned,
+                report.evicted,
+                report.evicted_stale_layout,
+                report.kept,
+                report.layouts_walked,
+            ),
+            (2, 1, 1, 1, 2),
+            "both legacy entries are scanned; only the unstamped one is \
+             evicted; the non-hex directory is not a layout",
+        );
+        assert!(referenced.is_file(), "a stamped legacy entry is never evicted");
+        assert!(!cold.exists(), "the unstamped legacy entry left its directory");
+        assert!(hidden.is_file(), "a non-target directory is never descended into");
+        assert_eq!(
+            report.entries.iter().map(|e| e.reason).collect::<Vec<_>>(),
+            vec!["stale-layout"],
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

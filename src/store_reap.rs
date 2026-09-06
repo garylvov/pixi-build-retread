@@ -181,6 +181,15 @@ pub struct StoreOutcome {
     pub kept: u64,
     pub skipped_locked: u64,
     pub versions_walked: u64,
+    /// STORE-REAP-3. How many on-disk LAYOUTS of this store the walk
+    /// enumerated. Only the shadow store has ever had more than one (L3-1 moved
+    /// the target identity out of the path and left the old directories where
+    /// they were), so the other two stores report 0 here — the same way the
+    /// shadow store reports 0 for `versions_walked`, because it has no
+    /// generation segment. ONE row format for all three stores; a field that
+    /// does not apply reads 0 rather than being absent, so a parser never has
+    /// to know which store it is looking at.
+    pub layouts_walked: u64,
     pub skipped_concurrent: bool,
     pub bytes: u64,
 }
@@ -210,7 +219,7 @@ pub fn run(args: &Args) -> anyhow::Result<i32> {
             println!(
                 "### store-reap SUMMARY root={} store={} mode={} max_age_days={} \
                  scanned={} {}={} stale_version={} kept={} skipped_locked={} \
-                 versions_walked={} skipped_concurrent={} bytes={}",
+                 versions_walked={} layouts_walked={} skipped_concurrent={} bytes={}",
                 root.display(),
                 store.as_str(),
                 args.mode.as_str(),
@@ -222,6 +231,7 @@ pub fn run(args: &Args) -> anyhow::Result<i32> {
                 outcome.kept,
                 outcome.skipped_locked,
                 outcome.versions_walked,
+                outcome.layouts_walked,
                 outcome.skipped_concurrent,
                 outcome.bytes,
             );
@@ -290,9 +300,11 @@ fn reap_one(
             report.entries
         }
         Store::Shadow => {
-            // The shadow reaper takes the shadow DIRECTORY, not the store root:
-            // its entries are files in one flat directory with no generation
-            // segment (L3-1b-1a-1 ruled that walk deliberately unchanged).
+            // The shadow reaper takes the shadow DIRECTORY, not the store root.
+            // It has no generation segment — L3-1b-1a-1 ruled that walk
+            // deliberately unchanged and that ruling still holds — but
+            // STORE-REAP-3 gave it a second LAYOUT to walk, so it reports
+            // `layouts_walked` where the other two report `versions_walked`.
             let report = crate::courier::reap_shadow_cache_store(
                 &crate::courier::shadow_cache_dir_in(root),
                 max_age,
@@ -301,6 +313,7 @@ fn reap_one(
             outcome.scanned = report.scanned;
             outcome.selected = report.evicted;
             outcome.kept = report.kept;
+            outcome.layouts_walked = report.layouts_walked;
             outcome.skipped_concurrent = report.skipped_concurrent;
             report.entries
         }
@@ -432,6 +445,24 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("shadow dir");
         let entry = dir.join(name);
         std::fs::write(&entry, vec![b's'; 16]).expect("payload");
+        set_mtime(&entry, age(ago));
+        entry
+    }
+
+    /// A 64-hex target identity, the shape `artifact_cache_identity` produces
+    /// and the only shape the legacy walk descends into.
+    fn legacy_target(seed: u8) -> String {
+        std::iter::repeat(format!("{seed:02x}")).take(32).collect()
+    }
+
+    /// STORE-REAP-3. One PRE-L3-1 shadow entry: a FILE one level down, under
+    /// the target artifact identity the key used to be qualified by —
+    /// `<root>/shadow/<64-hex target>/<key>.changed`.
+    fn shadow_legacy_entry(root: &Path, target: &str, name: &str, ago: u64) -> PathBuf {
+        let dir = root.join("shadow").join(target);
+        std::fs::create_dir_all(&dir).expect("legacy target dir");
+        let entry = dir.join(name);
+        std::fs::write(&entry, vec![b'l'; 64]).expect("payload");
         set_mtime(&entry, age(ago));
         entry
     }
@@ -726,5 +757,161 @@ mod tests {
             named.resolved_roots(),
             vec![PathBuf::from("/oscar/data/stellex/glvov/caches/rtcache")]
         );
+    }
+
+    /// STORE-REAP-3, GUARD 1 — THE FIXTURE CARRIES BOTH LAYOUTS AND THE VERB
+    /// SEES ALL OF IT.
+    ///
+    /// This is the guard that would have caught STORE-REAP-2's `scanned=0`
+    /// against two real persistent roots. Three entries, one of each fate:
+    /// * a FRESH flat entry — kept, because the age rule is unchanged;
+    /// * a STALE flat entry — evicted, `reason="unreferenced"`;
+    /// * a STALE entry in the pre-L3-1 `shadow/<64-hex target>/` layout —
+    ///   evicted, `reason="stale-layout"`, which is the whole lane.
+    /// `layouts_walked=2` says the walk reached both, and it is 1 when only the
+    /// flat layout is on disk — asserted below so the field cannot be a
+    /// constant.
+    #[test]
+    fn the_shadow_dry_run_walks_both_layouts_and_names_the_legacy_entry_by_its_own_reason() {
+        let root = scratch("shadow-both-layouts");
+        let target = legacy_target(0xab);
+        let fresh = shadow_entry(&root, "fresh.changed", 1);
+        let stale = shadow_entry(&root, "stale.changed", 30);
+        let legacy = shadow_legacy_entry(&root, &target, "old.changed", 30);
+        // An EMPTIED legacy directory is still a layout the walk reached, and
+        // it must never be selected: the reaper evicts files, never directories.
+        let empty_target = legacy_target(0xcd);
+        std::fs::create_dir_all(root.join("shadow").join(&empty_target)).expect("empty target");
+        let before = tree(&root);
+
+        let sh = dry_run(&root, Store::Shadow);
+
+        assert_eq!(
+            (sh.scanned, sh.selected, sh.kept, sh.layouts_walked),
+            (3, 2, 1, 2),
+            "three entries across two layouts, two of them over age, and BOTH \
+             layouts walked",
+        );
+        // ON THE TIP THIS IS (1, 1, 0, 0): the legacy entry is invisible, so
+        // `scanned` counts only the flat pair and `layouts_walked` does not
+        // exist. That is the mutation this guard is pinned against.
+        assert!(sh.bytes >= 64, "the legacy entry's bytes are charged: {}", sh.bytes);
+        assert_eq!(
+            tree(&root),
+            before,
+            "A DRY RUN OVER EITHER LAYOUT MUST CHANGE NOTHING",
+        );
+        assert!(fresh.is_file() && stale.is_file() && legacy.is_file());
+
+        // THE APPLY ARM, on the same fixture: the legacy entry moves, carries
+        // its layout AND its target in the quarantine name, and the flat
+        // quarantine is shared rather than re-nested.
+        let applied = reap_one(&root, Store::Shadow, 14, ReapMode::Apply, false).expect("apply");
+        assert_eq!(
+            (applied.scanned, applied.selected, applied.kept, applied.layouts_walked),
+            (3, 2, 1, 2),
+            "the apply arm selects exactly what the dry run named",
+        );
+        assert!(!legacy.exists(), "the legacy entry left its target directory");
+        assert!(!stale.exists(), "the stale flat entry left the shadow directory");
+        assert!(fresh.is_file(), "a fresh entry is never evicted, in either layout");
+        assert!(
+            root.join("shadow").join(&target).is_dir(),
+            "RULE 1 IS RENAME-ONLY, and it reaches the emptied directory too: \
+             a legacy target directory is never removed",
+        );
+        assert!(root.join("shadow").join(&empty_target).is_dir());
+        let mut quarantined: Vec<String> = std::fs::read_dir(root.join("shadow").join("quarantine"))
+            .expect("quarantine")
+            .map(|e| e.unwrap().file_name().to_str().unwrap().to_string())
+            .collect();
+        quarantined.sort();
+        assert_eq!(quarantined.len(), 2, "one quarantine, both layouts: {quarantined:?}");
+        assert!(
+            quarantined
+                .iter()
+                .any(|name| name.starts_with(&format!("legacy-{target}-old.changed-"))),
+            "THE LAYOUT AND THE TARGET ARE BOTH IN THE QUARANTINE NAME: {quarantined:?}",
+        );
+        assert!(
+            quarantined.iter().any(|name| name.starts_with("stale.changed-")),
+            "a flat eviction's quarantine name is unchanged by this lane: {quarantined:?}",
+        );
+
+        // NON-VACUITY FOR `layouts_walked`: a root with no legacy directory at
+        // all reports 1, so the 2 above is measured and not a constant.
+        let flat_only = scratch("shadow-flat-only");
+        shadow_entry(&flat_only, "solo.changed", 30);
+        let solo = dry_run(&flat_only, Store::Shadow);
+        assert_eq!(
+            (solo.scanned, solo.selected, solo.layouts_walked),
+            (1, 1, 1),
+            "with no legacy directory on disk only the flat layout is walked",
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&flat_only);
+    }
+
+    /// STORE-REAP-3, GUARD 2 — THE REASONS PARTITION THE SELECTED SET, AND THE
+    /// LEGACY ROWS CARRY THE LEGACY REASON.
+    ///
+    /// `store-reap`'s per-entry rows are what an operator vets a proposal from,
+    /// so `reason=` must distinguish "nothing referenced this" from "this sits
+    /// in a layout the writer retired". A single reason for both would make the
+    /// 85 pre-L3-1 entries on this filesystem indistinguishable in the census
+    /// from ordinary unreferenced ones.
+    #[test]
+    fn every_legacy_shadow_row_says_stale_layout_and_every_flat_row_says_unreferenced() {
+        let root = scratch("shadow-reasons");
+        let target_a = legacy_target(0x1a);
+        let target_b = legacy_target(0x2b);
+        shadow_entry(&root, "flat.changed", 30);
+        shadow_legacy_entry(&root, &target_a, "a.changed", 30);
+        shadow_legacy_entry(&root, &target_b, "b.same", 30);
+        // Same key under two targets — the collision the target-in-the-name
+        // rule exists to prevent. Both must be selected and both must survive
+        // the rename into ONE quarantine.
+        shadow_legacy_entry(&root, &target_a, "dup.changed", 30);
+        shadow_legacy_entry(&root, &target_b, "dup.changed", 30);
+
+        let report = crate::courier::reap_shadow_cache_store(
+            &crate::courier::shadow_cache_dir_in(&root),
+            std::time::Duration::from_secs(14 * 86_400),
+            ReapMode::Apply,
+        )
+        .expect("reap");
+        assert_eq!(
+            (report.scanned, report.evicted, report.evicted_stale_layout, report.layouts_walked),
+            (5, 5, 4, 2),
+            "four of the five selected entries are legacy",
+        );
+        let mut reasons: Vec<(String, &str)> = report
+            .entries
+            .iter()
+            .map(|entry| (entry.label.clone(), entry.reason))
+            .collect();
+        reasons.sort();
+        let mut expected: Vec<(String, &str)> = vec![
+            (format!("legacy-{target_a}-a.changed"), "stale-layout"),
+            (format!("legacy-{target_a}-dup.changed"), "stale-layout"),
+            (format!("legacy-{target_b}-b.same"), "stale-layout"),
+            (format!("legacy-{target_b}-dup.changed"), "stale-layout"),
+            ("flat.changed".to_string(), "unreferenced"),
+        ];
+        expected.sort();
+        assert_eq!(
+            reasons, expected,
+            "the labels are target-qualified so two entries with the same key \
+             under different targets are two different rows",
+        );
+        assert_eq!(
+            std::fs::read_dir(root.join("shadow").join("quarantine"))
+                .expect("quarantine")
+                .count(),
+            5,
+            "ALL FIVE survive the rename into one flat quarantine — the \
+             same-key pair does not collide",
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
