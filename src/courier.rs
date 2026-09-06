@@ -749,7 +749,41 @@ pub(crate) fn reap_shadow_cache_store(
     max_age: std::time::Duration,
 ) -> anyhow::Result<ShadowReapReport> {
     let mut report = ShadowReapReport::default();
-    if max_age.is_zero() || !shadow_dir.is_dir() {
+    // MERGE-M-2. BOTH refusals emit the summary row before returning, and the
+    // reason is a reader/writer one rather than a cosmetic one. This used to be
+    // a single silent `return Ok(report)`, so a job in which the reaper ran and
+    // found nothing was INDISTINGUISHABLE IN THE LOG from a job in which the
+    // reaper was never called at all. MERGE-M's B20 proof (mBM-relock 5931386)
+    // is the case: `shadow_cache_store` appears NOWHERE in its 392 360-line
+    // log, 0 reap rows and 0 evictions, and the only way the lane could show
+    // the block had executed was to point at the SIBLING three lines away —
+    // `source_build::reap_git_snapshot_store_once`, which printed 14 rows. On a
+    // cold job the shadow directory does not exist yet when the handler reaps:
+    // it is created lazily by the first miss, which happens after. So the
+    // ABSENT-STORE arm is the ORDINARY arm of a cold run, not an edge case, and
+    // it was the one arm that said nothing.
+    if max_age.is_zero() {
+        tracing::info!(
+            store = %shadow_dir.display(),
+            scanned = 0,
+            evicted = 0,
+            kept = 0,
+            max_age_days = 0,
+            reason = "disabled",
+            "shadow_cache_store reap",
+        );
+        return Ok(report);
+    }
+    if !shadow_dir.is_dir() {
+        tracing::info!(
+            store = %shadow_dir.display(),
+            scanned = 0,
+            evicted = 0,
+            kept = 0,
+            max_age_days = max_age.as_secs() / 86_400,
+            reason = "store-absent",
+            "shadow_cache_store reap",
+        );
         return Ok(report);
     }
     let reap_lock_path = shadow_dir.join(SHADOW_REAP_LOCK_NAME);
@@ -4878,6 +4912,118 @@ mod tests {
             reap_shadow_cache_store(&shadow, std::time::Duration::from_secs(14 * 86_400)).unwrap();
         assert_eq!(freed.evicted, 1);
         assert!(!stale.exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Keep every row a body emits, so a test can assert on what an OPERATOR
+    /// would have been able to grep out of a job's backend log. Same shape as
+    /// `wheel::tests::with_captured_rows`, without the runtime: nothing here is
+    /// async.
+    struct CapturedReapRows(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl std::io::Write for CapturedReapRows {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(buf).to_string());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn with_captured_rows<T>(body: impl FnOnce() -> T) -> (T, Vec<String>) {
+        let rows = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer({
+                let rows = std::sync::Arc::clone(&rows);
+                move || CapturedReapRows(std::sync::Arc::clone(&rows))
+            })
+            .finish();
+        let value = tracing::subscriber::with_default(subscriber, body);
+        let rows = rows.lock().unwrap().clone();
+        (value, rows)
+    }
+
+    /// MERGE-M-2, AND IT IS RED ON THE TIP. `reap_shadow_cache_store` opened
+    /// with `if max_age.is_zero() || !shadow_dir.is_dir() { return Ok(report) }`
+    /// — a SILENT return — so a cold job could not tell "the reaper ran against
+    /// a store that does not exist yet" from "the reaper was never called".
+    /// That is not an edge case: on a cold job the shadow directory is created
+    /// LAZILY by the first miss, which happens AFTER the handler reaps, so the
+    /// absent-store arm is the ordinary arm of every cold run. MERGE-M's B20
+    /// proof (mBM-relock 5931386) had ZERO `shadow_cache_store` rows in a
+    /// 392 360-line log and had to prove the block ran by pointing at the
+    /// SIBLING call three lines away.
+    ///
+    /// The assertion is on the ROW, not on the report, because the report was
+    /// already right and the row was the thing missing. All three arms are
+    /// here so the test cannot pass by accident: an absent store, a disabled
+    /// reaper, and — the non-vacuity control — a real store, which must keep
+    /// printing the row it always printed.
+    #[test]
+    fn every_shadow_reap_prints_its_summary_row_including_the_two_refusals() {
+        let tmp = make_test_dir("shadow-reap-rows");
+        let max_age = std::time::Duration::from_secs(14 * 86_400);
+
+        // (1) THE STORE DOES NOT EXIST YET -- a cold job, every time.
+        let absent = tmp.join("never-created");
+        assert!(!absent.exists());
+        let (report, rows) = with_captured_rows(|| reap_shadow_cache_store(&absent, max_age));
+        assert_eq!(
+            report.unwrap(),
+            ShadowReapReport::default(),
+            "an absent store reaps nothing -- the BEHAVIOUR is unchanged",
+        );
+        let joined = rows.join("");
+        assert!(
+            joined.contains("shadow_cache_store reap"),
+            "an absent store must still print the summary row, or the reader \
+             cannot tell it ran: rows were {rows:?}",
+        );
+        assert!(
+            joined.contains("scanned=0") && joined.contains("reason=\"store-absent\""),
+            "the absent-store row carries scanned=0 and names why: {joined}",
+        );
+        assert!(
+            joined.contains(absent.display().to_string().as_str()),
+            "the row names the store it looked for: {joined}",
+        );
+
+        // (2) THE REAPER IS TURNED OFF. Same requirement, different reason.
+        let live = tmp.join("shadow");
+        std::fs::create_dir_all(&live).unwrap();
+        let (off, rows) =
+            with_captured_rows(|| reap_shadow_cache_store(&live, std::time::Duration::ZERO));
+        assert_eq!(off.unwrap(), ShadowReapReport::default());
+        let joined = rows.join("");
+        assert!(
+            joined.contains("shadow_cache_store reap") && joined.contains("reason=\"disabled\""),
+            "a disabled reaper says so instead of saying nothing: {joined}",
+        );
+
+        // (3) NON-VACUITY CONTROL. A real store still prints the row it always
+        // printed, so arms 1 and 2 are not passing because the assertion is
+        // trivially true of every input.
+        let entry = live.join("eeee.changed");
+        std::fs::write(&entry, b"fresh-bytes").unwrap();
+        let (populated, rows) = with_captured_rows(|| reap_shadow_cache_store(&live, max_age));
+        let populated = populated.unwrap();
+        assert_eq!(populated.scanned, 1);
+        assert_eq!(populated.evicted, 0);
+        let joined = rows.join("");
+        assert!(
+            joined.contains("shadow_cache_store reap") && joined.contains("scanned=1"),
+            "the populated arm still prints its own row: {joined}",
+        );
+        assert!(
+            !joined.contains("reason=\"store-absent\"") && !joined.contains("reason=\"disabled\""),
+            "and it is NOT one of the refusal rows: {joined}",
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
