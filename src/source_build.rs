@@ -29,14 +29,26 @@ use tokio::process::Command;
 use crate::config::GitSubmodules;
 use crate::pypi::{NativeSourceBuildPolicy, ResolutionTarget, normalized_python_minor};
 
-const BUILT_WHEEL_CACHE_SCHEMA: &str = "retread-built-wheel-v12";
+const BUILT_WHEEL_CACHE_SCHEMA: &str = "retread-built-wheel-v13";
 const BUILT_WHEEL_CACHE_ROOT: &str = "built-wheels";
 // Bump whenever the BYTES of a source-built wheel can change for an
 // unchanged source tree -- injection rules included. Epoch 49 stopped denying
 // a nested `env` directory, and without this bump every previously cached
 // injected wheel kept its missing subpackage forever ("reusing cached injected
 // wheel" served the stale artifact straight past the fix).
-const BUILT_WHEEL_CACHE_VERSION: &str = "v12";
+//
+// L3-1b-1a, v12 -> v13: the MEANING of the identity segment below this one
+// changed. It used to be `ResolutionTarget::artifact_cache_identity`, which
+// carries the consumer scope; it is now `build_cache_identity`, which does
+// not. A narrowing MOVES EVERY ADDRESS IN THE STORE and makes two old
+// addresses into one new one, so reusing the version would let a v12 entry be
+// found at an address that now means something else. There is deliberately NO
+// fallback read of the old address: a miss is a rebuild, paid once, measured
+// once, and a fallback would reintroduce the very ambiguity the bump exists to
+// remove. BOARDED IN THE SAME COMMIT (L3-1b-1a-1): `reap_built_wheel_store`
+// walks `<kind>/<BUILT_WHEEL_CACHE_VERSION>` only, so this bump orphans the
+// previous generation from the reaper.
+const BUILT_WHEEL_CACHE_VERSION: &str = "v13";
 const CHECKOUT_CACHE_VERSION: &str = "v3";
 const LOCAL_SOURCE_SNAPSHOT_VERSION: &str = "v5";
 const CANONICAL_GIT_SOURCE_SCHEMA: &str = "retread-canonical-git-source-v3";
@@ -1003,7 +1015,20 @@ fn evdev_supports_reproducible_ecodes(expected: Option<&ExpectedWheel>) -> bool 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BuiltWheelMarker {
     schema: String,
+    /// AUDIT ONLY since L3-1b-1a, and deliberately still written: the FULL
+    /// `ResolutionTarget::artifact_cache_identity` of the target that happened
+    /// to build this entry, consumer scope and envelope bit included. It is no
+    /// longer part of the address and it is no longer compared on a hit —
+    /// comparing it is exactly the defect this lane removed, because a second
+    /// consumer scope would then be refused at an address it legitimately
+    /// shares. Its reader is the store census the proof harness runs
+    /// (`arms/built_wheel_store_row.sh`, `### BUILT-WHEEL STORE` rows), which
+    /// is how anyone asks after the fact "which target first paid for this
+    /// wheel".
     artifact_target: String,
+    /// L3-1b-1a. The address's own identity: `build_cache_identity`. THIS is
+    /// what a hit is checked against.
+    build_identity: String,
     source_identity: String,
     filename: String,
     sha256: String,
@@ -1483,26 +1508,36 @@ fn validate_sha256(value: &str, label: &str) -> Result<String> {
 /// byte-for-byte what they were, so no entry changes address relative to its
 /// root and no cache key moves.
 ///
-/// THE `target.artifact_cache_identity()` SEGMENT IS A MEASURED REUSE DEFEATER,
-/// L3-1's own shape one store over, and it is BOARDED (L3-1b-1a) rather than
-/// fixed here. Three production pairs hold byte-identical wheels for ONE source
-/// identity under TWO target identities — `isaaclab_rl-0.4.7` sha `2c98ffe2…`,
-/// `gym-0.26.2` sha `604d7acf…`, `pyperclip-1.8.0` sha `509c5d6c…`, `cmp` rc 0
-/// on all three — and the two `artifact.json` records for a pair differ in
-/// exactly one field, `artifact_target`. It is not fixed in the same commit
-/// because narrowing the term MOVES EVERY ADDRESS IN THE STORE, and a change
-/// that moves addresses cannot be measured in the same job as a change that
-/// only moves the root: the proof of this one is that two runs produce
-/// byte-identical locks.
+/// L3-1b-1a NARROWED THE IDENTITY SEGMENT AND BUMPED THE VERSION WITH IT.
+/// The segment was `target.artifact_cache_identity()`, which carries the
+/// CONSUMER SCOPE — which pixi profiles and environments consume the artifact —
+/// and the `exact_workspace_envelope` provenance bit. Neither can reach a PEP
+/// 517 build: the only target-derived value that crosses into `uv build
+/// --wheel` is `--python=`, and the hermetic toolchain and the pinned
+/// build-requirements lock are folded into `source_identity` before this
+/// function is called. It is now [`ResolutionTarget::build_cache_identity`],
+/// which keeps python minor, `conda_subdir`, `max_glibc` and the workspace
+/// contract and drops the other two. THE MEASUREMENT THAT FORCED IT, from the
+/// stores on this filesystem and not from reasoning: 481 entries, eleven
+/// stores, 362 (store, kind, source-identity) groups, of which 70 span more
+/// than one artifact target and ZERO of those 70 differ in wheel sha256; in
+/// one cold canonical lock's own store, eight source identities each stored
+/// three times, `cmp` rc 0 on the pairs re-checked with direct file arguments,
+/// and the `artifact.json` records differing in exactly one field.
 fn built_wheel_cache_dir(kind: &str, source_identity: &str, target: &ResolutionTarget) -> PathBuf {
     built_wheel_store_root()
         .join(BUILT_WHEEL_CACHE_ROOT)
         .join(kind)
         .join(BUILT_WHEEL_CACHE_VERSION)
-        .join(target.artifact_cache_identity())
+        .join(target.build_cache_identity())
         .join(source_identity)
 }
 
+/// The caller-visible materialization of one cache entry. It is job-local, but
+/// it is keyed by the SAME identity as the store above on purpose: two scopes
+/// that now share one store address must not be handed two different output
+/// paths for the same bytes, or a reader comparing the two would see a
+/// difference the store no longer has.
 fn materialized_wheel_output_dir(
     out_dir: &Path,
     source_identity: &str,
@@ -1511,7 +1546,7 @@ fn materialized_wheel_output_dir(
     out_dir
         .join(".retread-source-wheels")
         .join(BUILT_WHEEL_CACHE_VERSION)
-        .join(target.artifact_cache_identity())
+        .join(target.build_cache_identity())
         .join(source_identity)
 }
 
@@ -1965,6 +2000,7 @@ fn validate_wheel_metadata(
     Ok(BuiltWheelMarker {
         schema: BUILT_WHEEL_CACHE_SCHEMA.to_string(),
         artifact_target: target.artifact_cache_identity(),
+        build_identity: target.build_cache_identity(),
         source_identity: String::new(),
         filename: filename.to_string(),
         sha256: validate_sha256(&metadata.sha256, "built wheel hash")?,
@@ -2367,15 +2403,27 @@ fn validate_cache_entry(
             .with_context(|| format!("reading built-wheel marker {}", marker_path.display()))?,
     )
     .with_context(|| format!("parsing built-wheel marker {}", marker_path.display()))?;
+    // L3-1b-1a: the compared identity is `build_identity`, not
+    // `artifact_target`. They were the same field before the narrowing; they
+    // are not now, and comparing the wide one here would refuse every entry a
+    // second consumer scope legitimately shares — the exact reuse defeat this
+    // lane removed, moved from the path into the validator. `artifact_target`
+    // stays in the record as audit and is deliberately NOT compared. A v12
+    // marker has no `build_identity` at all, so it cannot parse into this
+    // struct and could never be admitted here even if the v13 path bump had
+    // not already made its address unreachable.
     if marker.schema != BUILT_WHEEL_CACHE_SCHEMA
         || marker.source_identity != source_identity
-        || marker.artifact_target != target.artifact_cache_identity()
+        || marker.build_identity != target.build_cache_identity()
         || Path::new(&marker.filename)
             .file_name()
             .and_then(|v| v.to_str())
             != Some(marker.filename.as_str())
     {
-        bail!("built-wheel cache marker does not match its v8 namespace");
+        bail!(
+            "built-wheel cache marker does not match its {BUILT_WHEEL_CACHE_VERSION} namespace \
+             (schema, source identity, or build identity)"
+        );
     }
     let path = cache_dir.join(&marker.filename);
     // Integrity and the caller's semantic expectation are distinct. A cache
@@ -13215,6 +13263,193 @@ version = "0.1.0"
 
         remove_owned_cache_entry(&cache).unwrap();
         let _ = std::fs::remove_dir_all(&output);
+    }
+
+    /// L3-1b-1a fixture: a workspace contract on the HOST subdir, so
+    /// `try_for_contract` accepts it and a consumer scope can be attached.
+    fn host_contract_for_scope() -> crate::workspace::WorkspaceTargetContract {
+        let subdir = crate::glibc::current_pixi_platform().to_string();
+        let mut detected = std::collections::BTreeMap::new();
+        let mut declared = std::collections::BTreeMap::new();
+        if subdir.starts_with("linux-") {
+            detected.insert("glibc".to_string(), "2.35".to_string());
+            declared.insert("glibc".to_string(), "2.35".to_string());
+            detected.insert("linux".to_string(), "4.18".to_string());
+            detected.insert("unix".to_string(), String::new());
+        }
+        crate::workspace::WorkspaceTargetContract {
+            subdir,
+            declared_virtual_packages: declared,
+            detected_virtual_packages: detected,
+        }
+    }
+
+    fn host_target_with_environment(environment: &str) -> ResolutionTarget {
+        let contract = host_contract_for_scope();
+        ResolutionTarget::try_for_contract("3.11", contract.clone())
+            .expect("a host-subdir contract target")
+            .with_workspace_scope(crate::workspace::ResolvedWorkspaceTarget {
+                contract,
+                profiles: vec!["default".to_string()],
+                environments: vec![environment.to_string()],
+            })
+            .expect("attaching a consumer scope")
+            .with_hermetic_builds(false)
+    }
+
+    /// L3-1b-1a, THE PRODUCTION-SHAPED GUARD AND THE WHOLE LANE: an entry
+    /// published for one consumer scope is a HIT for a second consumer scope
+    /// that agrees on everything a build can see. On the pre-fix code the
+    /// second scope lands on a different address, misses, and runs the build
+    /// callback — which is what `callback_ran` proves did not happen here.
+    #[tokio::test]
+    async fn a_second_consumer_scope_hits_the_first_scopes_built_wheel() {
+        let first = host_target_with_environment("pm-isaaclab");
+        let second = host_target_with_environment("uwlab-gpu");
+        assert_ne!(
+            first.artifact_cache_identity(),
+            second.artifact_cache_identity(),
+            "the two scopes must really be two targets, or this guard is vacuous",
+        );
+
+        let source_identity = hash_fields(
+            b"l31b1a-second-scope-hit\0",
+            &[unique_test_dir("l31b1a-scope-key")
+                .to_string_lossy()
+                .as_bytes()],
+        );
+        let cache = built_wheel_cache_dir("git", &source_identity, &first);
+        assert_eq!(
+            cache,
+            built_wheel_cache_dir("git", &source_identity, &second),
+            "two consumer scopes must address ONE built-wheel entry",
+        );
+        remove_owned_cache_entry(&cache).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        let wheel = cache.join("pkg-1.0.0-py3-none-any.whl");
+        write_test_wheel(&wheel, "pkg", "1.0.0");
+        let mut marker = validate_wheel_file(&wheel, &first, None).unwrap();
+        marker.source_identity = source_identity.clone();
+        // The audit half of the reader/writer pair: the record keeps the FULL
+        // artifact target of whoever paid for the build, and it is a different
+        // string from the address the entry lives at.
+        assert_eq!(marker.artifact_target, first.artifact_cache_identity());
+        assert_eq!(marker.build_identity, first.build_cache_identity());
+        assert_ne!(marker.artifact_target, marker.build_identity);
+        std::fs::write(
+            cache.join("artifact.json"),
+            serde_json::to_vec_pretty(&marker).unwrap(),
+        )
+        .unwrap();
+
+        let callback_ran = Arc::new(AtomicBool::new(false));
+        let callback_flag = Arc::clone(&callback_ran);
+        let output = unique_test_dir("l31b1a-scope-output");
+        let hit = cached_build(
+            "git",
+            &source_identity,
+            &second,
+            &output,
+            Some(&ExpectedWheel::exact("pkg", "1.0.0")),
+            false,
+            move |_private_out, _environment| {
+                let callback_flag = Arc::clone(&callback_flag);
+                async move {
+                    callback_flag.store(true, Ordering::Relaxed);
+                    Ok(())
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            !callback_ran.load(Ordering::Relaxed),
+            "the second consumer scope must not rebuild a wheel the first one already built",
+        );
+        assert!(hit.is_file());
+
+        remove_owned_cache_entry(&cache).unwrap();
+        let _ = std::fs::remove_dir_all(&output);
+    }
+
+    /// L3-1b-1a. A python minor is the one target term that is on the `uv
+    /// build --wheel` command line, so it must still be two addresses.
+    #[test]
+    fn two_python_minors_get_two_built_wheel_addresses() {
+        let subdir = crate::glibc::current_pixi_platform();
+        let older = ResolutionTarget::from_parts("3.11", subdir, Some((2, 35)));
+        let newer = ResolutionTarget::from_parts("3.12", subdir, Some((2, 35)));
+        assert_ne!(
+            built_wheel_cache_dir("git", "same-source", &older),
+            built_wheel_cache_dir("git", "same-source", &newer),
+        );
+        assert_ne!(
+            materialized_wheel_output_dir(Path::new("/out"), "same-source", &older),
+            materialized_wheel_output_dir(Path::new("/out"), "same-source", &newer),
+        );
+    }
+
+    /// L3-1b-1a. The version bump is the reason no old address is reused, so
+    /// it is pinned rather than left to a reviewer's eye, and the schema
+    /// string is pinned with it because the two are read together on every hit.
+    #[test]
+    fn the_built_wheel_cache_version_and_schema_move_together() {
+        assert_eq!(BUILT_WHEEL_CACHE_VERSION, "v13");
+        assert_eq!(BUILT_WHEEL_CACHE_SCHEMA, "retread-built-wheel-v13");
+        let target = ResolutionTarget::from_parts("3.11", crate::glibc::current_pixi_platform(), None);
+        let path = built_wheel_cache_dir("git", "src", &target);
+        assert!(
+            path.components()
+                .any(|component| component.as_os_str() == "v13"),
+            "the addressed generation must be v13, not the v12 the wide key used",
+        );
+        assert!(
+            path.components()
+                .all(|component| component.as_os_str() != "v12"),
+        );
+    }
+
+    /// L3-1b-1a. There is deliberately no fallback read of a v12 record: a
+    /// marker without a `build_identity` must be refused, not adopted.
+    #[test]
+    fn a_v12_shaped_marker_without_a_build_identity_is_refused() {
+        let target = ResolutionTarget::from_parts("3.11", crate::glibc::current_pixi_platform(), None);
+        let source_identity = hash_fields(
+            b"l31b1a-v12-marker\0",
+            &[unique_test_dir("l31b1a-v12-key")
+                .to_string_lossy()
+                .as_bytes()],
+        );
+        let cache = built_wheel_cache_dir("path", &source_identity, &target);
+        remove_owned_cache_entry(&cache).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        let wheel = cache.join("pkg-1.0.0-py3-none-any.whl");
+        write_test_wheel(&wheel, "pkg", "1.0.0");
+        let mut marker = validate_wheel_file(&wheel, &target, None).unwrap();
+        marker.source_identity = source_identity.clone();
+        let mut record = serde_json::to_value(&marker).unwrap();
+        record
+            .as_object_mut()
+            .unwrap()
+            .remove("build_identity")
+            .expect("the v13 record carries a build identity to remove");
+        record.as_object_mut().unwrap().insert(
+            "schema".to_string(),
+            serde_json::Value::String("retread-built-wheel-v12".to_string()),
+        );
+        std::fs::write(
+            cache.join("artifact.json"),
+            serde_json::to_vec_pretty(&record).unwrap(),
+        )
+        .unwrap();
+
+        let error = validate_cache_entry(&cache, &source_identity, &target, None).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("parsing built-wheel marker"),
+            "a record with no build identity must fail to parse, not be admitted: {error:#}",
+        );
+
+        remove_owned_cache_entry(&cache).unwrap();
     }
 
     #[tokio::test]
