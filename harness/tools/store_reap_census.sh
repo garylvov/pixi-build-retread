@@ -23,7 +23,10 @@
 #                        lane job and a census that costs minutes is a census
 #                        lanes will delete.
 #
-#   rc 0  the census ran (including when a store refused -- see below)
+#   rc 0  the census ran (including when a store refused -- see below), OR the
+#         binary does not carry the verb yet, which prints ONE row saying so
+#         and skips.  Every binsnap older than STORE-REAP-2 is in that case,
+#         and it must never read as a census that found nothing.
 #   rc 3  no usable BACKEND.  A census that silently prints nothing is worse
 #         than one that refuses: the row would read as "no over-age entries".
 #
@@ -59,6 +62,21 @@ STORE_REAP_BYTES=${STORE_REAP_BYTES:-0}
 if [ -z "$BACKEND" ] || [ ! -x "$BACKEND" ]; then
   echo "### STORE-REAP CENSUS ($WHEN): REFUSED -- BACKEND='${BACKEND:-<unset>}' is not an executable retread binary"
   exit 3
+fi
+
+# THE VERB IS NOT IN EVERY BINARY, AND A BINARY WITHOUT IT MUST NOT BE PROBED
+# BY RUNNING IT.  Every binsnap in flight while STORE-REAP-2 was written
+# (dcf417e, 498db14, B26's merge) predates the verb, and `retread store-reap`
+# on such a binary does NOT fail: `main.rs` matches no verb, falls through to
+# the automatic preflight and STARTS THE JSON-RPC TRANSPORT, so the census
+# would block a relock on a backend waiting for stdin.  The detection is
+# therefore STATIC -- a marker string that exists only in a binary carrying the
+# verb -- and nothing is executed until it is found.  An absent verb is ONE row
+# and exit 0; it must never look like a census that found nothing.
+STORE_REAP_MARKER='store-reap: --store '
+if ! grep -a -q -F -- "$STORE_REAP_MARKER" "$BACKEND"; then
+  echo "### store_reap_census: verb absent in this binary ($BACKEND sha256=$(sha256sum "$BACKEND" | cut -c1-16)) -- census skipped"
+  exit 0
 fi
 
 echo "### STORE-REAP CENSUS ($WHEN) backend=$BACKEND bytes=$STORE_REAP_BYTES roots=$STORE_REAP_ROOTS"

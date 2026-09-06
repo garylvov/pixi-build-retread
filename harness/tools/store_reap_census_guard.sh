@@ -45,6 +45,7 @@ STUB=$WORK/stub-retread
 ARGV=$WORK/argv.txt
 cat > "$STUB" <<'STUBEOF'
 #!/usr/bin/env bash
+# carries the verb marker the census probes for statically: store-reap: --store 
 printf '%s\n' "$*" >> "$ARGV_FILE"
 echo "### store-reap TOTAL roots=1 stores=3 mode=dry-run scanned=0 would_evict=0 bytes=0 refused=false"
 exit "${STUB_RC:-0}"
@@ -119,6 +120,37 @@ BYTES=1
 run_census "$WORK/rootA" >/dev/null
 BYTES=0
 chk "STORE_REAP_BYTES=1 turns it on" "$(grep -c -- '--bytes' "$ARGV")" 1
+
+
+# ---- 7. a binary WITHOUT the verb is one row and a skip, never an empty census
+# Every binsnap older than STORE-REAP-2 lacks `store-reap`, and on such a binary
+# the verb is not an error -- `main.rs` falls through to the JSON-RPC transport
+# and WAITS ON STDIN. The census must therefore detect it STATICALLY and must
+# not run it at all. The pair of arms is the non-vacuity control for each other:
+# the same census, the same roots, one stub with the marker and one without.
+OLD=$WORK/old-retread
+cat > "$OLD" <<'OLDEOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$ARGV_FILE"
+sleep 600
+OLDEOF
+chmod +x "$OLD"
+: > "$ARGV"
+ARGV_FILE=$ARGV BACKEND=$OLD STORE_REAP_ROOTS="$WORK/rootA" \
+  timeout 30 bash "$CENSUS" GUARD > "$WORK/out.txt" 2>&1
+chk "a binary without the verb exits 0" "$?" 0
+chk "a binary without the verb is NEVER executed" "$(wc -l < "$ARGV")" 0
+chk_has "it prints the verb-absent row" "$WORK/out.txt" "verb absent in this binary"
+chk_has "the row says the census was skipped" "$WORK/out.txt" "census skipped"
+chk "the verb-absent row does NOT print a census summary" \
+  "$(grep -c 'STORE-REAP CENSUS' "$WORK/out.txt")" 0
+# NON-VACUITY: the marker-carrying stub, same call, DOES census.
+: > "$ARGV"
+ARGV_FILE=$ARGV BACKEND=$STUB STORE_REAP_ROOTS="$WORK/rootA" \
+  bash "$CENSUS" GUARD > "$WORK/out.txt" 2>&1
+chk "NON-VACUITY: a binary WITH the verb is executed" "$(wc -l < "$ARGV")" 1
+chk "NON-VACUITY: and prints the census, not the absent row" \
+  "$(grep -c 'verb absent in this binary' "$WORK/out.txt")" 0
 
 echo "### GUARD bad=$bad"
 [ "$bad" -eq 0 ] || echo "### GUARD FAILED"
