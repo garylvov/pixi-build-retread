@@ -183,20 +183,32 @@ for tpl in phaseN_relock.sh phaseN_cert.sh; do
 done
 
 # ---- K: THE WRITER HALF -- a file nobody writes is a fallback that never fires
+# DET-1-1: `--write` now reads `<task dir>/tools/.harness_synced_commit`. These
+# arms are about the writer/reader round trip, NOT about the record, so they run
+# against a task dir that HAS no record -- where the resolve-at-submit check
+# announces itself OFF rather than guessing. The record's own arms live in
+# harness_sync_guard.sh (arm G), beside the writer of the record.
 KJR=$W/writejr
-wrc=$(bash "$RESOLVE" --write "$KJR" "$N2_OLD" > "$W/K1.log" 2>&1; echo $?)
-if [ "$wrc" = 0 ] && [ "$(cat "$KJR/HARNESS_COMMIT" 2>/dev/null)" = "$N2_OLD" ]; then
-  ok "K1: --write creates <job root>/HARNESS_COMMIT"
+KTASK=$W/norecord; mkdir -p "$KTASK/tools"
+kwrite () { HARNESS_TASK_DIR="$KTASK" bash "$RESOLVE" --write "$@"; }
+N2_FULL=$(git -C "${HARNESS_REPO:-/oscar/data/stellex/glvov/agrescap/worktrees/harness-tools}" \
+            rev-parse --verify "${N2_OLD}^{commit}" 2>/dev/null || echo "$N2_OLD")
+wrc=$(kwrite "$KJR" "$N2_OLD" > "$W/K1.log" 2>&1; echo $?)
+if [ "$wrc" = 0 ] && [ "$(cat "$KJR/HARNESS_COMMIT" 2>/dev/null)" = "$N2_FULL" ]; then
+  ok "K1: --write creates <job root>/HARNESS_COMMIT, as the FULL sha"
 else
-  bad "K1: --write rc=$wrc, file='$(cat "$KJR/HARNESS_COMMIT" 2>/dev/null)'"
+  bad "K1: --write rc=$wrc, file='$(cat "$KJR/HARNESS_COMMIT" 2>/dev/null)' want=$N2_FULL"
 fi
+grep -q 'no sync record' "$W/K1.log" \
+  && ok "K1: with no record the resolve-at-submit check announces itself OFF (DET-1-1)" \
+  || bad "K1: no record and no announcement -- a silent skip"
 rrc=$(run_resolve "$W/K1r" -- "$KJR")
-if [ "$rrc" = 0 ] && [ "$(cat "$W/K1r.out")" = "$N2_OLD" ]; then
+if [ "$rrc" = 0 ] && [ "$(cat "$W/K1r.out")" = "$N2_FULL" ]; then
   ok "K1: and the reader round-trips it -- writer and reader are the same file"
 else
   bad "K1: round trip rc=$rrc out='$(cat "$W/K1r.out")'"
 fi
-wrc=$(bash "$RESOLVE" --write "$W/nope" deadbee0 > "$W/K2.log" 2>&1; echo $?)
+wrc=$(kwrite "$W/nope" deadbee0 > "$W/K2.log" 2>&1; echo $?)
 if [ "$wrc" = 2 ] && grep -q 'WRITE REFUSED' "$W/K2.log" && [ ! -f "$W/nope/HARNESS_COMMIT" ]; then
   ok "K2: --write refuses a sha that is not a commit, at SUBMIT time, and writes nothing"
 else

@@ -20,7 +20,11 @@
 #   2. THE QUEUE.  A job that is PENDING has NOT snapshotted anything -- its
 #      pin file already names a commit, and moving the task dir off that commit
 #      kills it the moment it starts.  So a sync that would strand a queued job
-#      REFUSES (rc 4) and NAMES it, before writing one byte.
+#      REFUSES (rc 4) and NAMES it, before writing one byte.  AND AFTERWARDS
+#      (DET-1-1) it prints the PIN REPORT: every job root whose pin no longer
+#      names the synced commit, classed PENDING / RUNNING / no-job, because the
+#      rc-4 refusal is a PRE-condition and cannot see a job submitted a minute
+#      LATER off a stale pin -- which is how MERGE-T lost a relock.
 #   3. RENAME-INSTALL.  Every file goes down as a temp file in the TARGET
 #      directory and then `mv -f` over the name.  bash reads a script
 #      INCREMENTALLY: overwriting a file a running job is executing feeds it the
@@ -310,6 +314,63 @@ fi
 printf '%s\n' "$SHA" > "$TMP/record" && mv -f "$TMP/record" "$RECORD" || {
   echo "### SYNC FAILED -- could not write $RECORD"; exit 5; }
 echo "### SYNC RECORDED $RECORD = $SHA"
+
+# ---- THE PIN REPORT: every job root that is NOT at the commit just synced ----
+# DET-1-1.  The rc-4 refusal above is a PRE-condition and it can only see jobs
+# that are ALREADY queued; MERGE-T's relock was submitted 99 s after DET-1's sync
+# with a pin copied from earlier in the session, and no refusal could have fired.
+# So the sync also says, AFTERWARDS, which pin files no longer name the task
+# dir's own commit -- because that is the list of jobs that will die at a drift
+# gate, and it costs one squeue to print.  Three classes and they are not the
+# same problem:
+#   PENDING  the rc-4 rows above, forced through.  These die on their next start.
+#   RUNNING  SAFE: the job is past its drift gate, which it ran against the
+#            harness that was on disk when it started.  Named for the record.
+#   no job   a stale pin left over from a finished lane. Harmless until somebody
+#            submits behind it -- which is exactly what happened -- so the line
+#            says the actuator: rewrite it AT SUBMIT.
+ALLROWS="$TMP/all.txt"; : > "$ALLROWS"
+"$SQUEUE" -u glvov -h -o '%i %j %T' > "$ALLROWS" 2>/dev/null || : > "$ALLROWS"
+pin_total=0; pin_match=0; pin_pd=0; pin_run=0; pin_stale=0
+PINLINES="$TMP/pinlines.txt"; : > "$PINLINES"
+while read -r pd; do
+  [ -n "${pd:-}" ] || continue
+  pin=$(sed -e 's/#.*//' -e 's/[[:space:]]//g' "$pd/HARNESS_COMMIT" 2>/dev/null | grep -m1 . || true)
+  [ -n "$pin" ] || continue
+  pin_total=$((pin_total + 1))
+  pinsha=$(git -C "$REPO" rev-parse --verify "${pin}^{commit}" 2>/dev/null || echo "$pin")
+  if [ "$pinsha" = "$SHA" ]; then pin_match=$((pin_match + 1)); continue; fi
+  b=$(basename -- "$pd")
+  jid=; jname=; jstate=
+  while read -r cid cname cstate; do
+    [ -n "${cname:-}" ] || continue
+    stem=${cname%%-*}
+    match=0
+    [ "$b" = "$cname" ] && match=1
+    [ "${cname#"$b"-}" != "$cname" ] && match=1
+    [ "${b#"$stem"}" != "$b" ] && match=1
+    [ "$match" = 1 ] || continue
+    jid=$cid; jname=$cname; jstate=$cstate
+    [ "$cstate" = PENDING ] && break      # a PENDING match is the one that matters
+  done < "$ALLROWS"
+  case "${jstate:-}" in
+    PENDING)
+      pin_pd=$((pin_pd + 1))
+      printf '###   PENDING  %s pinned=%s job=%s %s -- IT WILL DIE at its drift gate. Repin: harness_commit_resolve.sh --write %s\n' \
+        "$pd/HARNESS_COMMIT" "$pinsha" "$jid" "$jname" "$pd" >> "$PINLINES";;
+    "")
+      pin_stale=$((pin_stale + 1))
+      printf '###   STALE    %s pinned=%s no job of ours matches -- stale pin, rewrite AT SUBMIT: harness_commit_resolve.sh --write %s\n' \
+        "$pd/HARNESS_COMMIT" "$pinsha" "$pd" >> "$PINLINES";;
+    *)
+      pin_run=$((pin_run + 1))
+      printf '###   %-8s %s pinned=%s job=%s %s -- SAFE, it is past its drift gate\n' \
+        "$jstate" "$pd/HARNESS_COMMIT" "$pinsha" "$jid" "$jname" >> "$PINLINES";;
+  esac
+done < "$PINDIRS"
+echo "### SYNC PIN REPORT commit=$SHA -- job roots whose pin is not this commit:"
+if [ -s "$PINLINES" ]; then cat "$PINLINES"; else echo "###   (none: every pin file names $SHA)"; fi
+echo "### SYNC PIN SUMMARY commit=$SHA pins=$pin_total match=$pin_match pending=$pin_pd running=$pin_run stale=$pin_stale"
 
 # The drift line from the NEW state, from the same checker the jobs run.
 echo "### the drift line from the new state:"

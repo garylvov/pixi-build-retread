@@ -33,6 +33,17 @@
 #      refusal could be a property of the fixture rather than of the fix.
 #   E  a SECOND mutation: harness_sync.sh with its queue block cut out must make
 #      arm B's assertion go RED, or arm B cannot fail and is worthless.
+#   G  DET-1-1, THE ONE THAT COST A RELOCK: a pin is written, a sync then moves
+#      the record, and the SUBMIT HELPER re-resolves -- `--write <job root>` with
+#      NO sha -- so the job's pin equals the SYNCED commit and not the value the
+#      lane was carrying. A sha that is NOT the synced one is refused rc 3 and
+#      names both; `--allow-older --reason` proceeds and prints the reason.
+#      MUTATION, pinned to $PREFIX_RESOLVE: the pre-fix `--write <jr> <sha>`
+#      writes the STALE pin, rc 0, silently -- which is 5981194 exactly.
+#   H  DET-1-1's other half: after a sync, the PIN REPORT names every job root
+#      whose pin is not the synced commit, classed PENDING / RUNNING / no-job,
+#      each with its actuator. The rc-4 refusal is a PRE-condition and cannot see
+#      a job submitted 99 s LATER; this line is what a lane reads afterwards.
 #   F  static: the mapping is SOURCED from the drift check, not copied -- the
 #      check defines map_of when sourced with HARNESS_DRIFT_LIB, and the writer
 #      contains no map_of of its own; and both phase templates run `--check`
@@ -45,6 +56,9 @@ set -uo pipefail
 export PATH=/users/glvov/.pixi/bin:/users/glvov/.local/bin:$PATH
 
 PREFIX=9a154a6857997f2c48707252a267d341dfccc009   # HARNESS-EXIT-3's tip: before this lane
+# DET-1's own last harness commit: `--write` exists there and takes the sha ON
+# TRUST, which is the defect arm G's mutation reproduces.
+PREFIX_RESOLVE=873263ff429af36fb8be1259f681597f99533fda
 
 HERE=$(cd -- "$(dirname -- "$0")" && pwd)
 REPO=${HARNESS_REPO:-}
@@ -257,6 +271,131 @@ if bash -n "$MUT" 2>/dev/null && ! grep -q 'SYNC REFUSED (rc 4)' "$MUT"; then
 else
   bad "E: could not build the queue-block mutant -- MUTATION ARM DID NOT RUN"
 fi
+
+# ---- G: DET-1-1 -- the pin is RESOLVED AT SUBMIT, not copied ----------------
+# The sequence that lost MERGE-T's relock, in a fixture: lane writes a pin at v1
+# (14:0x), a sync moves the task dir to v2 (14:06), the lane submits (14:07:59).
+RESOLVE=$HERE/harness_commit_resolve.sh
+[ -f "$RESOLVE" ] || RESOLVE=$REPO/harness/tools/harness_commit_resolve.sh
+if [ ! -f "$RESOLVE" ]; then
+  bad "G: no harness_commit_resolve.sh at $HERE or $REPO/harness/tools -- ARM DID NOT RUN"
+else
+read -r RG TG V1G V2G < <(mkfixture G)
+mkstub "$WORK/G_squeue"                       # nothing queued: the sync is free to move
+JRG=$TG/laneG
+mkdir -p "$JRG"
+wr () {  # run the submit helper against the FIXTURE task dir and repo
+  HARNESS_REPO="$RG" HARNESS_TASK_DIR="$TG" bash "$RESOLVE" --write "$@" 2>&1
+}
+# 1. the lane writes its pin while the task dir is still v1
+wr "$JRG" "$V1G" > "$WORK/G1.log" 2>&1; rcG1=$?
+[ "$rcG1" -eq 0 ] && [ "$(cat "$JRG/HARNESS_COMMIT")" = "$V1G" ] \
+  && ok "G: the pin is written at v1 while the task dir IS v1" \
+  || { bad "G: could not write the v1 pin (rc=$rcG1)"; sed 's/^/      /' "$WORK/G1.log"; }
+# 2. a sync moves the record to v2 -- exactly DET-1's 14:06:19 install
+runsync "$RG" "$TG" "$WORK/G_squeue" "$V2G" > "$WORK/G2.log" 2>&1; rcG2=$?
+[ "$rcG2" -eq 0 ] && [ "$(cat "$TG/tools/.harness_synced_commit")" = "$V2G" ] \
+  && ok "G: the sync moved the record to v2 with nothing queued to refuse for" \
+  || { bad "G: the sync rc=$rcG2 did not move the record"; sed 's/^/      /' "$WORK/G2.log"; }
+# 3. THE FIX: re-resolving at submit gives the SYNCED commit, not the carried one
+wr "$JRG" > "$WORK/G3.log" 2>&1; rcG3=$?
+if [ "$rcG3" -eq 0 ] && [ "$(cat "$JRG/HARNESS_COMMIT")" = "$V2G" ]; then
+  ok "G: --write with NO sha RESOLVES the pin at submit -- the job's pin is the synced commit $V2G"
+else
+  bad "G: re-resolve rc=$rcG3 left the pin at '$(cat "$JRG/HARNESS_COMMIT")', wanted $V2G"
+  sed 's/^/      /' "$WORK/G3.log"
+fi
+grep -q 'resolved at submit' "$WORK/G3.log" \
+  && ok "G: and it says WHERE the answer came from (the record), not just the sha" \
+  || bad "G: the resolve printed no provenance row"
+# 4. a CARRIED sha -- the copied stale pin -- is refused rc 3 and names both
+printf '%s\n' "$V2G" > "$JRG/HARNESS_COMMIT"
+wr "$JRG" "$V1G" > "$WORK/G4.log" 2>&1; rcG4=$?
+[ "$rcG4" -eq 3 ] && ok "G: a pin that is NOT the synced commit is REFUSED rc 3 at submit" \
+                  || { bad "G: a stale pin gave rc=$rcG4, wanted 3"; sed 's/^/      /' "$WORK/G4.log"; }
+grep -q "$V1G" "$WORK/G4.log" && grep -q "$V2G" "$WORK/G4.log" \
+  && ok "G: the refusal names BOTH the asked-for pin and what the task dir IS" \
+  || bad "G: the refusal does not name both shas"
+[ "$(cat "$JRG/HARNESS_COMMIT")" = "$V2G" ] \
+  && ok "G: the refusal wrote NOTHING -- the pin file still names the synced commit" \
+  || bad "G: the refusal overwrote the pin anyway"
+# 5. --allow-older WITHOUT a reason is still a refusal; with one it proceeds
+wr "$JRG" "$V1G" --allow-older > "$WORK/G5.log" 2>&1; rcG5=$?
+[ "$rcG5" -eq 3 ] && ok "G: --allow-older WITHOUT --reason is still a refusal" \
+                  || bad "G: bare --allow-older returned $rcG5"
+wr "$JRG" "$V1G" --allow-older --reason "guard fixture: rerunning an old job shape" > "$WORK/G6.log" 2>&1; rcG6=$?
+[ "$rcG6" -eq 0 ] && [ "$(cat "$JRG/HARNESS_COMMIT")" = "$V1G" ] \
+  && ok "G: --allow-older --reason proceeds and pins the older commit deliberately" \
+  || { bad "G: --allow-older --reason rc=$rcG6"; sed 's/^/      /' "$WORK/G6.log"; }
+grep -q 'ALLOWED-OLDER .*reason=guard fixture' "$WORK/G6.log" \
+  && ok "G: and it prints the reason for the lane log row" || bad "G: no ALLOWED-OLDER reason line"
+# 6. THE MUTATION: the pre-fix writer, pinned to a commit constant
+PREW=$WORK/harness_commit_resolve_prefix.sh
+if git -C "$REPO" cat-file blob "$PREFIX_RESOLVE:harness/tools/harness_commit_resolve.sh" > "$PREW" 2>/dev/null; then
+  if grep -q 'DET-1-1' "$PREW"; then
+    bad "G: $PREFIX_RESOLVE already carries the DET-1-1 fix -- the pin is not the pre-fix world"
+  else
+    ok "G: the pinned pre-fix writer $PREFIX_RESOLVE takes the sha on trust (no DET-1-1 block)"
+  fi
+  printf '%s\n' "$V2G" > "$JRG/HARNESS_COMMIT"
+  HARNESS_REPO="$RG" HARNESS_TASK_DIR="$TG" bash "$PREW" --write "$JRG" "$V1G" > "$WORK/G7.log" 2>&1
+  rcG7=$?
+  if [ "$rcG7" -eq 0 ] && [ "$(cat "$JRG/HARNESS_COMMIT")" = "$V1G" ]; then
+    ok "G: MUTATION -- the pre-fix writer stamped the STALE pin $V1G, rc 0, over a task dir that is $V2G (5981194)"
+  else
+    bad "G: the pre-fix writer gave rc=$rcG7 pin='$(cat "$JRG/HARNESS_COMMIT")' -- the mutation did not reproduce"
+  fi
+  grep -qi 'refus' "$WORK/G7.log" && bad "G: the pre-fix writer refused something -- it is not the pre-fix world" \
+                                  || ok "G: and it refused NOTHING, which is why nobody saw it"
+else
+  bad "G: could not read $PREFIX_RESOLVE:harness/tools/harness_commit_resolve.sh -- MUTATION ARM DID NOT RUN"
+fi
+fi
+
+# ---- H: DET-1-1 -- the PIN REPORT the sync prints afterwards ----------------
+# Three job roots, three classes: one PENDING (forced through), one RUNNING
+# (safe), one with no job at all (a stale pin from a finished lane).
+read -r RH TH V1H V2H < <(mkfixture H)
+mkdir -p "$TH/lanepd" "$TH/lanerun" "$TH/lanedead"
+printf '%s\n' "$V1H" > "$TH/lanepd/HARNESS_COMMIT"
+printf '%s\n' "$V1H" > "$TH/lanerun/HARNESS_COMMIT"
+printf '%s\n' "$V1H" > "$TH/lanedead/HARNESS_COMMIT"
+# The stub answers BOTH shapes the sync asks for: `-t PD -o '%i %j'` for the
+# refusal, and `-o '%i %j %T'` for the report.
+cat > "$WORK/H_squeue" <<'EOSTUB'
+#!/usr/bin/env bash
+pd=0; for a in "$@"; do [ "$a" = PD ] && pd=1; done
+if [ "$pd" = 1 ]; then
+  echo "7000001 lanepd-relock"
+else
+  echo "7000001 lanepd-relock PENDING"
+  echo "7000002 lanerun-relock RUNNING"
+fi
+EOSTUB
+chmod 755 "$WORK/H_squeue"
+runsync "$RH" "$TH" "$WORK/H_squeue" "$V2H" --force --reason "guard fixture H" > "$WORK/H.log" 2>&1; rcH=$?
+[ "$rcH" -eq 0 ] && ok "H: the forced sync completed so there is a post-sync state to report" \
+                 || { bad "H: forced sync rc=$rcH"; sed 's/^/      /' "$WORK/H.log"; }
+grep -q "PENDING  $TH/lanepd/HARNESS_COMMIT" "$WORK/H.log" \
+  && ok "H: the pin report names the PENDING job root that will die at its drift gate" \
+  || { bad "H: no PENDING row for lanepd"; grep '^### SYNC PIN' "$WORK/H.log" | sed 's/^/      /'; }
+grep -qE "RUNNING .*$TH/lanerun/HARNESS_COMMIT.*SAFE" "$WORK/H.log" \
+  && ok "H: a RUNNING job's stale pin is named as SAFE, not as a refusal" \
+  || { bad "H: no RUNNING/SAFE row for lanerun"; grep '^### SYNC PIN' "$WORK/H.log" | sed 's/^/      /'; }
+grep -q "STALE    $TH/lanedead/HARNESS_COMMIT" "$WORK/H.log" \
+  && ok "H: a pin with no job of ours behind it is named STALE" \
+  || { bad "H: no STALE row for lanedead"; grep '^### SYNC PIN' "$WORK/H.log" | sed 's/^/      /'; }
+grep -q 'rewrite AT SUBMIT: harness_commit_resolve.sh --write' "$WORK/H.log" \
+  && ok "H: the STALE row carries its actuator -- rewrite at submit, not 'stale'" \
+  || bad "H: the STALE row is a dead notice with no actuator"
+grep -qE '^### SYNC PIN SUMMARY .*pending=1 running=1 stale=1' "$WORK/H.log" \
+  && ok "H: the summary partitions the pins exactly: pending=1 running=1 stale=1" \
+  || { bad "H: the pin summary does not partition"; grep 'SYNC PIN SUMMARY' "$WORK/H.log" | sed 's/^/      /'; }
+# and the mutation for THIS half: arm A synced with no pin dirs at all and must
+# say so rather than printing nothing, or the report cannot be read as evidence.
+grep -q 'SYNC PIN REPORT' "$LOGA" && grep -q 'every pin file names' "$LOGA" \
+  && ok "H: a sync with no drifted pins says so explicitly (arm A's log)" \
+  || { bad "H: arm A's sync printed no pin report at all"; }
 
 # ---- F: static -- one mapping, and the templates call --check ---------------
 ( REPO=$REPO SHA=$PREFIX HARNESS_DRIFT_LIB=1 . "$DRIFT" >/dev/null 2>&1
