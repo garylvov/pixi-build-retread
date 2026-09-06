@@ -64,11 +64,45 @@ git -C "$REPO" rev-parse --verify "$PREFIX_COMMIT^{commit}" >/dev/null 2>&1 || {
   echo "GUARD FATAL: $PREFIX_COMMIT is not a commit in $REPO"; exit 4; }
 
 W=$(mktemp -d "${TMPDIR:-/tmp}/driver_exit_guard.XXXXXX") || { echo "GUARD FATAL: no temp dir"; exit 4; }
-trap 'rm -rf "$W"' EXIT
+# An EXPLORATORY run is one whose numbers are NOT a verdict -- a first sweep
+# with an empty baseline, a mutation arm, a narrowed DEG_ONLY. It says so on
+# its FIRST line so a later reader cannot mistake it for the authoritative
+# run, and it still prints the tally and still re-raises.
+[ "${DEG_EXPLORATORY:-0}" = 1 ] && echo "### EXPLORATORY RUN -- these numbers are NOT a verdict"
 echo "### driver_exit_guard  repo=$REPO  task=$TASK  prefix_commit=$PREFIX_COMMIT"
 echo "### work=$W  family=$WHICH  host=$(hostname)  $(date -Is)"
 
 pass=0; fail=0
+# ---- THE TALLY IS NOT OPTIONAL ------------------------------------------
+# HARNESS-EXIT-3, from its OWN defect: two discovery runs printed FAIL lines
+# and then ended with neither the `pass=/fail=` tally nor the GREEN/RED line,
+# and Slurm read COMPLETED 0:0 -- the exact shape this guard exists to refuse,
+# on the guard itself. The cause was measured, not guessed: THE SCRIPT WAS
+# EDITED WHILE IT WAS RUNNING. bash reads a script incrementally by BYTE
+# OFFSET, so an edit that shifts the file makes a running shell resume at a
+# stale offset -- here, onto the trailing `exit 0`. Two consequences, both
+# permanent:
+#   * a run executes a SNAPSHOT of this file (see the lane wrapper, which
+#     copies the three driver_exit_*.sh into a run-scoped directory), and
+#   * the tally prints from an EXIT TRAP, so a truncated, killed or
+#     resumed-at-a-stale-offset run still says what it had counted and still
+#     re-raises. A guard that can end silently is not a guard.
+deg_tally_printed=0
+deg_tally () {
+  [ "$deg_tally_printed" -eq 0 ] || return 0
+  deg_tally_printed=1
+  echo "### driver_exit_guard: pass=$pass fail=$fail  $(date -Is)"
+  [ "$fail" -eq 0 ] && echo "### DRIVER EXIT GUARD GREEN -- every driver's own failure reaches its exit code" \
+                    || echo "### DRIVER EXIT GUARD RED -- read the FAIL lines above"
+}
+deg_on_exit () {
+  local rc=$?
+  deg_tally
+  [ "$rc" -eq 0 ] && [ "$fail" -ne 0 ] && rc=1
+  rm -rf "$W"
+  exit "$rc"
+}
+trap deg_on_exit EXIT
 ok  () { pass=$((pass + 1)); echo "  PASS  $*"; }
 no  () { fail=$((fail + 1)); echo "  FAIL  $*"; }
 
@@ -191,66 +225,121 @@ if [ "$WHICH" = all ] || [ "$WHICH" = A ]; then
 fi
 
 # ---------------------------------------------------------------- FAMILY B --
-# Every live `.sbatch` in the task tree, run for real with `bash` shimmed.
-WRAPPERS="
-mergeB18/gate.sbatch
-mergeB17/gate.sbatch
-l3-work/l3.sbatch
-c18-1-work/c181_dryrun.sbatch
-c18-1-work/c181_negctl.sbatch
-c18-1-work/c181_twoarm.sbatch
-c18-1-work/c18_1_gate.sbatch
-p6ad4-phase1/p6ad4.sbatch
-p6ad4-work/mut.sbatch
-p6ad4-work/gate.sbatch
-p6ad4-work/guard.sbatch
-harnessfix1/guards.sbatch
-harnessfix1/baseline.sbatch
-harnessfix1/verify.sbatch
-harnessfix1/verify2.sbatch
-sr2-work/gate.sbatch
-sr2-work/mut.sbatch
-"
-# STORE-REAP-2, AND THIS LIST HAS A PRECONDITION THAT WAS NOT WRITTEN DOWN
-# UNTIL IT BIT. `mk_bash_shim` stubs `bash`, so FAMILY B can only drive a
-# wrapper whose payload is invoked AS `bash <driver>`. A wrapper whose payload
-# is `cargo ...` or a retread binary is NOT stubbed by the shim: adding one to
-# this list does not test it, it RUNS IT FOR REAL, on whatever host the guard
-# is running on. Measured the moment sr2-work/check.sbatch and
-# sr2-work/census.sbatch were added here -- the guard executed a real `cargo
-# check` and a real `store-reap` dry run on the login node, then reported
-# rc=0 and scored them as swallowers, which they are not. They are out of the
-# list, and closing the gap for real needs per-wrapper payload injection
-# rather than one `bash` shim: boarded with the discovery ratchet as
-# HARNESS-EXIT-3.
+# HARNESS-EXIT-3 REPLACED THIS FAMILY WHOLE. It was a HAND-TYPED LIST of
+# seventeen wrappers driven by one `bash` shim. Both halves were defects:
+#
+#   the list -- STORE-REAP-2 wrote a NEW ad-hoc wrapper (`sr2-mut`, job
+#   5966771) that swallowed its driver's rc and reported green, because a
+#   wrapper nobody typed into the list is invisible to the guard that exists to
+#   find it. The list is gone; the set is DISCOVERED.
+#
+#   the shim -- it stubbed `bash` and nothing else, so a listed wrapper whose
+#   payload is `cargo ...` or a retread binary was EXECUTED FOR REAL on the
+#   guard's host. Measured: adding sr2-work/check.sbatch and census.sbatch ran
+#   a real `cargo check` and a real `store-reap` dry run on the LOGIN NODE, and
+#   then scored both as swallowers, which they are not. The shim is gone; every
+#   payload goes through driver_exit_payload_shim.sh, and a payload the seam
+#   does not cover is a REFUSAL, never an execution.
+#
+# THE RATCHET. Discovery over a tree this size finds swallowers that predate
+# this lane and belong to lanes whose jobs are queued or running (a `.sbatch`
+# is snapshotted at submit, so a RUNNING job is safe to edit but a PENDING one
+# is not -- editing it is a silent change to a job that has not started). A
+# guard that goes red on all of them is a guard nobody can keep green, and a
+# permanently red guard is the same defect as no guard. So:
+#
+#   * driver_exit_baseline.txt names the wrappers KNOWN to swallow, and the
+#     wrappers whose payload the seam cannot cover, at the commit that wrote it.
+#   * the guard FAILS on a swallower that is NOT in the baseline. A new one is
+#     fixed, never baselined.
+#   * the baseline may only SHRINK. Its row counts at this commit are pinned in
+#     the two constants below, and a baseline larger than the pin is a REFUSAL
+#     (rc 4): somebody added a row instead of a fix.
+#   * a baselined wrapper that now re-raises is printed as STALE so the next
+#     pass deletes the row.
+BASELINE=${DEG_BASELINE:-$REPO/harness/tools/driver_exit_baseline.txt}
+# pinned at HARNESS-EXIT-3. LOWER THESE when you shrink the baseline; never raise.
+BASELINE_MAX_SWALLOW=4
+BASELINE_MAX_UNCOVERED=2
 
-mk_bash_shim () {
-  mkdir -p "$W/bshim"
-  cat > "$W/bshim/bash" <<'EOS'
-#!/bin/sh
-# The drift check is stubbed CLEAN so the wrapper REACHES its payload -- several
-# of these wrappers refuse early on a dirty drift and that refusal would make
-# the broken and the fixed shape agree, which is a vacuous fixture.
-for a in "$@"; do
-  case "$a" in
-    *harness_drift_check.sh) echo "### [guard shim] drift check stubbed CLEAN"; exit 0;;
-  esac
-done
-echo "### [guard shim] payload stubbed FAILING: $*"
-exit 7
-EOS
-  chmod +x "$W/bshim/bash"
-}
+DEG_SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+. "$DEG_SELF_DIR/driver_exit_payload_shim.sh"
+. "$DEG_SELF_DIR/driver_exit_scan.sh"
 
-run_wrapper () {  # $1 = absolute wrapper path
-  env PATH="$W/bshim:$PATH" SLURM_JOB_ID=999999 SLURM_JOB_NAME=driver-exit-guard \
-      /bin/bash "$1"
+# deg_run_wrapper <abs wrapper> <record dir> -- run one wrapper inside the seam.
+# CONTAINMENT: the task tree is a tmpfs inside the sandbox, with only the
+# wrapper itself bound back in read-only, so a wrapper's ordinary redirection
+# (`find ... > "$A/tree-before.txt"`) cannot overwrite another lane's artifacts.
+# This is additive to the payload seam, not a substitute for it.
+deg_run_wrapper () {
+  local f=$1 rec=$2 envs=() line binds=() extra
+  mkdir -p "$rec/tmp"
+  while IFS= read -r line; do envs+=("$line"); done < <(deg_shim_env "$rec")
+  envs+=("SLURM_JOB_ID=999999" "SLURM_JOB_NAME=driver-exit-guard" "HOME=$rec/tmp")
+  # The task tree is a tmpfs so a wrapper's ordinary redirection cannot land on
+  # another lane's artifacts. THE PERSISTENT STORES ARE TMPFS FOR A SECOND
+  # REASON: several wrappers open with a `find` or a census over a store with
+  # millions of entries, and a SAFE passthrough command that scans a real store
+  # is how a run becomes a function of the node instead of the bytes. Empty
+  # inside the sandbox, those scans return instantly and the bucket is
+  # reproducible. Nothing here is a substitute for the payload seam.
+  binds=(--dev-bind / / --tmpfs "$TASK" --bind "$W" "$W")
+  for extra in ${DEG_TMPFS_EXTRA:-/oscar/data/stellex/glvov/caches /users/glvov/.cache /oscar/data/stellex/glvov/retread}; do
+    [ -d "$extra" ] && binds+=(--tmpfs "$extra")
+  done
+  case "$f" in "$TASK"/*) binds+=(--ro-bind "$f" "$f");; esac
+  command timeout -k 5 "${DEG_WRAPPER_BUDGET_S:-60}" env "${envs[@]}" "$DEG_BWRAP" "${binds[@]}" /bin/bash "$f"
 }
 
 if [ "$WHICH" = all ] || [ "$WHICH" = B ]; then
-  echo "=== FAMILY B -- every live .sbatch wrapper, payload stubbed at 7"
-  mk_bash_shim
-  # the pinned pre-fix epilogue: the two lines every one of these files ended on
+  echo "=== FAMILY B -- EVERY .sbatch in the task tree, payload seam, ratcheted"
+  DEG_BWRAP=$(command -v bwrap 2>/dev/null); [ -n "$DEG_BWRAP" ] || { echo "GUARD FATAL: no bwrap -- FAMILY B refuses to run a wrapper uncontained"; exit 4; }
+  [ -f "$BASELINE" ] || { echo "GUARD FATAL: no baseline at $BASELINE"; exit 4; }
+
+  deg_build_shim "$W/seam" >/dev/null || { echo "GUARD FATAL: could not build the payload seam"; exit 4; }
+  echo "### payload seam built at $W/seam  inject=$DEG_INJECT"
+
+  # ---- DISCOVERY IS A SNAPSHOT, AND THE SNAPSHOT IS THE UNIT OF AGREEMENT.
+  # Watcher-11's finding, and it is the right one: two runs that enumerate a
+  # LIVE tree are not comparable, because lanes add and rewrite `.sbatch` files
+  # between them, and a bucket that moves for that reason is indistinguishable
+  # from a bucket that moves because the guard is flaky. So the set is
+  # enumerated ONCE into a list of `md5<TAB>path`, the list's own md5 is
+  # printed, and a run may be handed an existing list with DEG_SNAPSHOT.
+  # A wrapper whose md5 no longer matches the snapshot is a REFUSAL, not a
+  # reclassification: somebody rewrote it while the run was in flight, and no
+  # verdict about its bytes is available.
+  #
+  # maxdepth 3 reaches every one of them; HARNESS-EXIT-3 measured 0/82/98/98/98
+  # for depth 1..5 and 98 unbounded, so depth 3 is the floor that is also
+  # complete. The unbounded control runs on every SNAPSHOT so a wrapper filed
+  # deeper tomorrow is a loud discrepancy, not a silent miss.
+  if [ -n "${DEG_SNAPSHOT:-}" ] && [ -f "$DEG_SNAPSHOT" ]; then
+    cp -f "$DEG_SNAPSHOT" "$W/snapshot.tsv"
+    echo "### FAMILY B SNAPSHOT: reused from $DEG_SNAPSHOT"
+  else
+    find "$TASK" -maxdepth 3 -name '*.sbatch' -type f 2>/dev/null | sort > "$W/discovered.txt"
+    find "$TASK" -name '*.sbatch' -type f 2>/dev/null | sort > "$W/discovered_unbounded.txt"
+    nd=$(grep -c . "$W/discovered.txt"); nu=$(grep -c . "$W/discovered_unbounded.txt")
+    if [ "$nd" -ne "$nu" ]; then
+      no "DISCOVERY depth 3 found $nd but the tree holds $nu -- raise the depth before trusting any row below"
+    else
+      ok "DISCOVERY depth 3 is complete: $nd = the unbounded count"
+    fi
+    : > "$W/snapshot.tsv"
+    while IFS= read -r f; do
+      printf '%s\t%s\n' "$(md5sum "$f" | awk '{print $1}')" "$f" >> "$W/snapshot.tsv"
+    done < "$W/discovered.txt"
+    [ -n "${DEG_SNAPSHOT_OUT:-}" ] && cp -f "$W/snapshot.tsv" "$DEG_SNAPSHOT_OUT"
+  fi
+  awk -F'\t' '{print $2}' "$W/snapshot.tsv" > "$W/discovered.txt"
+  nd=$(grep -c . "$W/discovered.txt")
+  SNAP_MD5=$(md5sum "$W/snapshot.tsv" | awk '{print $1}')
+  echo "### FAMILY B SNAPSHOT: $nd wrappers, snapshot md5 $SNAP_MD5 -- two runs on this md5 MUST agree"
+
+  # ---- the pinned pre-fix epilogue: the shape every fixed wrapper used to end
+  # on. It is written out as a CONSTANT rather than read from a commit, so it
+  # keeps reproducing the defect after every fix lands.
   PRE=$W/prefix_wrapper.sbatch
   {
     echo '#!/bin/bash'
@@ -258,37 +347,140 @@ if [ "$WHICH" = all ] || [ "$WHICH" = B ]; then
     echo "bash $STUB"
     echo 'echo "### GATE_EXIT=$?"'
   } > "$PRE"
-  run_wrapper "$PRE" >"$W/B0.log" 2>&1; s=$?
+  deg_run_wrapper "$PRE" "$W/rec-B0" >"$W/B0.log" 2>&1; s=$?
   [ "$s" -eq 0 ] && ok "B0 the pinned PRE-FIX wrapper epilogue still swallows: rc=0" \
                  || no "B0 the pinned PRE-FIX epilogue reported $s, not 0 -- every arm below is vacuous"
-  # STORE-REAP-2. THE VERSIONED SHAPE ITSELF, run like any wrapper. A template
-  # every lane is told to copy that does not itself re-raise would propagate
-  # the defect it exists to stop, so it is an arm and not a document.
+
+  # ---- the versioned shape lanes are told to copy is an ARM, not a document.
   LW=$REPO/harness/phase_template/lane_wrapper.sbatch
   if [ -f "$LW" ]; then
-    run_wrapper "$LW" >"$W/lane_wrapper.log" 2>&1; s=$?
+    deg_run_wrapper "$LW" "$W/rec-LW" >"$W/lane_wrapper.log" 2>&1; s=$?
     [ "$s" -ne 0 ] && ok "B phase_template/lane_wrapper.sbatch (the shape lanes copy) re-raises: rc=$s" \
                    || no "B phase_template/lane_wrapper.sbatch swallowed a failing payload: rc=0"
   else
     no "B phase_template/lane_wrapper.sbatch is missing -- lanes have no versioned shape to copy"
   fi
-  # STORE-REAP-2, BOARDED AS HARNESS-EXIT-3 AND PRINTED RATHER THAN HIDDEN: the
-  # list above is a HAND-MAINTAINED SNAPSHOT, and that is why sr2-work's
-  # wrappers were invisible to this guard until they were typed in. The task
-  # tree holds far more `.sbatch` files than this list names; the count is
-  # printed on every run so the gap cannot be forgotten, and closing it needs a
-  # baseline file of known swallowers (a ratchet), which is more than one
-  # commit and is boarded, not attempted here.
-  listed=$(printf '%s\n' $WRAPPERS | grep -c .)
-  live=$(find "$TASK" -maxdepth 2 -name '*.sbatch' -type f 2>/dev/null | wc -l)
-  echo "### FAMILY B COVERAGE: $listed wrappers named here, $live live .sbatch in the task tree (HARNESS-EXIT-3: make this DISCOVERED with a swallower baseline)"
-  for w in $WRAPPERS; do
-    f=$TASK/$w
-    [ -f "$f" ] || { no "B $w: no such file"; continue; }
-    run_wrapper "$f" >"$W/$(echo "$w" | tr / _).log" 2>&1; s=$?
-    [ "$s" -ne 0 ] && ok "B $w re-raises: rc=$s" \
-                   || no "B $w swallowed a failing payload: rc=0"
-  done
+
+  # ---- the baseline, and its ratchet
+  bl_swallow=$(grep -E '^SWALLOW[[:space:]]' "$BASELINE" | awk '{print $2}' | sort -u)
+  bl_uncov=$(grep -E '^UNCOVERED[[:space:]]' "$BASELINE" | awk '{print $2}' | sort -u)
+  n_bl_s=$(printf '%s\n' "$bl_swallow" | grep -c .); n_bl_u=$(printf '%s\n' "$bl_uncov" | grep -c .)
+  echo "### BASELINE: $n_bl_s swallow rows (pin $BASELINE_MAX_SWALLOW), $n_bl_u uncovered rows (pin $BASELINE_MAX_UNCOVERED)"
+  if [ "$n_bl_s" -gt "$BASELINE_MAX_SWALLOW" ] || [ "$n_bl_u" -gt "$BASELINE_MAX_UNCOVERED" ]; then
+    echo "GUARD REFUSES: the baseline GREW ($n_bl_s/$n_bl_u against pins $BASELINE_MAX_SWALLOW/$BASELINE_MAX_UNCOVERED)."
+    echo "GUARD REFUSES: a new swallower is FIXED, not baselined. rc 4."
+    exit 4
+  fi
+
+  : > "$W/live_swallow.txt"; : > "$W/live_uncovered.txt"; : > "$W/live_timeout.txt"; live_reraise=0
+  while IFS= read -r f; do
+    rel=${f#"$TASK"/}
+    # DEG_ONLY narrows the sweep to one wrapper. It exists for the mutation
+    # arms, which must show ONE named wrapper flipping verdict, and it is never
+    # set on a scoring run -- the whole point of this family is that the set is
+    # discovered, not chosen.
+    [ -z "${DEG_ONLY:-}" ] || case "$rel" in $DEG_ONLY) ;; *) continue;; esac
+    # the snapshot is the unit of agreement: if these bytes are not the bytes
+    # that were enumerated, there is no verdict to give about them.
+    want=$(awk -F'\t' -v p="$f" '$2==p{print $1}' "$W/snapshot.tsv")
+    have=$(md5sum "$f" 2>/dev/null | awk '{print $1}')
+    if [ "$want" != "$have" ]; then
+      no "B $rel CHANGED UNDER THE RUN (snapshot $want, now ${have:-absent}) -- rewritten mid-run, not classified"
+      continue
+    fi
+    tag=$(printf '%s' "$rel" | tr / _)
+    rec=$W/rec-$tag; mkdir -p "$rec"
+    # STATIC HALF: a command invoked BY PATH cannot be reached by a PATH shim
+    # or a function. Such a wrapper is refused BEFORE it starts.
+    unc=""
+    while IFS= read -r tokline; do
+      [ -n "$tokline" ] || continue
+      deg_path_token_covered "$tokline" || unc="$unc $tokline"
+    done < <(deg_scan_paths "$f")
+    if [ -n "$unc" ]; then
+      echo "$rel" >> "$W/live_uncovered.txt"
+      echo "  REFUSE  B $rel: payload invoked by path, seam does not cover:$unc (NOT executed)"
+      continue
+    fi
+    deg_run_wrapper "$f" "$rec" >"$W/$tag.log" 2>&1; s=$?
+    # RUNTIME HALF: a name the seam did not stub reached command_not_found_handle.
+    if [ -s "$rec/uncovered.log" ]; then
+      echo "$rel" >> "$W/live_uncovered.txt"
+      echo "  REFUSE  B $rel: uncovered command $(awk '{print $2}' "$rec/uncovered.log" | sort -u | tr '\n' ' ')(refused at rc=$s, NOT executed)"
+      continue
+    fi
+    # A TIMEOUT IS ITS OWN BUCKET, and it is the one bucket that is not a pure
+    # function of the wrapper's bytes -- it depends on the node and the budget.
+    # It is therefore never folded into a score: it is counted, listed, and
+    # required to be EMPTY on the authoritative run. The determinism fix is
+    # upstream of it -- the sandbox puts the real cache roots on tmpfs too, so
+    # a wrapper's `find` over a store scans nothing and finishes.
+    if [ "$s" -eq 124 ] || [ "$s" -eq 137 ]; then
+      echo "$rel" >> "$W/live_timeout.txt"
+      echo "  TIMEOUT B $rel: still running after ${DEG_WRAPPER_BUDGET_S:-60}s -- NOT SCORED (rc=$s)"
+      continue
+    fi
+    if [ "$s" -eq 0 ]; then echo "$rel" >> "$W/live_swallow.txt"
+    else live_reraise=$((live_reraise + 1)); fi
+  done < "$W/discovered.txt"
+
+  n_live_s=$(grep -c . "$W/live_swallow.txt"); n_live_u=$(grep -c . "$W/live_uncovered.txt")
+  n_live_t=$(grep -c . "$W/live_timeout.txt")
+  echo "### FAMILY B LIVE: $live_reraise re-raise, $n_live_s swallow, $n_live_u refused-uncovered, $n_live_t timed-out, of $nd discovered (budget ${DEG_WRAPPER_BUDGET_S:-60}s, snapshot $SNAP_MD5)"
+  if [ "$n_live_t" -eq 0 ]; then
+    ok "B no wrapper timed out -- every bucket below is a function of the wrapper's bytes"
+  else
+    no "B $n_live_t wrapper(s) timed out and are UNSCORED: $(tr '\n' ' ' < "$W/live_timeout.txt")-- raise DEG_WRAPPER_BUDGET_S or tmpfs the root they scan; a timing-dependent bucket is not a verdict"
+  fi
+
+  # new swallowers -- the only thing that may turn this family red
+  comm -23 <(sort -u "$W/live_swallow.txt") <(printf '%s\n' "$bl_swallow" | sort -u) > "$W/new_swallow.txt"
+  comm -23 <(sort -u "$W/live_uncovered.txt") <(printf '%s\n' "$bl_uncov" | sort -u) > "$W/new_uncovered.txt"
+  if [ -s "$W/new_swallow.txt" ]; then
+    while IFS= read -r r; do no "B $r SWALLOWS a failing payload and is NOT in the baseline -- fix it, do not baseline it"; done < "$W/new_swallow.txt"
+  else
+    ok "B no wrapper outside the baseline swallows its payload ($n_live_s known, $live_reraise re-raise)"
+  fi
+  if [ -s "$W/new_uncovered.txt" ]; then
+    while IFS= read -r r; do no "B $r invokes a payload the seam does not cover and is NOT in the baseline -- widen the seam or fix the wrapper"; done < "$W/new_uncovered.txt"
+  else
+    ok "B every wrapper outside the baseline was driven through the seam ($n_live_u known-uncovered)"
+  fi
+  # stale rows: printed, never fatal -- a fix by another lane must not turn this red
+  comm -13 <(sort -u "$W/live_swallow.txt") <(printf '%s\n' "$bl_swallow" | sort -u) > "$W/stale.txt"
+  if [ -s "$W/stale.txt" ]; then
+    echo "### STALE BASELINE ROWS (these re-raise now -- delete them and lower the pin):"
+    sed 's/^/###   /' "$W/stale.txt"
+  fi
+
+  # ---- the canary. Nothing in $DEG_CANARY nor $CARGO_HOME/bin may ever have
+  # run: those stubs stand exactly where the REAL cargo/pixi/binary would be
+  # found if the function seam and the PATH both leaked, and each writes a file.
+  fired=$(find "$W" -maxdepth 2 -name 'CANARY_FIRED.*' -type f 2>/dev/null | wc -l)
+  if [ "$fired" -eq 0 ]; then
+    ok "B CANARY silent: no payload command reached a real PATH lookup in $nd wrapper runs"
+  else
+    no "B CANARY FIRED $fired times -- the payload seam LEAKED: $(find "$W" -maxdepth 2 -name 'CANARY_FIRED.*' -type f 2>/dev/null | tr '\n' ' ')"
+  fi
+  cat "$W"/rec-*/argv.log > "$W/argv-all.log" 2>/dev/null
+  echo "### ARGV RECORDER: $(grep -c . "$W/argv-all.log" 2>/dev/null || echo 0) intercepted invocations, $W/argv-all.log"
+  echo "### intercepted payload commands, by name:"
+  awk -F'\t' '$1=="PAYLOAD"{print $2}' "$W/argv-all.log" 2>/dev/null | sort | uniq -c | sort -rn | sed 's/^/###   /'
+  # ---- evidence. $W is a temp dir the EXIT trap removes, so a run that is
+  # supposed to be quotable copies its decisive files out. Law 4: every gate
+  # writes its evidence packet.
+  if [ -n "${DEG_EVIDENCE_DIR:-}" ]; then
+    mkdir -p "$DEG_EVIDENCE_DIR"
+    cp -f "$W/snapshot.tsv" "$W/live_swallow.txt" "$W/live_uncovered.txt" \
+          "$W/live_timeout.txt" "$W/new_swallow.txt" "$W/new_uncovered.txt" \
+          "$W/argv-all.log" "$DEG_EVIDENCE_DIR/" 2>/dev/null
+    for keep in ${DEG_EVIDENCE_LOGS:-}; do
+      cp -f "$W/$(printf '%s' "$keep" | tr / _).log" "$DEG_EVIDENCE_DIR/" 2>/dev/null
+      cp -f "$W/rec-$(printf '%s' "$keep" | tr / _)/argv.log" \
+            "$DEG_EVIDENCE_DIR/argv.$(printf '%s' "$keep" | tr / _).log" 2>/dev/null
+    done
+    echo "### EVIDENCE written to $DEG_EVIDENCE_DIR"
+  fi
 fi
 
 # ---------------------------------------------------------------- FAMILY C --
@@ -330,9 +522,6 @@ if [ "$WHICH" = all ] || [ "$WHICH" = C ]; then
                  || no "C5 gate_build.sh stopped and exited 0"
 fi
 
-echo "### driver_exit_guard: pass=$pass fail=$fail  $(date -Is)"
-[ "$fail" -eq 0 ] && echo "### DRIVER EXIT GUARD GREEN -- every driver's own failure reaches its exit code" \
-                  || echo "### DRIVER EXIT GUARD RED -- read the FAIL lines above"
-# This guard is itself a driver. It re-raises.
+deg_tally
 [ "$fail" -eq 0 ] || exit 1
 exit 0

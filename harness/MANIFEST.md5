@@ -12,7 +12,7 @@ a94ad376c0833f64fc32987afe19afb1  inode-cleanup/delete_allowlisted.sh
 c4d74ea6559b35ae8eb7c569c015bc51  inode-cleanup/delete_stale_roots.v2.sh
 d59ef9745ee493d7a0ba62fd6fa35e0d  inode-cleanup/f_clean.sbatch
 c9302fafd5ee1123a695bfef4dfcaf72  inode-cleanup/install_v2.sbatch
-4bb61ba2da4434c168da24c9c0402790  inode-cleanup/measure_caches.sbatch
+e2c07bf3dd974915aebbc70d47d7f1bf  inode-cleanup/measure_caches.sbatch
 924041c627830fbbedde376f7ec1e5bb  inode-cleanup/poll2.sh
 08fd70ed0a700a035330208298a77657  inode-cleanup/poll.sh
 6d079dd05d69498177525ac7872d2862  inode-cleanup/sweep_shard.sbatch
@@ -39,7 +39,7 @@ a465cea86edc07ad5adf9f96b1ebac9e  phase_template/wedge_triage_guard.sh
 c26805a4a64f89749fe352bf5aaa8381  phase_template/wedge_triage.sh
 09145148ded67bdc997646a6dc2f9836  phase_template/wheel_store_census_guard.sh
 0e84c07132b8e87b296cfc1dabb30b02  proof/hlgd_relock.sh
-c23efe77fe89da4494785474ed573498  README.md
+2c1c174bdb5cc830d9bed4100ffb3fd3  README.md
 252a6cf77606e900a65ded3d59c06124  tools/arm_lock_sha_count_guard.sh
 5f70649013b2bf100dfb91dcc49bef44  tools/arm_lock_sha_count.sh
 f60ea7f2564d383ef1d45d13d0cb2232  tools/b2_attribute.sh
@@ -50,7 +50,10 @@ f60ea7f2564d383ef1d45d13d0cb2232  tools/b2_attribute.sh
 3837765ced274b315ce84ad3695f8b5b  tools/cleanup_absent_root_guard.sh
 d46e02ed51852f281f89d4d98184e0f4  tools/cleanup_gate_env_derivation_guard.sh
 c56251e11ce8ab1bd8b807c395265fd4  tools/conda_deny_proxy.py
-44a5c303a0e5f1fdccafaa101c674492  tools/driver_exit_guard.sh
+7ebb2e87b4d9052e8135d0207700b853  tools/driver_exit_baseline.txt
+807d35e2bbe64e752f245533903e52a1  tools/driver_exit_guard.sh
+ddaf039b5ff300c3200c60127458d511  tools/driver_exit_payload_shim.sh
+78771287c12790a438715b2f1500b63c  tools/driver_exit_scan.sh
 7783cc47f9e8ad2503fd44950cd43013  tools/env_version_delta.py
 6a84c103a8be7b1f24d9fc4d46130379  tools/fast_env_snapshot_gate_guard.sh
 e09842a2b51059632dd6cae8e1263fae  tools/fixset_land_row.sh
@@ -93,8 +96,8 @@ dd16a8c662b31dda554a2bdc052ba94d  tools/retread_fast_env.sh
 bdd93cc2798a27301e793bdc6931be06  tools/sdist_build_poison_guard.sh
 da8aed178eda8db9d349a23d784bd8b6  tools/sdist_build_scope_guard.sh
 1c3729ccc1e9ba22803430aee01dc279  tools/shard_mirror.py
-e0e5d644c9d14c068a9b67bbb0c06457  tools/store_reap_census_guard.sh
-d5bfe892f2bb2ad9d8d7e6d64e7dc70f  tools/store_reap_census.sh
+3ed7d6f49541acf0cabb22062b6892de  tools/store_reap_census_guard.sh
+b72e59177eb2d36a416705a1e38fc9ba  tools/store_reap_census.sh
 4555925b41bc08ba5efb7bbb7b40f167  tools/test_stage_mirror.sh
 f4b1d2839ad51722d0f7a84b8482042b  tools/wheel_store_env_guard.sh
 955d184896115e611a763c60c490b5d8  tools/wheel_store_reclaim_guard.sh

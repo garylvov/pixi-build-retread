@@ -1,0 +1,44 @@
+# driver_exit_baseline.txt -- HARNESS-EXIT-3. The RATCHET for FAMILY B.
+#
+# FAMILY B discovers every `.sbatch` in the task tree and drives it through the
+# payload seam. Discovery over a tree this size finds wrappers that predate the
+# lane, wrappers whose swallow is DELIBERATE because they ARE the fixture for
+# the defect, and wrappers the seam cannot drive. A guard that goes red on all
+# of them is a guard nobody keeps green, and a permanently red guard is the same
+# defect as no guard. So this file names them, and the guard is red only on a
+# wrapper that is NOT here.
+#
+# THE RULES, enforced by driver_exit_guard.sh and not by good intentions:
+#   * A NEW SWALLOWER IS FIXED, NOT BASELINED. The guard pins the row counts
+#     below in BASELINE_MAX_SWALLOW / BASELINE_MAX_UNCOVERED and REFUSES (rc 4)
+#     if this file is larger than the pin.
+#   * The pins come DOWN with the file, never up.
+#   * Every row carries the reason it is here. "it was already broken" is not
+#     one. "it is the fixture that must swallow" and "its payload is invoked by
+#     a path the seam cannot reach" are.
+#   * A row whose wrapper now re-raises is printed as STALE. Delete it and
+#     lower the pin in the same commit.
+#
+# SWALLOW rows: the wrapper ran through the seam and exited 0 on a payload
+# stubbed FAILING at 7.
+
+# --- the two wrappers whose swallow IS the fixture -------------------------
+# These exist to demonstrate the defect. Fixing either would delete the control
+# arm that proves the other arms are not vacuous.
+SWALLOW c18-1-work/artifacts/exit_guard_bad.sbatch   # C18-1's own bad arm, the `0:0` half of its fixture pair (jobs 5910974/5910975)
+SWALLOW harnessexit2/proof-control.sbatch            # HARNESS-EXIT-2's control, which exists to show the pre-fix shape still swallows
+
+# --- the hold wrappers: there is no driver to re-raise ---------------------
+# A hold job's only command is `sleep`, which the SEAM neutralises to 0 -- so
+# the 0 is the guard's own doing and not a verdict about the wrapper. They are
+# here rather than "fixed" because there is no payload whose rc could be
+# carried, and adding a synthetic one would be a workaround (law 1).
+SWALLOW l3-work/hold.sbatch                          # `sleep 43200` and nothing else; the seam neutralises sleep
+SWALLOW l31-work/hold.sbatch                         # same shape
+
+# UNCOVERED rows: the seam REFUSED to run the wrapper rather than execute a
+# payload it cannot intercept. A refusal costs one row; an execution costs a
+# lane (STORE-REAP-2 ran a real `cargo check` and a real store-reap dry run on
+# the login node exactly this way).
+UNCOVERED p2e-candidate-scope/artifacts/p2e_cert_install.sbatch  # command-position `"$C"` / `"$WS"`: the scanner cannot prove those are directories and not binaries
+UNCOVERED p2f-routed-channel/artifacts/p2f_gate.sbatch           # same two tokens, same file family
