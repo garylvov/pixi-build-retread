@@ -40,11 +40,15 @@
 # FIX arm (118 lines total) and **173** on the live CTL arm (68 426 lines).  The
 # first frontend row on the CTL arm is at 17:36:51 against `### lock start
 # 2026-09-06T17:33:32`, i.e. **199 s on a fully cold cache** -- so the frontend
-# marker both SEPARATES the two outcomes and ARRIVES EARLY, and a smoke does not
-# have to finish a lock to answer the question.  The moment a frontend row
-# appears this script KILLS the lock and returns REACHED_FRONTEND.  The bounded
-# wall is therefore a ceiling that a healthy binary never reaches, not a budget
-# it spends.
+# marker separates those two outcomes and ARRIVES EARLY, and a smoke does not
+# have to finish a lock to answer the question.  BUT A FRONTEND ROW ALONE IS NOT
+# ENOUGH -- 5994177 arm C scored one in four seconds with a backend that only
+# slept, because the `cpu` environment has no source at all -- so the verdict
+# needs BOTH a frontend row AND a `conda/outputs` row in the BACKEND log (14 on
+# the known-good binary, 0 on the sleeping stub, 0 on the dying stub).  The
+# moment both appear this script KILLS the lock and returns REACHED_FRONTEND, so
+# the bounded wall is a ceiling a healthy binary never reaches, not a budget it
+# spends.
 #
 # WHAT "REACHED THE FRONTEND" DOES AND DOES NOT CLAIM.  It claims the backend
 # negotiated, answered the frontend's build-dispatch calls for at least one
@@ -125,11 +129,31 @@ SMOKE_PREFIX_HEADROOM=${SMOKE_PREFIX_HEADROOM:-8}
 # environment; `Preparing metadata for:` is uv building an sdist's metadata
 # inside it; the "assumed to be installed by conda" row is the resolver's own
 # first INFO line.  Any one of them means the frontend moved.
+# AND THE BACKEND HALF, WHICH IS NOT OPTIONAL AND WAS THE THIRD CORRECTION.
+# MEASURED on `psmoke-guards` 5994177: the SLEEPING stub scored a frontend row
+# in FOUR SECONDS -- `INFO resolve_pypi{group=cpu platform=linux-64-base}` --
+# because the `cpu` environment has no path or git source and resolves without
+# ever asking the backend for anything.  A frontend row alone therefore proves
+# nothing about the backend, and the smoke handed REACHED_FRONTEND to a backend
+# that had not answered a single call.  The backend half is one row it CANNOT
+# print without serving a real build-dispatch request: `rpc request
+# method=conda/outputs`.  Counted on four logs: known-good binary 14, sleeping
+# stub 0, dying stub 0, and the DET-1-FIX candidate 30 (it served, then panicked
+# -- and that one is caught by the process exit, which is the point of having
+# three verdicts rather than one).  REACHED_FRONTEND now requires BOTH halves.
+SMOKE_BACKEND_WORK_RE=${SMOKE_BACKEND_WORK_RE:-'conda/outputs'}
 SMOKE_FRONTEND_RE=${SMOKE_FRONTEND_RE:-'resolve_pypi\{|Preparing metadata for:|are assumed to be installed by conda|Found static `pyproject\.toml` for:'}
 # The first line worth quoting when nothing reached the frontend.
 SMOKE_ERROR_RE=${SMOKE_ERROR_RE:-'panicked at|^Error|ERROR|error\[|error:|× |failed with status'}
 
 smoke_say () { echo "### SMOKE $*"; }
+
+# THE VERDICT'S POSITIVE TEST, IN ONE PLACE.  Both halves or neither.
+smoke_both_halves () {
+  grep -a -q -E "$SMOKE_FRONTEND_RE" "$LLOG" 2>/dev/null || return 1
+  grep -a -q -E "$SMOKE_BACKEND_WORK_RE" "$BLOG" 2>/dev/null || return 1
+  return 0
+}
 
 # ---- the verdict row, and it is printed on EVERY exit path ------------------
 SMOKE_VERDICT=SETUP_FAILED
@@ -409,15 +433,18 @@ fi
 VERDICT=
 while :; do
   ELAPSED=$(( $(date +%s) - S ))
-  if grep -a -q -E "$SMOKE_FRONTEND_RE" "$LLOG" 2>/dev/null; then
+  # BOTH HALVES.  A frontend row alone is scored by a backend that never
+  # answered (5994177 arm C: the `cpu` environment resolves with no source at
+  # all), and a backend row alone says nothing about the resolver.
+  if smoke_both_halves; then
     VERDICT=REACHED_FRONTEND; break
   fi
   if ! kill -0 "$LPID" 2>/dev/null; then
-    # one last read: the frontend row may have landed in the same instant the
-    # process exited, and a race that reports BACKEND_DIED for a healthy binary
-    # would cost a lane a whole re-cut.
+    # one last read: the rows may have landed in the same instant the process
+    # exited, and a race that reports BACKEND_DIED for a healthy binary would
+    # cost a lane a whole re-cut.
     sleep 1
-    if grep -a -q -E "$SMOKE_FRONTEND_RE" "$LLOG" 2>/dev/null; then VERDICT=REACHED_FRONTEND
+    if smoke_both_halves; then VERDICT=REACHED_FRONTEND
     else VERDICT=BACKEND_DIED; fi
     break
   fi
@@ -441,11 +468,12 @@ fi
 wait "$LPID" 2>/dev/null; LRC=$?
 
 FE_ROWS=$(grep -a -c -E "$SMOKE_FRONTEND_RE" "$LLOG" 2>/dev/null); FE_ROWS=${FE_ROWS:-0}
-echo "### SMOKE lock ended verdict=$VERDICT wall=${WALL}s lock_rc=$LRC frontend_rows=$FE_ROWS log_lines=$(wc -l < "$LLOG")"
+BE_ROWS=$(grep -a -c -E "$SMOKE_BACKEND_WORK_RE" "$BLOG" 2>/dev/null); BE_ROWS=${BE_ROWS:-0}
+echo "### SMOKE lock ended verdict=$VERDICT wall=${WALL}s lock_rc=$LRC frontend_rows=$FE_ROWS backend_work_rows=$BE_ROWS log_lines=$(wc -l < "$LLOG")"
 
 case "$VERDICT" in
   REACHED_FRONTEND)
-    echo "### SMOKE first frontend row:"
+    echo "### SMOKE first frontend row (and backend_work_rows=$BE_ROWS, both halves required):"
     grep -a -m1 -E "$SMOKE_FRONTEND_RE" "$LLOG" | cut -c1-300 | sed 's/^/### SMOKE   /'
     SMOKE_VERDICT=REACHED_FRONTEND; SMOKE_RC=0 ;;
   BACKEND_DIED)
@@ -456,7 +484,8 @@ case "$VERDICT" in
     elif grep -a -q -F 'the hermetic entry path is' "$LLOG" "$BLOG" 2>/dev/null; then
       REASON=PREFIX_REFUSAL
     fi
-    echo "### SMOKE BACKEND_DIED reason=$REASON lock_rc=$LRC frontend_rows=0"
+    [ "$BE_ROWS" -eq 0 ] && [ "$REASON" = UNCLASSIFIED ] && REASON=NO_BACKEND_WORK
+    echo "### SMOKE BACKEND_DIED reason=$REASON lock_rc=$LRC frontend_rows=$FE_ROWS backend_work_rows=$BE_ROWS"
     if [ "$REASON" = PREFIX_PANIC_256 ]; then
       echo "### SMOKE   THIS IS DET-1-FIX-1 AND IT IS A PATH-LENGTH ACCIDENT, NOT A CODE DEFECT."
       echo "### SMOKE   rattler-build pads its build prefix to $SMOKE_PREFIX_PAD; the composed path overran it."
@@ -476,7 +505,7 @@ case "$VERDICT" in
     tail -12 "$LLOG" | cut -c1-200 | sed 's/^/### SMOKE   /'
     SMOKE_VERDICT=BACKEND_DIED; SMOKE_RC=1 ;;
   TIMEOUT)
-    echo "### SMOKE TIMEOUT: ${SMOKE_WALL}s elapsed with ZERO frontend rows and the lock still alive."
+    echo "### SMOKE TIMEOUT: ${SMOKE_WALL}s elapsed with frontend_rows=$FE_ROWS backend_work_rows=$BE_ROWS (BOTH must be non-zero) and the lock still alive."
     echo "### SMOKE   A healthy binary reached the frontend in 199 s on a fully cold cache (measured, 5989192 arm 3)."
     echo "### SMOKE lock log tail:"
     tail -12 "$LLOG" | cut -c1-200 | sed 's/^/### SMOKE   /'

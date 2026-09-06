@@ -98,7 +98,7 @@ c34a4e3a1a8834b073b997fc94230a9f  tools/pixi_merge_run_exports.py
 c9f561484d8ef42157ba6a7532f80681  tools/pixi_shard_cache.py
 6960c0ac937f51969cd1d4f1e1af65c2  tools/pixi_trim_repodata.py
 4fa86755b5199f2d8735c400a6a93026  tools/proof_smoke_guard.sh
-e3eccc679129b0e817b07d69214f8797  tools/proof_smoke.sh
+118a5579adae4d5b63c37cdd818393b1  tools/proof_smoke.sh
 dd16a8c662b31dda554a2bdc052ba94d  tools/retread_fast_env.sh
 46b5ede95808302e562b66b2e1a2201a  tools/retread_shard_mirror.sh
 bdd93cc2798a27301e793bdc6931be06  tools/sdist_build_poison_guard.sh
