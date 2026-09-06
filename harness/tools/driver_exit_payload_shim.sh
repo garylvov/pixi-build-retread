@@ -172,6 +172,19 @@ EOS
       printf '%s () { "%s/%s" "$@"; }\n' "$n" "$DEG_SHIM" "$n"
     done
     cat <<'EOS'
+# PATH IS READ-ONLY, and this is the layer ARM 2 proved was missing. Nine of
+# the wrappers in this tree assign PATH, and sr2-work/check.sbatch assigns it
+# to a REAL TOOLCHAIN: `export CARGO_HOME=/users/glvov/.cargo` then
+# `export PATH="$CARGO_HOME/bin:$PATH"`. /users IS visible inside the sandbox,
+# so with the cargo FUNCTION removed the real cargo was found and RUN -- the
+# mutation arm meant to prove "an uncovered payload is a refusal, never an
+# execution" instead demonstrated an execution. Functions were the only layer
+# holding, and a seam with one layer is a seam with none.
+# Refusing the assignment keeps PATH at shim:safebin:canary, so a name we did
+# not stub reaches command_not_found_handle instead of a real binary. Measured
+# before doing it: FOUR wrappers here use `set -e` and NINE assign PATH, and
+# the two sets do not intersect, so no wrapper changes bucket because of this.
+readonly PATH
 command_not_found_handle () {
   printf 'UNCOVERED\t%s\n' "$1" >> "$DEG_REC/uncovered.log"
   echo "### [guard] UNCOVERED PAYLOAD: $1 -- refusing rather than executing" >&2
