@@ -35,7 +35,7 @@
 # as the FIRST line of their drift block, so the refusal names the edited FILE
 # and the command that fixes it instead of saying "drift".
 #
-#   usage: harness_sync.sh <commit> [--force] [--reason "<why>"]
+#   usage: harness_sync.sh <commit> [--add <task path>]... [--force] [--reason "<why>"]
 #          harness_sync.sh --check [<commit>]          # no writes, ever
 #
 #   env overrides (argv wins):
@@ -55,13 +55,17 @@
 # defines `map_of`, `harness_is_evidence` and `HARNESS_SCAN_DIRS` and returns
 # without running; that file is the ONE home of the table.
 #
-# WHAT IT DELIBERATELY DOES NOT DO: create task files that do not exist yet.
-# The commit carries files that map into a scanned directory but are absent from
-# the task dir (`tools/land.sh` is one, and the task dir's copy of it lives at
-# `merge-h/land.sh` by the basename rule -- installing the tools/ name would
-# manufacture a second, wrong copy).  The drift check does not read absent files
-# either, so inventing them here would make the writer and the checker disagree
-# about the set.  They are REPORTED, not installed.
+# WHAT IT DELIBERATELY DOES NOT DO ON ITS OWN: create task files that do not
+# exist yet.  The commit carries files that map into a scanned directory but are
+# absent from the task dir (`tools/land.sh` is one, and the task dir's copy of it
+# lives at `merge-h/land.sh` by the basename rule -- installing the tools/ name
+# would manufacture a second, wrong copy).  The drift check does not read absent
+# files either, so inventing them all here would make the writer and the checker
+# disagree about the set.  So they are REPORTED, and a new file enters the task
+# dir only when a human NAMES it: `--add tools/<f>`, once, and from then on it is
+# an ordinary member of the set.  That keeps this the only writer -- the
+# alternative is a lane creating the file with a bare `cat-file`, which is the
+# defect -- while leaving the choice of what exists explicit and auditable.
 #
 # Reader: harness_sync_guard.sh.
 set -uo pipefail
@@ -73,11 +77,14 @@ SQUEUE="${HARNESS_SQUEUE:-squeue}"
 RECORD_REL="tools/.harness_synced_commit"
 RECORD="$TASK_DIR/$RECORD_REL"
 
-MODE=sync; COMMIT=; FORCE=0; REASON=
+MODE=sync; COMMIT=; FORCE=0; REASON=; ADDS=
 while [ $# -gt 0 ]; do
   case "$1" in
     --check)  MODE=check;;
     --force)  FORCE=1;;
+    --add)    shift; [ -n "${1:-}" ] || { echo "### SYNC FATAL: --add needs a task-relative path" >&2; exit 2; }
+              ADDS="$ADDS $1";;
+    --add=*)  ADDS="$ADDS ${1#--add=}";;
     --reason) shift; REASON="${1:-}";;
     --reason=*) REASON="${1#--reason=}";;
     -*)       echo "### SYNC FATAL: unknown flag '$1'" >&2; exit 2;;
@@ -142,6 +149,32 @@ while IFS= read -r w; do
   case "$trel" in */*/*/*) continue;; esac      # nested, not a maxdepth-1 file
   [ -e "$TASK_DIR/$trel" ] || printf '%s|%s\n' "$trel" "$w" >> "$ABSENT"
 done < <(git -C "$REPO" ls-tree -r --name-only "$SHA" harness/tools harness/phase_template 2>/dev/null | sort)
+
+# ---- --add: the one way a NEW file enters the task dir ----------------------
+# Named explicitly, one path at a time, and only into a scanned directory with a
+# blob behind it. After the first --add the file is an ordinary member of the
+# set and every later sync carries it without being told.
+if [ "$MODE" != check ]; then
+  for a in $ADDS; do
+    case "$a" in
+      tools/*|merge-h/*) ;;
+      *) echo "### SYNC FATAL: --add $a is not under a scanned directory ($HARNESS_SCAN_DIRS)" >&2; exit 2;;
+    esac
+    aw=$(map_of "$a")
+    if [ -z "$aw" ] || ! git -C "$REPO" cat-file -e "$SHA:$aw" 2>/dev/null; then
+      echo "### SYNC FATAL: --add $a maps to '${aw:-<nothing>}', which $SHA does not carry" >&2; exit 2
+    fi
+    if grep -qF -- "$a|" "$SET"; then
+      echo "### SYNC --add $a is already in the task dir -- it is synced either way"
+      continue
+    fi
+    mkdir -p "$(dirname -- "$TASK_DIR/$a")" || { echo "### SYNC FATAL: could not make the directory for $a" >&2; exit 2; }
+    printf '%s|%s\n' "$a" "$aw" >> "$SET"
+    echo "### SYNC --add $a will be CREATED from $SHA:$aw"
+    grep -vF -- "$a|" "$ABSENT" > "$TMP/absent2" 2>/dev/null || : > "$TMP/absent2"
+    mv -f "$TMP/absent2" "$ABSENT"
+  done
+fi
 
 TOTAL=$(wc -l < "$SET")
 
@@ -260,6 +293,8 @@ done < "$SET"
 if [ -s "$ABSENT" ]; then
   echo "### SYNC ABSENT ($(wc -l < "$ABSENT")): in $SHA, not in the task dir, NOT installed --"
   echo "###   the drift check does not read them either, so the writer and the checker agree."
+  echo "###   To bring one in, NAME it -- and this writer still installs it, not a bare"
+  echo "###   cat-file:  harness_sync.sh $COMMIT --add <task path>"
   sed 's/^/###   /' "$ABSENT"
 fi
 

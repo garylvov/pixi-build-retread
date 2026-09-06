@@ -150,6 +150,30 @@ HARNESS_DRIFT_ALLOWLIST=$TA/tools/harness_drift_allowlist.txt \
   && ok "A: an INDEPENDENT drift check agrees the task dir is $V2A" \
   || bad "A: the independent drift check still refuses after a sync"
 
+# ---- A2: a NEW file enters only when it is NAMED ---------------------------
+# `harness/arms/an_arm.sh` is in the commit and reachable through the merge-h
+# basename rule, but `merge-h/a_new_arm.sh` does not exist in the task dir. A
+# sync must NOT invent it, and `--add` must create it -- from this writer, never
+# from a bare cat-file.
+printf 'v2 brand new\n' > "$RA/harness/tools/a_new_tool.sh"
+git -C "$RA" add -A >/dev/null 2>&1; git -C "$RA" commit -q -m v3 >/dev/null 2>&1
+V3A=$(git -C "$RA" rev-parse HEAD)
+runsync "$RA" "$TA" "$WORK/A_squeue" "$V3A" > "$WORK/A2.log" 2>&1
+[ -e "$TA/tools/a_new_tool.sh" ] && bad "A2: the sync INVENTED a task file nobody named" \
+  || ok "A2: a file the commit carries but the task dir lacks is NOT invented"
+grep -q 'SYNC ABSENT' "$WORK/A2.log" && grep -q -- '--add <task path>' "$WORK/A2.log" \
+  && ok "A2: the absent report names the actuator (--add), it is not a dead notice" \
+  || { bad "A2: the absent report has no actuator"; sed 's/^/      /' "$WORK/A2.log"; }
+runsync "$RA" "$TA" "$WORK/A_squeue" "$V3A" --add tools/a_new_tool.sh > "$WORK/A3.log" 2>&1; rcA3=$?
+git -C "$RA" cat-file blob "$V3A:harness/tools/a_new_tool.sh" > "$WORK/A3.blob"
+[ "$rcA3" -eq 0 ] && cmp -s "$WORK/A3.blob" "$TA/tools/a_new_tool.sh" \
+  && ok "A2: --add creates the named file from the commit's own bytes" \
+  || { bad "A2: --add rc=$rcA3 did not create the file correctly"; sed 's/^/      /' "$WORK/A3.log"; }
+runsync "$RA" "$TA" "$WORK/A_squeue" "$V3A" --add tools/no_such_thing.sh > "$WORK/A4.log" 2>&1; rcA4=$?
+[ "$rcA4" -eq 2 ] && ok "A2: --add of a path the commit does not carry is FATAL, not invented" \
+                  || bad "A2: --add of a nonexistent blob returned $rcA4"
+V2A=$V3A                      # arm C compares against the record, which now says v3
+
 # ---- B: a PENDING job pinned to the older commit ---------------------------
 read -r RB TB V1B V2B < <(mkfixture B)
 mkdir -p "$TB/lane1"; printf '%s\n' "$V1B" > "$TB/lane1/HARNESS_COMMIT"
