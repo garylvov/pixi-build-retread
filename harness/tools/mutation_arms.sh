@@ -20,6 +20,12 @@
 #     source "$T/tools/mutation_arms.sh"
 #     JOB_ROOT=$T/<lane>-work  WT=<worktree>  A_DIR=$JOB_ROOT/mut  MUT_JOBS=1 \
 #       mut_init
+#
+#   A SECOND, CONCURRENT MATRIX POINTS `A_DIR` SOMEWHERE ELSE AND GETS ITS OWN
+#   SCRATCH -- that is what `A_DIR` is FOR (see defect 3 below):
+#
+#     JOB_ROOT=$T/<lane>-work  WT=<worktree>  A_DIR=$JOB_ROOT/mut2  MUT_JOBS=1 \
+#       mut_init
 #     GUARDS=( name_of_guard_one name_of_guard_two )
 #     run_arm BASE src/foo.rs ""            GREEN || bad=$((bad+1))
 #     run_arm M1   src/foo.rs 's|a|b|'      RED   || bad=$((bad+1))
@@ -51,16 +57,40 @@
 #     `mut_init` prints `df -PT` of the real scratch and `stat -f` of its
 #     filesystem type, and refuses on `tmpfs`/`ramfs`/`devtmpfs`.
 #
+# (3) DET-1-2, MEASURED 2026-09-06.  `mut_init` DERIVED `MUT_SCRATCH` FROM
+#     `$JOB_ROOT` AND IGNORED `A_DIR` ENTIRELY, so the documented way to keep a
+#     first run's arm logs -- point the second matrix at `mut2/` -- moved the
+#     ARTIFACTS and left the second matrix building its arm directories in the
+#     FIRST run's live scratch.  DET-1 hit exactly this: run 1 (5981304, A_DIR
+#     `mut`) and run 2 (5981742, A_DIR `mut2`) shared `$JOB_ROOT/mut`, and both
+#     runs were declared dead evidence rather than mined.  A third matrix could
+#     not be submitted at all while the first two were alive.  Two halves of the
+#     fix, and both are needed -- one makes the collision impossible to reach by
+#     accident, the other makes it impossible to reach on purpose:
+#       * THE SCRATCH ROOT FOLLOWS THE DECLARATION.  `MUT_SCRATCH` if the lane
+#         set one; else `A_DIR`, which is the knob every lane already reaches
+#         for; else `$JOB_ROOT/mut`, unchanged for every caller that declares
+#         neither.  `mut_init` PRINTS the root and WHERE IT CAME FROM.
+#       * A LOCK FILE WITH A PID.  A scratch root in use by a live matrix is
+#         REFUSED rc 6, naming the pid, the host, the slurm job and the arm
+#         directories already in it.  A lock whose owner is gone is announced as
+#         STALE and taken over -- a crashed job must not wedge the next run.
+#
 # ── REFUSALS (nothing is created before they are all passed) ─────────────────
 #   rc 3  `JOB_ROOT` or `WT` unset, or `JOB_ROOT` cannot be created
 #   rc 4  the scratch root is on a RAM-backed filesystem, or it resolves under a
 #         RAM-backed `/tmp` or `$TMPDIR`
 #   rc 5  `WT` is unset or is not a directory
+#   rc 6  the chosen scratch root is held by a LIVE matrix (DET-1-2)
 # and from `run_arm`:
 #   rc 99 the mutation changed nothing -- a mutation that does not mutate proves
 #         nothing
 #   rc 98 the arm printed no `test result:` line -- it did not run
 #   rc 1  the arm's colour is not the one declared
+# and, DET-1-4, NOT a return but an EXIT: a RED BASE arm ends the whole matrix
+# through `mut_done 1 base-red` with rc `MUT_BASE_FAIL_RC` (default 1), because
+# 5981304 printed `BASE FAILED` and then `MUT_EXIT=0` / `COMPLETED 0:0` -- the
+# detector fired into a lane script that swallowed the return.
 #
 # Sourcing this file defines functions and touches nothing.  `mut_init` is what
 # acts.
@@ -130,13 +160,50 @@ mut_init() {
     echo "### MUT REFUSED: cannot create JOB_ROOT $JOB_ROOT"; return 3; }
   [ -d "$JOB_ROOT" ] || { echo "### MUT REFUSED: JOB_ROOT is not a directory: $JOB_ROOT"; return 3; }
 
-  MUT_SCRATCH="$JOB_ROOT/mut"
-  A_DIR="${A_DIR:-$JOB_ROOT/mut-artifacts}"
+  # DET-1-2: the scratch root FOLLOWS THE DECLARATION, and says where it came
+  # from. Explicit `MUT_SCRATCH` first, then `A_DIR` (the knob a lane already
+  # moves when it wants a second matrix), then the job-root default -- which is
+  # what every caller that declares neither keeps getting.
+  #
+  # AND `mut_init` MUST NOT READ BACK ITS OWN EXPORT.  It exports `MUT_SCRATCH`
+  # and `A_DIR`, so a SECOND `mut_init` in the same shell -- or in a subshell of
+  # it, which is how a guard and a two-matrix lane both do this -- would see its
+  # predecessor's derived value sitting in the "the caller declared this"
+  # position and IGNORE the new declaration entirely.  That is the DET-1-2 defect
+  # again one level up, and it was measured on the very first run of this fix:
+  # the guard's prefix-assignment arm inherited `MUT_SCRATCH` from the arm before
+  # it, kept the FIRST matrix's root, and was refused rc 6 by its own live lock.
+  # So each derived value is remembered, and a value that is byte-equal to what
+  # this function last derived is treated as ABSENT, not as a declaration.
+  if [ -n "${MUT_SCRATCH:-}" ] && [ "${MUT_SCRATCH:-}" = "${MUT_SCRATCH_DERIVED:-}" ]; then
+    MUT_SCRATCH=
+  fi
+  if [ -n "${A_DIR:-}" ] && [ "${A_DIR:-}" = "${MUT_ADIR_DERIVED:-}" ]; then
+    A_DIR=
+  fi
+  local scratch_src
+  if [ -n "${MUT_SCRATCH:-}" ]; then
+    scratch_src=MUT_SCRATCH
+  elif [ -n "${A_DIR:-}" ]; then
+    MUT_SCRATCH="$A_DIR"; scratch_src=A_DIR
+  else
+    MUT_SCRATCH="$JOB_ROOT/mut"; scratch_src=JOB_ROOT-default
+  fi
+  # `MUT_ADIR_DERIVED` is recorded ONLY when this function invented the value.
+  # An `A_DIR` the CALLER set is the caller's, and re-declaring the same one in a
+  # second matrix must keep meaning what it says.
+  if [ -z "${A_DIR:-}" ]; then
+    A_DIR="$JOB_ROOT/mut-artifacts"; MUT_ADIR_DERIVED="$A_DIR"
+  else
+    MUT_ADIR_DERIVED=
+  fi
+  MUT_SCRATCH_DERIVED="$MUT_SCRATCH"
   MUT_JOBS="${MUT_JOBS:-1}"
+  MUT_LOCK="$MUT_SCRATCH/.mut_lock"
 
   # THE REFUSALS, all measured, and BEFORE anything is created under the root.
   local jt; jt="$(mut_fstype "$JOB_ROOT")"
-  echo "### MUT scratch root=$MUT_SCRATCH fstype=$jt"
+  echo "### MUT scratch root=$MUT_SCRATCH from=$scratch_src fstype=$jt (DET-1-2: A_DIR moves the scratch, not just the logs)"
   echo "### MUT df -PT JOB_ROOT: $(df -PT "$JOB_ROOT" 2>/dev/null | tail -1)"
   if mut_is_ram_fs "$JOB_ROOT"; then
     echo "### MUT REFUSED: JOB_ROOT $JOB_ROOT is on $jt, which is RAM."
@@ -157,11 +224,50 @@ mut_init() {
     fi
   done
 
+  # ── DET-1-2 THE LOCK, BEFORE ANY ARM DIRECTORY IS CREATED ──────────────────
+  # Two matrices in one scratch root delete each other's arm directories --
+  # `run_arm` does `rm -rf "$MUT_SCRATCH/$name"` on entry and on every exit -- so
+  # the loser's colours are not wrong, they are MEANINGLESS, and that is worse.
+  # The lock names the pid, the host and the slurm job so the refusal can say
+  # WHO holds it rather than "busy".
+  if [ -f "$MUT_LOCK" ]; then
+    local l_pid l_host l_job l_when l_live armdirs
+    l_pid=$(sed -n 's/^pid=//p'  "$MUT_LOCK" | head -1)
+    l_host=$(sed -n 's/^host=//p' "$MUT_LOCK" | head -1)
+    l_job=$(sed -n 's/^job=//p'  "$MUT_LOCK" | head -1)
+    l_when=$(sed -n 's/^when=//p' "$MUT_LOCK" | head -1)
+    armdirs=$(find "$MUT_SCRATCH" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l)
+    l_live=0
+    # The pid only means anything on the host that minted it, and a pid scan
+    # must not be able to match the scanner (law 14): `kill -0` on a NAMED pid
+    # cannot.
+    if [ -n "$l_pid" ] && [ "$l_host" = "$(hostname)" ] && kill -0 "$l_pid" 2>/dev/null; then
+      l_live=1
+    fi
+    # Across nodes the slurm job id is the only honest liveness signal.
+    if [ "$l_live" = 0 ] && [ -n "$l_job" ] && [ "$l_job" != "-" ] && command -v squeue >/dev/null 2>&1; then
+      if [ -n "$(squeue -h -j "$l_job" -o '%T' 2>/dev/null)" ]; then l_live=1; fi
+    fi
+    if [ "$l_live" = 1 ]; then
+      echo "### MUT REFUSED: scratch root $MUT_SCRATCH is HELD BY A LIVE MATRIX (DET-1-2)"
+      echo "### MUT   holder: pid=$l_pid host=$l_host job=$l_job since=$l_when"
+      echo "### MUT   arm directories already in it: $armdirs"
+      echo "### MUT   Two matrices in one scratch root delete each other's arm dirs, which"
+      echo "### MUT   is how DET-1's runs 1 and 2 both became dead evidence. Point this run"
+      echo "### MUT   somewhere else: A_DIR=\$JOB_ROOT/mut2 (or MUT_SCRATCH=<path>)."
+      return 6
+    fi
+    echo "### MUT lock at $MUT_LOCK is STALE (pid=$l_pid host=$l_host job=$l_job since=$l_when) -- taking it over"
+  fi
+
   mkdir -p "$MUT_SCRATCH" "$A_DIR" || {
     echo "### MUT REFUSED: cannot create $MUT_SCRATCH / $A_DIR"; return 3; }
+  printf 'pid=%s\nhost=%s\njob=%s\nwhen=%s\nscratch_from=%s\n' \
+    "$$" "$(hostname)" "${SLURM_JOB_ID:--}" "$(date -Is)" "$scratch_src" > "$MUT_LOCK"
+  echo "### MUT lock $MUT_LOCK pid=$$ job=${SLURM_JOB_ID:--}"
   echo "### MUT INIT ok host=$(hostname) $(date -Is) scratch=$MUT_SCRATCH artifacts=$A_DIR MUT_JOBS=$MUT_JOBS"
   echo "### MUT worktree WT=$WT HEAD=$(git -C "$WT" rev-parse --short HEAD 2>/dev/null) dirty=$(git -C "$WT" status --porcelain 2>/dev/null | wc -l)"
-  export MUT_SCRATCH A_DIR MUT_JOBS
+  export MUT_SCRATCH A_DIR MUT_JOBS MUT_LOCK MUT_SCRATCH_DERIVED MUT_ADIR_DERIVED
   return 0
 }
 
@@ -200,7 +306,29 @@ run_arm() {
   grep -E "^test .*(${MUT_ROW_FILTER:-.})" "$A_DIR/$name.log" | sed "s/^/###   $name /"
   [ -n "$split" ] || { echo "### $name FATAL: no test-result line -- it did not run"; arm_done 98; return 98; }
   if [ "$expect" = GREEN ]; then
-    [ "$rc" -eq 0 ] || { echo "### $name FAILED: expected GREEN, got rc=$rc"; arm_done 1; return 1; }
+    if [ "$rc" -ne 0 ]; then
+      echo "### $name FAILED: expected GREEN, got rc=$rc"
+      arm_done 1
+      # ── DET-1-4: A RED BASE ARM IS A TERMINAL EVENT, AND IT USED TO REACH
+      #    NOBODY. MEASURED: det1-mut 5981304 printed `### BASE FAILED: expected
+      #    GREEN, got rc=101`, then `### MUT_EXIT=0`, NO `MUT DONE` footer at
+      #    all, and Slurm recorded COMPLETED 0:0. The detector fired and the
+      #    actuator was a lane script that happened to swallow the return
+      #    (law 9). It cannot be left to the caller: a base that does not build
+      #    makes every mutant colour in the matrix MEANINGLESS -- a mutant that
+      #    "goes RED" against a base that is already red proves nothing -- so the
+      #    template ends the run itself, through the same `mut_done` path every
+      #    other exit takes, so the footer and the arm-directory count are always
+      #    printed and the job's rc is always non-zero.
+      if [ "$name" = "${MUT_BASE_ARM:-BASE}" ]; then
+        echo "### MUT BASE RED -- the matrix is VOID: every mutant colour would be measured"
+        echo "### MUT   against a base that does not build. Ending here rather than reporting"
+        echo "### MUT   colours nobody can read (law 9)."
+        mut_done 1 base-red
+        exit "${MUT_BASE_FAIL_RC:-1}"
+      fi
+      return 1
+    fi
   else
     [ "$rc" -ne 0 ] || { echo "### $name FAILED: expected RED, the mutation passed the guards"; arm_done 1; return 1; }
   fi
@@ -211,10 +339,17 @@ run_arm() {
 
 # Close out: prove nothing was left behind, and exit on the tally.
 mut_done() {
-  local bad="${1:-0}"
+  local bad="${1:-0}" reason="${2:-}"
   local left; left=$(find "$MUT_SCRATCH" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l)
   echo "### MUT arm directories left behind: $left (must be 0)"
-  rm -rf "$MUT_SCRATCH"
-  echo "### MUT DONE bad=$bad $(date -Is)"
+  # DET-1-2: the scratch root can now BE the artifacts directory (`A_DIR`), so a
+  # blanket `rm -rf "$MUT_SCRATCH"` would delete the very arm logs a lane moved
+  # `A_DIR` in order to keep. Remove what this template created -- the arm
+  # directories and the lock -- and take the root itself only when nothing else
+  # is in it.
+  find "$MUT_SCRATCH" -maxdepth 1 -mindepth 1 -type d -exec rm -rf {} + 2>/dev/null
+  rm -f "${MUT_LOCK:-$MUT_SCRATCH/.mut_lock}"
+  rmdir "$MUT_SCRATCH" 2>/dev/null
+  echo "### MUT DONE bad=$bad${reason:+ reason=$reason} $(date -Is)"
   [ "$bad" -eq 0 ] && [ "$left" -eq 0 ]
 }
