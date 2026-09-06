@@ -25,13 +25,20 @@ WHICH=${1:-all}
 
 [ -f "$GUARD" ] || { echo "ARMS FATAL: no guard at $GUARD"; exit 4; }
 
-W=$(mktemp -d "${TMPDIR:-/tmp}/driver_exit_arms.XXXXXX") || { echo "ARMS FATAL: no temp dir"; exit 4; }
+# THE ARM LOGS ARE EVIDENCE, so DEG_ARMS_DIR keeps them. And NOTHING in this
+# file uses a BACKTICK: the first version of ARM 2 wrote cargo check inside a
+# double-quoted PASS message, which is command substitution -- the arms script
+# ran a REAL cargo on the compute node while asserting that the guard does not.
+# The lesson generalises: a file about not executing payloads must not contain
+# a construct that executes one.
+W=${DEG_ARMS_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/driver_exit_arms.XXXXXX")}
+mkdir -p "$W" || { echo "ARMS FATAL: no work dir at $W"; exit 4; }
 # THE MUTANT WRAPPER LIVES IN THE TASK TREE, because the thing under test is
 # DISCOVERY -- a mutant outside the tree would prove nothing about it. It is
 # removed on every exit path, including a kill, so the tree never keeps a
 # deliberate swallower that the next lane would have to baseline.
 MUTDIR=$TASK/harnessexit3/mutarm
-trap 'rm -rf "$W" "$MUTDIR"' EXIT
+trap 'if [ -z "${DEG_ARMS_DIR:-}" ]; then rm -rf "$W"; fi; rm -rf "$MUTDIR"' EXIT
 echo "### driver_exit_mutation_arms  guard=$GUARD  task=$TASK  host=$(hostname)  $(date -Is)"
 
 pass=0; fail=0
@@ -87,8 +94,8 @@ fi
 # ---------------------------------------------------------------- ARM 2 -----
 # A stub REMOVED from the shim dir must produce the UNCOVERED-PAYLOAD REFUSAL,
 # never an execution. This is the STORE-REAP-2 defect as a fixture:
-# sr2-work/check.sbatch's payload is `cargo check --all-targets`, and with the
-# `cargo` stub gone the only acceptable outcome is a refusal.
+# sr2-work/check.sbatch's payload is cargo check --all-targets, and with the
+# cargo stub gone the only acceptable outcome is a refusal.
 if [ "$WHICH" = all ] || [ "$WHICH" = 2 ]; then
   echo "=== ARM 2 -- a stub removed from the shim dir"
   TARGET=sr2-work/check.sbatch
@@ -100,7 +107,7 @@ if [ "$WHICH" = all ] || [ "$WHICH" = 2 ]; then
   mut_can=$(grep -c 'CANARY FIRED' "$W/arm2mut.log")
   grep -q "intercepted payload commands" "$W/arm2ctl.log" && \
     grep -qE '^### +1 cargo' "$W/arm2ctl.log" \
-      && ok "ARM 2 CONTROL: the seam intercepted the real `cargo check` and stubbed it" \
+      && ok "ARM 2 CONTROL: the seam intercepted the real cargo check and stubbed it" \
       || no "ARM 2 CONTROL: no intercepted cargo in the recorder -- the arm below proves nothing (log $W/arm2ctl.log)"
   [ "$mut_ref" -gt 0 ] && ok "ARM 2 MUTANT: with the cargo stub gone the wrapper is REFUSED as uncovered, not run" \
                        || no "ARM 2 MUTANT: no uncovered refusal -- an unstubbed payload was not caught (log $W/arm2mut.log)"
