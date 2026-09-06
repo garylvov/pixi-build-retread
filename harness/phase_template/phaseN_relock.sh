@@ -222,6 +222,26 @@ ls -l "$SNAP"; "$SNAP" --version 2>&1 | head -2
 [ -f "$FAST_ENV" ] || { echo "FATAL: persistent-cache snippet $FAST_ENV missing"; exit 8; }
 
 ### HARNESS-DRIFT BEGIN
+# HARNESS-SYNC-1 (2026-09-06).  THE FIRST QUESTION IS NOT "IS THIS THE RIGHT
+# COMMIT" BUT "HAS ANYBODY HAND-EDITED A TASK COPY SINCE THE LAST SYNC".  The
+# drift check below can only say "not $HARNESS_COMMIT"; `harness_sync.sh --check`
+# names the FILE, because it compares against the commit the SINGLE WRITER last
+# installed (`tools/.harness_synced_commit`) -- so a direct edit is named here,
+# by path, with the command that fixes it, instead of killing a job three hours
+# later for "drift".  No writer, or no record yet = ANNOUNCED, never silent.
+SYNC_CHECK=$(dirname "$FAST_ENV")/harness_sync.sh
+if [ -f "$SYNC_CHECK" ]; then
+  SYNC_OUT=$(HARNESS_TASK_DIR=$T bash "$SYNC_CHECK" --check 2>&1); SYNC_RC=$?
+  echo "$SYNC_OUT"
+  if [ "$SYNC_RC" -eq 3 ]; then
+    echo "FATAL: a task copy named above was EDITED IN PLACE, not synced."
+    echo "       Commit it in the harness repo, then run: harness_sync.sh <commit>"
+    exit 6
+  fi
+  [ "$SYNC_RC" -eq 0 ] || echo "### harness_sync.sh --check inconclusive (rc=$SYNC_RC) -- the drift check below still runs"
+else
+  echo "### harness_sync.sh missing next to $FAST_ENV -- in-place-edit check OFF for this run"
+fi
 # C31-4-1d.  The task tree is not a git repo, so a task copy of this harness can
 # silently fall behind the versioned one -- C31-4-1 found four that had, one of
 # them 779 lines behind.  Set HARNESS_COMMIT to the harness commit this batch is

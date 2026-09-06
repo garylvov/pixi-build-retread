@@ -37,6 +37,59 @@
 # turns the RED case green.
 set -uo pipefail
 
+# ---- THE SOURCEABLE MAPPING (HARNESS-SYNC-1, 2026-09-06) --------------------
+# `harness_sync.sh` is the SINGLE WRITER of task copies, and it must install
+# exactly the set this check reads.  Two copies of that table would drift from
+# each other, and a mapping that disagreed with its own checker is the defect
+# this whole file exists to catch, one level up.  So the table lives HERE, once,
+# and the writer sources it:
+#
+#     HARNESS_DRIFT_LIB=1 . harness_drift_check.sh   # defines, does not run
+#
+# With the variable unset -- every existing caller, both phase templates
+# included -- nothing below changes and the check runs exactly as before.
+HARNESS_SCAN_DIRS=${HARNESS_SCAN_DIRS:-"tools tools/phase_template merge-h"}
+
+# `.bak-*`, `.pre-*` and __pycache__ are run evidence, not harness, and are
+# excluded here exactly as harness/README.md excludes them from the repo.
+# `.harness_synced_commit` is the single writer's own record of the last commit
+# it installed (HARNESS-SYNC-1); it is state this directory owns, has no blob
+# anywhere, and must not be read as a task copy that has gone missing.
+harness_is_evidence () {
+  case "$(basename -- "$1")" in
+    *.bak-*|*.pre-*|*.pyc|*~|.harness_synced_commit) return 0;;
+  esac
+  return 1
+}
+
+# task tools/<f>                -> harness/tools/<f>
+# task tools/phase_template/<f> -> harness/phase_template/<f>
+# task merge-h/<f>              -> by basename, searched phase_template, arms,
+#                                  tools (the section-34 basename rule: merge-h's
+#                                  cleanup_gated.sh is the phase_template file
+#                                  and its gate_build.sh is the tools file).
+# Reads $REPO and $SHA, which both the check and the writer set before calling.
+map_of () {
+  case "$1" in
+    tools/phase_template/*) echo "harness/phase_template/${1#tools/phase_template/}"; return;;
+    tools/*)                echo "harness/tools/${1#tools/}"; return;;
+    merge-h/*)
+      local b=${1#merge-h/} d
+      for d in phase_template arms tools; do
+        if git -C "$REPO" cat-file -e "$SHA:harness/$d/$b" 2>/dev/null; then
+          echo "harness/$d/$b"; return
+        fi
+      done
+      echo "harness/tools/$b"; return;;
+  esac
+  echo ""
+}
+
+if [ -n "${HARNESS_DRIFT_LIB:-}" ]; then
+  return 0 2>/dev/null || exit 0
+fi
+# ---- end of the sourceable half; everything below RUNS the check ------------
+
 COMMIT="${1:?usage: harness_drift_check.sh <commit-ish> [task-dir] [repo] [allowlist]}"
 TASK_DIR="${2:-${HARNESS_TASK_DIR:-/oscar/data/stellex/glvov/agrescap/tasks/retread-4-11}}"
 REPO="${3:-${HARNESS_REPO:-/oscar/data/stellex/glvov/agrescap/worktrees/harness-tools}}"
@@ -64,30 +117,7 @@ while read -r p rest; do
   ALLOWED="$ALLOWED $p"
 done < "$ALLOWLIST"
 
-# ---- the mapped set ------------------------------------------------------
-# task tools/<f>                -> harness/tools/<f>
-# task tools/phase_template/<f> -> harness/phase_template/<f>
-# task merge-h/<f>              -> by basename, searched phase_template, arms,
-#                                  tools (the §34 basename rule: merge-h's
-#                                  cleanup_gated.sh is the phase_template file
-#                                  and its gate_build.sh is the tools file).
-# `.bak-*`, `.pre-*` and __pycache__ are run evidence, not harness, and are
-# excluded here exactly as harness/README.md excludes them from the repo.
-map_of () {
-  case "$1" in
-    tools/phase_template/*) echo "harness/phase_template/${1#tools/phase_template/}"; return;;
-    tools/*)                echo "harness/tools/${1#tools/}"; return;;
-    merge-h/*)
-      local b=${1#merge-h/} d
-      for d in phase_template arms tools; do
-        if git -C "$REPO" cat-file -e "$SHA:harness/$d/$b" 2>/dev/null; then
-          echo "harness/$d/$b"; return
-        fi
-      done
-      echo "harness/tools/$b"; return;;
-  esac
-  echo ""
-}
+# ---- the mapped set: defined ONCE in the sourceable half above -----------
 
 checked=0; okc=0; allowc=0; mismatch=0; missing=0
 BAD="$TMP/bad.txt"; : > "$BAD"
@@ -97,7 +127,7 @@ scan_dir () {  # $1 = task-relative dir
   [ -d "$abs" ] || return 0
   while IFS= read -r f; do
     base=$(basename "$f")
-    case "$base" in *.bak-*|*.pre-*|*.pyc|*~) continue;; esac
+    if harness_is_evidence "$base"; then continue; fi
     trel="$rel/$base"
     case " $ALLOWED " in
       *" $trel "*) echo "DRIFT allow    $trel"; allowc=$((allowc + 1)); continue;;
@@ -123,9 +153,7 @@ scan_dir () {  # $1 = task-relative dir
   done < <(find "$abs" -maxdepth 1 -type f | sort)
 }
 
-scan_dir tools
-scan_dir tools/phase_template
-scan_dir merge-h
+for d in $HARNESS_SCAN_DIRS; do scan_dir "$d"; done
 
 echo "### DRIFT SUMMARY commit=$SHA checked=$checked ok=$okc allowed=$allowc mismatch=$mismatch missing=$missing"
 

@@ -413,6 +413,26 @@ for f in "$SNAP" "$LOCK" "$PROBES" "$PROBES_CANON" "$VERDICT" "$CERT_BASELINE" "
 done
 
 ### HARNESS-DRIFT BEGIN
+# HARNESS-SYNC-1 (2026-09-06).  THE FIRST QUESTION IS NOT "IS THIS THE RIGHT
+# COMMIT" BUT "HAS ANYBODY HAND-EDITED A TASK COPY SINCE THE LAST SYNC".  The
+# drift check below can only say "not $HARNESS_COMMIT"; `harness_sync.sh --check`
+# names the FILE, because it compares against the commit the SINGLE WRITER last
+# installed (`tools/.harness_synced_commit`) -- so a direct edit is named here,
+# by path, with the command that fixes it, instead of killing a job three hours
+# later for "drift".  No writer, or no record yet = ANNOUNCED, never silent.
+SYNC_CHECK=$(dirname "$FAST_ENV")/harness_sync.sh
+if [ -f "$SYNC_CHECK" ]; then
+  SYNC_OUT=$(HARNESS_TASK_DIR=$T bash "$SYNC_CHECK" --check 2>&1); SYNC_RC=$?
+  echo "$SYNC_OUT"
+  if [ "$SYNC_RC" -eq 3 ]; then
+    echo "### FATAL a task copy named above was EDITED IN PLACE, not synced."
+    echo "       Commit it in the harness repo, then run: harness_sync.sh <commit>"
+    exit 2
+  fi
+  [ "$SYNC_RC" -eq 0 ] || echo "### harness_sync.sh --check inconclusive (rc=$SYNC_RC) -- the drift check below still runs"
+else
+  echo "### harness_sync.sh missing next to $FAST_ENV -- in-place-edit check OFF for this run"
+fi
 # C31-4-1d.  Same guard as phaseN_relock.sh: HARNESS_COMMIT names the harness
 # commit this batch is meant to be, and a task-dir copy that is not that commit
 # refuses here rather than being certified.  Unset = announced OFF, never silent.

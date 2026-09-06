@@ -32,8 +32,8 @@ e893ee7f20e181181bb8205ab7edda0c  phase_template/cleanup_owner_guard.sh
 7a1fc4ce6b54ac46828fed8f7906f252  phase_template/lane_wrapper.sbatch
 a2515c75fe18f95fda20b4d8156728ea  phase_template/leftover_check_guard.sh
 063ba387f091f6c66eb73ccdc632c70d  phase_template/link_mode_guard.sh
-2c7594f28f008b368dc95169229dd3c6  phase_template/phaseN_cert.sh
-134bb21a37b555f27b90236d07923204  phase_template/phaseN_relock.sh
+525a5917929de811513f53e71eedaefd  phase_template/phaseN_cert.sh
+22de29899baff99b7fefa80b70960f3d  phase_template/phaseN_relock.sh
 5d5b822c3ed7e38e7f89b34e8edc9195  phase_template/README.md
 a465cea86edc07ad5adf9f96b1ebac9e  phase_template/wedge_triage_guard.sh
 c26805a4a64f89749fe352bf5aaa8381  phase_template/wedge_triage.sh
@@ -64,7 +64,9 @@ de2c918a31b7e5fdae517cda1ccba4d4  tools/gate_head_pin.sh
 6d465b9b66fcc7e08d8049bd0281d9fe  tools/harness_commit_pin_guard.sh
 13ed2134fbe344386ce4ea1c9391ab1c  tools/harness_commit_resolve.sh
 447037c0b4249d9d3d7c084940be5cc4  tools/harness_drift_allowlist.txt
-5941de23b36deaa3aa72d37cbc3a312b  tools/harness_drift_check.sh
+348ddf71544313af031463701f010ab9  tools/harness_sync.sh
+481f89a3f3231baee5c33fd8e279b3b8  tools/harness_sync_guard.sh
+587729c857a328049c8dd28a3d189f55  tools/harness_drift_check.sh
 39e620e807735bdc65b09fb8078d8e82  tools/import_audit.py
 f1f852fe67e87434d49b9a61f98e8052  tools/land_fixset_sync_guard.sh
 043624f5f51694c95651b155d79ddda9  tools/land.sh
