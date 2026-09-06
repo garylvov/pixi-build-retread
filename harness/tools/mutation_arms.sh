@@ -280,6 +280,81 @@ mut_arm_command() {
       cargo test --lib -j "$MUT_JOBS" -- "${GUARDS[@]}" )
 }
 
+# DET-1-FIX.  Take one arm's sed expression apart into the pieces that must each
+# find a line, and NAME the ones that found none.
+#
+# Every arm this campaign has ever written has one shape:
+#
+#     [/addr1/[,/addr2/]] s<D>LHS<D>RHS<D>[flags]
+#
+# so the pieces that can silently match nothing are the range ADDRESSES and the
+# substitution's LEFT-HAND SIDE.  Each is counted with `grep` as a BRE -- which
+# is what `sed` matched it as -- against the UNMUTATED file, and the first zero
+# is the pattern that broke the arm.  Two deliberate limits, stated rather than
+# hidden: an address regex containing a top-level `,`, and an LHS containing an
+# escaped copy of its own delimiter, are not split correctly.  Neither appears
+# in any arm today, and BOTH are reported as UNPARSED rather than as a clean
+# bill of health -- an expression this cannot read must not print silence, which
+# is the whole defect being fixed.
+mut_report_absent_patterns() {
+  local name="$1" file="$2" sedexpr="$3" src="$4"
+  echo "### $name   file: src/$file"
+  echo "### $name   sed:  $sedexpr"
+  [ -f "$src" ] || { echo "### $name   UNPARSED: no such source file to count against: $src"; return 0; }
+  local addr="" subst="" zeros=0
+  if [[ "$sedexpr" =~ ^(/.*/)[[:space:]]+(s.*)$ ]]; then
+    addr="${BASH_REMATCH[1]}"; subst="${BASH_REMATCH[2]}"
+  elif [[ "$sedexpr" =~ ^s.*$ ]]; then
+    subst="$sedexpr"
+  else
+    echo "### $name   UNPARSED: this is not [address] s<D>LHS<D>RHS<D> -- counted nothing, and says so"
+    return 0
+  fi
+  local piece pat count
+  if [ -n "$addr" ]; then
+    local -a pieces=()
+    IFS=, read -r -a pieces <<< "$addr"
+    for piece in "${pieces[@]}"; do
+      pat="${piece#/}"; pat="${pat%/}"
+      count=$(grep -c -e "$pat" -- "$src" 2>/dev/null); [ -n "$count" ] || count=0
+      if [ "$count" -eq 0 ]; then
+        echo "### $name   ADDRESS /$pat/ matches 0 lines  <-- THE PATTERN THAT FAILED TO FIND ITS LINE"
+        echo "### $name     the range never opened, so the substitution never ran. Read the REAL"
+        echo "### $name     text in src/$file (a one-line signature where the arm assumed a"
+        echo "### $name     multi-line one is how DET-1's M4 arm died twice)."
+        zeros=$((zeros+1))
+      else
+        echo "### $name   ADDRESS /$pat/ matches $count line(s)"
+      fi
+    done
+  fi
+  local delim rest lhs
+  delim="${subst:1:1}"
+  rest="${subst:2}"
+  if [ -z "$delim" ] || [ "$rest" = "$subst" ]; then
+    echo "### $name   UNPARSED substitution: $subst"
+    return 0
+  fi
+  lhs="${rest%%"$delim"*}"
+  if [ "$lhs" = "$rest" ]; then
+    echo "### $name   UNPARSED substitution (no closing '$delim'): $subst"
+    return 0
+  fi
+  count=$(grep -c -e "$lhs" -- "$src" 2>/dev/null); [ -n "$count" ] || count=0
+  if [ "$count" -eq 0 ]; then
+    echo "### $name   LHS $delim$lhs$delim matches 0 lines  <-- THE PATTERN THAT FAILED TO FIND ITS LINE"
+    zeros=$((zeros+1))
+  else
+    echo "### $name   LHS $delim$lhs$delim matches $count line(s)"
+  fi
+  if [ "$zeros" -eq 0 ]; then
+    echo "### $name   EVERY pattern above matches somewhere, yet the file is unchanged: the"
+    echo "### $name     addresses do not BRACKET the line the LHS is on (or the RHS is already"
+    echo "### $name     what the LHS says). Print the range and check it by hand."
+  fi
+  return 0
+}
+
 # run_arm <name> <file relative to src/> <sed expression or ""> <GREEN|RED>
 run_arm() {
   local name="$1" file="$2" sedexpr="$3" expect="$4"
@@ -296,6 +371,16 @@ run_arm() {
     sed -i "$sedexpr" "$dir/src/$file"
     if cmp -s "$MUT_WT/src/$file" "$dir/src/$file"; then
       echo "### $name FATAL: the mutation changed NOTHING -- a mutation that does not mutate proves nothing"
+      # DET-1-FIX: AND IT MUST NAME THE PATTERN THAT FAILED TO FIND ITS LINE.
+      # Measured: det1-mut 5981742 and det1-mut3 5983139 both printed the line
+      # above and nothing else for arm M4, ninety minutes and two nodes apart,
+      # and the reader had to go and diff the arm's sed expression against the
+      # file by hand to learn that the RANGE ANCHOR
+      # `/^fn configure_reproducible_source_build($/` never matched a real
+      # ONE-LINE signature. A refusal that says "something did not match" and
+      # not WHICH thing is a detector whose actuator is a human with a grep
+      # (law 9). The rows below say which.
+      mut_report_absent_patterns "$name" "$file" "$sedexpr" "$MUT_WT/src/$file"
       arm_done 99; return 99
     fi
   fi

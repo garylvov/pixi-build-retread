@@ -37,6 +37,13 @@
 #      `BASE FAILED` then `MUT_EXIT=0` and Slurm said COMPLETED 0:0.
 #  12. DET-1-4 MUTATION, pinned to $PREFIX: on the pre-fix template the same
 #      fixture exits ZERO with no footer, so check 11 can fail.
+#  13. DET-1-FIX: a mutation that matches ZERO lines is refused rc 99 BEFORE the
+#      suite is run, and the refusal NAMES the pattern that found nothing --
+#      the address separately from the substitution's LHS, so a reader can see
+#      which half is wrong without diffing by hand.
+#  14. DET-1-FIX MUTATION, pinned to $PREFIX: the pre-fix template refuses the
+#      same arm rc 99 and names NOTHING, which is the silence det1-mut3 5983139
+#      actually printed for arm M4.
 #
 #   rc 0  all of them hold
 #   rc 1  a check failed (the row says which)
@@ -362,6 +369,63 @@ if [ -f "$PRE" ]; then
   fi
 else
   fail "12: no pre-fix template to mutate against -- MUTATION ARM DID NOT RUN"
+fi
+
+# ── 13/14. DET-1-FIX: A ZERO-LINE MUTATION IS REFUSED **BEFORE THE SUITE RUNS**
+#      AND THE REFUSAL NAMES THE PATTERN THAT FOUND NOTHING.
+# Measured: det1-mut 5981742 and det1-mut3 5983139 both printed
+# `### M4 FATAL: the mutation changed NOTHING` and not one word more, on two
+# nodes ninety minutes apart, and the cause -- a range anchor written for a
+# multi-line signature against a real ONE-LINE one -- had to be found by hand.
+zero_probe=$BASE/zero.txt
+run_zero_arm () {            # $1 = template ; $2 = job root ; prints the arm's output
+  ( set -uo pipefail
+    # shellcheck source=/dev/null
+    source "$1"
+    mut_arm_command () { printf 'RAN\t%s\n' "$1" >> "$zero_probe"; echo "test result: ok. 1 passed; 0 failed; 0 ignored"; return 0; }
+    JOB_ROOT="$2"; WT="$FAKE_WT"; A_DIR="$2/mut"; MUT_JOBS=1
+    unset MUT_SCRATCH
+    mut_init >/dev/null 2>&1 || { echo "MUT_INIT_REFUSED"; exit 9; }
+    GUARDS=(dummy)
+    # The address names a function this fixture does not contain, exactly as
+    # DET-1's M4 named a signature spelling `source_build.rs` does not contain.
+    run_arm Z1 lib.rs '/^fn nosuchfn($/,/^}$/ s|^const MARKER.*$|const MARKER: \&str = "mutated";|' RED
+    echo "RUN_ARM_RC=$?"
+  ) 2>&1
+}
+: > "$zero_probe"
+zout=$(run_zero_arm "$TEMPLATE" "$BASE/zeroarm-fix")
+if printf '%s' "$zout" | grep -q 'RUN_ARM_RC=99'; then
+  ok "13: a mutation that matches nothing is refused rc=99"
+else
+  fail "13: a zero-line mutation did not return 99; output: $zout"
+fi
+if grep -q '^RAN' "$zero_probe"; then
+  fail "13: the arm's SUITE RAN anyway -- the refusal must come BEFORE the test command"
+else
+  ok "13: the refusal came BEFORE the suite ran (no arm command was invoked)"
+fi
+if printf '%s' "$zout" | grep -q 'ADDRESS /\^fn nosuchfn($/ matches 0 lines'; then
+  ok "13: the refusal NAMES the pattern that failed to find its line"
+else
+  fail "13: the refusal does not name the absent pattern; output: $zout"
+fi
+if printf '%s' "$zout" | grep -q 'LHS |\^const MARKER.*| matches 1 line'; then
+  ok "13: and it separates the pattern that DID match, so the reader knows which half is wrong"
+else
+  fail "13: the refusal does not report the substitution's LHS count; output: $zout"
+fi
+if [ -f "$PRE" ]; then
+  : > "$zero_probe"
+  zpre=$(run_zero_arm "$PRE" "$BASE/zeroarm-pre")
+  if printf '%s' "$zpre" | grep -q 'RUN_ARM_RC=99' \
+     && ! printf '%s' "$zpre" | grep -q 'ADDRESS /'; then
+    ok "14: MUTATION -- the pre-fix template refuses rc=99 and names NOTHING, which is the silence 5983139 printed"
+  else
+    fail "14: the pre-fix template already named the pattern -- check 13 proves nothing; output: $zpre"
+  fi
+else
+  fail "14: no pre-fix template to mutate against -- MUTATION ARM DID NOT RUN"
 fi
 
 echo "### MUTATION ARMS GUARD bad=$bad"
