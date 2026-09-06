@@ -787,16 +787,19 @@ mod tests {
         assert_eq!(empty.stores, Store::ALL.to_vec());
         assert!(empty.roots.is_empty() && !empty.bytes && empty.max_age_days.is_none());
 
-        // L3-1b-3B. `all` is FOUR, and each of the four is reachable by name.
-        // A hard 4 here rather than `Store::ALL.len()` on both sides, which
-        // would be an identity and would pass on a list that lost a store.
+        // L3-1b-4. `all` is FIVE, and each of the five is reachable by name.
+        // A hard 5 on BOTH counts rather than `Store::ALL.len()` on both sides,
+        // which would be an identity and would pass on a list that lost a
+        // store. The two hard numbers must be edited together; the first run of
+        // this landing's mutation matrix caught exactly that, with BASE red on
+        // the second one alone.
         assert_eq!(Store::ALL.len(), 5, "all five stores are in the fan-out");
         assert_eq!(
             parse_args(&["--store".into(), "all".into()])
                 .expect("all")
                 .stores
                 .len(),
-            4,
+            5,
         );
         for store in Store::ALL {
             assert_eq!(
