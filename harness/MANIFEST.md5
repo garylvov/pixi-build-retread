@@ -50,8 +50,8 @@ f60ea7f2564d383ef1d45d13d0cb2232  tools/b2_attribute.sh
 3837765ced274b315ce84ad3695f8b5b  tools/cleanup_absent_root_guard.sh
 d46e02ed51852f281f89d4d98184e0f4  tools/cleanup_gate_env_derivation_guard.sh
 c56251e11ce8ab1bd8b807c395265fd4  tools/conda_deny_proxy.py
-7ebb2e87b4d9052e8135d0207700b853  tools/driver_exit_baseline.txt
-660c4f5578a76b96298de6691dc250cf  tools/driver_exit_guard.sh
+921bd181527acf1de7fcb57e62046310  tools/driver_exit_baseline.txt
+93dc02e23cbaecc88ccea46a3fbef91c  tools/driver_exit_guard.sh
 66d936774e72666698c661eb564532a7  tools/driver_exit_payload_shim.sh
 78771287c12790a438715b2f1500b63c  tools/driver_exit_scan.sh
 7783cc47f9e8ad2503fd44950cd43013  tools/env_version_delta.py

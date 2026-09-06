@@ -28,17 +28,16 @@
 SWALLOW c18-1-work/artifacts/exit_guard_bad.sbatch   # C18-1's own bad arm, the `0:0` half of its fixture pair (jobs 5910974/5910975)
 SWALLOW harnessexit2/proof-control.sbatch            # HARNESS-EXIT-2's control, which exists to show the pre-fix shape still swallows
 
-# --- the hold wrappers: there is no driver to re-raise ---------------------
-# A hold job's only command is `sleep`, which the SEAM neutralises to 0 -- so
-# the 0 is the guard's own doing and not a verdict about the wrapper. They are
-# here rather than "fixed" because there is no payload whose rc could be
-# carried, and adding a synthetic one would be a workaround (law 1).
-SWALLOW l3-work/hold.sbatch                          # `sleep 43200` and nothing else; the seam neutralises sleep
-SWALLOW l31-work/hold.sbatch                         # same shape
-
 # UNCOVERED rows: the seam REFUSED to run the wrapper rather than execute a
 # payload it cannot intercept. A refusal costs one row; an execution costs a
 # lane (STORE-REAP-2 ran a real `cargo check` and a real store-reap dry run on
 # the login node exactly this way).
 UNCOVERED p2e-candidate-scope/artifacts/p2e_cert_install.sbatch  # command-position `"$C"` / `"$WS"`: the scanner cannot prove those are directories and not binaries
 UNCOVERED p2f-routed-channel/artifacts/p2f_gate.sbatch           # same two tokens, same file family
+
+# NOT HERE, and deliberately: `l3-work/hold.sbatch` and `l31-work/hold.sbatch`.
+# They were baselined as swallowers in the first draft of this file and that
+# was wrong. Their only command is `sleep`, which the seam neutralises, so the
+# seam never hands them a failing payload at all -- they belong in the guard's
+# NO-PAYLOAD-REACHED bucket, which is printed and unscored, not in a baseline
+# of known defects. The pin came down from 4 to 2 in the same commit.

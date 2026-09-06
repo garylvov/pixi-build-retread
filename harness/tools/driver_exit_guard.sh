@@ -259,7 +259,7 @@ fi
 #     pass deletes the row.
 BASELINE=${DEG_BASELINE:-$REPO/harness/tools/driver_exit_baseline.txt}
 # pinned at HARNESS-EXIT-3. LOWER THESE when you shrink the baseline; never raise.
-BASELINE_MAX_SWALLOW=4
+BASELINE_MAX_SWALLOW=2
 BASELINE_MAX_UNCOVERED=2
 
 DEG_SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
