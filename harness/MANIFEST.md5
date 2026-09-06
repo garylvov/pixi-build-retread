@@ -62,7 +62,7 @@ de2c918a31b7e5fdae517cda1ccba4d4  tools/gate_head_pin.sh
 f1f852fe67e87434d49b9a61f98e8052  tools/land_fixset_sync_guard.sh
 f8ef0afb0693e81ddd1e2c45135e1b8f  tools/manifest_audit.py
 9e199e2267d4f5835438b45a0287cf94  tools/moved_row_halves.sh
-c89fb8d9fb0b5838cbd9d7e3089bec51  tools/moved_row_halves_guard.sh
+ab5ad17805159e6e4d7255a2d079a6fb  tools/moved_row_halves_guard.sh
 62db5ba03d4644ccd514f1727db6f7c3  tools/moved_rows_match.sh
 e02808a84a7409e9b96a577fbae3dfe9  tools/moved_rows_match_guard.sh
 5d4435226ca639942f2227c290e09953  tools/msgpack_min.py

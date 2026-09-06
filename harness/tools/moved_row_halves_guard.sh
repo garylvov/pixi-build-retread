@@ -181,11 +181,13 @@ fi
 # ---- arm D: THE MUTATIONS.  Three, because they corrupt the reader at
 # different depths and a guard that only knows one of them is part of a guard.
 # The assertion is the property that matters, not a particular summary string:
-# a mutant must FAIL to report the row AND must exit 0, i.e. it would let the
-# landing through.  The observed signature is printed so a future reader of this
-# guard's log can see WHICH way each mutant broke.
+# a mutant must FAIL to report the row it was aimed at AND must exit with the rc
+# the arm NAMES.  Two of the three would then land the list (rc 0); the third
+# would not, and that is a finding about the reader rather than a weakness in
+# the arm -- see M3.  The observed signature is printed so a future reader of
+# this guard's log can see WHICH way each mutant broke.
 mutate_and_check() {
-  local tag=$1 sedexpr=$2 base=$3 new=$4 wantgrep=$5
+  local tag=$1 sedexpr=$2 base=$3 new=$4 wantgrep=$5 wantrc=$6 note=${7:-}
   local mutant="$WORK/mutant-$tag.sh"
   sed "$sedexpr" "$READER" > "$mutant"
   if cmp -s "$READER" "$mutant"; then
@@ -194,26 +196,36 @@ mutate_and_check() {
   local mout mrc mhit
   mout=$(bash "$mutant" "$base" "$new"); mrc=$?
   mhit=$(echo "$mout" | grep -c "$wantgrep")
-  if [ "$mhit" -eq 0 ] && [ "$mrc" -eq 0 ]; then
-    ok "D/$tag the mutant loses [$wantgrep] and exits 0 -- it would LAND it; summary [$(sumline "$mout")]"
+  if [ "$mhit" -eq 0 ] && [ "$mrc" -eq "$wantrc" ]; then
+    ok "D/$tag the mutant loses [$wantgrep] and exits $mrc${note:+ -- $note}; summary [$(sumline "$mout")]"
   else
-    bad "D/$tag unexpected: rc=$mrc hits=$mhit summary=[$(sumline "$mout")]"
+    bad "D/$tag unexpected: rc=$mrc (wanted $wantrc) hits=$mhit summary=[$(sumline "$mout")]"
   fi
 }
 #   M1  the classification itself is hard-wired to "conda".  It also drags the
 #       PARSE with it (the wheel is then split by the conda rule), so the pypi
 #       row is not merely mislabelled, it disappears.
 mutate_and_check M1 's/half = (\$0 ~ \/- conda: \/) ? "conda" : "pypi"/half = "conda"/' \
-  "$WORK/a.base" "$WORK/a.new" 'half=pypi'
+  "$WORK/a.base" "$WORK/a.new" '  MOVED   env=envB' 0 "it would LAND the list"
 #   M2  the parse is left correct and only the emitted LABEL is forced to
 #       "conda" -- the surgical "cannot classify" mutant.
+#       The row SURVIVES here, mislabelled -- which is why this arm's target is
+#       the LABEL `half=pypi` and not the row, and why the two mutants together
+#       are worth more than either alone.
 mutate_and_check M2 's/if (\$4 == "pypi") pypi\[k\] = 1; else conda\[k\] = 1/conda[k] = 1/' \
-  "$WORK/a.base" "$WORK/a.new" 'half=pypi'
+  "$WORK/a.base" "$WORK/a.new" 'half=pypi' 0 "it would LAND the list"
 #   M3  MERGE-M-4's OWN MUTANT: restore the pre-fix behaviour by dropping any
 #       group that is not present on both sides.  This is the defect that let
 #       B21's four vanished packages through, stated as a one-line mutation.
+#       IT EXITS 1, NOT 0, AND THAT IS THE POINT OF STATING THE rc: the rewrite
+#       has TWO independent detectors -- the row walk and the per-env package
+#       COUNT -- and this mutant only blinds the first, so the count still
+#       refuses. That is defence in depth and it is worth having in the log.
+#       The arm that shows the whole defect landing a list is H, which runs the
+#       pre-fix file itself and gets rc 0 out of it.
 mutate_and_check M3 's/^    } else if (haveb) {$/    } else if (haveb) { return/' \
-  "$WORK/r.base" "$WORK/r.new" 'REMOVED'
+  "$WORK/r.base" "$WORK/r.new" '  REMOVED env=' 1 \
+  "the per-env COUNT detector still refuses, which the row walk no longer does"
 
 # ---- arm H: THE PINNED PRE-FIX FILE, run as it shipped.  Not a mutant of the
 # current reader -- the actual blob at OLD_READER_COMMIT, which was the second
