@@ -31,3 +31,4 @@ add6cc4 c18-1-git-snapshot-store-default-and-reaper (landed as B19 = merge 076fa
 9fc0d7d l3-1b-shadow-store (L3-1 re-emit reuse rebased in, plus the persistent shadow-rewrite store and its reaper; landed as B20, a pure fast-forward of four commits)
 54915f8 p6ad4-3-invalidate-one-document (landed as B21 = merge 7dfb0b1 onto 9fc0d7d, ort, zero conflicts; correctness + the FROZEN_TEST_LOCK flake fix, never a speed claim)
 264f2ed l3-1b-1-built-wheels-store
+12e83ad merge-m-2-shadow-reap-absent-store-row
