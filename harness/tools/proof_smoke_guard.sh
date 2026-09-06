@@ -235,12 +235,42 @@ chk F1 $? "an unsatisfiable REQUIRED_UV is SETUP_FAILED rc=3, naming both versio
 # INODES -- p6x rule (2), "a hardlink clone is not isolation", read from the
 # permissions side.  Nothing in this guard's scratch is sealed; `rm -rf` alone
 # is correct, and its stderr is counted rather than thrown away (ORDER-1-1).
-rmerr=$( rm -rf "$SCR" 2>&1 | wc -l )
+#
+# AND IT GOES THROUGH `multiarm_store_reap.sh`, NOT A BARE `rm -rf`.  MEASURED
+# on 5994392: a bare `rm -rf "$SCR"` printed **1592** errors, because a smoke
+# that reaches the backend leaves rattler-build's SEALED conda environments
+# under it -- `make_source_tree_read_only` strips write from DIRECTORIES, and
+# unlinking an entry is a write to its parent (ORDER-1-1's whole finding, met
+# here from the other end).  `reap_delete` is the versioned answer: rename
+# FIRST, re-prove containment by dev:inode on the RENAMED path, chmod only
+# that, then remove SYNCHRONOUSLY with stderr COUNTED.  The workspace `w` is
+# handled separately and WITHOUT a chmod, because it is a `cp -al` clone of the
+# shared stage mirror and a recursive chmod there would change the mode of the
+# MIRROR'S OWN inodes (p6x rule 2).
+REAP_JOB_ROOT=$SCR
+# shellcheck source=/dev/null
+. "$T/tools/multiarm_store_reap.sh"
+rmerr=0
+if reap_init; then
+  # the hardlink clone first, plain and unchmodded
+  if [ -d "$SCR/w" ]; then
+    n=$( rm -rf "$SCR/w" 2>&1 | wc -l ); rmerr=$((rmerr + n))
+  fi
+  for d in "$SCR"/*; do
+    [ -e "$d" ] || continue
+    reap_delete "$d" psg || rmerr=$((rmerr + 1))
+  done
+  reap_done || rmerr=$((rmerr + 1))
+  rmdir "$SCR" 2>/dev/null
+else
+  echo "### PSG the reap context refused this guard's own scratch root -- leaving $SCR in place"
+  rmerr=$((rmerr + 1))
+fi
 [ "$rmerr" -eq 0 ] || fail=$((fail+1))
 
 # ---- out --------------------------------------------------------------------
 echo ""
-echo "### PSG scratch removed errors=$rmerr root=$SCR"
+echo "### PSG scratch removed errors=$rmerr root=$SCR (via multiarm_store_reap: aside=${REAP_ASIDE:-?} deleted=${REAP_DELETED:-?} refused=${REAP_REFUSED:-?})"
 echo "### PSG per-arm verdicts:"
 for f in "$AOUT" "$BOUT" "$COUT" "$FOUT"; do
   printf '###   %-28s %s\n' "$(basename "$f")" "$(grep -m1 '^### SMOKE [A-Z_]* binary=' "$f" 2>/dev/null || echo '<none>')"
