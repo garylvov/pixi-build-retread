@@ -20,8 +20,11 @@
 # ARMS -- and BOTH fixtures are RED on the pinned old file.
 #   A1  a root that EXISTS, evidence missing -> refuse 2, "Roots kept (PRESENT on
 #       disk)" names it, no ABSENT line, and the root is still on disk after.
-#   A2  a root that DOES NOT EXIST, evidence missing -> refuse 2, the kept list
-#       says every root named was absent, and the ABSENT line names it.
+#   A2  MERGE-T-2, and this arm used to assert the opposite: a call in which
+#       EVERY root is absent is a NO-OP -- exit 0, census printed, no refusal,
+#       `cleanup.sh` never called -- whatever the evidence looks like. Job
+#       5981195 printed `ROOT CENSUS present=0 absent=2` then `CLEANUP REFUSED`
+#       because the no-op branch sat BELOW the evidence conditions.
 #   A3  ONE OF EACH in one call -> each root lands in exactly one list.
 #   A4  an absent root with COMPLETE evidence -> exit 0, "NOTHING TO DO", and
 #       `cleanup.sh` IS NEVER CALLED (a stub proves it).
@@ -31,6 +34,10 @@
 #       the defect, verbatim.
 #   M3  MUTATION: A4's fixture on the old gate reaches GATE PASSED and calls
 #       `cleanup.sh` on a root that does not exist.
+#   M4  MUTATION for MERGE-T-2, pinned to $T2_OLD -- the file 5981195 ran, which
+#       HAS the classification and STILL refuses rc 2 on an all-absent call.
+#   M5  the fix is SCOPED: a PRESENT root with missing evidence refuses on the
+#       old file and on the new one alike.
 #
 # NOTHING IS EVER DELETED BY THIS GUARD.  The gate under test is run from a COPY
 # in a temp dir beside a STUB `cleanup.sh` that only prints a marker, so the real
@@ -108,15 +115,30 @@ grep -q "Roots ABSENT" "$W/A1.log" \
   || ok "A1: no ABSENT line when every root is present"
 [ -d "$PRESENT" ] && ok "A1: nothing was deleted -- the root is still on disk" || bad "A1: THE ROOT IS GONE"
 
-# ---- A2: a root that DOES NOT EXIST, evidence missing ------------------------
+# ---- A2: EVERY root absent, evidence MISSING -- MERGE-T-2 --------------------
+# This arm asserted rc=2 until 2026-09-06. It was wrong, and job 5981195 is what
+# says so: `### ROOT CENSUS present=0 absent=2` then `### CLEANUP REFUSED`,
+# exit 2, from a cleanup owner released on `afterany` for a chain whose roots
+# were already gone. MERGE-N-1's rule is that an absent root is nothing to delete
+# and nothing to keep; with NO present root the evidence conditions have nothing
+# to protect, so an all-absent call is a NO-OP and exits 0 whatever the evidence
+# looks like. The refusal keeps the case it was written for -- A1, a root that IS
+# on disk without its evidence.
 rc=$(run "$NEWBED" "$W/A2.log" "$ABSENT")
-[ "$rc" = 2 ] && ok "A2: missing evidence still refuses (rc=2)" || bad "A2: rc=$rc, want 2"
-grep -q "Roots kept (PRESENT on disk): <none -- every root named was absent>" "$W/A2.log" \
-  && ok "A2: an absent root is NOT reported as kept -- MERGE-N-1, fixed" \
-  || bad "A2: still claims to have kept it: $(grep -F 'Roots kept' "$W/A2.log")"
-grep -qF "Roots ABSENT (never existed or already reclaimed, nothing kept): $ABSENT" "$W/A2.log" \
-  && ok "A2: the absent root is named in its own list" \
-  || bad "A2: no ABSENT line naming $ABSENT"
+[ "$rc" = 0 ] && ok "A2: an ALL-ABSENT call is a no-op and exits 0 even with evidence missing (MERGE-T-2)" \
+              || { bad "A2: rc=$rc, want 0 -- this is 5981195's exit 2"; sed 's/^/      /' "$W/A2.log"; }
+grep -qF "NOTHING TO DO -- every root named is ABSENT: $ABSENT" "$W/A2.log" \
+  && ok "A2: it prints the census verdict and names the absent root" \
+  || bad "A2: no NOTHING TO DO row naming $ABSENT"
+grep -q 'CLEANUP REFUSED' "$W/A2.log" \
+  && bad "A2: it still refuses -- an owner job goes terminal non-zero for doing nothing" \
+  || ok "A2: and it does NOT refuse -- no meaningless non-zero for a watcher to read"
+grep -qF "$STUBMARK" "$W/A2.log" \
+  && bad "A2: cleanup.sh was called with no root on disk" \
+  || ok "A2: cleanup.sh was NOT called"
+grep -q '### ROOT CENSUS present=0 absent=1' "$W/A2.log" \
+  && ok "A2: the census is printed before the verdict, as 5981195 printed it" \
+  || bad "A2: no ROOT CENSUS row"
 
 # ---- A3: one of each in one call --------------------------------------------
 rc=$(run "$NEWBED" "$W/A3.log" "$PRESENT" "$ABSENT")
@@ -158,6 +180,37 @@ if [ -n "$OLDBED" ]; then
   grep -qF "$STUBMARK" "$W/M3.log" \
     && ok "M3: the old gate hands an ABSENT root to cleanup.sh (rc=$rc) -- the second half of the defect" \
     || bad "M3: the old gate did not call cleanup.sh (rc=$rc) -- read $W/M3.log"
+fi
+
+# ---- M4/M5: THE MERGE-T-2 MUTATION, pinned to its own pre-fix commit ---------
+# $N1_OLD predates the PRESENT/ABSENT classification entirely, so it cannot show
+# what MERGE-T-2 changed. The file 5981195 actually ran is the one to mutate
+# against: it HAS the classification and HAS the no-op branch, and still exits 2
+# because the branch sits below the `fail` check.
+T2_OLD=${T2_OLD:-873263ff429af36fb8be1259f681597f99533fda}
+T2F=$W/cleanup_gated.$T2_OLD.sh
+if git -C "$REPO" show "$T2_OLD:harness/phase_template/cleanup_gated.sh" > "$T2F" 2>/dev/null && [ -s "$T2F" ]; then
+  T2BED=$W/t2old; mk_bed "$T2BED" "$T2F"
+  grep -q 'MERGE-T-2' "$T2F" \
+    && bad "M4: $T2_OLD already carries the MERGE-T-2 fix -- WRONG PIN, A2 proves nothing" \
+    || ok "M4: the pinned $T2_OLD gate is the pre-fix one (no MERGE-T-2 block)"
+  rc=$(run "$T2BED" "$W/M4.log" "$ABSENT")
+  if [ "$rc" = 2 ] && grep -q 'CLEANUP REFUSED' "$W/M4.log"; then
+    ok "M4: THE DEFECT, REPRODUCED -- the pre-fix gate REFUSES rc=2 on an all-absent call (5981195)"
+  else
+    bad "M4: the pre-fix gate gave rc=$rc with no refusal -- A2 cannot fail; read $W/M4.log"
+  fi
+  grep -q '### ROOT CENSUS present=0 absent=1' "$W/M4.log" \
+    && ok "M4: and it printed the same census first, exactly as 5981195's stdout reads" \
+    || bad "M4: the pre-fix gate printed no census -- the pin is not the file 5981195 ran"
+  # AND THE OTHER DIRECTION: the fix must not have loosened the refusal that
+  # matters. A PRESENT root without its evidence still refuses on BOTH files.
+  rc=$(run "$T2BED" "$W/M5old.log" "$PRESENT"); rcn=$(run "$NEWBED" "$W/M5new.log" "$PRESENT")
+  [ "$rc" = 2 ] && [ "$rcn" = 2 ] \
+    && ok "M5: a PRESENT root with missing evidence still refuses on both files (old=$rc new=$rcn) -- the fix is scoped" \
+    || bad "M5: present-root refusal moved: old=$rc new=$rcn"
+else
+  bad "M4: could not extract $T2_OLD:harness/phase_template/cleanup_gated.sh -- THE MERGE-T-2 MUTATION DID NOT RUN"
 fi
 
 echo "### MERGE-N-1 absent-root guard: pass=$pass fail=$fail"

@@ -236,6 +236,31 @@ for r in "$@"; do
 done
 echo "### ROOT CENSUS present=${#PRESENT_ROOTS[@]} absent=${#ABSENT_ROOTS[@]}"
 
+# --- MERGE-T-2: ALL-ABSENT IS A NO-OP, AND IT HAS TO BE DECIDED HERE ---------
+# MEASURED: job 5981195 printed `### ROOT CENSUS present=0 absent=2` and then
+# `### CLEANUP REFUSED`, exit 2. The no-op branch existed -- it is the
+# `${#PRESENT_ROOTS[@]} -eq 0` block at the bottom -- but it sat BELOW the
+# `fail` check, so conditions 1 and 2 got to vote first: with every root already
+# gone, a missing `.rc`/`.wall`/`.lock.log` artifact set `fail=1` and the run
+# refused to do the nothing it had to do. A cleanup owner released on `afterany`
+# for a chain that never created its roots (or whose roots were already reaped)
+# then exits non-zero for the rest of time, and every watcher reads a terminal
+# non-zero that means nothing.
+#
+# MERGE-N-1's rule is that an absent root is "nothing to delete and nothing to
+# keep". With NO present roots there is nothing for the evidence gate to protect
+# -- the gate exists to stop a root being deleted before its evidence is in the
+# task root, and there is no root. So the decision moves ABOVE the conditions.
+# The refusal is untouched for the case it was written for: one or more roots
+# PRESENT without their evidence.
+if [ "${#PRESENT_ROOTS[@]}" -eq 0 ]; then
+  echo "### NOTHING TO DO -- every root named is ABSENT: ${ABSENT_ROOTS[*]:-<none>}."
+  echo "###   Nothing to delete and nothing to keep (MERGE-N-1), so the evidence"
+  echo "###   conditions have nothing to protect and are not run. Exiting 0 without"
+  echo "###   calling $CLEANUP."
+  exit 0
+fi
+
 # --- condition 1: the evidence is in the task root ----------------------------
 # A harness that GZIPS its lock log into the task root satisfies condition 1
 # just as well as one that leaves it plain -- the evidence is in the task root
@@ -342,9 +367,5 @@ if [ "$fail" -ne 0 ]; then
   exit 2
 fi
 
-if [ "${#PRESENT_ROOTS[@]}" -eq 0 ]; then
-  echo "### NOTHING TO DO -- every root named is ABSENT: ${ABSENT_ROOTS[*]:-<none>}. Exiting 0 without calling $CLEANUP."
-  exit 0
-fi
 echo "### GATE PASSED -- handing ${#PRESENT_ROOTS[@]} PRESENT root(s) to $CLEANUP (${#ABSENT_ROOTS[@]} absent, not passed)"
 exec bash "$CLEANUP" "${PRESENT_ROOTS[@]}"
