@@ -149,7 +149,13 @@ LEFTOVER_RE='bfinal|BFP1|BFP2|bfp1|bfp2|b1c|b1-phase|b1b-phase|b2-phase|b2b-phas
 ### LEFTOVER-CHECK BEGIN
 # Strips the three marked regions (this one included) and fails on any survivor.
 # Comments are NOT exempt: a stale path in a comment has misled a reader on this
-# campaign before. Deliberate evidence citations belong in the EVIDENCE region.
+# campaign before. Deliberate evidence citations belong in the EVIDENCE region,
+# or -- MERGE-N-4, when the citation has to sit beside the code it explains --
+# between a `### CITATION BEGIN` / `### CITATION END` pair, which is stripped
+# exactly like the other three. The pair is a DELIBERATE, per-site opt-out: a
+# botched derivation never carries one, so the check still catches every real
+# leftover. Blanket-exempting COMMENTS was rejected -- a stale path in a comment
+# is the defect this check was written for.
 # The match runs INSIDE awk, on the LINE, never on "FILENAME:LNO: line". Piping
 # the annotated text to grep made the check match its own FILENAME: a harness in
 # a directory named after a previous batch failed against itself, on every line,
@@ -158,6 +164,7 @@ LEFT=$(awk '
   /^### EVIDENCE BEGIN/       {e=1} /^### EVIDENCE END/       {e=0; next} e {next}
   /^### SUBSTITUTE: BEGIN/    {s=1} /^### SUBSTITUTE: END/    {s=0; next} s {next}
   /^### LEFTOVER-CHECK BEGIN/ {l=1} /^### LEFTOVER-CHECK END/ {l=0; next} l {next}
+  /^### CITATION BEGIN/       {c=1} /^### CITATION END/       {c=0; next} c {next}
   $0 ~ re {print FILENAME ":" FNR ": " $0}' re="$LEFTOVER_RE" "$0")
 if [ -n "$LEFT" ]; then
   echo "### FATAL leftover-token self-check FAILED -- this harness still names a previous batch"

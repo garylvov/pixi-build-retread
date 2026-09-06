@@ -397,6 +397,7 @@ LEFT=$(awk '
   /^### EVIDENCE BEGIN/       {e=1} /^### EVIDENCE END/       {e=0; next} e {next}
   /^### SUBSTITUTE: BEGIN/    {s=1} /^### SUBSTITUTE: END/    {s=0; next} s {next}
   /^### LEFTOVER-CHECK BEGIN/ {l=1} /^### LEFTOVER-CHECK END/ {l=0; next} l {next}
+  /^### CITATION BEGIN/       {c=1} /^### CITATION END/       {c=0; next} c {next}
   $0 ~ re {print FILENAME ":" FNR ": " $0}' re="$LEFTOVER_RE" "$0")
 if [ -n "$LEFT" ]; then
   echo "### FATAL leftover-token self-check FAILED -- this harness still names a previous batch"

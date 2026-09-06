@@ -24,6 +24,17 @@
 #      that adopted the same root, which is the shape that took `ws.A3B-5697522`
 #      out from under the A-final cert.)
 #   3. NOTHING IS DELETED ON A REFUSAL. Exit 2, print why, leave every byte.
+#   4. A ROOT THAT DOES NOT EXIST IS NOT A ROOT THAT WAS KEPT (MERGE-N-1,
+#      2026-09-06). The refusal used to end `Roots kept: $*` over the ARGUMENT
+#      LIST, so a gate that refused on missing evidence reported roots it had
+#      never seen on disk as still occupying quota -- and a lane reading that row
+#      goes looking for bytes that are not there. Every root is now classified
+#      PRESENT or ABSENT before any condition runs. An absent root is announced,
+#      is exempt from the ownership and queue checks (there is nothing to delete,
+#      so there is nothing to own), and NEVER sets `fail`; a present root behaves
+#      exactly as before. The refusal prints the two lists separately, and a call
+#      in which EVERY root is absent is a no-op that exits 0 rather than handing
+#      `cleanup.sh` a list of names.
 #
 # 2026-09-04 ROOT FIX (inode sweep 2, jobs 5764454/5764455 deleted NOTHING).
 # Two defects, both of them the same mistake -- treating a NAME SHAPE as the
@@ -213,6 +224,18 @@ hostname; date -Is
 echo "### CLEANUP GATE tag=$TAG relock_job=$RJ roots=$* "
 fail=0
 
+# --- condition 0: which of these roots exist at all (MERGE-N-1) ---------------
+PRESENT_ROOTS=(); ABSENT_ROOTS=()
+for r in "$@"; do
+  [ -n "$r" ] || continue
+  if [ -e "$r" ]; then
+    PRESENT_ROOTS+=("$r"); echo "### root $r: PRESENT on disk"
+  else
+    ABSENT_ROOTS+=("$r"); echo "### root $r: ABSENT -- it does not exist, so there is nothing to delete and nothing to keep (exit 0 for this root)"
+  fi
+done
+echo "### ROOT CENSUS present=${#PRESENT_ROOTS[@]} absent=${#ABSENT_ROOTS[@]}"
+
 # --- condition 1: the evidence is in the task root ----------------------------
 # A harness that GZIPS its lock log into the task root satisfies condition 1
 # just as well as one that leaves it plain -- the evidence is in the task root
@@ -260,7 +283,7 @@ if [ "$LRC" = 0 ]; then
 fi
 
 # --- condition 2: ownership, and nothing of ours still running on these roots --
-for r in "$@"; do
+for r in "${PRESENT_ROOTS[@]+"${PRESENT_ROOTS[@]}"}"; do
   [ -n "$r" ] || continue
   base=${r##*/}
   case "${r%/}" in
@@ -314,9 +337,14 @@ for r in "$@"; do
 done
 
 if [ "$fail" -ne 0 ]; then
-  echo "### CLEANUP REFUSED -- nothing deleted. Roots kept: $*"
+  echo "### CLEANUP REFUSED -- nothing deleted. Roots kept (PRESENT on disk): ${PRESENT_ROOTS[*]:-<none -- every root named was absent>}"
+  [ "${#ABSENT_ROOTS[@]}" -eq 0 ] || echo "### Roots ABSENT (never existed or already reclaimed, nothing kept): ${ABSENT_ROOTS[*]}"
   exit 2
 fi
 
-echo "### GATE PASSED -- handing $# root(s) to $CLEANUP"
-exec bash "$CLEANUP" "$@"
+if [ "${#PRESENT_ROOTS[@]}" -eq 0 ]; then
+  echo "### NOTHING TO DO -- every root named is ABSENT: ${ABSENT_ROOTS[*]:-<none>}. Exiting 0 without calling $CLEANUP."
+  exit 0
+fi
+echo "### GATE PASSED -- handing ${#PRESENT_ROOTS[@]} PRESENT root(s) to $CLEANUP (${#ABSENT_ROOTS[@]} absent, not passed)"
+exec bash "$CLEANUP" "${PRESENT_ROOTS[@]}"

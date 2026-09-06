@@ -159,7 +159,13 @@ LEFTOVER_RE='C13A|c13-work|c13_relock|5584ce6|6de298df|5741341|C12A|c12-work|c12
 ### LEFTOVER-CHECK BEGIN
 # Strips the three marked regions (this one included) and fails on any survivor.
 # Comments are NOT exempt: a stale path in a comment has misled a reader on this
-# campaign before. Deliberate evidence citations belong in the EVIDENCE region.
+# campaign before. Deliberate evidence citations belong in the EVIDENCE region,
+# or -- MERGE-N-4, when the citation has to sit beside the code it explains --
+# between a `### CITATION BEGIN` / `### CITATION END` pair, which is stripped
+# exactly like the other three. The pair is a DELIBERATE, per-site opt-out: a
+# botched derivation never carries one, so the check still catches every real
+# leftover. Blanket-exempting COMMENTS was rejected -- a stale path in a comment
+# is the defect this check was written for.
 # The match runs INSIDE awk, on the LINE, never on "FILENAME:LNO: line". Piping
 # the annotated text to grep made the check match its own FILENAME: a harness in
 # a directory named after a previous batch failed against itself, on every line,
@@ -168,6 +174,7 @@ LEFT=$(awk '
   /^### EVIDENCE BEGIN/       {e=1} /^### EVIDENCE END/       {e=0; next} e {next}
   /^### SUBSTITUTE: BEGIN/    {s=1} /^### SUBSTITUTE: END/    {s=0; next} s {next}
   /^### LEFTOVER-CHECK BEGIN/ {l=1} /^### LEFTOVER-CHECK END/ {l=0; next} l {next}
+  /^### CITATION BEGIN/       {c=1} /^### CITATION END/       {c=0; next} c {next}
   $0 ~ re {print FILENAME ":" FNR ": " $0}' re="$LEFTOVER_RE" "$0")
 if [ -n "$LEFT" ]; then
   echo "### FATAL leftover-token self-check FAILED -- this harness still names a previous batch"
@@ -638,9 +645,16 @@ retread_fast_env "$WS" || { echo "FATAL: retread_fast_env refused"; exit 7; }
 # and the parenthesis is a `${RETREAD_WHEEL_STORE:-<unset>}` expansion, so it
 # PRINTED A VALUE -- the variable was SET, the store was the SHARED one -- while
 # its own prose called the variable unset and the store job-scoped. The comment
+### CITATION BEGIN -- MERGE-N-4. READERS-1 put a deliberate citation of the
+### commit that re-enabled the shared export into this comment, and `p6i` is a
+### token in this harness's own LEFTOVER_RE, so the self-check exited 9 on every
+### lane that re-derived from this file (READERS-1-1). The citation is CORRECT and
+### load-bearing -- it is what makes the row above readable -- so it is marked as a
+### citation rather than deleted or paraphrased into vagueness.
 # it rested on ("retread_fast_env.sh keeps the shared export COMMENTED OUT") went
 # stale on 2026-09-03 15:35, when p6i merged and that file RE-ENABLED
 # `export RETREAD_WHEEL_STORE=$root/wheels`.
+### CITATION END
 # `tools/wheel_store_row.sh` resolves the store the way
 # `courier::wheel_store_root_with` does and reports the PATH, its PROVENANCE and
 # its SCOPE. $C is passed so shared-versus-job-scoped is DECIDED from the

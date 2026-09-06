@@ -192,12 +192,19 @@ LEFTOVER_RE='p5w|P5W|de58240|p5x|P5X|67ba7131|0d867265|SUBSTITUTE_ME_SHA256|bfin
 ### LEFTOVER-CHECK BEGIN
 # Strips the three marked regions (this one included) and fails on any survivor.
 # Comments are NOT exempt: a stale path in a comment has misled a reader on this
-# campaign before. Deliberate evidence citations belong in the EVIDENCE region.
+# campaign before. Deliberate evidence citations belong in the EVIDENCE region,
+# or -- MERGE-N-4, when the citation has to sit beside the code it explains --
+# between a `### CITATION BEGIN` / `### CITATION END` pair, which is stripped
+# exactly like the other three. The pair is a DELIBERATE, per-site opt-out: a
+# botched derivation never carries one, so the check still catches every real
+# leftover. Blanket-exempting COMMENTS was rejected -- a stale path in a comment
+# is the defect this check was written for.
 LEFT=$(awk '
   /^### EVIDENCE BEGIN/       {e=1} /^### EVIDENCE END/       {e=0; next} e {next}
   /^### SUBSTITUTE: BEGIN/    {s=1} /^### SUBSTITUTE: END/    {s=0; next} s {next}
   /^### LEFTOVER-CHECK BEGIN/ {l=1} /^### LEFTOVER-CHECK END/ {l=0; next} l {next}
-  {print FILENAME ":" FNR ": " $0}' "$0" | grep -E "$LEFTOVER_RE")
+  /^### CITATION BEGIN/       {c=1} /^### CITATION END/       {c=0; next} c {next}
+  $0 ~ re {print FILENAME ":" FNR ": " $0}' re="$LEFTOVER_RE" "$0")
 if [ -n "$LEFT" ]; then
   echo "### FATAL leftover-token self-check FAILED -- this harness still names a previous batch"
   printf '%s\n' "$LEFT"

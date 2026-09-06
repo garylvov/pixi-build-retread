@@ -166,7 +166,13 @@ LEFTOVER_RE='bfinal|BFP1|BFP2|bfp1|bfp2|b1c|b1-phase|b1b-phase|b2-phase|b2b-phas
 ### LEFTOVER-CHECK BEGIN
 # Strips the three marked regions (this one included) and fails on any survivor.
 # Comments are NOT exempt: a stale path in a comment has misled a reader on this
-# campaign before. Deliberate evidence citations belong in the EVIDENCE region.
+# campaign before. Deliberate evidence citations belong in the EVIDENCE region,
+# or -- MERGE-N-4, when the citation has to sit beside the code it explains --
+# between a `### CITATION BEGIN` / `### CITATION END` pair, which is stripped
+# exactly like the other three. The pair is a DELIBERATE, per-site opt-out: a
+# botched derivation never carries one, so the check still catches every real
+# leftover. Blanket-exempting COMMENTS was rejected -- a stale path in a comment
+# is the defect this check was written for.
 # The match runs INSIDE awk, on the LINE, never on "FILENAME:LNO: line". Piping
 # the annotated text to grep made the check match its own FILENAME: a harness in
 # a directory named after a previous batch failed against itself, on every line,
@@ -175,6 +181,7 @@ LEFT=$(awk '
   /^### EVIDENCE BEGIN/       {e=1} /^### EVIDENCE END/       {e=0; next} e {next}
   /^### SUBSTITUTE: BEGIN/    {s=1} /^### SUBSTITUTE: END/    {s=0; next} s {next}
   /^### LEFTOVER-CHECK BEGIN/ {l=1} /^### LEFTOVER-CHECK END/ {l=0; next} l {next}
+  /^### CITATION BEGIN/       {c=1} /^### CITATION END/       {c=0; next} c {next}
   $0 ~ re {print FILENAME ":" FNR ": " $0}' re="$LEFTOVER_RE" "$0")
 if [ -n "$LEFT" ]; then
   echo "### FATAL leftover-token self-check FAILED -- this harness still names a previous batch"
@@ -221,7 +228,24 @@ ls -l "$SNAP"; "$SNAP" --version 2>&1 | head -2
 # meant to be, and a stale copy REFUSES here in milliseconds instead of
 # certifying the wrong harness three hours from now.  Unset = the check is
 # announced as OFF; it is never silently skipped.
-HARNESS_COMMIT="${HARNESS_COMMIT:-}"
+# MERGE-N-2.  The pin used to arrive ONLY through
+# `sbatch --export=ALL,HARNESS_COMMIT=<sha>`, and that clause put jobs into
+# `launch_failed_requeued_held` / "user env retrieval failed" in TWO CONSECUTIVE
+# merge lanes -- Slurm re-runs the submitter's login environment to build `ALL`.
+# The job never starts, so nothing in ITS log can say why.  The pin is now read
+# from `$D/HARNESS_COMMIT`, a file the job OWNS, written by the submitter beside
+# the `artifacts/` this run already writes to; the export is kept as the FALLBACK,
+# so every existing caller keeps working and a submit with NO --export at all
+# still reaches this check.  A file and an export that DISAGREE refuse, naming
+# both -- see tools/harness_commit_resolve.sh.
+HC_RESOLVE=$(dirname "$FAST_ENV")/harness_commit_resolve.sh
+if [ -f "$HC_RESOLVE" ]; then
+  HARNESS_COMMIT=$(bash "$HC_RESOLVE" "$D") || {
+    echo "FATAL: harness commit pin REFUSED -- the file and the export disagree"; exit 6; }
+else
+  echo "### harness_commit_resolve.sh missing next to $FAST_ENV -- falling back to the exported pin"
+  HARNESS_COMMIT="${HARNESS_COMMIT:-}"
+fi
 if [ -n "$HARNESS_COMMIT" ]; then
   echo "### HARNESS_COMMIT=$HARNESS_COMMIT -- checking the task-dir harness against it"
   DRIFT_CHECK=$(dirname "$FAST_ENV")/harness_drift_check.sh

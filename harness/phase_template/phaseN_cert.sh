@@ -302,6 +302,7 @@ LEFT=$(awk '
   /^### EVIDENCE BEGIN/       {e=1} /^### EVIDENCE END/       {e=0; next} e {next}
   /^### SUBSTITUTE: BEGIN/    {s=1} /^### SUBSTITUTE: END/    {s=0; next} s {next}
   /^### LEFTOVER-CHECK BEGIN/ {l=1} /^### LEFTOVER-CHECK END/ {l=0; next} l {next}
+  /^### CITATION BEGIN/       {c=1} /^### CITATION END/       {c=0; next} c {next}
   $0 ~ re {print FILENAME ":" FNR ": " $0}' re="$LEFTOVER_RE" "$0")
 if [ -n "$LEFT" ]; then
   echo "### FATAL leftover-token self-check FAILED -- this harness still names a previous batch"
@@ -415,7 +416,24 @@ done
 # C31-4-1d.  Same guard as phaseN_relock.sh: HARNESS_COMMIT names the harness
 # commit this batch is meant to be, and a task-dir copy that is not that commit
 # refuses here rather than being certified.  Unset = announced OFF, never silent.
-HARNESS_COMMIT="${HARNESS_COMMIT:-}"
+# MERGE-N-2.  The pin used to arrive ONLY through
+# `sbatch --export=ALL,HARNESS_COMMIT=<sha>`, and that clause put jobs into
+# `launch_failed_requeued_held` / "user env retrieval failed" in TWO CONSECUTIVE
+# merge lanes -- Slurm re-runs the submitter's login environment to build `ALL`.
+# The job never starts, so nothing in ITS log can say why.  The pin is now read
+# from `$D/HARNESS_COMMIT`, a file the job OWNS, written by the submitter beside
+# the `artifacts/` this run already writes to; the export is kept as the FALLBACK,
+# so every existing caller keeps working and a submit with NO --export at all
+# still reaches this check.  A file and an export that DISAGREE refuse, naming
+# both -- see tools/harness_commit_resolve.sh.
+HC_RESOLVE=$(dirname "$FAST_ENV")/harness_commit_resolve.sh
+if [ -f "$HC_RESOLVE" ]; then
+  HARNESS_COMMIT=$(bash "$HC_RESOLVE" "$D") || {
+    echo "### FATAL harness commit pin REFUSED -- the file and the export disagree"; exit 2; }
+else
+  echo "### harness_commit_resolve.sh missing next to $FAST_ENV -- falling back to the exported pin"
+  HARNESS_COMMIT="${HARNESS_COMMIT:-}"
+fi
 if [ -n "$HARNESS_COMMIT" ]; then
   echo "### HARNESS_COMMIT=$HARNESS_COMMIT -- checking the task-dir harness against it"
   DRIFT_CHECK=$(dirname "$FAST_ENV")/harness_drift_check.sh
