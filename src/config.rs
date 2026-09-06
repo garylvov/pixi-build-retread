@@ -493,6 +493,69 @@ pub struct RetreadConfig {
     )]
     pub build_requirements_store_max_age_days: Option<u64>,
 
+    /// L3-1b-4: where the HERMETIC ENVIRONMENT store lives — the
+    /// content-addressed store of provisioned GCC/CUDA build environments.
+    ///
+    /// Unset means `hermetic_build::hermetic_environment_store_root()`, the
+    /// PERSISTENT root (`XDG_CACHE_HOME/retread`, else `$HOME/.cache/retread`),
+    /// plus the `hermetic-build-envs` segment. It used to mean
+    /// `courier::retread_cache_root()`, which `fasttmp` redirects into
+    /// `…/job-$SLURM_JOB_ID/caches/retread`, so the store died with the job and
+    /// every cold lock re-provisioned every toolchain. It was the LAST row of
+    /// the L3-1b cache-map audit still job-local.
+    ///
+    /// An entry is keyed on sha256 over the target glibc floor, the Python
+    /// minor, the CUDA version and the digest of the SOLVED conda records — not
+    /// on the path — and a hit skips `provision_uncached`, the rattler-build
+    /// materialisation of the prefix pair. The conda solve runs either way.
+    ///
+    /// `RETREAD_HERMETIC_ENVIRONMENT_STORE` is the harness-side fallback, for
+    /// the same reason the other four stores have one: naming a store in a pack
+    /// manifest moves that pack's build hash.
+    ///
+    /// ```toml
+    /// [build.config]
+    /// retread-hermetic-environment-store = "/shared/cache/retread"
+    /// ```
+    ///
+    /// EMIT-NEUTRAL: this names WHERE the store lives, never WHAT is emitted.
+    /// The path is explicitly excluded from the entry identity, and every hit
+    /// is re-checked by `validate_marker` before it is used.
+    #[serde(
+        default,
+        rename = "retread-hermetic-environment-store",
+        alias = "hermetic-environment-store",
+        alias = "hermetic_environment_store"
+    )]
+    pub hermetic_environment_store: Option<std::path::PathBuf>,
+
+    /// L3-1b-4: how long an unreferenced hermetic environment may sit before
+    /// the reaper QUARANTINES it, in days.
+    ///
+    /// Unset is
+    /// `hermetic_build::HERMETIC_ENVIRONMENT_STORE_DEFAULT_MAX_AGE_DAYS` (14 —
+    /// the same horizon as the other four stores on purpose). `0` turns the
+    /// reaper off entirely.
+    ///
+    /// Unlike the build-requirements store, an entry here IS a pure function of
+    /// its key in content: `toolchain_digest` is a digest of the exact solved
+    /// records, so two entries under one key are two link-outs of the same
+    /// packages. Its BYTES are not, because the completion marker and the
+    /// activation scripts record absolute paths — which is why the root must be
+    /// stable, and why `validate_marker` re-checks them on every read.
+    ///
+    /// ```toml
+    /// [build.config]
+    /// retread-hermetic-environment-store-max-age-days = 14
+    /// ```
+    #[serde(
+        default,
+        rename = "retread-hermetic-environment-store-max-age-days",
+        alias = "hermetic-environment-store-max-age-days",
+        alias = "hermetic_environment_store_max_age_days"
+    )]
+    pub hermetic_environment_store_max_age_days: Option<u64>,
+
     /// Experimental: run the conda co-solve's resolvo probes on a thread pool
     /// instead of serially.
     ///

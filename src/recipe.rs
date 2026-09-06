@@ -1555,6 +1555,8 @@ mod tests {
             // persistent default", which is what every one of these fixtures wants.
             build_requirements_store: None,
             build_requirements_store_max_age_days: None,
+            hermetic_environment_store: None,
+            hermetic_environment_store_max_age_days: None,
             path_source_metadata: None,
             path_source_records: None,
             parallel_probes: None,

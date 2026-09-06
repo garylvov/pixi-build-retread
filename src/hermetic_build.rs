@@ -18,10 +18,149 @@ use sha2::{Digest, Sha256};
 use tokio::process::Command;
 
 const CACHE_SCHEMA: &str = "retread-hermetic-build-environment-v8";
-const CACHE_NAMESPACE: &str = "hermetic-build-envs";
-const CACHE_VERSION: &str = "v8";
-const COMPLETION_MARKER: &str = "complete.json";
+/// The store directory. `pub(crate)` because
+/// [`crate::source_build::HERMETIC_ENVIRONMENT_STORE_SPEC`] READS it rather
+/// than re-spelling it — one name, so the reaper cannot drift from the writer.
+pub(crate) const CACHE_NAMESPACE: &str = "hermetic-build-envs";
+/// The generation segment. Read by the spec for the same reason.
+pub(crate) const CACHE_VERSION: &str = "v8";
+/// The completion marker, which is also the file that MAKES a directory an
+/// entry for the reaper's discovery.
+pub(crate) const COMPLETION_MARKER: &str = "complete.json";
 const MIN_RATTLER_BUILD_VERSION: (u64, u64, u64) = (0, 70, 0);
+
+// ── L3-1b-4: the hermetic environment cache is PERSISTENT, and the marker
+//    reaper walks it ────────────────────────────────────────────────────────
+
+/// L3-1b-4. Where the hermetic environment store lives. `None` — nothing
+/// named — means [`hermetic_environment_store_root`], the PERSISTENT root.
+///
+/// THE FLIP, AND WHAT IT IS: the root used to be
+/// `crate::courier::retread_cache_root()`, which consults
+/// `fasttmp::backend_env_override("RETREAD_CACHE_DIR")` and is therefore
+/// redirected into `…/job-$SLURM_JOB_ID/caches/retread`. The store died with
+/// the job, so every cold lock re-provisioned every hermetic toolchain. It was
+/// the LAST row of the L3-1b cache-map audit (L3-1b-4) and the only one still
+/// job-local.
+///
+/// WHAT AN ENTRY IS KEYED ON, read out of [`cache_directory`] and not
+/// remembered: sha256 over `retread-hermetic-environment-cache-v1` and four
+/// length-prefixed fields — the target glibc floor `major.minor`, the Python
+/// minor, the CUDA version (`"none"` when absent), and `toolchain_digest`,
+/// which is [`solved_records_digest`] over the SOLVED conda records. The PATH
+/// is explicitly NOT hashed. A hit therefore skips exactly one thing:
+/// [`provision_uncached`] — the rattler-build fetch/link of the whole GCC (and
+/// optionally CUDA) prefix pair — plus the marker validation that follows it.
+/// The conda SOLVE that produces `toolchain_digest` runs either way, so this
+/// store never short-circuits the resolution, only the materialisation.
+///
+/// IS AN ENTRY A PURE FUNCTION OF ITS KEY? The L3-1a test, applied honestly:
+/// the CONTENT is — `toolchain_digest` is a digest of the exact solved records,
+/// so two entries under one key are two link-outs of the same packages. The
+/// BYTES are not: the completion marker records ABSOLUTE PATHS, and activation
+/// scripts inside the prefix embed the prefix path. That is an argument FOR
+/// persisting rather than against it. Under the old job-local root every entry
+/// recorded paths that vanished with the job, which is precisely the
+/// dead-ending [`provision_for_solve`]'s "cached tuple that no longer
+/// validates" arm was written to recover from; a stable root is the condition
+/// under which those absolute paths stay true. `validate_marker` still checks
+/// them on every read, so a moved or half-copied entry is evicted and
+/// re-provisioned rather than trusted.
+static HERMETIC_ENVIRONMENT_STORE: std::sync::RwLock<Option<PathBuf>> =
+    std::sync::RwLock::new(None);
+
+/// How long an unreferenced hermetic environment may sit before the reaper
+/// quarantines it. `0` disables the reaper.
+///
+/// FOURTEEN DAYS, the same as the other four stores, on the standing argument
+/// that three horizons differing for no stated reason are three things to get
+/// wrong.
+pub(crate) const HERMETIC_ENVIRONMENT_STORE_DEFAULT_MAX_AGE_DAYS: u64 = 14;
+
+static HERMETIC_ENVIRONMENT_STORE_MAX_AGE_DAYS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(HERMETIC_ENVIRONMENT_STORE_DEFAULT_MAX_AGE_DAYS);
+static HERMETIC_ENVIRONMENT_STORE_REAP_ONCE: std::sync::Once = std::sync::Once::new();
+
+/// Wire the `retread-hermetic-environment-store` config key into the store.
+/// Called once per pack from the handler, beside
+/// [`crate::source_build::set_build_requirements_store`].
+pub(crate) fn set_hermetic_environment_store(configured: Option<&Path>) {
+    let resolved = hermetic_environment_store_with(configured, &|key| std::env::var(key).ok());
+    if let Ok(mut slot) = HERMETIC_ENVIRONMENT_STORE.write() {
+        *slot = resolved;
+    }
+}
+
+/// Testable core of [`set_hermetic_environment_store`]: config key first, then
+/// the `RETREAD_HERMETIC_ENVIRONMENT_STORE` fallback, then `None` — which means
+/// "take the default root", never an invented path.
+pub(crate) fn hermetic_environment_store_with(
+    configured: Option<&Path>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Option<PathBuf> {
+    if let Some(path) = configured {
+        return Some(path.to_path_buf());
+    }
+    env("RETREAD_HERMETIC_ENVIRONMENT_STORE")
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+}
+
+/// Wire `retread-hermetic-environment-store-max-age-days` into the reaper.
+pub(crate) fn set_hermetic_environment_store_max_age_days(configured: Option<u64>) {
+    HERMETIC_ENVIRONMENT_STORE_MAX_AGE_DAYS.store(
+        configured.unwrap_or(HERMETIC_ENVIRONMENT_STORE_DEFAULT_MAX_AGE_DAYS),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+fn hermetic_environment_store_max_age_days() -> u64 {
+    HERMETIC_ENVIRONMENT_STORE_MAX_AGE_DAYS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The ONE formula for the hermetic environment store root.
+pub(crate) fn hermetic_environment_store_root() -> PathBuf {
+    let slot = HERMETIC_ENVIRONMENT_STORE
+        .read()
+        .ok()
+        .and_then(|slot| slot.clone());
+    hermetic_environment_store_root_with(slot.as_deref(), &|key| std::env::var(key).ok())
+}
+
+/// Testable core: whatever was configured, else
+/// [`crate::courier::persistent_store_root_with`] and nothing else. There is
+/// deliberately no `RETREAD_CACHE_DIR` branch here — that absence IS the fix.
+pub(crate) fn hermetic_environment_store_root_with(
+    configured: Option<&Path>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> PathBuf {
+    match configured {
+        Some(root) => root.to_path_buf(),
+        None => crate::courier::persistent_store_root_with(env),
+    }
+}
+
+/// Run the hermetic environment reaper once for this process, and never fail a
+/// build because housekeeping failed.
+pub(crate) fn reap_hermetic_environment_store_once() {
+    HERMETIC_ENVIRONMENT_STORE_REAP_ONCE.call_once(|| {
+        let days = hermetic_environment_store_max_age_days();
+        let store_root = hermetic_environment_store_root();
+        let max_age = std::time::Duration::from_secs(days * 86_400);
+        if let Err(error) = crate::source_build::reap_marker_store(
+            &crate::source_build::HERMETIC_ENVIRONMENT_STORE_SPEC,
+            &store_root,
+            max_age,
+            crate::courier::ReapMode::Apply,
+        ) {
+            tracing::warn!(
+                store = %store_root.display(),
+                error = %error,
+                "hermetic_environment_store reap failed; nothing evicted",
+            );
+        }
+    });
+}
 
 /// A validated, immutable compiler environment ready to activate around a
 /// PEP 517 build. Clones are cheap path/value copies; the underlying prefix is
@@ -426,8 +565,30 @@ async fn provision_for_solve(
     };
     let cache_dir = cache_directory(&request)?;
     validate_shell_safe_cache_path(&cache_dir)?;
+    // L3-1b-4, THE READER BUILT BEFORE THE STORE IS FLIPPED (L3-1b-23-5: no
+    // lane quotes a saving without a bench row, and this door had NO span, no
+    // `bench:` row and no `#[instrument]` anywhere — the L3-1b audit recorded
+    // its size as UNMEASURED for exactly that reason). One row per call, on
+    // both arms, so a cold arm's n/sum/max and a warm arm's ZERO provisions
+    // are both readable from the log.
+    let started = std::time::Instant::now();
     let _lock = crate::source_build::acquire_artifact_cache_lock(&cache_dir).await?;
     let marker_path = cache_dir.join(COMPLETION_MARKER);
+    let identity = cache_dir
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let bench = |span_path: &'static str| {
+        tracing::info!(
+            span_path,
+            identity = %identity,
+            target_floor = %format!("{}.{}", request.target_floor.0, request.target_floor.1),
+            python_minor = %request.python_minor,
+            cuda = %request.cuda_version.as_deref().unwrap_or("none"),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "bench: hermetic_provision",
+        );
+    };
 
     match std::fs::symlink_metadata(&marker_path) {
         Ok(metadata) => {
@@ -445,7 +606,16 @@ async fn provision_for_solve(
                 })
                 .and_then(|marker| validate_marker(&cache_dir, &request, &marker));
             match cached {
-                Ok(environment) => return Ok(environment),
+                Ok(environment) => {
+                    // THE HIT ARM, and the reader half of the reaper: a store
+                    // that is persistent must be able to tell "nobody has
+                    // wanted this for 14 days" from "published 14 days ago and
+                    // used every day since". Best-effort, a sidecar, and never
+                    // a write inside the entry.
+                    crate::source_build::touch_use_stamp(&cache_dir);
+                    bench("cache-hit");
+                    return Ok(environment);
+                }
                 Err(error) => {
                     // A cached tuple that no longer validates is a STALE CACHE,
                     // not a fatal condition: markers record absolute paths, and
@@ -486,8 +656,12 @@ async fn provision_for_solve(
     }
     .await;
     match result {
-        Ok(environment) => Ok(environment),
+        Ok(environment) => {
+            bench("provisioned");
+            Ok(environment)
+        }
         Err(error) => {
+            bench("failed");
             if let Err(cleanup) = remove_incomplete_cache(&cache_dir).await {
                 return Err(error.context(format!(
                     "also failed to remove incomplete hermetic cache {}: {cleanup:#}",
@@ -2671,7 +2845,11 @@ fn validate_marker(
 }
 
 fn cache_directory(request: &ProvisionRequest) -> Result<PathBuf> {
-    let root = crate::courier::retread_cache_root();
+    // L3-1b-4: was `crate::courier::retread_cache_root()`, which `fasttmp`
+    // redirects into `…/job-$SLURM_JOB_ID/caches/retread`. The four path
+    // segments below the root do not move, so no key and no address moves --
+    // only where the root is.
+    let root = hermetic_environment_store_root();
     let root = if root.is_absolute() {
         root
     } else {
@@ -4293,6 +4471,130 @@ Error:   × Failed to resolve dependencies\n\
         assert!(environment.python_executable().is_file());
         assert!(environment.cuda_executable().is_some_and(Path::is_file));
         crate::source_build::remove_owned_cache_entry(&cache_dir).unwrap();
+    }
+
+    #[test]
+    fn the_hermetic_environment_store_default_is_persistent_not_the_job_local_redirect() {
+        // L3-1b-4. The whole property is the ABSENCE of a `RETREAD_CACHE_DIR`
+        // branch: `fasttmp` redirects that into
+        // `…/job-$SLURM_JOB_ID/caches/retread`, which is why the store used to
+        // die with the job.
+        let env = |key: &str| match key {
+            "XDG_CACHE_HOME" => Some("/xdg".to_string()),
+            "HOME" => Some("/home/who".to_string()),
+            "RETREAD_CACHE_DIR" => Some("/job-scoped/caches/retread".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            hermetic_environment_store_root_with(None, &env),
+            PathBuf::from("/xdg/retread"),
+            "the default root is the PERSISTENT one, and RETREAD_CACHE_DIR must not reach it",
+        );
+        let no_xdg = |key: &str| match key {
+            "HOME" => Some("/home/who".to_string()),
+            "RETREAD_CACHE_DIR" => Some("/job-scoped/caches/retread".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            hermetic_environment_store_root_with(None, &no_xdg),
+            PathBuf::from("/home/who/.cache/retread"),
+        );
+    }
+
+    #[test]
+    fn the_hermetic_environment_store_is_config_key_first_and_env_fallback_second() {
+        let env = |key: &str| match key {
+            "RETREAD_HERMETIC_ENVIRONMENT_STORE" => Some("/from/env".to_string()),
+            "XDG_CACHE_HOME" => Some("/xdg".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            hermetic_environment_store_with(Some(Path::new("/from/key")), &env),
+            Some(PathBuf::from("/from/key")),
+            "the config key outranks the env fallback",
+        );
+        assert_eq!(
+            hermetic_environment_store_with(None, &env),
+            Some(PathBuf::from("/from/env")),
+        );
+        let blank = |key: &str| match key {
+            "RETREAD_HERMETIC_ENVIRONMENT_STORE" => Some("   ".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            hermetic_environment_store_with(None, &blank),
+            None,
+            "a blank env value means `take the default root`, never an invented path",
+        );
+        // And `None` at BOTH levels resolves to the persistent root, not to
+        // nothing: this is the arm production takes.
+        assert_eq!(
+            hermetic_environment_store_root_with(None, &|key: &str| (key == "XDG_CACHE_HOME")
+                .then(|| "/xdg".to_string())),
+            PathBuf::from("/xdg/retread"),
+        );
+    }
+
+    #[test]
+    fn the_hermetic_store_spec_reads_this_modules_own_constants() {
+        // Two copies of "v8" is how STORE-REAP-3's reaper came to walk past
+        // the entries it was written for. The spec must READ these, never
+        // re-spell them.
+        let spec = crate::source_build::HERMETIC_ENVIRONMENT_STORE_SPEC;
+        assert_eq!(spec.dir, CACHE_NAMESPACE);
+        assert_eq!(spec.version, CACHE_VERSION);
+        assert_eq!(spec.marker, COMPLETION_MARKER);
+        assert!(
+            spec.reap_lock.starts_with('.'),
+            "the store-wide reap lock must be a dotfile or read_dir_names walks it as a generation",
+        );
+    }
+
+    #[test]
+    fn the_hermetic_cache_directory_lives_under_the_store_root_and_keeps_its_segments() {
+        let root = std::env::temp_dir().join(format!(
+            "retread-l31b4-root-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed"),
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        set_hermetic_environment_store(Some(&root));
+        let leaf = cache_directory(&ProvisionRequest {
+            target_floor: (2, 28),
+            python_minor: "3.11".to_string(),
+            cuda_version: None,
+            toolchain_digest: "a".repeat(64),
+        })
+        .unwrap();
+        set_hermetic_environment_store(None);
+        let canonical = std::fs::canonicalize(&root).unwrap();
+        assert_eq!(
+            leaf.parent().and_then(Path::file_name).unwrap(),
+            std::ffi::OsStr::new(CACHE_VERSION),
+            "the generation segment must not move: {}",
+            leaf.display(),
+        );
+        assert_eq!(
+            leaf.parent()
+                .and_then(Path::parent)
+                .and_then(Path::file_name)
+                .unwrap(),
+            std::ffi::OsStr::new(CACHE_NAMESPACE),
+        );
+        assert!(
+            leaf.starts_with(&canonical),
+            "{} is not under the configured store root {}",
+            leaf.display(),
+            canonical.display(),
+        );
+        assert!(
+            leaf.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("env-"),
+            "the identity leaf keeps its `env-` prefix",
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

@@ -79,7 +79,7 @@ async fn async_main() -> anyhow::Result<()> {
     }
 
     // `retread store-reap
-    //      [--store built-wheels|git-snapshots|shadow|build-requirements|all]
+    //      [--store built-wheels|git-snapshots|shadow|build-requirements|hermetic-envs|all]
     //      [--root <dir>]... [--dry-run|--apply]
     //      [--max-age-days <n>] [--bytes]`
     //

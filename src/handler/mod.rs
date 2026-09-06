@@ -5313,6 +5313,13 @@ impl Handler {
             pre_key_config.build_requirements_store_max_age_days,
         );
         crate::source_build::reap_build_requirements_store_once();
+        crate::hermetic_build::set_hermetic_environment_store(
+            pre_key_config.hermetic_environment_store.as_deref(),
+        );
+        crate::hermetic_build::set_hermetic_environment_store_max_age_days(
+            pre_key_config.hermetic_environment_store_max_age_days,
+        );
+        crate::hermetic_build::reap_hermetic_environment_store_once();
         // The SHARED built-output store, if the pack opted into one. Keyed on
         // content alone, so a workspace staged at a new path can adopt this
         // result instead of recomputing it. Unset = the store does not exist.

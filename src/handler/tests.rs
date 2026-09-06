@@ -745,6 +745,8 @@ fn pythons_for_rejects_bare_major_variant() {
         // persistent default", which is what every one of these fixtures wants.
         build_requirements_store: None,
         build_requirements_store_max_age_days: None,
+        hermetic_environment_store: None,
+        hermetic_environment_store_max_age_days: None,
         path_source_metadata: None,
         path_source_records: None,
         parallel_probes: None,
@@ -814,6 +816,8 @@ fn pythons_for_accepts_dotted_variant() {
         // persistent default", which is what every one of these fixtures wants.
         build_requirements_store: None,
         build_requirements_store_max_age_days: None,
+        hermetic_environment_store: None,
+        hermetic_environment_store_max_age_days: None,
         path_source_metadata: None,
         path_source_records: None,
         parallel_probes: None,
@@ -883,6 +887,8 @@ fn pythons_for_filters_bare_major_keeps_dotted() {
         // persistent default", which is what every one of these fixtures wants.
         build_requirements_store: None,
         build_requirements_store_max_age_days: None,
+        hermetic_environment_store: None,
+        hermetic_environment_store_max_age_days: None,
         path_source_metadata: None,
         path_source_records: None,
         parallel_probes: None,
@@ -3671,6 +3677,8 @@ fn cfg() -> RetreadConfig {
         // persistent default", which is what every one of these fixtures wants.
         build_requirements_store: None,
         build_requirements_store_max_age_days: None,
+        hermetic_environment_store: None,
+        hermetic_environment_store_max_age_days: None,
         path_source_metadata: None,
         path_source_records: None,
         parallel_probes: None,

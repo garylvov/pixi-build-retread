@@ -1192,21 +1192,59 @@ pub(crate) fn reap_built_wheel_store_once() {
 // ── L3-1b-3B: the MARKER-FILE build-requirements store is PERSISTENT, and a
 //    reaper walks it ───────────────────────────────────────────────────────
 
-/// THE SHAPE OF THIS STORE, named in constants rather than injected.
+/// THE SHAPE OF A MARKER STORE:
+/// `<root>/<dir>/<version>/<identity>/<marker>` — a fixed depth of TWO below
+/// the store directory, one generation segment, one marker FILE per entry.
 ///
-/// It is `<root>/build-requirements/<version>/<identity>/requirements.txt`: a
-/// fixed depth of TWO below the store directory, one generation segment, one
-/// marker FILE per entry. L3-1b-3B's first cut carried a `MarkerStoreSpec` of
-/// five `&'static str` fields and one generic walk so a SECOND store — the
-/// strict wheel attestations — could share it. That second store is gone
-/// (L3-1b-3B-READ proved it takes zero production writes: every pinned
-/// admission returns through C10's content record before the attestation is
-/// written, so C10 already answers what it was for), and a parameterisation
-/// with one instantiation is a callback with nothing on the other end. The
-/// five constants are therefore named here and read directly by the walk.
-/// [`reap_built_wheel_store`] and [`reap_canonical_git_snapshot_store`] stay
-/// separate for the reason that doc comment gives — they differ in SHAPE — and
-/// they are untouched.
+/// L3-1b-3B's first cut carried exactly this struct so the strict wheel
+/// attestations could share the walk; L3-1b-3B-SPLIT COLLAPSED it, on the
+/// steward's rule that an abstraction is kept only when a second user is real,
+/// after L3-1b-3B-READ proved the attestation store takes zero production
+/// writes. L3-1b-4 restores it because the second user is now real and
+/// measured, not anticipated: the hermetic environment cache is
+/// `<root>/hermetic-build-envs/v8/env-<sha256>/complete.json`, which is the
+/// same shape to the segment. Two instantiations, one walk. If a third store
+/// ever needs a DIFFERENT shape it gets its own reaper, exactly as
+/// [`reap_built_wheel_store`] and [`reap_canonical_git_snapshot_store`] have
+/// their own — those two differ in shape and stay separate and untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MarkerStoreSpec {
+    /// The store directory under the persistent root.
+    pub(crate) dir: &'static str,
+    /// The `<row> reap` / `<row> evicted` stem, so an operator greps one word.
+    pub(crate) row: &'static str,
+    /// The store-wide reap try-lock: a DOTFILE beside the generations, so
+    /// [`read_dir_names`] can never mistake it for one.
+    pub(crate) reap_lock: &'static str,
+    /// The generation this binary addresses. Every OTHER generation found is
+    /// still walked, and aged by the same rule with `reason="stale-version"`.
+    pub(crate) version: &'static str,
+    /// The file whose presence MAKES a directory an entry. Discovery is by
+    /// this name, never by counting levels.
+    pub(crate) marker: &'static str,
+}
+
+/// L3-1b-3B's store, spelled as a spec.
+pub(crate) const BUILD_REQUIREMENTS_STORE_SPEC: MarkerStoreSpec = MarkerStoreSpec {
+    dir: BUILD_REQUIREMENTS_STORE_DIR,
+    row: BUILD_REQUIREMENTS_STORE_ROW,
+    reap_lock: BUILD_REQUIREMENTS_STORE_REAP_LOCK,
+    version: BUILD_REQUIREMENTS_CACHE_VERSION,
+    marker: BUILD_REQUIREMENTS_MARKER,
+};
+
+/// L3-1b-4's store. Every field is READ FROM `hermetic_build` rather than
+/// re-spelled here: a generation bump there must move this walk with it, and
+/// two copies of `"v8"` is exactly how a reaper starts walking past the
+/// entries it was written for (STORE-REAP-3).
+pub(crate) const HERMETIC_ENVIRONMENT_STORE_SPEC: MarkerStoreSpec = MarkerStoreSpec {
+    dir: crate::hermetic_build::CACHE_NAMESPACE,
+    row: "hermetic_environment_store",
+    reap_lock: ".hermetic-build-envs.reap.lock",
+    version: crate::hermetic_build::CACHE_VERSION,
+    marker: crate::hermetic_build::COMPLETION_MARKER,
+};
+
 const BUILD_REQUIREMENTS_STORE_DIR: &str = "build-requirements";
 
 /// The `<prefix> reap` / `<prefix> evicted` row stem, so an operator greps one
@@ -1377,14 +1415,15 @@ pub(crate) struct MarkerStoreReapReport {
 ///
 /// STORE-REAP-2's `mode`: a dry run walks and decides identically and then
 /// stops one statement before the first write, and creates no lock sidecar.
-pub(crate) fn reap_build_requirements_store(
+pub(crate) fn reap_marker_store(
+    spec: &MarkerStoreSpec,
     store_root: &Path,
     max_age: std::time::Duration,
     mode: crate::courier::ReapMode,
 ) -> Result<MarkerStoreReapReport> {
     use crate::courier::ReapLockOutcome;
     let mut report = MarkerStoreReapReport::default();
-    let store_dir = store_root.join(BUILD_REQUIREMENTS_STORE_DIR);
+    let store_dir = store_root.join(spec.dir);
     if max_age.is_zero() {
         tracing::info!(
             store = %store_dir.display(),
@@ -1392,14 +1431,14 @@ pub(crate) fn reap_build_requirements_store(
             evicted = 0,
             evicted_stale_version = 0,
             versions_walked = 0,
-            current_version = BUILD_REQUIREMENTS_CACHE_VERSION,
+            current_version = spec.version,
             kept = 0,
             skipped_locked = 0,
             max_age_days = 0,
             mode = mode.as_str(),
             reason = "disabled",
             "{} reap",
-            BUILD_REQUIREMENTS_STORE_ROW,
+            spec.row,
         );
         return Ok(report);
     }
@@ -1410,18 +1449,18 @@ pub(crate) fn reap_build_requirements_store(
             evicted = 0,
             evicted_stale_version = 0,
             versions_walked = 0,
-            current_version = BUILD_REQUIREMENTS_CACHE_VERSION,
+            current_version = spec.version,
             kept = 0,
             skipped_locked = 0,
             max_age_days = max_age.as_secs() / 86_400,
             mode = mode.as_str(),
             reason = "store-absent",
             "{} reap",
-            BUILD_REQUIREMENTS_STORE_ROW,
+            spec.row,
         );
         return Ok(report);
     }
-    let reap_lock_path = store_dir.join(BUILD_REQUIREMENTS_STORE_REAP_LOCK);
+    let reap_lock_path = store_dir.join(spec.reap_lock);
     let _reap_lock = match crate::courier::take_reap_lock(&reap_lock_path, mode)? {
         ReapLockOutcome::Held(lock) => Some(lock),
         ReapLockOutcome::Absent => None,
@@ -1431,7 +1470,7 @@ pub(crate) fn reap_build_requirements_store(
                 store = %store_dir.display(),
                 mode = mode.as_str(),
                 "{} reap skipped=concurrent",
-                BUILD_REQUIREMENTS_STORE_ROW,
+                spec.row,
             );
             return Ok(report);
         }
@@ -1447,7 +1486,7 @@ pub(crate) fn reap_build_requirements_store(
             continue;
         }
         report.versions_walked += 1;
-        let reason = if version == BUILD_REQUIREMENTS_CACHE_VERSION {
+        let reason = if version == spec.version {
             REAP_REASON_UNREFERENCED
         } else {
             REAP_REASON_STALE_VERSION
@@ -1460,11 +1499,11 @@ pub(crate) fn reap_build_requirements_store(
             // DISCOVERY IS BY MARKER, never by counting levels. A directory
             // without one is a half-published entry or something that is not an
             // entry at all, and either way it is not this reaper's to move.
-            if !entry_dir.join(BUILD_REQUIREMENTS_MARKER).is_file() {
+            if !entry_dir.join(spec.marker).is_file() {
                 continue;
             }
             report.scanned += 1;
-            let Some(age) = marker_store_entry_age(&entry_dir, now) else {
+            let Some(age) = marker_store_entry_age(spec, &entry_dir, now) else {
                 report.kept += 1;
                 continue;
             };
@@ -1489,7 +1528,7 @@ pub(crate) fn reap_build_requirements_store(
                     continue;
                 }
             };
-            match marker_store_entry_age(&entry_dir, std::time::SystemTime::now()) {
+            match marker_store_entry_age(spec, &entry_dir, std::time::SystemTime::now()) {
                 Some(fresh) if fresh <= max_age => {
                     report.kept += 1;
                     continue;
@@ -1528,7 +1567,7 @@ pub(crate) fn reap_build_requirements_store(
                     reason = reason,
                     mode = mode.as_str(),
                     "{} would-evict",
-                    BUILD_REQUIREMENTS_STORE_ROW,
+                    spec.row,
                 );
                 continue;
             }
@@ -1537,7 +1576,7 @@ pub(crate) fn reap_build_requirements_store(
                     store = %store_dir.display(),
                     error = %error,
                     "could not create the {} quarantine; nothing evicted",
-                    BUILD_REQUIREMENTS_STORE_ROW,
+                    spec.row,
                 );
                 report.kept += 1;
                 continue;
@@ -1547,7 +1586,7 @@ pub(crate) fn reap_build_requirements_store(
                     identity = %identity,
                     error = %error,
                     "{} eviction could not rename; entry kept",
-                    BUILD_REQUIREMENTS_STORE_ROW,
+                    spec.row,
                 );
                 report.kept += 1;
                 continue;
@@ -1584,7 +1623,7 @@ pub(crate) fn reap_build_requirements_store(
                 quarantine = %quarantine.display(),
                 mode = mode.as_str(),
                 "{} evicted",
-                BUILD_REQUIREMENTS_STORE_ROW,
+                spec.row,
             );
         }
     }
@@ -1594,13 +1633,13 @@ pub(crate) fn reap_build_requirements_store(
         evicted = report.evicted,
         evicted_stale_version = report.evicted_stale_version,
         versions_walked = report.versions_walked,
-        current_version = BUILD_REQUIREMENTS_CACHE_VERSION,
+        current_version = spec.version,
         kept = report.kept,
         skipped_locked = report.skipped_locked,
         max_age_days = max_age.as_secs() / 86_400,
         mode = mode.as_str(),
         "{} reap",
-        BUILD_REQUIREMENTS_STORE_ROW,
+        spec.row,
     );
     Ok(report)
 }
@@ -1618,6 +1657,7 @@ const MARKER_STORE_QUARANTINE: &str = "quarantine";
 /// that all read as infinitely old on the reaper's first run would be a
 /// wipe-out dressed as housekeeping.
 fn marker_store_entry_age(
+    spec: &MarkerStoreSpec,
     entry_dir: &Path,
     now: std::time::SystemTime,
 ) -> Option<std::time::Duration> {
@@ -1625,7 +1665,7 @@ fn marker_store_entry_age(
         .and_then(|stamp| std::fs::metadata(stamp).ok())
         .and_then(|meta| meta.modified().ok())
         .or_else(|| {
-            std::fs::metadata(entry_dir.join(BUILD_REQUIREMENTS_MARKER))
+            std::fs::metadata(entry_dir.join(spec.marker))
                 .ok()
                 .and_then(|meta| meta.modified().ok())
         })?;
@@ -1641,7 +1681,8 @@ pub(crate) fn reap_build_requirements_store_once() {
         let days = build_requirements_store_max_age_days();
         let store_root = build_requirements_store_root();
         let max_age = std::time::Duration::from_secs(days * 86_400);
-        if let Err(error) = reap_build_requirements_store(
+        if let Err(error) = reap_marker_store(
+            &BUILD_REQUIREMENTS_STORE_SPEC,
             &store_root,
             max_age,
             crate::courier::ReapMode::Apply,
@@ -5117,7 +5158,21 @@ fn prepare_source_snapshot_with_hook(
     // below drops it -- but a `retread-built-wheels-store` pointed inside a
     // source tree is a supported configuration and must not become a recursion.
     let built_wheel_store = canonicalize_future_path(&built_wheel_store_root())?;
-    let mut candidates = vec![output, cache_root, built_wheel_store];
+    // L3-1b-4: and so did the build-requirements store (L3-1b-3B, which did
+    // NOT extend this list) and the hermetic environment store. The audit's
+    // warning was that a store leaving `retread_cache_root()` also leaves this
+    // exclusion; the list is now EXHAUSTIVE over the stores that have left,
+    // rather than one behind each time.
+    let build_requirements_store = canonicalize_future_path(&build_requirements_store_root())?;
+    let hermetic_environment_store =
+        canonicalize_future_path(&crate::hermetic_build::hermetic_environment_store_root())?;
+    let mut candidates = vec![
+        output,
+        cache_root,
+        built_wheel_store,
+        build_requirements_store,
+        hermetic_environment_store,
+    ];
     for excluded in additional_excluded_roots {
         candidates.push(canonicalize_future_path(excluded)?);
     }
@@ -17556,15 +17611,16 @@ version = "0.1.0"
     /// existed and which must age from its own MARKER instead of from the
     /// epoch.
     fn marker_fixture(
+        spec: &MarkerStoreSpec,
         root: &Path,
         version: &str,
         identity: &str,
         stamp: Option<std::time::Duration>,
         marker_age: std::time::Duration,
     ) -> PathBuf {
-        let entry = root.join(BUILD_REQUIREMENTS_STORE_DIR).join(version).join(identity);
+        let entry = root.join(spec.dir).join(version).join(identity);
         std::fs::create_dir_all(&entry).expect("entry");
-        let marker = entry.join(BUILD_REQUIREMENTS_MARKER);
+        let marker = entry.join(spec.marker);
         std::fs::write(&marker, b"payload\n").expect("marker");
         let age_file = |path: &Path, ago: std::time::Duration| {
             let when = std::time::SystemTime::now() - ago;
@@ -17682,15 +17738,15 @@ version = "0.1.0"
             let root = unique_test_dir(&format!("marker-reap-{}", BUILD_REQUIREMENTS_STORE_DIR));
             let day = std::time::Duration::from_secs(86_400);
             let used_yesterday =
-                marker_fixture(&root, BUILD_REQUIREMENTS_CACHE_VERSION, "used", Some(day), 30 * day);
+                marker_fixture(&BUILD_REQUIREMENTS_STORE_SPEC, &root, BUILD_REQUIREMENTS_CACHE_VERSION, "used", Some(day), 30 * day);
             let never_used =
-                marker_fixture(&root, BUILD_REQUIREMENTS_CACHE_VERSION, "cold", Some(30 * day), 30 * day);
+                marker_fixture(&BUILD_REQUIREMENTS_STORE_SPEC, &root, BUILD_REQUIREMENTS_CACHE_VERSION, "cold", Some(30 * day), 30 * day);
             // No `.used` at all: a pre-reaper entry, aged from its marker.
-            let pre_reaper = marker_fixture(&root, BUILD_REQUIREMENTS_CACHE_VERSION, "old", None, 30 * day);
+            let pre_reaper = marker_fixture(&BUILD_REQUIREMENTS_STORE_SPEC, &root, BUILD_REQUIREMENTS_CACHE_VERSION, "old", None, 30 * day);
             let pre_reaper_young =
-                marker_fixture(&root, BUILD_REQUIREMENTS_CACHE_VERSION, "young", None, day);
+                marker_fixture(&BUILD_REQUIREMENTS_STORE_SPEC, &root, BUILD_REQUIREMENTS_CACHE_VERSION, "young", None, day);
             // A RETIRED generation. Same rule, different reason.
-            let retired = marker_fixture(&root, "v0", "retired", Some(30 * day), 30 * day);
+            let retired = marker_fixture(&BUILD_REQUIREMENTS_STORE_SPEC, &root, "v0", "retired", Some(30 * day), 30 * day);
             // A FUTURE STAMP, AND IT IS HERE BECAUSE A MUTANT SURVIVED WITHOUT
             // IT. `marker_store_entry_age` clamps a stamp in the future to age
             // ZERO with `unwrap_or_default()`, which KEEPS the entry; the
@@ -17705,7 +17761,7 @@ version = "0.1.0"
             // on its own -- and its stamp is an HOUR IN THE FUTURE, so it can
             // only survive through the clamp.
             let skewed =
-                marker_fixture(&root, BUILD_REQUIREMENTS_CACHE_VERSION, "skewed", Some(day), 30 * day);
+                marker_fixture(&BUILD_REQUIREMENTS_STORE_SPEC, &root, BUILD_REQUIREMENTS_CACHE_VERSION, "skewed", Some(day), 30 * day);
             {
                 let stamp = use_stamp_path(&skewed).expect("stamp path");
                 let ahead = std::time::SystemTime::now() + std::time::Duration::from_secs(3_600);
@@ -17721,7 +17777,8 @@ version = "0.1.0"
                     .expect("push the stamp into the future");
             }
 
-            let report = reap_build_requirements_store(
+            let report = reap_marker_store(
+                &BUILD_REQUIREMENTS_STORE_SPEC,
                 &root,
                 std::time::Duration::from_secs(14 * 86_400),
                 crate::courier::ReapMode::Apply,
@@ -17842,7 +17899,7 @@ version = "0.1.0"
         let absent = base.join("absent");
         std::fs::create_dir_all(&absent).expect("absent root");
         let (report, rows) = with_marker_rows(|| {
-            reap_build_requirements_store(&absent, 14 * day, crate::courier::ReapMode::Apply)
+            reap_marker_store(&BUILD_REQUIREMENTS_STORE_SPEC, &absent, 14 * day, crate::courier::ReapMode::Apply)
         });
         assert_eq!(report.expect("absent").scanned, 0);
         let absent_row = rows
@@ -17855,9 +17912,10 @@ version = "0.1.0"
         );
 
         let live = base.join("live");
-        marker_fixture(&live, BUILD_REQUIREMENTS_CACHE_VERSION, "e", Some(30 * day), 30 * day);
+        marker_fixture(&BUILD_REQUIREMENTS_STORE_SPEC, &live, BUILD_REQUIREMENTS_CACHE_VERSION, "e", Some(30 * day), 30 * day);
         let (report, rows) = with_marker_rows(|| {
-            reap_build_requirements_store(
+            reap_marker_store(
+                &BUILD_REQUIREMENTS_STORE_SPEC,
                 &live,
                 std::time::Duration::ZERO,
                 crate::courier::ReapMode::Apply,
@@ -17881,7 +17939,7 @@ version = "0.1.0"
         // and with a real scan behind it, so the two above are refusals and not
         // just "the row always says that".
         let (report, rows) = with_marker_rows(|| {
-            reap_build_requirements_store(&live, 14 * day, crate::courier::ReapMode::Apply)
+            reap_marker_store(&BUILD_REQUIREMENTS_STORE_SPEC, &live, 14 * day, crate::courier::ReapMode::Apply)
         });
         let report = report.expect("live");
         assert_eq!((report.scanned, report.evicted), (1, 1), "{report:?}");
@@ -17905,10 +17963,10 @@ version = "0.1.0"
     fn a_marker_store_dry_run_names_the_entry_and_creates_no_sidecar() {
         let root = unique_test_dir("marker-dry");
         let day = std::time::Duration::from_secs(86_400);
-        marker_fixture(&root, BUILD_REQUIREMENTS_CACHE_VERSION, "stale", Some(30 * day), 30 * day);
+        marker_fixture(&BUILD_REQUIREMENTS_STORE_SPEC, &root, BUILD_REQUIREMENTS_CACHE_VERSION, "stale", Some(30 * day), 30 * day);
         let before = sorted_tree(&root);
 
-        let dry = reap_build_requirements_store(&root, 14 * day, crate::courier::ReapMode::DryRun)
+        let dry = reap_marker_store(&BUILD_REQUIREMENTS_STORE_SPEC, &root, 14 * day, crate::courier::ReapMode::DryRun)
             .expect("dry run");
         assert_eq!((dry.scanned, dry.evicted), (1, 1), "{dry:?}");
         assert_eq!(dry.entries.len(), 1, "a dry run must NAME what it selects");
@@ -17926,13 +17984,84 @@ version = "0.1.0"
 
         // NON-VACUITY: the apply arm on the SAME fixture moves it and DOES
         // create the lock sidecar, so the two zeros above are not trivial.
-        let applied = reap_build_requirements_store(&root, 14 * day, crate::courier::ReapMode::Apply)
+        let applied = reap_marker_store(&BUILD_REQUIREMENTS_STORE_SPEC, &root, 14 * day, crate::courier::ReapMode::Apply)
             .expect("apply");
         assert_eq!(applied.evicted, 1);
         assert_ne!(sorted_tree(&root), before);
         assert!(
             root.join(BUILD_REQUIREMENTS_STORE_DIR).join(BUILD_REQUIREMENTS_STORE_REAP_LOCK).is_file(),
             "the apply path DOES create the reap lock",
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// L3-1b-4, THE SECOND USER OF THE WALK, and the test that makes the
+    /// re-extracted [`MarkerStoreSpec`] more than a parameterisation with one
+    /// instantiation: the SAME `reap_marker_store` over the hermetic store's
+    /// own directory, generation and marker.
+    ///
+    /// It carries all three properties the build-requirements arm carries,
+    /// because a second store that only got the happy path would be the
+    /// abstraction earning nothing: an aged entry is quarantined, a FUTURE
+    /// stamp is clamped to age zero and KEEPS (the mutant that survived
+    /// L3-1b-3B-SPLIT's run 1), a directory without the marker is not an entry,
+    /// and every generation is walked.
+    #[test]
+    fn the_marker_reaper_walks_the_hermetic_environment_store_too() {
+        let spec = &HERMETIC_ENVIRONMENT_STORE_SPEC;
+        let root = unique_test_dir("marker-hermetic");
+        let day = std::time::Duration::from_secs(86_400);
+        let stale = marker_fixture(spec, &root, spec.version, "env-stale", Some(30 * day), 30 * day);
+        let fresh = marker_fixture(spec, &root, spec.version, "env-fresh", Some(day), 30 * day);
+        let retired = marker_fixture(spec, &root, "v0", "env-retired", Some(30 * day), 30 * day);
+        // A future stamp is clock skew across nodes, not an ancient entry.
+        let skewed = marker_fixture(spec, &root, spec.version, "env-skewed", Some(day), 30 * day);
+        {
+            let path = use_stamp_path(&skewed).expect("stamp path");
+            let when = std::time::SystemTime::now() + 3 * day;
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .expect("reopen the stamp");
+            file.set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(when)
+                    .set_accessed(when),
+            )
+            .expect("push the stamp into the future");
+        }
+        // Markerless: a half-published entry is not this reaper's to move.
+        let markerless = root.join(spec.dir).join(spec.version).join("env-halfway");
+        std::fs::create_dir_all(&markerless).expect("markerless");
+
+        let report = reap_marker_store(spec, &root, 14 * day, crate::courier::ReapMode::Apply)
+            .expect("reap the hermetic store");
+        assert_eq!(
+            (
+                report.scanned,
+                report.evicted,
+                report.evicted_stale_version,
+                report.versions_walked
+            ),
+            (4, 2, 1, 2),
+            "the hermetic store must be walked by the SAME rules as the build-requirements \
+             store, across BOTH generations: {report:?}",
+        );
+        assert!(!stale.exists(), "the aged entry was not quarantined");
+        assert!(!retired.exists(), "the stale-generation entry was not walked");
+        assert!(fresh.is_dir(), "a stamped entry must survive");
+        assert!(skewed.is_dir(), "a FUTURE stamp must clamp to age zero and KEEP");
+        assert!(markerless.is_dir(), "a directory without the marker is not an entry");
+        assert!(
+            root.join(spec.dir).join(MARKER_STORE_QUARANTINE).is_dir(),
+            "nothing is deleted; everything evicted is renamed into the quarantine",
+        );
+        // The two stores must not be able to reach into each other: this
+        // fixture wrote nothing under the build-requirements directory, and the
+        // hermetic reap must not have created one.
+        assert!(
+            !root.join(BUILD_REQUIREMENTS_STORE_DIR).exists(),
+            "the hermetic reaper touched the build-requirements store",
         );
         let _ = std::fs::remove_dir_all(&root);
     }

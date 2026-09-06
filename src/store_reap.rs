@@ -1,7 +1,10 @@
 //! STORE-REAP-2: `retread store-reap` — THE PRODUCTION CALL SITE OF THE
 //! PERSISTENT-STORE REAPERS. L3-1b-3B took the list from three to FOUR by
 //! persisting the build-requirements store, whose shape is
-//! `<root>/build-requirements/<version>/<identity>/requirements.txt`.
+//! `<root>/build-requirements/<version>/<identity>/requirements.txt`; L3-1b-4
+//! took it to FIVE with the hermetic environment store, whose shape is
+//! `<root>/hermetic-build-envs/<version>/env-<sha256>/complete.json` -- the
+//! same shape, so both are reaped by ONE walk, `source_build::reap_marker_store`.
 //!
 //! # Why this verb exists (STORE-REAP-1-1, law 2)
 //!
@@ -47,6 +50,8 @@ pub enum Store {
     Shadow,
     /// L3-1b-3B.
     BuildRequirements,
+    /// L3-1b-4.
+    HermeticEnvironments,
 }
 
 impl Store {
@@ -57,20 +62,23 @@ impl Store {
             Store::GitSnapshots => "git-snapshots",
             Store::Shadow => "shadow",
             Store::BuildRequirements => "build-requirements",
+            Store::HermeticEnvironments => "hermetic-envs",
         }
     }
 
     /// ALL of them, in the order the rows print. `--store all` is exactly this
     /// slice, never a re-listing of the names somewhere else.
     ///
-    /// L3-1b-3B appended one and did not reorder the first three: the merge
-    /// gate's readers grep summary rows by position in some places, and a
-    /// reordering would move rows that this landing has no reason to move.
-    pub const ALL: [Store; 4] = [
+    /// L3-1b-3B appended one and did not reorder the first three, and L3-1b-4
+    /// appends the fifth on the same rule: the merge gate's readers grep
+    /// summary rows by position in some places, and a reordering would move
+    /// rows that this landing has no reason to move.
+    pub const ALL: [Store; 5] = [
         Store::BuiltWheels,
         Store::GitSnapshots,
         Store::Shadow,
         Store::BuildRequirements,
+        Store::HermeticEnvironments,
     ];
 
     fn parse(value: &str) -> Option<Vec<Store>> {
@@ -93,6 +101,9 @@ impl Store {
             Store::Shadow => crate::courier::SHADOW_CACHE_STORE_DEFAULT_MAX_AGE_DAYS,
             Store::BuildRequirements => {
                 crate::source_build::BUILD_REQUIREMENTS_STORE_DEFAULT_MAX_AGE_DAYS
+            }
+            Store::HermeticEnvironments => {
+                crate::hermetic_build::HERMETIC_ENVIRONMENT_STORE_DEFAULT_MAX_AGE_DAYS
             }
         }
     }
@@ -155,7 +166,7 @@ pub fn parse_args(args: &[String]) -> anyhow::Result<Args> {
                     anyhow::anyhow!(
                         "store-reap: --store {value}: expected one of \
                          built-wheels, git-snapshots, shadow, \
-                         build-requirements, all"
+                         build-requirements, hermetic-envs, all"
                     )
                 })?);
             }
@@ -202,9 +213,9 @@ pub struct StoreOutcome {
     /// STORE-REAP-3. How many on-disk LAYOUTS of this store the walk
     /// enumerated. Only the shadow store has ever had more than one (L3-1 moved
     /// the target identity out of the path and left the old directories where
-    /// they were), so the other three stores report 0 here — the same way the
+    /// they were), so the other four stores report 0 here — the same way the
     /// shadow store reports 0 for `versions_walked`, because it has no
-    /// generation segment. ONE row format for all four stores; a field that
+    /// generation segment. ONE row format for all five stores; a field that
     /// does not apply reads 0 rather than being absent, so a parser never has
     /// to know which store it is looking at.
     pub layouts_walked: u64,
@@ -341,7 +352,30 @@ fn reap_one(
         // directory the caller has to name. It has ONE layout and reports
         // `layouts_walked` 0, the way the built-wheel and git-snapshot arms do.
         Store::BuildRequirements => {
-            let report = crate::source_build::reap_build_requirements_store(root, max_age, mode)?;
+            let report = crate::source_build::reap_marker_store(
+                &crate::source_build::BUILD_REQUIREMENTS_STORE_SPEC,
+                root,
+                max_age,
+                mode,
+            )?;
+            outcome.scanned = report.scanned;
+            outcome.selected = report.evicted;
+            outcome.stale_version = report.evicted_stale_version;
+            outcome.kept = report.kept;
+            outcome.skipped_locked = report.skipped_locked;
+            outcome.versions_walked = report.versions_walked;
+            outcome.skipped_concurrent = report.skipped_concurrent;
+            report.entries
+        }
+        // L3-1b-4. The SAME walk as the arm above, on the same shape, with a
+        // different spec -- not a second implementation of it.
+        Store::HermeticEnvironments => {
+            let report = crate::source_build::reap_marker_store(
+                &crate::source_build::HERMETIC_ENVIRONMENT_STORE_SPEC,
+                root,
+                max_age,
+                mode,
+            )?;
             outcome.scanned = report.scanned;
             outcome.selected = report.evicted;
             outcome.stale_version = report.evicted_stale_version;
@@ -756,7 +790,7 @@ mod tests {
         // L3-1b-3B. `all` is FOUR, and each of the four is reachable by name.
         // A hard 4 here rather than `Store::ALL.len()` on both sides, which
         // would be an identity and would pass on a list that lost a store.
-        assert_eq!(Store::ALL.len(), 4, "all four stores are in the fan-out");
+        assert_eq!(Store::ALL.len(), 5, "all five stores are in the fan-out");
         assert_eq!(
             parse_args(&["--store".into(), "all".into()])
                 .expect("all")
@@ -1052,6 +1086,85 @@ mod tests {
         assert!(
             root.join("build-requirements/v1/half-published").is_dir(),
             "a directory with no marker is not an entry and must not be moved"
+        );
+    }
+
+    /// L3-1b-4. THE GUARD THAT MATTERS FOR THE FIFTH STORE, because
+    /// `tools/store_reap_census.sh` only ever calls `--store all`: a store the
+    /// enum knows about but the fan-out does not reach is a reaper with no
+    /// reader, which is the exact shape law 2 forbids.
+    ///
+    /// It asserts the store is reached BOTH by name and through `all`, and
+    /// that `all` still reaches the four that were there before it — an
+    /// appended member must not displace one.
+    #[test]
+    fn the_hermetic_environment_store_is_reached_by_name_and_by_store_all() {
+        assert_eq!(
+            Store::parse("hermetic-envs"),
+            Some(vec![Store::HermeticEnvironments]),
+            "the spelling the census and an operator both type"
+        );
+        assert!(
+            Store::ALL.contains(&Store::HermeticEnvironments),
+            "`--store all` must fan out to the hermetic store"
+        );
+        for previous in [
+            Store::BuiltWheels,
+            Store::GitSnapshots,
+            Store::Shadow,
+            Store::BuildRequirements,
+        ] {
+            assert!(
+                Store::ALL.contains(&previous),
+                "appending the fifth store displaced {}",
+                previous.as_str()
+            );
+        }
+
+        let root = scratch("hermetic");
+        marker_store_entry(&root, "hermetic-build-envs", "v8", "env-cur", "complete.json", 30);
+        marker_store_entry(&root, "hermetic-build-envs", "v7", "env-old", "complete.json", 30);
+        marker_store_entry(&root, "hermetic-build-envs", "v8", "env-fresh", "complete.json", 1);
+        std::fs::create_dir_all(root.join("hermetic-build-envs/v8/env-half"))
+            .expect("half-published");
+        let before = tree(&root);
+
+        let dry = dry_run(&root, Store::HermeticEnvironments);
+        assert_eq!(
+            (
+                dry.scanned,
+                dry.selected,
+                dry.stale_version,
+                dry.versions_walked
+            ),
+            (3, 2, 1, 2),
+            "the hermetic store is walked by the same rules across both generations"
+        );
+        assert_eq!(tree(&root), before, "a dry run creates nothing");
+
+        // Non-vacuity, and the reader the census actually exercises: the SAME
+        // fixture reached through `all`, applied.
+        let mut selected_by_all = 0;
+        for store in Store::ALL {
+            selected_by_all += reap_one(&root, store, 14, ReapMode::Apply, true)
+                .unwrap_or_else(|error| panic!("{} reap: {error:#}", store.as_str()))
+                .selected;
+        }
+        assert_eq!(
+            selected_by_all, 2,
+            "`all` must reach the hermetic entries and nothing else in this fixture"
+        );
+        assert!(
+            root.join("hermetic-build-envs/quarantine").is_dir(),
+            "an eviction RENAMES into quarantine; it never deletes"
+        );
+        assert!(
+            root.join("hermetic-build-envs/v8/env-fresh/complete.json").is_file(),
+            "the fresh entry is untouched"
+        );
+        assert!(
+            root.join("hermetic-build-envs/v8/env-half").is_dir(),
+            "a directory with no completion marker is not an entry"
         );
     }
 }
