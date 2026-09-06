@@ -256,8 +256,15 @@ if reap_init; then
   if [ -d "$SCR/w" ]; then
     n=$( rm -rf "$SCR/w" 2>&1 | wc -l ); rmerr=$((rmerr + n))
   fi
+  # PLAIN FILES FIRST, AND reap_delete GETS DIRECTORIES ONLY.  MEASURED on
+  # 5994853: `reap_delete` REFUSED `run_preamble.sh` and
+  # `multiarm_preamble.MUT.sh` as "NOT strictly under the declared job root" --
+  # its containment proof is a dev:inode walk through `..`, which is a statement
+  # about directories, and handing it a regular file asks it a question it
+  # cannot answer.  That refusal is the tool being right; the caller was wrong.
+  find "$SCR" -maxdepth 1 -type f -delete 2>/dev/null
   for d in "$SCR"/*; do
-    [ -e "$d" ] || continue
+    [ -d "$d" ] || continue
     reap_delete "$d" psg || rmerr=$((rmerr + 1))
   done
   reap_done || rmerr=$((rmerr + 1))
