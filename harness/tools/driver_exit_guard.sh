@@ -272,7 +272,7 @@ DEG_SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # (`find ... > "$A/tree-before.txt"`) cannot overwrite another lane's artifacts.
 # This is additive to the payload seam, not a substitute for it.
 deg_run_wrapper () {
-  local f=$1 rec=$2 envs=() line binds=() extra
+  local f=$1 rec=$2 envs=() line binds=()
   mkdir -p "$rec/tmp"
   while IFS= read -r line; do envs+=("$line"); done < <(deg_shim_env "$rec")
   envs+=("SLURM_JOB_ID=999999" "SLURM_JOB_NAME=driver-exit-guard" "HOME=$rec/tmp")
@@ -280,21 +280,42 @@ deg_run_wrapper () {
   # another lane's artifacts. THE PERSISTENT STORES ARE TMPFS FOR A SECOND
   # REASON: several wrappers open with a `find` or a census over a store with
   # millions of entries, and a SAFE passthrough command that scans a real store
-  # is how a run becomes a function of the node instead of the bytes. Empty
-  # inside the sandbox, those scans return instantly and the bucket is
-  # reproducible. Nothing here is a substitute for the payload seam.
+  # is how a run becomes a function of the NODE instead of of the wrapper's
+  # bytes. Empty inside the sandbox, those scans return instantly. None of this
+  # is a substitute for the payload seam; it is containment, and it is additive.
+  # DEG_TMPFS_OK is built by deg_probe_tmpfs, because a mount that bwrap cannot
+  # make fails the WHOLE sandbox at rc 1 -- which is how this lane briefly
+  # scored 101 wrappers as re-raising with ZERO intercepted invocations, caught
+  # only by the B0 non-vacuity arm.
   binds=(--dev-bind / / --tmpfs "$TASK" --bind "$W" "$W")
-  for extra in ${DEG_TMPFS_EXTRA:-/oscar/data/stellex/glvov/caches /users/glvov/.cache /oscar/data/stellex/glvov/retread}; do
-    [ -d "$extra" ] && binds+=(--tmpfs "$extra")
-  done
+  [ -n "${DEG_TMPFS_OK:-}" ] && binds+=($DEG_TMPFS_OK)
   case "$f" in "$TASK"/*) binds+=(--ro-bind "$f" "$f");; esac
   command timeout -k 5 "${DEG_WRAPPER_BUDGET_S:-60}" env "${envs[@]}" "$DEG_BWRAP" "${binds[@]}" /bin/bash "$f"
+}
+
+# deg_probe_tmpfs -- keep only the extra tmpfs mounts this host's bwrap can
+# actually make. `/users` is not visible under `--dev-bind / /` here (it is a
+# separate mount), so asking for a tmpfs beneath it aborts the sandbox; a
+# candidate that cannot be mounted is DROPPED and printed, never silently kept.
+deg_probe_tmpfs () {
+  local cand out=""
+  for cand in ${DEG_TMPFS_EXTRA:-/oscar/data/stellex/glvov/caches /oscar/data/stellex/glvov/retread /users/glvov/.cache}; do
+    [ -d "$cand" ] || { echo "###   tmpfs candidate $cand: absent, skipped"; continue; }
+    if "$DEG_BWRAP" --dev-bind / / --tmpfs "$cand" /bin/true >/dev/null 2>&1; then
+      out="$out --tmpfs $cand"; echo "###   tmpfs candidate $cand: MOUNTED"
+    else
+      echo "###   tmpfs candidate $cand: bwrap cannot mount it here, DROPPED"
+    fi
+  done
+  DEG_TMPFS_OK=$out
 }
 
 if [ "$WHICH" = all ] || [ "$WHICH" = B ]; then
   echo "=== FAMILY B -- EVERY .sbatch in the task tree, payload seam, ratcheted"
   DEG_BWRAP=$(command -v bwrap 2>/dev/null); [ -n "$DEG_BWRAP" ] || { echo "GUARD FATAL: no bwrap -- FAMILY B refuses to run a wrapper uncontained"; exit 4; }
   [ -f "$BASELINE" ] || { echo "GUARD FATAL: no baseline at $BASELINE"; exit 4; }
+  echo "### containment: the task tree is a tmpfs; probing the extra store mounts"
+  deg_probe_tmpfs
 
   deg_build_shim "$W/seam" >/dev/null || { echo "GUARD FATAL: could not build the payload seam"; exit 4; }
   echo "### payload seam built at $W/seam  inject=$DEG_INJECT"
@@ -350,6 +371,13 @@ if [ "$WHICH" = all ] || [ "$WHICH" = B ]; then
   deg_run_wrapper "$PRE" "$W/rec-B0" >"$W/B0.log" 2>&1; s=$?
   [ "$s" -eq 0 ] && ok "B0 the pinned PRE-FIX wrapper epilogue still swallows: rc=0" \
                  || no "B0 the pinned PRE-FIX epilogue reported $s, not 0 -- every arm below is vacuous"
+  # A VACUOUS INJECTION PRODUCES NO BUCKETS. If the pre-fix epilogue does not
+  # swallow, the seam did not reach the payload -- a broken sandbox, a missing
+  # stub -- and every row below would be an artefact of that, not a verdict.
+  # Measured on this lane: one bad tmpfs candidate aborted bwrap at rc 1 and
+  # the run scored 101 wrappers as "re-raise" with ZERO intercepted
+  # invocations. That must never reach a log as a bucket count.
+  [ "$s" -eq 0 ] || { echo "GUARD REFUSES: the injection is vacuous (B0 rc=$s); no bucket below would mean anything"; exit 4; }
 
   # ---- the versioned shape lanes are told to copy is an ARM, not a document.
   LW=$REPO/harness/phase_template/lane_wrapper.sbatch
