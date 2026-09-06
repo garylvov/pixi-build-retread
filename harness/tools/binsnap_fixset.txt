@@ -28,3 +28,4 @@ f59aa35 p6z-lenient-metadata-and-reconciler-attribution
 a10b6e1 p6ad4-hash-each-document-once
 3fd0a6b c8l3-strict-central-directory
 add6cc4 c18-1-git-snapshot-store-default-and-reaper (landed as B19 = merge 076fa87 onto 3fd0a6b, ort, zero conflicts)
+9fc0d7d l3-1b-shadow-store (L3-1 re-emit reuse rebased in, plus the persistent shadow-rewrite store and its reaper; landed as B20, a pure fast-forward of four commits)
