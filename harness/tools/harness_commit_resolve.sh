@@ -13,6 +13,14 @@
 #           is not a commit, or no job root
 #   rc 3    --write REFUSED: the sha is not the commit the task copies actually
 #           ARE (DET-1-1), and no `--allow-older --reason` was given
+#   rc 4    READ REFUSED (HARNESS-SYNC-2-1): the pin this job would run under is
+#           not the commit the task copies actually ARE -- `.harness_synced_commit`
+#           -- and no `--allow-older` marker authorises it.  WHY 4: 0/2/3 are
+#           already taken above, and 2 and 6 are the phase templates' OWN FATAL
+#           exits, so neither could be told apart from a template refusal; 4
+#           already means "a pin disagrees with the sync record" on the WRITER
+#           side of this seam, in harness_sync.sh, and this is the same fact
+#           read from the other end.
 #
 # WHY THIS EXISTS, AND IT IS A SCHEDULER DEFECT, NOT A STYLE PREFERENCE.
 # The pin reached the job ONLY through `sbatch --export=ALL,HARNESS_COMMIT=<sha>`,
@@ -147,12 +155,24 @@ if [ "${1:-}" = --write ]; then
         echo "###   (--allow-older WITHOUT --reason is still a refusal.)" >&2
       exit 3
     fi
+    # HARNESS-SYNC-2-1: the reader refuses a stale pin too, so a deliberate
+    # older pin needs a MARKER or this write would create a job that refuses
+    # itself.  One sidecar line naming the very sha it authorises.
+    AO_MARK="allow-older pin=$WSHA_FULL synced=$SYNCED_SHA at=$(date -Is) reason=$(printf '%s' "$WREASON" | tr '\n' ' ')"
     echo "### HARNESS_COMMIT WRITE ALLOWED-OLDER pin=$WSHA_FULL synced=$SYNCED_SHA reason=$WREASON"
     echo "###   ^ copy this line into the lane log row for this submission."
   fi
 
   mkdir -p "$JR" || exit 2
   printf '%s\n' "$WSHA_FULL" > "$JR/HARNESS_COMMIT" || exit 2
+  if [ -n "${AO_MARK:-}" ]; then
+    printf '%s\n' "$AO_MARK" > "$JR/HARNESS_COMMIT.allow-older" || exit 2
+    echo "### HARNESS_COMMIT ALLOW-OLDER marker: $JR/HARNESS_COMMIT.allow-older"
+    echo "###   $AO_MARK"
+  else
+    # An ordinary write cancels any marker an earlier submission left here.
+    rm -f "$JR/HARNESS_COMMIT.allow-older"
+  fi
   echo "### HARNESS_COMMIT written: $JR/HARNESS_COMMIT = $WSHA_FULL (no --export needed)"
   exit 0
 fi
@@ -175,6 +195,74 @@ if [ -n "$FROM_FILE" ] && [ -n "$FROM_ENV" ] && [ "$FROM_FILE" != "$FROM_ENV" ];
   exit 2
 fi
 
+
+# ── HARNESS-SYNC-2-1: THE READER REFUSES A STALE PIN TOO, BEFORE THE DRIFT ───
+# CHECK EVER RUNS.  The writer's rc-3 refusal only fires when a lane PASSES a
+# sha; a lane that copies the pin FILE (a `cp`, an sbatch that writes it inline,
+# a job root cloned from an older one) bypasses the writer entirely and the job
+# then dies at its drift gate three to six seconds later with a table of files
+# and no statement of the actual fault.  The pin and the record are two strings
+# and comparing them costs nothing, so the eight-refusal shape becomes ONE line
+# that names both shas and the command that fixes it.
+#
+# THE MARKER, and why it is a SIDECAR and not a second line in the pin file.
+# `--allow-older --reason "<why>"` is a legitimate deliberate pin to an older
+# harness, and the reader must not undo the writer's decision -- so the writer
+# leaves `<pin file>.allow-older`, one line, naming the very sha it authorises:
+#
+#   allow-older pin=<full sha> synced=<sha at write time> at=<iso> reason=<why>
+#
+# It is honoured ONLY when its `pin=` equals the sha resolved here, so a marker
+# left behind by an earlier submission cannot authorise a different pin, and the
+# writer deletes it on any ordinary write.  A SIDECAR rather than a second line
+# because the pin file stays exactly one sha: every existing consumer -- and a
+# bare `cat <job root>/HARNESS_COMMIT` is one -- is unchanged, and a lane that
+# copies only the pin file leaves the marker behind and is REFUSED, which is the
+# right answer for a copied pin.
+PIN="${FROM_FILE:-$FROM_ENV}"
+if [ -n "$PIN" ]; then
+  R_REPO=${HARNESS_REPO:-/oscar/data/stellex/glvov/agrescap/worktrees/harness-tools}
+  R_TASK_DIR=${HARNESS_TASK_DIR:-/oscar/data/stellex/glvov/agrescap/tasks/retread-4-11}
+  R_RECORD=${HARNESS_SYNCED_RECORD:-$R_TASK_DIR/tools/.harness_synced_commit}
+  R_SYNCED=
+  if [ -f "$R_RECORD" ]; then
+    R_SYNCED=$(sed -e 's/#.*//' -e 's/[[:space:]]//g' "$R_RECORD" | grep -m1 . || true)
+  fi
+  if [ -z "$R_SYNCED" ]; then
+    # No record = nothing to compare against.  Announced, never silent (law 9).
+    echo "### HARNESS_COMMIT stale-pin check OFF: no sync record at $R_RECORD (HARNESS-SYNC-2-1)" >&2
+  else
+    R_SYNCED_SHA=$(git -C "$R_REPO" rev-parse --verify "${R_SYNCED}^{commit}" 2>/dev/null || printf '%s' "$R_SYNCED")
+    R_PIN_SHA=$(git -C "$R_REPO" rev-parse --verify "${PIN}^{commit}" 2>/dev/null || printf '%s' "$PIN")
+    if [ "$R_PIN_SHA" = "$R_SYNCED_SHA" ]; then
+      echo "### HARNESS_COMMIT pin matches the sync record $R_RECORD (HARNESS-SYNC-2-1)" >&2
+    else
+      R_MARK=
+      if [ -n "$FROM_FILE" ] && [ -n "$HC_FILE" ] && [ -f "$HC_FILE.allow-older" ]; then
+        # Read the marker's `pin=` as a FIELD, not by pattern-matching the whole
+        # line: a `reason=` string is free text and could otherwise contain a
+        # `pin=<sha>` of its own and authorise itself.
+        R_MARK_PIN=$(sed -n 's/^allow-older[[:space:]]\{1,\}pin=\([^[:space:]]\{1,\}\).*/\1/p' "$HC_FILE.allow-older" | head -1)
+        if [ -n "$R_MARK_PIN" ] && [ "$R_MARK_PIN" = "$R_PIN_SHA" ]; then
+          R_MARK=$(grep -m1 '^allow-older[[:space:]]' "$HC_FILE.allow-older" || true)
+        fi
+      fi
+      if [ -n "$R_MARK" ]; then
+        echo "### HARNESS_COMMIT ALLOW-OLDER honoured pin=$R_PIN_SHA synced=$R_SYNCED_SHA -- $R_MARK" >&2
+      else
+        echo "### PIN STALE pin=$R_PIN_SHA synced=$R_SYNCED_SHA -- run: bash tools/harness_commit_resolve.sh --write ${JOB_ROOT:-<job root>}" >&2
+        echo "###   The pin this job would run under is NOT what the task copies are." >&2
+        echo "###   pin    : $R_PIN_SHA   (${HC_FILE:-<export>})" >&2
+        echo "###   task IS: $R_SYNCED_SHA   ($R_RECORD)" >&2
+        echo "###   Refusing HERE, in the job's first seconds, instead of at the drift" >&2
+        echo "###   gate with a table of files (HARNESS-SYNC-2-1). A deliberate older" >&2
+        echo "###   pin is written with --allow-older --reason \"<why>\", which leaves the" >&2
+        echo "###   marker this reader honours." >&2
+        exit 4
+      fi
+    fi
+  fi
+fi
 if [ -n "$FROM_FILE" ]; then
   echo "### HARNESS_COMMIT=$FROM_FILE source=file:$HC_FILE (the job owns this file; no --export needed)" >&2
   printf '%s\n' "$FROM_FILE"

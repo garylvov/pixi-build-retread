@@ -34,6 +34,16 @@
 #   K   THE WRITER HALF: `--write <job root> <sha>` creates the file the reader
 #       reads, the two round-trip, and a sha that is not a commit in the harness
 #       repo is refused at SUBMIT time -- when it is cheap -- writing nothing.
+#   L   HARNESS-SYNC-2-1, THE READER HALF: with a sync record present, a pin
+#       that is NOT the recorded commit is refused rc 4 with ONE `### PIN STALE`
+#       line naming both shas and the `--write` command, BEFORE the drift check;
+#       the recorded pin passes straight through to it; an `--allow-older` pin
+#       still passes, because the writer leaves a marker sidecar the reader
+#       honours -- and a marker naming a DIFFERENT sha does not authorise, nor
+#       does one an ordinary write has since cancelled.  Its MUTATION is pinned
+#       to $HS21_OLD: that reader accepts the stale pin in silence and the block
+#       goes on to call the drift check on it, which is the eight-refusal shape
+#       this arm exists to kill.
 #
 # NOTHING IS RUN THAT COULD LOCK.  Each arm extracts ONLY the region between
 # `### HARNESS-DRIFT BEGIN` and `### HARNESS-DRIFT END`, prepends the two
@@ -51,7 +61,15 @@ fi
 RESOLVE=$REPO/harness/tools/harness_commit_resolve.sh
 [ -f "$RESOLVE" ] || { echo "FATAL: no resolver at $RESOLVE"; exit 3; }
 N2_OLD=${N2_OLD:-6279978}   # the HARNESS_COMMIT that carried the defect
+HS21_OLD=${HS21_OLD:-63a8521}  # HARNESS-SYNC-2-1: the reader BEFORE this fix
+HS21_REC=${HS21_REC:-63a8521}  # and the commit arm L's fixture record names
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
+# HARNESS-SYNC-2-1: the reader now compares the pin against the sync record of
+# the task dir it is told about, and the DEFAULT is the live task dir -- which
+# HAS a record.  Every arm below that is not about the record therefore runs
+# against a task dir that has NONE, where that check announces itself OFF; the
+# record's own arms (L) point HARNESS_TASK_DIR at their own fixture.
+export HARNESS_TASK_DIR=$W/norecord-default; mkdir -p "$HARNESS_TASK_DIR/tools"
 pass=0; fail=0
 ok()  { echo "PASS  $*"; pass=$((pass+1)); }
 bad() { echo "FAIL  $*"; fail=$((fail+1)); }
@@ -215,6 +233,146 @@ else
   bad "K2: rc=$wrc, log: $(cat "$W/K2.log")"
 fi
 
+
+# ---- L: HARNESS-SYNC-2-1 -- THE READER REFUSES A STALE PIN TOO --------------
+# The writer's rc-3 refusal only fires when a lane PASSES a sha.  A lane that
+# copies the pin FILE bypasses it, and before this arm the job then died at its
+# drift gate 3-6 s later with a table of files.  These arms run against a task
+# dir with a REAL sync record, so the reader has something to compare against.
+LTASK=$W/rectask; mkdir -p "$LTASK/tools"
+LREC_FULL=$(git -C "$REPO" rev-parse --verify "${HS21_REC}^{commit}" 2>/dev/null || echo "")
+if [ -z "$LREC_FULL" ] || [ -z "$N2_FULL" ] || [ "$LREC_FULL" = "$N2_FULL" ]; then
+  bad "L: could not resolve the two commit constants (rec=$HS21_REC old=$N2_OLD) -- THE ARM DID NOT RUN"
+else
+printf '%s\n' "$LREC_FULL" > "$LTASK/tools/.harness_synced_commit"
+LJR=$W/Ljobroot; mkdir -p "$LJR"
+lread() { # lread <logfile> [VAR=VAL ...] -- <job root>
+  local log=$1; shift
+  local -a envs=()
+  while [ "${1:-}" != "--" ]; do envs+=("$1"); shift; done
+  shift
+  ( env -u HARNESS_COMMIT -u HARNESS_COMMIT_FILE HARNESS_TASK_DIR="$LTASK" "${envs[@]}" \
+      bash "$RESOLVE" "$@" ) > "$log.out" 2> "$log.err"
+  echo $?
+}
+
+# L1  the recorded pin passes, and says so
+printf '%s\n' "$LREC_FULL" > "$LJR/HARNESS_COMMIT"; rm -f "$LJR/HARNESS_COMMIT.allow-older"
+rcL1=$(lread "$W/L1" -- "$LJR")
+[ "$rcL1" = 0 ] && [ "$(cat "$W/L1.out")" = "$LREC_FULL" ] \
+  && grep -q 'pin matches the sync record' "$W/L1.err" \
+  && ok "L1: a pin that IS the recorded commit passes through to the drift check" \
+  || bad "L1: rc=$rcL1 out='$(cat "$W/L1.out")' err='$(cat "$W/L1.err")'"
+
+# L2  a stale pin: ONE line, both shas, the command, and rc 4
+printf '%s\n' "$N2_FULL" > "$LJR/HARNESS_COMMIT"
+rcL2=$(lread "$W/L2" -- "$LJR")
+[ "$rcL2" = 4 ] && grep -q "^### PIN STALE pin=$N2_FULL synced=$LREC_FULL " "$W/L2.err" \
+  && ok "L2: a STALE pin is refused rc 4 with the PIN STALE line naming both shas" \
+  || bad "L2: rc=$rcL2 (want 4) err='$(head -2 "$W/L2.err")'"
+grep -q -- "-- run: bash tools/harness_commit_resolve.sh --write $LJR" "$W/L2.err" \
+  && ok "L2: and the refusal names the exact --write command, with THIS job root" \
+  || bad "L2: the PIN STALE line does not name the --write command for $LJR"
+
+# L3  the same refusal on the EXPORT fallback path, where there can be no marker
+rm -f "$LJR/HARNESS_COMMIT"
+rcL3=$(lread "$W/L3" "HARNESS_COMMIT=$N2_FULL" -- "$LJR")
+[ "$rcL3" = 4 ] && grep -q '^### PIN STALE ' "$W/L3.err" \
+  && ok "L3: a stale pin arriving by --export is refused the same way" \
+  || bad "L3: rc=$rcL3 (want 4) err='$(head -2 "$W/L3.err")'"
+
+# L4  --allow-older --reason writes the marker, and the reader HONOURS it
+lwrite() { HARNESS_TASK_DIR="$LTASK" bash "$RESOLVE" --write "$@"; }
+rm -f "$LJR/HARNESS_COMMIT" "$LJR/HARNESS_COMMIT.allow-older"
+wL4=$(lwrite "$LJR" "$N2_OLD" --allow-older --reason "guard fixture: rerunning an old job shape" > "$W/L4.log" 2>&1; echo $?)
+if [ "$wL4" = 0 ] && grep -q "^allow-older pin=$N2_FULL synced=$LREC_FULL .*reason=guard fixture" "$LJR/HARNESS_COMMIT.allow-older" 2>/dev/null; then
+  ok "L4: --allow-older --reason leaves a marker sidecar naming the sha it authorises"
+else
+  bad "L4: write rc=$wL4 marker='$(cat "$LJR/HARNESS_COMMIT.allow-older" 2>/dev/null)'"
+fi
+rcL4=$(lread "$W/L4r" -- "$LJR")
+[ "$rcL4" = 0 ] && [ "$(cat "$W/L4r.out")" = "$N2_FULL" ] \
+  && grep -q 'ALLOW-OLDER honoured .*reason=guard fixture' "$W/L4r.err" \
+  && ok "L4: and the reader HONOURS it -- a deliberate older pin still runs, reason in hand" \
+  || bad "L4: rc=$rcL4 out='$(cat "$W/L4r.out")' err='$(cat "$W/L4r.err")'"
+
+# L5  a marker naming a DIFFERENT sha authorises nothing
+printf 'allow-older pin=%s synced=%s at=x reason=stale marker\n' "0000000000000000000000000000000000000000" "$LREC_FULL" \
+  > "$LJR/HARNESS_COMMIT.allow-older"
+rcL5=$(lread "$W/L5" -- "$LJR")
+[ "$rcL5" = 4 ] && ok "L5: a marker for a DIFFERENT sha does not authorise this pin" \
+  || bad "L5: rc=$rcL5 (want 4) err='$(head -2 "$W/L5.err")'"
+
+
+# L5b  and the marker's pin= is read as a FIELD: a reason string that merely
+# CONTAINS `pin=<this sha>` authorises nothing.
+printf 'allow-older pin=%s synced=%s at=x reason=looks like pin=%s to a whole-line match\n' \
+  "0000000000000000000000000000000000000000" "$LREC_FULL" "$N2_FULL" \
+  > "$LJR/HARNESS_COMMIT.allow-older"
+rcL5b=$(lread "$W/L5b" -- "$LJR")
+[ "$rcL5b" = 4 ] && ok "L5b: a reason string containing pin=<sha> does not authorise itself" \
+  || bad "L5b: rc=$rcL5b (want 4) err='$(head -2 "$W/L5b.err")'"
+
+# L6  an ordinary write cancels the marker an earlier submission left
+wL6=$(lwrite "$LJR" > "$W/L6.log" 2>&1; echo $?)
+if [ "$wL6" = 0 ] && [ ! -f "$LJR/HARNESS_COMMIT.allow-older" ] && [ "$(cat "$LJR/HARNESS_COMMIT")" = "$LREC_FULL" ]; then
+  ok "L6: an ordinary --write cancels the marker and resolves the pin from the record"
+else
+  bad "L6: rc=$wL6 marker_present=$([ -f "$LJR/HARNESS_COMMIT.allow-older" ] && echo yes || echo no) pin='$(cat "$LJR/HARNESS_COMMIT")'"
+fi
+
+# L7/L8  THE BLOCK, as each template carries it: the recorded pin reaches the
+# drift check; the stale pin never does, and the refusal carries the template's
+# own exit code.
+for tpl in phaseN_relock.sh phaseN_cert.sh; do
+  want=6; [ "$tpl" = phaseN_cert.sh ] && want=2
+  printf '%s\n' "$LREC_FULL" > "$LJR/HARNESS_COMMIT"; rm -f "$LJR/HARNESS_COMMIT.allow-older"
+  extract_block "$REPO/harness/phase_template/$tpl" "$W/Lblk-$tpl"
+  sed -i "s#^D=.*#D=$LJR#" "$W/Lblk-$tpl"
+  rcL7=$(run_block "$W/Lblk-$tpl" "$W/L7-$tpl" "HARNESS_TASK_DIR=$LTASK")
+  [ "$rcL7" = 0 ] && grep -q "drift check called with commit=$LREC_FULL" "$W/L7-$tpl" \
+    && ok "L7 $tpl: the recorded pin passes the reader and reaches the drift check" \
+    || { bad "L7 $tpl: rc=$rcL7"; sed -n '1,6p' "$W/L7-$tpl"; }
+  printf '%s\n' "$N2_FULL" > "$LJR/HARNESS_COMMIT"
+  rcL8=$(run_block "$W/Lblk-$tpl" "$W/L8-$tpl" "HARNESS_TASK_DIR=$LTASK")
+  if [ "$rcL8" = "$want" ] && grep -q '^### PIN STALE ' "$W/L8-$tpl" \
+     && ! grep -q 'drift check called' "$W/L8-$tpl"; then
+    ok "L8 $tpl: a stale pin refuses with the template's own rc=$want and NEVER reaches the drift check"
+  else
+    bad "L8 $tpl: rc=$rcL8 (want $want); log: $(head -3 "$W/L8-$tpl" | tr '\n' ' ')"
+  fi
+done
+
+# L9  THE MUTATION, PINNED TO A COMMIT CONSTANT ($HS21_OLD): the reader as it
+# stood before this fix, on the SAME stale fixture -- it accepts the pin and the
+# block goes on to run the drift check on it, which is the drift table this arm
+# exists to replace with one line.
+OLDR=$W/oldresolve.sh
+if git -C "$REPO" show "$HS21_OLD:harness/tools/harness_commit_resolve.sh" > "$OLDR" 2>/dev/null && [ -s "$OLDR" ]; then
+  printf '%s\n' "$N2_FULL" > "$LJR/HARNESS_COMMIT"
+  rcL9=$( ( env -u HARNESS_COMMIT -u HARNESS_COMMIT_FILE HARNESS_TASK_DIR="$LTASK" \
+            bash "$OLDR" "$LJR" ) > "$W/L9.out" 2> "$W/L9.err"; echo $? )
+  if [ "$rcL9" = 0 ] && [ "$(cat "$W/L9.out")" = "$N2_FULL" ] && ! grep -q 'PIN STALE' "$W/L9.err"; then
+    ok "L9: the pinned $HS21_OLD reader ACCEPTS the stale pin in silence -- the defect, reproduced"
+  else
+    bad "L9: $HS21_OLD already refused (rc=$rcL9) -- WRONG PIN, arms L2/L8 prove nothing"
+  fi
+  OSTUB=$W/oldstub; mkdir -p "$OSTUB"; : > "$OSTUB/retread_fast_env.sh"
+  cp "$OLDR" "$OSTUB/harness_commit_resolve.sh"; cp "$STUB/harness_drift_check.sh" "$OSTUB/"
+  { printf 'set -uo pipefail\nFAST_ENV=%s/retread_fast_env.sh\nD=%s\n' "$OSTUB" "$LJR"
+    sed -n '/^### HARNESS-DRIFT BEGIN/,/^### HARNESS-DRIFT END/p' "$REPO/harness/phase_template/phaseN_relock.sh"
+    printf 'exit 0\n'; } > "$W/L9blk"
+  rcL9b=$(run_block "$W/L9blk" "$W/L9b.log" "HARNESS_TASK_DIR=$LTASK")
+  if grep -q "drift check called with commit=$N2_FULL" "$W/L9b.log"; then
+    ok "L9: and with that reader the block runs the DRIFT CHECK on the stale sha -- the table, not the line"
+  else
+    bad "L9: the pre-fix block did not reach the drift check (rc=$rcL9b): $(head -3 "$W/L9b.log" | tr '\n' ' ')"
+  fi
+else
+  bad "L9: could not extract $HS21_OLD:harness/tools/harness_commit_resolve.sh -- THE MUTATION ARM DID NOT RUN"
+  bad "L9: (and its block half did not run either)"
+fi
+fi
 echo "### MERGE-N-2 pin guard: pass=$pass fail=$fail"
 [ "$fail" = 0 ] || exit 1
 exit 0

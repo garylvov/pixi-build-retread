@@ -260,8 +260,12 @@ fi
 # both -- see tools/harness_commit_resolve.sh.
 HC_RESOLVE=$(dirname "$FAST_ENV")/harness_commit_resolve.sh
 if [ -f "$HC_RESOLVE" ]; then
-  HARNESS_COMMIT=$(bash "$HC_RESOLVE" "$D") || {
-    echo "FATAL: harness commit pin REFUSED -- the file and the export disagree"; exit 6; }
+  # HARNESS-SYNC-2-1: the resolver has TWO refusals now -- rc 2 (the file and
+  # the export disagree) and rc 4 (PIN STALE: the pin is not the commit the task
+  # copies ARE).  Name the rc so this FATAL cannot mis-state which one fired.
+  HARNESS_COMMIT=$(bash "$HC_RESOLVE" "$D"); HC_RC=$?
+  [ "$HC_RC" -eq 0 ] || {
+    echo "FATAL harness commit pin REFUSED rc=$HC_RC -- see the resolver line above (2 = the file and the export disagree, 4 = PIN STALE)"; exit 6; }
 else
   echo "### harness_commit_resolve.sh missing next to $FAST_ENV -- falling back to the exported pin"
   HARNESS_COMMIT="${HARNESS_COMMIT:-}"
