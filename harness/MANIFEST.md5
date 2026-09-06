@@ -77,6 +77,8 @@ e02808a84a7409e9b96a577fbae3dfe9  tools/moved_rows_match_guard.sh
 62db5ba03d4644ccd514f1727db6f7c3  tools/moved_rows_match.sh
 00e4cbab1c56c0f8cdd613bf116bec8c  tools/msgpack_min_guard.py
 5d4435226ca639942f2227c290e09953  tools/msgpack_min.py
+36af6a82e5884fb1a98251f206dad185  tools/multiarm_store_reap_guard.sh
+5703d740537be994ecbb007272a1fa64  tools/multiarm_store_reap.sh
 72815e68e461fdd8efdfc180b6f2e81b  tools/mutation_arms_guard.sh
 02498843b98e8be21b9763cfef1d7286  tools/mutation_arms.sh
 1fa8e8023be66e2f6cffbb86905f1b42  tools/p6ad_freeze_guard.sh
