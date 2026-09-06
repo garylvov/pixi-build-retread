@@ -3,9 +3,12 @@
 #
 # WHAT IT IS FOR (law 2, and the debt it closes).  STORE-REAP-1 boarded
 # STORE-REAP-1-1: the persistent-store reapers (C18-1 git snapshots, L3-1b
-# shadow, L3-1b-1 built wheels, and -- since L3-1b-3B -- build-requirements and
-# strict-wheel-attestations, the last two walked by ONE reaper because they are
-# the same `<root>/<dir>/<version>/<identity>/<marker>` shape) have exactly one
+# shadow, L3-1b-1 built wheels, L3-1b-3B build-requirements and -- since
+# L3-1b-4 -- hermetic environments, the last two walked by ONE reaper because
+# they are the same `<root>/<dir>/<version>/<identity>/<marker>` shape.  The
+# strict-wheel-attestation store named here before L3-1b-3B-SPLIT does not
+# exist: that split deleted it after L3-1b-3B-READ proved it takes zero
+# production writes) have exactly one
 # production caller --
 # the backend's `initialize` -- and every relock this harness runs job-scopes
 # `XDG_CACHE_HOME` to `$C/xdg-cache`, so the root that caller resolves is a

@@ -100,7 +100,7 @@ bdd93cc2798a27301e793bdc6931be06  tools/sdist_build_poison_guard.sh
 da8aed178eda8db9d349a23d784bd8b6  tools/sdist_build_scope_guard.sh
 1c3729ccc1e9ba22803430aee01dc279  tools/shard_mirror.py
 3ed7d6f49541acf0cabb22062b6892de  tools/store_reap_census_guard.sh
-b72e59177eb2d36a416705a1e38fc9ba  tools/store_reap_census.sh
+608d43b992a6f1f98974850ccb3983b0  tools/store_reap_census.sh
 4555925b41bc08ba5efb7bbb7b40f167  tools/test_stage_mirror.sh
 f4b1d2839ad51722d0f7a84b8482042b  tools/wheel_store_env_guard.sh
 955d184896115e611a763c60c490b5d8  tools/wheel_store_reclaim_guard.sh
