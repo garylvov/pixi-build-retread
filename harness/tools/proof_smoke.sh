@@ -93,6 +93,18 @@ PROOF_SMOKE_VERSION=1
 
 SMOKE_SRC_WS=${SMOKE_SRC_WS:-/oscar/data/stellex/glvov/imprint-data}
 SMOKE_PIXI=${SMOKE_PIXI:-/users/glvov/.pixi/bin/pixi.real}
+# THE PINNED uv, AND IT IS NOT OPTIONAL.  MEASURED, on this guard's own first
+# real run (`psmoke-guards` 5993691 arm A): with the ambient uv on PATH the
+# KNOWN-GOOD binsnap `integration-569b0ac` died in 3 s and the smoke reported
+# BACKEND_DIED against a binary that is fine.  The backend log said why, twenty
+# times over: `preflight: uv version mismatch  wanted: 0.12.5  got: 0.11.29`.
+# retread's `uv_closure::REQUIRED_UV` refuses any other uv, and every driver
+# satisfies it from the harness's own pinned uv -- so a smoke that does not is
+# a guard that blames the wrong thing, which is worse than no guard.  The
+# version is CHECKED below, not assumed, and a mismatch is SETUP_FAILED (rc 3),
+# never a verdict about the binary.
+SMOKE_UVBIN=${SMOKE_UVBIN:-/oscar/data/stellex/glvov/tasks/retread-cold-solve/verify_fixes/artifacts/uvbin}
+SMOKE_REQUIRED_UV=${SMOKE_REQUIRED_UV:-0.12.5}
 SMOKE_WALL=${SMOKE_WALL:-900}
 SMOKE_POLL=${SMOKE_POLL:-2}
 SMOKE_MIRROR_ROOT=${SMOKE_MIRROR_ROOT:-/oscar/data/stellex/glvov/agrescap/cache/retread/stage-mirror}
@@ -323,6 +335,25 @@ echo "### SMOKE shim exec lines=$SHIM_EXEC_N line: ${SHIM_EXEC:-<none>}"
 echo "### SMOKE shim ok: it execs THIS smoke's binary"
 
 export PIXI_BUILD_BACKEND_OVERRIDE="pixi-build-retread=$SHIM"
+
+# ---- THE BACKEND'S ENVIRONMENT, the same one every driver gives it ----------
+# A smoke whose environment differs from the production driver's answers a
+# different question.  These are the knobs the drivers set, and the uv is
+# CHECKED rather than trusted.
+export PATH=/users/glvov/.pixi/bin:$SMOKE_UVBIN:/users/glvov/.local/bin:/usr/bin:/bin
+export RETREAD_UV=$SMOKE_UVBIN/uv
+[ -x "$RETREAD_UV" ] || smoke_setup_failed "RETREAD_UV $RETREAD_UV missing -- retread's preflight refuses any other uv"
+UVVER=$("$RETREAD_UV" --version 2>&1 | awk '{print $2}')
+echo "### SMOKE uv: $RETREAD_UV -> $UVVER (retread's uv_closure::REQUIRED_UV wants $SMOKE_REQUIRED_UV)"
+[ "$UVVER" = "$SMOKE_REQUIRED_UV" ] || smoke_setup_failed "uv is $UVVER, retread's preflight wants $SMOKE_REQUIRED_UV -- every backend call would fail 'preflight: uv version mismatch' and the smoke would blame the binary"
+export CONDA_OVERRIDE_CUDA=12
+export CONDA_OVERRIDE_GLIBC=2.35
+export OMNI_KIT_ACCEPT_EULA=YES
+export PRIVACY_CONSENT=Y
+export UV_LINK_MODE=copy
+export UV_LOCK_TIMEOUT=${SMOKE_UV_LOCK_TIMEOUT:-3600}
+export RUST_BACKTRACE=1
+
 export PIXI_CACHE_DIR=$CACHE/pixi
 export RATTLER_CACHE_DIR=$CACHE/rattler
 export UV_CACHE_DIR=$CACHE/uv
@@ -338,9 +369,19 @@ cd "$WS" || smoke_setup_failed "cannot cd $WS"
 S=$(date +%s)
 setsid "$SMOKE_PIXI" lock >>"$LLOG" 2>&1 &
 LPID=$!
-LPGID=$(awk '{sub(/^.*\) /,""); print $3}' "/proc/$LPID/stat" 2>/dev/null)
-LPGID=${LPGID:-$LPID}
 MYPGID=$(awk '{sub(/^.*\) /,""); print $3}' "/proc/$$/stat" 2>/dev/null)
+# READ THE PGID IN A LOOP, NOT ONCE.  `setsid` calls setsid(2) AFTER the shell
+# has forked and returned the pid, so a single read right here loses the race
+# and reports the parent's group -- which is what 5993691 printed on all three
+# of its arms.  Five one-second reads, and only then a verdict.
+LPGID=
+for _i in 1 2 3 4 5; do
+  LPGID=$(awk '{sub(/^.*\) /,""); print $3}' "/proc/$LPID/stat" 2>/dev/null)
+  [ -n "$LPGID" ] && [ "$LPGID" != "${MYPGID:-none}" ] && break
+  kill -0 "$LPID" 2>/dev/null || break
+  sleep 1
+done
+LPGID=${LPGID:-$LPID}
 echo "### SMOKE lock started pid=$LPID pgid=$LPGID (this script's pgid=$MYPGID) at $(date -Is)"
 if [ "$LPGID" = "${MYPGID:-none}" ]; then
   # setsid did not take.  Killing this group would kill the smoke itself, so the
@@ -406,11 +447,15 @@ case "$VERDICT" in
       echo "### SMOKE   Shorten the store root and re-smoke before touching the branch."
       grep -a -m1 -E 'is out of bounds for string of length' "$LLOG" "$BLOG" 2>/dev/null | cut -c1-300 | sed 's/^/### SMOKE   panic| /'
     fi
-    echo "### SMOKE first ERROR/panic line (backend log first, then the lock log):"
-    FIRST=$(grep -a -m1 -E "$SMOKE_ERROR_RE" "$BLOG" 2>/dev/null)
-    [ -n "$FIRST" ] || FIRST=$(grep -a -m1 -E "$SMOKE_ERROR_RE" "$LLOG" 2>/dev/null)
-    [ -n "$FIRST" ] || FIRST=$(tail -1 "$LLOG" 2>/dev/null)
-    printf '### SMOKE   %s\n' "$(printf '%s' "$FIRST" | cut -c1-300)"
+    # THE FIRST ERROR LINE PLUS THE TWO AFTER IT.  A rust panic's first line is
+    # only its LOCATION -- `thread 'main' panicked at src/foo.rs:1:1:` -- and the
+    # message is on the NEXT line.  5993691 arm B quoted the header and dropped
+    # the sentence, which is the half a reader needs.
+    echo "### SMOKE first ERROR/panic line and the two after it (backend log first, then the lock log):"
+    FIRST=$(grep -a -m1 -A2 -E "$SMOKE_ERROR_RE" "$BLOG" 2>/dev/null)
+    [ -n "$FIRST" ] || FIRST=$(grep -a -m1 -A2 -E "$SMOKE_ERROR_RE" "$LLOG" 2>/dev/null)
+    [ -n "$FIRST" ] || FIRST=$(tail -3 "$LLOG" 2>/dev/null)
+    printf '%s\n' "$FIRST" | cut -c1-300 | sed 's/^/### SMOKE   /'
     echo "### SMOKE lock log tail:"
     tail -12 "$LLOG" | cut -c1-200 | sed 's/^/### SMOKE   /'
     SMOKE_VERDICT=BACKEND_DIED; SMOKE_RC=1 ;;

@@ -101,6 +101,11 @@ MULTIARM_SMOKE=${MULTIARM_SMOKE:-1}
 MULTIARM_SMOKE_REASON=${MULTIARM_SMOKE_REASON:-}
 MULTIARM_SMOKE_WALL=${MULTIARM_SMOKE_WALL:-900}
 MULTIARM_JOB_FATAL=0
+# Set to 1 ONLY by multiarm_smoke_all.  The summary line reads it rather than
+# asserting the smoke happened: 5993691 arm E2 caught the unmutated wording
+# claiming "every distinct binary REACHED_FRONTEND" in a copy whose smoke call
+# had been deleted -- a claim about work that did not run.
+MULTIARM_SMOKE_RAN=0
 MULTIARM_SMOKE_ROOTS=()
 
 multiarm_say () { echo "### PREAMBLE $*"; }
@@ -276,6 +281,7 @@ multiarm_smoke_all () {
     fi
   done
   MULTIARM_SMOKE_ROOTS+=("$MULTIARM_CACHE_ROOT/smk")
+  MULTIARM_SMOKE_RAN=1
   [ "$ok" = 1 ]
 }
 
@@ -327,6 +333,10 @@ multiarm_preamble () {
     echo "################################################################################"
     return "${rc:-9}"
   fi
-  multiarm_say "PREAMBLE CLEAN: pin+drift ok, witness table ok, prefix budget ok for $MULTIARM_ARMS arm(s), every distinct binary REACHED_FRONTEND."
+  if [ "$MULTIARM_SMOKE_RAN" = 1 ]; then
+    multiarm_say "PREAMBLE CLEAN: pin+drift ok, witness table ok, prefix budget ok for $MULTIARM_ARMS arm(s), smoke_ran=1, every distinct binary REACHED_FRONTEND."
+  else
+    multiarm_say "PREAMBLE CLEAN ON WHAT IT RAN: pin+drift ok, witness table ok, prefix budget ok for $MULTIARM_ARMS arm(s), smoke_ran=0 -- NO BINARY WAS SMOKED, so nothing here says this job's backend works."
+  fi
   return 0
 }

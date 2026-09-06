@@ -11,9 +11,9 @@
 #   Everything this guard creates lives under a SHORT scratch root it owns and
 #   is removed on the way out.
 #
-#   PREDICTED: pass=12 fail=0  (state this in the sbatch before submitting)
+#   PREDICTED: pass=13 fail=0  (state this in the sbatch before submitting)
 #
-# ── THE TWELVE CHECKS ────────────────────────────────────────────────────────
+# ── THE THIRTEEN CHECKS ────────────────────────────────────────────────────────
 #   A1  the known-good binsnap reaches the frontend            REACHED_FRONTEND
 #   A2  ... and proof_smoke.sh exits 0
 #   B1  a stub that prints a panic and exits 1                 BACKEND_DIED
@@ -28,12 +28,14 @@
 #       `### SMOKE BACKEND_DIED` row
 #   E2  the MUTATION -- the preamble with step 6 (the smoke) deleted, which is
 #       every multi-arm driver written before this landing: it returns ZERO and
-#       prints ZERO `### SMOKE` rows against the SAME dead binary.  That is the
-#       measurement behind "a green gate is not a working backend": without the
-#       smoke the job proceeds to its arms.
+#       prints ZERO VERDICT rows and SAYS `smoke_ran=0` against the SAME dead
+#       binary.  That is the measurement behind "a green gate is not a working
+#       backend": without the smoke the job proceeds straight to its arms.
 #   E3  the pin: at the PRE-FIX harness commit named below, neither
 #       proof_smoke.sh nor multiarm_preamble.sh exists, so no driver at or
 #       before it could have run a smoke.
+#   F1  an unsatisfiable REQUIRED_UV is SETUP_FAILED rc=3 naming both versions --
+#       the guard for the pin that arm A of 5993691 proved was missing.
 set -uo pipefail
 
 # THE MUTATION ARM'S COMMIT CONSTANT -- the harness tip immediately BEFORE this
@@ -61,7 +63,7 @@ chk () {  # chk <name> <condition-rc> <what was wanted> <what was seen>
 echo "### PSG proof_smoke_guard.sh  $(date -Is)  host=$(hostname -s) job=$J"
 echo "### PSG scratch=$SCR  job_root=$JOB_ROOT"
 echo "### PSG good binsnap=$GOOD"
-echo "### PSG PREDICTED pass=12 fail=0"
+echo "### PSG PREDICTED pass=13 fail=0"
 
 # ---- the stubs --------------------------------------------------------------
 # They live at a path ENDING `/pixi-build-retread` because the shim readback
@@ -176,9 +178,13 @@ else
   bash "$SCR/run_preamble.sh" "$SCR/multiarm_preamble.MUT.sh" "$T" "$JOB_ROOT" "$SCR/mcm" "$SCR/stubdie" "$MANIFEST" >"$EMOUT" 2>&1
   emrc=$?
   tail -12 "$EMOUT"
-  smrows=$(grep -c '^### SMOKE ' "$EMOUT")
-  { [ "$emrc" = 0 ] && [ "$smrows" -eq 0 ]; }
-  chk E2 $? "the preamble WITHOUT the smoke lets the dead backend through: rc=0 and ZERO '### SMOKE' rows" "rc=$emrc smoke_rows=$smrows"
+  # THE READER IS THE VERDICT ROW, NOT ANY `### SMOKE` LINE.  5993691 E2 failed
+  # on `smoke_rows=1` and the row it counted was `### SMOKE PREFIX BUDGET`, which
+  # the preamble's step 4 prints out of the same library -- a check that counts
+  # the wrong rows is a check that reports the wrong thing.
+  smrows=$(grep -c '^### SMOKE [A-Z_]* binary=' "$EMOUT")
+  { [ "$emrc" = 0 ] && [ "$smrows" -eq 0 ] && grep -q 'smoke_ran=0' "$EMOUT"; }
+  chk E2 $? "the preamble WITHOUT the smoke lets the dead backend through: rc=0, ZERO verdict rows, and it SAYS smoke_ran=0" "rc=$emrc verdict_rows=$smrows smoke_ran_row=$(grep -c 'smoke_ran=0' "$EMOUT")"
 fi
 
 git -C "$REPO" cat-file -e "$PSG_PREFIX_COMMIT:harness/tools/proof_smoke.sh" 2>/dev/null; a=$?
@@ -186,9 +192,24 @@ git -C "$REPO" cat-file -e "$PSG_PREFIX_COMMIT:harness/tools/multiarm_preamble.s
 { [ "$a" != 0 ] && [ "$b" != 0 ]; }
 chk E3 $? "the pre-fix commit $PSG_PREFIX_COMMIT carries NEITHER file, so no driver at or before it could have smoked" "proof_smoke rc=$a multiarm_preamble rc=$b"
 
+# ---- F: the uv preflight refusal -------------------------------------------
+# 5993691 arm A reported BACKEND_DIED for the KNOWN-GOOD binsnap because the
+# ambient uv is 0.11.29 and retread's `uv_closure::REQUIRED_UV` is 0.12.5: the
+# backend printed `preflight: uv version mismatch` twenty times and the smoke
+# blamed the binary.  The tool now pins the uv AND checks the version, and this
+# arm is the guard for that check -- an impossible required version must be
+# SETUP_FAILED (rc 3), never a verdict about the binary.
+echo ""; echo "########## PSG ARM F -- the uv preflight refusal ##########"
+FOUT=$OUT/psg-$J-F.out
+SMOKE_REQUIRED_UV=99.99.99 SMOKE_WALL=60 bash "$T/tools/proof_smoke.sh" "$SCR/stubdie" "$MANIFEST" "$JOB_ROOT" >"$FOUT" 2>&1
+frc=$?
+tail -6 "$FOUT"
+{ [ "$frc" = 3 ] && grep -q '^### SMOKE SETUP_FAILED ' "$FOUT" && grep -q 'retread.s preflight wants 99.99.99' "$FOUT"; }
+chk F1 $? "an unsatisfiable REQUIRED_UV is SETUP_FAILED rc=3, naming both versions -- not a verdict about the binary" "rc=$frc $(grep -m1 '^### SMOKE [A-Z_]* binary=' "$FOUT" || echo '<no verdict row>')"
+
 # ---- out --------------------------------------------------------------------
 echo ""
-echo "### PSG SUMMARY pass=$pass fail=$fail (predicted pass=12 fail=0)"
+echo "### PSG SUMMARY pass=$pass fail=$fail (predicted pass=13 fail=0)"
 echo "### PSG per-arm verdicts:"
 for f in "$AOUT" "$BOUT" "$COUT"; do
   printf '###   %-28s %s\n' "$(basename "$f")" "$(grep -m1 '^### SMOKE [A-Z_]* binary=' "$f" 2>/dev/null || echo '<none>')"
