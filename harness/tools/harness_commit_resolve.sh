@@ -36,6 +36,29 @@
 # Guessing here would pin a three-hour relock to a harness nobody chose, so it
 # names both and refuses (law 9: never coerce an error to a default).
 set -uo pipefail
+
+# ---- THE WRITER HALF (reader/writer law) ------------------------------------
+# A file nobody writes is a fallback that never fires, so the submitter's half
+# lives in this same file and there is exactly one command to remember:
+#
+#   bash harness_commit_resolve.sh --write <job root> <sha>
+#
+# It REFUSES a sha that is not a commit in the harness repo. That check costs
+# nothing at SUBMIT time and is the only moment it is cheap: the alternative is
+# a three-hour relock refusing at its drift gate on a typo.
+if [ "${1:-}" = --write ]; then
+  JR=${2:?usage: harness_commit_resolve.sh --write <job root> <sha>}
+  SHA=${3:?usage: harness_commit_resolve.sh --write <job root> <sha>}
+  REPO=${HARNESS_REPO:-/oscar/data/stellex/glvov/agrescap/worktrees/harness-tools}
+  if ! git -C "$REPO" rev-parse --verify "${SHA}^{commit}" >/dev/null 2>&1; then
+    echo "### HARNESS_COMMIT WRITE REFUSED: '$SHA' is not a commit in $REPO" >&2
+    exit 2
+  fi
+  mkdir -p "$JR" || exit 2
+  printf '%s\n' "$SHA" > "$JR/HARNESS_COMMIT" || exit 2
+  echo "### HARNESS_COMMIT written: $JR/HARNESS_COMMIT = $SHA (no --export needed)"
+  exit 0
+fi
 JOB_ROOT="${1:-}"
 HC_FILE="${HARNESS_COMMIT_FILE:-}"
 [ -n "$HC_FILE" ] || { [ -n "$JOB_ROOT" ] && HC_FILE=$JOB_ROOT/HARNESS_COMMIT; }

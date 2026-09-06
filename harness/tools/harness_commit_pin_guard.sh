@@ -31,6 +31,9 @@
 #       commit that carried the defect, same fixture -- it cannot see the file
 #       and announces the drift check OFF.  Without this arm H proves nothing.
 #   J   the block carries the resolver's refusal to the template's own exit code.
+#   K   THE WRITER HALF: `--write <job root> <sha>` creates the file the reader
+#       reads, the two round-trip, and a sha that is not a commit in the harness
+#       repo is refused at SUBMIT time -- when it is cheap -- writing nothing.
 #
 # NOTHING IS RUN THAT COULD LOCK.  Each arm extracts ONLY the region between
 # `### HARNESS-DRIFT BEGIN` and `### HARNESS-DRIFT END`, prepends the two
@@ -178,6 +181,27 @@ for tpl in phaseN_relock.sh phaseN_cert.sh; do
     bad "J $tpl: rc=$rcJ, want $want; log: $(head -3 "$W/J-$tpl" | tr '\n' ' ')"
   fi
 done
+
+# ---- K: THE WRITER HALF -- a file nobody writes is a fallback that never fires
+KJR=$W/writejr
+wrc=$(bash "$RESOLVE" --write "$KJR" "$N2_OLD" > "$W/K1.log" 2>&1; echo $?)
+if [ "$wrc" = 0 ] && [ "$(cat "$KJR/HARNESS_COMMIT" 2>/dev/null)" = "$N2_OLD" ]; then
+  ok "K1: --write creates <job root>/HARNESS_COMMIT"
+else
+  bad "K1: --write rc=$wrc, file='$(cat "$KJR/HARNESS_COMMIT" 2>/dev/null)'"
+fi
+rrc=$(run_resolve "$W/K1r" -- "$KJR")
+if [ "$rrc" = 0 ] && [ "$(cat "$W/K1r.out")" = "$N2_OLD" ]; then
+  ok "K1: and the reader round-trips it -- writer and reader are the same file"
+else
+  bad "K1: round trip rc=$rrc out='$(cat "$W/K1r.out")'"
+fi
+wrc=$(bash "$RESOLVE" --write "$W/nope" deadbee0 > "$W/K2.log" 2>&1; echo $?)
+if [ "$wrc" = 2 ] && grep -q 'WRITE REFUSED' "$W/K2.log" && [ ! -f "$W/nope/HARNESS_COMMIT" ]; then
+  ok "K2: --write refuses a sha that is not a commit, at SUBMIT time, and writes nothing"
+else
+  bad "K2: rc=$wrc, log: $(cat "$W/K2.log")"
+fi
 
 echo "### MERGE-N-2 pin guard: pass=$pass fail=$fail"
 [ "$fail" = 0 ] || exit 1

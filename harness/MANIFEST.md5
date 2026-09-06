@@ -24,7 +24,7 @@ c9302fafd5ee1123a695bfef4dfcaf72  inode-cleanup/install_v2.sbatch
 a2deab8ba099cc7a3055dc5e4f74da50  instrumented/p6b_stamp.py
 cc3a5b8dbd993448f33cc6c0329df768  manifests/a3b/README.md
 5c116bc032f62e38e1a822b44284ef06  manifests/a3b/isaaclab-2.3x-pack.pixi.toml.a3b2only.diff
-cb117753b14c12c0f55deeb91e7a3dd0  phase_template/README.md
+5d5b822c3ed7e38e7f89b34e8edc9195  phase_template/README.md
 ff372fca5de0277efa02c3d65e1cea7e  phase_template/census_collation_guard.sh
 8cc39f42cf0dcda7c93878195cbac569  phase_template/cleanup.sh
 5f487a1032806e5a6f5b817e00e9b6d1  phase_template/cleanup_gated.sh
@@ -56,8 +56,8 @@ e09842a2b51059632dd6cae8e1263fae  tools/fixset_land_row.sh
 6fd8a3d08d3acd5db8e19ce290e7e8fa  tools/gate_build.sh
 de2c918a31b7e5fdae517cda1ccba4d4  tools/gate_head_pin.sh
 78f0ff8acec5a5036fd78e9cbe406ad3  tools/gate_head_pin_guard.sh
-6e3254f5fc183fa3aadfdc7d085b527c  tools/harness_commit_pin_guard.sh
-d23e264884ea6a644ea8d4d8c7bfc2a2  tools/harness_commit_resolve.sh
+6d465b9b66fcc7e08d8049bd0281d9fe  tools/harness_commit_pin_guard.sh
+13ed2134fbe344386ce4ea1c9391ab1c  tools/harness_commit_resolve.sh
 447037c0b4249d9d3d7c084940be5cc4  tools/harness_drift_allowlist.txt
 5941de23b36deaa3aa72d37cbc3a312b  tools/harness_drift_check.sh
 39e620e807735bdc65b09fb8078d8e82  tools/import_audit.py

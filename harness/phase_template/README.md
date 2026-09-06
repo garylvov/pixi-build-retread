@@ -810,3 +810,32 @@ becomes a 3 600 s timeout that kills the job**: that is exactly how `hlgd-proof`
 the outage explaining a uv lock timeout may only be visible from a different host
 than the job's. When a uv "waiting for lock" row is the last thing in a log,
 `wedge_triage.sh` prints the lockd view for you.
+
+## The harness pin travels in a FILE, not in `--export` (MERGE-N-2)
+
+`sbatch --export=ALL,HARNESS_COMMIT=<sha>` put jobs into
+`PD (user env retrieval failed requeued held)` in two consecutive merge lanes:
+Slurm re-runs the submitting user's login environment to build `ALL`, and when
+that retrieval times out the job is requeued **and held**. The job never starts,
+so nothing in its own log can say why. Job `5841188` was still sitting in that
+state while this was written.
+
+So the submitter writes the pin into a file the job owns, in the harness
+directory whose `artifacts/` the run already writes to:
+
+```
+bash tools/harness_commit_resolve.sh --write <harness dir> <sha>
+```
+
+It refuses a sha that is not a commit in the harness repo — at submit time,
+which is the only moment that check is cheap. Then submit with **no**
+`HARNESS_COMMIT` in `--export` at all. The `### HARNESS-DRIFT` block in both
+`phaseN_relock.sh` and `phaseN_cert.sh` reads the file first and falls back to
+the exported variable, so an existing caller that still exports keeps working.
+A file and an export that **disagree** refuse and name both values.
+
+Reader: `tools/harness_commit_pin_guard.sh`, whose acceptance arm runs each
+template's drift block with no exported pin at all and requires the drift check
+to run on the sha from the file, and whose mutation arm — pinned to the commit
+constant `6279978`, never `HEAD` — runs the same block from the commit that
+carried the defect and requires it to announce the check OFF.
