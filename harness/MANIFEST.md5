@@ -32,7 +32,7 @@ e893ee7f20e181181bb8205ab7edda0c  phase_template/cleanup_owner_guard.sh
 a2515c75fe18f95fda20b4d8156728ea  phase_template/leftover_check_guard.sh
 063ba387f091f6c66eb73ccdc632c70d  phase_template/link_mode_guard.sh
 2c7594f28f008b368dc95169229dd3c6  phase_template/phaseN_cert.sh
-c530d5bf2e5ae03bf2f9ba032e4caa94  phase_template/phaseN_relock.sh
+134bb21a37b555f27b90236d07923204  phase_template/phaseN_relock.sh
 5d5b822c3ed7e38e7f89b34e8edc9195  phase_template/README.md
 a465cea86edc07ad5adf9f96b1ebac9e  phase_template/wedge_triage_guard.sh
 c26805a4a64f89749fe352bf5aaa8381  phase_template/wedge_triage.sh
@@ -92,6 +92,8 @@ dd16a8c662b31dda554a2bdc052ba94d  tools/retread_fast_env.sh
 bdd93cc2798a27301e793bdc6931be06  tools/sdist_build_poison_guard.sh
 da8aed178eda8db9d349a23d784bd8b6  tools/sdist_build_scope_guard.sh
 1c3729ccc1e9ba22803430aee01dc279  tools/shard_mirror.py
+a1799a3a83422fd55c26a225973edd19  tools/store_reap_census_guard.sh
+c8492810d7efaffd05716687fd6ee218  tools/store_reap_census.sh
 4555925b41bc08ba5efb7bbb7b40f167  tools/test_stage_mirror.sh
 f4b1d2839ad51722d0f7a84b8482042b  tools/wheel_store_env_guard.sh
 955d184896115e611a763c60c490b5d8  tools/wheel_store_reclaim_guard.sh

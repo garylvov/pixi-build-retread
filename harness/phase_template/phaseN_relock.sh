@@ -825,6 +825,23 @@ cache_census() {
 echo "### persistent cache census BEFORE the lock (entry counts; du is banned here):"
 cache_census
 
+# --- STORE-REAP-2: the persistent-store census, the PRODUCTION READER of
+# `retread store-reap` -------------------------------------------------------
+# STORE-REAP-1-1 (law 2): the three persistent-store reapers have exactly one
+# caller, the backend's `initialize`, and the root IT resolves is job-scoped by
+# the ENV BLOCK above -- so the reapers can never reach the roots that actually
+# hold the over-age entries, and their capability had no reader that runs. This
+# is that reader. It is DRY RUN, it renames nothing, and the census script has
+# no way to be told otherwise (tools/store_reap_census_guard.sh asserts it).
+# Its rc is deliberately not checked: a census must never fail a relock.
+STORE_REAP_CENSUS=$(dirname "$0")/../tools/store_reap_census.sh
+[ -f "$STORE_REAP_CENSUS" ] || STORE_REAP_CENSUS=$T/tools/store_reap_census.sh
+if [ -f "$STORE_REAP_CENSUS" ]; then
+  BACKEND=$BACKEND bash "$STORE_REAP_CENSUS" "BEFORE LOCK"
+else
+  echo "### STORE-REAP CENSUS (BEFORE LOCK): SKIPPED -- no store_reap_census.sh beside this template nor at \$T/tools"
+fi
+
 ########## 3. LOCK ($EXPECT_ENVS envs, no pre-existing pixi.lock) ##########
 cd "$WS" || exit 5
 LLOG=$A/${TAG}-$J.lock.log
