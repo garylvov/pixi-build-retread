@@ -458,7 +458,8 @@ if [ "$WHICH" = all ] || [ "$WHICH" = B ]; then
     # sr2 bytes), every one of which re-raises correctly on a real failure.
     # PRECOND rows (the drift check, the harness-commit reader) are not
     # injected failures and do not count.
-    inj=$(grep -c '^PAYLOAD' "$rec/argv.log" 2>/dev/null || echo 0)
+    inj=0
+    [ -f "$rec/argv.log" ] && inj=$(grep -c "^PAYLOAD" "$rec/argv.log")
     if [ "${inj:-0}" -eq 0 ]; then
       echo "$rel" >> "$W/live_nopayload.txt"
       continue
