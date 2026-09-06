@@ -321,6 +321,9 @@ pub(crate) struct GitSnapshotReapReport {
     /// `true` when another process held the reap try-lock and this one backed
     /// off without scanning anything.
     pub(crate) skipped_concurrent: bool,
+    /// STORE-REAP-2. One element per selected entry, in scan order — the READER
+    /// half of a dry run, which must be able to NAME what it would move.
+    pub(crate) entries: Vec<crate::courier::ReapedEntry>,
 }
 
 /// C18-1, THE REAPER. Quarantine every entry that no lock has referenced for
@@ -339,10 +342,16 @@ pub(crate) struct GitSnapshotReapReport {
 /// 3. **It re-reads the age under the lock.** A hit can land between the scan
 ///    and the rename, so the stamp is re-stated after the entry lock is held
 ///    and an entry that became fresh in that window is kept.
+///
+/// STORE-REAP-2 adds `mode`: [`crate::courier::ReapMode::DryRun`] walks and
+/// decides exactly as `Apply` does and then does not `rename`, and creates no
+/// lock sidecar while doing it.
 pub(crate) fn reap_canonical_git_snapshot_store(
     store_root: &Path,
     max_age: std::time::Duration,
+    mode: crate::courier::ReapMode,
 ) -> Result<GitSnapshotReapReport> {
+    use crate::courier::ReapLockOutcome;
     let mut report = GitSnapshotReapReport::default();
     if max_age.is_zero() {
         return Ok(report);
@@ -354,26 +363,22 @@ pub(crate) fn reap_canonical_git_snapshot_store(
         return Ok(report);
     }
     let reap_lock_path = sources.join(GIT_SNAPSHOT_REAP_LOCK_NAME);
-    let reap_lock = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&reap_lock_path)
-        .with_context(|| {
-            format!(
-                "opening the git snapshot store reap lock {}",
-                reap_lock_path.display()
-            )
-        })?;
-    if !fs4::fs_std::FileExt::try_lock_exclusive(&reap_lock).unwrap_or(false) {
-        report.skipped_concurrent = true;
-        tracing::info!(
-            store = %store_root.display(),
-            "git_snapshot_store reap skipped=concurrent",
-        );
-        return Ok(report);
-    }
+    let _reap_lock = match crate::courier::take_reap_lock(&reap_lock_path, mode)? {
+        ReapLockOutcome::Held(lock) => Some(lock),
+        ReapLockOutcome::Absent => None,
+        // `take_reap_lock` returns Err rather than `Unopenable`, so this arm is
+        // its safe future-proofing: a store whose lock cannot be opened is a
+        // store this process must not reap, which is the same refusal.
+        ReapLockOutcome::Busy | ReapLockOutcome::Unopenable => {
+            report.skipped_concurrent = true;
+            tracing::info!(
+                store = %store_root.display(),
+                mode = mode.as_str(),
+                "git_snapshot_store reap skipped=concurrent",
+            );
+            return Ok(report);
+        }
+    };
     let quarantine_root = sources.join(GIT_SNAPSHOT_QUARANTINE);
     let now = std::time::SystemTime::now();
     // L3-1b-1a-1. EVERY generation directory, not just the current one. Same
@@ -424,21 +429,19 @@ pub(crate) fn reap_canonical_git_snapshot_store(
                     report.kept += 1;
                     continue;
                 };
-                let Ok(entry_lock) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .truncate(false)
-                    .read(true)
-                    .write(true)
-                    .open(&entry_lock_path)
-                else {
-                    report.kept += 1;
-                    continue;
+                let _entry_lock = match crate::courier::take_entry_lock(&entry_lock_path, mode) {
+                    ReapLockOutcome::Held(lock) => Some(lock),
+                    ReapLockOutcome::Absent => None,
+                    ReapLockOutcome::Unopenable => {
+                        report.kept += 1;
+                        continue;
+                    }
+                    ReapLockOutcome::Busy => {
+                        report.skipped_locked += 1;
+                        report.kept += 1;
+                        continue;
+                    }
                 };
-                if !fs4::fs_std::FileExt::try_lock_exclusive(&entry_lock).unwrap_or(false) {
-                    report.skipped_locked += 1;
-                    report.kept += 1;
-                    continue;
-                }
                 // Rule 3: re-state the age now that nobody else can publish here.
                 match git_snapshot_entry_age(&entry_dir, std::time::SystemTime::now()) {
                     Some(fresh) if fresh <= max_age => {
@@ -464,6 +467,33 @@ pub(crate) fn reap_canonical_git_snapshot_store(
                     "{version}-{identity}-{ref_state}-{stamp_unix}-{}",
                     std::process::id()
                 ));
+                let label = format!("{version}-{identity}-{ref_state}");
+                // STORE-REAP-2. THE DRY RUN STOPS HERE, one statement before the
+                // first thing that writes.
+                if mode.is_dry_run() {
+                    report.evicted += 1;
+                    if reason == REAP_REASON_STALE_VERSION {
+                        report.evicted_stale_version += 1;
+                    }
+                    report.entries.push(crate::courier::ReapedEntry {
+                        label: label.clone(),
+                        path: entry_dir.clone(),
+                        quarantine: None,
+                        age_days: age.as_secs() / 86_400,
+                        reason,
+                    });
+                    tracing::info!(
+                        version = %version,
+                        identity = %identity,
+                        ref_state = %ref_state,
+                        age_days = age.as_secs() / 86_400,
+                        max_age_days = max_age.as_secs() / 86_400,
+                        reason = reason,
+                        mode = mode.as_str(),
+                        "git_snapshot_store would-evict",
+                    );
+                    continue;
+                }
                 if let Err(error) = std::fs::create_dir_all(&quarantine_root) {
                     tracing::warn!(
                         store = %store_root.display(),
@@ -500,6 +530,13 @@ pub(crate) fn reap_canonical_git_snapshot_store(
                 if reason == REAP_REASON_STALE_VERSION {
                     report.evicted_stale_version += 1;
                 }
+                report.entries.push(crate::courier::ReapedEntry {
+                    label: label.clone(),
+                    path: entry_dir.clone(),
+                    quarantine: Some(quarantine.clone()),
+                    age_days: age.as_secs() / 86_400,
+                    reason,
+                });
                 // ONE ROW PER EVICTION, the `wheel_store evicted` shape.
                 tracing::info!(
                     version = %version,
@@ -509,6 +546,7 @@ pub(crate) fn reap_canonical_git_snapshot_store(
                     max_age_days = max_age.as_secs() / 86_400,
                     reason = reason,
                     quarantine = %quarantine.display(),
+                    mode = mode.as_str(),
                     "git_snapshot_store evicted",
                 );
             }
@@ -524,6 +562,7 @@ pub(crate) fn reap_canonical_git_snapshot_store(
         kept = report.kept,
         skipped_locked = report.skipped_locked,
         max_age_days = max_age.as_secs() / 86_400,
+        mode = mode.as_str(),
         "git_snapshot_store reap",
     );
     Ok(report)
@@ -580,7 +619,7 @@ pub(crate) fn reap_git_snapshot_store_once() {
         }
         let store_root = canonical_git_snapshot_store_root();
         let max_age = std::time::Duration::from_secs(days * 86_400);
-        if let Err(error) = reap_canonical_git_snapshot_store(&store_root, max_age) {
+        if let Err(error) = reap_canonical_git_snapshot_store(&store_root, max_age, crate::courier::ReapMode::Apply) {
             tracing::warn!(
                 store = %store_root.display(),
                 error = %error,
@@ -760,6 +799,9 @@ pub(crate) struct BuiltWheelReapReport {
     /// `true` when another process held the reap try-lock and this one backed
     /// off without scanning anything.
     pub(crate) skipped_concurrent: bool,
+    /// STORE-REAP-2. One element per selected entry, in scan order — the READER
+    /// half of a dry run, which must be able to NAME what it would move.
+    pub(crate) entries: Vec<crate::courier::ReapedEntry>,
 }
 
 /// L3-1b-1, THE REAPER. Quarantine every built-wheel entry no lock has
@@ -806,10 +848,16 @@ pub(crate) struct BuiltWheelReapReport {
 /// quarantine name — three injection points to save perhaps thirty lines, which
 /// is the abstraction this project's doctrine refuses. What IS shared is shared:
 /// the stamp helpers, the lock path, and the row shapes.
+///
+/// STORE-REAP-2 adds `mode`: [`crate::courier::ReapMode::DryRun`] walks and
+/// decides exactly as `Apply` does and then does not `rename`, and creates no
+/// lock sidecar while doing it.
 pub(crate) fn reap_built_wheel_store(
     store_root: &Path,
     max_age: std::time::Duration,
+    mode: crate::courier::ReapMode,
 ) -> Result<BuiltWheelReapReport> {
+    use crate::courier::ReapLockOutcome;
     let mut report = BuiltWheelReapReport::default();
     // MERGE-N-5. BOTH refusals emit the summary row before returning, and this
     // is MERGE-M-2's defect one store over -- boarded in the very commit that
@@ -834,6 +882,7 @@ pub(crate) fn reap_built_wheel_store(
             kept = 0,
             skipped_locked = 0,
             max_age_days = 0,
+            mode = mode.as_str(),
             reason = "disabled",
             "built_wheel_store reap",
         );
@@ -851,32 +900,29 @@ pub(crate) fn reap_built_wheel_store(
             kept = 0,
             skipped_locked = 0,
             max_age_days = max_age.as_secs() / 86_400,
+            mode = mode.as_str(),
             reason = "store-absent",
             "built_wheel_store reap",
         );
         return Ok(report);
     }
     let reap_lock_path = built_wheels.join(BUILT_WHEEL_REAP_LOCK_NAME);
-    let reap_lock = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&reap_lock_path)
-        .with_context(|| {
-            format!(
-                "opening the built-wheel store reap lock {}",
-                reap_lock_path.display()
-            )
-        })?;
-    if !fs4::fs_std::FileExt::try_lock_exclusive(&reap_lock).unwrap_or(false) {
-        report.skipped_concurrent = true;
-        tracing::info!(
-            store = %store_root.display(),
-            "built_wheel_store reap skipped=concurrent",
-        );
-        return Ok(report);
-    }
+    let _reap_lock = match crate::courier::take_reap_lock(&reap_lock_path, mode)? {
+        ReapLockOutcome::Held(lock) => Some(lock),
+        ReapLockOutcome::Absent => None,
+        // `take_reap_lock` returns Err rather than `Unopenable`, so this arm is
+        // its safe future-proofing: a store whose lock cannot be opened is a
+        // store this process must not reap, which is the same refusal.
+        ReapLockOutcome::Busy | ReapLockOutcome::Unopenable => {
+            report.skipped_concurrent = true;
+            tracing::info!(
+                store = %store_root.display(),
+                mode = mode.as_str(),
+                "built_wheel_store reap skipped=concurrent",
+            );
+            return Ok(report);
+        }
+    };
     let quarantine_root = built_wheels.join(BUILT_WHEEL_QUARANTINE);
     let now = std::time::SystemTime::now();
     let mut entries = Vec::new();
@@ -941,21 +987,19 @@ pub(crate) fn reap_built_wheel_store(
             report.kept += 1;
             continue;
         };
-        let Ok(entry_lock) = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&entry_lock_path)
-        else {
-            report.kept += 1;
-            continue;
+        let _entry_lock = match crate::courier::take_entry_lock(&entry_lock_path, mode) {
+            ReapLockOutcome::Held(lock) => Some(lock),
+            ReapLockOutcome::Absent => None,
+            ReapLockOutcome::Unopenable => {
+                report.kept += 1;
+                continue;
+            }
+            ReapLockOutcome::Busy => {
+                report.skipped_locked += 1;
+                report.kept += 1;
+                continue;
+            }
         };
-        if !fs4::fs_std::FileExt::try_lock_exclusive(&entry_lock).unwrap_or(false) {
-            report.skipped_locked += 1;
-            report.kept += 1;
-            continue;
-        }
         // Rule 3: re-state the age now that nobody else can publish here.
         match built_wheel_entry_age(&entry_dir, std::time::SystemTime::now()) {
             Some(fresh) if fresh <= max_age => {
@@ -974,6 +1018,30 @@ pub(crate) fn reap_built_wheel_store(
             .unwrap_or(0);
         let quarantine =
             quarantine_root.join(format!("{label}-{stamp_unix}-{}", std::process::id()));
+        // STORE-REAP-2. THE DRY RUN STOPS HERE, one statement before the first
+        // thing that writes.
+        if mode.is_dry_run() {
+            report.evicted += 1;
+            if reason == REAP_REASON_STALE_VERSION {
+                report.evicted_stale_version += 1;
+            }
+            report.entries.push(crate::courier::ReapedEntry {
+                label: label.clone(),
+                path: entry_dir.clone(),
+                quarantine: None,
+                age_days: age.as_secs() / 86_400,
+                reason,
+            });
+            tracing::info!(
+                entry = %label,
+                age_days = age.as_secs() / 86_400,
+                max_age_days = max_age.as_secs() / 86_400,
+                reason = reason,
+                mode = mode.as_str(),
+                "built_wheel_store would-evict",
+            );
+            continue;
+        }
         if let Err(error) = std::fs::create_dir_all(&quarantine_root) {
             tracing::warn!(
                 store = %store_root.display(),
@@ -1009,6 +1077,13 @@ pub(crate) fn reap_built_wheel_store(
         if reason == REAP_REASON_STALE_VERSION {
             report.evicted_stale_version += 1;
         }
+        report.entries.push(crate::courier::ReapedEntry {
+            label: label.clone(),
+            path: entry_dir.clone(),
+            quarantine: Some(quarantine.clone()),
+            age_days: age.as_secs() / 86_400,
+            reason,
+        });
         // ONE ROW PER EVICTION, the `git_snapshot_store evicted` shape.
         tracing::info!(
             entry = %label,
@@ -1016,6 +1091,7 @@ pub(crate) fn reap_built_wheel_store(
             max_age_days = max_age.as_secs() / 86_400,
             reason = reason,
             quarantine = %quarantine.display(),
+            mode = mode.as_str(),
             "built_wheel_store evicted",
         );
     }
@@ -1029,6 +1105,7 @@ pub(crate) fn reap_built_wheel_store(
         kept = report.kept,
         skipped_locked = report.skipped_locked,
         max_age_days = max_age.as_secs() / 86_400,
+        mode = mode.as_str(),
         "built_wheel_store reap",
     );
     Ok(report)
@@ -1101,7 +1178,7 @@ pub(crate) fn reap_built_wheel_store_once() {
         }
         let store_root = built_wheel_store_root();
         let max_age = std::time::Duration::from_secs(days * 86_400);
-        if let Err(error) = reap_built_wheel_store(&store_root, max_age) {
+        if let Err(error) = reap_built_wheel_store(&store_root, max_age, crate::courier::ReapMode::Apply) {
             tracing::warn!(
                 store = %store_root.display(),
                 error = %error,
@@ -15866,7 +15943,7 @@ version = "0.1.0"
         let absent = base.join("never-created");
         assert!(!absent.join(BUILT_WHEEL_CACHE_ROOT).exists());
         let (report, rows) =
-            with_captured_built_wheel_rows(|| reap_built_wheel_store(&absent, max_age));
+            with_captured_built_wheel_rows(|| reap_built_wheel_store(&absent, max_age, crate::courier::ReapMode::Apply));
         assert_eq!(
             report.expect("an absent store is not an error"),
             BuiltWheelReapReport::default(),
@@ -15896,7 +15973,7 @@ version = "0.1.0"
             Some(std::time::Duration::from_secs(3_600)),
         );
         let (off, rows) = with_captured_built_wheel_rows(|| {
-            reap_built_wheel_store(&store, std::time::Duration::ZERO)
+            reap_built_wheel_store(&store, std::time::Duration::ZERO, crate::courier::ReapMode::Apply)
         });
         assert_eq!(
             off.expect("max_age 0 is the OFF switch, not an error"),
@@ -15916,7 +15993,7 @@ version = "0.1.0"
         // printed, so arms 1 and 2 are not passing because the assertion is
         // trivially true of every input.
         let (populated, rows) =
-            with_captured_built_wheel_rows(|| reap_built_wheel_store(&store, max_age));
+            with_captured_built_wheel_rows(|| reap_built_wheel_store(&store, max_age, crate::courier::ReapMode::Apply));
         let populated = populated.expect("a populated store reaps");
         assert_eq!(populated.scanned, 1);
         assert_eq!(populated.evicted, 0);
@@ -15970,7 +16047,7 @@ version = "0.1.0"
         }
 
         let report =
-            reap_built_wheel_store(&store, std::time::Duration::from_secs(14 * 86_400))
+            reap_built_wheel_store(&store, std::time::Duration::from_secs(14 * 86_400), crate::courier::ReapMode::Apply)
                 .expect("the reaper must run");
 
         assert_eq!(
@@ -16040,14 +16117,14 @@ version = "0.1.0"
         // A second pass has nothing left to do: the reaper is idempotent and
         // cannot re-quarantine what it already moved, and must not walk into
         // the quarantine it created.
-        let again = reap_built_wheel_store(&store, std::time::Duration::from_secs(14 * 86_400))
+        let again = reap_built_wheel_store(&store, std::time::Duration::from_secs(14 * 86_400), crate::courier::ReapMode::Apply)
             .expect("second pass");
         assert_eq!(again.evicted, 0, "a second pass must evict nothing: {again:?}");
         assert_eq!(again.scanned, 3, "only the survivors remain: {again:?}");
 
         // max_age 0 is the documented OFF switch, and it must not evict what a
         // 14-day pass just kept.
-        let off = reap_built_wheel_store(&store, std::time::Duration::ZERO).expect("max_age 0");
+        let off = reap_built_wheel_store(&store, std::time::Duration::ZERO, crate::courier::ReapMode::Apply).expect("max_age 0");
         assert_eq!(off, BuiltWheelReapReport::default(), "0 must disable the reaper");
         assert!(fresh.join("pkg-1.0.0-py3-none-any.whl").is_file());
 
@@ -16140,7 +16217,7 @@ version = "0.1.0"
         );
 
         let (report, rows) =
-            with_captured_built_wheel_rows(|| reap_built_wheel_store(&store, max_age));
+            with_captured_built_wheel_rows(|| reap_built_wheel_store(&store, max_age, crate::courier::ReapMode::Apply));
         let report = report.expect("a two-generation store reaps");
 
         assert_eq!(
@@ -16288,7 +16365,7 @@ version = "0.1.0"
             );
         }
 
-        let report = reap_built_wheel_store(&store, max_age).expect("the reaper must run");
+        let report = reap_built_wheel_store(&store, max_age, crate::courier::ReapMode::Apply).expect("the reaper must run");
         assert_eq!(report.scanned, 3, "{report:?}");
         assert_eq!(report.evicted, 1, "only the over-age entry moves: {report:?}");
         assert_eq!(report.skipped_locked, 0, "{report:?}");
@@ -16358,7 +16435,7 @@ version = "0.1.0"
             reap_fixture_entry_in(&store, retired, "identity-a", "refs-fresh", Some(hour));
 
         let (report, rows) = with_captured_built_wheel_rows(|| {
-            reap_canonical_git_snapshot_store(&store, max_age)
+            reap_canonical_git_snapshot_store(&store, max_age, crate::courier::ReapMode::Apply)
         });
         let report = report.expect("a two-generation snapshot store reaps");
 
@@ -16454,7 +16531,7 @@ version = "0.1.0"
             .open(built_wheels.join(BUILT_WHEEL_REAP_LOCK_NAME))
             .expect("reap lock");
         assert!(fs4::fs_std::FileExt::try_lock_exclusive(&held).unwrap_or(false));
-        let backed_off = reap_built_wheel_store(&store, std::time::Duration::from_secs(86_400))
+        let backed_off = reap_built_wheel_store(&store, std::time::Duration::from_secs(86_400), crate::courier::ReapMode::Apply)
             .expect("a held store lock is not an error");
         assert!(backed_off.skipped_concurrent, "{backed_off:?}");
         assert_eq!(backed_off.scanned, 0, "a backed-off reaper scans nothing: {backed_off:?}");
@@ -16473,7 +16550,7 @@ version = "0.1.0"
             .open(&entry_lock_path)
             .expect("entry lock");
         assert!(fs4::fs_std::FileExt::try_lock_exclusive(&entry_held).unwrap_or(false));
-        let skipped = reap_built_wheel_store(&store, std::time::Duration::from_secs(86_400))
+        let skipped = reap_built_wheel_store(&store, std::time::Duration::from_secs(86_400), crate::courier::ReapMode::Apply)
             .expect("a held entry lock is not an error");
         assert_eq!(skipped.scanned, 1, "{skipped:?}");
         assert_eq!(skipped.skipped_locked, 1, "a live publish must be SKIPPED: {skipped:?}");
@@ -16484,7 +16561,7 @@ version = "0.1.0"
 
         // With neither lock held the same entry goes, so neither arm above was
         // vacuous.
-        let done = reap_built_wheel_store(&store, std::time::Duration::from_secs(86_400))
+        let done = reap_built_wheel_store(&store, std::time::Duration::from_secs(86_400), crate::courier::ReapMode::Apply)
             .expect("unlocked pass");
         assert_eq!(done.evicted, 1, "{done:?}");
         assert!(!stale.exists());
@@ -16530,6 +16607,7 @@ version = "0.1.0"
         let report = reap_canonical_git_snapshot_store(
             &store,
             std::time::Duration::from_secs(14 * 86_400),
+            crate::courier::ReapMode::Apply,
         )
         .expect("the reaper must run");
 
@@ -16587,6 +16665,7 @@ version = "0.1.0"
         let again = reap_canonical_git_snapshot_store(
             &store,
             std::time::Duration::from_secs(14 * 86_400),
+            crate::courier::ReapMode::Apply,
         )
         .expect("second pass");
         assert_eq!(again.evicted, 0, "a second pass must evict nothing: {again:?}");
@@ -16594,7 +16673,7 @@ version = "0.1.0"
 
         // max_age 0 is the documented OFF switch, and it must not evict the
         // entries a 14-day pass just kept.
-        let off = reap_canonical_git_snapshot_store(&store, std::time::Duration::ZERO)
+        let off = reap_canonical_git_snapshot_store(&store, std::time::Duration::ZERO, crate::courier::ReapMode::Apply)
             .expect("max_age 0");
         assert_eq!(off, GitSnapshotReapReport::default(), "0 must disable the reaper");
         assert!(fresh.join("repo").join("base.txt").is_file());
@@ -16635,6 +16714,7 @@ version = "0.1.0"
         let report = reap_canonical_git_snapshot_store(
             &store,
             std::time::Duration::from_secs(14 * 86_400),
+            crate::courier::ReapMode::Apply,
         )
         .expect("a contended reap is not an error");
         assert!(
@@ -16651,6 +16731,7 @@ version = "0.1.0"
         let after = reap_canonical_git_snapshot_store(
             &store,
             std::time::Duration::from_secs(14 * 86_400),
+            crate::courier::ReapMode::Apply,
         )
         .expect("an uncontended reap");
         assert!(!after.skipped_concurrent);
@@ -16690,6 +16771,7 @@ version = "0.1.0"
         let report = reap_canonical_git_snapshot_store(
             &store,
             std::time::Duration::from_secs(14 * 86_400),
+            crate::courier::ReapMode::Apply,
         )
         .expect("reap");
         assert_eq!(
@@ -16707,6 +16789,7 @@ version = "0.1.0"
         let after = reap_canonical_git_snapshot_store(
             &store,
             std::time::Duration::from_secs(14 * 86_400),
+            crate::courier::ReapMode::Apply,
         )
         .expect("reap again");
         assert_eq!(after.skipped_locked, 0);
@@ -16796,6 +16879,7 @@ version = "0.1.0"
         let report = reap_canonical_git_snapshot_store(
             &store,
             std::time::Duration::from_secs(14 * 86_400),
+            crate::courier::ReapMode::Apply,
         )
         .expect("reap");
         assert_eq!(

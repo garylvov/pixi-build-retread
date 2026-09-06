@@ -78,6 +78,26 @@ async fn async_main() -> anyhow::Result<()> {
         return run_migrate_overrides(&argv[2..]);
     }
 
+    // `retread store-reap [--store built-wheels|git-snapshots|shadow|all]
+    //                     [--root <dir>]... [--dry-run|--apply]
+    //                     [--max-age-days <n>] [--bytes]`
+    //
+    // STORE-REAP-2, and it exists because of law 2. The three persistent-store
+    // reapers had no production caller that could ever reach a persistent
+    // store: the only call site is the backend's `initialize`, and every
+    // relock this harness runs job-scopes `XDG_CACHE_HOME`, so the root that
+    // resolves is empty by construction and deleted by the job's cleanup.
+    // This is the reap-only invocation `p6v_lock_reap.sh` had the shape of.
+    //
+    // IT IS A DRY RUN UNLESS `--apply` IS TYPED. A dry run walks and decides
+    // with the SAME code -- `courier::ReapMode` is a parameter of the reapers,
+    // not a second walk -- and then creates nothing and renames nothing.
+    if matches!(argv.get(1).map(String::as_str), Some("store-reap")) {
+        let args = pixi_build_retread::store_reap::parse_args(&argv[2..])?;
+        let code = pixi_build_retread::store_reap::run(&args)?;
+        std::process::exit(code);
+    }
+
     // `retread path-source-refresh` -- the operator-facing half of
     // `retread-path-source-metadata`. The pack's `path-sources/<project>.toml`
     // record is the SOURCE OF TRUTH, and every backend initialize refuses when

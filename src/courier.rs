@@ -452,6 +452,13 @@ pub(crate) fn git_snapshot_store_root_with(
 /// `RETREAD_WHEEL_STORE` branch in front and does not filter an empty
 /// `XDG_CACHE_HOME`, so folding it in here would change its behaviour on an
 /// empty variable. One formula per behaviour, not one formula per resemblance.
+/// STORE-REAP-2. The persistent root a process with THIS environment would
+/// resolve — the default `--root` of `retread store-reap`, so the verb can
+/// never name a location the product itself would not have used.
+pub fn persistent_store_root() -> std::path::PathBuf {
+    persistent_store_root_with(&|key| std::env::var(key).ok())
+}
+
 pub(crate) fn persistent_store_root_with(
     env: &dyn Fn(&str) -> Option<String>,
 ) -> std::path::PathBuf {
@@ -506,7 +513,7 @@ pub fn expand_wheel_store_path(recorded: &str) -> std::path::PathBuf {
 /// was `nvidia_cudnn_cu12` twice at 42.0 s and 42.2 s, `nvidia_cusparse_cu12`
 /// twice, `nvidia_cusolver_cu12` twice and `nvidia_cufft_cu12` twice, in one
 /// cold lock, for byte-identical outputs.
-fn shadow_cache_dir_in(cache_root: &Path) -> PathBuf {
+pub(crate) fn shadow_cache_dir_in(cache_root: &Path) -> PathBuf {
     cache_root.join("shadow")
 }
 
@@ -708,6 +715,136 @@ pub(crate) fn touch_shadow_use_stamp(entry: &Path) {
     }
 }
 
+// ── STORE-REAP-2: one mode word, shared by all three reapers ────────────────
+
+/// STORE-REAP-2. Whether a reap ACTS or only says what it would do.
+///
+/// It is a parameter of the reapers themselves, and NOT a second walk in the
+/// `store-reap` verb, deliberately. A dry run whose scan is a separate
+/// implementation of the eviction rule is a dry run that can disagree with the
+/// thing it is predicting — and the first time it did, the disagreement would
+/// read as a store that moved. One walk, one age rule, one lock discipline,
+/// one set of reasons; the mode decides only whether the `rename` happens.
+///
+/// [`ReapMode::DryRun`] is READ-ONLY BY CONSTRUCTION, which is stronger than
+/// "does not rename": it never CREATES anything either. The apply path opens
+/// both the store-wide reap lock and each entry's writer lock with
+/// `create(true)`, so a dry run that reused it would leave zero-byte sidecars
+/// scattered through a store it promised not to touch. A dry run opens both
+/// with `create(false)` instead and reads an absent sidecar as "nobody holds
+/// this", which is exactly what an absent lock file means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReapMode {
+    /// Quarantine what the rules select.
+    Apply,
+    /// Name what the rules select and change nothing.
+    DryRun,
+}
+
+impl ReapMode {
+    /// The word that goes in a log row, so `apply` and `dry-run` rows can never
+    /// be confused by a reader counting evictions out of a job log.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReapMode::Apply => "apply",
+            ReapMode::DryRun => "dry-run",
+        }
+    }
+
+    pub fn is_dry_run(self) -> bool {
+        matches!(self, ReapMode::DryRun)
+    }
+}
+
+/// STORE-REAP-2. One entry a reap selected, so a caller can print a row per
+/// eviction and a guard can assert on the set rather than only on a count.
+///
+/// The READER half of the dry run: a summary that says `would_evict=50` and
+/// cannot name the fifty is not a proposal an operator can vet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReapedEntry {
+    /// The reaper's own label for the entry — the same string its log row
+    /// carries and the stem of its quarantine directory.
+    pub(crate) label: String,
+    /// Where the entry is (dry run) or was (apply).
+    pub(crate) path: std::path::PathBuf,
+    /// Where it was renamed to. `None` in a dry run, ALWAYS, and a guard reads
+    /// that: a dry-run report carrying a quarantine path is a dry run that
+    /// moved something.
+    pub(crate) quarantine: Option<std::path::PathBuf>,
+    pub(crate) age_days: u64,
+    pub(crate) reason: &'static str,
+}
+
+/// STORE-REAP-2. What taking a reaper's store-wide try-lock produced.
+pub(crate) enum ReapLockOutcome {
+    /// The lock is ours for the life of the returned handle.
+    Held(std::fs::File),
+    /// Dry run only: the lock sidecar does not exist, so no reaper has ever
+    /// run in this store and nobody can be holding it. Proceed without
+    /// creating it — creating it would be the mutation a dry run promises not
+    /// to make.
+    Absent,
+    /// Somebody else is reaping. Back off; never wait.
+    Busy,
+    /// The lock could not be OPENED at all (permissions, a vanished entry).
+    /// The pre-STORE-REAP-2 apply path kept such an entry WITHOUT counting it
+    /// as `skipped_locked`, and that distinction is preserved here rather than
+    /// folded into `Busy`: "a writer holds it" and "I cannot look" are
+    /// different facts and a housekeeping counter that conflates them lies.
+    Unopenable,
+}
+
+/// STORE-REAP-2. THE ONE PLACE a reaper's store-wide try-lock is taken, so the
+/// "never blocking, never creating in a dry run" rule is one implementation
+/// rather than three. Never blocks in either mode.
+pub(crate) fn take_reap_lock(path: &Path, mode: ReapMode) -> anyhow::Result<ReapLockOutcome> {
+    let opened = std::fs::OpenOptions::new()
+        .create(!mode.is_dry_run())
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path);
+    let lock = match opened {
+        Ok(file) => file,
+        Err(error) if mode.is_dry_run() && error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ReapLockOutcome::Absent);
+        }
+        Err(error) => {
+            return Err(anyhow::Error::new(error)
+                .context(format!("opening the reap lock {}", path.display())));
+        }
+    };
+    if !fs4::fs_std::FileExt::try_lock_exclusive(&lock).unwrap_or(false) {
+        return Ok(ReapLockOutcome::Busy);
+    }
+    Ok(ReapLockOutcome::Held(lock))
+}
+
+/// STORE-REAP-2. The per-ENTRY writer lock, same discipline: try, never wait,
+/// and never create it in a dry run. `Ok(None)` means "treat as unlocked".
+pub(crate) fn take_entry_lock(path: &Path, mode: ReapMode) -> ReapLockOutcome {
+    let opened = std::fs::OpenOptions::new()
+        .create(!mode.is_dry_run())
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path);
+    match opened {
+        Ok(lock) => {
+            if fs4::fs_std::FileExt::try_lock_exclusive(&lock).unwrap_or(false) {
+                ReapLockOutcome::Held(lock)
+            } else {
+                ReapLockOutcome::Busy
+            }
+        }
+        Err(error) if mode.is_dry_run() && error.kind() == std::io::ErrorKind::NotFound => {
+            ReapLockOutcome::Absent
+        }
+        Err(_) => ReapLockOutcome::Unopenable,
+    }
+}
+
 /// What the reaper did, so a caller can print it and a guard can assert on it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ShadowReapReport {
@@ -717,6 +854,8 @@ pub(crate) struct ShadowReapReport {
     /// `true` when another process held the reap try-lock and this one backed
     /// off without scanning anything.
     pub(crate) skipped_concurrent: bool,
+    /// STORE-REAP-2. One element per selected entry, in scan order.
+    pub(crate) entries: Vec<ReapedEntry>,
 }
 
 /// L3-1b, THE REAPER. Quarantine every shadow entry no lock has referenced for
@@ -744,9 +883,14 @@ pub(crate) struct ShadowReapReport {
 /// project's doctrine refuses. What IS shared is the SHAPE: the same rule
 /// numbering, the same `.used` suffix, the same non-blocking try-lock, one row
 /// per eviction and one summary row.
+///
+/// STORE-REAP-2 adds `mode`: [`ReapMode::DryRun`] walks and decides exactly as
+/// [`ReapMode::Apply`] does and then does not `rename`. See [`ReapMode`] for
+/// why the dry run is this parameter and not a second walk somewhere else.
 pub(crate) fn reap_shadow_cache_store(
     shadow_dir: &Path,
     max_age: std::time::Duration,
+    mode: ReapMode,
 ) -> anyhow::Result<ShadowReapReport> {
     let mut report = ShadowReapReport::default();
     // MERGE-M-2. BOTH refusals emit the summary row before returning, and the
@@ -769,6 +913,7 @@ pub(crate) fn reap_shadow_cache_store(
             evicted = 0,
             kept = 0,
             max_age_days = 0,
+            mode = mode.as_str(),
             reason = "disabled",
             "shadow_cache_store reap",
         );
@@ -781,32 +926,29 @@ pub(crate) fn reap_shadow_cache_store(
             evicted = 0,
             kept = 0,
             max_age_days = max_age.as_secs() / 86_400,
+            mode = mode.as_str(),
             reason = "store-absent",
             "shadow_cache_store reap",
         );
         return Ok(report);
     }
     let reap_lock_path = shadow_dir.join(SHADOW_REAP_LOCK_NAME);
-    let reap_lock = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&reap_lock_path)
-        .with_context(|| {
-            format!(
-                "opening the shadow cache reap lock {}",
-                reap_lock_path.display()
-            )
-        })?;
-    if !fs4::fs_std::FileExt::try_lock_exclusive(&reap_lock).unwrap_or(false) {
-        report.skipped_concurrent = true;
-        tracing::info!(
-            store = %shadow_dir.display(),
-            "shadow_cache_store reap skipped=concurrent",
-        );
-        return Ok(report);
-    }
+    let _reap_lock = match take_reap_lock(&reap_lock_path, mode)? {
+        ReapLockOutcome::Held(lock) => Some(lock),
+        ReapLockOutcome::Absent => None,
+        // `take_reap_lock` returns Err rather than `Unopenable`, so this arm is
+        // its safe future-proofing: a store whose lock cannot be opened is a
+        // store this process must not reap, which is the same refusal.
+        ReapLockOutcome::Busy | ReapLockOutcome::Unopenable => {
+            report.skipped_concurrent = true;
+            tracing::info!(
+                store = %shadow_dir.display(),
+                mode = mode.as_str(),
+                "shadow_cache_store reap skipped=concurrent",
+            );
+            return Ok(report);
+        }
+    };
     let quarantine_root = shadow_dir.join("quarantine");
     let now = std::time::SystemTime::now();
     let mut names: Vec<String> = Vec::new();
@@ -864,6 +1006,30 @@ pub(crate) fn reap_shadow_cache_store(
             .unwrap_or(0);
         let quarantine =
             quarantine_root.join(format!("{name}-{stamp_unix}-{}", std::process::id()));
+        // STORE-REAP-2. THE DRY RUN STOPS HERE, one statement before the first
+        // thing that writes: the entry has been scanned, aged, re-aged and
+        // selected by exactly the rules the apply path uses, and the only
+        // difference from here on is that nothing is created and nothing is
+        // renamed.
+        if mode.is_dry_run() {
+            report.evicted += 1;
+            report.entries.push(ReapedEntry {
+                label: name.clone(),
+                path: entry_path.clone(),
+                quarantine: None,
+                age_days: age.as_secs() / 86_400,
+                reason: "unreferenced",
+            });
+            tracing::info!(
+                entry = %name,
+                age_days = age.as_secs() / 86_400,
+                max_age_days = max_age.as_secs() / 86_400,
+                reason = "unreferenced",
+                mode = mode.as_str(),
+                "shadow_cache_store would-evict",
+            );
+            continue;
+        }
         if let Err(error) = std::fs::create_dir_all(&quarantine_root) {
             tracing::warn!(
                 store = %shadow_dir.display(),
@@ -889,6 +1055,13 @@ pub(crate) fn reap_shadow_cache_store(
             let _ = std::fs::remove_file(stamp);
         }
         report.evicted += 1;
+        report.entries.push(ReapedEntry {
+            label: name.clone(),
+            path: entry_path.clone(),
+            quarantine: Some(quarantine.clone()),
+            age_days: age.as_secs() / 86_400,
+            reason: "unreferenced",
+        });
         // ONE ROW PER EVICTION, the `wheel_store evicted` / `git_snapshot_store
         // evicted` shape.
         tracing::info!(
@@ -897,6 +1070,7 @@ pub(crate) fn reap_shadow_cache_store(
             max_age_days = max_age.as_secs() / 86_400,
             reason = "unreferenced",
             quarantine = %quarantine.display(),
+            mode = mode.as_str(),
             "shadow_cache_store evicted",
         );
     }
@@ -906,6 +1080,7 @@ pub(crate) fn reap_shadow_cache_store(
         evicted = report.evicted,
         kept = report.kept,
         max_age_days = max_age.as_secs() / 86_400,
+        mode = mode.as_str(),
         "shadow_cache_store reap",
     );
     Ok(report)
@@ -938,7 +1113,7 @@ pub(crate) fn reap_shadow_cache_store_once() {
         }
         let shadow_dir = shadow_cache_dir();
         let max_age = std::time::Duration::from_secs(days * 86_400);
-        if let Err(error) = reap_shadow_cache_store(&shadow_dir, max_age) {
+        if let Err(error) = reap_shadow_cache_store(&shadow_dir, max_age, ReapMode::Apply) {
             tracing::warn!(
                 store = %shadow_dir.display(),
                 error = %error,
@@ -4824,17 +4999,31 @@ mod tests {
         age_path_days(&sidecar, 30);
 
         let report =
-            reap_shadow_cache_store(&shadow, std::time::Duration::from_secs(14 * 86_400)).unwrap();
+            reap_shadow_cache_store(&shadow, std::time::Duration::from_secs(14 * 86_400), ReapMode::Apply).unwrap();
+        // STORE-REAP-2: the report now carries the SET as well as the counts,
+        // so the assertion is on both. It was one `assert_eq!` against a whole
+        // struct literal; a quarantine path carries a unix stamp and a pid, so
+        // the literal cannot name it -- the counts are compared exactly and the
+        // entries are compared by (label, reason), which is strictly MORE than
+        // the struct literal checked.
         assert_eq!(
-            report,
-            ShadowReapReport {
-                scanned: 2,
-                evicted: 1,
-                kept: 1,
-                skipped_concurrent: false,
-            },
+            (report.scanned, report.evicted, report.kept, report.skipped_concurrent),
+            (2, 1, 1, false),
             "only published .changed/.same files are entries, and only the \
              unreferenced stale one is evicted",
+        );
+        assert_eq!(
+            report
+                .entries
+                .iter()
+                .map(|entry| (entry.label.as_str(), entry.reason))
+                .collect::<Vec<_>>(),
+            vec![("aaaa.changed", "unreferenced")],
+            "the evicted set is NAMED, not merely counted",
+        );
+        assert!(
+            report.entries.iter().all(|entry| entry.quarantine.is_some()),
+            "an APPLIED eviction records where it was moved to",
         );
         assert!(!stale.exists(), "the stale entry left the cache directory");
         assert!(referenced.is_file(), "a referenced entry is never evicted");
@@ -4876,7 +5065,7 @@ mod tests {
         age_path_days(&stale, 30);
 
         // max_age = 0 DISABLES the reaper: nothing scanned, nothing evicted.
-        let off = reap_shadow_cache_store(&shadow, std::time::Duration::ZERO).unwrap();
+        let off = reap_shadow_cache_store(&shadow, std::time::Duration::ZERO, ReapMode::Apply).unwrap();
         assert_eq!(off, ShadowReapReport::default());
         assert!(stale.is_file());
 
@@ -4891,16 +5080,12 @@ mod tests {
             .unwrap();
         assert!(fs4::fs_std::FileExt::try_lock_exclusive(&held).unwrap());
         let busy =
-            reap_shadow_cache_store(&shadow, std::time::Duration::from_secs(14 * 86_400)).unwrap();
+            reap_shadow_cache_store(&shadow, std::time::Duration::from_secs(14 * 86_400), ReapMode::Apply).unwrap();
         assert_eq!(
-            busy,
-            ShadowReapReport {
-                scanned: 0,
-                evicted: 0,
-                kept: 0,
-                skipped_concurrent: true,
-            },
+            (busy.scanned, busy.evicted, busy.kept, busy.skipped_concurrent),
+            (0, 0, 0, true),
         );
+        assert!(busy.entries.is_empty(), "a backed-off reaper names nothing");
         assert!(stale.is_file(), "a backed-off reaper evicts nothing");
         assert!(!shadow.join("quarantine").exists());
 
@@ -4909,7 +5094,7 @@ mod tests {
         fs4::fs_std::FileExt::unlock(&held).unwrap();
         drop(held);
         let freed =
-            reap_shadow_cache_store(&shadow, std::time::Duration::from_secs(14 * 86_400)).unwrap();
+            reap_shadow_cache_store(&shadow, std::time::Duration::from_secs(14 * 86_400), ReapMode::Apply).unwrap();
         assert_eq!(freed.evicted, 1);
         assert!(!stale.exists());
         let _ = std::fs::remove_dir_all(&tmp);
@@ -4973,7 +5158,7 @@ mod tests {
         // (1) THE STORE DOES NOT EXIST YET -- a cold job, every time.
         let absent = tmp.join("never-created");
         assert!(!absent.exists());
-        let (report, rows) = with_captured_rows(|| reap_shadow_cache_store(&absent, max_age));
+        let (report, rows) = with_captured_rows(|| reap_shadow_cache_store(&absent, max_age, ReapMode::Apply));
         assert_eq!(
             report.unwrap(),
             ShadowReapReport::default(),
@@ -4998,7 +5183,7 @@ mod tests {
         let live = tmp.join("shadow");
         std::fs::create_dir_all(&live).unwrap();
         let (off, rows) =
-            with_captured_rows(|| reap_shadow_cache_store(&live, std::time::Duration::ZERO));
+            with_captured_rows(|| reap_shadow_cache_store(&live, std::time::Duration::ZERO, ReapMode::Apply));
         assert_eq!(off.unwrap(), ShadowReapReport::default());
         let joined = rows.join("");
         assert!(
@@ -5011,7 +5196,7 @@ mod tests {
         // trivially true of every input.
         let entry = live.join("eeee.changed");
         std::fs::write(&entry, b"fresh-bytes").unwrap();
-        let (populated, rows) = with_captured_rows(|| reap_shadow_cache_store(&live, max_age));
+        let (populated, rows) = with_captured_rows(|| reap_shadow_cache_store(&live, max_age, ReapMode::Apply));
         let populated = populated.unwrap();
         assert_eq!(populated.scanned, 1);
         assert_eq!(populated.evicted, 0);
