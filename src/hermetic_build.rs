@@ -549,6 +549,52 @@ async fn solve_hermetic_with_cuda_fallback(
     Ok((solved, cuda_version))
 }
 
+/// THE CACHE-HIT ARM OF [`provision_for_solve`], as ONE named thing a guard can
+/// drive. Behaviour is byte-for-byte what `provision_for_solve` inlined before
+/// DET-1-FIX; only the seam is new, and it exists because law 3 had no other
+/// way to reach this code.
+///
+/// Two obligations, and only one of them was guarded. An entry that VALIDATED
+/// is handed back AND its `.used` sidecar is refreshed: a persistent store must
+/// be able to tell "nobody has wanted this for 14 days" from "published 14 days
+/// ago and used every day since", and this is the ONLY writer of that sidecar
+/// for the hermetic environment store — without it
+/// [`crate::source_build::HERMETIC_ENVIRONMENT_STORE_SPEC`]'s reaper quarantines
+/// an environment that is in daily use on day fifteen. An entry that did NOT
+/// validate is a STALE CACHE about to be evicted and re-provisioned by the
+/// caller (markers record absolute paths, and an entry reached through a cache
+/// root that has since been deleted dead-ends every consumer forever with
+/// "canonicalizing rattler work directory ...: No such file or directory"); the
+/// caller holds the exclusive tuple lock, so eviction is safe — and that arm
+/// must NOT stamp, because a stamp there keeps a dead entry alive for another
+/// whole horizon.
+///
+/// MEASURED, and the reason this function exists: mutation arm M6 of
+/// `det1-work/det1_mutations3.sh` deleted the `touch_use_stamp` call from the
+/// inlined hit arm and det1-mut3 5983139 printed `14 passed; 0 failed` — every
+/// named guard of both halves of this landing green with the stamp gone.
+fn accept_cache_hit(
+    cache_dir: &Path,
+    validated: Result<HermeticBuildEnvironment>,
+) -> Option<HermeticBuildEnvironment> {
+    match validated {
+        Ok(environment) => {
+            // Best-effort, a sidecar, and never a write inside the entry.
+            crate::source_build::touch_use_stamp(cache_dir);
+            Some(environment)
+        }
+        Err(error) => {
+            tracing::warn!(
+                cache = %cache_dir.display(),
+                error = %format!("{error:#}"),
+                "hermetic build environment cache failed validation; \
+                 evicting and re-provisioning",
+            );
+            None
+        }
+    }
+}
+
 /// Provision (or reuse) the tuple identified by one already-completed solve.
 async fn provision_for_solve(
     target_floor: (u32, u32),
@@ -605,33 +651,9 @@ async fn provision_for_solve(
                         .with_context(|| format!("parsing {}", marker_path.display()))
                 })
                 .and_then(|marker| validate_marker(&cache_dir, &request, &marker));
-            match cached {
-                Ok(environment) => {
-                    // THE HIT ARM, and the reader half of the reaper: a store
-                    // that is persistent must be able to tell "nobody has
-                    // wanted this for 14 days" from "published 14 days ago and
-                    // used every day since". Best-effort, a sidecar, and never
-                    // a write inside the entry.
-                    crate::source_build::touch_use_stamp(&cache_dir);
-                    bench("cache-hit");
-                    return Ok(environment);
-                }
-                Err(error) => {
-                    // A cached tuple that no longer validates is a STALE CACHE,
-                    // not a fatal condition: markers record absolute paths, and
-                    // an entry copied from (or reached through) a cache root
-                    // that has since been deleted dead-ends every consumer
-                    // forever ("canonicalizing rattler work directory ...: No
-                    // such file or directory"). We hold the exclusive tuple
-                    // lock, so evict and re-provision below exactly like a
-                    // markerless interrupted setup.
-                    tracing::warn!(
-                        cache = %cache_dir.display(),
-                        error = %format!("{error:#}"),
-                        "hermetic build environment cache failed validation; \
-                         evicting and re-provisioning",
-                    );
-                }
+            if let Some(environment) = accept_cache_hit(&cache_dir, cached) {
+                bench("cache-hit");
+                return Ok(environment);
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -4594,6 +4616,64 @@ Error:   × Failed to resolve dependencies\n\
                 .starts_with("env-"),
             "the identity leaf keeps its `env-` prefix",
         );
+
+        // DET-1-FIX, THE WRITER HALF AT THIS VERY LEAF, added as a FIXTURE
+        // here rather than as a new `#[test]` because the location asserted
+        // above is only worth asserting BECAUSE the reaper walks it and ages
+        // each entry from a `.used` sidecar beside it. The hit arm is the sole
+        // writer of that sidecar for this store, and mutation arm M6 deleted
+        // the write with all fourteen guards of this landing still green
+        // (det1-mut3 5983139: `14 passed; 0 failed`). Both fates, because the
+        // stamp is WRONG on one of them: an entry that validated is stamped,
+        // an entry that was REJECTED is about to be evicted and must not be —
+        // stamping it would buy a dead entry another whole horizon.
+        std::fs::create_dir_all(&leaf).unwrap();
+        let stamp = crate::source_build::use_stamp_path(&leaf).unwrap();
+        assert!(
+            !stamp.exists(),
+            "the fixture must start with no stamp, or it proves nothing: {}",
+            stamp.display(),
+        );
+        let environment = HermeticBuildEnvironment {
+            activation_script: leaf.join("build_env.sh"),
+            build_prefix: leaf.join("build"),
+            host_prefix: leaf.join("host"),
+            python_executable: leaf.join("host/bin/python"),
+            c_compiler: leaf.join("build/bin/cc"),
+            cxx_compiler: leaf.join("build/bin/c++"),
+            sysroot_path: leaf.join("build/sysroot"),
+            cuda_executable: None,
+            selected_sysroot: (2, 28),
+            platform_tag: platform_tag((2, 28)),
+            toolchain_digest: "a".repeat(64),
+            gcc_major: 13,
+        };
+        assert!(
+            accept_cache_hit(&leaf, Ok(environment)).is_some(),
+            "a validated entry must be handed back to the caller",
+        );
+        assert!(
+            stamp.is_file(),
+            "the cache-hit arm did not write the `.used` sidecar the reaper ages from; \
+             an environment used every day would be quarantined on day fifteen: {}",
+            stamp.display(),
+        );
+
+        let rejected = root.join("rejected-entry");
+        std::fs::create_dir_all(&rejected).unwrap();
+        assert!(
+            accept_cache_hit(&rejected, Err(anyhow!("marker does not match the cache tuple")))
+                .is_none(),
+            "an entry that failed validation must not be handed back",
+        );
+        assert!(
+            !crate::source_build::use_stamp_path(&rejected)
+                .unwrap()
+                .exists(),
+            "an entry about to be EVICTED was stamped; the stamp would keep it alive \
+             for another whole horizon",
+        );
+
         std::fs::remove_dir_all(&root).ok();
     }
 
