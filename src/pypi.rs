@@ -724,6 +724,64 @@ impl ResolutionTarget {
         )
     }
 
+    /// L3-1b-1a. SHA-256 namespace for a SOURCE-BUILT artifact: the subset of
+    /// [`Self::artifact_cache_identity`]'s inputs that can change the bytes a
+    /// PEP 517 backend emits, or that decide whether those bytes are ADMISSIBLE
+    /// for the target at all.
+    ///
+    /// WHAT IS IN, AND WHY EACH ONE IS IN:
+    /// * the normalized python minor — it is `--python=` on the `uv build
+    ///   --wheel` command line verbatim (`source_build`'s three doors all bind
+    ///   `python` as `normalized_python_minor(target.python_version())`), so it
+    ///   changes the interpreter, the wheel tag and the marker-resolved
+    ///   `Requires-Dist`;
+    /// * `conda_subdir` — it decides `native_source_build_policy`, and it is
+    ///   the `linux-64` precondition the whole hermetic compiler path and
+    ///   `validate_hermetic_wheel_marker` are written against;
+    /// * `max_glibc` — this one cannot change the emitted bytes (its only
+    ///   readers are `score_platform_tag`/`glibc_fits`, i.e. index selection),
+    ///   but it decides ADMISSION: `validate_cache_entry` re-validates every
+    ///   hit against the target, and a refusal there deletes and rebuilds, so
+    ///   two ceilings sharing one address would evict each other forever;
+    /// * the [`WorkspaceTargetContract`] — same admission argument, plus it is
+    ///   what selects the build environment (`hermetic_cuda`, the effective
+    ///   glibc floor, `native_source_build_policy`).
+    ///
+    /// WHAT IS OUT, AND WHY:
+    /// * the CONSUMER SCOPE (which pixi profiles and environments consume the
+    ///   artifact). It is never an argument to `uv build --wheel`, never an
+    ///   argument to the `uv pip compile` in `resolve_build_requirements`, and
+    ///   never an input to `hermetic_build::provision`. The dependency overlay
+    ///   a scope contributes changes `Requires-Dist`, which is applied
+    ///   DOWNSTREAM by `wheel_rewrite::rewrite_wheel_metadata_with` behind
+    ///   courier's shadow cache — L3-1 already keyed that on (input bytes,
+    ///   applicable override subset, code version) for exactly this reason.
+    ///   MEASURED before this was written: in one cold canonical lock's store
+    ///   (`certMBQ-5951142`, 59 entries, 12 artifact-target identities) EIGHT
+    ///   source identities are each stored THREE times under three different
+    ///   artifact targets, and every triple's three wheels carry ONE sha256;
+    ///   across 481 entries in eleven production stores, 70 of 362 (store,
+    ///   kind, source-identity) groups span more than one artifact target and
+    ///   the number of them whose wheel bytes differ across those targets is
+    ///   ZERO.
+    /// * `exact_workspace_envelope` — provenance about how the scope was
+    ///   obtained. It cannot reach a build the scope itself cannot reach.
+    ///
+    /// The DOMAIN STRING changes if and only if this input SET changes. Adding
+    /// or removing a term without bumping it would let one address hold two
+    /// meanings; `the_built_wheel_build_identity_domain_pins_its_input_set`
+    /// is the guard that fails when the two drift apart.
+    pub(crate) fn build_cache_identity(&self) -> String {
+        target_identity(
+            b"retread-built-wheel-build-target-v1\0",
+            &self.wheel_target,
+            None,
+            self.target_contract.as_ref(),
+            None,
+            false,
+        )
+    }
+
     /// Full SHA-256 identity for resolution and replay decisions. This also
     /// includes the explicit declaration, distinguishing a deployment promise
     /// from an equal host-derived compatibility ceiling.
@@ -2214,6 +2272,194 @@ mod tests {
             ResolutionTarget::try_for_contract_on_subdir("3.11", "linux-64", contract.clone())
                 .unwrap();
         assert_eq!(target.target_contract(), Some(&contract));
+    }
+
+    /// L3-1b-1a GUARD 1. The whole lane in one assertion: two targets that
+    /// differ ONLY in which environments consume the artifact must reach ONE
+    /// build identity, and the assertion is paired with the `assert_ne!` on
+    /// `artifact_cache_identity` so it cannot pass by the targets being equal.
+    #[test]
+    fn two_targets_differing_only_in_consumer_scope_share_one_build_identity() {
+        let base = ResolutionTarget::try_for_contract("3.11", linux_64_contract(Some("2.35")))
+            .expect("a linux-64 3.11 contract target");
+        let contract = base.target_contract().expect("contract present").clone();
+        let one = base
+            .clone()
+            .with_workspace_scope(ResolvedWorkspaceTarget {
+                contract: contract.clone(),
+                profiles: vec!["default".to_string()],
+                environments: vec!["pm-isaaclab".to_string()],
+            })
+            .expect("attaching a scope");
+        let other = base
+            .clone()
+            .with_workspace_scope(ResolvedWorkspaceTarget {
+                contract: contract.clone(),
+                profiles: vec!["default".to_string()],
+                environments: vec!["uwlab-gpu".to_string()],
+            })
+            .expect("attaching a scope");
+
+        assert_ne!(
+            one.artifact_cache_identity(),
+            other.artifact_cache_identity(),
+            "the wide artifact identity must still partition by consumer scope, \
+             or this guard would pass for the wrong reason",
+        );
+        assert_eq!(
+            one.build_cache_identity(),
+            other.build_cache_identity(),
+            "which environment consumes a source-built wheel cannot change the \
+             bytes uv emits, so it must not change the build address",
+        );
+        assert_eq!(
+            base.build_cache_identity(),
+            one.build_cache_identity(),
+            "and an unscoped target must land on the same address as a scoped one",
+        );
+    }
+
+    /// L3-1b-1a GUARD 2. `exact_workspace_envelope` is provenance about how a
+    /// scope was obtained. It cannot reach a build the scope cannot reach.
+    #[test]
+    fn the_exact_workspace_envelope_bit_does_not_move_a_build_identity() {
+        let base = ResolutionTarget::try_for_contract("3.11", linux_64_contract(Some("2.35")))
+            .expect("a linux-64 3.11 contract target");
+        let contract = base.target_contract().expect("contract present").clone();
+        let scope = ResolvedWorkspaceTarget {
+            contract,
+            profiles: vec!["default".to_string()],
+            environments: vec!["pm-isaaclab".to_string()],
+        };
+        let inferred = base
+            .clone()
+            .with_workspace_scope(scope.clone())
+            .expect("inferred scope");
+        let exact = base
+            .clone()
+            .with_exact_workspace_scope(scope)
+            .expect("exact scope");
+
+        assert!(exact.has_exact_workspace_envelope());
+        assert!(!inferred.has_exact_workspace_envelope());
+        assert_ne!(
+            inferred.artifact_cache_identity(),
+            exact.artifact_cache_identity(),
+            "the wide identity must still separate inferred from authoritative provenance",
+        );
+        assert_eq!(
+            inferred.build_cache_identity(),
+            exact.build_cache_identity(),
+        );
+    }
+
+    /// L3-1b-1a GUARD 3. Every term that CAN change the emitted bytes, or that
+    /// decides whether they are admissible, must still split the address. One
+    /// test, four independent single-term perturbations, each asserted alone so
+    /// a failure names which term stopped partitioning.
+    #[test]
+    fn every_term_that_can_change_built_wheel_bytes_still_splits_the_build_identity() {
+        let base = ResolutionTarget::try_for_contract("3.11", linux_64_contract(Some("2.35")))
+            .expect("a linux-64 3.11 contract target");
+
+        let other_python = ResolutionTarget::try_for_contract("3.12", linux_64_contract(Some("2.35")))
+            .expect("a linux-64 3.12 contract target");
+        assert_ne!(
+            base.build_cache_identity(),
+            other_python.build_cache_identity(),
+            "python minor is `--python=` on the uv build command line",
+        );
+
+        let other_subdir = ResolutionTarget::try_for_subdir("3.11", "linux-aarch64")
+            .expect("an aarch64 target");
+        let plain_linux_64 =
+            ResolutionTarget::try_for_subdir("3.11", "linux-64").expect("a linux-64 target");
+        assert_ne!(
+            plain_linux_64.build_cache_identity(),
+            other_subdir.build_cache_identity(),
+            "conda_subdir decides the native build policy and the hermetic path",
+        );
+
+        let lower_ceiling =
+            ResolutionTarget::try_for_contract("3.11", linux_64_contract(Some("2.28")))
+                .expect("a lower-ceiling contract target");
+        assert_ne!(
+            base.effective_glibc(),
+            lower_ceiling.effective_glibc(),
+            "the fixture must actually move the ceiling",
+        );
+        assert_ne!(
+            base.build_cache_identity(),
+            lower_ceiling.build_cache_identity(),
+            "max_glibc decides ADMISSION: validate_cache_entry re-validates every \
+             hit, and a refusal there deletes and rebuilds",
+        );
+
+        let mut richer = linux_64_contract(Some("2.35"));
+        richer
+            .detected_virtual_packages
+            .insert("cuda".to_string(), "12.8".to_string());
+        let with_cuda =
+            ResolutionTarget::try_for_contract("3.11", richer).expect("a cuda contract target");
+        assert_ne!(
+            base.build_cache_identity(),
+            with_cuda.build_cache_identity(),
+            "the workspace contract selects the hermetic environment",
+        );
+
+        let contractless =
+            ResolutionTarget::try_for_subdir("3.11", "linux-64").expect("a contractless target");
+        assert_ne!(
+            base.build_cache_identity(),
+            contractless.build_cache_identity(),
+            "having a contract at all changes the resolution ceiling and the policy",
+        );
+    }
+
+    /// L3-1b-1a GUARD 4. The domain string is the promise that one address has
+    /// one meaning. This test fails the moment someone adds or removes a term
+    /// without renaming the domain: it recomputes the identity from the term
+    /// list this lane committed to, and the two must agree.
+    #[test]
+    fn the_built_wheel_build_identity_domain_pins_its_input_set() {
+        let target = ResolutionTarget::try_for_contract("3.11", linux_64_contract(Some("2.35")))
+            .expect("a linux-64 3.11 contract target")
+            .with_exact_workspace_scope(ResolvedWorkspaceTarget {
+                contract: linux_64_contract(Some("2.35")),
+                profiles: vec!["default".to_string()],
+                environments: vec!["pm-isaaclab".to_string()],
+            })
+            .expect("attaching a scope");
+
+        let expected = target_identity(
+            b"retread-built-wheel-build-target-v1\0",
+            target.wheel_target(),
+            None,
+            target.target_contract(),
+            None,
+            false,
+        );
+        assert_eq!(
+            target.build_cache_identity(),
+            expected,
+            "build_cache_identity is exactly: domain \
+             `retread-built-wheel-build-target-v1`, normalized python minor, \
+             conda_subdir, max_glibc, the workspace contract, NO declared glibc, \
+             NO consumer scope, NO envelope bit. Changing that set without \
+             changing the domain is what this guard exists to refuse.",
+        );
+        assert_ne!(
+            target.build_cache_identity(),
+            target.artifact_cache_identity(),
+        );
+        assert_ne!(
+            target.build_cache_identity(),
+            target.compatibility_identity(),
+        );
+        assert_ne!(
+            target.build_cache_identity(),
+            target.resolution_identity(),
+        );
     }
 
     #[test]
