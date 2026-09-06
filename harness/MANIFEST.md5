@@ -77,10 +77,11 @@ e02808a84a7409e9b96a577fbae3dfe9  tools/moved_rows_match_guard.sh
 62db5ba03d4644ccd514f1727db6f7c3  tools/moved_rows_match.sh
 00e4cbab1c56c0f8cdd613bf116bec8c  tools/msgpack_min_guard.py
 5d4435226ca639942f2227c290e09953  tools/msgpack_min.py
+675984bc8cb751a3f9abb64a6295a8a3  tools/multiarm_preamble.sh
 36af6a82e5884fb1a98251f206dad185  tools/multiarm_store_reap_guard.sh
 5703d740537be994ecbb007272a1fa64  tools/multiarm_store_reap.sh
-72815e68e461fdd8efdfc180b6f2e81b  tools/mutation_arms_guard.sh
-02498843b98e8be21b9763cfef1d7286  tools/mutation_arms.sh
+cbfb1b91ab68fab2110b94fdae2446ad  tools/mutation_arms_guard.sh
+f7be958f4f868c6d22eca3ef9f382c7d  tools/mutation_arms.sh
 1fa8e8023be66e2f6cffbb86905f1b42  tools/p6ad_freeze_guard.sh
 3232909035475da53f3762d6c4dee5ce  tools/p6ad_negctl.sh
 2a59e952d4d6701639eaefffe39e5902  tools/p6ad_PREDICTION.md
@@ -96,6 +97,8 @@ ca28f32b8c5556397f7a965fba6e72b8  tools/p6af2h_probe4_uvenv.sh
 c34a4e3a1a8834b073b997fc94230a9f  tools/pixi_merge_run_exports.py
 c9f561484d8ef42157ba6a7532f80681  tools/pixi_shard_cache.py
 6960c0ac937f51969cd1d4f1e1af65c2  tools/pixi_trim_repodata.py
+85647def877ef58e06d8db6e265791bb  tools/proof_smoke_guard.sh
+b2813c91f3f34a1437c2c5b22e7843de  tools/proof_smoke.sh
 dd16a8c662b31dda554a2bdc052ba94d  tools/retread_fast_env.sh
 46b5ede95808302e562b66b2e1a2201a  tools/retread_shard_mirror.sh
 bdd93cc2798a27301e793bdc6931be06  tools/sdist_build_poison_guard.sh
