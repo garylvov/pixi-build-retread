@@ -85,7 +85,11 @@ deg_build_shim () {   # $1 = root dir (created)
 #!/bin/sh
 n=${0##*/}
 printf 'PAYLOAD\t%s\t%s\n' "$n" "$*" >> "$DEG_REC/argv.log"
-echo "### [payload shim] $n $* -- STUBBED FAILING rc=${DEG_INJECT:-7}"
+# STDERR, never stdout. HARNESS-EXIT-3: a stub that prints on stdout is INSIDE
+# any `n=$(payload ...)` the wrapper writes, so `${n:-FALLBACK}` never takes the
+# fallback and the wrapper cannot detect its own failure. Measured on
+# p6-inode-cleanup/char3.sbatch, whose TIMEOUT rows all became shim text.
+echo "### [payload shim] $n $* -- STUBBED FAILING rc=${DEG_INJECT:-7}" >&2
 exit ${DEG_INJECT:-7}
 EOS
     chmod +x "$DEG_SHIM/$n"
@@ -110,14 +114,14 @@ for a in "$@"; do
   case "$a" in
     *harness_drift_check.sh)
       printf 'PRECOND\tbash\t%s\n' "$*" >> "$DEG_REC/argv.log"
-      echo "### [guard shim] drift check stubbed CLEAN"; exit 0;;
+      echo "### [guard shim] drift check stubbed CLEAN" >&2; exit 0;;
     *harness_commit_resolve.sh)
       printf 'PRECOND\tbash\t%s\n' "$*" >> "$DEG_REC/argv.log"
       echo "${DEG_FAKE_COMMIT:-0000000}"; exit 0;;
   esac
 done
 printf 'PAYLOAD\tbash\t%s\n' "$*" >> "$DEG_REC/argv.log"
-echo "### [payload shim] bash $* -- STUBBED FAILING rc=${DEG_INJECT:-7}"
+echo "### [payload shim] bash $* -- STUBBED FAILING rc=${DEG_INJECT:-7}" >&2
 exit ${DEG_INJECT:-7}
 EOS
   chmod +x "$DEG_SHIM/bash"

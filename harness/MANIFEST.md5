@@ -52,7 +52,7 @@ d46e02ed51852f281f89d4d98184e0f4  tools/cleanup_gate_env_derivation_guard.sh
 c56251e11ce8ab1bd8b807c395265fd4  tools/conda_deny_proxy.py
 7ebb2e87b4d9052e8135d0207700b853  tools/driver_exit_baseline.txt
 660c4f5578a76b96298de6691dc250cf  tools/driver_exit_guard.sh
-42e57cd86015ff985d03eebdb8aea086  tools/driver_exit_payload_shim.sh
+66d936774e72666698c661eb564532a7  tools/driver_exit_payload_shim.sh
 78771287c12790a438715b2f1500b63c  tools/driver_exit_scan.sh
 7783cc47f9e8ad2503fd44950cd43013  tools/env_version_delta.py
 6a84c103a8be7b1f24d9fc4d46130379  tools/fast_env_snapshot_gate_guard.sh
