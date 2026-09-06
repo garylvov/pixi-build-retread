@@ -92,6 +92,52 @@ fn apply_uv_lock_budget_with<C: UvCommandEnv>(command: &mut C, inherited: Option
     command.set_uv_env(UV_LOCK_TIMEOUT_ENV, &value);
 }
 
+/// Env var CPython reads for the seed of its string hash.
+pub const PYTHON_HASH_SEED_ENV: &str = "PYTHONHASHSEED";
+
+/// The interpreter hash seed retread pins on EVERY child that can reach a
+/// PEP 517 build backend — the sdist/path/git wheel builds, the resolver
+/// children that prepare an sdist's metadata, and the build-requirements
+/// resolve.
+///
+/// ORDER-1 measured why, on job `order1-hashseed` 5980068 (node2336, CPython
+/// 3.9.21). `gym` 0.26.2's `setup.py` declares eight extras as literal lists
+/// and then composes two more out of a Python set —
+/// `list(set(itertools.chain.from_iterable(map(lambda g: extras[g], group))))`
+/// — and `list(set(...))` over `str` is randomised PER PROCESS unless this
+/// variable is pinned. FIVE processes with the seed unset produced FIVE
+/// DIFFERENT orders for `testing` and `all`; THREE with `PYTHONHASHSEED=0`
+/// produced ONE; and the three extras declared as literal lists came back
+/// identical in all EIGHT — the control that separates "a set serialised in
+/// hash order" from "the whole file is unstable".
+///
+/// Nothing downstream re-sorts it: every container on the requires-dist path
+/// preserves document order (`wheel::read_requires_dist`, `emit_pypi`'s
+/// `BTreeMap`, `wheel_rewrite`'s in-place drop-only rewrite, `courier::stage`,
+/// uv's `ResolutionMetadata::parse`, pixi's
+/// `convert_uv_requirements_to_pep508`), so an unpinned seed reorders 24
+/// `requires_dist` lines of a lock whose resolution did not move by one
+/// package. A lock whose bytes are not a function of its resolution cannot be
+/// compared between two runs, and that comparison is what every proof in this
+/// campaign rests on.
+///
+/// `0`, not a random-but-recorded value: it is the one seed a later reader can
+/// reproduce without first finding the log that recorded it.
+pub const REPRODUCIBLE_PYTHON_HASH_SEED: &str = "0";
+
+/// Pin [`REPRODUCIBLE_PYTHON_HASH_SEED`] on a child that may run Python.
+///
+/// Unconditional, and deliberately NOT shaped like [`apply_uv_lock_budget`]:
+/// an inherited `PYTHONHASHSEED` is not a caller expressing a preference, it
+/// is exactly the defect — the ambient value in every one of these jobs is
+/// unset, and unset means random.
+pub fn apply_reproducible_python_hash_seed<C: UvCommandEnv>(command: &mut C) {
+    command.set_uv_env(
+        PYTHON_HASH_SEED_ENV,
+        OsStr::new(REPRODUCIBLE_PYTHON_HASH_SEED),
+    );
+}
+
 /// Marker appended to `retread-drop-deps` override entries so uv removes
 /// the name from the resolution graph entirely (spec AMENDMENT A3: the
 /// documented uv idiom for dependency removal — an override with an
@@ -5804,6 +5850,10 @@ fn build_uv_closure_command_with(
     // Siblings share `uv_cache_dir`; without a budget of our own, uv's 300 s
     // default aborts the lock whenever a cold sdist build outlasts it.
     apply_uv_lock_budget(&mut command);
+    // This is the child that prints `Preparing metadata for: <name>`: it runs
+    // the PEP 517 backend of every sdist in the resolution, and the order that
+    // backend emits requires-dist in is what reaches `pixi.lock` unaltered.
+    apply_reproducible_python_hash_seed(&mut command);
     #[cfg(unix)]
     command.process_group(0);
     command
@@ -8174,6 +8224,54 @@ mod tests {
             uv_env_value(&command, UV_LOCK_TIMEOUT_ENV).as_deref(),
             Some(OsStr::new(DEFAULT_UV_LOCK_TIMEOUT_SECS)),
         );
+    }
+
+    #[test]
+    fn the_reproducible_hash_seed_overrides_an_inherited_random_one() {
+        let mut command = std::process::Command::new("uv");
+        // The ambient state this actually runs in: a shell that set the seed
+        // to `random`, or (the usual case) left it unset entirely.
+        command.env(PYTHON_HASH_SEED_ENV, "random");
+        apply_reproducible_python_hash_seed(&mut command);
+        assert_eq!(
+            uv_env_value(&command, PYTHON_HASH_SEED_ENV).as_deref(),
+            Some(OsStr::new("0")),
+            "an inherited seed is the defect, not a caller preference; it must be overridden",
+        );
+        assert_eq!(
+            REPRODUCIBLE_PYTHON_HASH_SEED, "0",
+            "the seed a later reader reproduces without consulting a log",
+        );
+    }
+
+    #[test]
+    fn the_closure_resolver_child_pins_the_python_hash_seed() {
+        // This is the child that prepares an sdist's metadata during `uv
+        // lock`. ORDER-1 (job 5980068) measured five distinct requires-dist
+        // orders from five unseeded processes of gym 0.26.2's `setup.py`, and
+        // nothing between that backend and `pixi.lock` re-sorts the list.
+        for args in [
+            vec!["lock".to_string()],
+            vec![
+                "export".to_string(),
+                "--format".to_string(),
+                "pylock.toml".to_string(),
+            ],
+        ] {
+            let command = build_uv_closure_command(
+                Path::new("uv"),
+                &args,
+                Path::new("/tmp"),
+                Path::new("/tmp/uv-cache"),
+                UvChildTracing::Traced,
+            );
+            assert_eq!(
+                uv_env_value(command.as_std(), PYTHON_HASH_SEED_ENV).as_deref(),
+                Some(OsStr::new(REPRODUCIBLE_PYTHON_HASH_SEED)),
+                "the resolver child that runs PEP 517 backends must not inherit a random \
+                 interpreter hash seed ({args:?})",
+            );
+        }
     }
 
     #[test]

@@ -2008,6 +2008,42 @@ fn pyproject_from_sdist(bytes: &[u8], filename: &str) -> Result<Option<String>> 
     bail!("cannot inspect build-system requirements in unsupported sdist `{filename}`")
 }
 
+/// The `uv pip compile` child [`resolve_build_requirements`] publishes from.
+///
+/// Split out of the caller so the environment it runs with is readable by a
+/// test. `uv pip compile` builds any build requirement that ships no wheel,
+/// which runs that project's PEP 517 backend — so this child is one of the
+/// three doors that must carry
+/// [`crate::uv_closure::REPRODUCIBLE_PYTHON_HASH_SEED`], and the resolved text
+/// it writes is hashed into `source_identity`, which puts a reordered line
+/// here underneath every built wheel below it.
+fn build_requirements_compile_command(
+    uv: &Path,
+    input: &Path,
+    lock_path: &Path,
+    python_version: &str,
+    python_platform: &str,
+) -> Command {
+    let mut command = Command::new(uv);
+    command
+        .args(["pip", "compile"])
+        .arg(input)
+        .arg("--generate-hashes")
+        .arg("--no-header")
+        .arg("--no-annotate")
+        .arg("--no-strip-markers")
+        .arg("--python-version")
+        .arg(python_version)
+        .arg("--python-platform")
+        .arg(python_platform)
+        .arg("--output-file")
+        .arg(lock_path)
+        .env("UV_PYTHON_DOWNLOADS", "automatic");
+    crate::uv_closure::apply_uv_lock_budget(&mut command);
+    crate::uv_closure::apply_reproducible_python_hash_seed(&mut command);
+    command
+}
+
 async fn resolve_build_requirements(
     pyproject: Option<&str>,
     source_identity: &str,
@@ -2063,22 +2099,13 @@ async fn resolve_build_requirements(
                 || "x86_64-unknown-linux-gnu".to_string(),
                 |floor| format!("x86_64-manylinux_{}_{}", floor.0, floor.1),
             );
-            let mut command = Command::new(source_build_uv_executable()?);
-            command
-                .args(["pip", "compile"])
-                .arg(&input)
-                .arg("--generate-hashes")
-                .arg("--no-header")
-                .arg("--no-annotate")
-                .arg("--no-strip-markers")
-                .arg("--python-version")
-                .arg(target.python_version())
-                .arg("--python-platform")
-                .arg(python_platform)
-                .arg("--output-file")
-                .arg(&lock_path)
-                .env("UV_PYTHON_DOWNLOADS", "automatic");
-            crate::uv_closure::apply_uv_lock_budget(&mut command);
+            let mut command = build_requirements_compile_command(
+                &source_build_uv_executable()?,
+                &input,
+                &lock_path,
+                target.python_version(),
+                &python_platform,
+            );
             if constrain_legacy_setuptools {
                 command.arg("--constraints").arg(&constraints);
             }
@@ -9199,8 +9226,11 @@ impl Drop for UnixProcessGroupGuard {
 fn configure_reproducible_source_build(command: &mut Command) {
     // Some PEP 517 projects construct dependency metadata from Python sets.
     // A randomized interpreter hash seed can therefore reorder semantically
-    // identical Requires-Dist lines and change wheel bytes.
-    command.env("PYTHONHASHSEED", "0");
+    // identical Requires-Dist lines and change wheel bytes. ORDER-1 measured
+    // how large that is; the measurement, and the seed itself, live once in
+    // [`crate::uv_closure::REPRODUCIBLE_PYTHON_HASH_SEED`] for all three doors
+    // that can run Python.
+    crate::uv_closure::apply_reproducible_python_hash_seed(command);
 }
 
 fn source_build_uv_executable() -> Result<PathBuf> {
@@ -13542,6 +13572,44 @@ version = "0.1.0"
             })
             .expect("source build did not set PYTHONHASHSEED");
         assert_eq!(value, "0");
+    }
+
+    #[test]
+    fn the_build_requirements_resolve_pins_the_python_hash_seed() {
+        // `uv pip compile` builds any build requirement that ships no wheel,
+        // and the text it writes is hashed into `source_identity`.
+        let command = build_requirements_compile_command(
+            Path::new("uv"),
+            Path::new("/tmp/requirements.in"),
+            Path::new("/tmp/requirements.txt"),
+            "3.11",
+            "x86_64-manylinux_2_35",
+        );
+        let value = command
+            .as_std()
+            .get_envs()
+            .find_map(|(name, value)| {
+                (name == crate::uv_closure::PYTHON_HASH_SEED_ENV)
+                    .then(|| value.expect("seed was removed"))
+            })
+            .expect("the build-requirements resolve did not pin PYTHONHASHSEED");
+        assert_eq!(
+            value,
+            crate::uv_closure::REPRODUCIBLE_PYTHON_HASH_SEED,
+            "the build-requirements resolve is the third door that can run a PEP 517 backend",
+        );
+        // Non-vacuity: the same command still carries the flags the store's
+        // input identity was derived against, so this is not a test of an
+        // empty command.
+        let args: Vec<_> = command
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.contains(&"compile".to_string()) && args.contains(&"--generate-hashes".to_string()),
+            "the compile command lost its flags: {args:?}",
+        );
     }
 
     #[test]
