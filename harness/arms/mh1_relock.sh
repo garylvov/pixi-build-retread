@@ -100,9 +100,14 @@ set -uo pipefail
 # with ONE block swapped outside these markers, recorded here so the derivation
 # is not silent: the "SHARED WHEEL STORE -- ON, FOR THIS JOB ONLY" block is
 # replaced VERBATIM by merge-e/me1_relock.sh's "WHEEL STORE -- JOB-SCOPED (the
-# default)" block. Both stores are therefore job-scoped, which is what a merge
-# proof needs: three other lanes are writing the shared wheel store tonight and
-# an adopted or poisoned entry from one of them is not attributable to this tip.
+# default)" block.
+# CORRECTED 2026-09-05 (MERGE-M-1): this paragraph used to continue "Both stores
+# are therefore job-scoped, which is what a merge proof needs". THAT WAS FALSE
+# from 2026-09-03 15:35 onward -- `retread_fast_env.sh` re-enabled
+# `export RETREAD_WHEEL_STORE`, so the WHEEL store has been the SHARED one in
+# every merge proof since, and only the built-output store below is job-scoped.
+# The row now derives and prints which it is instead of asserting it; WHICH store
+# a merge proof SHOULD use is a live question and is boarded, not answered here.
 
 TAG=MH1                                      # short batch tag; roots become cert<TAG>-<job> / ws.<TAG>-<job>
 T=/oscar/data/stellex/glvov/agrescap/tasks/retread-4-11
@@ -626,13 +631,21 @@ export RUST_BACKTRACE=1
 . "$FAST_ENV"
 retread_fast_env "$WS" || { echo "FATAL: retread_fast_env refused"; exit 7; }
 
-########## WHEEL STORE -- JOB-SCOPED (the default) ############################
-# `tools/retread_fast_env.sh` keeps the shared RETREAD_WHEEL_STORE export
-# COMMENTED OUT, so the store resolves through XDG_CACHE_HOME, which the
-# job-scoped block above pointed at $C/xdg-cache. This arm therefore locks
-# against a store no other job can write. It is the CONTROL for the shared-
-# store arm that runs after it.
-echo "### WHEEL STORE: job-scoped, under XDG_CACHE_HOME=$XDG_CACHE_HOME (RETREAD_WHEEL_STORE unset: ${RETREAD_WHEEL_STORE:-<unset>})"
+########## WHEEL STORE -- RESOLVED AND REPORTED, NOT ASSERTED (MERGE-M-1) ######
+# THIS ROW USED TO LIE, and it lied identically in B18, B19, B20 and B21. It read
+#   "### WHEEL STORE: job-scoped, under XDG_CACHE_HOME=... (RETREAD_WHEEL_STORE
+#    unset: /oscar/.../agrescap/cache/retread/wheels)"
+# and the parenthesis is a `${RETREAD_WHEEL_STORE:-<unset>}` expansion, so it
+# PRINTED A VALUE -- the variable was SET, the store was the SHARED one -- while
+# its own prose called the variable unset and the store job-scoped. The comment
+# it rested on ("retread_fast_env.sh keeps the shared export COMMENTED OUT") went
+# stale on 2026-09-03 15:35, when p6i merged and that file RE-ENABLED
+# `export RETREAD_WHEEL_STORE=$root/wheels`.
+# `tools/wheel_store_row.sh` resolves the store the way
+# `courier::wheel_store_root_with` does and reports the PATH, its PROVENANCE and
+# its SCOPE. $C is passed so shared-versus-job-scoped is DECIDED from the
+# declared job root rather than guessed -- which is the whole of MERGE-M-1.
+bash "$T/tools/wheel_store_row.sh" "$C" || { echo "FATAL: the wheel store could not be derived"; exit 7; }
 
 ########## JOB-SCOPED, EMPTY BUILT-OUTPUT STORE ################################
 # `retread_fast_env` points RETREAD_BUILT_OUTPUT_STORE at the SHARED persistent

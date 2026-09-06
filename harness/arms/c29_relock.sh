@@ -1387,6 +1387,25 @@ if [ "$FRESH_SHA" != "$PRES_SHA" ]; then
   else
     echo "     (instrument missing: $EVD)"; : > "$EVDOUT"
   fi
+  # MERGE-M-3. The isaac-family row, counted over MOVED ROWS ONLY. The one-liner
+  # every merge lane inherited (`grep -icE 'isaac'` over the whole drift block)
+  # counts the ENVIRONMENT NAME lines `pm-isaaclab` and `isaaclab-gpu-latest`,
+  # and printed 2 on a moved list that was EMPTY. This matches the PACKAGE field
+  # of a moved row, and it reports env_version_delta's 40-row-per-env truncation
+  # so a floor is never read as a total.
+  if [ -s "$EVDOUT" ]; then
+    bash "$T/tools/moved_rows_match.sh" 'isaac' "$EVDOUT" 2>&1 | sed 's/^/     /'
+  fi
+  # MERGE-K-1, widened by MERGE-M-4. The SECOND, INDEPENDENT implementation of
+  # the same delta: it splits every changed row into its conda/pypi half AND
+  # counts REMOVALS and ADDITIONS, which the version-only reading above shows in
+  # its per-env `pkgs=` counts and does NOT show in its summary line. Its
+  # `TOTAL rows` must equal env_version_delta's `total moved rows across all
+  # envs`; a disagreement is a finding about one of the two.
+  MHOUT=$A/$P.moved_row_halves.txt
+  bash "$T/tools/moved_row_halves.sh" "$PRESERVED_LOCK" "$FRESH_LOCK" > "$MHOUT" 2>&1; MRH_RC=$?
+  sed 's/^/     /' "$MHOUT"
+  echo "###   moved_row_halves rc=$MRH_RC (0 = no pypi row and no per-env package-count change; 1 = REFUSED, attribute it with a same-generation control; 2 = setup failure)"
   echo "###   auto-import rows this run emitted (store state at injection time):"
   grep -aE 'auto_imports(_dry|_lead)?:' "$A/$P-ONCERT.backend.stripped.log" 2>/dev/null \
     | grep -aE 'injecting detected requirements|BACK-OFF|indexing the wheel store' | cut -c1-220 | head -20 | sed 's/^/     /'
