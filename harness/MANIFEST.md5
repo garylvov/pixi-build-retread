@@ -45,7 +45,7 @@ c23efe77fe89da4494785474ed573498  README.md
 f60ea7f2564d383ef1d45d13d0cb2232  tools/b2_attribute.sh
 552d0bb34c32e248185694542da0e767  tools/binsnap_ancestry_guard.sh
 62e2b386e47ce1d93d7bb92ce758d124  tools/binsnap_ancestry_guard_test.sh
-98454333b5fa053003eb1bde2ca9795b  tools/binsnap_fixset.txt
+64c15a805a78662945d22054df8d0532  tools/binsnap_fixset.txt
 338c5d78067aa05577ed082dea895211  tools/channel_mirror_server.py
 3837765ced274b315ce84ad3695f8b5b  tools/cleanup_absent_root_guard.sh
 d46e02ed51852f281f89d4d98184e0f4  tools/cleanup_gate_env_derivation_guard.sh
