@@ -340,16 +340,33 @@ if [ -s "$INSTSET" ]; then
     while read -r jid jname wd; do
       [ -n "${jid:-}" ] || continue
       cmd=$(scontrol show job "$jid" 2>/dev/null | tr ' ' '\n' | sed -n 's/^Command=//p' | head -1)
-      printf '%s %s %s %s\n' "$jid" "${jname:--}" "${wd:--}" "${cmd:--}" >> "$RUNROWS"
+      jroot="${wd:--}"
+      [ -f "${cmd:-}" ] && jroot=$(dirname -- "$cmd")
+      # THE SUBMITTED SCRIPT FROM SLURM'S OWN SNAPSHOT, not from the filesystem.
+      # `sbatch --wrap` and a heredoc submission both leave `Command=(null)` and
+      # no file on disk (5992050 is one), and reading that as "no script" would
+      # refuse every sync for the life of the job. `scontrol write batch_script`
+      # hands back the exact bytes Slurm is running.
+      if scontrol write batch_script "$jid" "$TMP/sb.$jid" >/dev/null 2>&1 && [ -s "$TMP/sb.$jid" ]; then
+        script="$TMP/sb.$jid"
+      elif [ -f "${cmd:-}" ]; then
+        script="$cmd"
+      else
+        script=-
+      fi
+      printf '%s %s %s %s %s\n' "$jid" "${jname:--}" "${wd:--}" "$script" "$jroot" >> "$RUNROWS"
     done < "$TMP/rq.txt"
   fi
-  while read -r jid jname wd script; do
+  while read -r jid jname wd script jroot; do
     [ -n "${jid:-}" ] || continue
-    # IN SCOPE: the job works in this task dir, runs a script from it, or owns a
-    # pin dir here by the same name rule the PIN REPORT uses.
+    if [ -z "${jroot:-}" ]; then
+      if [ "${script:--}" != "-" ] && [ -f "$script" ]; then jroot=$(dirname -- "$script"); else jroot=${wd:--}; fi
+    fi
+    # IN SCOPE: the job works in this task dir, its job root is in it, or it owns
+    # a pin dir here by the same name rule the PIN REPORT uses.
     scope=0
-    case "${wd:-}"     in "$TASK_DIR"|"$TASK_DIR"/*) scope=1;; esac
-    case "${script:-}" in "$TASK_DIR"|"$TASK_DIR"/*) scope=1;; esac
+    case "${wd:-}"    in "$TASK_DIR"|"$TASK_DIR"/*) scope=1;; esac
+    case "${jroot:-}" in "$TASK_DIR"|"$TASK_DIR"/*) scope=1;; esac
     if [ "$scope" = 0 ] && [ -n "${jname:-}" ]; then
       stem=${jname%%-*}
       while read -r pd; do
@@ -367,7 +384,6 @@ if [ -s "$INSTSET" ]; then
       printf '?\n' > "$RS"
     else
       refs_of "$script" > "$RS"
-      jroot=$(dirname -- "$script")
       while IFS= read -r rb; do
         [ "$rb" = '?' ] && continue
         [ -f "$jroot/$rb" ] || continue
@@ -387,7 +403,7 @@ if [ -s "$INSTSET" ]; then
       tb=$(basename -- "$trel")
       grep -qxF -- "$tb" "$RS" || continue
       printf '### SYNC REFUSED rc=6 running=%s file=%s reason=read-by-%s\n' \
-        "$jid" "$tb" "$(basename -- "$script")" >> "$RSHITS"
+        "$jid" "$tb" "$jname" >> "$RSHITS"
     done < "$INSTSET"
   done < "$RUNROWS"
 fi

@@ -525,6 +525,42 @@ else
   bad "I(a5): could not build the read-set mutant -- MUTATION ARM DID NOT RUN"
 fi
 
+# a1b: a `--wrap` shaped script -- ONE bash line, no driver -- is parsed too.
+# 5992050 is exactly this shape: BatchFlag=1, Command=(null), one `bash <path>`.
+read -r RI6 TI6 V1I6 V2I6 < <(mkfixture I6)
+mkstub "$WORK/I6_squeue"
+mkdir -p "$TI6/jobroot"
+{ echo '#!/bin/sh'; echo '# This script was created by sbatch --wrap.'; echo
+  echo "bash $TI6/tools/a_tool.sh arg1 arg2"; } > "$TI6/jobroot/wrap.sh"
+printf '8000006 laneI6 %s %s\n' "$TI6" "$TI6/jobroot/wrap.sh" > "$WORK/I6_run.txt"
+runsync "$RI6" "$TI6" "$WORK/I6_squeue" "$V2I6" --running-list "$WORK/I6_run.txt" > "$WORK/I6.log" 2>&1; rcI6=$?
+[ "$rcI6" -eq 6 ] && grep -q 'file=a_tool.sh' "$WORK/I6.log" \
+  && ok "I(a1b): a --wrap one-liner naming an installed file refuses rc 6 too (the 5992050 shape)" \
+  || { bad "I(a1b): rc=$rcI6 -- the --wrap shape was not read"; sed 's/^/      /' "$WORK/I6.log"; }
+
+# ---- K: the live read set comes from SLURM'S OWN SNAPSHOT, not from disk ----
+# `--running-list` shims the job LIST; it cannot shim the one live call the list
+# is built from. `sbatch --wrap` and heredoc submissions leave `Command=(null)`
+# and NO file on disk -- 5992050, RUNNING in this task dir, is one -- so a check
+# that read only `Command=` would have called every such job undeterminable and
+# refused every sync for its whole life. This arm runs the real call against THIS
+# guard's own job, which is the only running job it is entitled to ask about.
+grep -q 'scontrol write batch_script' "$SYNC" \
+  && ok "K: harness_sync.sh takes the running job's script from Slurm's snapshot, not from Command= alone" \
+  || bad "K: harness_sync.sh never calls scontrol write batch_script -- Command=(null) jobs would refuse forever"
+if [ -n "${SLURM_JOB_ID:-}" ]; then
+  if scontrol write batch_script "$SLURM_JOB_ID" "$WORK/self.sbatch" >/dev/null 2>&1 && [ -s "$WORK/self.sbatch" ]; then
+    ok "K: scontrol write batch_script $SLURM_JOB_ID dumped $(wc -c < "$WORK/self.sbatch") bytes -- the mechanism works on a RUNNING job"
+  else
+    bad "K: scontrol write batch_script failed on this guard's own job -- the live read set has no source"
+  fi
+  grep -q 'harness_sync_guard.sh' "$WORK/self.sbatch" 2>/dev/null \
+    && ok "K: and the bytes are THIS job's real submitted script (it names harness_sync_guard.sh)" \
+    || bad "K: the dump does not name harness_sync_guard.sh -- it is not this job's script"
+else
+  bad "K: no SLURM_JOB_ID -- the live-snapshot arm DID NOT RUN (run this guard under sbatch)"
+fi
+
 # ---- J: the header no longer claims the rename is sufficient ---------------
 [ "$(grep -c 'is the only safe way to write into a live task dir' "$SYNC")" -eq 0 ] \
   && ok "J: the retracted claim ('the only safe way to write into a live task dir') is GONE" \
