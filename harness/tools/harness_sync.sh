@@ -69,7 +69,26 @@
 #   rc 0  synced (or --check found nothing edited)
 #   rc 2  FATAL: bad arguments, no repo, no such commit, no mapping library
 #   rc 3  --check: at least one task copy differs from the last synced commit
-#   rc 4  REFUSED: a PENDING job of ours is pinned to a different commit
+#   rc 4  REFUSED: a PENDING job of ours is pinned to a different commit AND
+#         that job would actually be hurt by the move (HARNESS-SYNC-6).  The pin
+#         alone is no longer enough: the same read set rc 6 computes is asked
+#         about every pin-mismatched job, and it refuses only when
+#           reason=reads-installed-file       its read set intersects the install set
+#           reason=read-set-undeterminable    its script or a reference is unreadable
+#           reason=read-set-not-examined      it never reached a determinate read
+#                                             set (out of scope, or nothing to
+#                                             install) -- "we did not look" is
+#                                             not "we looked and it was clean"
+#         A job whose read set is DETERMINATE and disjoint is TOLERATED on a
+#         `### PIN MISMATCH tolerated jid=<j> reason=<why>` row -- never in
+#         silence -- with reason=reads-only-job-root for the owner-snapshot shape
+#         (HARNESS-SYNC-5: it execs a frozen copy under its own job root and
+#         reads nothing of ours, so it neither runs a drift gate against this
+#         task dir nor executes a byte this sync writes) and
+#         reason=read-set-disjoint otherwise.  6015658/6015659 det162-cleanup
+#         are the case that forced this: two snapshot owners, `afterany` on a
+#         proof that could run to 13:05, holding the whole merge queue on a pin
+#         neither of them ever read.
 #   rc 5  a file failed to install or failed its md5 verification
 #   rc 6  REFUSED: a job of ours -- RUNNING **or PENDING** -- would READ a file
 #         this sync would install.  Every refusal row carries `state=`, and the
@@ -315,12 +334,18 @@ while read -r jid jname; do
   done < "$PINDIRS"
 done < "$PDROWS"
 
-if [ -s "$REFUSALS" ]; then
+# THE VERDICT ON THESE ROWS IS DEFERRED TO `rc4_verdict` BELOW (HARNESS-SYNC-6).
+# It cannot be decided here any more, because it now depends on the READ SET,
+# which is computed further down.  Nothing is printed yet either: the rows keep
+# their place at the TOP of a refusal page, ahead of the rc-6 family, because
+# that is the order every consumer of this output was written against.
+rc4_verdict () {   # called AFTER the read-set computation; prints the rc-4 family
+if [ -s "$REF_REFUSE" ]; then
   echo "### SYNC would strand these PENDING jobs -- they are pinned to another commit:"
   # `state=PENDING` on every row, because these rows now share a page with the
   # rc-6 rows and only the state field says which check produced which.  Every
   # row here is PENDING by construction: $PDROWS is `squeue -t PD`.
-  sed 's/^/###   state=PENDING /' "$REFUSALS"
+  sed 's/^/###   state=PENDING /' "$REF_REFUSE"
   if [ "$FORCE" != 1 ]; then
     echo "### SYNC REFUSED (rc 4). A queued job has snapshotted NOTHING: syncing the task"
     echo "###   dir to $SHA kills it at its own drift gate the moment it starts."
@@ -339,13 +364,26 @@ if [ -s "$REFUSALS" ]; then
     # against `squeue`.  (HARNESS-SYNC-4 replaced an `awk '{print $3}'` here that
     # printed the literal REFUSED for every input; a count that is merely
     # PLAUSIBLE is how that survived, so it is asserted by the guard now.)
-    echo "### SYNC FORCED over $(awk '{print $1}' "$REFUSALS" | sort -u | wc -l) pinned PENDING job(s) reason=$REASON"
+    echo "### SYNC FORCED over $(awk '{print $1}' "$REF_REFUSE" | sort -u | wc -l) pinned PENDING job(s) reason=$REASON"
     echo "###   ^ copy this line into the lane log row for this sync."
   fi
-  echo "### SYNC rc-4 rows=$(wc -l < "$REFUSALS") jobs=$(awk '{print $1}' "$REFUSALS" | sort -u | wc -l) refusing=$( [ "$SYNC_RC4" = 0 ] && echo no || echo yes)"
-  echo "###   -- the read-set check below STILL RUNS (HARNESS-SYNC-4-1): if it also"
+  echo "### SYNC rc-4 rows=$(wc -l < "$REF_REFUSE") jobs=$(awk '{print $1}' "$REF_REFUSE" | sort -u | wc -l) refusing=$( [ "$SYNC_RC4" = 0 ] && echo no || echo yes)"
+  echo "###   -- the read-set check ALSO RAN (HARNESS-SYNC-4-1): if it also"
   echo "###   refuses, its rows are printed here too and you get BOTH waits at once."
 fi
+# THE TOLERATED ROWS ARE PRINTED WHETHER OR NOT ANYTHING REFUSED (HARNESS-SYNC-6).
+# A pin mismatch that this sync decided NOT to refuse for is exactly the kind of
+# thing that must not be silent: it is a judgement the machinery made on the
+# operator's behalf, and the PIN REPORT at the bottom only names pins AFTER a
+# successful sync.  One row per (job, pin dir), with the reason that cleared it.
+if [ -s "$REF_TOL" ]; then
+  cat "$REF_TOL"
+  echo "###   ^ PIN MISMATCH tolerated: these PENDING jobs are pinned to another commit, but"
+  echo "###   their READ SET does not intersect this sync's install set, so moving the task"
+  echo "###   dir cannot change a byte they will execute.  rc 4 used to refuse for them on"
+  echo "###   the pin alone (HARNESS-SYNC-6)."
+fi
+}
 
 # ---- THE READ SET OF EVERY RUNNING JOB, BEFORE A SINGLE BYTE (HARNESS-SYNC-3) -
 # rc 6, and it is the guard the rename is NOT.  `mv -f` over a name is atomic
@@ -401,6 +439,7 @@ SR=$(dirname -- "$0")/script_refs.sh
 . "$SR"
 
 RSHITS="$TMP/readset.txt"; : > "$RSHITS"
+RSDET="$TMP/readset_determinate.txt"; : > "$RSDET"   # HARNESS-SYNC-6
 if [ -s "$INSTSET" ]; then
   RUNROWS="$TMP/run.txt"; : > "$RUNROWS"
   if [ -n "$RUNLIST" ]; then
@@ -492,6 +531,14 @@ if [ -s "$INSTSET" ]; then
       done < "$INSTSET"
       continue
     fi
+    # HARNESS-SYNC-6.  THIS job's read set is DETERMINATE -- every reference in
+    # it resolved.  Record that, because the rc-4 verdict below needs to tell
+    # "we looked and it reads nothing of ours" apart from "we never looked",
+    # and law 9 forbids reading the second as the first.  The second column says
+    # whether every resolved reference lives under the job's OWN root, which is
+    # the owner-snapshot shape (HARNESS-SYNC-5) and the reason worth printing.
+    ojr=$(awk -F'\t' -v jr="$jroot/" '$2!="-" && index($2,jr)!=1 {print "no"; exit}' "$RS")
+    printf '%s %s\n' "$jid" "${ojr:-yes}" >> "$RSDET"
     # THE HIT TEST, HARNESS-SYNC-5, AND THE ADDITION IS THE `elsewhere` BRANCH.
     # Matching by basename alone made a job that runs a JOB-LOCAL SNAPSHOT of
     # cleanup_gated.sh collide with the task copy of that name, and pin the
@@ -522,6 +569,68 @@ if [ -s "$INSTSET" ]; then
     done < "$INSTSET"
   done < "$RUNROWS"
 fi
+
+# ---- THE rc-4 REFINEMENT (HARNESS-SYNC-6) -----------------------------------
+# WHAT WAS WRONG WITH THE PIN TEST ALONE.  rc 4 asks ONE question -- "does a
+# PENDING job own a pin dir naming a different commit?" -- and refuses on the
+# answer.  That was right when every queued job read the task harness live.  It
+# is not right any more, because HARNESS-SYNC-5's owner snapshot exists exactly
+# to make a queued job STOP reading the task tree: it copies the gate and what
+# the gate sources into the job's own root and submits an sbatch that `exec`s
+# the frozen copy by literal absolute path.  Such a job cannot be hurt by this
+# sync -- not its drift gate, because it does not run one, and not its bytes,
+# because none of them are ours.  Refusing for it is a refusal with no injury
+# behind it, and this campaign has paid for that twice: 6015658/6015659
+# det162-cleanup are snapshot owners, `afterany` on a proof that can run to
+# 13:05, and they held the whole merge queue on a pin they never read.
+#
+# SO THE TEST IS NOW THE PIN **AND** THE READ SET, and the read set is the SAME
+# one rc 6 computes -- the same `refs_of_sibling_resolved` parser over
+# `scontrol write batch_script` plus one level of drivers in the job root.  Two
+# outcomes refuse and one tolerates:
+#   * the job appears in $RSHITS -- its read set intersects the install set, OR
+#     it was undeterminable (law 9: an unreadable job is not a safe job).  rc 4.
+#   * the job never reached a determinate read set at all -- out of the read-set
+#     scope, or the install set was empty so no job was examined.  ALSO rc 4:
+#     "we did not look" is not "we looked and it was clean", and reading it as
+#     the latter is precisely how 6001240 became invisible (HARNESS-SYNC-4).
+#   * the job HAS a determinate read set and is not in $RSHITS -- tolerated, on
+#     a named row, never in silence.
+# The tolerated row's reason distinguishes the shape that motivated this from
+# the general case, because they are cleared for different reasons and a reader
+# sizing the next owner needs to know which one they have.
+REF_REFUSE="$TMP/refusals_refusing.txt"; : > "$REF_REFUSE"
+REF_TOL="$TMP/refusals_tolerated.txt";   : > "$REF_TOL"
+while read -r r_jid r_jname r_pinfile r_pinned; do
+  [ -n "${r_jid:-}" ] || continue
+  if grep -q " running=$r_jid " "$RSHITS" 2>/dev/null; then
+    # WHY it is in $RSHITS decides the reason, because the two are cleared
+    # differently: an intersecting reader has to finish, an UNDETERMINABLE one
+    # may only need a readable script (or an owner snapshot).  A row ending
+    # `reason=unresolved-reference` or `reason=no-sbatch-found` is the second.
+    if grep -F " running=$r_jid " "$RSHITS" | grep -qvE 'reason=(unresolved-reference|no-sbatch-found)$'; then
+      r_why=reads-installed-file
+    else
+      r_why=read-set-undeterminable
+    fi
+    printf '%s %s %s %s reason=%s\n' \
+      "$r_jid" "$r_jname" "$r_pinfile" "$r_pinned" "$r_why" >> "$REF_REFUSE"
+    continue
+  fi
+  r_det=$(awk -v j="$r_jid" '$1==j{print $2; exit}' "$RSDET")
+  if [ -z "$r_det" ]; then   # HARNESS-SYNC-6 TOLERANCE BRANCH
+    # NOT EXAMINED is not CLEAN.  The job was out of the read-set scope, or the
+    # install set was empty so no job was examined at all.  Law 9.
+    printf '%s %s %s %s reason=read-set-not-examined\n' \
+      "$r_jid" "$r_jname" "$r_pinfile" "$r_pinned" >> "$REF_REFUSE"
+    continue
+  fi
+  r_why=read-set-disjoint
+  [ "$r_det" = yes ] && r_why=reads-only-job-root
+  printf '### PIN MISMATCH tolerated jid=%s reason=%s name=%s pin=%s pinned=%s\n' \
+    "$r_jid" "$r_why" "$r_jname" "$r_pinfile" "$r_pinned" >> "$REF_TOL"
+done < "$REFUSALS"
+rc4_verdict
 
 if [ -s "$RSHITS" ]; then
   sort -u "$RSHITS"
@@ -556,7 +665,7 @@ fi
 # one exits, so an operator holding an rc-4 refusal is holding the rc-6 rows too
 # and can clear one queue state instead of two.
 if [ "$SYNC_RC4" != 0 ] || [ "$SYNC_RC6" != 0 ]; then
-  echo "### SYNC REFUSED -- rc4_rows=$(wc -l < "$REFUSALS") rc6_rows=$(sort -u "$RSHITS" | wc -l)"
+  echo "### SYNC REFUSED -- rc4_rows=$(wc -l < "$REF_REFUSE") rc6_rows=$(sort -u "$RSHITS" | wc -l) rc4_tolerated=$(wc -l < "$REF_TOL")"
   if [ "$SYNC_RC4" != 0 ] && [ "$SYNC_RC6" != 0 ]; then
     echo "###   BOTH CHECKS REFUSED. Exiting rc 4 (rc 4 takes precedence -- it is the"
     echo "###   cheaper one to clear, by repin), but the rc-6 rows above are OWED TOO:"

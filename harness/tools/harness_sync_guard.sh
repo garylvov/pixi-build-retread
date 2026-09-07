@@ -77,6 +77,12 @@
 #      `--force` summary's JOB COUNT, which no arm had ever read: HARNESS-SYNC-4
 #      replaced an `awk '{print $3}'` there that printed the literal REFUSED for
 #      every input, in the line the operator is told to copy into a lane log row.
+#   N  HARNESS-SYNC-6: rc 4 is the PIN **AND** THE READ SET. A pin-mismatched
+#      PENDING job that reads only its OWN job root (the HARNESS-SYNC-5 owner
+#      snapshot) is TOLERATED on a named row instead of refusing (n1); one that
+#      reads an installed file still refuses rc 4 with its rc-6 rows beside it
+#      (n2); one whose read set is undeterminable, or was never examined, still
+#      refuses (n3, n3b -- law 9). n4 is the mutation.
 #   J  static: the header no longer claims the rename is "the only safe way to
 #      write into a live task dir" -- it is safe only when renamer and reader are
 #      the SAME NFS client -- and the PIN REPORT no longer calls a RUNNING job
@@ -1072,6 +1078,133 @@ if [ "$rcQ3" -eq 0 ]; then
 else
   bad "Q(q3): the mutation did not change the rc (got $rcQ3) -- q2 cannot fail"
 fi
+# ---- N: HARNESS-SYNC-6 -- rc 4 is the PIN **AND** THE READ SET --------------
+# THE DEFECT, WITH THE QUEUE STATE THAT PROVED IT. rc 4 asked ONE question --
+# "does a PENDING job own a pin dir naming another commit?" -- and refused on the
+# answer alone. HARNESS-SYNC-5 then built the owner snapshot for the express
+# purpose of making a queued job STOP reading the task tree: it freezes the gate
+# and what the gate sources into the job's own root and submits an sbatch that
+# `exec`s the frozen copy by literal absolute path. Such a job runs no drift gate
+# against this task dir and executes not one byte this sync writes -- and rc 4
+# went on refusing for it anyway. On 2026-09-07 that was 6015658/6015659
+# det162-cleanup: two snapshot owners, `afterany` on a proof that could run to
+# 13:05, holding the entire merge queue on a pin neither of them ever read.
+#   n1  a pin-mismatched PENDING SNAPSHOT OWNER -> TOLERATED on a named row, rc 0,
+#       and the file with the colliding basename is actually installed
+#   n2  a pin-mismatched PENDING `--wrap` READER of an installed file -> still
+#       rc 4, and the rc-6 rows are on the same page (HARNESS-SYNC-4-1 intact)
+#   n3  a pin-mismatched PENDING job whose script cannot be read -> still rc 4,
+#       reason=read-set-undeterminable (law 9), and n3b: a job the read-set scope
+#       never reached -> reason=read-set-not-examined, because "we did not look"
+#       is not "we looked and it was clean"
+#   n4  THE MUTATION: the tolerance branch forced unreachable -> n1's fixture
+#       refuses rc 4 again, so n1 CAN fail
+mksnapowner () {  # $1 = task dir; freezes a gate + its cleanup under <task>/jobroot/owner-snapshot
+  local T=$1 S=$1/jobroot/owner-snapshot
+  mkdir -p "$S"
+  printf '#!/bin/bash\nCLEANUP=$(dirname "$0")/cleanup.sh\nbash "$CLEANUP"\n' > "$S/cleanup_gated.sh"
+  printf '#!/bin/bash\necho frozen cleanup\n' > "$S/cleanup.sh"
+  # The literal absolute path is the point: a variable here reads back
+  # unresolved and the job goes on refusing (P(p3) asserts the same thing).
+  { echo '#!/bin/bash'; echo "exec bash $S/cleanup_gated.sh /some/cert /some/ws"; } > "$S/owner.sbatch"
+  chmod 755 "$S/cleanup_gated.sh" "$S/cleanup.sh" "$S/owner.sbatch"
+}
+# ---- n1: the snapshot owner is TOLERATED ------------------------------------
+read -r RN TN V1N V2N < <(mkfixture N)
+mkdir -p "$TN/lane1"; printf '%s\n' "$V1N" > "$TN/lane1/HARNESS_COMMIT"
+mksnapowner "$TN"
+mkstub "$WORK/N1_squeue" "9000001 lane1-relock"      # the rc-4 pin query sees it
+printf '9000001 PENDING lane1-relock %s %s %s\n' \
+  "$TN" "$TN/jobroot/owner-snapshot/owner.sbatch" "$TN/jobroot/owner-snapshot" > "$WORK/N1_run.txt"
+git -C "$RN" cat-file blob "$V2N:harness/phase_template/cleanup_gated.sh" > "$WORK/N1.blob"
+BEFORE_N1=$(md5sum "$TN/merge-h/cleanup_gated.sh" | awk '{print $1}')
+WANT_N1=$(md5sum "$WORK/N1.blob" | awk '{print $1}')
+[ "$BEFORE_N1" != "$WANT_N1" ] \
+  && ok "N(n1): NON-VACUITY -- merge-h/cleanup_gated.sh is $BEFORE_N1 and $V2N says $WANT_N1, so the colliding basename IS in the install set" \
+  || bad "N(n1): the fixture gate already matches the commit -- the arm would prove nothing"
+runsync "$RN" "$TN" "$WORK/N1_squeue" "$V2N" --running-list "$WORK/N1_run.txt" > "$WORK/N1.log" 2>&1; rcN1=$?
+[ "$rcN1" -eq 0 ] && ok "N(n1): THE FIX -- a pin-mismatched PENDING SNAPSHOT OWNER no longer refuses the sync (rc 0)" \
+  || { bad "N(n1): rc=$rcN1, wanted 0 -- the pin alone is still refusing"; sed 's/^/      /' "$WORK/N1.log"; }
+grep -q '^### PIN MISMATCH tolerated jid=9000001 reason=reads-only-job-root' "$WORK/N1.log" \
+  && ok "N(n1): and it SAYS SO on a named row -- tolerated jid=9000001 reason=reads-only-job-root, never in silence" \
+  || { bad "N(n1): no 'PIN MISMATCH tolerated jid=9000001 reason=reads-only-job-root' row"; sed 's/^/      /' "$WORK/N1.log"; }
+grep -q 'SYNC REFUSED (rc 4)' "$WORK/N1.log" \
+  && { bad "N(n1): it printed the rc-4 refusal anyway"; sed 's/^/      /' "$WORK/N1.log"; } \
+  || ok "N(n1): and no rc-4 refusal is printed for it"
+cmp -s "$WORK/N1.blob" "$TN/merge-h/cleanup_gated.sh" \
+  && ok "N(n1): the install actually HAPPENED -- merge-h/cleanup_gated.sh is now $V2N's bytes" \
+  || bad "N(n1): rc 0 but the file was not installed"
+grep -q 'read-set OK job=9000001 file=cleanup_gated.sh' "$WORK/N1.log" \
+  && ok "N(n1): the rc-6 side cleared it too, by the owner-snapshot rule (HARNESS-SYNC-5), and said which basename" \
+  || bad "N(n1): no 'read-set OK' row -- n1 may be passing for the wrong reason"
+# ---- n2: a pin-mismatched PENDING READER still refuses, WITH its rc-6 rows ---
+read -r RN2 TN2 V1N2 V2N2 < <(mkfixture N2)
+mkdir -p "$TN2/lane1"; printf '%s\n' "$V1N2" > "$TN2/lane1/HARNESS_COMMIT"
+mkdir -p "$TN2/jobroot"
+{ echo '#!/bin/sh'; echo '# This script was created by sbatch --wrap.'; echo
+  echo "bash $TN2/tools/a_tool.sh /some/cert"; } > "$TN2/jobroot/wrap.sh"
+mkstub "$WORK/N2_squeue" "9000002 lane1-relock"
+printf '9000002 PENDING lane1-relock %s %s %s\n' "$TN2" "$TN2/jobroot/wrap.sh" "$TN2/jobroot" > "$WORK/N2_run.txt"
+BEFORE_N2=$(md5sum "$TN2/tools/a_tool.sh" | awk '{print $1}')
+runsync "$RN2" "$TN2" "$WORK/N2_squeue" "$V2N2" --running-list "$WORK/N2_run.txt" > "$WORK/N2.log" 2>&1; rcN2=$?
+[ "$rcN2" -eq 4 ] && ok "N(n2): a pin-mismatched PENDING job that DOES read an installed file still refuses rc 4" \
+  || { bad "N(n2): rc=$rcN2, wanted 4 -- the refinement is too wide"; sed 's/^/      /' "$WORK/N2.log"; }
+grep -q '^###   state=PENDING 9000002 lane1-relock .*reason=reads-installed-file' "$WORK/N2.log" \
+  && ok "N(n2): and the rc-4 row now carries the REASON it refused -- reads-installed-file" \
+  || { bad "N(n2): the rc-4 row has no reason= field"; sed 's/^/      /' "$WORK/N2.log"; }
+grep -q 'SYNC REFUSED rc=6 running=9000002 state=PENDING file=a_tool.sh' "$WORK/N2.log" \
+  && ok "N(n2): the rc-6 rows are STILL on the same page (HARNESS-SYNC-4-1 survives the refinement)" \
+  || { bad "N(n2): the rc-6 rows are gone -- the refinement broke SYNC-4-1"; sed 's/^/      /' "$WORK/N2.log"; }
+grep -q 'BOTH CHECKS REFUSED' "$WORK/N2.log" \
+  && ok "N(n2): and the summary still says BOTH refused, with rc 4 keeping precedence" \
+  || bad "N(n2): no BOTH CHECKS REFUSED summary"
+grep -q 'PIN MISMATCH tolerated' "$WORK/N2.log" \
+  && bad "N(n2): it tolerated a job that reads an installed file" \
+  || ok "N(n2): and no tolerated row was printed for it"
+[ "$(md5sum "$TN2/tools/a_tool.sh" | awk '{print $1}')" = "$BEFORE_N2" ] \
+  && ok "N(n2): nothing was written" || bad "N(n2): it wrote while refusing"
+# ---- n3: undeterminable is a REFUSAL, and it says which kind ----------------
+read -r RN3 TN3 V1N3 V2N3 < <(mkfixture N3)
+mkdir -p "$TN3/lane1"; printf '%s\n' "$V1N3" > "$TN3/lane1/HARNESS_COMMIT"
+mkstub "$WORK/N3_squeue" "9000003 lane1-relock"
+printf '9000003 PENDING lane1-relock %s -\n' "$TN3" > "$WORK/N3_run.txt"
+runsync "$RN3" "$TN3" "$WORK/N3_squeue" "$V2N3" --running-list "$WORK/N3_run.txt" > "$WORK/N3.log" 2>&1; rcN3=$?
+[ "$rcN3" -eq 4 ] && ok "N(n3): a pin-mismatched PENDING job with NO readable script still refuses rc 4 (law 9)" \
+  || { bad "N(n3): rc=$rcN3, wanted 4"; sed 's/^/      /' "$WORK/N3.log"; }
+grep -q '^###   state=PENDING 9000003 lane1-relock .*reason=read-set-undeterminable' "$WORK/N3.log" \
+  && ok "N(n3): and the row says WHICH kind of refusal it is -- read-set-undeterminable, not 'reads an installed file'" \
+  || { bad "N(n3): the reason is missing or wrong"; sed 's/^/      /' "$WORK/N3.log"; }
+# n3b: the job the read-set scope never reached at all. Arm B's fixture is this
+# shape already (a bare `<jid> <name>` squeue stub leaves the read-set query a
+# row with no workdir), so the reason has to be the NOT-EXAMINED one.
+grep -q 'reason=read-set-not-examined' "$LOGB" \
+  && ok "N(n3b): a pin-mismatched job the read-set scope never reached refuses as read-set-not-examined, not as clean" \
+  || { bad "N(n3b): arm B's job was not classed read-set-not-examined"; grep -E '^###   state=PENDING' "$LOGB" | sed 's/^/      /'; }
+# ---- n4: THE MUTATION -------------------------------------------------------
+# Cut exactly one thing: the branch that lets a determinate, disjoint read set
+# reach the tolerated row. n1's fixture must then refuse rc 4 again.
+MUT6=$WORK/harness_sync_notolerance.sh
+sed 's|.*# HARNESS-SYNC-6 TOLERANCE BRANCH$|  if true; then|' "$SYNC" > "$MUT6"
+if bash -n "$MUT6" 2>/dev/null && ! grep -q 'HARNESS-SYNC-6 TOLERANCE BRANCH' "$MUT6"; then
+  read -r RN4 TN4 V1N4 V2N4 < <(mkfixture N4)
+  mkdir -p "$TN4/lane1"; printf '%s\n' "$V1N4" > "$TN4/lane1/HARNESS_COMMIT"
+  mksnapowner "$TN4"
+  mkstub "$WORK/N4_squeue" "9000004 lane1-relock"
+  printf '9000004 PENDING lane1-relock %s %s %s\n' \
+    "$TN4" "$TN4/jobroot/owner-snapshot/owner.sbatch" "$TN4/jobroot/owner-snapshot" > "$WORK/N4_run.txt"
+  cp -f "$MUT6" "$TN4/tools/harness_sync.sh"
+  HARNESS_REPO="$RN4" HARNESS_TASK_DIR="$TN4" HARNESS_SQUEUE="$WORK/N4_squeue" \
+    bash "$TN4/tools/harness_sync.sh" "$V2N4" --running-list "$WORK/N4_run.txt" > "$WORK/N4.log" 2>&1; rcN4=$?
+  if [ "$rcN4" -eq 4 ] && ! grep -q 'PIN MISMATCH tolerated' "$WORK/N4.log"; then
+    ok "N(n4): MUTATION -- with the tolerance branch cut the SAME snapshot owner refuses rc 4 again (rc=$rcN4) and no tolerated row is printed, so n1 CAN fail"
+  else
+    bad "N(n4): the mutant gave rc=$rcN4 and still tolerated -- ARM n1 IS NOT TESTING THE REFINEMENT"
+    sed 's/^/      /' "$WORK/N4.log"
+  fi
+else
+  bad "N(n4): could not build the no-tolerance mutant -- MUTATION ARM DID NOT RUN"
+fi
+
 echo "### harness_sync_guard: pass=$pass fail=$fail"
 [ "$fail" -eq 0 ] || exit 1
 exit 0
