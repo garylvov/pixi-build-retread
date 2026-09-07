@@ -686,6 +686,42 @@ export RUST_BACKTRACE=1
 . "$FAST_ENV"
 retread_fast_env "$WS" || { echo "FATAL: retread_fast_env refused"; exit 7; }
 
+# --- C31-4: JOB-SCOPED sdist BUILD TREES, AND THE GUARD THAT READS THEM -------
+# HARNESS-CONSOL-9, 2026-09-07. THE BACK-PORT THIS TEMPLATE NEVER GOT, AND IT IS
+# THE ONE THAT MATTERED MOST. `retread_fast_env` above just pointed UV_CACHE_DIR
+# and PIXI_CACHE_DIR at the SHARED persistent root. For the byte-keyed buckets
+# that is the whole 41x win and it stays. For `sdists-v9` and `builds-v0` it is a
+# CORRECTNESS BUG: uv builds a source distribution IN PLACE inside `sdists-v9`,
+# so a cmake project leaves a `CMakeCache.txt` there holding the ABSOLUTE
+# compiler paths of whichever workspace built it first, and the next job inherits
+# them. B-cert-4's `pm-newton-gpu` RED-install was exactly that -- a compiler
+# path into `ws.MN1-5761731`, reaped weeks earlier -- while `pm-mujoco` built the
+# SAME sdist green in the same job off the healthy python-3.10 sibling directory.
+# LANE-C-WARM-LOG 31.10-31.12 and 33.
+#
+# C31-4 fixed that in `phase_template/phaseN_relock.sh` and ONLY there. THIS file
+# is the DERIVATION SOURCE every merge lane's relock is cut from -- seven lanes
+# did `git cat-file blob <sha>:harness/arms/mh1_relock.sh`, harness/README.md's
+# `arms/` row states the contract -- so until this line existed EVERY merge proof
+# since C31-4 locked against the shared, poisonable sdist tree. Measured, not
+# asserted: merge lane mCA's relock, job 6000717 (2026-09-06T22:06:11, running
+# `merge-h/mh1_relock.sh`), printed `retread_scope_sdist_builds` 0 times and
+# `sdist scoping` 0 times in 1706 lines of stdout; the single occurrence of
+# `sdist_build_poison_guard` in that log is a DRIFT manifest row for the FILE,
+# not a run of it.
+#
+# `retread_relock_scope_and_verify` (tools/retread_fast_env.sh) is the ONE
+# producer: it scopes the build halves, honours `--cold-proof-arm` on the argv
+# for a declared-cold proof arm, and runs the poison guard EITHER WAY. Its
+# readers are tools/cold_proof_arm_guard.sh and tools/sdist_build_scope_guard.sh.
+# `"$@"` is this script's own argv.
+#
+# A LANE THAT DERIVES FROM THIS FILE INHERITS THE SCOPING. Its first merge proof
+# will run the scoper for the first time, so its sdist builds are COLD once (the
+# byte-keyed buckets stay shared) -- predict a wall change, do not be surprised
+# by one.
+retread_relock_scope_and_verify "$C" "$@" || exit 7
+
 ########## WHEEL STORE -- RESOLVED AND REPORTED, NOT ASSERTED (MERGE-M-1) ######
 # THIS ROW USED TO LIE, and it lied identically in B18, B19, B20 and B21. It read
 #   "### WHEEL STORE: job-scoped, under XDG_CACHE_HOME=... (RETREAD_WHEEL_STORE

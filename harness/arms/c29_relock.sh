@@ -231,6 +231,13 @@ set -uo pipefail
 # failure is, and a failing arm answers that as well as a passing one.
 
 TAG=C29P1                                    # roots become cert${TAG}-<job>-<ARM> / ws.${TAG}-<job>-<ARM>; verified absent under /oscar/data/stellex/glvov/retread before submission, so this arm cannot collide with any prior one
+# THE SCRIPT'S OWN ARGV, CAPTURED AT TOP LEVEL (HARNESS-CONSOL-9). The C31-4
+# back-port below runs inside `run_arm`, and `"$@"` inside a shell function is
+# the FUNCTION's arguments -- run_arm's are <ARM> <cache_root> <auto_imports>.
+# Forwarding those would silently drop `--cold-proof-arm` and, worse, would hand
+# the helper three positional words that mean something else entirely. So the
+# script's argv is captured HERE, once, and forwarded by name.
+C29_ARGV=("$@")
 T=/oscar/data/stellex/glvov/agrescap/tasks/retread-4-11  # task root
 D=$T/c29-phase1                              # THIS harness's own directory
 SRC_WS=/oscar/data/stellex/glvov/imprint-data           # READ-ONLY canonical source tree
@@ -881,6 +888,36 @@ run_arm() {
   # shellcheck source=/dev/null
   . "$FAST_ENV"
   retread_fast_env "$WS" || { echo "FATAL: retread_fast_env refused"; exit 7; }
+
+  # --- C31-4: JOB-SCOPED sdist BUILD TREES, AND THE GUARD THAT READS THEM -----
+  # HARNESS-CONSOL-9, 2026-09-07. THE BACK-PORT THIS TEMPLATE NEVER GOT.
+  # `retread_fast_env` above just pointed UV_CACHE_DIR and PIXI_CACHE_DIR at the
+  # SHARED persistent root ($CACHEROOT). For the byte-keyed buckets that is the
+  # whole 41x win and it stays. For `sdists-v9` and `builds-v0` it is a
+  # CORRECTNESS BUG: uv builds a source distribution IN PLACE inside `sdists-v9`,
+  # so a cmake project leaves a `CMakeCache.txt` there holding the ABSOLUTE
+  # compiler paths of whichever workspace built it first, and the next job
+  # inherits them (B-cert-4's `pm-newton-gpu` RED-install; LANE-C-WARM-LOG
+  # 31.10-31.12 and 33). C31-4 wired the fix into the phase template's relock
+  # and nowhere else; `grep -c` at 3b7d1cb read scoper=0 in this file. (The
+  # template's file name is deliberately NOT spelled here: this arm's
+  # LEFTOVER_RE lists it, and a comment naming it fails the self-check -- which
+  # is the check doing its job, caught by running the fixture, not by reading.)
+  #
+  # THIS ARM SCRIPT IS THE ONE WHERE THE BUG IS WORST-SHAPED. run_arm is called
+  # TWICE in one job, OFF then ON, and the two arms differ only in
+  # RETREAD_AUTO_IMPORTS. With an unscoped `sdists-v9` the OFF arm's build state
+  # is visible to the ON arm, so an A/B whose entire claim is "one variable
+  # differs" carries a second, invisible difference: arm 2 builds against arm 1's
+  # leftovers. `$C` is run_arm's own per-arm root, so scoping here gives each arm
+  # its own empty build halves and the comparison means what it says.
+  #
+  # `retread_relock_scope_and_verify` (tools/retread_fast_env.sh) is the ONE
+  # producer: scoper, `--cold-proof-arm` on the argv, poison guard either way.
+  # Its readers are tools/cold_proof_arm_guard.sh and
+  # tools/sdist_build_scope_guard.sh. C29_ARGV is the SCRIPT's argv (see its
+  # capture at the top) -- `"$@"` here would be run_arm's three arguments.
+  retread_relock_scope_and_verify "$C" "${C29_ARGV[@]}" || exit 7
 
   # THE WHEEL STORE -- the import->distribution INDEX AUTHORITY, and the reason
   # every injection run so far reported ~0% indexed naming.

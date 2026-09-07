@@ -668,6 +668,31 @@ export RUST_BACKTRACE=1
 . "$FAST_ENV"
 retread_fast_env "$WS" || { echo "FATAL: retread_fast_env refused"; exit 7; }
 
+# --- C31-4: JOB-SCOPED sdist BUILD TREES, AND THE GUARD THAT READS THEM -------
+# HARNESS-CONSOL-9, 2026-09-07. THE BACK-PORT THIS TEMPLATE NEVER GOT.
+# `retread_fast_env` above just pointed UV_CACHE_DIR and PIXI_CACHE_DIR at the
+# SHARED persistent root. For the byte-keyed buckets that is the whole 41x win
+# and it stays. For `sdists-v9` and `builds-v0` it is a CORRECTNESS BUG: uv
+# builds a source distribution IN PLACE inside `sdists-v9`, so a cmake project
+# leaves a `CMakeCache.txt` there holding the ABSOLUTE compiler paths of
+# whichever workspace built it first, and the next job inherits them. B-cert-4's
+# `pm-newton-gpu` RED-install was exactly that. LANE-C-WARM-LOG 31.10-31.12, 33.
+#
+# C31-4 wired the fix into `phase_template/phaseN_relock.sh` and nowhere else;
+# `grep -c` at 3b7d1cb read scoper=0 in this file. A hardlink-guard PROOF that
+# locks against another job's build state is not proving what it says it proves,
+# so the back-port belongs here as much as in the arms.
+#
+# `retread_relock_scope_and_verify` (tools/retread_fast_env.sh) is the ONE
+# producer: it scopes the build halves, honours `--cold-proof-arm` on the argv --
+# which THIS file is the likeliest to need, a proof arm given its OWN EMPTY
+# `RETREAD_PERSIST_CACHE_ROOT` has nothing to symlink and the scoper refuses it
+# (DET-1-6-2, job 6014471 arm W1) -- and runs the poison guard EITHER WAY, since
+# a cold arm keeps the shared caches and needs the reader more, not less. Its
+# readers are tools/cold_proof_arm_guard.sh and tools/sdist_build_scope_guard.sh.
+# `"$@"` is this script's own argv.
+retread_relock_scope_and_verify "$C" "$@" || exit 7
+
 # --- OPTIONAL: JOB-SCOPED WHEEL STORE, SEEDED FROM THE PERSISTENT ONE ---------
 # retread_fast_env just exported RETREAD_WHEEL_STORE=<persist root>/wheels, the
 # SHARED store. That is the right default and it is what buys index authority

@@ -182,6 +182,94 @@ else
   echo "GUARD  ?? : EXDEV control SKIPPED (set SCOPE_GUARD_XDEV to a dir on another filesystem, e.g. /tmp, to run it)"
 fi
 
+
+########## HALF THREE: THE ONE RELOCK-SIDE PRODUCER #############################
+# HARNESS-CONSOL-9. HALVES ONE AND TWO guard the two pieces; nothing guarded the
+# CALL. C31-4 was wired into one relock template and three others -- including
+# `arms/mh1_relock.sh`, the file every merge lane's relock is derived from --
+# called neither piece, so every merge proof since C31-4 locked against the
+# shared, poisonable sdist tree (mCA job 6000717: zero scoping rows in 1706
+# lines). The back-port is `retread_relock_scope_and_verify`, ONE producer that
+# all four templates call. This half drives it end to end, with the REAL scoper
+# and the REAL reader, against the same poisoned fixture.
+echo "GUARD: === HALF THREE: retread_relock_scope_and_verify, end to end ==="
+command -v retread_relock_scope_and_verify >/dev/null \
+  || { fail "retread_relock_scope_and_verify is not defined by $FAST_ENV"; }
+
+SH3=$WORK/shared3
+mk_cache "$SH3/uv" "$DEAD"
+mk_cache "$SH3/pixi/uv-cache" "$DEAD"
+mkdir -p "$SH3/pixi/pkgs"; printf 'shared-pkg\n' > "$SH3/pixi/pkgs/warm.txt"
+
+# (a) PRODUCTION SHAPE: the poison is in the shared cache, the producer scopes
+#     it out of reach, and the reader it runs afterwards therefore goes GREEN.
+JR3=$WORK/jobroot3
+( export UV_CACHE_DIR=$SH3/uv PIXI_CACHE_DIR=$SH3/pixi
+  retread_relock_scope_and_verify "$JR3" ) > "$WORK/h3-hot.out" 2>&1
+RC=$?
+sed 's/^/GUARD:   /' "$WORK/h3-hot.out"
+[ "$RC" -eq 0 ] && ok "producer, production shape: rc=0 over a POISONED shared cache -- the scoping is what makes the reader green" \
+  || fail "producer, production shape: rc=$RC, expected 0"
+grep -q '### stage: sdist builds scoped' "$WORK/h3-hot.out" \
+  && ok "producer, production shape: the log carries the greppable 'sdist builds scoped' row a merge proof can be audited on" \
+  || fail "producer, production shape: no 'sdist builds scoped' row -- a production log could not be audited for it"
+grep -q 'cmakecache_files=' "$WORK/h3-hot.out" \
+  && ok "producer, production shape: the reader actually ran (census row present) -- the GREEN is not vacuous" \
+  || fail "producer, production shape: the poison guard did not run at all"
+[ -d "$JR3/uv-overlay/sdists-v9" ] && [ ! -L "$JR3/uv-overlay/sdists-v9" ] \
+  && ok "producer, production shape: the job-local sdists-v9 exists" \
+  || fail "producer, production shape: no job-local sdists-v9 -- the producer did not scope"
+
+# (b) COLD PROOF ARM over a POISONED shared cache: the scoping is skipped BY
+#     DESIGN, so the poison stays reachable and the reader MUST refuse. This is
+#     the assertion that says a declared-cold arm is not exempt from the reader
+#     -- it keeps the shared caches, so it needs the reader more, not less.
+JR4=$WORK/jobroot4
+( export UV_CACHE_DIR=$SH3/uv PIXI_CACHE_DIR=$SH3/pixi
+  retread_relock_scope_and_verify "$JR4" --cold-proof-arm ) > "$WORK/h3-cold.out" 2>&1
+RC=$?
+sed 's/^/GUARD:   /' "$WORK/h3-cold.out"
+grep -q 'sdist scoping SKIPPED (declared cold proof arm)' "$WORK/h3-cold.out" \
+  && ok "producer, cold arm: the SKIPPED row is printed" || fail "producer, cold arm: no SKIPPED row"
+[ "$RC" -eq 7 ] && ok "producer, cold arm: REFUSES (rc=7) -- skipping the scoper does not skip the reader" \
+  || fail "producer, cold arm: rc=$RC, expected 7 -- a cold arm walked past a poisoned shared cache"
+[ -e "$JR4/uv-overlay" ] && fail "producer, cold arm: an overlay was built anyway -- the flag did not skip the scoper" \
+  || ok "producer, cold arm: no overlay was built"
+
+# (c) COLD PROOF ARM over a CLEAN shared cache: green, or (b) would be a guard
+#     that only ever passes because it always refuses.
+SH4=$WORK/shared4
+mk_cache "$SH4/uv" "$GOODCC"
+mk_cache "$SH4/pixi/uv-cache" "$GOODCC"
+( export UV_CACHE_DIR=$SH4/uv PIXI_CACHE_DIR=$SH4/pixi
+  retread_relock_scope_and_verify "$WORK/jobroot5" --cold-proof-arm ) > "$WORK/h3-cold-clean.out" 2>&1
+RC=$?
+[ "$RC" -eq 0 ] && ok "producer, cold arm over a CLEAN cache: rc=0 -- (b)'s refusal is the poison, not the flag" \
+  || { fail "producer, cold arm over a CLEAN cache: rc=$RC, expected 0"; sed 's/^/GUARD:   /' "$WORK/h3-cold-clean.out"; }
+
+# (d) THE FLAG MUST BE READ FROM THE FORWARDED ARGV, not from anything ambient:
+#     a template forwards its whole `"$@"`, so the flag arrives among other
+#     words and an unrelated argv must NOT trigger the skip.
+( export UV_CACHE_DIR=$SH3/uv PIXI_CACHE_DIR=$SH3/pixi
+  retread_relock_scope_and_verify "$WORK/jobroot6" OFF /some/cache '' ) > "$WORK/h3-argv.out" 2>&1
+RC=$?
+if grep -q 'sdist scoping SKIPPED' "$WORK/h3-argv.out"; then
+  fail "producer: an argv WITHOUT --cold-proof-arm still skipped the scoping"
+else
+  ok "producer: an unrelated argv (run_arm's three words) does not trigger the skip (rc=$RC)"
+fi
+( export UV_CACHE_DIR=$SH3/uv PIXI_CACHE_DIR=$SH3/pixi
+  retread_relock_scope_and_verify "$WORK/jobroot7" OFF /some/cache '' --cold-proof-arm ) > "$WORK/h3-argv2.out" 2>&1
+grep -q 'sdist scoping SKIPPED' "$WORK/h3-argv2.out" \
+  && ok "producer: the flag is found among other forwarded words, not only in first position" \
+  || fail "producer: the flag was missed when it was not the first forwarded word"
+
+# (e) USAGE: no job root at all is a usage error, not a silent no-op.
+( export UV_CACHE_DIR=$SH3/uv PIXI_CACHE_DIR=$SH3/pixi
+  retread_relock_scope_and_verify ) > "$WORK/h3-usage.out" 2>&1
+RC=$?
+[ "$RC" -eq 2 ] && ok "producer: an empty job root is a usage refusal (rc=2)" \
+  || fail "producer: an empty job root gave rc=$RC, expected 2"
 echo "GUARD: ==============================="
 [ "$FAIL" -eq 0 ] && { echo "GUARD: ALL CHECKS PASSED"; exit 0; }
 echo "GUARD: FAILURES ABOVE"; exit 1

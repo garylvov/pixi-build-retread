@@ -789,41 +789,26 @@ retread_fast_env "$WS" || { echo "FATAL: retread_fast_env refused"; exit 7; }
 # uv caches (pixi 0.73.0 does not read UV_CACHE_DIR; its uv cache hangs off
 # PIXI_CACHE_DIR, and THAT is the one that was poisoned) and leaves every
 # byte-keyed bucket a symlink into the shared cache.
-# --- `--cold-proof-arm`: THE ONE SHAPE THIS FUNCTION CANNOT SERVE ------------
-# DET-1-6-2, measured on job 6014471 arm W1. `retread_scope_sdist_builds`
-# shares the byte-keyed buckets by SYMLINKING every top-level entry of the
-# shared uv cache EXCEPT `sdists-v9`/`builds-v0`, and then REFUSES when it
-# symlinked none: "no byte-keyed bucket was symlinked -- the overlay would be a
-# COLD cache, not an isolation of the build halves". That refusal is correct
-# for a production relock and WRONG for a DECLARED-COLD PROOF ARM, which is
-# given its OWN EMPTY `RETREAD_PERSIST_CACHE_ROOT` on purpose -- a shared cache
-# would let arm 2 replay arm 1's prepared metadata and make the proof vacuous.
-# For such an arm there is nothing to symlink BY CONSTRUCTION, and 6014471's
-# census row read `symlinked=0 copied=0 build_dirs_local=4/4
-# build_dirs_nonempty=0 shared_links_seen=0` before the refusal.
-# PRE-SEEDING THE ROOT IS NOT THE FIX EITHER: the bucket a cold proof must not
-# share is exactly `sdists-v9`, and `sdists-v9` is the one bucket this function
-# never links -- it `rm -rf`s and re-creates it empty. So the caller declares
-# the shape ON ARGV, not in the environment, which is where a proof's own state
-# leaks between its arms.
-# THE GUARD THAT READS THIS FLAG: tools/cold_proof_arm_guard.sh -- it runs the
-# scoper against an empty shared cache with the flag and without it, and refuses
-# unless the flagged run prints the SKIPPED row and the unflagged run refuses.
-COLD_PROOF_ARM=0
-for _cpa in "$@"; do [ "$_cpa" = --cold-proof-arm ] && COLD_PROOF_ARM=1; done
-unset _cpa
-if [ "$COLD_PROOF_ARM" = 1 ]; then
-  echo "### stage: sdist scoping SKIPPED (declared cold proof arm)"
-  echo "### stage: cold proof arm keeps UV_CACHE_DIR=$UV_CACHE_DIR PIXI_CACHE_DIR=$PIXI_CACHE_DIR unscoped -- the poison guard below still reads them"
-else
-  retread_scope_sdist_builds "$C" || { echo "FATAL: retread_scope_sdist_builds refused"; exit 7; }
-fi
-
-# ITS READER, and it runs BEFORE any install. A criterion with no live producer
-# is a defect; this one names a file and a path and refuses on them.
-SDIST_GUARD=$(dirname "$FAST_ENV")/sdist_build_poison_guard.sh
-[ -f "$SDIST_GUARD" ] || { echo "FATAL: sdist_build_poison_guard.sh missing next to $FAST_ENV"; exit 7; }
-bash "$SDIST_GUARD" || { echo "FATAL: sdist build poison guard refused -- see the rows above"; exit 7; }
+# --- `--cold-proof-arm` AND THE POISON GUARD NOW LIVE IN ONE PRODUCER --------
+# HARNESS-CONSOL-9, 2026-09-07. Both halves that used to be inline here -- the
+# `--cold-proof-arm` branch (DET-1-6-2, measured on job 6014471 arm W1) and the
+# `sdist_build_poison_guard.sh` run that reads the result -- are now
+# `retread_relock_scope_and_verify` in tools/retread_fast_env.sh. They moved
+# because THIS TEMPLATE WAS THE ONLY ONE THAT HAD THEM: `grep -c` at commit
+# 3b7d1cb read scoper=3 here and scoper=0 in arms/mh1_relock.sh,
+# arms/c29_relock.sh and proof/hlgd_relock.sh -- and arms/mh1_relock.sh is the
+# template every merge lane's relock is derived from, so the fix reached the one
+# relock the merge campaign does not run (mCA job 6000717 locked with zero
+# scoping rows in 1706 lines of stdout). Four copies of a correctness fix drift;
+# one producer does not. Read that function for the whole argument, which is no
+# longer duplicated here. Its readers: tools/cold_proof_arm_guard.sh (every
+# shipped relock template must reach C31-4 through it, and the flag must still
+# gate) and tools/sdist_build_scope_guard.sh HALF THREE (the poisoned fixture
+# driven end to end through it).
+#
+# `"$@"` is this script's own argv and carries `--cold-proof-arm` when a proof
+# arm declares itself cold.
+retread_relock_scope_and_verify "$C" "$@" || exit 7
 
 # --- OPTIONAL: JOB-SCOPED WHEEL STORE, SEEDED FROM THE PERSISTENT ONE ---------
 # retread_fast_env just exported RETREAD_WHEEL_STORE=<persist root>/wheels, the

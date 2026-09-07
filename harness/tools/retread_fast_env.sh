@@ -1207,3 +1207,90 @@ retread_scope_sdist_builds () {
   echo "retread_scope_sdist_builds: PIXI_CACHE_DIR=$PIXI_CACHE_DIR"
   return 0
 }
+
+######## retread_relock_scope_and_verify -- ONE CALL SITE FOR C31-4 ############
+#
+#   retread_relock_scope_and_verify <job-scoped root> ["$@"]
+#
+# WHY THIS FUNCTION EXISTS AT ALL (HARNESS-CONSOL-9, 2026-09-07). C31-4 landed
+# its two halves -- `retread_scope_sdist_builds` above and its reader
+# `tools/sdist_build_poison_guard.sh` -- and then wired them into exactly ONE
+# relock script, `phase_template/phaseN_relock.sh`. Measured by `grep -c` on the
+# four relock templates in the tree at commit 3b7d1cb:
+#
+#     phase_template/phaseN_relock.sh   scoper=3  poison_guard=2
+#     arms/mh1_relock.sh                scoper=0  poison_guard=0
+#     arms/c29_relock.sh                scoper=0  poison_guard=0
+#     proof/hlgd_relock.sh              scoper=0  poison_guard=0
+#
+# `arms/mh1_relock.sh` is the DERIVATION SOURCE every merge lane's relock is cut
+# from (`git cat-file blob <sha>:harness/arms/mh1_relock.sh`; harness/README.md
+# row for `arms/`), so the one template that got the fix is the one template the
+# merge campaign does not run. Confirmed in production: merge lane mCA's relock,
+# job 6000717 (2026-09-06T22:06:11, `merge-h/mh1_relock.sh`), printed
+# `retread_scope_sdist_builds` 0 times and `sdist scoping` 0 times in its 1706
+# stdout lines -- the only occurrence of the string `sdist_build_poison_guard`
+# in that log is a DRIFT manifest row for the FILE, never a run of it. Every
+# merge proof since C31-4 has locked against the SHARED, poisonable sdist tree.
+#
+# The back-port is this function rather than four copies of the block, because
+# four copies of a correctness fix drift and the copy that drifts is the one
+# nobody is looking at. `tools/cold_proof_arm_guard.sh` is its reader: it
+# requires every shipped relock template to reach C31-4 THROUGH here, and
+# `tools/sdist_build_scope_guard.sh` HALF THREE drives this function end to end
+# against the poisoned fixture.
+#
+# WHAT IT DOES, in the order a relock needs it:
+#   1. `--cold-proof-arm` on the forwarded argv -> the scoper is SKIPPED and
+#      says so. DET-1-6-2: `retread_scope_sdist_builds` REFUSES when it
+#      symlinked no byte-keyed bucket ("no byte-keyed bucket was symlinked"),
+#      which is exactly the state of a declared-cold proof arm handed its OWN
+#      EMPTY `RETREAD_PERSIST_CACHE_ROOT` on purpose (measured, job 6014471 arm
+#      W1: `symlinked=0 ... shared_links_seen=0` then the FATAL). That refusal is
+#      right for a production relock and wrong for such an arm, and PRE-SEEDING
+#      IS NOT THE FIX -- the bucket a cold proof must not share is `sdists-v9`,
+#      the one bucket the scoper never links but `rm -rf`s and recreates empty.
+#      So the shape is declared ON ARGV, not in the environment, which is where
+#      a proof's state leaks between its own arms.
+#   2. otherwise, scope the build halves into the job-scoped root.
+#   3. EITHER WAY run the poison guard -- a cold proof arm keeps the shared,
+#      poisonable caches, so it needs the reader MORE than a scoped run does.
+#
+# Callers pass their own `"$@"` so the flag reaches step 1. A caller whose lock
+# runs inside a shell function must capture the SCRIPT's argv at top level first
+# (`arms/c29_relock.sh` does: `C29_ARGV=("$@")`), because `"$@"` inside a
+# function is the function's arguments and the flag would be silently lost.
+#
+# Returns 0 clean, 7 on any refusal (the exit code the templates already use for
+# an environment refusal), 2 on a usage error.
+retread_relock_scope_and_verify () {
+  local job_root=${1:-}
+  [ "$#" -gt 0 ] && shift
+  if [ -z "$job_root" ]; then
+    echo "retread_relock_scope_and_verify: usage: retread_relock_scope_and_verify <job-scoped root> [\"\$@\"]" >&2
+    return 2
+  fi
+
+  local cold=0 a
+  for a in "$@"; do [ "$a" = --cold-proof-arm ] && cold=1; done
+
+  if [ "$cold" = 1 ]; then
+    echo "### stage: sdist scoping SKIPPED (declared cold proof arm)"
+    echo "### stage: cold proof arm keeps UV_CACHE_DIR=${UV_CACHE_DIR:-<unset>} PIXI_CACHE_DIR=${PIXI_CACHE_DIR:-<unset>} unscoped -- the poison guard below still reads them"
+  else
+    retread_scope_sdist_builds "$job_root" || {
+      echo "FATAL: retread_scope_sdist_builds refused"; return 7; }
+    echo "### stage: sdist builds scoped UV_CACHE_DIR=${UV_CACHE_DIR:-<unset>} PIXI_CACHE_DIR=${PIXI_CACHE_DIR:-<unset>}"
+  fi
+
+  # ITS READER, and it runs BEFORE any install. A criterion with no live
+  # producer is a defect; this one names a file and a path and refuses on them.
+  local here guard
+  here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd) || return 7
+  guard=$here/sdist_build_poison_guard.sh
+  if [ ! -f "$guard" ]; then
+    echo "FATAL: sdist_build_poison_guard.sh missing next to $here/retread_fast_env.sh"; return 7
+  fi
+  bash "$guard" || { echo "FATAL: sdist build poison guard refused -- see the rows above"; return 7; }
+  return 0
+}
