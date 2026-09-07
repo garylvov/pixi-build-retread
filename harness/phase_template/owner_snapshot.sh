@@ -31,7 +31,18 @@
 # would fall back to the live path with a row saying it was frozen.
 #
 #   usage: owner_snapshot.sh <job root> <script> [<script> ...] \
-#                            [--arms <n>] [--roots <root> [<root> ...]]
+#                            [--arms <n>] --roots <root> [<root> ...]
+#          owner_snapshot.sh <job root> <script> ... \
+#                            --allow-underived --reason "<why this needs no wall>"
+#
+#   `--roots` IS REQUIRED (HARNESS-CONSOL-12). Without it the wall cannot be
+#   derived and the owner would carry covers=0 / wall=0s placeholders that every
+#   downstream comparison reads as measurements -- the shape det163's 24
+#   self-continuing owners were generated in. The roots need not EXIST yet: an
+#   absent root is estimated for the wall at submit and censused as zero inside
+#   the owner. A caller that never submits the owner it generates says so with
+#   `--allow-underived --reason`, which leaves a marker sidecar beside the job
+#   root; that flag WITHOUT a reason is still a refusal.
 #
 #   Writes  <job root>/owner-snapshot/          the frozen scripts
 #           <job root>/owner-snapshot/owner.sbatch   execs the FIRST script,
@@ -380,17 +391,63 @@ owner_continue_check () {
 
 ########## the argument split: scripts to freeze, roots to size the wall from ##
 SCRIPTS=(); ROOTS=(); OWNER_ARMS=1; argmode=scripts
+ALLOW_UNDERIVED=0; UNDERIVED_REASON=
 while [ "$#" -gt 0 ]; do
   case $1 in
     --roots) argmode=roots ;;
     --arms)  shift; OWNER_ARMS=${1:-1}; [ "$OWNER_ARMS" -ge 1 ] 2>/dev/null || OWNER_ARMS=1 ;;
+    --allow-underived) ALLOW_UNDERIVED=1 ;;
+    --reason) shift; UNDERIVED_REASON=${1:-} ;;
     *) if [ "$argmode" = roots ]; then ROOTS+=("$1"); else SCRIPTS+=("$1"); fi ;;
   esac
   shift
 done
 [ -n "$JOB_ROOT" ] && [ "${#SCRIPTS[@]}" -ge 1 ] || {
-  echo "### OWNER SNAPSHOT REFUSED: usage: owner_snapshot.sh <job root> <script> [<script>...] [--arms <n>] [--roots <root>...]"; exit 2; }
+  echo "### OWNER SNAPSHOT REFUSED: usage: owner_snapshot.sh <job root> <script> [<script>...] [--arms <n>] [--roots <root>...] [--allow-underived --reason \"<why>\"]"; exit 2; }
 set -- "${SCRIPTS[@]}"
+
+########## HARNESS-CONSOL-12: AN UNDERIVED WALL REFUSES AT SUBMIT #############
+# A DETECTOR WITH NO ACTUATOR IS A DEFECT (law 9), AND THIS ONE COST 24 JOBS.
+# Called with no `--roots` this tool used to print
+#   ### OWNER SNAPSHOT wall=UNDERIVED roots=0
+# and carry on. det163_proof.sh's submit_owner calls
+# `owner_snapshot.sh "$jr" "$gate"` and nothing else; the row is in
+# det163-6020526.out TWICE, nobody read it, and the owners it generated -- with
+# OWNER_WALL_COVERS=0 and OWNER_WALL_S=0, placeholders that every downstream
+# comparison read as measurements -- self-continued four deep, twenty-four times
+# on 2026-09-07 between 08:07 and 08:25. CLEANUP-WALL-3 stopped the owner from
+# ACTING on the placeholder. This stops it being MADE, which is the other half:
+# the refusal names the actuator (`--roots <every root the arms will create>`)
+# rather than describing the hazard, so the row a caller gets is the fix.
+#
+# THE OPT-OUT IS `--allow-older`'s, deliberately: some callers legitimately want
+# a snapshot with no wall -- guards that exercise the READ SET and never submit
+# the owner they generate -- and for those a refusal would be a wall in the wrong
+# place. It costs an explicit argv flag AND a written reason, and it leaves a
+# marker sidecar beside the job root, so an underived owner can always be traced
+# to the caller that asked for one. `--allow-underived` WITHOUT `--reason` is
+# still a refusal: an undocumented opt-out is the row nobody reads again.
+if [ "${#ROOTS[@]}" -eq 0 ] && [ "$ALLOW_UNDERIVED" != 1 ]; then
+  echo "### OWNER SNAPSHOT REFUSED: no --roots, so this owner's wall CANNOT be derived and it"
+  echo "###   would carry OWNER_WALL_COVERS=0 and OWNER_WALL_S=0 -- placeholders that read as"
+  echo "###   measurements to everything downstream. det1f-cleanup 5999937 TIMED OUT at a"
+  echo "###   hand-typed 6 h with 3,068,868 entries left; det163's owners self-continued four"
+  echo "###   deep against covers=0, 24 jobs on 2026-09-07 08:07-08:25."
+  echo "###   PASS THE ROOTS -- every root the arms will create, whether or not they exist yet:"
+  echo "###     owner_snapshot.sh $JOB_ROOT ${SCRIPTS[*]} --roots <root> [<root>...]"
+  echo "###   The roots need not exist at submit: an absent root is ESTIMATED for the wall and"
+  echo "###   censused as zero inside the owner (OWNER_CENSUS_ESTIMATE_ABSENT)."
+  echo "###   If this caller never submits the owner it generates, say so and it proceeds:"
+  echo "###     --allow-underived --reason \"<why this owner needs no wall>\""
+  exit 2
+fi
+if [ "${#ROOTS[@]}" -eq 0 ] && [ -z "$UNDERIVED_REASON" ]; then
+  echo "### OWNER SNAPSHOT REFUSED: --allow-underived WITHOUT --reason is still a refusal."
+  echo "###   The marker sidecar exists so an underived owner can be traced to the caller that"
+  echo "###   asked for one; an empty reason is the unread row this refusal replaced."
+  echo "###     --allow-underived --reason \"<why this owner needs no wall>\""
+  exit 2
+fi
 
 SR=$HERE/../tools/script_refs.sh
 [ -f "$SR" ] || SR=$HERE/script_refs.sh
@@ -403,6 +460,20 @@ SR=$HERE/../tools/script_refs.sh
 
 SNAP=$JOB_ROOT/owner-snapshot
 mkdir -p "$SNAP" || { echo "### OWNER SNAPSHOT REFUSED: cannot create $SNAP"; exit 2; }
+
+# HARNESS-CONSOL-12: the marker sidecar, beside the job root exactly as
+# `HARNESS_COMMIT.allow-older` sits beside its pin. An underived owner is
+# permitted only when a caller wrote down why, and this file is where that
+# sentence survives the job that carried it. Stale markers are removed rather
+# than left to authorise a later run that did not ask.
+AU_MARK_PATH=$JOB_ROOT/OWNER_SNAPSHOT.allow-underived
+if [ "${#ROOTS[@]}" -eq 0 ]; then
+  printf 'allow-underived roots=0 job_root=%s at=%s reason=%s\n' \
+    "$JOB_ROOT" "$(date -Is)" "$(printf '%s' "$UNDERIVED_REASON" | tr '\n' ' ')" \
+    > "$AU_MARK_PATH" || { echo "### OWNER SNAPSHOT REFUSED: cannot write $AU_MARK_PATH"; exit 2; }
+else
+  rm -f "$AU_MARK_PATH"
+fi
 
 ########## DET-1-6-a: WHERE THE BYTES CAME FROM, NEVER A GUESS ################
 # THE DEFECT, MEASURED. This file used to read `src_commit` out of
@@ -601,10 +672,11 @@ if [ "${#ROOTS[@]}" -ge 1 ]; then
   echo "### OWNER SNAPSHOT wall=$OWNER_WALL_S (--time=$OWNER_WALL_HMS) from entries=$OWNER_ENTRIES rate=$OWNER_UNLINK_RATE_PER_S margin=$OWNER_WALL_MARGIN census_allow=$OWNER_CENSUS_ALLOW_S roots=${#ROOTS[@]} present=$OWNER_PRESENT absent=$OWNER_ABSENT arms=$OWNER_ARMS"
   echo "### OWNER SNAPSHOT wall file: $SNAP/owner.wall ($(cat "$SNAP/owner.wall"))"
 else
-  echo "### OWNER SNAPSHOT wall=UNDERIVED roots=0 -- this caller passed no --roots, so the"
-  echo "###   owner keeps whatever --time the submit site types by hand. That is the shape"
-  echo "###   that killed det1f-cleanup 5999937 (TIMEOUT at 06:00:04 with a root half gone);"
-  echo "###   pass --roots <root>... and the wall is derived and printed instead."
+  echo "### OWNER SNAPSHOT wall=UNDERIVED roots=0 AUTHORISED reason=$UNDERIVED_REASON"
+  echo "###   marker: $AU_MARK_PATH"
+  echo "###   This owner keeps whatever --time the submit site types by hand, and it will run"
+  echo "###   its pass but REFUSE to continue itself (CLEANUP-WALL-3: it cannot be short of a"
+  echo "###   wall it never had). Pass --roots <root>... and the wall is derived instead."
 fi
 echo "### OWNER SNAPSHOT frozen: $(cd "$SNAP" && ls -1 *.sh 2>/dev/null | tr '\n' ' ')"
 echo "### OWNER SNAPSHOT md5s: $MD5S ($(wc -l < "$MD5S") file(s)); provenance: $PROV"

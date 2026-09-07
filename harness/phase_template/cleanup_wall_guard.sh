@@ -42,6 +42,13 @@
 #   E. THE PRODUCTION CALL SITE (law 2). phaseN_cert.sh's real
 #      cleanup_submit_or_defer must PASS --roots and CONSUME owner.wall. A
 #      derivation with no caller is boarded debt, not a fix.
+#   G. HARNESS-CONSOL-12 (2026-09-07). An UNDERIVED wall REFUSES at submit: no
+#      --roots is rc 2 with the actuator named, --roots is untouched, and the
+#      documented opt-out (--allow-underived --reason, in --allow-older's shape)
+#      proceeds and leaves a marker sidecar. G5 sweeps every call site in the
+#      harness tree, because a refusal with no consumers is law 2 from the other
+#      end. `### OWNER SNAPSHOT wall=UNDERIVED roots=0` used to be a row the
+#      tool printed and nobody read -- twice in det163-6020526.out.
 #   F. CLEANUP-WALL-2. The census walks what the REAPER walks. A tree DEEPER
 #      than the old `-maxdepth 16` bound is censused at the UNBOUNDED count,
 #      the wall is derived from THAT count, the disagreement with the bounded
@@ -289,9 +296,18 @@ fi
 # continuation on EVERY run, four deep, which is the whole chain. It must now
 # print the UNDERIVED row, say out loud that it will not continue, and submit
 # nothing: that is what turns a row nobody read into an actuator (law 9).
+#
+# HARNESS-CONSOL-12 (2026-09-07): generating this fixture now takes the explicit
+# opt-out, because an underived owner is a REFUSAL at submit since arm G below.
+# The two halves are deliberately separate: G stops an underived owner being
+# MADE by a caller that did not mean it, C3 proves that one made ON PURPOSE
+# still cannot continue itself. Removing either would leave the other half of
+# law 9's actuator alone with the defect.
 mkdir -p "$W/jr.und"
 OWNER_WALL_FLOOR_S=60 OWNER_WALL_PRESSURE_NUM=0 \
-  bash "$SNAPTOOL" "$W/jr.und" "$GATE" > "$W/C3.snap.log" 2>&1; rcU=$?
+  bash "$SNAPTOOL" "$W/jr.und" "$GATE" \
+  --allow-underived --reason "arm C3 fixture: an underived owner made ON PURPOSE, to prove it refuses to continue itself" \
+  > "$W/C3.snap.log" 2>&1; rcU=$?
 if [ "$rcU" = 0 ] && [ -f "$W/jr.und/owner-snapshot/owner.sbatch" ]; then
   : > "$W/C3.sbatch"
   SBATCH_LOG=$W/C3.sbatch PATH=$W/bin:$PATH SLURM_JOB_ID=8800003 SLURM_JOB_NAME=guard-cleanup \
@@ -436,6 +452,139 @@ else
     fail "F4. the bounded mutant censused $FM_CENSUS (bounded=$F_B16 unbounded=$F_UNB) -- the mutation did not change the count, so F1 proves nothing"
   fi
 fi
+########## G. HARNESS-CONSOL-12: AN UNDERIVED WALL REFUSES AT SUBMIT ###########
+# THE DEFECT. `### OWNER SNAPSHOT wall=UNDERIVED roots=0` was a ROW, and the tool
+# carried on and generated the owner anyway. That is law 9's detector with no
+# actuator, and it cost 24 jobs: det163_proof.sh's submit_owner calls
+# `owner_snapshot.sh "$jr" "$gate"` with no --roots, the row is in
+# det163-6020526.out TWICE, nobody read it, and the owners it made carried
+# covers=0 / wall=0s placeholders that everything downstream read as
+# measurements. Arm C3 above proves the OWNER will no longer act on them; these
+# arms prove the SUBMITTER can no longer make one by accident.
+#   G1  no --roots -> REFUSE, non-zero, and the refusal NAMES THE ACTUATOR
+#       (`--roots <root>...`, with the exact command) instead of describing the
+#       hazard. NO owner.sbatch is written: a refusal that still leaves a usable
+#       owner behind is not a refusal.
+#   G2  --roots -> the derived wall row, no refusal. The fix is SCOPED.
+#   G3  --allow-underived --reason -> proceeds, prints the reason on the row,
+#       and leaves the marker sidecar beside the JOB ROOT naming it.
+#   G3b --allow-underived WITHOUT --reason -> still a refusal, and no marker.
+#       An undocumented opt-out is the unread row all over again.
+#   G4  MUTATION: the refusal branch cut on a COPY -> G1's fixture proceeds and
+#       writes an owner. Without G4, G1 passes against any tool that refuses for
+#       some other reason and proves nothing.
+#   G5  LAW 2, THE CALL SITES. Every owner_snapshot.sh invocation in the harness
+#       tree must pass --roots or the documented opt-out. A rule with a live
+#       producer and no consumers is the same defect from the other end.
+mkdir -p "$W/jr.g1" "$W/jr.g2" "$W/jr.g3" "$W/jr.g3b"
+bash "$SNAPTOOL" "$W/jr.g1" "$GATE" > "$W/G1.log" 2>&1; rcG1=$?  # G5-EXEMPT: this IS the no---roots fixture
+if [ "$rcG1" != 0 ] && grep -q '^### OWNER SNAPSHOT REFUSED: no --roots' "$W/G1.log"; then
+  ok "G1. no --roots is a REFUSAL (rc=$rcG1), not a row: $(grep -m1 '^### OWNER SNAPSHOT REFUSED' "$W/G1.log")"
+else
+  fail "G1. rc=$rcG1 and no '### OWNER SNAPSHOT REFUSED: no --roots' row -- UNDERIVED is still a detector with no actuator"
+  sed 's/^/GUARD:   /' "$W/G1.log"
+fi
+if grep -q -- "--roots <root>" "$W/G1.log"; then
+  ok "G1. and the refusal NAMES THE ACTUATOR -- the caller is handed the flag to add, not a description of the hazard"
+else
+  fail "G1. the refusal does not name '--roots <root>' as the fix"
+  sed 's/^/GUARD:   /' "$W/G1.log"
+fi
+if [ ! -f "$W/jr.g1/owner-snapshot/owner.sbatch" ]; then
+  ok "G1. and NO owner.sbatch was written -- a refusal that leaves a usable owner behind is not a refusal"
+else
+  fail "G1. the tool refused and generated the owner anyway: $W/jr.g1/owner-snapshot/owner.sbatch"
+fi
+# G2: SCOPE. The A1 fixture is the with-roots case and it must be untouched.
+bash "$SNAPTOOL" "$W/jr.g2" "$GATE" --roots "$SMALL" > "$W/G2.log" 2>&1; rcG2=$?
+if [ "$rcG2" = 0 ] && [ -n "$(wall_of "$W/G2.log")" ] && ! grep -q 'OWNER SNAPSHOT REFUSED' "$W/G2.log"; then
+  ok "G2. with --roots the wall is DERIVED and nothing refuses (rc=0, wall=$(wall_of "$W/G2.log")s) -- the fix is scoped"
+else
+  fail "G2. rc=$rcG2 wall='$(wall_of "$W/G2.log")' -- the refusal is catching the case it was not written for"
+  sed 's/^/GUARD:   /' "$W/G2.log"
+fi
+# G3: the documented opt-out, in the shape `--allow-older` established.
+G3REASON="guard arm G3: this owner is never submitted"
+bash "$SNAPTOOL" "$W/jr.g3" "$GATE" --allow-underived --reason "$G3REASON" > "$W/G3.log" 2>&1; rcG3=$?
+G3MARK=$W/jr.g3/OWNER_SNAPSHOT.allow-underived
+if [ "$rcG3" = 0 ] && [ -f "$W/jr.g3/owner-snapshot/owner.sbatch" ] \
+   && grep -q "^### OWNER SNAPSHOT wall=UNDERIVED roots=0 AUTHORISED reason=$G3REASON$" "$W/G3.log"; then
+  ok "G3. --allow-underived --reason proceeds and prints the reason on its row: $(grep -m1 'wall=UNDERIVED' "$W/G3.log")"
+else
+  fail "G3. rc=$rcG3 -- the documented opt-out did not proceed"
+  sed 's/^/GUARD:   /' "$W/G3.log"
+fi
+if [ -f "$G3MARK" ] && grep -q "^allow-underived roots=0 job_root=$W/jr.g3 at=.* reason=$G3REASON$" "$G3MARK"; then
+  ok "G3. and the marker sidecar beside the job root names it: $(cat "$G3MARK")"
+else
+  fail "G3. no marker sidecar at $G3MARK, or it does not name the reason: '$( [ -f "$G3MARK" ] && cat "$G3MARK" )'"
+fi
+# G3b: the opt-out costs a reason, or it is not documented at all.
+bash "$SNAPTOOL" "$W/jr.g3b" "$GATE" --allow-underived > "$W/G3b.log" 2>&1; rcG3b=$?
+if [ "$rcG3b" != 0 ] && grep -q '^### OWNER SNAPSHOT REFUSED: --allow-underived WITHOUT --reason' "$W/G3b.log" \
+   && [ ! -f "$W/jr.g3b/OWNER_SNAPSHOT.allow-underived" ]; then
+  ok "G3b. --allow-underived without --reason is STILL a refusal (rc=$rcG3b) and leaves no marker"
+else
+  fail "G3b. rc=$rcG3b -- an undocumented opt-out was accepted, which is the unread row again"
+  sed 's/^/GUARD:   /' "$W/G3b.log"
+fi
+# G4 MUTATION: cut the refusal on a COPY, and G1's fixture must then proceed.
+GMUTD=$W/mutG/phase_template; mkdir -p "$GMUTD" "$W/mutG/tools" "$W/jr.g4"
+cp "$REFS" "$W/mutG/tools/script_refs.sh"
+cp "$HERE/../tools/owner_export.sh" "$W/mutG/tools/owner_export.sh"
+GMUT=$GMUTD/owner_snapshot.sh
+# BOTH refusal branches are cut, not just the first. Cutting only
+# `ALLOW_UNDERIVED != 1` leaves `-z "$UNDERIVED_REASON"` standing, and a no---roots
+# call with no reason then refuses on THAT instead -- rc 2 either way, and the
+# mutant looks like the fix. The first run of this arm (job 6022013) printed
+# exactly that RED, which is the mutation arm catching its own weakness. What G1
+# asserts is that an underived owner cannot be MADE by a caller that did not ask,
+# so the mutation has to remove every branch that stops it being made.
+NG_ANCH=$(grep -c '^if \[ "\${#ROOTS\[@\]}" -eq 0 \] && \[ ' "$SNAPTOOL")
+sed 's|^if \[ "\${#ROOTS\[@\]}" -eq 0 \] && \[ .*; then$|if false; then|' "$SNAPTOOL" > "$GMUT"
+if [ "$NG_ANCH" != 2 ]; then
+  fail "G4. the mutation anchor matched $NG_ANCH refusal branches, not 2 -- G1/G3b are not asserting on the branches this cuts"
+elif cmp -s "$SNAPTOOL" "$GMUT"; then
+  fail "G4. the mutation did not apply -- G1 is asserting against an unmutated file and cannot fail"
+else
+  bash "$GMUT" "$W/jr.g4" "$GATE" > "$W/G4.log" 2>&1; rcG4=$?
+  if [ "$rcG4" = 0 ] && [ -f "$W/jr.g4/owner-snapshot/owner.sbatch" ]; then
+    ok "G4. MUTATION REPRODUCED: with the refusal cut, a no---roots call generates an owner with covers=0/wall=0s exactly as det163's submit_owner did -- G1 CAN fail"
+  else
+    fail "G4. the mutant still refused (rc=$rcG4) -- G1 proves nothing"
+    sed 's/^/GUARD:   /' "$W/G4.log"
+  fi
+fi
+# G5 LAW 2: every call site in the harness tree honours the rule. A refusal with
+# no consumers is the same defect from the other end -- and this sweep is the
+# reader that would have caught det163_proof.sh's submit_owner if that driver
+# lived in the harness tree rather than in the task directory (BOARDED: the
+# det-style drivers under $T are task-only and unversioned; they are named in
+# this commit's message, not fixed by it).
+#
+# CONTINUATION LINES ARE JOINED FIRST. A line-anchored grep cannot see
+# `bash "$SNAPTOOL" ... \` followed by `--roots ...` on the next line and calls
+# every multi-line call site a violation -- measured here on the first draft,
+# which reported 13 of them and every one was green. The sweep is scoped to the
+# REAL tool (`$SNAPTOOL`, `$SNAPT`, or a literal owner_snapshot.sh path); a
+# mutant COPY under some other variable is a guard's own fixture by construction
+# and is not a production call site. A deliberate no---roots fixture carries a
+# `# G5-EXEMPT` marker on its line and says why.
+HROOT=$(cd "$HERE/.." && pwd)
+G5BAD=$W/G5.bad; : > "$G5BAD"
+while IFS= read -r f; do
+  sed -e ':a' -e '/\\$/{N;s/\\\n/ /;ba}' "$f" \
+    | grep -nE 'bash +"[^"]*(SNAPTOOL|SNAPT|owner_snapshot\.sh)[^"]*"' \
+    | grep -vE -- '--roots|--allow-underived|G5-EXEMPT' \
+    | sed "s|^|${f#$HROOT/}:|" >> "$G5BAD"
+done < <(find "$HROOT" -name '*.sh' ! -name owner_snapshot.sh)
+if [ ! -s "$G5BAD" ]; then
+  ok "G5. every owner_snapshot.sh call site in $HROOT passes --roots or the documented opt-out (law 2: the rule has consumers, not just a producer)"
+else
+  fail "G5. call site(s) in the harness tree pass neither --roots nor --allow-underived --reason:"
+  sed 's/^/GUARD:   /' "$G5BAD"
+fi
 echo
 [ "$FAIL" = 0 ] && echo "CLEANUP-WALL-1/2 GUARD: ALL GREEN" || echo "CLEANUP-WALL-1/2 GUARD: SOME CHECKS FAILED"
 exit "$FAIL"
+

@@ -985,7 +985,8 @@ mkowner () {   # $1 = task dir, $2 = repo; echoes the amended v2 sha
 read -r RP TP V1P V2P < <(mkfixture P)
 V2P=$(mkowner "$TP" "$RP")
 PSNAP=$WORK/P_snapshot.log
-bash "$SNAPTOOL" "$TP/jobroot" "$TP/merge-h/cleanup_gated.sh" > "$PSNAP" 2>&1; rcP3=$?
+bash "$SNAPTOOL" "$TP/jobroot" "$TP/merge-h/cleanup_gated.sh" \
+  --allow-underived --reason "sync arm P(p3): this owner is NEVER submitted -- the arm measures the READ SET (the gate and the cleanup.sh it sources) and the literal path in owner.sbatch, so it declares no roots and needs no wall" > "$PSNAP" 2>&1; rcP3=$?
 if [ "$rcP3" -eq 0 ] \
    && grep -qE '^### OWNER SNAPSHOT files=2 root='"$TP"'/jobroot src_commit=' "$PSNAP" \
    && [ -f "$TP/jobroot/owner-snapshot/cleanup_gated.sh" ] \
@@ -1045,7 +1046,8 @@ fi
 read -r RP4 TP4 V1P4 V2P4 < <(mkfixture P4)
 mkowner "$TP4" "$RP4" >/dev/null
 printf '#!/bin/bash\n. "$UNSET_SOMETHING"\n' >> "$TP4/merge-h/cleanup_gated.sh"
-bash "$SNAPTOOL" "$TP4/jobroot" "$TP4/merge-h/cleanup_gated.sh" > "$WORK/P4.log" 2>&1; rcP4=$?
+bash "$SNAPTOOL" "$TP4/jobroot" "$TP4/merge-h/cleanup_gated.sh" \
+  --allow-underived --reason "sync arm P4: never submitted -- this arm measures what the snapshot REFUSES to freeze, so it declares no roots and needs no wall" > "$WORK/P4.log" 2>&1; rcP4=$?
 if [ "$rcP4" -ne 0 ] && grep -q 'OWNER SNAPSHOT REFUSED' "$WORK/P4.log" \
    && [ ! -f "$TP4/jobroot/owner-snapshot/owner.sbatch" ]; then
   ok "P(p4): a reference the parser cannot resolve REFUSES the snapshot (rc=$rcP4) and leaves NO owner.sbatch for a caller to submit"

@@ -73,7 +73,8 @@ HEADA=$(git -C "$GR" rev-parse HEAD)
 mkdir -p "$W/A/jobroot" "$W/A/tools" "$GR/harness/tools"
 printf '%s\n' "$PIN" > "$W/A/tools/.harness_synced_commit"
 printf '%s\n' "$PIN" > "$GR/harness/tools/.harness_synced_commit"
-bash "$SNAPTOOL" "$W/A/jobroot/jr" "$GR/harness/phase_template/cleanup_gated.sh" > "$W/A.log" 2>&1; rcA=$?
+bash "$SNAPTOOL" "$W/A/jobroot/jr" "$GR/harness/phase_template/cleanup_gated.sh" \
+  --allow-underived --reason "provenance arm A: this owner is never submitted -- the arm reads src_commit/src_kind off the snapshot rows and nothing else, so it has no roots and needs no wall" > "$W/A.log" 2>&1; rcA=$?
 KA=$(field "$W/A.log" src_kind); SA=$(field "$W/A.log" src_commit)
 if [ "$rcA" = 0 ] && [ "$KA" = git ] && [ "$SA" = "$HEADA" ]; then
   ok "A. a git-worktree source is named by its OWN HEAD: src_kind=git src_commit=$SA"
@@ -91,7 +92,8 @@ else
 fi
 # and the dirty case, because a dirty file is NOT the commit it sits on
 printf '#!/bin/bash\necho cleanup CHANGED\n' > "$GR/harness/phase_template/cleanup.sh"
-bash "$SNAPTOOL" "$W/A/jobroot/jr2" "$GR/harness/phase_template/cleanup_gated.sh" > "$W/A2.log" 2>&1
+bash "$SNAPTOOL" "$W/A/jobroot/jr2" "$GR/harness/phase_template/cleanup_gated.sh" \
+  --allow-underived --reason "provenance arm A2: never submitted, provenance rows only" > "$W/A2.log" 2>&1
 if grep -q '^### OWNER SNAPSHOT froze file=cleanup.sh .* dirty=yes' "$W/A2.log"; then
   ok "A. an UNCOMMITTED source file is stamped dirty=yes, not silently attributed to HEAD"
 else
@@ -103,7 +105,8 @@ fi
 mkgate "$W/B/task/merge-h"
 mkdir -p "$W/B/task/tools" "$W/B/jobroot"
 printf '%s\n' "$PIN" > "$W/B/task/tools/.harness_synced_commit"
-bash "$SNAPTOOL" "$W/B/jobroot/jr" "$W/B/task/merge-h/cleanup_gated.sh" > "$W/B.log" 2>&1; rcB=$?
+bash "$SNAPTOOL" "$W/B/jobroot/jr" "$W/B/task/merge-h/cleanup_gated.sh" \
+  --allow-underived --reason "provenance arm B: never submitted, provenance rows only" > "$W/B.log" 2>&1; rcB=$?
 KB=$(field "$W/B.log" src_kind); SB=$(field "$W/B.log" src_commit)
 if [ "$rcB" = 0 ] && [ "$KB" = record ] && [ "$SB" = "$PIN" ]; then
   ok "B. a task copy is named by the record beside it: src_kind=record src_commit=$SB"
@@ -115,7 +118,8 @@ fi
 ########## C. neither -> REFUSE ###############################################
 mkgate "$W/C/orphan"
 mkdir -p "$W/C/jobroot"
-bash "$SNAPTOOL" "$W/C/jobroot/jr" "$W/C/orphan/cleanup_gated.sh" > "$W/C.log" 2>&1; rcC=$?
+bash "$SNAPTOOL" "$W/C/jobroot/jr" "$W/C/orphan/cleanup_gated.sh" \
+  --allow-underived --reason "provenance arm C: never submitted, and this arm expects a REFUSAL on the source identity -- the roots are not what is under test" > "$W/C.log" 2>&1; rcC=$?
 if [ "$rcC" = 2 ] && grep -q 'REFUSED: cannot identify the source' "$W/C.log"; then
   ok "C. an unidentifiable source is REFUSED rc 2, not frozen under a guessed row"
 else
@@ -133,7 +137,8 @@ if cmp -s "$SNAPTOOL" "$W/mut/phase_template/owner_snapshot.sh"; then
 else
   # arm A's fixture again: a git worktree with a pin record beside the JOB ROOT
   bash "$W/mut/phase_template/owner_snapshot.sh" "$W/A/jobroot/jrmut" \
-       "$GR/harness/phase_template/cleanup_gated.sh" > "$W/D.log" 2>&1
+       "$GR/harness/phase_template/cleanup_gated.sh" \
+       --allow-underived --reason "provenance arm D mutant: never submitted, provenance rows only" > "$W/D.log" 2>&1
   KD=$(field "$W/D.log" src_kind); SD=$(field "$W/D.log" src_commit)
   if [ "$KD" = record ] && [ "$SD" = "$PIN" ]; then
     ok "D. MUTATION REPRODUCED: without the git branch the SAME fixture advertises the pin ($SD) for bytes that came from $HEADA -- DET-1-6-a exactly"

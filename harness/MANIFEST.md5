@@ -27,7 +27,7 @@ cc3a5b8dbd993448f33cc6c0329df768  manifests/a3b/README.md
 9ebf3564d6efdfd5373a0dbf10581c59  phase_template/cleanup_gated.sh
 3f2101c6bd74757a12ba1de7e97aac5b  phase_template/cleanup_lock_evidence_guard.sh
 4dcd1698a9015c2669919d8c94095364  phase_template/cleanup_owner_guard.sh
-fab4ea23aec40b55b24bbaa16ff90d10  phase_template/cleanup_wall_guard.sh
+6aa6da39b79bef50f3c8c2262bf84f51  phase_template/cleanup_wall_guard.sh
 8cc39f42cf0dcda7c93878195cbac569  phase_template/cleanup.sh
 626a39d4abcb4fdb43b28212ff0792f6  phase_template/env_seed_export_guard.sh
 883d517a614357c59a463f8cdbd9ba4d  phase_template/expect_sha_gate_guard.sh
@@ -37,8 +37,8 @@ a2515c75fe18f95fda20b4d8156728ea  phase_template/leftover_check_guard.sh
 e8e04e6bef93261dbd2035ecd9a19d13  phase_template/phaseN_cert.sh
 7aa9b72fba166fbade2a2eb751483f17  phase_template/phaseN_relock.sh
 6cbcbe998e44568d0ee8ee82fb11d1f5  phase_template/quarantine_collision_guard.sh
-1b883cd78f7695e20e44c911306f50f2  phase_template/owner_snapshot.sh
-aa0c70855063565f693aea5141ab146d  phase_template/owner_snapshot_provenance_guard.sh
+791d307f391cd4a73f8fb2f512d73104  phase_template/owner_snapshot.sh
+494317a3e4779562bd32592b318c7439  phase_template/owner_snapshot_provenance_guard.sh
 f767b333ee61acbc8c8ea4abfb8090f2  phase_template/README.md
 e3ae2fe962354985617f5d6fa77f5a50  phase_template/store_census_snapshot_guard.sh
 a465cea86edc07ad5adf9f96b1ebac9e  phase_template/wedge_triage_guard.sh
@@ -77,7 +77,7 @@ de2c918a31b7e5fdae517cda1ccba4d4  tools/gate_head_pin.sh
 8cad0bdfc7496ee0661c4f5701a8e087  tools/harness_commit_resolve.sh
 447037c0b4249d9d3d7c084940be5cc4  tools/harness_drift_allowlist.txt
 ccca0222c657f87297fab1f870767c8f  tools/harness_sync.sh
-bcdf106ebd02348ce4e99cb4ecbfa52f  tools/harness_sync_guard.sh
+92916d02a6e5934e94bac72bca7826f5  tools/harness_sync_guard.sh
 b84e488467c4ce2f68a94a1f20ebe739  tools/harness_drift_check.sh
 4c8a892042e7de5b6ed3763562a2dd52  tools/harness_push_check.sh
 39e620e807735bdc65b09fb8078d8e82  tools/import_audit.py
