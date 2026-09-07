@@ -377,10 +377,24 @@ cleanup_submit_or_defer () {   # $1=dependency spec  $2..=roots
   # rows. The fix is not a weaker refusal, it is an owner that reads job-local
   # bytes: nothing installs into a job root, so there is nothing left to protect.
   local SNAPTOOL=$(dirname -- "$0")/owner_snapshot.sh
-  [ -f "$SNAPTOOL" ] || SNAPTOOL=$T/tools/phase_template/owner_snapshot.sh
+  [ -f "$SNAPTOOL" ] || SNAPTOOL=${T:-/nonexistent}/tools/phase_template/owner_snapshot.sh
   local SUBMIT=$CLEANUP
-  if [ -f "$SNAPTOOL" ] && bash "$SNAPTOOL" "$D" "$CLEANUP"; then
+  # CLEANUP-WALL-1: the roots go to the snapshot tool as `--roots`, because the
+  # roots are what the WALL is a function of. It derives `--time` from their
+  # entry counts at the measured unlink rate and writes it to owner.wall; the
+  # hand-typed --time in CLEANUP_SBATCH_ARGS is then REPLACED by it rather than
+  # repeated beside it, so exactly one wall reaches sbatch. det1f-cleanup
+  # 5999937 died at a hand-typed 6 h with 3,068,868 entries left to unlink.
+  if [ -f "$SNAPTOOL" ] && bash "$SNAPTOOL" "$D" "$CLEANUP" --roots "$@"; then
     SUBMIT=$D/owner-snapshot/owner.sbatch
+    if [ -s "$D/owner-snapshot/owner.wall" ]; then
+      local DERIVED_WALL; DERIVED_WALL=$(cat "$D/owner-snapshot/owner.wall")
+      CLEANUP_SBATCH_ARGS="$(printf '%s' "$CLEANUP_SBATCH_ARGS" | sed 's/--time=[0-9:]*//g') $DERIVED_WALL"
+      echo "### CLEANUP WALL: DERIVED $DERIVED_WALL from the declared roots (see the OWNER SNAPSHOT wall= row above); the hand-typed --time was replaced"
+    else
+      echo "### CLEANUP WALL: NOT DERIVED -- owner.wall is absent or empty, so this owner runs on"
+      echo "###   the hand-typed wall in CLEANUP_SBATCH_ARGS. That is the shape that timed out."
+    fi
   else
     echo "### OWNER SNAPSHOT UNAVAILABLE -- submitting the owner against the LIVE task copy"
     echo "###   $CLEANUP. This still cleans up; what it costs is that every harness_sync"
