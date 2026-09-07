@@ -145,9 +145,20 @@ async fn async_main() -> anyhow::Result<()> {
         std::process::exit(code);
     }
 
-    // `retread sdist-meta-key --sdist-sha256 <hex> --uv-version <s>
-    //      --python-tag <s> --backend <s> --pythonhashseed <s>
+    // `retread sdist-meta-key (--revision-http <file> | --probe)
+    //      --uv-version <s> --python-tag <s> --backend <s> --pythonhashseed <s>
     //      [--store-root <dir>]`
+    //
+    // SDIST-META-3 REPLACED `--sdist-sha256` WITH `--revision-http`, and the
+    // reason is a measurement rather than a preference: the sdist sha256 the
+    // old flag carried IS NOT IN `revision.http` any more. `od -c` on the same
+    // shard in the same tree shows `91 92 a6 "Sha256" d9 40 <64 hex>` on a file
+    // written 2026-09-04 and the EMPTY array `90` on one written 2026-09-07;
+    // job 6043382 arm 1 refused all six sdists with
+    // `no-sha256-in-revision.http` and admitted nothing. The URL and the ETag
+    // are byte-identical across both shapes, so the key is built on those and
+    // the verb reads the file itself. `--probe` is the seeder's one call to
+    // learn where the store is before it holds an entry.
     //
     // SDIST-META-2, and it exists for the same reason `repodata-universe`
     // does: the prepared-sdist-metadata store has TWO halves in the harness --

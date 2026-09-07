@@ -1251,7 +1251,18 @@ mod tests {
         let dir = sdm::CACHE_NAMESPACE;
         let marker = sdm::COMPLETION_MARKER;
         marker_store_entry(&root, dir, sdm::CACHE_VERSION, "sdm-cur", marker, 30);
-        marker_store_entry(&root, dir, "v0", "sdm-old", marker, 30);
+        // `v1` BY NAME, not a placeholder. SDIST-META-3 bumped the generation
+        // to `v2` because the key's first field changed, and the v1 directory
+        // is left standing for the reaper rather than deleted. This fixture is
+        // the state that actually exists on disk after that bump, and it
+        // asserts the walk ages a v1 entry by the same rule with
+        // `reason="stale-version"` instead of walking past it forever.
+        marker_store_entry(&root, dir, "v1", "sdm-old", marker, 30);
+        assert_ne!(
+            sdm::CACHE_VERSION,
+            "v1",
+            "the older-generation fixture must not be the current generation"
+        );
         marker_store_entry(&root, dir, sdm::CACHE_VERSION, "sdm-fresh", marker, 1);
         // A half-published entry: the payload landed, the marker did not. It is
         // NOT an entry, which is the property the harvester's marker-last write
