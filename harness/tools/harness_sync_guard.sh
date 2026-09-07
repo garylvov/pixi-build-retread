@@ -65,6 +65,18 @@
 #      column is REQUIRED (b6): a stale four-field row is a FATAL rc 2, because
 #      read one field out of step it yields an EMPTY read set and a silent
 #      install -- the very defect this block exists to prevent.
+#   M  HARNESS-SYNC-4-1: rc 4 exited where it stood, UPSTREAM of the read-set
+#      computation, so when both refusals applied the operator was shown only
+#      the rc-4 rows, told to drain the queued job, and handed rc 6 on the
+#      re-run -- two serial waits for one queue state (MERGE-U's landing,
+#      2026-09-06T22:41). Both sets are now computed and BOTH printed, with the
+#      exit decided afterwards and rc 4 taking precedence. m1 asserts both row
+#      families in ONE rc-4 run; m2 is the non-vacuity control (rc 6 alone is
+#      still 6 and prints no rc-4 row); m3 is the MUTATION -- restore the early
+#      `exit 4` and m1's rc-6 rows vanish, so m1 can fail. m4 covers the
+#      `--force` summary's JOB COUNT, which no arm had ever read: HARNESS-SYNC-4
+#      replaced an `awk '{print $3}'` there that printed the literal REFUSED for
+#      every input, in the line the operator is told to copy into a lane log row.
 #   J  static: the header no longer claims the rename is "the only safe way to
 #      write into a live task dir" -- it is safe only when renamer and reader are
 #      the SAME NFS client -- and the PIN REPORT no longer calls a RUNNING job
@@ -746,6 +758,104 @@ grep -q "state='laneL6'" "$WORK/L6.log" \
   || { bad "L(b6): the FATAL does not name the bad state field"; sed 's/^/      /' "$WORK/L6.log"; }
 [ "$(md5sum "$TL6/tools/a_tool.sh" | awk '{print $1}')" = "$BEFORE_L6" ] \
   && ok "L(b6): and it wrote nothing before refusing" || bad "L(b6): it wrote before the FATAL"
+
+# ---- M: HARNESS-SYNC-4-1 -- BOTH refusal sets are computed and BOTH printed --
+# THE DEFECT, WITH A DATED LANDING IN IT. The rc-4 pin block `exit 4`ed where it
+# stood, upstream of the entire read-set computation. So when both applied the
+# operator saw only the rc-4 rows, was told to let the queued job drain, drained
+# it, re-ran -- and was THEN handed rc 6 and a second wait nothing had let them
+# see coming. That is MERGE-U's landing at 2026-09-06T22:41: refused rc 4 naming
+# det141-cleanup 6001240, with det141-proof 6001140 RUNNING beside it and its
+# read-set hit never computed. Two serial waits for ONE queue state.
+# Now both checks run, both print, and the exit is decided after both. rc 4 wins
+# when both apply -- it is the cheaper one to clear (repin) and a caller
+# switching on the rc needs a stable answer -- and the summary says the rc-6
+# rows are owed too, so the precedence is not silently a dismissal.
+mkboth () {         # $1 = task dir; a pin dir at $2 plus a driver reading $3
+  local T=$1 pin=$2 reads=$3
+  mkdir -p "$T/lane1"; printf '%s\n' "$pin" > "$T/lane1/HARNESS_COMMIT"
+  mkjob "$T" "$reads"
+}
+# m1: BOTH. A PENDING job pinned to v1 (rc 4) AND a RUNNING job whose driver
+# reads a_tool.sh (rc 6), in one fixture, one invocation.
+read -r RM TM V1M V2M < <(mkfixture M)
+mkboth "$TM" "$V1M" tools/a_tool.sh
+mkstub "$WORK/M_squeue" "9999901 lane1-relock"          # answers the rc-4 pin query
+printf '8000021 RUNNING laneM %s %s\n' "$TM" "$TM/jobroot/j.sbatch" > "$WORK/M_run.txt"
+BEFORE_M=$(md5sum "$TM/tools/a_tool.sh" | awk '{print $1}')
+git -C "$RM" cat-file blob "$V2M:harness/tools/a_tool.sh" > "$WORK/M.blob"
+WANT_M=$(md5sum "$WORK/M.blob" | awk '{print $1}')
+[ "$BEFORE_M" != "$WANT_M" ] \
+  && ok "M(m1): NON-VACUITY -- a_tool.sh is $BEFORE_M and $V2M says $WANT_M, so it IS in the install set" \
+  || bad "M(m1): the fixture already matches the commit -- neither check would have a subject"
+runsync "$RM" "$TM" "$WORK/M_squeue" "$V2M" --running-list "$WORK/M_run.txt" > "$WORK/M.log" 2>&1; rcM=$?
+[ "$rcM" -eq 4 ] && ok "M(m1): with BOTH refusals live the sync exits rc 4 (the documented precedence)" \
+                 || { bad "M(m1): rc=$rcM, wanted 4"; sed 's/^/      /' "$WORK/M.log"; }
+grep -q 'state=PENDING 9999901' "$WORK/M.log" \
+  && ok "M(m1): the rc-4 family is printed AND carries state= like the rc-6 family does" \
+  || { bad "M(m1): no 'state=PENDING 9999901' rc-4 row"; sed 's/^/      /' "$WORK/M.log"; }
+grep -q 'SYNC REFUSED rc=6 running=8000021 state=RUNNING file=a_tool.sh' "$WORK/M.log" \
+  && ok "M(m1): THE FIX -- the rc-6 rows are on the page too, in the SAME run that refused rc 4" \
+  || { bad "M(m1): the rc-6 rows are missing -- the early exit is still upstream of the read set"; sed 's/^/      /' "$WORK/M.log"; }
+grep -q 'BOTH CHECKS REFUSED' "$WORK/M.log" \
+  && ok "M(m1): and the summary SAYS both refused, so rc 4 does not read as an all-clear on rc 6" \
+  || { bad "M(m1): no BOTH CHECKS REFUSED summary"; sed 's/^/      /' "$WORK/M.log"; }
+[ "$(md5sum "$TM/tools/a_tool.sh" | awk '{print $1}')" = "$BEFORE_M" ] \
+  && ok "M(m1): and running BOTH checks still wrote nothing" || bad "M(m1): it wrote while refusing"
+# m2: the non-vacuity control for m1's rc. rc-6 ALONE must still be rc 6, and
+# must print NO rc-4 row -- otherwise m1's `4` could be the script's only answer.
+read -r RM2 TM2 V1M2 V2M2 < <(mkfixture M2)
+mkstub "$WORK/M2_squeue"                                 # nothing pinned, nothing queued
+mkjob "$TM2" tools/a_tool.sh
+printf '8000022 RUNNING laneM2 %s %s\n' "$TM2" "$TM2/jobroot/j.sbatch" > "$WORK/M2_run.txt"
+runsync "$RM2" "$TM2" "$WORK/M2_squeue" "$V2M2" --running-list "$WORK/M2_run.txt" > "$WORK/M2.log" 2>&1; rcM2=$?
+[ "$rcM2" -eq 6 ] && ok "M(m2): rc 6 ALONE is still rc 6 -- the deferred exit did not collapse both rcs into 4" \
+                  || { bad "M(m2): rc=$rcM2, wanted 6"; sed 's/^/      /' "$WORK/M2.log"; }
+grep -q 'would strand these PENDING jobs' "$WORK/M2.log" \
+  && { bad "M(m2): an rc-4 row was printed with nothing pinned"; sed 's/^/      /' "$WORK/M2.log"; } \
+  || ok "M(m2): and it prints NO rc-4 row -- the families are reported separately, not merged"
+grep -q 'rc 6 only' "$WORK/M2.log" \
+  && ok "M(m2): the summary says which single check refused" || bad "M(m2): no 'rc 6 only' summary line"
+# m3: THE MUTATION, and it cuts exactly one thing -- the deferred exit becomes
+# the early `exit 4` again. m1's fixture must then LOSE its rc-6 rows. Without
+# this arm m1's rc-6 assertion could be passing on the fixture rather than on
+# the reordering.
+MUT5=$WORK/harness_sync_earlyexit4.sh
+sed 's/SYNC_RC4=4   # HARNESS-SYNC-4-1 DEFERRED EXIT/exit 4/' "$SYNC" > "$MUT5"
+if bash -n "$MUT5" 2>/dev/null && ! grep -q 'SYNC_RC4=4   # HARNESS-SYNC-4-1 DEFERRED EXIT' "$MUT5"; then
+  read -r RM3 TM3 V1M3 V2M3 < <(mkfixture M3)
+  mkboth "$TM3" "$V1M3" tools/a_tool.sh
+  mkstub "$WORK/M3_squeue" "9999903 lane1-relock"
+  printf '8000023 RUNNING laneM3 %s %s\n' "$TM3" "$TM3/jobroot/j.sbatch" > "$WORK/M3_run.txt"
+  cp -f "$MUT5" "$TM3/tools/harness_sync.sh"
+  HARNESS_REPO="$RM3" HARNESS_TASK_DIR="$TM3" HARNESS_SQUEUE="$WORK/M3_squeue" \
+    bash "$TM3/tools/harness_sync.sh" "$V2M3" --running-list "$WORK/M3_run.txt" > "$WORK/M3.log" 2>&1; rcM3=$?
+  if [ "$rcM3" -eq 4 ] && ! grep -q 'SYNC REFUSED rc=6' "$WORK/M3.log"; then
+    ok "M(m3): MUTATION -- with the early \`exit 4\` restored the same fixture prints NO rc-6 row (rc=$rcM3), so m1 CAN fail"
+  else
+    bad "M(m3): the early-exit mutant still printed the rc-6 rows (rc=$rcM3) -- ARM m1 IS NOT TESTING THE DEFERRED EXIT"
+  fi
+else
+  bad "M(m3): could not build the early-exit-4 mutant -- MUTATION ARM DID NOT RUN"
+fi
+# m4: the `--force` summary's JOB COUNT, which had no reader at all. HARNESS-
+# SYNC-4 replaced an `awk '{print $3}'` here that printed the literal REFUSED
+# for every input -- a count nobody ever asserted, in a line the operator is
+# told to copy into a lane log row. Two pinned jobs must print TWO.
+read -r RM4 TM4 V1M4 V2M4 < <(mkfixture M4)
+mkdir -p "$TM4/lane1" "$TM4/lane2"
+printf '%s\n' "$V1M4" > "$TM4/lane1/HARNESS_COMMIT"
+printf '%s\n' "$V1M4" > "$TM4/lane2/HARNESS_COMMIT"
+mkstub "$WORK/M4_squeue" "9999904 lane1-relock" "9999905 lane2-relock"
+runsync "$RM4" "$TM4" "$WORK/M4_squeue" "$V2M4" > "$WORK/M4a.log" 2>&1; rcM4a=$?
+[ "$rcM4a" -eq 4 ] && [ "$(grep -c 'state=PENDING 999990' "$WORK/M4a.log")" -eq 2 ] \
+  && ok "M(m4): NON-VACUITY -- the fixture really does produce TWO rc-4 rows for TWO jobs" \
+  || { bad "M(m4): rc=$rcM4a with $(grep -c 'state=PENDING 999990' "$WORK/M4a.log") rows, wanted rc 4 and 2"; sed 's/^/      /' "$WORK/M4a.log"; }
+runsync "$RM4" "$TM4" "$WORK/M4_squeue" "$V2M4" --force --reason "guard fixture m4" > "$WORK/M4.log" 2>&1; rcM4=$?
+grep -q '### SYNC FORCED over 2 pinned PENDING job(s) reason=guard fixture m4' "$WORK/M4.log" \
+  && ok "M(m4): the forced summary COUNTS the jobs it overrode -- 'over 2 pinned PENDING job(s)'" \
+  || { bad "M(m4): the count is wrong: $(grep -m1 'SYNC FORCED over' "$WORK/M4.log" || echo '<no SYNC FORCED line>')"; sed 's/^/      /' "$WORK/M4.log"; }
+
 # ---- K: the live read set comes from SLURM'S OWN SNAPSHOT, not from disk ----
 # `--running-list` shims the job LIST; it cannot shim the one live call the list
 # is built from. `sbatch --wrap` and heredoc submissions leave `Command=(null)`

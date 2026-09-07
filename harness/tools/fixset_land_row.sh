@@ -188,6 +188,21 @@ if [ "$src" != 0 ]; then
     4)
       echo "###   rc 4 means a PENDING job of ours is pinned to a different commit and this sync would strand it;"
       echo "###   let it start or drain, then re-run the landing (the fix-set row is idempotent)."
+      # HARNESS-SYNC-4-1. The sync now computes the READ-SET check too before it
+      # exits 4, so an rc-4 refusal may ALSO carry rc-6 rows. Printing them here
+      # is the reader half: without it the lander is told "drain the pinned job",
+      # drains it, re-runs, and is handed a second wait it was never shown. That
+      # is exactly what this landing did on 2026-09-06T22:41.
+      if grep -q '### SYNC REFUSED rc=6' "$SYNCLOG" 2>/dev/null; then
+        RJIDS4=$(sed -n 's/.*### SYNC REFUSED rc=6 running=\([0-9][0-9]*\).*/\1/p' "$SYNCLOG" | sort -u | tr '\n' ' ')
+        echo "###   AND rc 6 IS OWED TOO -- the same run's read-set check ALSO refused. Repinning or"
+        echo "###   draining the rc-4 job does NOT make this sync legal on its own. Its rows:"
+        grep -F -- '### SYNC REFUSED rc=6' "$SYNCLOG" | sed 's/^/###     from harness_sync: /'
+        echo "###   ACTUATOR: job(s) ${RJIDS4:-<none named -- read the rows above>} must ALSO finish (a"
+        echo "###   state=PENDING one must RUN and finish, not merely start) before the landing is re-run."
+      else
+        echo "###   (the same run's read-set check did NOT refuse: no rc-6 row is on the page.)"
+      fi
       ;;
     6)
       RJIDS=$(sed -n 's/.*### SYNC REFUSED rc=6 running=\([0-9][0-9]*\).*/\1/p' "$SYNCLOG" | sort -u | tr '\n' ' ')   # RC6-MSG

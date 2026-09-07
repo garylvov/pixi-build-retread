@@ -90,6 +90,26 @@
 #             (HARNESS-SYNC-4.)
 #         Override: --force --reason "<why>".
 #
+#   BOTH REFUSAL SETS ARE ALWAYS COMPUTED AND ALWAYS PRINTED (HARNESS-SYNC-4-1).
+#   Until this lane the rc-4 block `exit 4`ed where it stood, BEFORE the read-set
+#   computation ran at all -- so when both applied the operator was handed the
+#   rc-4 rows and told "let the queued job drain", drained it, re-ran, and was
+#   THEN handed rc 6 and a second wait it had been given no way to see coming.
+#   Two serial waits for one queue state, and the second one invisible: that is
+#   MERGE-U's landing 2026-09-06T22:41 exactly (refused rc 4 on det141-cleanup
+#   6001240 with det141-proof 6001140 still RUNNING and unread beside it).
+#   So: the pin check and the read-set check BOTH run, BOTH print their rows,
+#   and the exit is decided afterwards.
+#     PRECEDENCE: rc 4 wins when both apply.  Not because it is worse -- it is
+#     the CHEAPER one to clear (a pinned PENDING job can be repinned with
+#     harness_commit_resolve.sh --write, where a read-set hit can only be
+#     waited out) -- but because a caller that switches on the rc must get a
+#     STABLE answer, and `fixset_land_row.sh` already explains 4 and 6
+#     differently.  The rc-6 rows are on the page either way, and the rc-4 arm
+#     of that explainer re-prints them, so nothing is stamped-but-unread.
+#   Neither check writes a byte in either case: the install is still downstream
+#   of both.
+#
 # THE MAPPING IS NOT DUPLICATED HERE.  A writer with its own copy of the table
 # would eventually install a set its own checker does not read, which is the
 # same class of defect one level up.  `HARNESS_DRIFT_LIB=1 . harness_drift_check.sh`
@@ -255,6 +275,11 @@ fi
 # a pin dir matches a job when the names are equal, when the job name extends the
 # dir name, or when the dir name starts with the job name's leading token
 # (`sr3-gate` -> `sr3-work`).
+# The two refusal verdicts, decided here and ACTED ON at the bottom of the
+# checks (HARNESS-SYNC-4-1).  0 means "this check did not refuse".
+SYNC_RC4=0
+SYNC_RC6=0
+
 PINDIRS="$TMP/pindirs.txt"
 find "$TASK_DIR" -maxdepth 2 -name HARNESS_COMMIT -type f -printf '%h\n' 2>/dev/null | sort > "$PINDIRS"
 
@@ -281,22 +306,34 @@ done < "$PDROWS"
 
 if [ -s "$REFUSALS" ]; then
   echo "### SYNC would strand these PENDING jobs -- they are pinned to another commit:"
-  sed 's/^/###   /' "$REFUSALS"
+  # `state=PENDING` on every row, because these rows now share a page with the
+  # rc-6 rows and only the state field says which check produced which.  Every
+  # row here is PENDING by construction: $PDROWS is `squeue -t PD`.
+  sed 's/^/###   state=PENDING /' "$REFUSALS"
   if [ "$FORCE" != 1 ]; then
     echo "### SYNC REFUSED (rc 4). A queued job has snapshotted NOTHING: syncing the task"
     echo "###   dir to $SHA kills it at its own drift gate the moment it starts."
     echo "###   Let them run, repin them (harness_commit_resolve.sh --write <job root> $SHA),"
     echo "###   or re-run with --force --reason \"<why this is the right call>\"."
-    exit 4
-  fi
-  if [ -z "$REASON" ]; then
+    SYNC_RC4=4   # HARNESS-SYNC-4-1 DEFERRED EXIT
+  elif [ -z "$REASON" ]; then
     echo "### SYNC REFUSED (rc 4) -- --force WITHOUT --reason is still a refusal. The rows"
     echo "###   above are what you are overriding; say why, and it goes in the log row:"
     echo "###     harness_sync.sh $COMMIT --force --reason \"<why>\""
-    exit 4
+    SYNC_RC4=4   # HARNESS-SYNC-4-1 DEFERRED EXIT
+  else
+    # The COUNT IS OF JOBS, not of rows.  One queued job matching two pin dirs
+    # writes two rows, and `wc -l` would call that two jobs; the operator copies
+    # this line into a lane log row, so it has to be the number they can check
+    # against `squeue`.  (HARNESS-SYNC-4 replaced an `awk '{print $3}'` here that
+    # printed the literal REFUSED for every input; a count that is merely
+    # PLAUSIBLE is how that survived, so it is asserted by the guard now.)
+    echo "### SYNC FORCED over $(awk '{print $1}' "$REFUSALS" | sort -u | wc -l) pinned PENDING job(s) reason=$REASON"
+    echo "###   ^ copy this line into the lane log row for this sync."
   fi
-  echo "### SYNC FORCED over $(wc -l < "$REFUSALS") pinned PENDING job(s) reason=$REASON"
-  echo "###   ^ copy this line into the lane log row for this sync."
+  echo "### SYNC rc-4 rows=$(wc -l < "$REFUSALS") jobs=$(awk '{print $1}' "$REFUSALS" | sort -u | wc -l) refusing=$( [ "$SYNC_RC4" = 0 ] && echo no || echo yes)"
+  echo "###   -- the read-set check below STILL RUNS (HARNESS-SYNC-4-1): if it also"
+  echo "###   refuses, its rows are printed here too and you get BOTH waits at once."
 fi
 
 # ---- THE READ SET OF EVERY RUNNING JOB, BEFORE A SINGLE BYTE (HARNESS-SYNC-3) -
@@ -481,14 +518,32 @@ if [ -s "$RSHITS" ]; then
     echo "###   or, if you have MEASURED that none of them will read the file, re-run with:"
     echo "###     harness_sync.sh $COMMIT --force --reason \"<why this is the right call>\""
     [ "$FORCE" = 1 ] && [ -z "$REASON" ] && echo "###   (--force WITHOUT --reason is still a refusal.)"
-    exit 6
+    SYNC_RC6=6   # HARNESS-SYNC-4-1 DEFERRED EXIT
+  else
+    RS_MARK="force-readset commit=$SHA at=$(date -Is) hits=$(sort -u "$RSHITS" | wc -l) reason=$(printf '%s' "$REASON" | tr '\n' ' ')"
+    printf '%s\n' "$RS_MARK" > "$RECORD.force-readset" || {
+      echo "### SYNC FATAL: could not write $RECORD.force-readset" >&2; exit 2; }
+    echo "### SYNC FORCED over the read set of $(sort -u "$RSHITS" | sed -n 's/.* running=\([^ ]*\) .*/\1/p' | sort -u | wc -l) RUNNING/PENDING job(s) reason=$REASON"
+    echo "###   marker: $RECORD.force-readset"
+    echo "###   ^ copy this line into the lane log row for this sync."
   fi
-  RS_MARK="force-readset commit=$SHA at=$(date -Is) hits=$(sort -u "$RSHITS" | wc -l) reason=$(printf '%s' "$REASON" | tr '\n' ' ')"
-  printf '%s\n' "$RS_MARK" > "$RECORD.force-readset" || {
-    echo "### SYNC FATAL: could not write $RECORD.force-readset" >&2; exit 2; }
-  echo "### SYNC FORCED over the read set of $(sort -u "$RSHITS" | sed -n 's/.* running=\([^ ]*\) .*/\1/p' | sort -u | wc -l) RUNNING/PENDING job(s) reason=$REASON"
-  echo "###   marker: $RECORD.force-readset"
-  echo "###   ^ copy this line into the lane log row for this sync."
+fi
+
+# ---- THE COMBINED REFUSAL (HARNESS-SYNC-4-1) -------------------------------
+# Both checks have now RUN and both have PRINTED.  This is the only place either
+# one exits, so an operator holding an rc-4 refusal is holding the rc-6 rows too
+# and can clear one queue state instead of two.
+if [ "$SYNC_RC4" != 0 ] || [ "$SYNC_RC6" != 0 ]; then
+  echo "### SYNC REFUSED -- rc4_rows=$(wc -l < "$REFUSALS") rc6_rows=$(sort -u "$RSHITS" | wc -l)"
+  if [ "$SYNC_RC4" != 0 ] && [ "$SYNC_RC6" != 0 ]; then
+    echo "###   BOTH CHECKS REFUSED. Exiting rc 4 (rc 4 takes precedence -- it is the"
+    echo "###   cheaper one to clear, by repin), but the rc-6 rows above are OWED TOO:"
+    echo "###   repinning the queued job does NOT make this sync legal. Clear both."
+    exit 4
+  fi
+  [ "$SYNC_RC4" != 0 ] && { echo "###   rc 4 only: no job's read set intersects the install set."; exit 4; }
+  echo "###   rc 6 only: no PENDING job of ours is pinned to another commit."
+  exit 6
 fi
 
 # ---- install: temp file in the TARGET dir, then mv -f -----------------------

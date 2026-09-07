@@ -403,6 +403,71 @@ if bash -n "$WORK/helper_norc6.sh" 2>/dev/null; then
 else
   bad "J2: the mutant does not parse -- MUTATION ARM DID NOT RUN"
 fi
+
+# ---- ARM J3: HARNESS-SYNC-4-1 -- an rc-4 refusal may CARRY rc-6 rows --------
+# harness_sync.sh no longer exits 4 upstream of its read-set check: both sets are
+# computed and both printed, and rc 4 wins only the EXIT. So an rc-4 refusal can
+# now arrive with rc-6 rows attached, and a helper whose rc-4 arm ignores them is
+# a stamped-but-unread directive: the lander is told "drain the pinned job",
+# drains it, re-runs, and is handed a wait nothing had shown them. That is
+# MERGE-U's landing, 2026-09-06T22:41. J3 asserts the rc-4 arm reads them; J4 is
+# the mutation.
+mkshim4 () {  # a harness_sync.sh that refuses rc 4 WITH an rc-6 row on the page
+  cat > "$1/tools/harness_sync.sh" <<'SHIM'
+#!/usr/bin/env bash
+echo "### SYNC would strand these PENDING jobs -- they are pinned to another commit:"
+echo "###   state=PENDING 888888 lane1-relock /t/lane1/HARNESS_COMMIT pinned=deadbeef"
+echo "### SYNC REFUSED (rc 4). A queued job has snapshotted NOTHING."
+echo "### SYNC REFUSED rc=6 running=777777 state=RUNNING file=y.sh reason=read-by-other-job"
+echo "### SYNC REFUSED -- rc4_rows=1 rc6_rows=1"
+exit 4
+SHIM
+  chmod 755 "$1/tools/harness_sync.sh"
+}
+read -r RL2 TL2 < <(mkfixture L2)
+mkshim4 "$TL2"
+bash "$HELPER" "$RL2" "$TL2" "$ROW1" > "$WORK/L2.log" 2>&1; rcL2=$?
+[ "$rcL2" = 3 ] && ok "J3: a landing over an rc-4 refusal still FATALs (rc=3)" \
+  || { bad "J3: rc=$rcL2, want 3"; sed 's/^/      /' "$WORK/L2.log"; }
+grep -q 'rc 4 means a PENDING job of ours is pinned' "$WORK/L2.log" \
+  && ok "J3: the rc-4 explanation is still printed, unchanged" || bad "J3: the rc-4 explanation is gone"
+grep -q 'AND rc 6 IS OWED TOO' "$WORK/L2.log" \
+  && ok "J3: THE FIX -- the rc-4 arm SAYS the same run's read-set check also refused" \
+  || { bad "J3: the rc-6 rows on an rc-4 page are unread -- the second wait is still invisible"; sed 's/^/      /' "$WORK/L2.log"; }
+grep -q 'from harness_sync: ### SYNC REFUSED rc=6 running=777777' "$WORK/L2.log" \
+  && ok "J3: and it RE-PRINTS the rc-6 row rather than merely mentioning it" \
+  || bad "J3: the rc-6 row itself is not re-printed under the rc-4 FATAL"
+grep -q 'must ALSO finish' "$WORK/L2.log" && grep -q '777777' "$WORK/L2.log" \
+  && ok "J3: and it names the ACTUATOR job 777777, so the refusal reaches someone who can clear it" \
+  || bad "J3: no actuator naming the rc-6 job"
+# The non-vacuity control: an rc-4 refusal with NO rc-6 row must say so, not
+# print an empty "owed" section that a lander would read as a second wait.
+read -r RL3 TL3 < <(mkfixture L3)
+{ echo '#!/usr/bin/env bash'
+  echo 'echo "### SYNC would strand these PENDING jobs -- they are pinned to another commit:"'
+  echo 'echo "###   state=PENDING 888888 lane1-relock /t/lane1/HARNESS_COMMIT pinned=deadbeef"'
+  echo 'exit 4'; } > "$TL3/tools/harness_sync.sh"
+chmod 755 "$TL3/tools/harness_sync.sh"
+bash "$HELPER" "$RL3" "$TL3" "$ROW1" > "$WORK/L3.log" 2>&1
+grep -q 'AND rc 6 IS OWED TOO' "$WORK/L3.log" \
+  && bad "J3: an rc-4-only refusal claims rc 6 is owed -- a wait invented from nothing" \
+  || ok "J3: an rc-4-only refusal says the read-set check did NOT refuse (no invented second wait)"
+# ---- ARM J4: THE MUTATION for J3 --------------------------------------------
+sed "s/^      if grep -q '### SYNC REFUSED rc=6' \"\$SYNCLOG\" 2>\/dev\/null; then/      if false; then/" \
+  "$HELPER" > "$WORK/helper_norc4both.sh"
+if bash -n "$WORK/helper_norc4both.sh" 2>/dev/null && ! grep -q "if grep -q '### SYNC REFUSED rc=6' \"\$SYNCLOG\"" "$WORK/helper_norc4both.sh"; then
+  read -r RL4 TL4 < <(mkfixture L4)
+  mkshim4 "$TL4"
+  bash "$WORK/helper_norc4both.sh" "$RL4" "$TL4" "$ROW1" > "$WORK/L4.log" 2>&1; rcL4=$?
+  if [ "$rcL4" = 3 ] && ! grep -q 'AND rc 6 IS OWED TOO' "$WORK/L4.log"; then
+    ok "J4: MUTATION -- with the rc-6 readback cut, the same rc-4 page loses the owed-rc-6 section, so J3 CAN fail"
+  else
+    bad "J4: the mutant still printed the owed-rc-6 section (rc=$rcL4) -- ARM J3 IS NOT TESTING THE READBACK"
+  fi
+else
+  bad "J4: could not build the rc-4-readback mutant -- MUTATION ARM DID NOT RUN"
+fi
+
 echo "### land_fixset_sync_guard: pass=$pass fail=$fail"
 [ "$fail" -eq 0 ] || exit 1
 exit 0
