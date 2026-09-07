@@ -377,7 +377,12 @@ STAGE_MIRROR_ROOT=/oscar/data/stellex/glvov/agrescap/cache/retread/stage-mirror
 # PROOF-SMOKE-1-7: the ONE inode-disjointness authority, sourced by this file and
 # by phase_template/phaseN_relock.sh. Two implementations of "does this tree
 # share inodes with imprint-data" is how a publish gated on 50 sampled files
+### CITATION BEGIN -- MERGE-V-2-1 (HARNESS-CONSOL-15). The job id on the line
+# below is the MEASUREMENT this paragraph rests on and it names a previous
+# batch. Marked so that a derived batch which puts that id into its own
+# LEFTOVER_RE does not make this shipped template exit 9 against itself.
 # handed a mirror to a reader that judged it by a different rule (job 6014471).
+### CITATION END
 STAGE_MIRROR_LIB=$(dirname -- "${BASH_SOURCE[0]}")/stage_mirror.sh
 # the task layout is $T/tools/phase_template beside $T/tools, the repo layout is
 # harness/phase_template beside harness/tools -- both spellings, and neither guessed.
@@ -517,7 +522,12 @@ stage_assert_mirror_disjoint () { # the mirror must share NO inode with $SRC_WS
   # publish wrote only `.stage-mirror-key` -- and it returned 1 for "cannot
   # check", the same rc as "hardlinked", so the caller printed a hardlink
   # verdict for a check that never ran and quarantined a 10.72 GB mirror as
+### CITATION BEGIN -- MERGE-V-2-1 (HARNESS-CONSOL-15). The job id on the line
+# below is the MEASUREMENT this paragraph rests on and it names a previous
+# batch. Marked so that a derived batch which puts that id into its own
+# LEFTOVER_RE does not make this shipped template exit 9 against itself.
   # SRCLINKED (job 6014471, mirror published 03:55:59 by smoke job 6013332).
+### CITATION END
   # The check is now the ONE enumeration in tools/stage_mirror.sh, which walks
   # the tree instead of asking its builder's bookkeeping, keys on (device,
   # inode) rather than an inode number alone, and answers rc 2 for "cannot
@@ -835,7 +845,12 @@ retread_fast_env "$WS" || { echo "FATAL: retread_fast_env refused"; exit 7; }
 # byte-keyed bucket a symlink into the shared cache.
 # --- `--cold-proof-arm` AND THE POISON GUARD NOW LIVE IN ONE PRODUCER --------
 # HARNESS-CONSOL-9, 2026-09-07. Both halves that used to be inline here -- the
+### CITATION BEGIN -- MERGE-V-2-1 (HARNESS-CONSOL-15). The job id on the line
+# below is the MEASUREMENT this paragraph rests on and it names a previous
+# batch. Marked so that a derived batch which puts that id into its own
+# LEFTOVER_RE does not make this shipped template exit 9 against itself.
 # `--cold-proof-arm` branch (DET-1-6-2, measured on job 6014471 arm W1) and the
+### CITATION END
 # `sdist_build_poison_guard.sh` run that reads the result -- are now
 # `retread_relock_scope_and_verify` in tools/retread_fast_env.sh. They moved
 # because THIS TEMPLATE WAS THE ONLY ONE THAT HAD THEM: `grep -c` at commit

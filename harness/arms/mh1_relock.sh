@@ -452,7 +452,12 @@ stage_assert_mirror_disjoint () { # the mirror must share NO inode with $SRC_WS
   # publish wrote only `.stage-mirror-key` -- and it returned 1 for "cannot
   # check", the same rc as "hardlinked", so the caller printed a hardlink
   # verdict for a check that never ran and quarantined a 10.72 GB mirror as
+### CITATION BEGIN -- MERGE-V-2-1 (HARNESS-CONSOL-15). The job id on the line
+# below is the MEASUREMENT this paragraph rests on and it names a previous
+# batch. Marked so that a derived batch which puts that id into its own
+# LEFTOVER_RE does not make this shipped template exit 9 against itself.
   # SRCLINKED (job 6014471, mirror published 03:55:59 by smoke job 6013332).
+### CITATION END
   # The check is now the ONE enumeration in tools/stage_mirror.sh, which walks
   # the tree instead of asking its builder's bookkeeping, keys on (device,
   # inode) rather than an inode number alone, and answers rc 2 for "cannot

@@ -955,6 +955,17 @@ run_arm() {
   # read that absence as a result. Reader: tools/cold_proof_arm_guard.sh ARM5.
   retread_relock_frontend_log "${C29_ARGV[@]}"
 
+### CITATION BEGIN -- HARNESS-CONSOL-15 (2026-09-07), MERGE-V-2-1's shape. The
+# paragraph below cites, BY NAME, the template this capability was back-ported
+# FROM. `phaseN` and `PHASEN` are tokens in this arm's own LEFTOVER_RE, so the
+# leftover-token self-check matched four of its comment lines and this harness
+# exited 9 AGAINST ITSELF -- on a deliberate provenance citation, not a botched
+# derivation. Measured by hc14-guard 6023585, arms D and F of
+# leftover_check_guard.sh: `arms/c29_relock.sh FAILS its own self-check (rc=9)
+# -- a lane re-deriving from it exits 9`.
+# The pair is scoped to the COMMENT PARAGRAPH ONLY (no code inside it), because
+# deleting `|phaseN` from LEFTOVER_RE instead would disarm the token for the
+# whole file -- the blanket exemption arm E2 of that guard exists to forbid.
   # ── DET-1-4-1 / DET-1-6-1: THE PINNED INTERPRETER HASH SEED ─────────────────
   # BACK-PORTED from phase_template/phaseN_relock.sh by HARNESS-CONSOL-12
   # (2026-09-07), at the same stage phaseN calls it: after the frontend-log
@@ -984,6 +995,7 @@ run_arm() {
   # manifest three times on one node with one binary, varying nothing but this
   # variable: seeded twice gave gym requires_dist md5 e569ebf5..., unset gave
   # bd63668b... -- a RAW delta of 28 with a SORTED delta of 0, a pure reordering.
+### CITATION END
   ENV_SEED_LIB=$(dirname "$0")/../tools/env_seed.sh
   [ -f "$ENV_SEED_LIB" ] || ENV_SEED_LIB=$T/tools/env_seed.sh
   if [ ! -f "$ENV_SEED_LIB" ]; then

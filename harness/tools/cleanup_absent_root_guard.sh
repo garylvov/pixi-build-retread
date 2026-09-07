@@ -565,6 +565,121 @@ for ST in COMPLETED RUNNING PENDING "CANCELLED by 1234"; do
     sed 's/^/      /' "$W/J10.$SLUG.log"
   fi
 done
+# ---- J11-J14: CLEANUP-SEAM-3, the driver that exits on its OWN `exit` --------
+# MEASURED, mCB-relock 6022684 (sacct FAILED 14:0). Its stdout, verbatim, ends:
+#
+#     ### stage: quarantined -> …/85db7fdbbf51206a0cb57fa0d55e0e74.DIRTY-6022684-MCB-…
+#     ### FATAL: the stage mirror was already dirty BEFORE this lock.
+#     ###        Refusing to lock on inputs that are not the ones it was built from.
+#
+# and `grep -c '_EXIT=' ` over it returns 0. Every one of the four families J1-J5
+# exercise depends on a row printed by somebody OTHER than the driver -- the
+# preamble, a per-arm wrapper, a proof footer, or the sbatch wrapper -- and this
+# driver reached none of them, because `phaseN_relock.sh`'s mirror-dirty branch
+# is a bare `exit 14`. So `job_fatal_check` found no row, the gate fell through
+# to condition 1, owner mCB-cleanup 6023543 REFUSED (FAILED 2:0), and
+# certMCB-6022684 / ws.MCB-6022684 had no reaper at all. It is 6014484's
+# stranding again, through a different hole.
+#
+# BOTH HALVES OF THE FIX ARE MEASURED HERE, and they are independent:
+#   J11 the gate reads the `### FATAL:` row the driver was ALREADY printing.
+#   J13 the driver now prints `### <TAG>_EXIT=<rc>` of its own accord, from
+#       tools/retread_fast_env.sh, so even a driver with no FATAL row at all is
+#       reapable. (That trap has its own reader, tools/driver_exit_row_guard.sh;
+#       what J13 adds is that the row it emits really unlocks THIS gate.)
+# Either half alone would have reaped 6022684. Both landed because the first is
+# a rule about rows we cannot control and the second is a producer we can.
+#
+# AND THE LYING ROW IS THE POINT OF J12. The `### FATAL:` family is the only one
+# of the five that carries NO NUMBER, so it cannot lean on `<nonzero>` the way
+# `_EXIT=`, `rc=` and `job_fatal=` do. Condition (ii) -- sacct -- is the whole of
+# its evidence, and a driver that prints `### FATAL:` and then exits 0 must not
+# unlock the reaper. That is not new code, it is the existing override, and J12
+# is what proves it still covers the widened family.
+MCB_QUAR='### stage: quarantined -> /oscar/data/stellex/glvov/agrescap/cache/retread/stage-mirror/85db7fdbbf51206a0cb57fa0d55e0e74.DIRTY-6022684-MCB-1788788544'
+MCB_FATAL='### FATAL: the stage mirror was already dirty BEFORE this lock.'
+MCB_FATAL2='###        Refusing to lock on inputs that are not the ones it was built from.'
+
+mk_seam3_harness () {   # mk_seam3_harness <dir> <tag> <rj> <shape: fatal|exitrow>
+  mkdir -p "$1/artifacts" "$1/logs"
+  printf '%s\n' "$2-$3 owed roots" > "$1/artifacts/$2-$3.reap-owed.txt"
+  if [ "$4" = fatal ]; then
+    # 6022684's own tail. NOT ONE of the four pre-seam-3 families appears here.
+    { printf '### stage: PRE-LOCK mirror verify\n'
+      printf '%s\n' "$MCB_QUAR"
+      printf '%s\n' "$MCB_FATAL"
+      printf '%s\n' "$MCB_FATAL2"
+    } > "$1/logs/mcb-$3.out"
+  else
+    # The same job with the seam-3 trap installed and NO fatal row at all: the
+    # driver's own exit row is then the only evidence in the file.
+    { printf '### stage: PRE-LOCK mirror verify\n'
+      printf '### %s_EXIT=14\n' "$2"
+    } > "$1/logs/mcb-$3.out"
+  fi
+}
+
+# ---- J11: 6022684's stdout, sacct FAILED -> REMOVED -------------------------
+TAG_J11=GUARDJ11$$; HD_J11=$T/guard-j11-$$; mk_seam3_harness "$HD_J11" "$TAG_J11" "$RJ" fatal
+J11A=$W/roots/cert$TAG_J11-$RJ;  mk_staged_root "$J11A"
+J11B=$W/roots/ws.$TAG_J11-$RJ;   mk_staged_root "$J11B"
+rc=$(runp "$BIN_FAILED" "$RMBED" "$W/J11.log" "$J11A" "$J11B")
+[ "$rc" = 0 ] && ok "J11: 6022684's OWN stdout shape now unlocks the reaper (rc=0)" \
+  || { bad "J11: rc=$rc, want 0 -- this is mCB-cleanup 6023543's permanent refusal"; sed 's/^/      /' "$W/J11.log"; }
+grep -qF '### CLEANUP JOB-FATAL roots=2 removed=2' "$W/J11.log" \
+  && ok "J11: the footer counts both roots and both removals" \
+  || bad "J11: footer wrong: $(grep -m1 'JOB-FATAL roots=' "$W/J11.log" || echo '<no footer>')"
+grep -qF "$MCB_FATAL" "$W/J11.log" \
+  && ok "J11: and it QUOTES the row it decided on, so the verdict is auditable" \
+  || bad "J11: the gate did not echo the fatal row it matched"
+{ [ ! -e "$J11A" ] && [ ! -e "$J11B" ]; } \
+  && ok "J11: both roots are really gone" || bad "J11: a root survived"
+rm -rf "$HD_J11"
+
+# ---- J12: THE LYING ROW -- same stdout, sacct COMPLETED -> REFUSED ----------
+TAG_J12=GUARDJ12$$; HD_J12=$T/guard-j12-$$; mk_seam3_harness "$HD_J12" "$TAG_J12" "$RJ" fatal
+J12A=$W/roots/cert$TAG_J12-$RJ;  mk_staged_root "$J12A"
+rc=$(runp "$BIN_DONE" "$NEWBED" "$W/J12.log" "$J12A")
+if [ "$rc" = 2 ] && grep -q 'JOB-FATAL NOT TAKEN' "$W/J12.log" \
+   && ! grep -qF "$STUBMARK" "$W/J12.log" && [ -d "$J12A" ]; then
+  ok "J12: a '### FATAL:' row over sacct COMPLETED is a LYING ROW -- refused rc 2, cleanup.sh never called, root on disk"
+else
+  bad "J12: rc=$rc (want 2) cleanup_called=$(grep -qF "$STUBMARK" "$W/J12.log" && echo yes || echo no) root_present=$( [ -d "$J12A" ] && echo yes || echo no) -- the numberless family escaped the sacct override"
+  sed 's/^/      /' "$W/J12.log"
+fi
+rm -rf "$HD_J12"
+
+# ---- J13: the driver's OWN exit row is a live producer for this gate --------
+TAG_J13=GUARDJ13$$; HD_J13=$T/guard-j13-$$; mk_seam3_harness "$HD_J13" "$TAG_J13" "$RJ" exitrow
+J13A=$W/roots/cert$TAG_J13-$RJ;  mk_staged_root "$J13A"
+rc=$(runp "$BIN_FAILED" "$RMBED" "$W/J13.log" "$J13A")
+[ "$rc" = 0 ] && ok "J13: a stdout whose ONLY evidence is the seam-3 trap's '### <TAG>_EXIT=14' reaps (rc=0)" \
+  || { bad "J13: rc=$rc, want 0 -- the trap's row does not reach this gate, so the producer is not wired to the reader"; sed 's/^/      /' "$W/J13.log"; }
+grep -qF '### CLEANUP JOB-FATAL roots=1 removed=1' "$W/J13.log" \
+  && ok "J13: with its own footer" || bad "J13: no JOB-FATAL footer"
+rm -rf "$HD_J13"
+
+# ---- J14: THE MUTATION -- the FATAL: alternative cut out of the family ------
+MUTF3=$W/cleanup_gated.MUTF3.sh
+sed 's/|FATAL:)( |$)/)( |$)/' "$SRC" > "$MUTF3"
+mutf3=$(diff "$SRC" "$MUTF3" | grep -c '^< ')
+if [ "$mutf3" -ne 1 ]; then
+  bad "J14: the mutation changed $mutf3 line(s), want exactly 1 -- J11 cannot fail, so it proves nothing"
+else
+  MUTF3BED=$W/mutf3; mk_bed_rm "$MUTF3BED" "$MUTF3"
+  TAG_J14=GUARDJ14$$; HD_J14=$T/guard-j14-$$; mk_seam3_harness "$HD_J14" "$TAG_J14" "$RJ" fatal
+  J14A=$W/roots/cert$TAG_J14-$RJ; mk_staged_root "$J14A"
+  rc=$(runp "$BIN_FAILED" "$MUTF3BED" "$W/J14.log" "$J14A")
+  { [ "$rc" = 2 ] && grep -q '### CLEANUP REFUSED -- nothing deleted' "$W/J14.log"; } \
+    && ok "J14: THE DEFECT, REPRODUCED -- without the FATAL: family 6022684's roots strand again (rc=$rc)" \
+    || bad "J14: the mutant did not reproduce the stranding (rc=$rc) -- J11 cannot fail; read $W/J14.log"
+  grep -qF '### CLEANUP JOB-FATAL' "$W/J14.log" \
+    && bad "J14: the mutant still took the branch -- the alternative is not what J11 rests on" \
+    || ok "J14: and the mutant prints no JOB-FATAL row at all"
+  [ -d "$J14A" ] && ok "J14: the mutant left the root stranded, which is the whole finding" || bad "J14: the mutant deleted it anyway"
+  rm -rf "$HD_J14"
+fi
+
 # ---- J6: THE MUTATION -- the branch cut out of the new file ------------------
 MUTJ=$W/cleanup_gated.MUTJ.sh
 sed 's/^job_fatal_check   # JOB-FATAL-BRANCH (MUTATION ANCHOR)$/: # MUTATION: the job-fatal branch is cut/' "$SRC" > "$MUTJ"

@@ -418,7 +418,12 @@ stage_assert_mirror_disjoint () { # the mirror must share NO inode with $SRC_WS
   # publish wrote only `.stage-mirror-key` -- and it returned 1 for "cannot
   # check", the same rc as "hardlinked", so the caller printed a hardlink
   # verdict for a check that never ran and quarantined a 10.72 GB mirror as
+### CITATION BEGIN -- MERGE-V-2-1 (HARNESS-CONSOL-15). The job id on the line
+# below is the MEASUREMENT this paragraph rests on and it names a previous
+# batch. Marked so that a derived batch which puts that id into its own
+# LEFTOVER_RE does not make this shipped template exit 9 against itself.
   # SRCLINKED (job 6014471, mirror published 03:55:59 by smoke job 6013332).
+### CITATION END
   # The check is now the ONE enumeration in tools/stage_mirror.sh, which walks
   # the tree instead of asking its builder's bookkeeping, keys on (device,
   # inode) rather than an inode number alone, and answers rc 2 for "cannot
@@ -726,7 +731,12 @@ retread_fast_env "$WS" || { echo "FATAL: retread_fast_env refused"; exit 7; }
 # producer: it scopes the build halves, honours `--cold-proof-arm` on the argv --
 # which THIS file is the likeliest to need, a proof arm given its OWN EMPTY
 # `RETREAD_PERSIST_CACHE_ROOT` has nothing to symlink and the scoper refuses it
+### CITATION BEGIN -- MERGE-V-2-1 (HARNESS-CONSOL-15). The job id on the line
+# below is the MEASUREMENT this paragraph rests on and it names a previous
+# batch. Marked so that a derived batch which puts that id into its own
+# LEFTOVER_RE does not make this shipped template exit 9 against itself.
 # (DET-1-6-2, job 6014471 arm W1) -- and runs the poison guard EITHER WAY, since
+### CITATION END
 # a cold arm keeps the shared caches and needs the reader more, not less. Its
 # readers are tools/cold_proof_arm_guard.sh and tools/sdist_build_scope_guard.sh.
 # `"$@"` is this script's own argv.

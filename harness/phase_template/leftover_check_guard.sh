@@ -22,7 +22,49 @@ say() { printf '%s\n' "$*"; }
 
 TOKEN=bfinal            # already in every template's LEFTOVER_RE
 mkdir -p "$W/$TOKEN-batch"
-run() { SLURM_JOB_ID=999999 bash "$1" 2>&1; }
+
+# HARNESS-CONSOL-15, 2026-09-07: ARMS A-C WERE THE LAST TEMPLATE-EXECUTING ARMS
+# IN THIS FILE, AND THEY BECAME LIVE THE DAY THE TEMPLATES WENT CLEAN.
+#
+# `run()` was `SLURM_JOB_ID=999999 bash "$1"` over an UNMODIFIED copy of the
+# template. That is only ever safe while the copy EXITS 9 EARLY, and arms A and
+# C are the two arms that assert the check comes back CLEAN -- so on a clean
+# template `bash` keeps going: past the gates, into stage_build_mirror, against
+# the SHARED mirror under STAGE_MIRROR_ROOT, with the job id forced to 999999.
+# Arm H's own note already records what that costs, measured on hc14-guard
+# 6023585: eleven minutes building a mirror and the leftover
+# `85db7fdbbf51206a0cb57fa0d55e0e74.building.999999-MH1-2247202` in the mirror
+# root. H was rewritten to cut the check out; A-C were not, and they aimed at
+# phaseN_relock.sh rather than mh1 only by luck of which gate refused first.
+# The templates are clean as of this commit, so the luck has run out.
+#
+# THE FIX IS THE ONE ARMS D-G ALREADY USE: every file these arms execute gets
+# `exit 0` spliced immediately after `### LEFTOVER-CHECK END`, so the check runs
+# over the WHOLE file on disk (the awk scans `"$0"`, not a truncated copy) and
+# the process stops the instant the check has spoken. Nothing above the check
+# does anything but assign variables.
+#
+# AND THE SPLICE IS VERIFIED, NOT ASSUMED. `arm_fixture` refuses -- loudly, and
+# without running anything -- if the marker was not found, because a silent
+# splice failure is the same runaway with a green row over it. That refusal is
+# the guard rail; the `exit 0` is only the mechanism.
+#
+# The path still carries $TOKEN, because arm A is ABOUT the filename: the check
+# must scan the LINE, never "FILENAME:LNO: line". Splicing in place keeps that.
+arm_fixture() {   # arm_fixture <file, rewritten in place>
+  awk '{print} /^### LEFTOVER-CHECK END/{print "exit 0"}' "$1" > "$1.fix" || return 1
+  if ! grep -qx 'exit 0' "$1.fix" || [ "$(grep -c '^### LEFTOVER-CHECK END' "$1")" != 1 ]; then
+    rm -f "$1.fix"; return 1
+  fi
+  mv -f "$1.fix" "$1"
+}
+run() {
+  if ! arm_fixture "$1"; then
+    say "  FAIL  could not splice 'exit 0' after the check in $1 -- REFUSING to execute a live template"
+    FAIL=1; return 99
+  fi
+  bash "$1" 2>&1
+}
 
 for TPL in phaseN_relock.sh phaseN_cert.sh; do
   say "== $TPL =="
@@ -55,6 +97,19 @@ for TPL in phaseN_relock.sh phaseN_cert.sh; do
     say "  PASS  a deliberate citation inside EVIDENCE stays exempt"
   else
     say "  FAIL  the EVIDENCE region is no longer exempt"; FAIL=1
+  fi
+
+  # A2. HARNESS-CONSOL-15's own reader: the arms above must not be able to run a
+  # template body. After A-C, the three fixtures must each carry the spliced
+  # `exit 0`, and NONE of them may have reached a stage-mirror row -- the first
+  # thing a runaway prints.
+  for f in "$P" "$P2" "$P3"; do
+    grep -qx 'exit 0' "$f" || { say "  FAIL  A2 $f was executed without the splice"; FAIL=1; }
+  done
+  if printf '%s' "$OUT" | grep -q 'stage(mirror)\|stage: building\|PRE-LOCK mirror verify'; then
+    say "  FAIL  A2 a template body RAN -- a stage-mirror row reached the guard's stdout"; FAIL=1
+  else
+    say "  PASS  A2 all three fixtures carry the splice and no template body ran"
   fi
 done
 

@@ -446,6 +446,37 @@ setup_refused_check   # SETUP-REFUSED-BRANCH (MUTATION ANCHOR)
 #               producer: the sbatch wrapper's `echo "### <TAG>_EXIT=$rc"` --
 #               det141.sbatch, det16.sbatch, det161.sbatch, det161b.sbatch,
 #               det162.sbatch, and the det1-work gate/mut sbatches.
+#           `### FATAL: <why>`                                CLEANUP-SEAM-3
+#               producer: the relock drivers' own last-gasp row, printed
+#               immediately before a non-zero `exit` -- phaseN_relock.sh and
+#               arms/mh1_relock.sh (`### FATAL: the stage mirror was already
+#               dirty BEFORE this lock.` then `exit 14`; `### FATAL: this job
+#               wrote through a hardlink into a SHARED INPUT`; `### FATAL:
+#               staged manifest is not <x>` then `exit 3`), and the same shape
+#               in arms/c29_relock.sh.
+#               WHY IT IS HERE. mCB-relock 6022684 went FAILED 14:0 on the
+#               mirror-dirty branch and its stdout carries NONE of the four
+#               families above -- `grep -c '_EXIT=' ` over
+#               mergeB31/logs/slurm-6022684.out returns 0 -- because the row
+#               those families depend on is printed by the WRAPPER, and this
+#               driver exits on its own. Owner mCB-cleanup 6023543 therefore
+#               REFUSED (FAILED 2:0) and certMCB-6022684 / ws.MCB-6022684 had
+#               no reaper at all. Two things close that seam, and BOTH landed
+#               together: the driver now prints its own `### <TAG>_EXIT=<rc>`
+#               from the one library all six templates source (see
+#               tools/retread_fast_env.sh, `retread_exit_row_install`), and
+#               this family reads the row the driver was ALREADY printing.
+#               THIS FAMILY CARRIES NO NUMBER, so unlike the four above it
+#               cannot lean on `<nonzero>` to prove fatality -- condition (ii)
+#               is the whole of its evidence, and a `### FATAL:` row over an
+#               sacct COMPLETED 0:0 is a LYING ROW that must not unlock the
+#               reaper. That is not a new rule and needs no new code: (ii)
+#               already overrules every family, and arm J13 measures it on
+#               exactly this row.
+#               NOT MATCHED, deliberately: `### PREAMBLE FATAL:` (it is
+#               SETUP_REFUSED_RE's, and this one is anchored at `^### FATAL:`)
+#               and `### FATAL two retread_fast_env.sh candidates DIFFER`,
+#               which has no colon.
 #         ZERO IS NOT FATAL and the regex says so: `job_fatal=0`, `rc=0` and
 #         `_EXIT=0` are the SUCCESS rows of the very same producers, and a
 #         family that matched them would unlock the reaper on every green job
@@ -513,7 +544,11 @@ setup_refused_check   # SETUP-REFUSED-BRANCH (MUTATION ANCHOR)
 # per-arm wrapper stdouts under `artifacts/` match nothing.
 #
 # Reader: cleanup_absent_root_guard.sh, arms J1-J5.
-JOB_FATAL_RE='^### ((PREAMBLE JOB REFUSED BEFORE ARM 1\. MULTIARM_JOB_FATAL=|ARM [^ ]+ WRAPPER EXIT rc=|[A-Za-z0-9_]+_EXIT=)[0-9]*[1-9][0-9]*|.* PROOF DONE job_fatal=[0-9]*[1-9][0-9]*)( |$)'
+# The fifth alternative, `FATAL:`, is CLEANUP-SEAM-3's. Keep this assignment a
+# BARE quoted string on one line: driver_exit_row_guard.sh arm X9 extracts it by
+# stripping the prefix and everything from the next quote, so that it tests the
+# family this file really uses rather than a second copy typed into the guard.
+JOB_FATAL_RE='^### ((PREAMBLE JOB REFUSED BEFORE ARM 1\. MULTIARM_JOB_FATAL=|ARM [^ ]+ WRAPPER EXIT rc=|[A-Za-z0-9_]+_EXIT=)[0-9]*[1-9][0-9]*|.* PROOF DONE job_fatal=[0-9]*[1-9][0-9]*|FATAL:)( |$)'
 JOB_FATAL_STATES='^(FAILED|TIMEOUT|OUT_OF_MEMORY|NODE_FAIL)$'
 JOB_FATAL_SEAL_DEPTH=$SETUP_REFUSED_DEPTH
 

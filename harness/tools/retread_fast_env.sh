@@ -98,6 +98,107 @@
 
 RETREAD_PERSIST_CACHE_ROOT=${RETREAD_PERSIST_CACHE_ROOT:-/oscar/data/stellex/glvov/agrescap/cache/retread}
 
+# ── CLEANUP-SEAM-3: THE DRIVER PRINTS ITS OWN EXIT ROW ───────────────────────
+# MEASURED, mCB-relock 6022684 (sacct FAILED 14:0, stdout
+# mergeB31/logs/slurm-6022684.out). Its last two rows are:
+#
+#     ### stage: quarantined -> …/85db7fdbbf51206a0cb57fa0d55e0e74.DIRTY-6022684-MCB-…
+#     ### FATAL: the stage mirror was already dirty BEFORE this lock.
+#
+# and then it exits 14. `cleanup_gated.sh`'s JOB_FATAL_RE accepts four row
+# families -- `MULTIARM_JOB_FATAL=`, `ARM <x> WRAPPER EXIT rc=`, `<TAG>_EXIT=`,
+# `PROOF DONE job_fatal=` -- and this driver printed NONE of them: `grep -c
+# '_EXIT=' ` over that stdout returns 0. So owner mCB-cleanup 6023543 REFUSED
+# (FAILED 2:0) and certMCB-6022684 / ws.MCB-6022684 were left with no reaper.
+#
+# THE PRODUCER WAS ALWAYS SOMEONE ELSE'S JOB. cleanup_gated.sh names it in its
+# own reader list: "producer: the sbatch wrapper's `echo \"### <TAG>_EXIT=$rc\"`".
+# A driver that ends on its own `exit 14` therefore depends on a SEPARATE file
+# remembering to re-raise, and every wrapper that forgets strands its roots
+# forever. A gate criterion whose producer is optional is the reader/writer
+# law's own defect shape, and it is the one this block closes.
+#
+# SO THE DRIVER PRINTS THE ROW ITSELF, from the ONE library all six templates
+# already source. Verified, each by its own `. "$FAST_ENV"` line:
+# phase_template/phaseN_relock.sh, phase_template/phaseN_cert.sh,
+# arms/mh1_relock.sh, arms/c29_relock.sh, proof/hlgd_relock.sh and
+# instrumented/p6b_relock.sh. (tools/stage_mirror.sh is sourced by only three of
+# the six and tools/env_seed.sh by five, so neither could carry this.) No
+# template edit, and no sixth chance to forget. The wrapper's row is untouched
+# and still wins when it is there -- JOB_FATAL_RE takes the FIRST match, so a
+# duplicate row costs the gate nothing.
+#
+# THREE THINGS THIS MUST NOT DO, and each is a line of the code below.
+#
+#   1. IT MUST NOT CLOBBER AN EXISTING EXIT TRAP. phaseN_cert.sh sets
+#      `trap collect_artifacts EXIT` BEFORE it sources this file. A bare
+#      `trap … EXIT` here would silently delete that artifact collection and
+#      nothing would say so. The installer CHAINS: it reads whatever EXIT trap
+#      is already set, unquotes it, and runs it FIRST.
+#
+#   2. IT MUST NOT SPEAK FOR A GUARD. Many tools/*.sh guards source this lib to
+#      exercise its functions, and several of them write stdout that ANOTHER
+#      guard greps as a fixture. An unasked-for row there is a false positive
+#      waiting to happen. So the trap installs only when the sourcing script has
+#      already set TAG -- which every template does, hundreds of lines above its
+#      `. "$FAST_ENV"`, and no guard that sources this lib does at all
+#      (verified by grep over the sourcing set). RETREAD_EXIT_ROW=0 opts out.
+#
+#   3. IT MUST NOT CHANGE THE EXIT STATUS. An EXIT trap's own return value is
+#      discarded by bash unless the trap calls `exit`, and this one never does.
+#      `rc` is captured on the trap's FIRST line, before anything else can
+#      overwrite `$?`.
+#
+# TAG is read AT EXIT, not at install time, so the row carries the template's
+# own variable: `### PHASEN_EXIT=14`, `### MH1_EXIT=0`, `### C29P1_EXIT=3`. The
+# format is exactly the one JOB_FATAL_RE's `[A-Za-z0-9_]+_EXIT=` family already
+# reads, so the gate needed no widening for it.
+#
+# Reader: tools/driver_exit_row_guard.sh (arms X1-X7) proves the row, the
+# chaining, the TAG, the guard-silence and the mutation; end-to-end,
+# tools/cleanup_absent_root_guard.sh arms J11-J14 drive a fixture stdout of this
+# shape through the real gate.
+RETREAD_EXIT_ROW_PREV=${RETREAD_EXIT_ROW_PREV:-}
+RETREAD_EXIT_ROW_INSTALLED=${RETREAD_EXIT_ROW_INSTALLED:-}
+
+retread_exit_row () {
+  local rc=$?
+  if [ -n "${RETREAD_EXIT_ROW_PREV:-}" ]; then
+    eval "$RETREAD_EXIT_ROW_PREV"
+  fi
+  echo "### ${TAG:-UNTAGGED}_EXIT=$rc"
+  return "$rc"
+}
+
+retread_exit_row_install () {
+  # Opt-out, and the two conditions from note 2 above.
+  if [ "${RETREAD_EXIT_ROW:-1}" = 0 ]; then return 0; fi
+  if [ -z "${TAG:-}" ]; then return 0; fi
+  if [ -n "${RETREAD_EXIT_ROW_INSTALLED:-}" ]; then return 0; fi
+  # CHAIN, note 1. `trap -p EXIT` renders as: trap -- '<body>' EXIT , with any
+  # embedded single quote written '\'' . Anything that does not match that shape
+  # (no trap set, or a form we did not expect) chains nothing rather than
+  # guessing -- an unparsed trap must never be eval'd.
+  local prev q
+  prev=$(trap -p EXIT)
+  q="'\\''"
+  case "$prev" in
+    "trap -- '"*"' EXIT")
+      prev=${prev#trap -- \'}
+      prev=${prev%\' EXIT}
+      RETREAD_EXIT_ROW_PREV=${prev//"$q"/\'}
+      ;;
+    *)
+      RETREAD_EXIT_ROW_PREV=
+      ;;
+  esac
+  RETREAD_EXIT_ROW_INSTALLED=1
+  trap retread_exit_row EXIT            # EXIT-ROW-INSTALL (MUTATION ANCHOR)
+  return 0
+}
+
+retread_exit_row_install
+
 retread_fast_env () {
   local ws=${1:?retread_fast_env: pass the workspace directory}
   local root=$RETREAD_PERSIST_CACHE_ROOT
