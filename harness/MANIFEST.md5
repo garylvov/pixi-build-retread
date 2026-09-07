@@ -71,8 +71,8 @@ a067c7b73eecdcd53aa578ab239ea3dc  tools/harness_sync_guard.sh
 e85a61b96ec1894a8518d4b1541cbf1e  tools/land_fixset_sync_guard.sh
 043624f5f51694c95651b155d79ddda9  tools/land.sh
 f8ef0afb0693e81ddd1e2c45135e1b8f  tools/manifest_audit.py
-ab5ad17805159e6e4d7255a2d079a6fb  tools/moved_row_halves_guard.sh
-9e199e2267d4f5835438b45a0287cf94  tools/moved_row_halves.sh
+9d5cd96cdadae4d3dc9ba796deaf7bb8  tools/moved_row_halves_guard.sh
+2a0ac79167e6330a6060e3af82ac5f32  tools/moved_row_halves.sh
 e02808a84a7409e9b96a577fbae3dfe9  tools/moved_rows_match_guard.sh
 62db5ba03d4644ccd514f1727db6f7c3  tools/moved_rows_match.sh
 00e4cbab1c56c0f8cdd613bf116bec8c  tools/msgpack_min_guard.py

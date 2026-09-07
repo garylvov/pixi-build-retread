@@ -267,5 +267,85 @@ chk "F identical locks: nothing in any column" \
   "$(sumline "$out")" "moved=0 conda=0 pypi=0 removed=0 added=0"
 chk "F identical locks: TOTAL rows 0" "$(totline "$out")" "0"
 
+# ---- arm U: the REORDER CLASSIFIER (MERGE-U-1), back-ported from mergeB30 ----
+# NOTE ON THE LETTER: this guard already has an arm H (the PINNED pre-fix reader,
+# MERGE-M-4), so this one is U for the lane that found it. Two arms sharing a
+# letter is a log nobody can read back.
+# THE DEFECT. B29's analyze.sh classified a changed line as a `requires-dist`
+# line by grepping the LITERAL STRING `requires-dist` on the changed line. In a
+# pixi.lock that is the KEY; what reorders under it are the LIST ITEMS beneath
+# it, which never carry the key's own text. So on a textbook gym 0.26.2 reorder
+# it scored `0 requires-dist / 28 NOT` -- it would have told its reader the
+# predicted shape did not reproduce, on a pair where it reproduced exactly.
+# MERGE-U caught it on B30's real candidate (raw 41 diff lines, 28 of them gym's
+# own `extra ==` items, 0 anything else) and fixed it in mergeB30/analyze.sh
+# only. That file is task-dir-only and copied lane to lane -- mergeB16 through
+# mergeB30, and `grep -rn requires-dist harness/` finds nothing -- so the fix
+# lived in exactly one of sixteen copies. It lives HERE now, in the reader those
+# analyzers already call with the same two locks.
+#
+# THE FIXTURE IS A GYM REORDER AND NOTHING ELSE: the same 28 items, in a
+# different order, under a real `requires-dist:` key, on top of an otherwise
+# identical lock. Then the OLD classifier must read 0 and the FIXED one 28.
+mkgym() {   # $1 = out; $2 = order (fwd|rev)
+  local out=$1 order=$2 i
+  mklock "$out" "envA|conda|$CF/anyio-4.15.1-pyh5ded981_0.conda"
+  { echo "- pypi: $PH/gym-0.26.2-py3-none-any.whl"
+    echo "  name: gym"
+    echo "  version: 0.26.2"
+    echo "  requires-dist:"
+    if [ "$order" = fwd ]; then
+      for i in $(seq 1 14); do echo "  - pkg-a$i ; extra == 'all'"; done
+      for i in $(seq 1 14); do echo "  - pkg-t$i ; extra == 'testing'"; done
+    else
+      for i in $(seq 14 -1 1); do echo "  - pkg-t$i ; extra == 'testing'"; done
+      for i in $(seq 14 -1 1); do echo "  - pkg-a$i ; extra == 'all'"; done
+    fi
+  } >> "$out"
+}
+mkgym "$WORK/h.base" fwd
+mkgym "$WORK/h.new"  rev
+hout=$(bash "$READER" "$WORK/h.base" "$WORK/h.new" 2>&1); hrc=$?
+hnum() { echo "$hout" | sed -n "s/.*$1[^:]*: *\([0-9][0-9]*\).*/\1/p" | head -1; }
+H_RAW=$(hnum 'changed lines (RAW'); H_OLD=$(hnum 'OLD count'); H_FIX=$(hnum 'FIXED count')
+H_GYM=$(hnum "gym's own extras"); H_NOT=$(hnum 'NOT dependency items'); H_SRT=$(hnum 'both sides SORTED')
+echo "### GUARD U measured: raw=$H_RAW sorted=$H_SRT old=$H_OLD fixed=$H_FIX gym=$H_GYM not_dep=$H_NOT"
+chk "U a pure reorder is not a package move -- the rc the landing reads is unchanged" "$hrc" "0"
+# THE DEFECT ITSELF, and the two counts are asserted AGAINST EACH OTHER rather
+# than against a magic number: `diff`'s alignment on a reordered block is not a
+# constant, so an arm pinned to MERGE-U's own 28 would be asserting GNU diff's
+# choices, not the classifier's. What is invariant is the SHAPE: every changed
+# line here is a requires-dist list item carrying an extra marker, so the FIXED
+# count must equal the raw changed-line count and the OLD count must be ZERO.
+chk "U OLD count -- the literal-key grep -- reads 0 on a REAL gym reorder (the B29 defect)" "$H_OLD" "0"
+chk "U FIXED count claims EVERY changed line, because every one is an extras item" "$H_FIX" "$H_RAW"
+chk "U ... and all of them are gym's own all/testing extras" "$H_GYM" "$H_RAW"
+chk "U ... and NOTHING here is a non-dependency line" "$H_NOT" "0"
+chk "U the same bytes SORTED are identical -- this is a reorder, not a resolution change" "$H_SRT" "0"
+[ "${H_FIX:-0}" -gt 0 ] && ok "U NON-VACUITY -- the fixture really does change lines (raw=$H_RAW), so 'OLD reads 0' is a MISS and not an empty diff" \
+  || bad "U the fixture produced no changed lines at all -- OLD=0 would be trivially true and the arm proves nothing"
+echo "$hout" | grep -q 'THE SAME BYTES IN A DIFFERENT ORDER' \
+  && ok "U the verdict line calls it a reorder and says the rc does not change" \
+  || bad "U no reorder verdict line"
+# H-mut: THE MUTATION, cutting exactly one thing -- the FIXED count goes back to
+# grepping the literal key. It must then read 0 where the fix reads $H_RAW.
+# Without this arm the FIXED count could be passing on the fixture rather than
+# on the classifier.
+HMUT=$WORK/moved_row_halves_literalkey.sh
+HLN=$(grep -n 'FIXED count' "$READER" | cut -d: -f1 | head -1)
+cat > "$WORK/h_mut_line.txt" <<'MUTLINE'
+echo "  FIXED count -- LITERAL-KEY MUTANT (B29's grep)                : $(grep -cE 'requires-dist' "$MRH_D")"
+MUTLINE
+if [ -n "$HLN" ]; then
+  awk -v n="$HLN" 'NR==FNR{r=$0;next} FNR==n{print r;next}{print}' "$WORK/h_mut_line.txt" "$READER" > "$HMUT"
+fi
+if [ -n "$HLN" ] && bash -n "$HMUT" 2>/dev/null && grep -q 'LITERAL-KEY MUTANT' "$HMUT"; then
+  hmout=$(bash "$HMUT" "$WORK/h.base" "$WORK/h.new" 2>&1)
+  chk "U-mut MUTATION -- the literal-key grep reads 0 where the fix reads $H_RAW, so U CAN fail" \
+    "$(echo "$hmout" | sed -n "s/.*FIXED count[^:]*: *\([0-9][0-9]*\).*/\1/p" | head -1)" "0"
+else
+  bad "U-mut could not build the literal-key mutant -- MUTATION ARM DID NOT RUN"
+fi
+
 echo "### MOVED-HALVES GUARD $pass passed, $fail failed"
 [ "$fail" -eq 0 ] || exit 1

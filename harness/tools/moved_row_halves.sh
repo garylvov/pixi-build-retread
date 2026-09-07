@@ -202,3 +202,60 @@ LC_ALL=C awk -F'\t' '
     exit 0
   }
 ' "$A"
+MRH_RC=$?
+
+# ── THE REORDER CLASSIFIER (MERGE-U-1), BACK-PORTED HERE ────────────────────
+# WHERE IT CAME FROM AND WHY IT LIVES HERE NOW. Every merge lane's `analyze.sh`
+# is a task-dir file copied forward from the previous lane -- mergeB16 through
+# mergeB30, sixteen copies, and `grep -rn requires-dist harness/` finds NOTHING:
+# the analyzer has no harness home at all, so a defect fixed in one copy is
+# fixed in exactly one copy and every later lane inherits the broken one. This
+# reader IS the harness file those analyzers already call (`bash
+# $T/tools/moved_row_halves.sh "$CTL" "$NEW"`, four times in mergeB30/analyze.sh
+# alone) and it takes the SAME two locks, so the classification lands here and
+# gets a call site for free rather than needing a new file nobody invokes.
+#
+# THE DEFECT. B29's analyzer classified a changed line as a `requires-dist` line
+# by grepping the LITERAL STRING `requires-dist` ON THE CHANGED LINE. In a
+# pixi.lock `requires-dist:` is a KEY and the things that reorder under it are
+# the LIST ITEMS beneath it, which never carry the key's own text. So on a
+# textbook gym 0.26.2 reorder it scored `0 requires-dist / 28 NOT` and would
+# have told its reader the predicted shape did not reproduce -- when all 28
+# changed lines were gym's own `extra == 'all'` / `extra == 'testing'` items.
+# MERGE-U measured that on B30's real candidate and fixed it lane-locally; this
+# is that fix, versioned.
+#
+# BOTH COUNTS ARE PRINTED SIDE BY SIDE, deliberately: the defect stays VISIBLE
+# rather than being silently repaired, so a reader comparing this output with
+# any B29-era analyze.sh log can see why the two disagree.
+#
+# AND THE FIX'S OWN NARROWNESS IS PRINTED TOO, rather than left to be discovered
+# the way the first one was: keying on the `extra ==` marker classifies a
+# requires-dist item that carries an extra marker and MISSES one that does not
+# (`- numpy>=1.18.0`). On the gym block every one of the 28 carries a marker, so
+# the fix is right about the case it was measured on and no wider; the
+# `no_extra_marker` count is what a later reorder somewhere else would show up
+# in, and it is on the page so nobody has to rediscover the same class of miss.
+echo "### MOVED-HALVES REORDER CLASSIFICATION (MERGE-U-1) baseline=$BASE new=$NEW"
+MRH_RAW=$(LC_ALL=C diff "$BASE" "$NEW" | grep -cE '^[<>]')
+MRH_SRT=$(LC_ALL=C diff <(LC_ALL=C sort "$BASE") <(LC_ALL=C sort "$NEW") | grep -cE '^[<>]')
+MRH_D=$(mktemp); LC_ALL=C diff "$BASE" "$NEW" | grep -E '^[<>]' > "$MRH_D"
+echo "  changed lines (RAW, order-sensitive)                          : $MRH_RAW"
+echo "  changed lines with both sides SORTED (order-insensitive)      : $MRH_SRT"
+echo "  OLD count -- changed lines carrying the LITERAL requires-dist : $(grep -cE 'requires-dist' "$MRH_D")   <-- MERGE-U-1: reads 0 on a REAL gym reorder, which is the defect"
+echo "  FIXED count -- changed dependency ITEMS carrying an 'extra ==': $(grep -cE '^[<>][[:space:]]*-[[:space:]].*extra ==' "$MRH_D")"
+echo "  of those, gym's own extras (all / testing)                    : $(grep -cE "^[<>][[:space:]]*-[[:space:]].*extra == .(all|testing)." "$MRH_D")"
+echo "  dependency items with NO extra marker (the fix's blind spot)  : $(grep -E '^[<>][[:space:]]*-[[:space:]]' "$MRH_D" | grep -cvE 'extra ==')"
+echo "  changed lines that are NOT dependency items                   : $(grep -cvE '^[<>][[:space:]]*-[[:space:]]' "$MRH_D")"
+if [ "$MRH_RAW" -gt 0 ] && [ "$MRH_SRT" -eq 0 ]; then
+  echo "  VERDICT: raw=$MRH_RAW sorted=0 -- THE SAME BYTES IN A DIFFERENT ORDER. No package moved,"
+  echo "           no row was added or removed. This is a LEAD about emission-order stability and"
+  echo "           NOT a moved row; the rc above is what tick-439 reads, and this section does not"
+  echo "           change it."
+elif [ "$MRH_RAW" -eq 0 ]; then
+  echo "  VERDICT: raw=0 -- byte-identical. No reorder appears in this pair."
+else
+  echo "  VERDICT: raw=$MRH_RAW sorted=$MRH_SRT -- a SORTED delta is a RESOLUTION change, not a reorder."
+fi
+rm -f "$MRH_D"
+exit "$MRH_RC"
