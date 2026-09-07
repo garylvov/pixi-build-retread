@@ -900,7 +900,10 @@ run_arm() {
   export OMNI_KIT_ACCEPT_EULA=YES
   export PRIVACY_CONSENT=Y
   export PIXI_BUILD_RETREAD_LOG=pixi_build_retread=debug,warn
-  unset RUST_LOG
+# DET-1-6-3: `unset RUST_LOG` used to be this line. Both halves of the frontend
+# log control now live in `retread_relock_frontend_log` (tools/retread_fast_env.sh)
+# and it is CALLED further down, one line after the scoper -- it cannot be called
+# here, because the file that defines it is not sourced yet.
   export RUST_BACKTRACE=1
 
   # PERSISTENT CACHES -- after the job-scoped block, after RETREAD_FAST_TMP_ROOT.
@@ -938,6 +941,19 @@ run_arm() {
   # tools/sdist_build_scope_guard.sh. C29_ARGV is the SCRIPT's argv (see its
   # capture at the top) -- `"$@"` here would be run_arm's three arguments.
   retread_relock_scope_and_verify "$C" "${C29_ARGV[@]}" || exit 7
+
+  # DET-1-6-3. The frontend tracing filter and the `pixi lock` verbosity flag are
+  # ONE control -- pixi's own `-v` sets pixi's tracing filter and OVERRIDES
+  # RUST_LOG -- and their single producer is `retread_relock_frontend_log` in
+  # tools/retread_fast_env.sh. No flag on argv = today's behaviour byte for byte:
+  # RUST_LOG unset, verbosity `-v`. `--frontend-rust-log=<filter>` = that filter
+  # exported AND the verbosity flag dropped, which is the only shape in which a
+  # cold-proof arm's `build_metadata{dist=...}` vacuity assertion has a live
+  # producer. Measured on job 6015646 arm W1: the `unset RUST_LOG` above plus the
+  # hardcoded `-v` below produced a 16 MB frontend log carrying 18390 DEBUG rows
+  # and ZERO `build_metadata` rows FOR EVERY DIST, and the arm's vacuity assertion
+  # read that absence as a result. Reader: tools/cold_proof_arm_guard.sh ARM5.
+  retread_relock_frontend_log "${C29_ARGV[@]}"
 
   # THE WHEEL STORE -- the import->distribution INDEX AUTHORITY, and the reason
   # every injection run so far reported ~0% indexed naming.
@@ -1040,7 +1056,7 @@ SHIMEOF
   local LTIME=$A/$P-$ARM.lock.time.txt
   echo "### ARM $ARM lock start $(date -Is)"
   local S LRC LW; S=$(date +%s)
-  /usr/bin/time -v -o "$LTIME" "$PIXI" lock -v > "$LLOG" 2>&1
+  /usr/bin/time -v -o "$LTIME" "$PIXI" lock $LOCK_VERBOSITY > "$LLOG" 2>&1
   LRC=$?
   LW=$(( $(date +%s) - S ))
   echo "### ARM $ARM lock rc=$LRC wall=${LW}s end $(date -Is)"

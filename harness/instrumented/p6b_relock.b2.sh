@@ -165,7 +165,7 @@ FAST_ENV=$(dirname "$0")/../tools/retread_fast_env.sh    # persistent caches; fa
 # --- INSTRUMENTATION: the whole reason this harness exists -------------------
 # Verbosity that reaches uv. -vv is INFO (see the EVIDENCE header); -vvv is the
 # debug level, and `uv_resolver` sits in pixi's own default filter template.
-LOCK_VERBOSITY=-vvv
+LOCK_VERBOSITY=            # DET-1-6-3: MUST stay EMPTY while FRONTEND_RUST_LOG is declared -- pixi's own -v/-vvv sets pixi's tracing filter and OVERRIDES RUST_LOG, so -vvv here made the filter below a lie. retread_relock_frontend_log owns this value from the call site onward.
 # RUST_LOG REPLACES that default filter, so it has to re-name every target the
 # extractor reads, not just the uv ones. `uv_client`/`uv_distribution` are the
 # targets that say whether a resolve is fetching or thinking; `pixi_uv` is NOT a
@@ -389,11 +389,11 @@ export PIXI_BUILD_RETREAD_LOG=$BACKEND_LOG_FILTER
 # at all. The BACKEND must not inherit it -- it is a child process and its
 # control surface is PIXI_BUILD_RETREAD_LOG (HANDOFF section 1). The shim below
 # unsets RUST_LOG before exec'ing it, which is the only place that can.
-export RUST_LOG=$FRONTEND_RUST_LOG
+# DET-1-6-3: `export RUST_LOG=$FRONTEND_RUST_LOG` was here, and it was overridden
+# nine lines later by `pixi lock -vvv`. RUST_LOG and the verbosity flag are ONE
+# control with ONE producer now, `retread_relock_frontend_log`, CALLED below
+# with this declared filter once tools/retread_fast_env.sh is sourced.
 export RUST_BACKTRACE=1
-echo "### INSTRUMENTATION: frontend RUST_LOG=$RUST_LOG"
-echo "### INSTRUMENTATION: frontend verbosity $LOCK_VERBOSITY (pixi 0.73: -vvv = debug)"
-echo "### INSTRUMENTATION: backend PIXI_BUILD_RETREAD_LOG=$PIXI_BUILD_RETREAD_LOG (RUST_LOG unset for it)"
 [ -f "$STAMPER" ]   || { echo "FATAL: line stamper $STAMPER missing"; exit 8; }
 [ -f "$EXTRACTOR" ] || { echo "FATAL: extractor $EXTRACTOR missing"; exit 8; }
 
@@ -420,6 +420,19 @@ retread_fast_env "$WS" || { echo "FATAL: retread_fast_env refused"; exit 7; }
 # which now name this file among their targets -- so a copy that LOSES the call
 # goes red instead of going quiet.
 retread_relock_scope_and_verify "$C" "$@" || exit 7
+
+# DET-1-6-3. The frontend tracing filter and the `pixi lock` verbosity flag are
+# ONE control -- pixi's own `-v` sets pixi's tracing filter and OVERRIDES
+# RUST_LOG -- and their single producer is `retread_relock_frontend_log` in
+# tools/retread_fast_env.sh. No flag on argv = today's behaviour byte for byte:
+# RUST_LOG unset, verbosity `-v`. `--frontend-rust-log=<filter>` = that filter
+# exported AND the verbosity flag dropped, which is the only shape in which a
+# cold-proof arm's `build_metadata{dist=...}` vacuity assertion has a live
+# producer. Measured on job 6015646 arm W1: the `unset RUST_LOG` above plus the
+# hardcoded `-v` below produced a 16 MB frontend log carrying 18390 DEBUG rows
+# and ZERO `build_metadata` rows FOR EVERY DIST, and the arm's vacuity assertion
+# read that absence as a result. Reader: tools/cold_proof_arm_guard.sh ARM5.
+retread_relock_frontend_log "$@" "--frontend-rust-log=$FRONTEND_RUST_LOG"
 # B2 DELTA (2026-09-02): this run measures WHERE THE TIME GOES on a cold-store
 # relock, and it runs concurrently with the B1 store measurement against the same
 # manifest. Sharing the store would let a concurrent publish serve this run's

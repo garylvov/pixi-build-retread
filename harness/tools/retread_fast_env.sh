@@ -1294,3 +1294,75 @@ retread_relock_scope_and_verify () {
   bash "$guard" || { echo "FATAL: sdist build poison guard refused -- see the rows above"; return 7; }
   return 0
 }
+
+# --- DET-1-6-3: THE FRONTEND LOG FILTER, AND THE LOCK VERBOSITY THAT OWNS IT --
+# `retread_relock_frontend_log ["$@"]` -- the ONE producer of a relock's frontend
+# tracing filter. It sets `RUST_LOG` (exported) and `LOCK_VERBOSITY` (the flag
+# the caller must pass to `pixi lock`, UNQUOTED so that empty contributes no
+# argument at all), and it prints what it did.
+#
+# MEASURED ON JOB 6015646 (DET-1-6-2) ARM W1, 2026-09-07. That arm's vacuity
+# assertion -- `build_metadata{dist=gym==0.26.2}` rows in the arm's own frontend
+# log >= 1 -- read ZERO, and the arm was reported VACUOUS on the reading that
+# gym's prepared metadata had been REPLAYED out of a warm cache. THAT DIAGNOSIS
+# WAS WRONG. The rows that falsify it:
+#   * the arm's real frontend log `D6C-6015646.lock.log` (16372214 bytes) has
+#     `build_metadata` ZERO times FOR EVERY DIST, not merely for gym, and
+#     `get_or_build_wheel_metadata`, `uv_distribution` and `Preparing metadata`
+#     are zero too -- while the SAME file carries 18390 DEBUG rows, 7009 INFO
+#     and 22 `resolve_pypi` spans. A log with 18390 DEBUG rows and zero rows
+#     from ONE crate is a FILTER, not an absence of work.
+#   * and the arm HAD done the work: its own job-scoped wheel store holds two
+#     independently sha-keyed retread-BUILT wheels,
+#     `gym-0.26.2-999retread-py3-none-any.whl` written 05:37:47 and 05:47:30,
+#     both `links=1`, both inside that arm's window. Two builds -- exactly the
+#     count DET-1-4-1's cold arms logged as 2.
+#   * the arm's caches were never warm to begin with: its
+#     `RETREAD_PERSIST_CACHE_ROOT` basename carries the job id
+#     (`retread-injection-on-d6c-6015646`) and its `uv/sdists-v9` and
+#     `uv/simple-v24` were created at 05:30:59 and 05:31:22 against an arm that
+#     started at 05:30.
+#
+# TWO THINGS DELETED THE EVIDENCE, AND A FIX FOR EITHER ALONE CHANGES NOTHING:
+#   1. `unset RUST_LOG` in the relock templates threw away any filter a harness
+#      exported, so the `build_metadata` span -- emitted by the `uv_distribution`
+#      crate, NOT by pixi -- could never be enabled.
+#   2. `"$PIXI" lock -v` sets pixi's OWN tracing filter and pixi's `-v` IGNORES
+#      RUST_LOG. This is exactly what DET-1-4-1's det141_proof.sh means by
+#      `LOCK_VERBOSITY=   # MUST be empty for RUST_LOG to take`: it ran
+#      `"$PIXI" lock $LOCK_VERBOSITY` with that variable EMPTY and
+#      `RUST_LOG=uv_distribution=debug,pixi=info,pixi_core=info,
+#      pixi_command_dispatcher=info,warn`, and got 27 `build_metadata` rows of
+#      which 2 were gym's. det141 never hit this defect because it ran its own
+#      inline relock, not a shipped template.
+# So the two are ONE control and they move together, here, once.
+#
+# WHY ARGV AND NOT AN ENVIRONMENT VARIABLE (operator doctrine: args over env
+# vars), and the same reason `--cold-proof-arm` is on argv: a proof's two arms
+# share one environment, and that is precisely where one arm's state leaks into
+# the next.
+#
+# THE DEFAULT IS TODAY'S BEHAVIOUR EXACTLY -- no flag means `RUST_LOG` unset and
+# `LOCK_VERBOSITY=-v` -- so every production relock and every merge lane that
+# adopts the call is byte-unaffected until it passes the flag.
+#
+# ITS READER: `tools/cold_proof_arm_guard.sh` ARM5, which executes THIS function
+# in both shapes and mutates it.
+retread_relock_frontend_log () {
+  local filter= a
+  for a in "$@"; do
+    case "$a" in --frontend-rust-log=*) filter=${a#--frontend-rust-log=} ;; esac
+  done
+  if [ -n "$filter" ]; then
+    export RUST_LOG=$filter
+    LOCK_VERBOSITY=
+    echo "### INSTRUMENTATION: frontend RUST_LOG=$RUST_LOG (declared on argv by --frontend-rust-log=)"
+    echo "### INSTRUMENTATION: lock verbosity flag DROPPED -- pixi's own -v overrides RUST_LOG (DET-1-4-1's LOCK_VERBOSITY= rule)"
+  else
+    unset RUST_LOG
+    LOCK_VERBOSITY=-v
+    echo "### INSTRUMENTATION: frontend RUST_LOG unset, lock verbosity '-v' (the default; no --frontend-rust-log= on argv)"
+  fi
+  echo "### INSTRUMENTATION: backend PIXI_BUILD_RETREAD_LOG=${PIXI_BUILD_RETREAD_LOG:-<unset>}"
+  return 0
+}

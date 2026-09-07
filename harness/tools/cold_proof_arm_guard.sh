@@ -181,6 +181,116 @@ for TPL in $TARGETS; do
   fi
 done
 
+# ---- ARM 5 (DET-1-6-3): the frontend log filter, EXECUTED, then MUTATED ------
+# WHY IT IS HERE. A cold proof arm's whole point is that it BUILDS rather than
+# replays, and the only evidence of a build is the `uv_distribution` span
+# `build_metadata{dist=...}` in the frontend log. Job 6015646 arm W1 asserted
+# exactly that and read ZERO -- and was WRONG about why: the log had zero
+# `build_metadata` rows FOR EVERY DIST while carrying 18390 DEBUG rows, because
+# the relock template did `unset RUST_LOG` and then ran `pixi lock -v`, whose
+# own filter overrides RUST_LOG. A criterion whose producer is switched off one
+# function above it is a criterion with no live producer (doctrine law 2), and
+# this arm is that producer's reader.
+#
+# IT EXECUTES THE REAL BYTES. `retread_relock_frontend_log` is sourced out of
+# retread_fast_env.sh and CALLED, in both shapes; nothing here re-implements its
+# logic, because a guard that greps for the logic it expects passes a file that
+# says the right thing and does the wrong one.
+A5F='uv_distribution=debug,pixi=info,warn'
+
+# 5a DEFAULT SHAPE: no flag must be byte-for-byte today's behaviour.
+A5A=$( set +e
+  # shellcheck source=/dev/null
+  . "$FAST" >/dev/null 2>&1
+  retread_relock_frontend_log --cold-proof-arm
+  echo "RESULT rust_log=${RUST_LOG-<unset>} lock_verbosity=${LOCK_VERBOSITY-<UNSET-VAR>}" )
+A5AR=$(printf '%s\n' "$A5A" | grep -F 'RESULT ')
+if [ "$A5AR" = 'RESULT rust_log=<unset> lock_verbosity=-v' ] \
+   && printf '%s\n' "$A5A" | grep -qF "### INSTRUMENTATION: frontend RUST_LOG unset, lock verbosity '-v'"; then
+  say "ARM5a PASS no flag = today's behaviour exactly ($A5AR)"
+else
+  say "ARM5a FAIL no flag must leave RUST_LOG unset and LOCK_VERBOSITY=-v, so every production relock is byte-unaffected. Got: $A5AR"
+  printf '%s\n' "$A5A" | sed 's/^/###     /'
+  fail=1
+fi
+
+# 5b DECLARED SHAPE: the filter is exported AND the -v is dropped. Both, or the
+# spans still never print -- that is the whole lesson of 6015646 W1.
+A5B=$( set +e
+  # shellcheck source=/dev/null
+  . "$FAST" >/dev/null 2>&1
+  retread_relock_frontend_log --cold-proof-arm "--frontend-rust-log=$A5F"
+  echo "RESULT rust_log=${RUST_LOG-<unset>} lock_verbosity=${LOCK_VERBOSITY-<UNSET-VAR>}" )
+A5BR=$(printf '%s\n' "$A5B" | grep -F 'RESULT ')
+if [ "$A5BR" = "RESULT rust_log=$A5F lock_verbosity=" ] \
+   && printf '%s\n' "$A5B" | grep -qF "### INSTRUMENTATION: frontend RUST_LOG=$A5F" \
+   && printf '%s\n' "$A5B" | grep -qF '### INSTRUMENTATION: lock verbosity flag DROPPED'; then
+  say "ARM5b PASS --frontend-rust-log= exports the filter AND empties LOCK_VERBOSITY ($A5BR)"
+else
+  say "ARM5b FAIL the declared filter must reach RUST_LOG *and* drop pixi's -v (pixi's own -v overrides RUST_LOG). Got: $A5BR"
+  printf '%s\n' "$A5B" | sed 's/^/###     /'
+  fail=1
+fi
+
+# 5c MUTATION. Delete the argv parse from a COPY of the producer and 5b must go
+# red. A guard that cannot fail is a defect, so this arm fails when the mutant
+# PASSES.
+A5MUT=$W/fast_env_mutant.sh
+sed 's/^\([[:space:]]*\)case "\$a" in --frontend-rust-log=.*$/\1: # ARM5c MUTATION: argv parse deleted/' "$FAST" > "$A5MUT"
+if cmp -s "$FAST" "$A5MUT"; then
+  say "ARM5c FAIL the mutation edited nothing -- this arm is asserting against an unmutated file and cannot fail"
+  fail=1
+else
+  A5C=$( set +e
+    # shellcheck source=/dev/null
+    . "$A5MUT" >/dev/null 2>&1
+    retread_relock_frontend_log --cold-proof-arm "--frontend-rust-log=$A5F"
+    echo "RESULT rust_log=${RUST_LOG-<unset>} lock_verbosity=${LOCK_VERBOSITY-<UNSET-VAR>}" )
+  A5CR=$(printf '%s\n' "$A5C" | grep -F 'RESULT ')
+  if [ "$A5CR" = "RESULT rust_log=$A5F lock_verbosity=" ]; then
+    say "ARM5c FAIL the mutant with NO argv parse still produced the declared filter -- 5b proves nothing. Got: $A5CR"
+    fail=1
+  else
+    say "ARM5c PASS (mutation) argv parse deleted -> the declared filter does NOT appear ($A5CR)"
+  fi
+fi
+
+# 5d PER TARGET, ADOPTION. A template that adopted the call must NOT also keep a
+# hardcoded `lock -v`: half an adoption is worse than none, because the row says
+# the filter was set while pixi quietly overrides it. A template that has not
+# adopted it is REPORTED, not failed -- the back-port is boarded debt, named in
+# the row -- but a template that adopted it and kept `-v` is a hard failure.
+for TPL in $TARGETS; do
+  TN=$(basename "$TPL")
+  [ -f "$TPL" ] || continue
+  ADOPT=$(grep -cE '^[[:space:]]*retread_relock_frontend_log[[:space:]]' "$TPL")
+  HARDV=$(grep -cE '"\$PIXI" lock[[:space:]]+-v' "$TPL")
+  # THE SECOND HALF-ADOPTION, AND IT IS THE ONE THE INSTRUMENTED TEMPLATES
+  # ACTUALLY HAD. A template can adopt the call, pass `$LOCK_VERBOSITY` to pixi,
+  # and STILL lie -- by re-assigning LOCK_VERBOSITY after the producer set it.
+  # `p6b_relock.sh` shipped `LOCK_VERBOSITY=-vvv` beside an exported
+  # FRONTEND_RUST_LOG and a row announcing that filter, and pixi's own -vvv
+  # overrode it: the row was false for as long as that template has existed.
+  # So in an ADOPTING template the producer must be the LAST writer -- any
+  # `LOCK_VERBOSITY=` assignment below the call line is a second producer.
+  CALLLINE=$(grep -nE '^[[:space:]]*retread_relock_frontend_log[[:space:]]' "$TPL" | head -1 | cut -d: -f1)
+  LVAFTER=0
+  [ -n "$CALLLINE" ] && LVAFTER=$(awk -v c="$CALLLINE" 'NR>c && /^[[:space:]]*LOCK_VERBOSITY=/ {n++} END{print n+0}' "$TPL")
+  if [ "$ADOPT" -ge 1 ] && [ "$HARDV" = 0 ] && [ "$LVAFTER" != 0 ]; then
+    say "ARM5d FAIL $TN calls retread_relock_frontend_log and then RE-ASSIGNS LOCK_VERBOSITY $LVAFTER time(s) below the call -- a second producer of the one value the call exists to own, and the announced filter would be overridden in silence"
+    fail=1
+  elif [ "$ADOPT" -ge 1 ] && [ "$HARDV" = 0 ]; then
+    say "ARM5d PASS $TN calls retread_relock_frontend_log, passes \$LOCK_VERBOSITY to pixi lock (no hardcoded -v), and never re-assigns it below the call"
+  elif [ "$ADOPT" -ge 1 ] && [ "$HARDV" != 0 ]; then
+    say "ARM5d FAIL $TN calls retread_relock_frontend_log but STILL hardcodes 'pixi lock -v' ($HARDV line(s)) -- pixi's -v overrides RUST_LOG, so the filter it just announced is a lie"
+    fail=1
+  elif grep -qE '^[[:space:]]*unset RUST_LOG[[:space:]]*$' "$TPL"; then
+    say "ARM5d NOT-ADOPTED $TN still does 'unset RUST_LOG' + 'pixi lock -v' and cannot log uv_distribution spans. BOARDED DEBT (DET-1-6-3): back-port the retread_relock_frontend_log call, one line after its retread_relock_scope_and_verify call, and swap 'lock -v' for 'lock \$LOCK_VERBOSITY'. Sized: 2 lines per template, $TN."
+  else
+    say "ARM5d NOT-ADOPTED $TN (no 'unset RUST_LOG' of its own; nothing to back-port yet)"
+  fi
+done
+
 say "TARGETS checked=$napp"
 [ "$napp" -ge 1 ] || { say "REFUSED no target -- this guard would be green against nothing"; exit 3; }
 [ "$fail" = 0 ] && { say "ALL ARMS PASS"; exit 0; }

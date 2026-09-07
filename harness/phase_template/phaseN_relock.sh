@@ -782,7 +782,15 @@ export UV_LINK_MODE=copy
 export OMNI_KIT_ACCEPT_EULA=YES
 export PRIVACY_CONSENT=Y
 export PIXI_BUILD_RETREAD_LOG=pixi_build_retread=debug,warn
-unset RUST_LOG
+# DET-1-6-3. `unset RUST_LOG` USED TO BE THIS LINE, and together with the
+# hardcoded `lock -v` below it made this template unable to log the
+# `uv_distribution` spans a cold-proof arm's vacuity assertion reads (job
+# 6015646 W1: zero `build_metadata` rows for EVERY dist in a 16 MB log carrying
+# 18390 DEBUG rows). Both halves are now `retread_relock_frontend_log` in
+# tools/retread_fast_env.sh -- ONE producer, the way `--cold-proof-arm` became
+# one in HARNESS-CONSOL-9 -- and it is CALLED BELOW, after retread_fast_env.sh
+# is sourced (it cannot be called here; the file that defines it is not sourced
+# yet). Read that function for the whole argument; it is not duplicated here.
 export RUST_BACKTRACE=1
 
 # PERSISTENT CACHES -- must come AFTER the job-scoped block above (it overrides
@@ -828,6 +836,14 @@ retread_fast_env "$WS" || { echo "FATAL: retread_fast_env refused"; exit 7; }
 # `"$@"` is this script's own argv and carries `--cold-proof-arm` when a proof
 # arm declares itself cold.
 retread_relock_scope_and_verify "$C" "$@" || exit 7
+
+# DET-1-6-3. The frontend tracing filter and the `pixi lock` verbosity flag are
+# ONE control (pixi's `-v` overrides RUST_LOG), and this is their single
+# producer. No flag on argv = today's behaviour exactly: RUST_LOG unset,
+# LOCK_VERBOSITY=-v. `--frontend-rust-log=<filter>` = that filter exported and
+# the `-v` dropped, which is the only shape in which a cold proof arm's
+# `build_metadata{dist=...}` vacuity assertion has a live producer.
+retread_relock_frontend_log "$@"
 
 # --- OPTIONAL: JOB-SCOPED WHEEL STORE, SEEDED FROM THE PERSISTENT ONE ---------
 # retread_fast_env just exported RETREAD_WHEEL_STORE=<persist root>/wheels, the
@@ -1146,7 +1162,13 @@ echo "### source-tree write guard: fingerprinted $(wc -l < "$SRC_FP_BEFORE") in-
 wheel_store_census 'BEFORE LOCK'
 echo "### lock start $(date -Is)"
 S=$(date +%s)
-/usr/bin/time -v -o "$LTIME" "$PIXI" lock -v > "$LLOG" 2>&1
+# $LOCK_VERBOSITY is set by retread_relock_frontend_log above: `-v` by default,
+# EMPTY when an argv `--frontend-rust-log=` declared a frontend filter, because
+# pixi's own `-v` would otherwise override RUST_LOG and delete the
+# `uv_distribution` spans the caller asked for (measured, job 6015646 W1).
+# UNQUOTED ON PURPOSE: empty must contribute NO argument at all.
+# shellcheck disable=SC2086
+/usr/bin/time -v -o "$LTIME" "$PIXI" lock $LOCK_VERBOSITY > "$LLOG" 2>&1
 LRC=$?
 LW=$(( $(date +%s) - S ))
 echo "### lock rc=$LRC wall=${LW}s end $(date -Is)"
