@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Guard for tools/moved_row_halves.sh (MERGE-K-1, widened by MERGE-M-4).
+# Guard for tools/moved_row_halves.sh (MERGE-K-1, widened by MERGE-M-4, and by
+# HARNESS-CONSOL-13's BUILD-STRING reader -- arms W1-W6 at the foot of this file).
 # Doctrine law 3: every change lands with its guard test, and a guard that
 # cannot fail is a defect -- so arm D MUTATES the reader and REQUIRES the
 # mutation to be caught, and arm H runs the PINNED PRE-FIX FILE ITSELF and
@@ -212,7 +213,7 @@ mutate_and_check M1 's/half = (\$0 ~ \/- conda: \/) ? "conda" : "pypi"/half = "c
 #       The row SURVIVES here, mislabelled -- which is why this arm's target is
 #       the LABEL `half=pypi` and not the row, and why the two mutants together
 #       are worth more than either alone.
-mutate_and_check M2 's/if (\$4 == "pypi") pypi\[k\] = 1; else conda\[k\] = 1/conda[k] = 1/' \
+mutate_and_check M2 's/if (\$5 == "pypi") pypi\[k\] = 1; else conda\[k\] = 1/conda[k] = 1/' \
   "$WORK/a.base" "$WORK/a.new" 'half=pypi' 0 "it would LAND the list"
 #   M3  MERGE-M-4's OWN MUTANT: restore the pre-fix behaviour by dropping any
 #       group that is not present on both sides.  This is the defect that let
@@ -345,6 +346,93 @@ if [ -n "$HLN" ] && bash -n "$HMUT" 2>/dev/null && grep -q 'LITERAL-KEY MUTANT' 
     "$(echo "$hmout" | sed -n "s/.*FIXED count[^:]*: *\([0-9][0-9]*\).*/\1/p" | head -1)" "0"
 else
   bad "U-mut could not build the literal-key mutant -- MUTATION ARM DID NOT RUN"
+fi
+
+# ---- arm W: THE BUILD-STRING READER (HARNESS-CONSOL-13, CRIT-1) -------------
+# THE DEFECT IT IS AIMED AT. Every reader above arm W is keyed on VERSION, so a
+# conda package rebuilt upstream -- same version, new build string -- is a
+# byte-for-byte change in the environment that the whole file called CLEAN.
+# `pkg-config 0.29.2 h1114479_1012 -> _1013` is the real one, between B30's
+# landed proof lock and det162's W1 lock, and NOTHING in tree could see it.
+# W1 is that shape as a fixture; W3 and W5 are the two ways a "rebuild" is not
+# one; W4 is the mutation, without which W1 could be passing on the fixture.
+# The letter is W because D, H and U are taken and two arms sharing a letter is
+# a log nobody can read back.
+bssum()   { echo "$1" | sed -n 's/^### BUILD-STRING SUMMARY //p' | head -1; }
+bscount() { echo "$1" | sed -n 's/^### BUILD-STRING CHANGES //p' | head -1; }
+PC=$CF/pkg-config-0.29.2
+# W1: the real shape -- one package, one old->new pair, EVERY env carrying it.
+mklock "$WORK/w1.base" "envA|conda|$PC-h1114479_1012.conda" \
+                       "envB|conda|$PC-h1114479_1012.conda"
+mklock "$WORK/w1.new"  "envA|conda|$PC-h1114479_1013.conda" \
+                       "envB|conda|$PC-h1114479_1013.conda"
+out=$(bash "$READER" "$WORK/w1.base" "$WORK/w1.new"); rc=$?
+chk "W1 a build-string-only bump that swept every env stays rc 0 (an environmental rebuild)" "$rc" "0"
+chk "W1 the table is NOT empty -- the change the version readers cannot see is printed" \
+  "$(bscount "$out")" "2"
+chk "W1 the row names env, package, version and both build strings" \
+  "$(echo "$out" | grep -c 'BUILD env=envA package=pkg-config version=0.29.2 h1114479_1012 -> h1114479_1013')" "1"
+chk "W1 the summary is the row section 2 reads" \
+  "$(bssum "$out")" "build_string_changed=2 envs=2 identical_per_env=yes"
+chk "W1 the per-package rollup shows the coverage the rule turns on" \
+  "$(echo "$out" | grep -c 'BUILD-PKG package=pkg-config version=0.29.2 changed_envs=2 envs_carrying=2 distinct_build_pairs=one identical=yes')" "1"
+chk "W1 the version readers above still call it clean -- which is exactly why the table had to exist" \
+  "$(echo "$out" | grep -c 'MOVED-HALVES CLEAN')" "1"
+# W2: identical locks -- the empty table, and it is PRINTED rather than absent
+out=$(bash "$READER" "$WORK/w1.base" "$WORK/w1.base"); rc=$?
+chk "W2 identical locks: rc 0" "$rc" "0"
+chk "W2 identical locks: the table is present and empty" "$(bscount "$out")" "0"
+chk "W2 identical locks: the summary still prints (a missing row is not a zero)" \
+  "$(bssum "$out")" "build_string_changed=0 envs=0 identical_per_env=yes"
+# W3: PARTIAL -- carried by two envs, rebuilt in one.  Not a rebuild: a
+# resolution difference, and the one shape this reader REFUSES.
+mklock "$WORK/w3.base" "envA|conda|$PC-h1114479_1012.conda" \
+                       "envB|conda|$PC-h1114479_1012.conda"
+mklock "$WORK/w3.new"  "envA|conda|$PC-h1114479_1013.conda" \
+                       "envB|conda|$PC-h1114479_1012.conda"
+out=$(bash "$READER" "$WORK/w3.base" "$WORK/w3.new"); rc=$?
+chk "W3 a build string that reached only SOME envs is rc 1" "$rc" "1"
+chk "W3 the summary says identical_per_env=no" \
+  "$(bssum "$out")" "build_string_changed=1 envs=1 identical_per_env=no"
+chk "W3 the rollup prints the coverage that failed: 1 of 2" \
+  "$(echo "$out" | grep -c 'BUILD-PKG package=pkg-config version=0.29.2 changed_envs=1 envs_carrying=2 distinct_build_pairs=one identical=no')" "1"
+chk "W3 the refusal names itself" "$(echo "$out" | grep -c '### BUILD-STRING REFUSE')" "1"
+chk "W3 NON-VACUITY: the version readers still see nothing at all here" \
+  "$(sumline "$out")" "moved=0 conda=0 pypi=0 removed=0 added=0"
+# W5: TWO DIFFERENT old->new pairs for one (package, version) is not one rebuild
+mklock "$WORK/w5.base" "envA|conda|$PC-h1114479_1012.conda" \
+                       "envB|conda|$PC-h1114479_1012.conda"
+mklock "$WORK/w5.new"  "envA|conda|$PC-h1114479_1013.conda" \
+                       "envB|conda|$PC-h1114479_1014.conda"
+out=$(bash "$READER" "$WORK/w5.base" "$WORK/w5.new"); rc=$?
+chk "W5 two different build pairs for one (package, version) is rc 1" "$rc" "1"
+chk "W5 the summary refuses even though EVERY env changed" \
+  "$(bssum "$out")" "build_string_changed=2 envs=2 identical_per_env=no"
+chk "W5 the rollup names the reason: MANY distinct pairs" \
+  "$(echo "$out" | grep -c 'distinct_build_pairs=MANY identical=no')" "1"
+# W6: a VERSION move that also carries a new build belongs to the row walk, and
+# must NOT be double-counted here -- the two readers partition the event space.
+mklock "$WORK/w6.base" "envA|conda|$CF/anyio-4.15.0-pyh5ded981_0.conda"
+mklock "$WORK/w6.new"  "envA|conda|$CF/anyio-4.15.1-pyh5ded981_1.conda"
+out=$(bash "$READER" "$WORK/w6.base" "$WORK/w6.new"); rc=$?
+chk "W6 a version move is the row walk's row, not a build-string row" "$(bscount "$out")" "0"
+chk "W6 ... and the row walk still reports it" \
+  "$(sumline "$out")" "moved=1 conda=1 pypi=0 removed=0 added=0"
+chk "W6 rc 0 -- counts held, conda only, and no partial rebuild" "$rc" "0"
+# W4: THE MUTATION -- the build comparison itself cut out.  On W3's fixture the
+# mutant must print an EMPTY table and exit 0, which is the pre-CONSOL-13 tree
+# exactly: a build-string change landing unseen.
+WMUT=$WORK/moved_row_halves_nobuild.sh
+sed 's/if (bbld != nbld \&\& bbld != "-" \&\& nbld != "-") {/if (0) {/' "$READER" > "$WMUT"
+if cmp -s "$READER" "$WMUT"; then
+  bad "W4 the mutation changed nothing -- the build comparison was not found, so arm W is vacuous"
+else
+  wout=$(bash "$WMUT" "$WORK/w3.base" "$WORK/w3.new"); wrc=$?
+  chk "W4 MUTATION: with the build compare cut, the partial rebuild is INVISIBLE (table empty)" \
+    "$(bscount "$wout")" "0"
+  chk "W4 MUTATION: ... and the mutant LANDS it (rc 0) -- that is the tree before this arm" "$wrc" "0"
+  chk "W4 MUTATION: ... and its summary claims identical_per_env=yes about a partial rebuild" \
+    "$(bssum "$wout")" "build_string_changed=0 envs=0 identical_per_env=yes"
 fi
 
 echo "### MOVED-HALVES GUARD $pass passed, $fail failed"

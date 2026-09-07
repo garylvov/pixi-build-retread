@@ -84,8 +84,8 @@ b84e488467c4ce2f68a94a1f20ebe739  tools/harness_drift_check.sh
 6d2b91a7a82e1509d77fa7c2333b5f56  tools/land_fixset_sync_guard.sh
 043624f5f51694c95651b155d79ddda9  tools/land.sh
 f8ef0afb0693e81ddd1e2c45135e1b8f  tools/manifest_audit.py
-9d5cd96cdadae4d3dc9ba796deaf7bb8  tools/moved_row_halves_guard.sh
-2a0ac79167e6330a6060e3af82ac5f32  tools/moved_row_halves.sh
+38482e13f5304dd07dab6425dce90807  tools/moved_row_halves_guard.sh
+442c081d11007f170035028233147195  tools/moved_row_halves.sh
 e02808a84a7409e9b96a577fbae3dfe9  tools/moved_rows_match_guard.sh
 62db5ba03d4644ccd514f1727db6f7c3  tools/moved_rows_match.sh
 00e4cbab1c56c0f8cdd613bf116bec8c  tools/msgpack_min_guard.py

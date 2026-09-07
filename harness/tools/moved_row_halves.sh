@@ -39,13 +39,23 @@
 #         the conda half with counts held are the shape tick 439 accepts.)
 #   rc 1  REFUSED -- at least one of: a changed row is pypi; an environment's
 #         package count changed (a removal, an addition, or an environment that
-#         exists on only one side).  Every such row is printed and the reasons
+#         exists on only one side); or (HARNESS-CONSOL-13) a conda BUILD STRING
+#         changed in only SOME of the environments carrying that package, or in
+#         more than one old->new pair.  Every such row is printed and the reasons
 #         are named on the `REFUSE` line.  NOT an error: it is the signal the
 #         steward's rule says must then be attributed by a control.  A caller
 #         that treats rc 1 as a crash has misread it; a caller that ignores it
 #         has skipped the gate.
 #   rc 2  a file is missing or unreadable, or a lock declares no environments
 #         (SETUP FAILURE, never a verdict -- the p4l cert_verdict.sh convention)
+#
+#   A BUILD-STRING-ONLY change with identical per-env coverage stays rc 0 -- an
+#   upstream rebuild sweeping every environment is an environmental fact, not a
+#   resolution change -- but it is NEVER SILENT: `### BUILD-STRING CHANGES <n>`
+#   and its `### BUILD-STRING SUMMARY` row are the table HANDOFF section 2's
+#   HARNESS-CONSOL-13 rule reads before landing.  Before this section a rebuild
+#   was invisible to every reader in the tree, because every one of them is
+#   keyed on VERSION.
 #
 # IT IS A SECOND, INDEPENDENT IMPLEMENTATION OF THE CHANGED SET, and that is
 # deliberate: `env_version_delta.py` computes the same thing in python from the
@@ -79,7 +89,10 @@ for f in "$BASE" "$NEW"; do
   [ -r "$f" ] || { echo "MOVED-HALVES FATAL: cannot read $f" >&2; exit 2; }
 done
 
-# one lock -> "env<TAB>name<TAB>version<TAB>half", IN FILE ORDER (the order is
+# one lock -> "env<TAB>name<TAB>version<TAB>build<TAB>half", IN FILE ORDER (the
+# BUILD column is `-` for every pypi row: a wheel has no conda build string, and
+# a column that invented one would make the build-string reader below compare
+# two things that are not the same kind of fact).  (the order is
 # load-bearing: the last url for a name inside one env is the one that counts,
 # which is what the python reader's dict assignment does).
 extract() {
@@ -92,15 +105,15 @@ extract() {
       n = split(s, a, "-"); if (n < 3) return ""
       ver = a[n-1]; name = a[1]
       for (i = 2; i <= n-2; i++) name = name "-" a[i]
-      return norm(name) "\t" ver
+      return norm(name) "\t" ver "\t" a[n]
     }
     function pypi_nv(b,   s, n, a, i, name, ver) {
-      if (b ~ /\.whl$/) { n = split(b, a, "-"); if (n < 2) return ""; return norm(a[1]) "\t" a[2] }
+      if (b ~ /\.whl$/) { n = split(b, a, "-"); if (n < 2) return ""; return norm(a[1]) "\t" a[2] "\t-" }
       s = b; sub(/\.tar\.gz$/, "", s); sub(/\.zip$/, "", s); sub(/\.tar\.xz$/, "", s)
       n = split(s, a, "-"); if (n < 2) return ""
       ver = a[n]; name = a[1]
       for (i = 2; i <= n-1; i++) name = name "-" a[i]
-      return norm(name) "\t" ver
+      return norm(name) "\t" ver "\t-"
     }
     /^environments:$/            { inenv = 1; next }
     inenv && /^[a-z]/            { inenv = 0 }
@@ -116,17 +129,19 @@ extract() {
 }
 
 # fold one extract to ONE entry per (env, name): last url in file order wins the
-# version, and a name carried by BOTH halves inside one env is labelled
-# `conda+pypi` so it can never be read as pure conda.
+# version AND the build string, and a name carried by BOTH halves inside one env
+# is labelled `conda+pypi` so it can never be read as pure conda.
+# OUT: env<TAB>name<TAB>version<TAB>half<TAB>build -- half stays in column 4 so
+# every reader written against the pre-BUILD shape still reads what it read.
 fold() {
   awk -F'\t' '
     { k = $1 SUBSEP $2
       if (!(k in ver)) { ord[++n] = k; e[k] = $1; p[k] = $2 }
-      ver[k] = $3
-      if ($4 == "pypi") pypi[k] = 1; else conda[k] = 1 }
+      ver[k] = $3; bld[k] = $4
+      if ($5 == "pypi") pypi[k] = 1; else conda[k] = 1 }
     END { for (i = 1; i <= n; i++) { k = ord[i]
         h = (conda[k] && pypi[k]) ? "conda+pypi" : (pypi[k] ? "pypi" : "conda")
-        print e[k] "\t" p[k] "\t" ver[k] "\t" h } }
+        print e[k] "\t" p[k] "\t" ver[k] "\t" h "\t" bld[k] } }
   ' "$1"
 }
 
@@ -141,8 +156,8 @@ echo "### MOVED-HALVES new=$NEW rows=$nn"
 # ONE sorted stream, both sides tagged, grouped by (env, package).  A group of
 # two is a package present on both sides; a group of one is a REMOVAL or an
 # ADDITION, which is precisely what the pre-MERGE-M-4 join dropped on the floor.
-{ awk -F'\t' '{ print $1 "\t" $2 "\tB\t" $3 "\t" $4 }' "$B"
-  awk -F'\t' '{ print $1 "\t" $2 "\tN\t" $3 "\t" $4 }' "$N"
+{ awk -F'\t' '{ print $1 "\t" $2 "\tB\t" $3 "\t" $4 "\t" $5 }' "$B"
+  awk -F'\t' '{ print $1 "\t" $2 "\tN\t" $3 "\t" $4 "\t" $5 }' "$N"
 } | LC_ALL=C sort -t"$(printf '\t')" -k1,1 -k2,2 -k3,3 > "$A"
 
 LC_ALL=C awk -F'\t' '
@@ -204,6 +219,91 @@ LC_ALL=C awk -F'\t' '
 ' "$A"
 MRH_RC=$?
 
+# ── THE BUILD-STRING READER (HARNESS-CONSOL-13, CRIT-1) ─────────────────────
+# WHY IT EXISTS. Everything above this line is keyed on VERSION. A conda package
+# rebuilt upstream keeps its version and changes only its BUILD STRING --
+# `pkg-config 0.29.2 h1114479_1012` -> `h1114479_1013` between B30's landed
+# proof lock (mergeB30/artifacts/pixi.lock.cert) and det162's W1 lock
+# (det162-work/artifacts/pixi.lock.D17-6015646-W1) -- and to every reader above
+# that pair is IDENTICAL: no move, no removal, no addition, no count change.
+# `### MOVED-HALVES CLEAN` is printed and the landing criterion reads it and
+# lands. The bytes in the environment are NOT the bytes that were proved, and
+# nothing in the tree said so. This section is that missing half.
+#
+# THE CRITERION IT SERVES, and it is a rule that lands with this producer:
+# HANDOFF section 2 now reads THIS table -- land only when it is EMPTY, or when
+# every changed row is present in ALL the environments that carry the package,
+# identically (one and the same old->new pair). A rebuild that swept every
+# environment at once is an environmental fact about the channel; a rebuild that
+# reached SOME environments is a RESOLUTION difference wearing a rebuild's
+# clothes, and those are not the same event.
+#
+# THE rc CONTRACT, stated because it is deliberately NOT symmetric with the
+# refusals above: a build-string-only change with identical per-env coverage
+# leaves rc 0 -- refusing every upstream rebuild would refuse most weeks -- but
+# a PARTIAL change (identical_per_env=no) is rc 1, because that is the shape
+# that is not an environmental rebuild. The rc above still wins if it refused.
+#
+# WHAT IT DELIBERATELY DOES NOT DO: pypi rows carry no build string (the BUILD
+# column is `-` for them) and a package whose VERSION moved is already the row
+# walk's business, so only (env, name, version)-identical CONDA pairs are
+# compared here. That keeps the two readers from double-counting one event.
+BS_OUT=$(LC_ALL=C awk -F'\t' '
+  function flush(   k) {
+    if (key == "") return
+    if (haveb && haven && bhalf == "conda" && nhalf == "conda" && bver == nver) {
+      k = pkg SUBSEP bver
+      carry[k]++
+      if (bbld != nbld && bbld != "-" && nbld != "-") {
+        rows++
+        chg[pkg SUBSEP bver SUBSEP bbld SUBSEP nbld]++
+        pkgchg[k]++
+        envseen[env] = 1
+        line[++nl] = sprintf("  BUILD env=%s package=%s version=%s %s -> %s", env, pkg, bver, bbld, nbld)
+      }
+    }
+  }
+  {
+    k = $1 SUBSEP $2
+    if (k != key) { flush(); key = k; env = $1; pkg = $2; haveb = 0; haven = 0 }
+    if ($3 == "B") { haveb = 1; bver = $4; bhalf = $5; bbld = $6 }
+    else           { haven = 1; nver = $4; nhalf = $5; nbld = $6 }
+  }
+  END {
+    flush()
+    identical = "yes"
+    for (c in chg) { split(c, f, SUBSEP); pairs[f[1] SUBSEP f[2]]++ }
+    printf "### BUILD-STRING CHANGES %d\n", rows+0
+    for (i = 1; i <= nl; i++) print line[i]
+    for (p in pkgchg) {
+      split(p, g, SUBSEP)
+      pk = (pairs[p] == 1) ? "one" : "MANY"
+      ident = (pkgchg[p] == carry[p] && pairs[p] == 1) ? "yes" : "no"
+      if (ident == "no") identical = "no"
+      roll[++nr] = sprintf("  BUILD-PKG package=%s version=%s changed_envs=%d envs_carrying=%d distinct_build_pairs=%s identical=%s", \
+        g[1], g[2], pkgchg[p], carry[p], pk, ident)
+    }
+    for (i = 2; i <= nr; i++) { v = roll[i]; j = i-1
+      while (j >= 1 && roll[j] > v) { roll[j+1] = roll[j]; j-- }
+      roll[j+1] = v }
+    for (i = 1; i <= nr; i++) print roll[i]
+    ne = 0; for (e in envseen) ne++
+    printf "### BUILD-STRING SUMMARY build_string_changed=%d envs=%d identical_per_env=%s\n", rows+0, ne, identical
+    if (rows+0 == 0) {
+      print "### BUILD-STRING NOTE no conda row kept its version and changed its build -- nothing for the section-2 rule to read"
+      exit 0
+    }
+    if (identical == "yes") {
+      print "### BUILD-STRING NOTE every changed row reached EVERY environment carrying the package, as one old->new pair: an upstream rebuild, which section 2 lands"
+      exit 0
+    }
+    print "### BUILD-STRING REFUSE a build-string change that reached only SOME of the environments carrying the package is a RESOLUTION difference, not an environmental rebuild (HANDOFF section 2)"
+    exit 1
+  }
+' "$A")
+BS_RC=$?
+printf '%s\n' "$BS_OUT"
+
 # ── THE REORDER CLASSIFIER (MERGE-U-1), BACK-PORTED HERE ────────────────────
 # WHERE IT CAME FROM AND WHY IT LIVES HERE NOW. Every merge lane's `analyze.sh`
 # is a task-dir file copied forward from the previous lane -- mergeB16 through
@@ -258,4 +358,8 @@ else
   echo "  VERDICT: raw=$MRH_RAW sorted=$MRH_SRT -- a SORTED delta is a RESOLUTION change, not a reorder."
 fi
 rm -f "$MRH_D"
-exit "$MRH_RC"
+# THE rc IS THE WORST OF THE TWO READERS, and the version reader wins a tie:
+# a list that the row walk already refuses is refused for ITS reason, and a list
+# the row walk accepts can still be refused by the build-string half alone.
+if [ "$MRH_RC" -ne 0 ]; then exit "$MRH_RC"; fi
+exit "$BS_RC"
