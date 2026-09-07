@@ -192,5 +192,50 @@ else
 fi
 fi
 
+
+# ── ARM H: MERGE-V-2-1. A JOB ID IS A PREVIOUS BATCH'S TOKEN ────────────────
+# The tip's sdist-scoping paragraph cited `mCA job 6000717` as a plain comment,
+# outside every marked region. The check greps comments ON PURPOSE, so the
+# moment a derived batch put that campaign's ids into LEFTOVER_RE the shipped
+# template would exit 9 AGAINST ITSELF -- for a deliberate citation, not a
+# botched derivation. H drives exactly that: the real templates, with the ids in
+# the regex. H2 is the mutation: strip the CITATION pair from the same copies
+# and the same regex must fire, or H is measuring nothing.
+say "== H: MERGE-V-2-1, a previous batch's JOB ID in LEFTOVER_RE =="
+B30_TOKENS='6000717|6014471|b30|B30|mCA|mCB'
+H_OK=1
+for REL in phaseN_relock.sh ../arms/mh1_relock.sh; do
+  SRCF=$HERE/$REL
+  [ -f "$SRCF" ] || { say "  FAIL  H no file at $SRCF"; FAIL=1; H_OK=0; continue; }
+  B=$(basename "$REL")
+  mkdir -p "$W/h"
+  HP=$W/h/$B
+  sed "s@^LEFTOVER_RE='@LEFTOVER_RE='$B30_TOKENS|@" "$SRCF" > "$HP"
+  if ! grep -q "LEFTOVER_RE='$B30_TOKENS|" "$HP"; then
+    say "  FAIL  H could not widen LEFTOVER_RE in $B -- the arm did not run"; FAIL=1; H_OK=0; continue
+  fi
+  OUT=$(run "$HP"); RC=$?
+  if printf '%s' "$OUT" | grep -q 'leftover-token self-check: clean'; then
+    say "  PASS  H $B is clean with B30's tokens ($B30_TOKENS) in LEFTOVER_RE"
+  else
+    say "  FAIL  H $B trips its own leftover check on a deliberate citation (rc=$RC):"
+    printf '%s\n' "$OUT" | grep -m4 -E '6000717|leftover-token' | sed 's/^/          /'
+    FAIL=1; H_OK=0
+  fi
+  # H2. THE MUTATION: the citation pair removed, the same widened regex.
+  HM=$W/h/mut-$B
+  grep -v '^### CITATION BEGIN' "$HP" | grep -v '^### CITATION END' > "$HM"
+  if [ "$(grep -c '^### CITATION' "$HM")" != 0 ] || [ "$(grep -c '^### CITATION' "$HP")" = 0 ]; then
+    say "  FAIL  H2 could not build the citation-stripped mutant of $B"; FAIL=1
+  else
+    OUT=$(run "$HM"); RC=$?
+    if [ "$RC" = 9 ] && printf '%s' "$OUT" | grep -q '6000717'; then
+      say "  PASS  H2 MUTATION -- with the CITATION pair removed $B exits 9 naming 6000717, so H is a real exemption"
+    else
+      say "  FAIL  H2 the citation-stripped $B did NOT exit 9 (rc=$RC) -- arm H proves nothing"; FAIL=1
+    fi
+  fi
+done
+[ "$H_OK" = 1 ] && say "  PASS  H no shipped template names a previous batch's job id outside a marked region"
 [ "$FAIL" = 0 ] && { say "leftover-check guard (with MERGE-N-4 arms): ALL PASS"; exit 0; }
 say "leftover-check guard (with MERGE-N-4 arms): FAILED"; exit 1

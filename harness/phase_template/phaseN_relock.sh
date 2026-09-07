@@ -824,9 +824,17 @@ retread_fast_env "$WS" || { echo "FATAL: retread_fast_env refused"; exit 7; }
 # because THIS TEMPLATE WAS THE ONLY ONE THAT HAD THEM: `grep -c` at commit
 # 3b7d1cb read scoper=3 here and scoper=0 in arms/mh1_relock.sh,
 # arms/c29_relock.sh and proof/hlgd_relock.sh -- and arms/mh1_relock.sh is the
+### CITATION BEGIN -- MERGE-V-2-1. The job id below is a DELIBERATE citation of
+# the evidence for the paragraph it sits in, and it names a PREVIOUS batch's
+# job. The leftover-token self-check greps comments too, on purpose, so once a
+# derived batch puts that campaign's tokens into LEFTOVER_RE this template
+# would fail against itself -- for a citation, not a botched derivation. The
+# documented per-site opt-out is exactly this pair; a botched derivation never
+# carries one, so the check still catches every real leftover.
 # template every merge lane's relock is derived from, so the fix reached the one
 # relock the merge campaign does not run (mCA job 6000717 locked with zero
 # scoping rows in 1706 lines of stdout). Four copies of a correctness fix drift;
+### CITATION END
 # one producer does not. Read that function for the whole argument, which is no
 # longer duplicated here. Its readers: tools/cold_proof_arm_guard.sh (every
 # shipped relock template must reach C31-4 through it, and the flag must still

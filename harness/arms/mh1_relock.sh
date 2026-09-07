@@ -725,12 +725,17 @@ retread_fast_env "$WS" || { echo "FATAL: retread_fast_env refused"; exit 7; }
 # is the DERIVATION SOURCE every merge lane's relock is cut from -- seven lanes
 # did `git cat-file blob <sha>:harness/arms/mh1_relock.sh`, harness/README.md's
 # `arms/` row states the contract -- so until this line existed EVERY merge proof
+### CITATION BEGIN -- MERGE-V-2-1. Same reason as the template's: the job id
+# below is the measurement this paragraph rests on, and it names a previous
+# batch. Stripping it here keeps the evidence in the file and out of the
+# leftover-token regex.
 # since C31-4 locked against the shared, poisonable sdist tree. Measured, not
 # asserted: merge lane mCA's relock, job 6000717 (2026-09-06T22:06:11, running
 # `merge-h/mh1_relock.sh`), printed `retread_scope_sdist_builds` 0 times and
 # `sdist scoping` 0 times in 1706 lines of stdout; the single occurrence of
 # `sdist_build_poison_guard` in that log is a DRIFT manifest row for the FILE,
 # not a run of it.
+### CITATION END
 #
 # `retread_relock_scope_and_verify` (tools/retread_fast_env.sh) is the ONE
 # producer: it scopes the build halves, honours `--cold-proof-arm` on the argv
