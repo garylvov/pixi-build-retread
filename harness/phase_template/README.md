@@ -188,8 +188,27 @@ same node with the same manifest and the same binary.
        --dependency=afterany:<p1 job>:<p2 job> \
        --export=ALL,D=<T>/<newbatch>,TAG=<tag>,RJ=<p1 job> \
        --output=<T>/<newbatch>/logs/slurm-cleanup-%j.out \
-       --wrap 'bash <T>/tools/phase_template/cleanup_gated.sh <cert root> <cache root> <ws root>'
+       <T>/<newbatch>/owner-snapshot/owner.sbatch <cert root> <cache root> <ws root>
    ```
+   **Freeze the owner's scripts FIRST (HARNESS-SYNC-5), and submit the frozen
+   copy, never the task path:**
+   ```
+   bash <T>/tools/phase_template/owner_snapshot.sh <T>/<newbatch> \
+        <T>/tools/phase_template/cleanup_gated.sh
+   # prints  ### OWNER SNAPSHOT files=<n> root=<T>/<newbatch> src_commit=<sha>
+   # writes  <T>/<newbatch>/owner-snapshot/{cleanup_gated.sh,cleanup.sh,owner.sbatch}
+   ```
+   An owner submitted with `--wrap 'bash <T>/tools/.../cleanup_gated.sh ...'`
+   reads a SYNCED file for its whole life: Slurm snapshots only the top-level
+   script, so the wrap is frozen and the gate is not. A reap of millions of
+   entries runs for hours (det1f-cleanup 5999937: four hours inside ONE
+   3,587,597-entry unlink), and for every one of them `harness_sync.sh` refuses
+   rc 6 on any install touching `cleanup_gated.sh` or `cleanup.sh`. That refusal
+   is RIGHT -- rewriting a file an owner has open on another NFS client unlinks
+   its inode under it and the owner exits 0 having run half its rows -- so the
+   fix is an owner that reads job-local bytes, not a weaker refusal.
+   `phaseN_cert.sh`'s `cleanup_submit_or_defer` does this automatically; a
+   hand-submitted owner must do it too.
    **Submit all THREE, and the third one now, not later.** The cleanup is
    `afterany` on *both* phases, so it also reclaims the roots of a relock that
    failed its own lock — the case that stranded C18A/C18B. Then **record that
@@ -296,7 +315,11 @@ diagnostician who wants to keep them can hold them by cancelling it.
         --dependency=afterany:<p1 job>:<p2 job> \
         --export=ALL,D=<harness dir>,TAG=<tag>,RJ=<p1 job> \
         --output=<T>/<newbatch>/logs/slurm-cleanup-%j.out \
-        --wrap 'bash <T>/tools/phase_template/cleanup_gated.sh <root> ...'
+        <harness dir>/owner-snapshot/owner.sbatch <root> ...
+
+(after `owner_snapshot.sh <harness dir> <T>/tools/phase_template/cleanup_gated.sh`
+-- HARNESS-SYNC-5: an owner must read JOB-LOCAL bytes, never a synced path, or
+it pins every install for as long as its reap runs.)
 
 `cleanup_gated.sh` is the gate, `cleanup.sh` is the deletion. The gate checks
 three things and exits 2 without unlinking a byte if any fails: the evidence is

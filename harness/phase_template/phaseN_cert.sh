@@ -367,17 +367,37 @@ cleanup_submit_or_defer () {   # $1=dependency spec  $2..=roots
     echo "    $*"
     return 1
   fi
+  # HARNESS-SYNC-5: FREEZE WHAT THE OWNER WILL READ, THEN SUBMIT THE FROZEN COPY.
+  # A cleanup owner reads cleanup_gated.sh and the cleanup.sh it calls from the
+  # task tree for its WHOLE life, and a reap of millions of entries lives for
+  # hours (det1f-cleanup 5999937: four hours inside ONE 3,587,597-entry unlink).
+  # For all those hours harness_sync refuses rc 6 on any install touching those
+  # files -- correctly, because rewriting a file an owner has open on another NFS
+  # client unlinks its inode under it and the owner exits 0 having run half its
+  # rows. The fix is not a weaker refusal, it is an owner that reads job-local
+  # bytes: nothing installs into a job root, so there is nothing left to protect.
+  local SNAPTOOL=$(dirname -- "$0")/owner_snapshot.sh
+  [ -f "$SNAPTOOL" ] || SNAPTOOL=$T/tools/phase_template/owner_snapshot.sh
+  local SUBMIT=$CLEANUP
+  if [ -f "$SNAPTOOL" ] && bash "$SNAPTOOL" "$D" "$CLEANUP"; then
+    SUBMIT=$D/owner-snapshot/owner.sbatch
+  else
+    echo "### OWNER SNAPSHOT UNAVAILABLE -- submitting the owner against the LIVE task copy"
+    echo "###   $CLEANUP. This still cleans up; what it costs is that every harness_sync"
+    echo "###   touching cleanup_gated.sh or cleanup.sh will refuse rc 6 until this owner"
+    echo "###   FINISHES. Said out loud rather than left for the next lane to discover."
+  fi
   # shellcheck disable=SC2086
   clj=$(env -u SLURM_JOB_ID sbatch --parsable $CLEANUP_SBATCH_ARGS \
         --job-name=${TAG}-cleanup --dependency=$dep \
-        --output=$A/slurm-cleanup-%j.out "$CLEANUP" "$@" 2>&1); clrc=$?
+        --output=$A/slurm-cleanup-%j.out "$SUBMIT" "$@" 2>&1); clrc=$?
   if [ "$clrc" = 0 ]; then
     echo "### CLEANUP OWNER: job $clj (submitted by this cert job ${J:-?}; no cleanup was recorded at dispatch) -- roots: $*"
     echo "### cleanup job submitted: $clj (--dependency=$dep) -- this job exits WITHOUT unlinking anything"
   else
     echo "### CLEANUP OWNER: NOBODY -- submit failed rc=$clrc output: $clj"
     echo "### RUN THIS BY HAND, it is the only thing that returns the inodes:"
-    echo "    env -u SLURM_JOB_ID sbatch $CLEANUP_SBATCH_ARGS --job-name=${TAG}-cleanup $CLEANUP $*"
+    echo "    env -u SLURM_JOB_ID sbatch $CLEANUP_SBATCH_ARGS --job-name=${TAG}-cleanup $SUBMIT $*"
   fi
   return 0
 }

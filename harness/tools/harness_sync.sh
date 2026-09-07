@@ -378,35 +378,15 @@ while IFS='|' read -r trel w; do
   printf '%s\n' "$trel" >> "$INSTSET"
 done < "$SET"
 
-# Every `bash|source|.` reference in a script, as a BASENAME.  A reference whose
-# basename is a variable is resolved from a same-file assignment (`FAST_ENV=$T/
-# tools/retread_fast_env.sh` then `. "$FAST_ENV"`, which is det1_proof2.sh); one
-# that still cannot be resolved prints `?` and makes the whole job unknown.
-refs_of () {                      # $1 = script path
-  local f=$1
-  # TWO patterns, not one.  `bash` and `source` are verbs anywhere a command may
-  # start, INCLUDING inside `$( )` -- that is how 5992569 reaches
-  # harness_commit_resolve.sh.  The BARE DOT is not: in `grep -c . "$OB"` the dot
-  # is an ARGUMENT, and matching it makes det1_proof2.sh look like it sources
-  # four files it never touches, none of them resolvable, which would mark that
-  # job undeterminable and turn EVERY sync into a refusal for its whole run.
-  # So the dot is a verb only in COMMAND POSITION: line start, or after ; & | (
-  # or a backquote.
-  { grep -hoE '(^|[[:space:]]|[(`;&|])(bash|source)[[:space:]]+[^[:space:];&|)]+' "$f" 2>/dev/null
-    grep -hoE '(^|[;&|(`])[[:space:]]*\.[[:space:]]+[^[:space:];&|)]+'            "$f" 2>/dev/null; } \
-  | awk '{print $NF}' | tr -d '\042\047' | while IFS= read -r tok; do
-      local b=${tok##*/} v r
-      case "$b" in
-        *'$'*)
-          v=${b#*\$}; v=${v#\{}; v=${v%%[^A-Za-z0-9_]*}
-          [ -n "$v" ] || { printf '?\n'; continue; }
-          r=$(sed -n "s/^[[:space:]]*$v=.*\/\([A-Za-z0-9_.-]*\.\(sh\|sbatch\|bash\)\).*/\1/p" "$f" | head -1)
-          if [ -n "$r" ]; then printf '%s\n' "$r"; else printf '?\n'; fi;;
-        *.sh|*.sbatch|*.bash) printf '%s\n' "$b";;
-        *) ;;                     # `bash -c`, `. /etc/profile`, flags: not a task copy
-      esac
-    done
-}
+# THE READ-SET PARSER LIVES IN tools/script_refs.sh (HARNESS-SYNC-5), because
+# phase_template/owner_snapshot.sh must copy exactly the files a job will read
+# and two copies of that parser is how a snapshot ends up missing one. It emits
+# `<basename>\t<abs path or ->`, or `?\t-` for a reference it cannot resolve.
+SR=$(dirname -- "$0")/script_refs.sh
+[ -f "$SR" ] || SR=$TASK_DIR/tools/script_refs.sh
+[ -f "$SR" ] || { echo "### SYNC FATAL: no script_refs.sh beside $0 nor at $TASK_DIR/tools -- the read-set check has no parser and a silent install is worse than a refusal" >&2; exit 2; }
+# shellcheck disable=SC1090
+. "$SR"
 
 RSHITS="$TMP/readset.txt"; : > "$RSHITS"
 if [ -s "$INSTSET" ]; then
@@ -471,19 +451,27 @@ if [ -s "$INSTSET" ]; then
     fi
     [ "$scope" = 1 ] || continue
     # THE READ SET: the job's own sbatch, plus one level down -- the driver
-    # scripts it names that sit in the job root.
+    # scripts it names that sit in the job root.  Rows are `<basename>\t<path>`
+    # (HARNESS-SYNC-5); the recursion still walks by BASENAME because a job-root
+    # driver is found by name, and the PATH column is what the hit test uses.
     RS="$TMP/rs.$jid.txt"; : > "$RS"
     if [ -z "${script:-}" ] || [ "$script" = "-" ] || [ ! -f "$script" ]; then
-      printf '?\n' > "$RS"
+      printf '?\t-\n' > "$RS"
     else
-      refs_of "$script" > "$RS"
+      refs_of_sibling_resolved "$script" > "$RS"
       while IFS= read -r rb; do
         [ "$rb" = '?' ] && continue
-        [ -f "$jroot/$rb" ] || continue
-        refs_of "$jroot/$rb" >> "$RS"
-      done < <(sort -u "$RS")
+        # A reference that resolved to a LITERAL path is followed THERE; one
+        # that did not is looked for in the job root, as before.
+        rp=$(awk -F'\t' -v b="$rb" '$1==b && $2!="-"{print $2; exit}' "$RS")
+        if [ -n "$rp" ] && [ -f "$rp" ]; then
+          refs_of_sibling_resolved "$rp" >> "$RS"
+        elif [ -f "$jroot/$rb" ]; then
+          refs_of_sibling_resolved "$jroot/$rb" >> "$RS"
+        fi
+      done < <(cut -f1 "$RS" | sort -u)
     fi
-    if grep -qx '?' "$RS"; then
+    if cut -f1 "$RS" | grep -qx '?'; then
       why=unresolved-reference
       [ -f "${script:-/nonexistent}" ] || why=no-sbatch-found
       while IFS= read -r trel; do
@@ -492,11 +480,33 @@ if [ -s "$INSTSET" ]; then
       done < "$INSTSET"
       continue
     fi
+    # THE HIT TEST, HARNESS-SYNC-5, AND THE ADDITION IS THE `elsewhere` BRANCH.
+    # Matching by basename alone made a job that runs a JOB-LOCAL SNAPSHOT of
+    # cleanup_gated.sh collide with the task copy of that name, and pin the
+    # whole harness for as long as it ran -- hours, for a reap of millions of
+    # entries (det1f-cleanup 5999937, det141-cleanup 6001240). A reference is a
+    # hit when the basename matches AND at least one of its rows either has an
+    # UNRESOLVED path (law 9: what cannot be read is assumed dangerous) or
+    # resolves to exactly the file this sync would rewrite. If every row for
+    # that basename resolves somewhere else, the job is reading a different
+    # file with the same name and the sync is safe for it -- which is what the
+    # owner snapshot exists to make true.
     while IFS= read -r trel; do
       tb=$(basename -- "$trel")
-      grep -qxF -- "$tb" "$RS" || continue
-      printf '### SYNC REFUSED rc=6 running=%s state=%s file=%s reason=read-by-%s\n' \
-        "$jid" "${jstate:-RUNNING}" "$tb" "$jname" >> "$RSHITS"
+      cut -f1 "$RS" | grep -qxF -- "$tb" || continue
+      verdict=$(awk -F'\t' -v b="$tb" -v want="$TASK_DIR/$trel" '
+        $1==b { seen=1; if ($2=="-") unresolved=1; else if ($2==want) exact=1; else other=1 }
+        END { if (!seen) print "none"; else if (unresolved) print "unresolved";
+              else if (exact) print "exact"; else print "elsewhere" }' "$RS")
+      case "$verdict" in
+        elsewhere)
+          printf '###   read-set OK job=%s file=%s -- every reference to that basename resolves elsewhere (owner snapshot); not a read of %s\n' \
+            "$jid" "$tb" "$TASK_DIR/$trel"
+          continue;;
+        none) continue;;
+      esac
+      printf '### SYNC REFUSED rc=6 running=%s state=%s file=%s reason=read-by-%s match=%s\n' \
+        "$jid" "${jstate:-RUNNING}" "$tb" "$jname" "$verdict" >> "$RSHITS"
     done < "$INSTSET"
   done < "$RUNROWS"
 fi

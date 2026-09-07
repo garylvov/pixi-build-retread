@@ -894,6 +894,102 @@ LIVE_AFTER=$( [ -f "$LIVE_RECORD" ] && md5sum "$LIVE_RECORD" | awk '{print $1}' 
 [ "$LIVE_BEFORE" = "$LIVE_AFTER" ] && ok "live task dir untouched: $LIVE_RECORD md5 $LIVE_BEFORE" \
                                    || bad "THE GUARD MOVED THE LIVE RECORD: $LIVE_BEFORE -> $LIVE_AFTER"
 
+
+# ---- P: HARNESS-SYNC-5 -- an owner that reads JOB-LOCAL bytes ---------------
+# THE DEFECT. A cleanup owner is submitted as
+#   sbatch --wrap 'bash <task dir>/merge-h/cleanup_gated.sh <roots>'
+# Slurm snapshots the TOP-LEVEL script -- the one-line wrap -- and nothing else,
+# so the gate and the cleanup.sh it calls are read from the task tree LIVE for
+# the owner's whole life. det1f-cleanup 5999937 spent four hours inside ONE
+# 3,587,597-entry unlink with those reads open and det141-cleanup 6001240 sat
+# beside it; for every one of those hours any install touching those files was
+# refused rc 6. The refusal is RIGHT and stays; what changes is that the owner
+# stops reading a synced file, so there is nothing left to protect.
+#
+#   p1  an owner running a JOB-ROOT SNAPSHOT installs (rc 0) even though the
+#       install set contains a file of the SAME BASENAME
+#   p2  the MUTATION, and it is the OLD SHAPE: the same fixture, the same
+#       install set, the owner reading the TASK path -> rc 6, still. Without p2,
+#       p1 would pass just as well on a read-set check that had stopped
+#       refusing anything at all.
+#   p3  owner_snapshot.sh copies the gate AND what the gate sources, and prints
+#       its row
+#   p4  a reference the parser cannot resolve is a REFUSAL, not a partial
+#       snapshot -- a snapshot with a hole is worse than none, because the job
+#       reads the LIVE path for that one file while every row says it is frozen
+SNAPTOOL=$(dirname -- "$SYNC")/../phase_template/owner_snapshot.sh
+[ -f "$SNAPTOOL" ] || SNAPTOOL=$REPO/harness/phase_template/owner_snapshot.sh
+if [ ! -f "$SNAPTOOL" ]; then
+  bad "P: no owner_snapshot.sh -- HARNESS-SYNC-5's submitter half is absent"
+else
+mkowner () {   # $1 = task dir; builds a gate that SOURCES a cleanup.sh beside it
+  local T=$1
+  printf '#!/bin/bash\nCLEANUP=$(dirname "$0")/cleanup.sh\nbash "$CLEANUP"\n' > "$T/merge-h/cleanup_gated.sh"
+  printf '#!/bin/bash\necho cleanup\n' > "$T/merge-h/cleanup.sh"
+  mkdir -p "$T/jobroot"
+}
+# ---- p3 first: the snapshot itself, because p1 depends on it working --------
+read -r RP TP V1P V2P < <(mkfixture P)
+mkowner "$TP"
+PSNAP=$WORK/P_snapshot.log
+bash "$SNAPTOOL" "$TP/jobroot" "$TP/merge-h/cleanup_gated.sh" > "$PSNAP" 2>&1; rcP3=$?
+if [ "$rcP3" -eq 0 ] \
+   && grep -qE '^### OWNER SNAPSHOT files=2 root='"$TP"'/jobroot src_commit=' "$PSNAP" \
+   && [ -f "$TP/jobroot/owner-snapshot/cleanup_gated.sh" ] \
+   && [ -f "$TP/jobroot/owner-snapshot/cleanup.sh" ] \
+   && [ -f "$TP/jobroot/owner-snapshot/owner.sbatch" ]; then
+  ok "P(p3): owner_snapshot froze the gate AND the cleanup.sh it sources (files=2) and wrote owner.sbatch"
+else
+  bad "P(p3): rc=$rcP3"; sed 's/^/      /' "$PSNAP"
+fi
+grep -qF "exec bash $TP/jobroot/owner-snapshot/cleanup_gated.sh" "$TP/jobroot/owner-snapshot/owner.sbatch" \
+  && ok "P(p3): the generated sbatch names the frozen copy by LITERAL absolute path (a variable there would read back unresolved and go on refusing)" \
+  || { bad "P(p3): owner.sbatch does not exec the frozen copy by literal path"; sed 's/^/      /' "$TP/jobroot/owner-snapshot/owner.sbatch"; }
+# ---- p1: the sync now installs over that owner ------------------------------
+mkstub "$WORK/P_squeue"
+printf '8000051 RUNNING laneP %s %s %s\n' "$TP" "$TP/jobroot/owner-snapshot/owner.sbatch" "$TP/jobroot/owner-snapshot" > "$WORK/P_run.txt"
+git -C "$RP" cat-file blob "$V2P:harness/phase_template/cleanup_gated.sh" > "$WORK/P.blob"
+BEFORE_P=$(md5sum "$TP/merge-h/cleanup_gated.sh" | awk '{print $1}')
+WANT_P=$(md5sum "$WORK/P.blob" | awk '{print $1}')
+[ "$BEFORE_P" != "$WANT_P" ] \
+  && ok "P(p1): NON-VACUITY -- merge-h/cleanup_gated.sh is $BEFORE_P and $V2P says $WANT_P, so it IS in the install set" \
+  || bad "P(p1): the fixture gate already matches the commit -- the arm would prove nothing"
+runsync "$RP" "$TP" "$WORK/P_squeue" "$V2P" --running-list "$WORK/P_run.txt" > "$WORK/P1.log" 2>&1; rcP1=$?
+if [ "$rcP1" -eq 0 ] && cmp -s "$WORK/P.blob" "$TP/merge-h/cleanup_gated.sh"; then
+  ok "P(p1): an owner running the JOB-ROOT snapshot no longer blocks the sync -- rc 0 and cleanup_gated.sh installed, with a live owner of the same basename in the queue"
+else
+  bad "P(p1): rc=$rcP1 -- the snapshot did not clear the read-set refusal"; sed 's/^/      /' "$WORK/P1.log"
+fi
+grep -q 'read-set OK job=8000051 file=cleanup_gated.sh' "$WORK/P1.log" \
+  && ok "P(p1): and it SAYS SO -- the row names the job and the basename it cleared, rather than clearing it in silence" \
+  || { bad "P(p1): no 'read-set OK' row naming the job"; sed 's/^/      /' "$WORK/P1.log"; }
+# ---- p2: the MUTATION -- the old shape, reading the task path ---------------
+read -r RP2 TP2 V1P2 V2P2 < <(mkfixture P2)
+mkowner "$TP2"
+mkstub "$WORK/P2_squeue"
+{ echo '#!/bin/bash'; echo "bash $TP2/merge-h/cleanup_gated.sh /oscar/data/stellex/glvov/retread/certX-1"; } > "$TP2/jobroot/wrap.sbatch"
+printf '8000052 RUNNING laneP2 %s %s %s\n' "$TP2" "$TP2/jobroot/wrap.sbatch" "$TP2/jobroot" > "$WORK/P2_run.txt"
+BEFORE_P2=$(md5sum "$TP2/merge-h/cleanup_gated.sh" | awk '{print $1}')
+runsync "$RP2" "$TP2" "$WORK/P2_squeue" "$V2P2" --running-list "$WORK/P2_run.txt" > "$WORK/P2.log" 2>&1; rcP2=$?
+AFTER_P2=$(md5sum "$TP2/merge-h/cleanup_gated.sh" | awk '{print $1}')
+if [ "$rcP2" -eq 6 ] && [ "$AFTER_P2" = "$BEFORE_P2" ] \
+   && grep -q 'SYNC REFUSED rc=6 running=8000052 .*file=cleanup_gated.sh' "$WORK/P2.log"; then
+  ok "P(p2): MUTATION -- the SAME owner submitted the OLD way, reading the task path, is STILL refused rc 6 and nothing was written. p1 is the snapshot clearing it, not the check going blind."
+else
+  bad "P(p2): rc=$rcP2 before=$BEFORE_P2 after=$AFTER_P2 -- the old shape must still refuse"; sed 's/^/      /' "$WORK/P2.log"
+fi
+# ---- p4: a hole in the snapshot is a refusal --------------------------------
+read -r RP4 TP4 V1P4 V2P4 < <(mkfixture P4)
+mkowner "$TP4"
+printf '#!/bin/bash\n. "$UNSET_SOMETHING"\n' >> "$TP4/merge-h/cleanup_gated.sh"
+bash "$SNAPTOOL" "$TP4/jobroot" "$TP4/merge-h/cleanup_gated.sh" > "$WORK/P4.log" 2>&1; rcP4=$?
+if [ "$rcP4" -ne 0 ] && grep -q 'OWNER SNAPSHOT REFUSED' "$WORK/P4.log" \
+   && [ ! -f "$TP4/jobroot/owner-snapshot/owner.sbatch" ]; then
+  ok "P(p4): a reference the parser cannot resolve REFUSES the snapshot (rc=$rcP4) and leaves NO owner.sbatch for a caller to submit"
+else
+  bad "P(p4): rc=$rcP4 -- an unresolvable reference must refuse, not freeze a partial set"; sed 's/^/      /' "$WORK/P4.log"
+fi
+fi
 echo "### harness_sync_guard: pass=$pass fail=$fail"
 [ "$fail" -eq 0 ] || exit 1
 exit 0
