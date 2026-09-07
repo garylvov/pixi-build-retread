@@ -38,3 +38,4 @@ dcf417e l3-1b-1a-built-wheel-build-identity
 cbed649 store-reap-2-verb
 4d3b235 store-reap-3-shadow-legacy-layout
 569b0ac l3-1b-3b-split-build-requirements
+3f2095a det1-hashseed-hermetic-store
