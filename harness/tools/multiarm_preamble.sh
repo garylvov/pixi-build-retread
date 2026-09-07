@@ -55,12 +55,19 @@
 #    refuses a correct shim is the same class of defect as one that accepts a
 #    wrong one.
 #
-# 4. THE COMPOSED-PREFIX LENGTH CHECK (DET-1-FIX-1).  `rattler-build debug
-#    setup` pads its build prefix to a fixed 256 bytes; the hermetic store entry
-#    path plus 92 fixed bytes is what gets padded.  MEASURED: 164+92 = 256
-#    provisioned and locked; 168+92 = 260 underflowed `256 - len` and panicked
-#    in `rattler_build_core/src/types/directories.rs` before ANY FIX arm
-#    provisioned.  The parent proof sat EXACTLY on the boundary and nobody knew.
+# 4. THE COMPOSED-PREFIX LENGTH CHECK (DET-1-FIX-1, corrected by PROOF-SMOKE-1-5).
+#    `rattler-build debug setup` pads its host prefix to a fixed target and
+#    slices a placeholder by `pad - len`; when the composed path is longer that
+#    subtraction underflows and it panics in
+#    `rattler_build_core/src/types/directories.rs` before ANY arm provisions.
+#    MEASURED (job 6004714, two arms eight bytes apart, plus the store roots read
+#    off disk while it ran): THE LONGEST HERMETIC ENTRY THAT SURVIVES IS 167
+#    BYTES, and there are TWO store roots a binary can reach -- the persistent
+#    one (which 6001140's arms measured at exactly the length this rule predicts)
+#    and the fast-tmp job namespace, which adds a FIXED 146 bytes and is what
+#    actually panicked.  The earlier numbers here (164+92=256 provisioned,
+#    168+92=260 panicked) were read off a panic message whose 260 is
+#    rattler-build's PLACEHOLDER BUFFER and not a path length at all.
 #    Every arm's store root is measured here, before the job stages anything --
 #    AND SO IS THE SMOKE'S, AGAINST THE LONGEST ARM'S (PROOF-SMOKE-1-3).  6000903
 #    refused itself in 11 s because the smoke's default root was five bytes
@@ -219,9 +226,22 @@ SHIMEOF
 # ---- 4. the composed-prefix budget -----------------------------------------
 # One implementation, in proof_smoke.sh, sourced here.  Two copies of a length
 # rule is how the rule drifts.
+# PROOF-SMOKE-1-5: the third argument is the FAST-TMP root, because a binary
+# whose hermetic store still goes through `courier::retread_cache_root()` puts
+# the store under the fast-tmp job namespace and composes a FIXED 148 bytes
+# more than this root does.  `smoke_prefix_budget` defaults it from
+# `RETREAD_FAST_TMP_ROOT`, and that variable is USUALLY UNSET HERE ON PURPOSE:
+# det141_proof.sh exports `$G/fast-tmp` in its ENV BLOCK, which runs AFTER it
+# calls this preamble.  The budget therefore prints an explicit
+# `fast-tmp entry=NOT_MODELLED` note rather than passing silently -- a floor, not
+# an answer, and the row says so.  MEASURED, and the reason this is not simply
+# wired to a new variable: 6001140's arms ran under the persistent root and
+# their entries measured on disk at exactly the length this rule predicts
+# (`<arm cache home>/retread/hermetic-build-envs` = 81), so a driver that does
+# NOT redirect its hermetic store must not be refused for a chain it never uses.
 multiarm_prefix_check () {
-  local root=$1 label=${2:-store root}
-  smoke_prefix_budget "$root" "$label"
+  local root=$1 label=${2:-store root} fast=${3-${RETREAD_FAST_TMP_ROOT:-}}
+  smoke_prefix_budget "$root" "$label" "$fast"
 }
 
 # PROOF-SMOKE-1-3.  THE SMOKE'S OWN ROOT IS MEASURED HERE TOO, AND AGAINST THE

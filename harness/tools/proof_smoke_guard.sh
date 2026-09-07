@@ -11,9 +11,23 @@
 #   Everything this guard creates lives under a SHORT scratch root it owns and
 #   is removed on the way out.
 #
-#   PREDICTED: pass=24 fail=0  (state this in the sbatch before submitting)
+#   PREDICTED: pass=31 fail=0 (state this in the sbatch before submitting).
+#   PROOF-SMOKE-1-5 added SEVEN: N1-N7.  ARMS A-F STILL READ THE TASK COPY, so
+#   A1/A2 remain the unfixed coin until the harness is synced -- read them as a
+#   control on what a lane did NOT touch, never as a verdict.
 #
-# ── THE TWENTY-FOUR CHECKS ────────────────────────────────────────────────────
+#   N1  the NEW rule REFUSES the exact fixture root 6003336 ran and panicked on
+#   N2  ... and the SAME row reports what the OLD rule said about it (240/16),
+#       which is the non-vacuity control: the verdict INVERTED on one root
+#   N3  ... and still PASSES a root with real headroom -- not "always refuses"
+#   N4  MUTATION: remove the fast-tmp suffix term and the fixture root PASSES
+#   N5  the MEASURED boundary from both sides: entry 167 composes to the pad
+#       exactly, entry 168 trips the pad refusal at 256
+#   N6  the fixed smoke PRINTS its fast-tmp mode -- the divergence is not silent
+#   N7  THREE consecutive REACHED_FRONTEND in ONE job: the red/green/red coin
+#       HARNESS-CONSOL-5 measured across 6003336/6003619/6003855 is retired
+#
+# ── THE THIRTY-ONE CHECKS ────────────────────────────────────────────────────
 #   A1  the known-good binsnap reaches the frontend            REACHED_FRONTEND
 #   A2  ... and proof_smoke.sh exits 0
 #   B1  a stub that prints a panic and exits 1                 BACKEND_DIED
@@ -193,6 +207,84 @@ drc2=$?
 cat "$DOUT"
 [ "$drc" != 0 ]; chk D1 $? "the rule REFUSES a root composing past 256 (len $(( ${#LONGROOT} + 100 + 92 )) )" "rc=$drc"
 [ "$drc2" = 0 ]; chk D2 $? "the rule PASSES the short root -- the non-vacuity control" "rc=$drc2"
+
+# ---- N: PROOF-SMOKE-1-5, the root the budget was not modelling --------------
+# These arms read the REPO copy (like G1-G4 and H), because the task copy is the
+# unsynced 8108ca4 and is the CONTROL on what this lane did not touch.
+echo ""; echo "########## PSG ARM N -- PROOF-SMOKE-1-5: the fast-tmp store root ##########"
+NSMOKE=$REPO/harness/tools/proof_smoke.sh
+NOUT=$OUT/psg-$J-N.out
+# THE FIXTURE IS THE EXACT SHAPE THAT SAID headroom=16 AND THEN PANICKED.
+# 6003336/6003855 ran with XDG_CACHE_HOME=<...>/retread/psg<jobid>/c/x, 48 bytes,
+# and a fast-tmp root of <...>/retread/psg<jobid>/f, 46 bytes.  Nothing here
+# touches the filesystem: the budget is string arithmetic and these are strings.
+NFIX=/oscar/data/stellex/glvov/retread/psgFIX0001/c/x
+NFIXFAST=/oscar/data/stellex/glvov/retread/psgFIX0001/f
+: > "$NOUT"
+bash -c 'PROOF_SMOKE_LIB=1 . "$1"; smoke_prefix_budget "$2" "N1 fixture (the 6003336 shape)" "$3"' \
+     _ "$NSMOKE" "$NFIX" "$NFIXFAST" >>"$NOUT" 2>&1
+n1rc=$?
+bash -c 'PROOF_SMOKE_LIB=1 . "$1"; smoke_prefix_budget "$2" "N3 real headroom, no fast-tmp" ""' \
+     _ "$NSMOKE" "$SCR/c/x" >>"$NOUT" 2>&1
+n3rc=$?
+cat "$NOUT"
+[ "$n1rc" != 0 ]; chk N1 $? "the NEW rule REFUSES the fixture root that 6003336 ran and panicked on" "rc=$n1rc"
+# NON-VACUITY, AND IT IS THE WHOLE POINT: the OLD function, on the SAME root,
+# said composed=240 with 16 bytes to spare.  The new row carries that number
+# itself so the inversion is on one page instead of across two logs.
+grep -q 'OLD RULE .* said composed=240 headroom=16' "$NOUT"
+chk N2 $? "the same row reports the OLD rule's verdict on the SAME root: composed=240 headroom=16" \
+          "$(grep -m1 'OLD RULE' "$NOUT" || echo '<no OLD RULE row>')"
+[ "$n3rc" = 0 ]; chk N3 $? "the NEW rule still PASSES a root with real headroom -- it does not just always refuse" "rc=$n3rc"
+
+# THE MUTATION: delete the per-namespace suffix term, so the fast-tmp candidate
+# composes with the SHORT rule and the fixture root sails through.
+sed 's#fe=$(smoke_prefix_fasttmp_entry "$fast")#fe=$(smoke_prefix_entry "$fast")#' \
+    "$NSMOKE" > "$SCR/proof_smoke.NMUT.sh"
+nmutn=$(diff "$NSMOKE" "$SCR/proof_smoke.NMUT.sh" | grep -c '^< ')
+bash -c 'PROOF_SMOKE_LIB=1 . "$1"; smoke_prefix_budget "$2" "N4 MUTATION" "$3"' \
+     _ "$SCR/proof_smoke.NMUT.sh" "$NFIX" "$NFIXFAST" >"$OUT/psg-$J-N4.out" 2>&1
+n4rc=$?
+cat "$OUT/psg-$J-N4.out"
+[ "$nmutn" = 1 ] && [ "$n4rc" = 0 ]
+chk N4 $? "MUTATION: with the fast-tmp suffix term removed (1 changed line) the fixture root PASSES -- the term is what refuses" \
+          "changed_lines=$nmutn rc=$n4rc"
+
+# THE BOUNDARY, BOTH SIDES, against the MEASURED 167.  Asserted on the hard
+# refusal's own row, not on rc: at 167 the headroom band still objects (255-8),
+# and that is a different sentence from the pad overrun.
+NR67=$(printf 'x%.0s' $(seq 1 67)); NR68=$(printf 'x%.0s' $(seq 1 68))
+bash -c 'PROOF_SMOKE_LIB=1 . "$1"; smoke_prefix_budget "/$2" "N5 entry 167" ""' _ "$NSMOKE" "${NR67:1}" >"$OUT/psg-$J-N5.out" 2>&1
+bash -c 'PROOF_SMOKE_LIB=1 . "$1"; smoke_prefix_budget "/$2" "N5 entry 168" ""' _ "$NSMOKE" "${NR68:1}" >>"$OUT/psg-$J-N5.out" 2>&1
+cat "$OUT/psg-$J-N5.out"
+n5b=$(grep -c 'PREFIX REFUSAL: composed 256' "$OUT/psg-$J-N5.out")
+[ "$(grep -c 'entry=167 composed=255' "$OUT/psg-$J-N5.out")" = 1 ] && [ "$n5b" = 1 ]
+chk N5 $? "the MEASURED boundary: entry 167 composes to exactly the pad (255) and entry 168 trips the pad refusal at 256" \
+          "entry167_rows=$(grep -c 'entry=167 composed=255' "$OUT/psg-$J-N5.out") pad_refusals_at_256=$n5b"
+
+# ---- N6/N7: THE COIN, RUN THREE TIMES ---------------------------------------
+# HARNESS-CONSOL-5 measured arm A red/green/red on ONE binary across three solo
+# jobs and drew the standing consequence that a single arm-A result carries no
+# information.  THAT IS THE THING THIS ARM HAS TO RETIRE, and the only way to
+# retire it is three runs in ONE job on the FIXED smoke.  They share the staged
+# workspace and the cache, so runs 2 and 3 are cheap.
+echo ""; echo "########## PSG ARM N7 -- the FIXED smoke, three times, one job ##########"
+n7pass=0
+for r in 1 2 3; do
+  RO=$OUT/psg-$J-N7-$r.out
+  SMOKE_WALL=${PSG_WALL_A:-900} bash "$NSMOKE" "$GOOD" "$MANIFEST" "$JOB_ROOT" >"$RO" 2>&1
+  rrc=$?
+  echo "### PSG N7 run $r rc=$rrc $(grep -m1 '^### SMOKE [A-Z_]* binary=' "$RO" || echo '<no verdict row>')"
+  grep -m1 '^### SMOKE lock ended' "$RO" | cut -c1-200 | sed 's/^/### PSG   /'
+  grep -m1 '^### SMOKE PREFIX BUDGET smoke store root ' "$RO" | cut -c1-220 | sed 's/^/### PSG   /'
+  [ "$rrc" = 0 ] && grep -q '^### SMOKE REACHED_FRONTEND ' "$RO" && n7pass=$((n7pass+1))
+done
+grep -q '^### SMOKE fast-tmp mode=off' "$OUT/psg-$J-N7-1.out"
+chk N6 $? "the fixed smoke PRINTS its fast-tmp mode -- the divergence from the driver is on the page, not silent" \
+          "$(grep -m1 'fast-tmp mode=' "$OUT/psg-$J-N7-1.out" || echo '<no mode row>')"
+[ "$n7pass" = 3 ]
+chk N7 $? "THREE consecutive REACHED_FRONTEND on one binary -- the coin HARNESS-CONSOL-5 measured (red/green/red) is gone" \
+          "reached_frontend=$n7pass of 3"
 
 # ---- E: the preamble, and the mutation that removes its smoke --------------
 echo ""; echo "########## PSG ARM E -- preamble vs preamble-without-the-smoke ##########"
@@ -568,7 +660,7 @@ echo "### PSG per-arm verdicts:"
 for f in "$AOUT" "$BOUT" "$COUT" "$FOUT"; do
   printf '###   %-28s %s\n' "$(basename "$f")" "$(grep -m1 '^### SMOKE [A-Z_]* binary=' "$f" 2>/dev/null || echo '<none>')"
 done
-echo "### PSG SUMMARY pass=$pass fail=$fail (predicted pass=24 fail=0)"
+echo "### PSG SUMMARY pass=$pass fail=$fail (predicted pass=31 fail=0)"
 echo "### PSG FINAL pass=$pass fail=$fail"
 if [ "$fail" -eq 0 ]; then exit 0; fi
 exit 1

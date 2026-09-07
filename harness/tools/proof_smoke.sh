@@ -59,23 +59,38 @@
 #
 # ── THE TWO NAMED DEATHS IT DETECTS BY NAME ──────────────────────────────────
 #
-# (1) THE 256-BYTE PREFIX PANIC (DET-1-FIX-1).  `rattler-build debug setup` pads
-#     its build prefix to a fixed 256 bytes; at a composed length of 260 the
-#     `256 - len` underflows and it panics in
-#     `rattler_build_core/src/types/directories.rs` with
-#     `end byte index 18446744073709551615 is out of bounds for string of
-#     length 260`.  Measured: the parent proof's store root composed to exactly
-#     256 and provisioned; the re-cut's was four bytes longer and every FIX arm
-#     died.  This script reports that death as `reason=PREFIX_PANIC_256`, so a
-#     lane never again reads a path-length accident as a code defect.
+# (1) THE PREFIX PANIC (DET-1-FIX-1).  `rattler-build debug setup` pads its host
+#     prefix to a fixed target and slices a placeholder string by `pad - len`;
+#     when the composed path is longer than the pad that subtraction underflows
+#     in usize and it panics in
+#     `rattler_build_core/src/types/directories.rs`.  This script reports that
+#     death as `reason=PREFIX_PANIC_256`, so a lane never again reads a
+#     path-length accident as a code defect.
 #
-# (2) THE PRE-LOCK REFUSAL DET-1-FIX-1 ADDED.  The same check, run BEFORE the
-#     lock: this script composes the longest hermetic entry path its own store
-#     root would produce and refuses at > 256 with `reason=PREFIX_REFUSAL`,
-#     because a smoke run from a root too long to provision would report
-#     BACKEND_DIED against a perfectly good binary.  A guard that blames the
-#     wrong thing is worse than no guard.  It is a SETUP_FAILED, not a verdict
-#     on the binary -- rc 3, and the row says which root to shorten.
+#     READ THE PANIC CORRECTLY, because this campaign misread it once and sized
+#     a fix to the wrong number.  `end byte index 18446744073709551591 is out of
+#     bounds for string of length 260`: the **260 IS THE PLACEHOLDER**, built by
+#     repeating a ten-byte template until it clears the pad -- 26 * 10 = 260 for
+#     every input, always, and it says NOTHING about any path.  The path is in
+#     the **INDEX**: `2^64 - 18446744073709551591 = 25` is how many bytes the
+#     composed prefix overran the pad by.  PROOF-SMOKE-1-5 measured that against
+#     two roots eight bytes apart (job 6004714) and got deficits of exactly 25
+#     and 33, which is what makes the boundary a measurement and not an opinion.
+#
+# (2) THE PRE-LOCK REFUSAL DET-1-FIX-1 ADDED, AND THE ROOT IT WAS MISSING.  The
+#     same check, run BEFORE the lock: this script composes the longest hermetic
+#     entry path its store root would produce and refuses with
+#     `reason=PREFIX_REFUSAL`, because a smoke run from a root too long to
+#     provision would report BACKEND_DIED against a perfectly good binary.  A
+#     guard that blames the wrong thing is worse than no guard.  It is a
+#     SETUP_FAILED, not a verdict on the binary -- rc 3.
+#
+#     PROOF-SMOKE-1-5: it modelled ONE of the TWO store roots a binary can
+#     reach, and the one it modelled was not the one that panicked.  See the
+#     note over `smoke_prefix_entry`.  The refusal now composes both and judges
+#     the worse; and because the fast-tmp candidate cannot fit under any root on
+#     this filesystem, the smoke disengages fast-tmp and says so, which is what
+#     turns arm A from a coin flip back into a verdict about the binary.
 #
 # ── WHAT IS DELIBERATELY NOT HERE ────────────────────────────────────────────
 #
@@ -119,10 +134,16 @@ SMOKE_ROOT_BASE=${SMOKE_ROOT_BASE:-/oscar/data/stellex/glvov/retread}
 SMOKE_RUST_LOG=${SMOKE_RUST_LOG:-uv_distribution=debug,pixi=info,pixi_core=info,pixi_command_dispatcher=info,warn}
 SMOKE_BACKEND_LOG=${SMOKE_BACKEND_LOG:-pixi_build_retread=debug,warn}
 # The rattler-build padding target and the fixed tail the composed prefix adds
-# to the store entry path.  Both MEASURED on 5989192 / DET1-5981957: 164+92=256
-# provisioned, 168+92=260 panicked.
-SMOKE_PREFIX_PAD=${SMOKE_PREFIX_PAD:-256}
-SMOKE_PREFIX_TAIL=${SMOKE_PREFIX_TAIL:-92}
+# to the store entry path.  PROOF-SMOKE-1-5, job 6004714: only the DIFFERENCE of
+# these two is measured, and it is 167 -- the longest hermetic entry path that
+# does not panic.  See the long note above `smoke_prefix_entry` for how 167 was
+# read off two arms whose roots differ by eight bytes, and why the 255/88 split
+# is the corroborated one.  The previous pair (256/92 -> a boundary of 164) came
+# from 5989192 / DET1-5981957 and was three bytes out on a root that was itself
+# 44 bytes short of the one the binary used, which is why it passed a root that
+# panicked every time it was reached.
+SMOKE_PREFIX_PAD=${SMOKE_PREFIX_PAD:-255}
+SMOKE_PREFIX_TAIL=${SMOKE_PREFIX_TAIL:-88}
 SMOKE_PREFIX_HEADROOM=${SMOKE_PREFIX_HEADROOM:-8}
 
 # THE FRONTEND MARKERS.  `resolve_pypi{` is the span the resolver opens per
@@ -183,26 +204,114 @@ smoke_setup_failed () {
 # that with the rule as it stood was to re-derive the entry path beside it, i.e.
 # a second copy of a length rule.  `smoke_prefix_composed` is that one number,
 # `smoke_prefix_budget` is the one verdict, and both read `smoke_prefix_entry`.
+#
+# PROOF-SMOKE-1-5 (2026-09-07): THE RULE HAD THE RIGHT SHAPE AND THE WRONG ROOT,
+# and the number that exposed it had been misread.  All of the below is measured
+# on job 6004714 (two arms, roots eight bytes apart) plus the two red psg runs.
+#
+# (1) `composed=260` WAS NEVER A PATH LENGTH.  The panic reads `end byte index
+#     18446744073709551591 is out of bounds for string of length 260`.  260 is
+#     the PLACEHOLDER rattler-build builds by repeating a ten-byte template
+#     until it clears its pad target -- 26 * 10 = 260 for every input, forever.
+#     The number that carries the path is the INDEX: 2^64 - 25, i.e. `pad -
+#     composed` underflowed by 25.  Both reds (6003336, 6003855) printed the
+#     SAME index, and job 6004714's two arms printed 2^64-25 at entry 148 and
+#     2^64-33 at entry 156 -- the deficit moved by EXACTLY the eight bytes the
+#     root moved.  So the overrun is a clean linear function of the root and the
+#     boundary is a single measured number, below.
+#
+# (2) THE ROOT WAS WRONG BY 44 BYTES.  `smoke_prefix_entry` composes
+#     `<root>/retread/hermetic-build-envs/...`, which is
+#     `courier::persistent_store_root_with` -- correct for a binary that carries
+#     the L3-1b-4 flip (det141-proof 6001140's arms measured on disk at
+#     `<arm cache home>/retread/hermetic-build-envs` = 81 bytes, exactly this
+#     rule).  It is NOT correct for a binary whose hermetic store still goes
+#     through `courier::retread_cache_root()`, which `fasttmp::
+#     backend_env_override` redirects into the job namespace.  MEASURED ON DISK
+#     while 6004714 ran, not modelled:
+#       <fast-tmp>/retread-glvov/79ff79765a52/job-6004714/caches/retread/
+#       hermetic-build-envs/v8   = 123 bytes (arm A) and 131 (arm B, +8)
+#     and the entry leaf is named by the lock files left behind
+#     (`.env-a383a406...lock`, 64 hex), so the real entry was 192, not 148.
+#
+# (3) THE MEASURED BOUNDARY.  Arm A: entry 192, deficit 25.  Arm B: entry 200,
+#     deficit 33.  Both give the same answer: THE LARGEST HERMETIC ENTRY PATH
+#     THAT DOES NOT PANIC IS 167 BYTES.  `SMOKE_PREFIX_PAD - SMOKE_PREFIX_TAIL`
+#     is that 167 and nothing else; only their DIFFERENCE is measured, and the
+#     255/88 split below is the corroborated one -- 88 is
+#     `/rattler-output` + `/bld` + `/rattler-build_` +
+#     `retread-hermetic-build-environment` (the ONE package
+#     `render_debug_recipe` emits) + `_` + a ten-digit stamp + `/host_env`, and
+#     255 is the only pad target for which the placeholder buffer is 260.
+#
+# (4) SO THE "PER-PACKAGE, EMISSION-ORDER" READING IS FALSIFIED.  The recipe has
+#     exactly one output; there is no order for it to be noisy about, and both
+#     reds printed the same constant.
 smoke_prefix_entry () {
-  # the longest entry this store root can produce: <root>/retread/
-  # hermetic-build-envs/v8/env-<64 hex>
+  # the longest entry a PERSISTENT store root can produce (the L3-1b-4 root):
+  # <root>/retread/hermetic-build-envs/v8/env-<64 hex>
   printf '%s/retread/hermetic-build-envs/v8/env-%s' "$1" "$(printf 'a%.0s' $(seq 1 64))"
 }
+# ...and the longest entry the FAST-TMP JOB NAMESPACE produces, which is the one
+# that actually panicked.  Every component is measured, not guessed:
+# `retread-$USER` from `fasttmp::user_namespace_component`, a twelve-hex
+# workspace digest from `fasttmp::workspace_hash` (six bytes rendered, measured
+# as `79ff79765a52`), `job-<id>` from `fasttmp::current_job_component`, and
+# `caches/retread` from the `RETREAD_CACHE_DIR` redirect.
+smoke_prefix_fasttmp_entry () {
+  printf '%s/retread-%s/%s/job-%s/caches/retread/hermetic-build-envs/v8/env-%s' \
+    "$1" "${USER:-u}" "$(printf 'a%.0s' $(seq 1 12))" "${SLURM_JOB_ID:-$$}" \
+    "$(printf 'a%.0s' $(seq 1 64))"
+}
+# THE ONE COMPOSER, AND IT TAKES THE WORST CANDIDATE, because the smoke does not
+# get to know which store root the binary under test will choose -- that is
+# decided by whether the binary carries L3-1b-4, which is precisely the thing a
+# smoke is run to find out.  A budget that models one of two reachable roots is
+# a budget that passes the other, which is what happened.
 smoke_prefix_composed () {
-  local entry; entry=$(smoke_prefix_entry "$1")
-  printf '%s' "$(( ${#entry} + SMOKE_PREFIX_TAIL ))"
+  local root=$1 fast=${2-${RETREAD_FAST_TMP_ROOT:-}} e best entry
+  entry=$(smoke_prefix_entry "$root"); best=${#entry}
+  if [ -n "$fast" ]; then
+    e=$(smoke_prefix_fasttmp_entry "$fast")
+    [ "${#e}" -gt "$best" ] && best=${#e}
+  fi
+  printf '%s' "$(( best + SMOKE_PREFIX_TAIL ))"
 }
 smoke_prefix_budget () {
-  local root=$1 label=${2:-store root} entry len composed
-  entry=$(smoke_prefix_entry "$root")
-  len=${#entry}
+  local root=$1 label=${2:-store root} fast=${3-${RETREAD_FAST_TMP_ROOT:-}}
+  local pe fe plen flen len composed oldcomposed which
+  pe=$(smoke_prefix_entry "$root");            plen=${#pe}
+  len=$plen; which="persistent $root"
+  if [ -n "$fast" ]; then
+    fe=$(smoke_prefix_fasttmp_entry "$fast");  flen=${#fe}
+    if [ "$flen" -gt "$len" ]; then len=$flen; which="fast-tmp $fast"; fi
+  else
+    flen=NOT_MODELLED
+  fi
   composed=$(( len + SMOKE_PREFIX_TAIL ))
-  echo "### SMOKE PREFIX BUDGET $label entry=$len composed=$composed pad=$SMOKE_PREFIX_PAD headroom=$(( SMOKE_PREFIX_PAD - composed )) root=$root"
+  # THE OLD NUMBER STAYS ON THE PAGE.  A rule that changes silently is a rule
+  # nobody can audit, and this one changed by enough to invert a verdict.
+  oldcomposed=$(( plen + 92 ))
+  echo "### SMOKE PREFIX BUDGET $label entry=$len composed=$composed pad=$SMOKE_PREFIX_PAD headroom=$(( SMOKE_PREFIX_PAD - composed )) root=$root worst=$which"
+  echo "### SMOKE PREFIX BUDGET $label   candidates: persistent entry=$plen | fast-tmp entry=$flen ${fast:+root=$fast}"
+  echo "### SMOKE PREFIX BUDGET $label   OLD RULE (pre PROOF-SMOKE-1-5, persistent root + tail 92) said composed=$oldcomposed headroom=$(( 256 - oldcomposed )) -- DELTA=$(( composed - oldcomposed ))"
+  if [ -z "$fast" ]; then
+    echo "### SMOKE PREFIX NOTE: the fast-tmp candidate is NOT modelled here because RETREAD_FAST_TMP_ROOT is unset AT THIS POINT."
+    echo "### SMOKE   If the caller exports one LATER (det141_proof.sh exports \$G/fast-tmp long after it calls the preamble), this row is a FLOOR, not the answer."
+  fi
   if [ "$composed" -gt "$SMOKE_PREFIX_PAD" ]; then
     echo "### SMOKE PREFIX REFUSAL: composed $composed > $SMOKE_PREFIX_PAD."
     echo "### SMOKE   rattler-build pads its build prefix to $SMOKE_PREFIX_PAD and panics on the underflow"
     echo "### SMOKE   in rattler_build_core/src/types/directories.rs before anything provisions."
-    echo "### SMOKE   SHORTEN THE ROOT, NOT THE CHECK: $root"
+    echo "### SMOKE   The longest hermetic entry that survives is $(( SMOKE_PREFIX_PAD - SMOKE_PREFIX_TAIL )) bytes (MEASURED, job 6004714); this one is $len."
+    echo "### SMOKE   THE OVERRUN IS IN: $which"
+    if [ -n "$fast" ] && [ "$which" != "persistent $root" ]; then
+      echo "### SMOKE   AND IT CANNOT BE FIXED BY SHORTENING THE ROOT: the fast-tmp namespace adds a FIXED $(( flen - ${#fast} )) bytes,"
+      echo "### SMOKE   so no root on this filesystem composes short enough while the store is redirected there."
+      echo "### SMOKE   THE ACTUATOR IS RETREAD_FAST_TMP=off for the smoke (fasttmp.rs reads it), which is what this script now does."
+    else
+      echo "### SMOKE   SHORTEN THE ROOT, NOT THE CHECK: $root"
+    fi
     return 1
   fi
   if [ "$composed" -gt $(( SMOKE_PREFIX_PAD - SMOKE_PREFIX_HEADROOM )) ]; then
@@ -501,7 +610,36 @@ echo "### SMOKE root=$ROOT ws=$WS cache=$CACHE wall_cap=${SMOKE_WALL}s"
 export XDG_CACHE_HOME=$CACHE/x
 export XDG_DATA_HOME=$CACHE/d
 mkdir -p "$XDG_CACHE_HOME" "$XDG_DATA_HOME" || smoke_setup_failed "cannot create $XDG_CACHE_HOME"
-smoke_prefix_budget "$XDG_CACHE_HOME" "smoke store root" || {
+# PROOF-SMOKE-1-5.  THE FAST-TMP ROOT IS DECIDED HERE, ABOVE THE BUDGET, because
+# the budget cannot model a root it has not been told about -- and the root it
+# was not being told about is the one that panicked.  (It used to be exported
+# two hundred lines below, after the refusal it belongs to.)
+RETREAD_FAST_TMP_ROOT=$ROOT/f
+# AND FAST-TMP IS DISENGAGED FOR THE SMOKE, WHICH IS A ROOT FIX AND NOT A
+# WORKAROUND, and the reason is arithmetic rather than preference.  MEASURED
+# (job 6004714, and on disk while it ran): the fast-tmp job namespace inserts a
+# FIXED 146 bytes between the FAST-TMP ROOT and the hermetic entry -- and the
+# fast-tmp root is `$ROOT/f`, so 148 from the smoke root itself; both numbers
+# appear below and they are the same measurement counted from two places --
+# (`/retread-$USER/<12 hex>/job-<id>/caches/retread/hermetic-build-envs/v8/env-
+# <64 hex>`), so the entry is `len(root) + 148` and the boundary is 167 -- which
+# needs a root of 19 bytes, when `/oscar/data/stellex/glvov/retread` alone is 33.
+# NO ROOT ON THIS FILESYSTEM CAN SATISFY IT.  A smoke that cannot be given a
+# passing root is not a guard, it is a coin: 6003336 red, 6003619 green, 6003855
+# red on ONE binary, and the green one never reached the hermetic build at all
+# (zero `hermetic` rows in its backend log) -- it won a race to the frontend and
+# killed the lock before the panic could happen.  Disengaging fast-tmp puts the
+# store back on `persistent_store_root`, where the budget's rule is the true one
+# and the verdict is about the binary again.  IT IS PRINTED, because it is a
+# real difference from the driver's environment and a reader must see it.
+export RETREAD_FAST_TMP=${SMOKE_FAST_TMP:-off}
+echo "### SMOKE fast-tmp mode=$RETREAD_FAST_TMP (PROOF-SMOKE-1-5: 'off' keeps the hermetic store off the +148-byte job namespace, which no root here can afford; the DRIVER still runs with it on)"
+# The fast-tmp candidate is modelled EXACTLY WHEN the store can reach it: with
+# the mode off it cannot, so passing it would refuse every root for a chain that
+# is not in play.  One call, one verdict.
+SMOKE_PREFIX_FAST_ARG=$RETREAD_FAST_TMP_ROOT
+[ "$RETREAD_FAST_TMP" = off ] && SMOKE_PREFIX_FAST_ARG=
+smoke_prefix_budget "$XDG_CACHE_HOME" "smoke store root" "$SMOKE_PREFIX_FAST_ARG" || {
   echo "### SMOKE reason=PREFIX_REFUSAL -- this is a refusal about the ROOT, not a verdict about the binary."
   SMOKE_VERDICT=SETUP_FAILED; SMOKE_RC=3; smoke_finish
 }
@@ -572,7 +710,9 @@ echo "### SMOKE uv: $RETREAD_UV -> $UVVER (retread's uv_closure::REQUIRED_UV wan
 # root) and none of them meets this budget.  Raising --mem would be treating the
 # symptom; the smoke's environment must be the driver's.
 export RETREAD_SCRATCH_ROOT=$ROOT/s
-export RETREAD_FAST_TMP_ROOT=$ROOT/f
+# PROOF-SMOKE-1-5: the VALUE is chosen far above, beside the budget that has to
+# model it; this line is now only the export, and it must stay in agreement.
+export RETREAD_FAST_TMP_ROOT
 export XDG_STATE_HOME=$ROOT/t
 export XDG_CONFIG_HOME=$ROOT/n
 mkdir -p "$RETREAD_SCRATCH_ROOT" "$RETREAD_FAST_TMP_ROOT" "$XDG_STATE_HOME" "$XDG_CONFIG_HOME" \
@@ -587,14 +727,21 @@ echo "### SMOKE fast-tmp root (DISK, job-scoped, ONE LETTER ON PURPOSE): $RETREA
 # `<fast-tmp>/retread-$USER/<12 hex>/job-<jid>/caches/retread/hermetic-build-envs`
 # -- 131 bytes of directory before the entry.  `$ROOT/f` is twelve bytes shorter
 # than `$CACHE/g/fast-tmp` and buys exactly that back.
-# BOARDED PROOF-SMOKE-1-2, AND NOT SHIPPED AS A GUESS: the pre-lock budget check
-# still measures XDG_CACHE_HOME, which is the L3-1b-4 default root and NOT the
-# root a fast-tmp job uses, so it did not refuse this before the lock -- the
-# PREFIX_PANIC_256 backstop caught it after 75 s instead.  Modelling the fast-tmp
-# chain was tried on paper and REJECTED: the arithmetic that fits DET-1-FIX-1
-# (root + 100 + 92) predicts 284 for a configuration that is measured at 260, so
-# a modelled refusal would refuse working jobs.  The reader that closes it is one
-# job that prints the composed prefix retread actually built, not more algebra.
+# PROOF-SMOKE-1-2 IS CLOSED (PROOF-SMOKE-1-5), AND THE REASON IT STAYED OPEN IS
+# WORTH KEEPING.  It read: "modelling the fast-tmp chain was tried on paper and
+# REJECTED -- the arithmetic (root + 100 + 92) predicts 284 for a configuration
+# that is MEASURED AT 260, so a modelled refusal would refuse working jobs."
+# THAT REJECTION WAS CAUSED BY THE SAME MISREADING THE FIX IS ABOUT: 260 was
+# never a measurement of the path, it is rattler-build's placeholder buffer.  The
+# configuration was measured at 280 (entry 192 + tail 88), the paper arithmetic
+# said 284, and the four bytes between them are the tail's own error (92 vs the
+# real 88).  The model was RIGHT to within four bytes and was thrown out on a
+# number that meant something else -- which is the whole argument for reading
+# the index and not the length.  The fast-tmp chain is now modelled, from a
+# measurement: `/retread-$USER/<12 hex>/job-<id>/caches/retread/hermetic-build-
+# envs/v8/env-<64 hex>` = a FIXED 146 bytes from the fast-tmp root, confirmed on disk while job 6004714
+# ran (123 bytes to `.../v8` on arm A, 131 on arm B, the entry leaf named by the
+# `.env-<64 hex>.lock` files left behind).
 export CONDA_OVERRIDE_CUDA=12
 export CONDA_OVERRIDE_GLIBC=2.35
 export OMNI_KIT_ACCEPT_EULA=YES
