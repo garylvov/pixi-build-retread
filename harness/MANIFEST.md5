@@ -111,7 +111,7 @@ b7b4546662fa8c555a727be04c8b08ff  tools/proof_smoke.sh
 dd16a8c662b31dda554a2bdc052ba94d  tools/retread_fast_env.sh
 8ead634bfa020525eabee2a7a57b0182  tools/script_refs.sh
 ff9014ec8ab0806334b426b41e38c5a2  tools/stage_mirror.sh
-fe20a15c26696aab4a17ff8b5990e52b  tools/stage_mirror_guard.sh
+a03023af88c7c712fa4e39a1043347fa  tools/stage_mirror_guard.sh
 46b5ede95808302e562b66b2e1a2201a  tools/retread_shard_mirror.sh
 bdd93cc2798a27301e793bdc6931be06  tools/sdist_build_poison_guard.sh
 da8aed178eda8db9d349a23d784bd8b6  tools/sdist_build_scope_guard.sh

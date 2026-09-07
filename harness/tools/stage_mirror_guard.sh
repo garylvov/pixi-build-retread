@@ -124,17 +124,39 @@ else
   printf '%s\n' "$OUTC2" | sed 's/^/GUARD:   /'
 fi
 
-########## D. MUTATION: sampling restored -> the linked tree publishes #########
+########## D. MUTATION: sampling restored -> the ONE linked file is missed ######
+# THE FIXTURE IS THE ARM. Reusing the fully-hardlinked tree of arm A proves
+# nothing about sampling: every one of its files is shared, so even the first 50
+# catch it -- job 6015548 measured exactly that (`the sampled mutant still caught
+# it (rc=1 shared=50)`). The shape that matters is the REAL one: a mirror that is
+# a genuine copy except for a single file that slipped through as a hardlink.
+# That one file is what writes through into imprint-data, and it is what a
+# 50-file sample of 203 misses. `zzz_linked.bin` sorts LAST under LC_ALL=C, so a
+# `head -n 50` sample provably never reaches it -- a `shuf` here would make the
+# arm a coin toss, and a guard that flips a coin is not a guard.
+ONELINK=$W/mirror.onelink
+cp -a "$SRC" "$ONELINK"
+rm -f "$ONELINK/zzz_linked.bin"
+ln "$SRC/zzz_linked.bin" "$ONELINK/zzz_linked.bin"
+OUTD0=$(stage_mirror_inode_check "$ONELINK" "$SRC"); rcD0=$?
+ND0=$(printf '%s' "$OUTD0" | sed -n 's/.*enumerated \([0-9]*\) shared \([0-9]*\).*/\1 \2/p')
+set -- $ND0
+if [ "$rcD0" = 1 ] && [ "${2:-0}" = 1 ]; then
+  ok "D. the ENUMERATION catches a mirror whose ONLY defect is one hardlinked file (enumerated ${1:-?} shared 1) -- the realistic shape, and the one a sample loses"
+else
+  fail "D. the enumeration missed the single hardlink: rc=$rcD0 enumerated='${1:-}' shared='${2:-}'"
+  printf '%s\n' "$OUTD0" | sed 's/^/GUARD:   /'
+fi
 MUT=$W/stage_mirror.sampled.sh
 sed "s@LC_ALL=C sort > \"\$wd/tree\"@LC_ALL=C sort | head -n 50 > \"\$wd/tree\"@" "$LIB" > "$MUT"
 if cmp -s "$LIB" "$MUT"; then
   fail "D. the mutation did not apply -- the enumeration line was not found, so D is vacuous"
 else
-  OUTD=$( . "$MUT" >/dev/null 2>&1; stage_mirror_inode_check "$LINKED" "$SRC" ); rcD=$?
+  OUTD=$( . "$MUT" >/dev/null 2>&1; stage_mirror_inode_check "$ONELINK" "$SRC" ); rcD=$?
   ND=$(printf '%s' "$OUTD" | sed -n 's/.*enumerated \([0-9]*\) shared \([0-9]*\).*/\1 \2/p')
   set -- $ND
   if [ "$rcD" = 0 ] && [ "${2:-1}" = 0 ]; then
-    ok "D. MUTATION REPRODUCED: a 50-file sample of the SAME cp -al tree reports shared 0 and PUBLISHES it (enumerated ${1:-?}) -- arm A is measuring the enumeration"
+    ok "D. MUTATION REPRODUCED: a 50-file sample of that SAME tree reports shared 0 and PUBLISHES it (enumerated ${1:-?}) -- arm A is measuring the enumeration"
   else
     fail "D. the sampled mutant still caught it (rc=$rcD shared=${2:-?}) -- arm A proves nothing"
   fi
