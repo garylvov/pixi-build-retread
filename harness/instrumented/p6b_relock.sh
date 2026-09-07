@@ -233,7 +233,7 @@ case "$C"  in /oscar/data/stellex/glvov/retread/cert${TAG}-*) ;; *) echo "FATAL 
 GOT_SHA=$(sha256sum "$SNAP" | awk '{print $1}')
 [ "$GOT_SHA" = "$EXPECT_SHA" ] || { echo "FATAL: snapshot sha $GOT_SHA != $EXPECT_SHA"; exit 8; }
 echo "### backend snapshot OK: $SNAP sha256=$GOT_SHA"
-ls -l "$SNAP"; "$SNAP" --version 2>&1 | head -2
+ls -l "$SNAP"
 [ -f "$FAST_ENV" ] || { echo "FATAL: persistent-cache snippet $FAST_ENV missing"; exit 8; }
 # --- FAST_ENV RESOLUTION, REPORTED (HARNESS-CONSOL-10, 2026-09-07) -----------
 # CLAUDE.md law 7 hazard (b): two copies of one module are the normal state
@@ -475,6 +475,16 @@ fi
 # shellcheck source=/dev/null
 . "$ENV_SEED_LIB"
 env_seed_export "$BACKEND" || exit 15
+# MERGE-V-2-2 (2026-09-07). THE VERSION PROBE MOVED HERE, AND THE MOVE IS THE
+# FIX. `"$SNAP" --version` used to run beside the `ls -l` in the snapshot gate,
+# some 580 lines above -- BEFORE anything exported PYTHONHASHSEED. A backend at
+# or after fix/det1-env-seed carries a preflight that refuses an unset seed, so
+# every relock log opened with that refusal on roughly line 21: ungated (the
+# probe's rc is discarded), harmless (nothing reads it), and MISLEADING, which
+# is the part that costs time -- the first thing a reader sees in a healthy log
+# is a FATAL-shaped line about the very variable this harness pins. The probe is
+# a diagnostic, so it moves; the seed export is a gate, so it does not.
+"$SNAP" --version 2>&1 | head -2
 
 # Node-local log root: uv_resolver=debug on 27 envs is a multi-GB stream and it
 # must not be written straight onto NFS while it grows (2026-08-31: 842 MB of
