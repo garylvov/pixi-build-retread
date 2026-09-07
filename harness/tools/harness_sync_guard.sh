@@ -938,6 +938,12 @@ mkowner () {   # $1 = task dir, $2 = repo; echoes the amended v2 sha
   printf 'v2 cleanup CHANGED\n' > "$R/harness/phase_template/cleanup.sh"
   git -C "$R" add -A >/dev/null 2>&1
   git -C "$R" commit -q --amend --no-edit >/dev/null 2>&1
+  # DET-1-6-a: a REAL task tree carries `tools/.harness_synced_commit` -- that
+  # record is what identifies a task copy's bytes, and owner_snapshot.sh now
+  # REFUSES a source it cannot identify at all. A fixture without the record was
+  # a fixture less faithful than production, and it is the only thing that made
+  # the old `src_commit=unknown` row look acceptable.
+  git -C "$R" rev-parse HEAD > "$T/tools/.harness_synced_commit"
   git -C "$R" rev-parse HEAD
 }
 # ---- p3 first: the snapshot itself, because p1 depends on it working --------

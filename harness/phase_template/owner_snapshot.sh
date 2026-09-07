@@ -38,7 +38,8 @@
 #                                                    passing "$@" through
 #           <job root>/owner-snapshot/owner.wall     the DERIVED `--time=HH:MM:SS`
 #                                                    for the caller's sbatch line
-#   Prints  ### OWNER SNAPSHOT files=<n> root=<job root> src_commit=<sha>
+#   Prints  ### OWNER SNAPSHOT files=<n> root=<job root> src_commit=<sha> src_kind=<git|record> ...
+#           ### OWNER SNAPSHOT froze file=<b> md5=<m> src_kind=<k> src_sha=<sha> dirty=<y/n>
 #           ### OWNER SNAPSHOT wall=<s> ... (CLEANUP-WALL-1, below)
 #   rc 0    frozen; rc 2 refused (and nothing was written that a caller may use)
 #
@@ -214,21 +215,84 @@ SR=$HERE/../tools/script_refs.sh
 SNAP=$JOB_ROOT/owner-snapshot
 mkdir -p "$SNAP" || { echo "### OWNER SNAPSHOT REFUSED: cannot create $SNAP"; exit 2; }
 
-# The commit the SOURCE tree is at, so a frozen copy can be traced back to what
-# it was frozen from. Read at the point of use, never remembered.
-SRC_COMMIT=unknown
+########## DET-1-6-a: WHERE THE BYTES CAME FROM, NEVER A GUESS ################
+# THE DEFECT, MEASURED. This file used to read `src_commit` out of
+# `<job root>/../tools/.harness_synced_commit` and print it as the provenance of
+# the frozen copy. That record is the TASK PIN -- what the task tree under
+# `tools/` was last synced to -- and it says nothing about the bytes actually
+# copied. det16_proof.sh froze the WORKTREE's files (at 6b3b669) while this row
+# advertised src_commit=8108ca4, the pin, and the proof author had to add a
+# hand-written PROVENANCE NOTE with two md5sums beside the row so a reader could
+# not be misled by it. A row that needs a note beside it saying what it really
+# means is a defect in the row.
+#
+# THE FIX IS TO IDENTIFY THE SOURCE, PER FILE, AND TO REFUSE WHEN IT CANNOT BE.
+#   * a source directory inside a git repo, with the file TRACKED there:
+#     kind=git, sha=`git rev-parse HEAD` of that tree, and its dirty state for
+#     that file (a dirty file is NOT the commit it sits on, and saying so is the
+#     whole point).
+#   * a task copy -- the task tree is not a repo -- : kind=record, sha = the
+#     `.harness_synced_commit` beside it, which for a task copy IS the identity
+#     of those bytes rather than a pin over somebody else's.
+#   * neither: REFUSE. An unidentifiable source is exactly the case the old
+#     `src_commit=unknown` printed and carried on, and carrying on is how a
+#     frozen copy of nobody-knows-what ends up in a job root for hours.
+# The md5 of every frozen file is stamped too, in `md5sum -c` form, so the row
+# cannot be misread even when the sha is right: bytes are the fact, the sha is
+# the claim about them.
+SRC_RECORD=; SRC_RECORD_PATH=
 for c in "$JOB_ROOT/../tools/.harness_synced_commit" "$JOB_ROOT/tools/.harness_synced_commit" \
-         "$(dirname -- "$1")/../.harness_synced_commit" "$(dirname -- "$1")/../tools/.harness_synced_commit"; do
-  [ -f "$c" ] && { SRC_COMMIT=$(head -c 40 "$c"); break; }
+         "$(dirname -- "${SCRIPTS[0]}")/../.harness_synced_commit" \
+         "$(dirname -- "${SCRIPTS[0]}")/../tools/.harness_synced_commit"; do
+  [ -f "$c" ] && { SRC_RECORD=$(head -c 40 "$c"); SRC_RECORD_PATH=$c; break; }
 done
 
+owner_src_identity () {          # $1 = a file about to be frozen; echoes "<kind> <sha> <dirty>"
+  local f=$1 d sha st r
+  d=$(cd -- "$(dirname -- "$f")" 2>/dev/null && pwd) || { echo "none - -"; return 0; }
+  if git -C "$d" rev-parse --git-dir >/dev/null 2>&1 &&
+     git -C "$d" ls-files --error-unmatch -- "$f" >/dev/null 2>&1; then
+    sha=$(git -C "$d" rev-parse HEAD 2>/dev/null)
+    st=$(git -C "$d" status --porcelain -- "$f" 2>/dev/null)
+    if [ -n "$sha" ]; then
+      if [ -n "$st" ]; then echo "git $sha yes"; else echo "git $sha no"; fi
+      return 0
+    fi
+  fi
+  for r in "$d/../tools/.harness_synced_commit" "$d/../.harness_synced_commit" \
+           "$d/.harness_synced_commit" "$d/tools/.harness_synced_commit"; do
+    [ -f "$r" ] && { echo "record $(head -c 40 "$r") -"; return 0; }
+  done
+  echo "none - -"
+}
+
+PROV=$SNAP/owner-snapshot.provenance
+MD5S=$SNAP/owner-snapshot.md5
+: > "$PROV"; : > "$MD5S"
+SRC_KIND=; SRC_COMMIT=; SRC_DIRTY=
 seen=" "
 n=0
 copy_one () {                    # $1 = absolute path of a script to freeze
-  local src=$1 b=${1##*/} rb rp
+  local src=$1 b=${1##*/} rb rp kind sha dirty m
   case "$seen" in *" $b "*) return 0;; esac
   [ -f "$src" ] || { echo "### OWNER SNAPSHOT REFUSED: $src does not exist"; return 2; }
+  # IDENTIFY BEFORE COPYING. A copy whose source cannot be named is a copy
+  # nobody can trace back, and this file exists to make the frozen bytes
+  # traceable.
+  read -r kind sha dirty < <(owner_src_identity "$src")
+  if [ "$kind" = none ]; then
+    echo "### OWNER SNAPSHOT REFUSED: cannot identify the source of $src."
+    echo "###   Its directory is not a git worktree that tracks it, and there is no"
+    echo "###   .harness_synced_commit beside it. Freezing it would put a copy of"
+    echo "###   nobody-knows-what in the job root under a row claiming provenance."
+    return 2
+  fi
   cp -p "$src" "$SNAP/$b" || { echo "### OWNER SNAPSHOT REFUSED: cannot copy $src"; return 2; }
+  m=$(md5sum "$SNAP/$b" | awk '{print $1}')
+  printf '%s  %s\n' "$m" "$b" >> "$MD5S"
+  printf '%s\t%s\t%s\t%s\t%s\n' "$b" "$m" "$kind" "$sha" "$dirty" >> "$PROV"
+  echo "### OWNER SNAPSHOT froze file=$b md5=$m src_kind=$kind src_sha=$sha dirty=$dirty from=$src"
+  [ -n "$SRC_KIND" ] || { SRC_KIND=$kind; SRC_COMMIT=$sha; SRC_DIRTY=$dirty; }
   seen="$seen$b "
   n=$((n+1))
   # follow what it reads, with the SAME parser the sync judges with
@@ -282,14 +346,14 @@ fi
 {
   echo '#!/usr/bin/env bash'
   echo '# GENERATED by phase_template/owner_snapshot.sh -- do not edit.'
-  echo "# frozen from src_commit=$SRC_COMMIT at $(date -Is)"
+  echo "# frozen from src_commit=$SRC_COMMIT (src_kind=$SRC_KIND dirty=$SRC_DIRTY, task pin record=${SRC_RECORD:-none}) at $(date -Is)"
   # A directive, not the last word: a `--time=` on the caller's sbatch line
   # overrides it. It is here so an owner submitted with NO --time still gets the
   # derived one rather than the partition default (5 min, measured with
   # `sinfo -p batch -o %L`), which would kill every reap instantly.
   [ -n "$OWNER_WALL_HMS" ] && echo "#SBATCH --time=$OWNER_WALL_HMS"
   echo 'set -u'
-  echo "echo \"### OWNER SNAPSHOT running frozen copy $SNAP/$FIRST src_commit=$SRC_COMMIT\""
+  echo "echo \"### OWNER SNAPSHOT running frozen copy $SNAP/$FIRST src_commit=$SRC_COMMIT src_kind=$SRC_KIND\""
   # --- the re-derivation the owner performs on ITSELF (law 9's actuator) ------
   echo "OWNER_UNLINK_RATE_PER_S=$OWNER_UNLINK_RATE_PER_S"
   echo "OWNER_CENSUS_RATE_PER_S=$OWNER_CENSUS_RATE_PER_S"
@@ -311,7 +375,7 @@ fi
 } > "$SNAP/owner.sbatch" || { echo "### OWNER SNAPSHOT REFUSED: cannot write $SNAP/owner.sbatch"; exit 2; }
 chmod +x "$SNAP/owner.sbatch"
 
-echo "### OWNER SNAPSHOT files=$n root=$JOB_ROOT src_commit=$SRC_COMMIT"
+echo "### OWNER SNAPSHOT files=$n root=$JOB_ROOT src_commit=$SRC_COMMIT src_kind=$SRC_KIND src_dirty=$SRC_DIRTY task_pin_record=${SRC_RECORD:-none}${SRC_RECORD_PATH:+ ($SRC_RECORD_PATH)}"
 if [ "${#ROOTS[@]}" -ge 1 ]; then
   echo "### OWNER SNAPSHOT wall=$OWNER_WALL_S (--time=$OWNER_WALL_HMS) from entries=$OWNER_ENTRIES rate=$OWNER_UNLINK_RATE_PER_S margin=$OWNER_WALL_MARGIN census_allow=$OWNER_CENSUS_ALLOW_S roots=${#ROOTS[@]} present=$OWNER_PRESENT absent=$OWNER_ABSENT arms=$OWNER_ARMS"
   echo "### OWNER SNAPSHOT wall file: $SNAP/owner.wall ($(cat "$SNAP/owner.wall"))"
@@ -322,5 +386,6 @@ else
   echo "###   pass --roots <root>... and the wall is derived and printed instead."
 fi
 echo "### OWNER SNAPSHOT frozen: $(cd "$SNAP" && ls -1 *.sh 2>/dev/null | tr '\n' ' ')"
+echo "### OWNER SNAPSHOT md5s: $MD5S ($(wc -l < "$MD5S") file(s)); provenance: $PROV"
 echo "### OWNER SNAPSHOT sbatch: $SNAP/owner.sbatch -> $SNAP/$FIRST"
 exit 0
