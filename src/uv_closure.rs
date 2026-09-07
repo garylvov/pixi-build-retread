@@ -5550,6 +5550,27 @@ pub enum PreflightError {
     UvMissing(String),
     /// uv ran, but reports a version this build is not validated against.
     UvVersion { want: String, got: String },
+    /// The AMBIENT [`PYTHON_HASH_SEED_ENV`] is absent, or carries a value other
+    /// than [`REPRODUCIBLE_PYTHON_HASH_SEED`].
+    ///
+    /// DET-1-4-1 (job 6001140, node1802) is why this is a refusal rather than
+    /// something the backend repairs for itself. That job locked the same
+    /// manifest three times on the same node with THIS binary: two arms with
+    /// `PYTHONHASHSEED=0` exported into the shell that launched pixi, one with
+    /// it unset. The two seeded arms' `gym` 0.26.2 `requires_dist` block came
+    /// back BYTE-IDENTICAL (42 rows, `cmp` rc=0, raw diff 0); the unseeded arm
+    /// differed from each of them by 28 raw lines with a SORTED diff of 0 — a
+    /// pure reordering, no package moved.
+    ///
+    /// [`apply_reproducible_python_hash_seed`] was already on all three of this
+    /// backend's own doors when that job ran, and the block moved anyway: the
+    /// process that builds `gym`'s metadata is an IN-PROCESS PEP 517 child of
+    /// the pixi FRONTEND, spawned by pixi's embedded uv, which this backend
+    /// never execs and therefore cannot pin. The only channel that reaches it
+    /// is the environment pixi itself was launched with. So the backend cannot
+    /// fix this; it can only DETECT it — and it is the one component pixi is
+    /// guaranteed to invoke, which makes it the right detector.
+    PythonHashSeed { got: Option<String> },
 }
 
 impl std::fmt::Display for PreflightError {
@@ -5566,6 +5587,26 @@ impl std::fmt::Display for PreflightError {
                  wanted: {want}\n  \
                  got:    {got}",
             ),
+            PreflightError::PythonHashSeed { got } => write!(
+                f,
+                "preflight: ${PYTHON_HASH_SEED_ENV} must be \
+                 `{REPRODUCIBLE_PYTHON_HASH_SEED}` in the environment that \
+                 launched pixi\n  \
+                 wanted: {REPRODUCIBLE_PYTHON_HASH_SEED}\n  \
+                 got:    {got}\n  \
+                 why:    pixi's own embedded uv prepares sdist metadata in an \
+                 in-process PEP 517 child that this backend never execs, so an \
+                 unpinned seed reorders `requires_dist` lines of a lock whose \
+                 resolution did not move by one package (DET-1-4-1, job \
+                 6001140: 28 raw lines moved, sorted diff 0).\n  \
+                 fix:    export {PYTHON_HASH_SEED_ENV}={REPRODUCIBLE_PYTHON_HASH_SEED} \
+                 in the shell that launches pixi (the production wrapper does \
+                 this; read the value with `retread {ENV_SEED_VERB}`).",
+                got = match got {
+                    Some(value) => format!("`{value}`"),
+                    None => "<absent from the environment>".to_string(),
+                },
+            ),
         }
     }
 }
@@ -5576,8 +5617,65 @@ impl PreflightError {
         match self {
             PreflightError::UvMissing(_) => 10,
             PreflightError::UvVersion { .. } => 11,
+            PreflightError::PythonHashSeed { .. } => 12,
         }
     }
+}
+
+/// The argv verb that prints [`REPRODUCIBLE_PYTHON_HASH_SEED`] on stdout.
+///
+/// It exists so the ONE authority for the value stays this crate: a shell
+/// cannot read a Rust constant, so the wrapper that must export the seed asks
+/// the binary for it instead of carrying a second copy of the literal that
+/// could drift from this one.
+pub const ENV_SEED_VERB: &str = "env-seed";
+
+/// Refuse when the AMBIENT hash seed is not the reproducible one.
+///
+/// Reads this process's own environment, which is the environment pixi handed
+/// down — see [`PreflightError::PythonHashSeed`] for why that is the thing
+/// worth checking and why the backend cannot repair it itself.
+///
+/// There is deliberately NO opt-out, for the reason [`preflight_uv`] states:
+/// an escape hatch reintroduces exactly the silent misconfiguration this
+/// exists to remove.
+pub fn check_ambient_python_hash_seed() -> std::result::Result<(), PreflightError> {
+    check_ambient_python_hash_seed_value(std::env::var_os(PYTHON_HASH_SEED_ENV))
+}
+
+/// The decision half of [`check_ambient_python_hash_seed`], split out so a test
+/// can drive every case without mutating the process environment.
+fn check_ambient_python_hash_seed_value(
+    value: Option<OsString>,
+) -> std::result::Result<(), PreflightError> {
+    match value {
+        Some(value) if value == OsStr::new(REPRODUCIBLE_PYTHON_HASH_SEED) => Ok(()),
+        Some(value) => Err(PreflightError::PythonHashSeed {
+            got: Some(value.to_string_lossy().into_owned()),
+        }),
+        None => Err(PreflightError::PythonHashSeed { got: None }),
+    }
+}
+
+/// THE production preflight: the ambient hash seed, then uv.
+///
+/// Deliberately a COMPOSITION rather than two checks stuffed into
+/// [`preflight_uv`], and DET-1-5's own gate (job 6007909) is why. Folding the
+/// seed check into `preflight_uv` made that function refuse for a reason its
+/// name does not describe, and two tests written to exercise uv detection --
+/// `preflight_uv_rejects_wrong_version` and `preflight_uv_reports_missing_binary`
+/// -- started failing on the seed instead, because a test process has no
+/// `PYTHONHASHSEED` either. They were right and the change was wrong: a
+/// function that answers "is uv usable" must keep answering exactly that, or
+/// every caller and every test of it silently changes meaning.
+///
+/// The seed goes FIRST here, and it costs no exec: a mis-launched pixi is
+/// cheaper to refuse than a mis-configured uv, and the seed decides lock BYTES
+/// rather than whether the run can proceed at all -- which is the failure that
+/// survives to a comparison hours later and voids it.
+pub async fn preflight() -> std::result::Result<(PathBuf, String), PreflightError> {
+    check_ambient_python_hash_seed()?;
+    preflight_uv().await
 }
 
 /// Validate this process's own environment before doing any work.
@@ -5626,6 +5724,81 @@ mod preflight_tests {
                 }
             }
         }
+    }
+
+    /// Drives the AMBIENT seed the way `UvEnvGuard` drives `RETREAD_UV`.
+    struct SeedEnvGuard(Option<OsString>);
+
+    impl SeedEnvGuard {
+        fn clear() -> Self {
+            let prior = std::env::var_os(PYTHON_HASH_SEED_ENV);
+            // SAFETY: TEST_ASYNC_ENV_MUTEX serializes environment mutation.
+            unsafe { std::env::remove_var(PYTHON_HASH_SEED_ENV) };
+            Self(prior)
+        }
+
+        fn set(value: &str) -> Self {
+            let prior = std::env::var_os(PYTHON_HASH_SEED_ENV);
+            // SAFETY: TEST_ASYNC_ENV_MUTEX serializes environment mutation.
+            unsafe { std::env::set_var(PYTHON_HASH_SEED_ENV, value) };
+            Self(prior)
+        }
+    }
+
+    impl Drop for SeedEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: TEST_ASYNC_ENV_MUTEX remains held while this guard drops.
+            unsafe {
+                match &self.0 {
+                    Some(value) => std::env::set_var(PYTHON_HASH_SEED_ENV, value),
+                    None => std::env::remove_var(PYTHON_HASH_SEED_ENV),
+                }
+            }
+        }
+    }
+
+    // DET-1-5: the COMPOSITION, and the ordering inside it. These are what make
+    // the split from `preflight_uv` a design rather than a dodge -- the two
+    // tests above keep asserting that `preflight_uv` answers "is uv usable",
+    // and these two assert that `preflight` additionally refuses a bad ambient
+    // seed, and refuses it FIRST.
+
+    #[tokio::test]
+    async fn preflight_refuses_an_absent_seed_before_it_looks_at_uv() {
+        let _lock = crate::TEST_ASYNC_ENV_MUTEX.lock().await;
+        let _seed = SeedEnvGuard::clear();
+        // Point RETREAD_UV at something that cannot possibly execute, so that
+        // reaching the uv half AT ALL would produce UvMissing(10). Getting
+        // PythonHashSeed(12) back is therefore positive evidence of order, not
+        // merely of presence.
+        let _env = UvEnvGuard::set(Path::new("/nonexistent/uv-that-cannot-run"));
+        let err = preflight()
+            .await
+            .expect_err("an absent ambient seed must refuse the production preflight");
+        assert_eq!(
+            err.exit_code(),
+            12,
+            "the seed is checked BEFORE uv; a 10 here means the order regressed",
+        );
+        assert!(
+            matches!(err, PreflightError::PythonHashSeed { got: None }),
+            "and it refuses for the seed, naming it as absent",
+        );
+    }
+
+    #[tokio::test]
+    async fn preflight_passes_the_seed_gate_and_then_reaches_uv() {
+        let _lock = crate::TEST_ASYNC_ENV_MUTEX.lock().await;
+        let _seed = SeedEnvGuard::set(REPRODUCIBLE_PYTHON_HASH_SEED);
+        let _env = UvEnvGuard::set(Path::new("/nonexistent/uv-that-cannot-run"));
+        let err = preflight()
+            .await
+            .expect_err("uv is still unusable, so this must fail -- on UV, not on the seed");
+        assert_eq!(
+            err.exit_code(),
+            10,
+            "with the seed pinned the gate opens and the uv half is what refuses",
+        );
     }
 
     #[cfg(unix)]
@@ -8242,6 +8415,85 @@ mod tests {
             REPRODUCIBLE_PYTHON_HASH_SEED, "0",
             "the seed a later reader reproduces without consulting a log",
         );
+    }
+
+    // ---- DET-1-5: the AMBIENT seed, which the backend can only refuse ------
+    // The three arms of DET-1-4-1 (job 6001140), as three cases. `apply_*`
+    // above pins the seed on children this backend execs; these cover the seed
+    // it INHERITS, which is the one that reached pixi's in-process PEP 517
+    // child and moved 28 lines of the `gym` block.
+
+    #[test]
+    fn the_ambient_seed_check_accepts_the_reproducible_value() {
+        // Arms D1 and D2: `PYTHONHASHSEED=0` exported into the launching
+        // shell. Their gym blocks came back byte-identical.
+        check_ambient_python_hash_seed_value(Some(OsString::from(
+            REPRODUCIBLE_PYTHON_HASH_SEED,
+        )))
+        .expect("the pinned seed is exactly what the wrapper exports");
+    }
+
+    #[test]
+    fn the_ambient_seed_check_refuses_an_absent_seed() {
+        // Arm E: absent from /proc/<pixi.real pid>/environ. This is the shape
+        // that actually occurs -- unset, and unset means random per process.
+        let error = check_ambient_python_hash_seed_value(None)
+            .expect_err("an absent seed must refuse, not default");
+        assert!(
+            matches!(error, PreflightError::PythonHashSeed { got: None }),
+            "an absent seed is reported as absent, not as an empty value",
+        );
+        assert_eq!(error.exit_code(), 12, "a distinguishable exit code");
+        let message = error.to_string();
+        assert!(
+            message.contains("<absent from the environment>"),
+            "the message says the seed was absent: {message}",
+        );
+        assert!(
+            message.contains("export PYTHONHASHSEED=0"),
+            "the message names the ACTUATOR, not just the fault: {message}",
+        );
+        assert!(
+            message.contains(ENV_SEED_VERB),
+            "the message points at the verb that keeps one authority: {message}",
+        );
+    }
+
+    #[test]
+    fn the_ambient_seed_check_refuses_a_wrong_seed() {
+        // Not a DET-1-4-1 arm: the case a wrapper creates by exporting a value
+        // of its own. A seed that is pinned but not OUR pin is still a lock
+        // whose bytes no later reader can reproduce.
+        let error = check_ambient_python_hash_seed_value(Some(OsString::from("random")))
+            .expect_err("a seed other than the constant must refuse");
+        assert!(
+            matches!(
+                &error,
+                PreflightError::PythonHashSeed { got: Some(value) } if value == "random",
+            ),
+            "the refusal quotes the value it actually found",
+        );
+        assert!(
+            error.to_string().contains("got:    `random`"),
+            "the message quotes the wrong value so the operator can see it",
+        );
+    }
+
+
+    #[test]
+    fn the_env_seed_verb_prints_the_one_authority() {
+        // The wrapper does `export PYTHONHASHSEED="$(<bin> env-seed)"`, so the
+        // verb's output and the constant the check compares against must be
+        // the same string -- that is the whole point of the verb existing.
+        assert_eq!(
+            crate::env_seed_verb_output(),
+            format!("{REPRODUCIBLE_PYTHON_HASH_SEED}\n"),
+            "the verb prints the constant and nothing else",
+        );
+        check_ambient_python_hash_seed_value(Some(OsString::from(
+            crate::env_seed_verb_output().trim_end(),
+        )))
+        .expect("what the verb prints must satisfy the check it feeds");
     }
 
     #[test]

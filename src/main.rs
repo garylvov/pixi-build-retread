@@ -4,6 +4,7 @@
 //! Speaks line-delimited JSON-RPC 2.0 over stdin/stdout, per the pixi build
 //! protocol (`crates/pixi_build_types`, API version 4).
 
+use std::ffi::OsStr;
 use std::io::Write as _;
 use std::path::PathBuf;
 
@@ -11,6 +12,17 @@ use pixi_build_retread::{fasttmp, handler, installer, rpc, solve};
 use tracing_subscriber::EnvFilter;
 
 fn main() -> anyhow::Result<()> {
+    // `retread env-seed` -- handled FIRST, and the position is the whole
+    // design. The production wrapper's job is to export the reproducible
+    // interpreter hash seed BEFORE it launches pixi, and it asks this binary
+    // what to export so the value has exactly one authority. If the verb sat
+    // behind the RPC preflight it would refuse for want of the very variable
+    // it exists to supply, and the wrapper could never bootstrap. It therefore
+    // runs before panic hooks, Tokio, tracing and preflight, and touches
+    // nothing: it prints a constant and exits.
+    if let Some(code) = env_seed_command_exit_code() {
+        std::process::exit(code);
+    }
     pixi_build_retread::panic_hook::install_global_panic_hook();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -25,6 +37,40 @@ fn main() -> anyhow::Result<()> {
             anyhow::anyhow!("failed to build Tokio runtime: {error}")
         })?;
     runtime.block_on(async_main())
+}
+
+/// `retread env-seed` prints the reproducible interpreter hash seed and exits.
+///
+/// Returns `None` when this is not an `env-seed` invocation, so `main` falls
+/// through to its ordinary path. A malformed invocation (`env-seed` with any
+/// further argument) exits 2 and prints nothing on stdout -- the wrapper reads
+/// stdout with `$(...)`, so a diagnostic there would be exported AS the seed.
+fn env_seed_command_exit_code() -> Option<i32> {
+    let mut arguments = std::env::args_os();
+    let _program = arguments.next();
+    if arguments.next().as_deref()
+        != Some(OsStr::new(pixi_build_retread::uv_closure::ENV_SEED_VERB))
+    {
+        return None;
+    }
+    if arguments.next().is_some() {
+        eprintln!(
+            "retread {}: takes no arguments",
+            pixi_build_retread::uv_closure::ENV_SEED_VERB
+        );
+        return Some(2);
+    }
+    let mut stdout = std::io::stdout().lock();
+    match stdout
+        .write_all(pixi_build_retread::env_seed_verb_output().as_bytes())
+        .and_then(|()| stdout.flush())
+    {
+        Ok(()) => Some(0),
+        Err(error) => {
+            eprintln!("retread env-seed: writing stdout: {error}");
+            Some(1)
+        }
+    }
 }
 
 async fn async_main() -> anyhow::Result<()> {
@@ -45,7 +91,7 @@ async fn async_main() -> anyhow::Result<()> {
     // scripts, CI) that want to fail at second zero instead of twenty minutes
     // into a staged run. Diagnostics go to stderr; stdout stays clean.
     if matches!(argv.get(1).map(String::as_str), Some("preflight")) {
-        return match pixi_build_retread::uv_closure::preflight_uv().await {
+        return match pixi_build_retread::uv_closure::preflight().await {
             Ok((bin, version)) => {
                 eprintln!(
                     "preflight OK: uv {version} at {} (retread {})",
@@ -157,7 +203,7 @@ async fn async_main() -> anyhow::Result<()> {
     // starts, so a misconfigured uv fails here in milliseconds instead of
     // surfacing twenty minutes into a staged build. Diagnostics go to stderr;
     // stdout is the JSON-RPC channel and MUST stay clean.
-    if let Err(error) = pixi_build_retread::uv_closure::preflight_uv().await {
+    if let Err(error) = pixi_build_retread::uv_closure::preflight().await {
         eprintln!("{error}");
         std::process::exit(error.exit_code());
     }

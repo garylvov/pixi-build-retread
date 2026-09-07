@@ -57,3 +57,15 @@ pub mod workspace;
 // transiently switch another module's production path.
 #[cfg(test)]
 pub(crate) static TEST_ASYNC_ENV_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Exactly what `retread env-seed` writes to stdout: the one authority for the
+/// reproducible interpreter hash seed, newline-terminated so `$(...)` in the
+/// production wrapper strips it and a human `retread env-seed` reads normally.
+///
+/// It lives here rather than in `main.rs` so the guard that ties it to
+/// [`uv_closure::REPRODUCIBLE_PYTHON_HASH_SEED`] can be a unit test of the
+/// library — a verb whose output could drift from the constant the preflight
+/// compares against would defeat the point of having the verb at all.
+pub fn env_seed_verb_output() -> String {
+    format!("{}\n", uv_closure::REPRODUCIBLE_PYTHON_HASH_SEED)
+}
