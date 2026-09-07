@@ -40,6 +40,15 @@
 #      ran no arm cannot write, so it kept `certDET141-6000903` and
 #      `ws.DET141-6000903` -- six empty directories -- forever. The branch above
 #      the conditions is `setup_refused_check`; the full reasoning sits at it.
+#   6. A JOB THAT DIED MID-ARM HAS NO EVIDENCE AND NEVER WILL EITHER
+#      (CLEANUP-SEAM-2, 2026-09-07). Rule 5's branch requires EMPTY roots, which
+#      is right for a preamble refusal and wrong for the next case along: job
+#      6014471 staged, ran two arms, and both wrappers exited 7, so its roots
+#      hold a store AND no `.rc`/`.wall`/`.lock.log` will ever be written. Its
+#      owner 6014484 refused rc 2 and would have forever. The second branch is
+#      `job_fatal_check`: a job-fatal row in the job's OWN stdout, sacct FAILED
+#      or TIMEOUT for that job, nothing of ours still queued on the roots, and
+#      no sealed subtree. The full reasoning sits at it.
 #
 # 2026-09-04 ROOT FIX (inode sweep 2, jobs 5764454/5764455 deleted NOTHING).
 # Two defects, both of them the same mistake -- treating a NAME SHAPE as the
@@ -304,16 +313,40 @@ fi
 SETUP_REFUSED_RE='^### (PREAMBLE JOB REFUSED BEFORE ARM 1|PREAMBLE FATAL:|SMOKE SETUP_FAILED)'
 SETUP_REFUSED_DEPTH=8
 
-setup_refused_stdout () {
-  # The relock job's own stdout, found by its JOB ID under the harness dir --
-  # `find -maxdepth` per HANDOFF section 2, never a full-tree walk. Job names
-  # differ per lane (`$D/logs/det141-6000903.out`), the job id does not.
-  find "$D" -maxdepth 2 -type f -name "*$RJ*.out" 2>/dev/null | sort
+JOB_STDOUT_FALLBACK_DEPTH=3
+
+job_stdout_files () {
+  # The relock job's own stdout, found by its JOB ID -- `find -maxdepth` per
+  # HANDOFF section 2, never a full-tree walk. Job names differ per lane
+  # (`$D/logs/det141-6000903.out`), the job id does not.
+  #
+  # CLEANUP-SEAM-2 (2026-09-07). This searched `$D` at depth 2 and nothing else,
+  # which assumes the harness dir and the job's log live together. det161b
+  # splits them: `D` derives to the PER-ARM root `det161b-w1` (its `artifacts/`
+  # is what holds `<TAG>-<RJ>*`, so that is the directory `derive_harness_dir`
+  # is right to name), while the driver's stdout is `det161b-work/logs/
+  # det161b-6014471.out`. The finder returned NOTHING for job 6014471, so any
+  # branch keyed on the job's own stdout was silent on it. `$D` is still tried
+  # FIRST and still wins, so nothing changes for a lane whose log is where it
+  # always was; only when `$D` yields nothing does the search widen to the TASK
+  # ROOT at depth 3, which is the shallowest depth that reaches
+  # `<T>/<lane>-work/logs/<name>-<jid>.out`. A widening is ANNOUNCED, and the
+  # JOB-FATAL branch below announces an EMPTY result too: a branch that says
+  # nothing because it found no file is indistinguishable from one that says
+  # nothing because the job was healthy, and that silence is what this note and
+  # that row exist to make readable.
+  local hits
+  hits=$(find "$D" -maxdepth 2 -type f -name "*$RJ*.out" 2>/dev/null | sort)
+  if [ -z "$hits" ]; then
+    hits=$(find "$T" -maxdepth "$JOB_STDOUT_FALLBACK_DEPTH" -type f -name "*$RJ*.out" 2>/dev/null | sort)
+    [ -z "$hits" ] || echo "### JOB STDOUT: none under D=$D at depth 2; fell back to $T at depth $JOB_STDOUT_FALLBACK_DEPTH and found $(printf '%s\n' "$hits" | grep -c .) file(s)" >&2
+  fi
+  printf '%s\n' "$hits"
 }
 
 setup_refused_check () {
   local outs row r n files sealed deep removed=0 crc
-  outs=$(setup_refused_stdout)
+  outs=$(job_stdout_files)
   [ -n "$outs" ] || return 0
   row=$(printf '%s\n' "$outs" | while IFS= read -r f; do
           grep -m1 -E "$SETUP_REFUSED_RE" "$f" 2>/dev/null && break
@@ -356,6 +389,161 @@ setup_refused_check () {
   exit 2
 }
 setup_refused_check   # SETUP-REFUSED-BRANCH (MUTATION ANCHOR)
+
+# --- CLEANUP-SEAM-2: A JOB THAT DIED MID-ARM, AFTER IT HAD ALREADY STAGED ----
+# MEASURED on det161b-cleanup 6014484, the afterany owner of det161b-proof
+# 6014471. 6014471 did NOT die in its preamble -- it got through the smoke, got
+# through staging, ran arm W1 for 865 s and arm W2 for 86 s, and both arms died
+# in `retread_scope_sdist_builds`:
+#
+#     retread_scope_sdist_builds: FATAL no byte-keyed bucket was symlinked --
+#       the overlay would be a COLD cache, not an isolation of the build halves
+#     FATAL: retread_scope_sdist_builds refused
+#     ### ARM W1 WRAPPER EXIT rc=7 arm wall=865s 2026-09-07T04:41:35-04:00
+#     ### ARM W2 WRAPPER EXIT rc=7 arm wall=86s 2026-09-07T04:43:01-04:00
+#     ### D16 DET-1-6 PROOF DONE job_fatal=1 2026-09-07T04:43:03-04:00
+#     ### DET161B_EXIT=1
+#
+# sacct agrees: `6014471 det161b-proof FAILED 1:0`. A wrapper that exits 7
+# writes no `.rc`, no `.wall` and no `.lock.log`, so condition 1 reported all
+# three MISSING and 6014484 printed `### CLEANUP REFUSED -- nothing deleted`,
+# rc 2, keeping certD16-6014471, certD6A-6014471, ws.D6A-6014471 and the
+# per-arm isolated cache -- and it would keep them for the rest of time,
+# because the evidence it waits for can never arrive for a job that is over.
+#
+# THIS IS CLEANUP-SEAM-1's DEFECT ONE SEAM FURTHER ON, AND THE SEAM-1 BRANCH
+# CANNOT COVER IT. `setup_refused_check` requires every present root to hold NO
+# FILE AT ALL -- that is right for a job the preamble refused before arm 1, which
+# left six empty directories. A job that died mid-arm has STAGED: its roots hold
+# a pixi/rattler/uv store, an overlay, a workspace checkout. The emptiness proof
+# is exactly what distinguishes the two cases, so widening seam 1 would delete
+# the roots of jobs it was written to protect. This is a SECOND branch with a
+# SECOND set of conditions, not a loosening of the first.
+#
+# THE THREE CONDITIONS, and each one is refusable on its own:
+#
+#   (i)   THE JOB'S OWN STDOUT CARRIES A JOB-FATAL ROW. Not any error, not a
+#         stderr line: one of the four rows this campaign's drivers print to
+#         DECLARE the job dead, each with a live producer, each derived by grep
+#         and not invented here:
+#           `### PREAMBLE JOB REFUSED BEFORE ARM 1. MULTIARM_JOB_FATAL=<nonzero>`
+#               producer: tools/multiarm_preamble.sh, `multiarm_say "JOB REFUSED
+#               BEFORE ARM 1. MULTIARM_JOB_FATAL=1"`.
+#           `### ARM <label> WRAPPER EXIT rc=<nonzero>`
+#               producer: the multi-arm drivers' `echo "### ARM $AL WRAPPER EXIT
+#               rc=$rc arm wall=${W}s $(date -Is)"` -- det16_proof.sh,
+#               det161_proof.sh, det161b_proof.sh, det162_proof.sh.
+#           `### <TAG> ... PROOF DONE job_fatal=<nonzero>`
+#               producer: `echo "### ${TAG} ... PROOF DONE job_fatal=$JOB_FATAL
+#               $(date -Is)"` -- det1_proof.sh, det141_proof.sh, det16_proof.sh,
+#               det161_proof.sh, det161b_proof.sh, det162_proof.sh.
+#           `### <TAG>_EXIT=<nonzero>`
+#               producer: the sbatch wrapper's `echo "### <TAG>_EXIT=$rc"` --
+#               det141.sbatch, det16.sbatch, det161.sbatch, det161b.sbatch,
+#               det162.sbatch, and the det1-work gate/mut sbatches.
+#         ZERO IS NOT FATAL and the regex says so: `job_fatal=0`, `rc=0` and
+#         `_EXIT=0` are the SUCCESS rows of the very same producers, and a
+#         family that matched them would unlock the reaper on every green job
+#         in the campaign.
+#
+#   (ii)  SLURM AGREES THE JOB DIED. `sacct -X` for RJ must be FAILED or
+#         TIMEOUT. A ROW IN A LOG IS A CLAIM; THE ACCOUNTING RECORD IS THE FACT.
+#         A driver that prints a fatal row and then exits 0 -- a swallowed rc,
+#         which is the exact defect `driver_exit_guard.sh` exists for -- must NOT
+#         unlock the reaper, because a job that reported success may have handed
+#         its roots to a successor. The two halves are independent readers of the
+#         same question and both have to say yes.
+#
+#   (iii) NO ROOT HOLDS A SEALED (write-stripped) DIRECTORY. Same refusal, same
+#         reasoning and the same depth bound as seam 1: `source_build.rs::
+#         make_source_tree_read_only` strips `w` from DIRECTORIES, so a sealed
+#         subtree means a rattler-build store really provisioned there, and
+#         `multiarm_store_reap.sh` renames such a tree aside rather than deleting
+#         it in-job. A sealed root is a reap question, not a strand question,
+#         and it refuses exactly as it does today. The containment half of that
+#         proof (dev:inode, not a string prefix) is NOT re-implemented here --
+#         it lives in `multiarm_store_reap.sh` for the reap path and in
+#         `cleanup.sh` for this one, which is why the branch DECIDES and
+#         `cleanup.sh` DELETES.
+#
+# AND ONE MORE, WHICH SEAM 1 DID NOT NEED: NOTHING OF OURS IS STILL RUNNING ON
+# THESE ROOTS. Seam 1's roots were empty, so an adopting sibling had nothing to
+# lose; these roots hold staged data, which is precisely what a phase-2 or a
+# sibling arm adopts. Condition 2's queue check sits BELOW this branch and would
+# never run, so the branch runs it itself over every `-<jid>` token in every
+# present root's basename. That is the check that would have saved
+# `ws.A3B-5697522` from the A-final cert.
+#
+# WHOSE STDOUT, AND THE READER THAT MADE IT NECESSARY. `setup_refused_stdout`
+# looked ONLY under `$D` at depth 2, which is right when the harness dir and the
+# job log live together (`det141-work/logs/det141-6000903.out`). det161b splits
+# them: its `D` derives to the PER-ARM root `det161b-w1`, whose only child is
+# `artifacts/`, while the driver's stdout is in `det161b-work/logs/`. The
+# finder returned nothing, so a branch keyed on the job's own stdout would have
+# been silent on the very job it was written for. The lookup now falls back to
+# the TASK ROOT at depth 3 -- bounded, HANDOFF section 2 -- and the files it
+# searched are PRINTED, so a future silence is readable instead of invisible.
+# MEASURED: at depth 3 the fallback finds five `*6014471*.out` files and only
+# `det161b-work/logs/det161b-6014471.out` carries a row of the family; the four
+# per-arm wrapper stdouts under `artifacts/` match nothing.
+#
+# Reader: cleanup_absent_root_guard.sh, arms J1-J5.
+JOB_FATAL_RE='^### ((PREAMBLE JOB REFUSED BEFORE ARM 1\. MULTIARM_JOB_FATAL=|ARM [^ ]+ WRAPPER EXIT rc=|[A-Za-z0-9_]+_EXIT=)[0-9]*[1-9][0-9]*|.* PROOF DONE job_fatal=[0-9]*[1-9][0-9]*)( |$)'
+JOB_FATAL_STATES='^(FAILED|TIMEOUT)$'
+JOB_FATAL_SEAL_DEPTH=$SETUP_REFUSED_DEPTH
+
+job_fatal_check () {
+  local outs row st r sealed base jid jids qst removed=0 crc n
+  outs=$(job_stdout_files)
+  [ -n "$outs" ] || return 0
+  row=$(printf '%s\n' "$outs" | while IFS= read -r f; do
+          grep -m1 -E "$JOB_FATAL_RE" "$f" 2>/dev/null && break
+        done)
+  [ -n "$row" ] || return 0
+  echo "### JOB-FATAL: the relock job $RJ declared itself dead in its own stdout:"
+  echo "###   $row"
+  # (ii) Slurm's own record, and it is allowed to overrule the row.
+  st=$(sacct -j "$RJ" -X -n -o State 2>/dev/null | head -1 | awk '{print $1}')
+  echo "### JOB-FATAL sacct state for job $RJ: '${st:-<none>}' (accepted: FAILED, TIMEOUT)"
+  if ! printf '%s\n' "$st" | grep -qE "$JOB_FATAL_STATES"; then
+    echo "### JOB-FATAL NOT TAKEN: the row is a CLAIM and sacct is the FACT -- '${st:-<none>}' is not FAILED/TIMEOUT, so a driver that printed a fatal row and still exited cleanly does not unlock the reaper. The evidence conditions decide."
+    return 0
+  fi
+  # AND: nothing of ours still running on these roots.
+  for r in "${PRESENT_ROOTS[@]+"${PRESENT_ROOTS[@]}"}"; do
+    base=${r##*/}
+    jids=$(printf '%s\n' "$base" | grep -oE -- '-[0-9]{6,}' | tr -d - | sort -u)
+    for jid in $jids; do
+      qst=$(squeue -j "$jid" -h -o '%t' 2>/dev/null | paste -sd, )
+      if [ -n "$qst" ]; then
+        echo "### JOB-FATAL NOT TAKEN: job $jid (named by root $r) is still in the queue: $qst. A root with staged data in it is exactly what a sibling arm adopts."
+        return 0
+      fi
+    done
+  done
+  # (iii) a sealed subtree is a reap question, not a strand question.
+  for r in "${PRESENT_ROOTS[@]+"${PRESENT_ROOTS[@]}"}"; do
+    sealed=$(find "$r" -maxdepth "$JOB_FATAL_SEAL_DEPTH" -type d ! -writable 2>/dev/null | head -5)
+    n=$(printf '%s\n' "$sealed" | grep -c .)
+    echo "### JOB-FATAL root $r: sealed_dirs=$n within depth $JOB_FATAL_SEAL_DEPTH"
+    if [ -n "$sealed" ]; then
+      echo "### JOB-FATAL NOT TAKEN: $r holds SEALED (write-stripped) director(ies) -- a provisioned store, which multiarm_store_reap.sh renames aside rather than deleting in-job. Refusing exactly as before:"
+      printf '%s\n' "$sealed" | sed 's/^/###     /'
+      return 0
+    fi
+  done
+  echo "### JOB-FATAL TAKEN: ${#PRESENT_ROOTS[@]} present root(s), job $RJ is $st, nothing of ours in the queue, no sealed tree, and no evidence can ever arrive for a job that is over. Handing them to $CLEANUP (which owns the containment refusals)."
+  bash "$CLEANUP" "${PRESENT_ROOTS[@]}"; crc=$?
+  for r in "${PRESENT_ROOTS[@]+"${PRESENT_ROOTS[@]}"}"; do
+    if [ -e "$r" ]; then echo "### JOB-FATAL kept  $r (still on disk)"
+    else echo "### JOB-FATAL removed $r"; removed=$((removed + 1)); fi
+  done
+  echo "### CLEANUP JOB-FATAL roots=${#PRESENT_ROOTS[@]} removed=$removed cleanup_rc=$crc fatal_row=\"$row\""
+  if [ "$crc" = 0 ] && [ "$removed" = "${#PRESENT_ROOTS[@]}" ]; then exit 0; fi
+  echo "### JOB-FATAL INCOMPLETE -- $CLEANUP returned $crc and $removed of ${#PRESENT_ROOTS[@]} root(s) are gone. Law 9: this rc reaches Slurm."
+  exit 2
+}
+job_fatal_check   # JOB-FATAL-BRANCH (MUTATION ANCHOR)
 
 # --- condition 1: the evidence is in the task root ----------------------------
 # A harness that GZIPS its lock log into the task root satisfies condition 1

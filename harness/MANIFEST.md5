@@ -24,7 +24,7 @@ a2deab8ba099cc7a3055dc5e4f74da50  instrumented/p6b_stamp.py
 5c116bc032f62e38e1a822b44284ef06  manifests/a3b/isaaclab-2.3x-pack.pixi.toml.a3b2only.diff
 cc3a5b8dbd993448f33cc6c0329df768  manifests/a3b/README.md
 03371cea0ea723097df37b30258b7734  phase_template/census_collation_guard.sh
-49fd2a525a3ee059e96862afb514bab7  phase_template/cleanup_gated.sh
+aca5103a981a6d5b9f51b3777d1be5c9  phase_template/cleanup_gated.sh
 3f2101c6bd74757a12ba1de7e97aac5b  phase_template/cleanup_lock_evidence_guard.sh
 e893ee7f20e181181bb8205ab7edda0c  phase_template/cleanup_owner_guard.sh
 e8e163eafe17927064ef2e24f448bbfc  phase_template/cleanup_wall_guard.sh
@@ -53,7 +53,7 @@ f60ea7f2564d383ef1d45d13d0cb2232  tools/b2_attribute.sh
 62e2b386e47ce1d93d7bb92ce758d124  tools/binsnap_ancestry_guard_test.sh
 7da335e3f761e8682d04f2ac424ea947  tools/binsnap_fixset.txt
 338c5d78067aa05577ed082dea895211  tools/channel_mirror_server.py
-c742abaa0fda01afbafa3b9418557fbf  tools/cleanup_absent_root_guard.sh
+1828f0ccc4b7708e933308c59e483a7c  tools/cleanup_absent_root_guard.sh
 d46e02ed51852f281f89d4d98184e0f4  tools/cleanup_gate_env_derivation_guard.sh
 c56251e11ce8ab1bd8b807c395265fd4  tools/conda_deny_proxy.py
 fa9f15499e48cf716d7537fc286782eb  tools/derived_region_parse_check.sh

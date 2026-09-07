@@ -50,6 +50,11 @@
 #   S4  MUTATION: the branch's anchor line cut (counted, must be exactly 1) ->
 #       S1's fixture is stranded again, rc 2, no footer. S1 can fail.
 #
+# ── CLEANUP-SEAM-2 (2026-09-07), the same file, one seam further on again ────
+#   J1-J6  a job that died MID-ARM, after staging: its roots hold BYTES, so the
+#       seam-1 branch declines and a SECOND branch decides. The full arm list
+#       sits at the J block below.
+#
 # NOTHING IS EVER DELETED BY THIS GUARD.  The gate under test is run from a COPY
 # in a temp dir beside a STUB `cleanup.sh` that only prints a marker, so the real
 # deletion machinery is not on the path at all; the one root that EXISTS is a
@@ -339,6 +344,169 @@ else
   [ -d "$S4A" ] && ok "S4: the mutant left the root stranded, which is the whole finding" || bad "S4: the mutant deleted it anyway"
 fi
 
+
+# ── J1-J6: CLEANUP-SEAM-2 (2026-09-07), the job that died MID-ARM ────────────
+# 6014484 refused certD16-6014471, certD6A-6014471, ws.D6A-6014471 and the
+# per-arm isolated cache forever. 6014471 was NOT refused by its preamble -- it
+# staged, ran arm W1 for 865 s and arm W2 for 86 s, and both wrappers exited 7
+# in `retread_scope_sdist_builds`. A wrapper that exits 7 writes no `.rc`, no
+# `.wall` and no `.lock.log`, so condition 1 reported all three MISSING.
+#
+# THE FIXTURES CARRY THE DISTINGUISHING PROPERTY, not a sketch of it: a
+# seam-2 root HOLDS FILES. That is exactly why `setup_refused_check` cannot be
+# widened to cover this case and why J1 asserts the seam-1 branch printing
+# `SETUP-REFUSED NOT TAKEN` before seam 2 decides -- two branches, two
+# conditions, and the arms prove the first one still declines.
+#
+#   J1  fatal row + sacct FAILED + unsealed roots WITH FILES -> removed through
+#       `cleanup.sh`, footer `### CLEANUP JOB-FATAL roots=2 removed=2 ...`
+#       quoting the row it acted on, both paths named, both really gone.
+#   J2  the same fatal row, but sacct says COMPLETED -> REFUSED. A row in a log
+#       is a claim; the accounting record is the fact, and a driver that
+#       swallowed its rc must not unlock the reaper.
+#   J3  the same fatal row, sacct FAILED, but one root holds a SEALED
+#       (write-stripped) subtree -> refused, `cleanup.sh` never called.
+#   J4  ZERO IS NOT FATAL: a stdout whose only rows are `WRAPPER EXIT rc=0`,
+#       `job_fatal=0` and `_EXIT=0` -- the SUCCESS rows of the very same
+#       producers -- with sacct FAILED. The branch must be SILENT, or every
+#       green job in the campaign is reapable by its own success rows.
+#   J5  THE det161b STDOUT SHAPE. `D` derives to the PER-ARM root (artifacts/
+#       only) while the driver's stdout lives in a DIFFERENT directory under the
+#       task root. The old `find "$D" -maxdepth 2` found nothing, so a branch
+#       keyed on the job's own stdout was silent on the one job it was written
+#       for. The fallback must find it, ANNOUNCE the widening, and reap.
+#   J6  MUTATION: the branch's anchor line cut (counted, exactly 1) -> J1's
+#       fixture is stranded again, rc 2, no footer. J1 can fail.
+JF_ROW='### ARM W1 WRAPPER EXIT rc=7 arm wall=865s 2026-09-07T04:41:35-04:00'
+RJ_J5=98$$                    # its own job id: the $T fallback must not see the
+                              # S-arm fixtures' logs, which share $RJ
+
+mk_fatal_harness () {   # mk_fatal_harness <dir> <tag> <rj> <fatal: yes|no|nolog>
+  mkdir -p "$1/artifacts"
+  printf '%s\n' "$2-$3 owed roots" > "$1/artifacts/$2-$3.reap-owed.txt"
+  [ "$4" = nolog ] && return 0
+  mkdir -p "$1/logs"
+  if [ "$4" = yes ]; then
+    { printf '### SMOKE stage: PUBLISHED key=85db7fdb wall=879s\n'
+      printf '%s\n' "$JF_ROW"
+      printf '### %s DET-1-6 PROOF DONE job_fatal=1 2026-09-07T04:43:03-04:00\n' "$2"
+      printf '### JFGUARD_EXIT=1\n'
+    } > "$1/logs/jfguard-$3.out"
+  else
+    # The SUCCESS rows of the same four producers. Nothing here may match.
+    { printf '### SMOKE stage: PUBLISHED key=85db7fdb wall=879s\n'
+      printf '### ARM W1 WRAPPER EXIT rc=0 arm wall=865s 2026-09-07T04:41:35-04:00\n'
+      printf '### %s DET-1-6 PROOF DONE job_fatal=0 2026-09-07T04:43:03-04:00\n' "$2"
+      printf '### JFGUARD_EXIT=0\n'
+      printf '### PREAMBLE JOB REFUSED BEFORE ARM 1. MULTIARM_JOB_FATAL=0\n'
+    } > "$1/logs/jfguard-$3.out"
+  fi
+}
+# A root of the shape seam 1 must DECLINE: it holds bytes.
+mk_staged_root () { mkdir -p "$1/pixi/pkgs" "$1/g/fast-tmp"; printf 'staged\n' > "$1/pixi/pkgs/blob.tar"; }
+# The `sacct` the gate will find on PATH. It is the ONLY thing shimmed, and only
+# for the J arms: the A/M/S arms keep the real one, which returns EMPTY for a job
+# id no scheduler ever issued -- verified at $RJ before this guard was written.
+mk_sacct () { mkdir -p "$1"; printf '#!/usr/bin/env bash\necho "%s"\n' "$2" > "$1/sacct"; chmod +x "$1/sacct"; }
+runp() {  # runp <bindir> <bed> <log> <roots...>
+  local bin=$1 bed=$2 log=$3; shift 3
+  ( PATH="$bin:$PATH" env -u D -u TAG -u RJ -u OJ bash "$bed/cleanup_gated.sh" "$@" ) > "$log" 2>&1
+  echo $?
+}
+BIN_FAILED=$W/bin-failed;  mk_sacct "$BIN_FAILED" FAILED
+BIN_DONE=$W/bin-done;      mk_sacct "$BIN_DONE"   COMPLETED
+
+TAG_J1=GUARDJ1$$;  HD_J1=$T/guard-j1-$$;  mk_fatal_harness "$HD_J1" "$TAG_J1" "$RJ" yes
+TAG_J2=GUARDJ2$$;  HD_J2=$T/guard-j2-$$;  mk_fatal_harness "$HD_J2" "$TAG_J2" "$RJ" yes
+TAG_J3=GUARDJ3$$;  HD_J3=$T/guard-j3-$$;  mk_fatal_harness "$HD_J3" "$TAG_J3" "$RJ" yes
+TAG_J4=GUARDJ4$$;  HD_J4=$T/guard-j4-$$;  mk_fatal_harness "$HD_J4" "$TAG_J4" "$RJ" no
+TAG_J5=GUARDJ5$$;  HD_J5=$T/guard-j5-$$;  mk_fatal_harness "$HD_J5" "$TAG_J5" "$RJ_J5" nolog
+HD_J5LOG=$T/guard-j5log-$$;  mkdir -p "$HD_J5LOG/logs"
+{ printf '%s\n' "$JF_ROW"; } > "$HD_J5LOG/logs/det-$RJ_J5.out"
+trap 'chmod -R u+w "$W" 2>/dev/null; rm -rf "$HD_BAD" "$HD_OK" "$HD_SR" "$HD_NR" "$HD_J1" "$HD_J2" "$HD_J3" "$HD_J4" "$HD_J5" "$HD_J5LOG" "$W"' EXIT
+
+# ---- J1: died mid-arm, roots hold bytes, sacct FAILED -> REMOVED ------------
+J1A=$W/roots/cert$TAG_J1-$RJ;      mk_staged_root "$J1A"
+J1B=$W/roots/ws.$TAG_J1-$RJ;       mk_staged_root "$J1B"
+rc=$(runp "$BIN_FAILED" "$RMBED" "$W/J1.log" "$J1A" "$J1B")
+[ "$rc" = 0 ] && ok "J1: a job that died MID-ARM has its roots reclaimed (rc=0)" \
+  || { bad "J1: rc=$rc, want 0 -- this is 6014484's permanent refusal"; sed 's/^/      /' "$W/J1.log"; }
+grep -qF '### CLEANUP JOB-FATAL roots=2 removed=2' "$W/J1.log" \
+  && ok "J1: the footer counts both roots and both removals" \
+  || bad "J1: footer wrong: $(grep -F 'CLEANUP JOB-FATAL' "$W/J1.log" || echo '<no footer>')"
+grep -qF "fatal_row=\"$JF_ROW\"" "$W/J1.log" \
+  && ok "J1: and the footer QUOTES the row it acted on" \
+  || bad "J1: the footer does not quote the fatal row: $(grep -F 'CLEANUP JOB-FATAL' "$W/J1.log" || echo '<none>')"
+grep -q 'SETUP-REFUSED NOT TAKEN' "$W/J1.log" \
+  && ok "J1: seam 1 DECLINED first (the roots hold bytes) -- the two branches are distinct" \
+  || bad "J1: seam 1 said nothing about declining; the fixture may not hold files"
+{ [ ! -e "$J1A" ] && [ ! -e "$J1B" ]; } \
+  && ok "J1: both roots are really gone from disk" || bad "J1: a root survived"
+
+# ---- J2: the same row, but sacct says COMPLETED -> REFUSE -------------------
+J2A=$W/roots/cert$TAG_J2-$RJ; mk_staged_root "$J2A"
+rc=$(runp "$BIN_DONE" "$NEWBED" "$W/J2.log" "$J2A")
+[ "$rc" = 2 ] && ok "J2: a fatal ROW with a COMPLETED accounting record refuses (rc=2)" \
+  || bad "J2: rc=$rc, want 2 -- a lying row unlocked the reaper"
+grep -q 'JOB-FATAL NOT TAKEN' "$W/J2.log" && grep -q "not FAILED/TIMEOUT" "$W/J2.log" \
+  && ok "J2: and it says WHY -- the row is a claim, sacct is the fact" \
+  || bad "J2: no sacct refusal row: $(grep -m1 'JOB-FATAL' "$W/J2.log" || echo '<no JOB-FATAL row at all>')"
+grep -qF "$STUBMARK" "$W/J2.log" && bad "J2: cleanup.sh was called on a job Slurm says completed" \
+  || ok "J2: cleanup.sh was NOT called"
+[ -d "$J2A" ] && ok "J2: the root is still on disk" || bad "J2: THE ROOT WAS DELETED"
+
+# ---- J3: fatal row + FAILED, but a SEALED subtree -> REFUSE -----------------
+J3A=$W/roots/cert$TAG_J3-$RJ; mk_staged_root "$J3A"; chmod a-w "$J3A/g/fast-tmp"
+rc=$(runp "$BIN_FAILED" "$NEWBED" "$W/J3.log" "$J3A")
+[ "$rc" = 2 ] && ok "J3: a SEALED (write-stripped) subtree still refuses (rc=2)" || bad "J3: rc=$rc, want 2"
+grep -q 'JOB-FATAL NOT TAKEN' "$W/J3.log" && grep -q 'SEALED' "$W/J3.log" \
+  && ok "J3: and it says WHY -- a provisioned store is a reap question, not a strand question" \
+  || bad "J3: no sealed-tree refusal row"
+grep -qF "$STUBMARK" "$W/J3.log" && bad "J3: cleanup.sh was called over a sealed tree" \
+  || ok "J3: cleanup.sh was NOT called"
+[ -d "$J3A" ] && ok "J3: the sealed root is still on disk" || bad "J3: THE SEALED ROOT WAS DELETED"
+chmod -R u+w "$J3A" 2>/dev/null
+
+# ---- J4: ZERO IS NOT FATAL --------------------------------------------------
+J4A=$W/roots/cert$TAG_J4-$RJ; mk_staged_root "$J4A"
+rc=$(runp "$BIN_FAILED" "$NEWBED" "$W/J4.log" "$J4A")
+[ "$rc" = 2 ] && ok "J4: a stdout carrying only the SUCCESS rows of the same producers refuses (rc=2)" \
+  || bad "J4: rc=$rc, want 2 -- rc=0/job_fatal=0/_EXIT=0 matched the fatal family"
+grep -q 'JOB-FATAL' "$W/J4.log" \
+  && bad "J4: the branch spoke for a job whose rows are all zero: $(grep -m1 'JOB-FATAL' "$W/J4.log")" \
+  || ok "J4: the branch is SILENT -- zero is not fatal, and condition 1 decides"
+[ -d "$J4A" ] && ok "J4: nothing was deleted" || bad "J4: THE ROOT IS GONE"
+
+# ---- J5: the det161b stdout shape -- D has no logs/ --------------------------
+J5A=$W/roots/cert$TAG_J5-$RJ_J5; mk_staged_root "$J5A"
+rc=$(runp "$BIN_FAILED" "$RMBED" "$W/J5.log" "$J5A")
+[ "$rc" = 0 ] && ok "J5: the job's stdout is found outside D and the root is reclaimed (rc=0)" \
+  || { bad "J5: rc=$rc, want 0 -- the finder is still blind to det161b's shape"; sed 's/^/      /' "$W/J5.log"; }
+grep -q "### JOB STDOUT: none under D=" "$W/J5.log" \
+  && ok "J5: and the widening is ANNOUNCED, not silent" \
+  || bad "J5: no fallback announcement row"
+grep -qF '### CLEANUP JOB-FATAL roots=1 removed=1' "$W/J5.log" \
+  && ok "J5: the footer counts the one root" || bad "J5: footer wrong"
+[ ! -e "$J5A" ] && ok "J5: the root is really gone" || bad "J5: the root survived"
+
+# ---- J6: THE MUTATION -- the branch cut out of the new file ------------------
+MUTJ=$W/cleanup_gated.MUTJ.sh
+sed 's/^job_fatal_check   # JOB-FATAL-BRANCH (MUTATION ANCHOR)$/: # MUTATION: the job-fatal branch is cut/' "$SRC" > "$MUTJ"
+mutj=$(diff "$SRC" "$MUTJ" | grep -c '^< ')
+if [ "$mutj" -ne 1 ]; then
+  bad "J6: the mutation changed $mutj line(s), want exactly 1 -- J1 cannot fail, so it proves nothing"
+else
+  MUTJBED=$W/mutj; mk_bed_rm "$MUTJBED" "$MUTJ"
+  J6A=$W/roots/cert$TAG_J1-$RJ-J6; mk_staged_root "$J6A"
+  rc=$(runp "$BIN_FAILED" "$MUTJBED" "$W/J6.log" "$J6A")
+  { [ "$rc" = 2 ] && grep -q '### CLEANUP REFUSED -- nothing deleted' "$W/J6.log"; } \
+    && ok "J6: THE DEFECT, REPRODUCED -- with the branch cut, 6014484's permanent refusal comes straight back (rc=$rc)" \
+    || bad "J6: the mutant did not reproduce the stranding (rc=$rc) -- J1 cannot fail; read $W/J6.log"
+  grep -qF '### CLEANUP JOB-FATAL' "$W/J6.log" \
+    && bad "J6: the mutant still printed the footer -- the anchor is not the branch" \
+    || ok "J6: and the mutant prints no JOB-FATAL footer at all"
+  [ -d "$J6A" ] && ok "J6: the mutant left the root stranded, which is the whole finding" || bad "J6: the mutant deleted it anyway"
+fi
 echo "### MERGE-N-1 absent-root guard: pass=$pass fail=$fail"
 [ "$fail" = 0 ] || exit 1
 exit 0
