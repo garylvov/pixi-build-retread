@@ -183,15 +183,36 @@ OWNER_CENSUS_COMPARE_DEPTH=${OWNER_CENSUS_COMPARE_DEPTH-16}
 # owner submitted with `--export=ALL,...` is held by Slurm with
 # `user env retrieval failed requeued held` and nothing in this harness reads
 # that reason, so refusing here is the loud failure law 9 asks for.
-OE=$HERE/../tools/owner_export.sh
-[ -f "$OE" ] || OE=$HERE/owner_export.sh
+# OWNER-EXPORT-2 / MERGE-V-2-3 (2026-09-07). THE SPELLINGS ARE THE POINT.
+# In the REPO the pair is harness/phase_template/owner_snapshot.sh beside
+# harness/tools/owner_export.sh, so `$HERE/../tools/` finds it. In the TASK
+# layout the synced pair is <task>/tools/phase_template/owner_snapshot.sh beside
+# <task>/tools/owner_export.sh, so the sibling is `$HERE/../` -- and that
+# spelling was MISSING. `$HERE/../tools/` resolves to <task>/tools/tools/ and
+# `$HERE/` to <task>/tools/phase_template/, neither of which exists, so every
+# production run in the task layout died `### OWNER SNAPSHOT REFUSED: no
+# owner_export.sh` rc 2 while owner_export_guard.sh was green 27/0 -- its
+# fixture drives the REPO-shaped copy (CLAUDE.md law 7 hazard b: two copies of
+# one module is the normal state, and path order alone decides which is read).
+# The fix is the multi-spelling ladder the relock templates already use for
+# STAGE_MIRROR_LIB: every layout named, none guessed, and the winner PRINTED so
+# a job log answers "which copy did this run import" without re-deriving it.
+OE=$HERE/owner_export.sh
+[ -f "$OE" ] || OE=$HERE/../owner_export.sh          # task:  <task>/tools/
+[ -f "$OE" ] || OE=$HERE/../tools/owner_export.sh    # repo:  harness/tools/
+[ -f "$OE" ] || OE=/oscar/data/stellex/glvov/agrescap/tasks/retread-4-11/tools/owner_export.sh
 [ -f "$OE" ] || {
   echo "### OWNER SNAPSHOT REFUSED: no owner_export.sh -- the generated owner would have to"
   echo "###   build its own --export clause, and the last time two sites built that clause"
   echo "###   four owners sat held for days (REAP-3: 6013350 6013351 6014485 5841188)."
+  echo "###   Looked in, in order: \$HERE/ \$HERE/../ \$HERE/../tools/ and the task tree,"
+  echo "###   with HERE=$HERE."
   exit 2; }
 # shellcheck disable=SC1090
 . "$OE"
+# The reader for the ladder above: one grep over any job log says which copy of
+# the ONE producer that job actually sourced.
+echo "### OWNER SNAPSHOT export_lib=$OE"
 
 # ONE derivation, defined once and SHIPPED into the generated owner.sbatch by
 # `declare -f` below, so the number the submitter derives and the number the

@@ -36,7 +36,7 @@ ba303c2cd1f2c2c4261567b4496c78ed  phase_template/env_seed_export_guard.sh
 7a1fc4ce6b54ac46828fed8f7906f252  phase_template/lane_wrapper.sbatch
 a2515c75fe18f95fda20b4d8156728ea  phase_template/leftover_check_guard.sh
 180ae6dbf5d68f70a92eefb3619d056f  phase_template/link_mode_guard.sh
-791d307f391cd4a73f8fb2f512d73104  phase_template/owner_snapshot.sh
+ea534b93cbb40c93f101154a64a102a8  phase_template/owner_snapshot.sh
 62c2899e8832e49566e855d7dc20a73b  phase_template/owner_snapshot_provenance_guard.sh
 e8e04e6bef93261dbd2035ecd9a19d13  phase_template/phaseN_cert.sh
 7aa9b72fba166fbade2a2eb751483f17  phase_template/phaseN_relock.sh
@@ -98,7 +98,7 @@ b8e2a0d5ecfbcf0e7a444f13b354a8e6  tools/multiarm_preamble.sh
 f7be958f4f868c6d22eca3ef9f382c7d  tools/mutation_arms.sh
 cbfb1b91ab68fab2110b94fdae2446ad  tools/mutation_arms_guard.sh
 ce7b2d1c8d2fa3d20dec5e43c66e51f8  tools/owner_export.sh
-91ed5bc86aeeef0d2d14c4048fe97f22  tools/owner_export_guard.sh
+f7e91b9c4747001e98d0e51e7cc4bf77  tools/owner_export_guard.sh
 2a59e952d4d6701639eaefffe39e5902  tools/p6ad_PREDICTION.md
 1fa8e8023be66e2f6cffbb86905f1b42  tools/p6ad_freeze_guard.sh
 3232909035475da53f3762d6c4dee5ce  tools/p6ad_negctl.sh

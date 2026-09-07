@@ -32,6 +32,15 @@
 #      short wall so `owner_wall_check` takes its continuation branch; the argv
 #      the shim recorded must carry an explicit clause, no `ALL`, and the bumped
 #      OWNER_CONT_N.
+#   E  THE TASK LAYOUT (MERGE-V-2-3). Arms C and D drive the REPO-shaped copy.
+#      Production runs the SYNCED copy, <task>/tools/phase_template beside
+#      <task>/tools, whose sibling spelling is `$HERE/../` -- and that spelling
+#      was missing, so the production copy refused rc 2 on every run while this
+#      guard was green 27/0. Arm E builds the task shape and drives it end to
+#      end, and reads the `### OWNER SNAPSHOT export_lib=` row to say WHICH copy
+#      of the producer was sourced.
+#   F  MUTATION for E: delete the task spellings from a copy and the SAME
+#      fixture refuses rc 2 again -- the production defect, reproduced.
 set -uo pipefail
 HERE=$(cd -- "$(dirname -- "$0")" && pwd)
 ROOT=$(cd -- "$HERE/.." && pwd)                 # the harness/ tree
@@ -246,6 +255,62 @@ EOS
   fi
 fi
 
+
+# ---- ARM E: THE TASK LAYOUT, WHICH IS WHERE PRODUCTION RUNS -----------------
+# MERGE-V-2-3. Every arm above drives the REPO-shaped copy: harness/phase_template
+# beside harness/tools. Production runs the SYNCED copy, <task>/tools/phase_template
+# beside <task>/tools -- a different sibling spelling entirely -- and this guard
+# was green 27/0 while that copy refused rc 2 on every run, because it had never
+# been asked to run in the shape it ships in. CLAUDE.md law 7 hazard (b): two
+# copies of one module is the normal state here, and path order alone decides
+# which one a process reads, so a fixture that only builds one shape measures
+# one shape.
+TASK=$W/task2
+mkdir -p "$TASK/tools/phase_template" "$TASK/merge-h" "$TASK/roots"
+cp "$SNAPT" "$TASK/tools/phase_template/owner_snapshot.sh"
+cp "$PROD"  "$TASK/tools/owner_export.sh"
+printf '3333333333333333333333333333333333333333\n' > "$TASK/tools/.harness_synced_commit"
+cp "$FAKE/cleanup_gated.sh" "$TASK/merge-h/cleanup_gated.sh"
+TROOT=$TASK/roots/certE99-123456; mkdir -p "$TROOT/a/b"; : > "$TROOT/a/b/f1"; : > "$TROOT/a/f2"
+TJR=$W/jobroot_task; mkdir -p "$TJR"
+( cd "$TASK" && bash "$TASK/tools/phase_template/owner_snapshot.sh" "$TJR" "$TASK/merge-h/cleanup_gated.sh" --roots "$TROOT" ) > "$W/snapE.out" 2>&1
+ERC=$?
+if grep -q 'OWNER SNAPSHOT REFUSED: no owner_export.sh' "$W/snapE.out"; then
+  bad "E the TASK-shaped copy still refuses to find its sibling owner_export.sh (rc=$ERC) -- MERGE-V-2-3 is not fixed:"
+  sed 's/^/###     /' "$W/snapE.out" | head -8
+else
+  ok "E the TASK-shaped copy (<task>/tools/phase_template beside <task>/tools) resolves owner_export.sh"
+fi
+ELIB=$(grep -m1 '^### OWNER SNAPSHOT export_lib=' "$W/snapE.out" | sed 's/^### OWNER SNAPSHOT export_lib=//')
+if [ "$ELIB" = "$TASK/tools/owner_export.sh" ]; then
+  ok "E the run PRINTED which copy it sourced, and it is the task one ($ELIB)"
+else
+  bad "E export_lib row is '$ELIB', want '$TASK/tools/owner_export.sh' -- a job log cannot say which producer it read"
+fi
+if [ -f "$TJR/owner-snapshot/owner.sbatch" ]; then
+  ok "E the TASK-shaped copy went on to generate owner.sbatch end to end (rc=$ERC)"
+else
+  bad "E the TASK-shaped copy produced no owner.sbatch (rc=$ERC):"; sed 's/^/###     /' "$W/snapE.out" | head -12
+fi
+
+# ---- ARM F: THE MUTATION, which is the production defect itself -------------
+# Delete the two task spellings from a COPY and the SAME fixture must go back to
+# refusing rc 2. Without this, arm E says only that some ladder exists.
+MUT=$TASK/tools/phase_template/owner_snapshot.mut.sh
+grep -v '^\[ -f "\$OE" \] || OE=\$HERE/\.\./owner_export\.sh' "$SNAPT" \
+  | grep -v '^\[ -f "\$OE" \] || OE=/oscar/data/stellex/glvov/agrescap/tasks/' > "$MUT"
+MJR=$W/jobroot_mut; mkdir -p "$MJR"
+if bash -n "$MUT" 2>/dev/null && [ "$(grep -c '^\[ -f "\$OE" \] || OE=' "$MUT")" -lt "$(grep -c '^\[ -f "\$OE" \] || OE=' "$SNAPT")" ]; then
+  ( cd "$TASK" && bash "$MUT" "$MJR" "$TASK/merge-h/cleanup_gated.sh" --roots "$TROOT" ) > "$W/snapF.out" 2>&1
+  MRC=$?
+  if [ "$MRC" = 2 ] && grep -q 'OWNER SNAPSHOT REFUSED: no owner_export.sh' "$W/snapF.out"; then
+    ok "F MUTATION -- with the task spellings removed the SAME fixture refuses rc 2 again, so arm E is a real resolution and not a constant"
+  else
+    bad "F the mutant did NOT refuse (rc=$MRC) -- arm E proves nothing"
+  fi
+else
+  bad "F could not build the spelling-removed mutant of owner_snapshot.sh"
+fi
 say "rc=$fail"
 [ "$fail" = 0 ] && { say "ALL ARMS PASS"; exit 0; }
 say "FAILED"; exit 1
