@@ -961,6 +961,100 @@ else
   echo "### STORE-REAP CENSUS (BEFORE LOCK): SKIPPED -- no store_reap_census.sh beside this template nor at \$T/tools"
 fi
 
+
+# --- READERS-2-1: A LANDING CRITERION MUST HAVE A FROZEN PRODUCER ------------
+# THE DEFECT. B29's relock judged its git-snapshot landing criterion against the
+# SHARED persistent store root read LIVE at judgement time
+# ($RETREAD_PERSIST_CACHE_ROOT/git-snapshots/canonical-git-sources, exported by
+# retread_fast_env's C18-1 default-on flip). Two runs of the same relock over
+# the same landing reported census_rows 5 and then 3 -- not because the landing
+# changed, but because other jobs write that root while a lock is running. A
+# criterion whose input can move under it is not a criterion; it is a coin, and
+# it had been flipping in silence.
+#
+# THE FIX, AND WHY IT IS A FILE AND NOT A VARIABLE. Freeze the listing to a file
+# in the JOB ROOT before the lock, and judge against the FILE. A shell variable
+# would freeze the number too, but it dies with the process, cannot be audited
+# after the fact, and cannot be handed to the phase-2 cert or to an analyzer
+# that runs hours later in a different job -- which is exactly where these
+# criteria are read. The frozen file is the evidence packet's copy of the input
+# the verdict was computed from.
+#
+# BOTH NUMBERS, ONE RELEASE. store_census_release prints frozen AND live on one
+# line. Hiding the live number would trade one blindness for another: a store
+# that grew by six generations under the lock is a fact the packet should carry,
+# it is just not the fact the verdict is allowed to depend on.
+#
+# A MISSING SNAPSHOT IS A REFUSAL, NOT A FALLBACK. store_census_frozen_rows
+# returns non-zero and prints FATAL when it is asked for a label nobody
+# snapshotted, so a criterion can never quietly degrade back to reading the
+# live store -- which is the whole defect, reintroduced by omission.
+# Reader: phase_template/store_census_snapshot_guard.sh.
+store_census_file () { printf '%s\n' "$A/${TAG}-$J.census-$1.tsv"; }
+
+store_census_live_rows () {      # $1 = subtree root; generation DIRECTORIES only
+  # Directories only, on purpose: the reap try-lock beside the generations is a
+  # FILE and the reaper's walk skips it, so counting it would make the criterion
+  # disagree with the walk it is judging.
+  find "$1" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l
+}
+
+store_census_snapshot () {       # $1 = label, $2 = subtree root. BEFORE THE LOCK.
+  local label=$1 root=$2 out n
+  out=$(store_census_file "$label")
+  find "$root" -maxdepth 1 -mindepth 1 -printf '%y\t%f\n' 2>/dev/null | LC_ALL=C sort > "$out"
+  n=$(grep -c '^d' "$out")
+  printf '%s\n' "$n" > "$out.rows"
+  echo "### CENSUS SNAPSHOT rows=$n file=$out"
+  echo "### CENSUS SNAPSHOT label=$label root=$root taken=$(date -Is)"
+}
+
+store_census_frozen_rows () {    # $1 = label -> echoes the FROZEN count, or REFUSES
+  local label=$1 out
+  out=$(store_census_file "$label")
+  if [ ! -f "$out.rows" ]; then
+    echo "### FATAL CENSUS: no snapshot was taken for label='$label', so there is" >&2
+    echo "###        nothing frozen to judge against. Refusing rather than falling" >&2
+    echo "###        back to a live read of a store other jobs are writing --" >&2
+    echo "###        that fallback IS the READERS-2-1 defect." >&2
+    echo "###        ACTUATOR: call store_census_snapshot '$label' <root> before the lock." >&2
+    return 1
+  fi
+  cat "$out.rows"
+}
+
+store_census_release () {        # $1 = label, $2 = subtree root. BOTH numbers, one line.
+  local label=$1 root=$2 frozen live
+  frozen=$(store_census_frozen_rows "$label") || return 1
+  live=$(store_census_live_rows "$root")
+  echo "### CENSUS RELEASE label=$label frozen=$frozen live=$live delta=$((live - frozen)) file=$(store_census_file "$label")"
+}
+
+store_census_judge_present () {  # $1 = label. THE CRITERION, judged from the FILE.
+  # "the store the reapers were asked to walk was PRESENT when this lock
+  # started". Judged frozen, because a store that appears or empties AFTER the
+  # lock must not be able to flip a verdict about the lock.
+  local label=$1 frozen
+  frozen=$(store_census_frozen_rows "$label") || return 1
+  if [ "$frozen" -eq 0 ]; then
+    echo "### CENSUS CRITERION label=$label REFUSED: the frozen listing counted ZERO"
+    echo "###        generation directories, so every reaper row this run prints is"
+    echo "###        over a store that was not there -- 'nothing over-age' and"
+    echo "###        'nowhere to look' are not the same reading."
+    echo "###        ACTUATOR: confirm RETREAD_GIT_SNAPSHOT_STORE points at the"
+    echo "###        persistent root (retread_fast_env exports it) before reading"
+    echo "###        any reap row from this job."
+    return 1
+  fi
+  echo "### CENSUS CRITERION label=$label ok: frozen generation_dirs=$frozen (judged from the snapshot file, never from a live re-read)"
+}
+
+# THE PRODUCTION CALL SITE (law 2: a capability with no caller is the same
+# defect as a criterion with no producer). The git-snapshot store is the SHARED
+# persistent one and it is the root every merge lane's census criterion is about.
+GIT_SNAPSHOT_GENS=${RETREAD_GIT_SNAPSHOT_STORE:-${RETREAD_PERSIST_CACHE_ROOT:-/oscar/data/stellex/glvov/agrescap/cache/retread}/git-snapshots}/canonical-git-sources
+store_census_snapshot git-snapshots "$GIT_SNAPSHOT_GENS"
+store_census_judge_present git-snapshots || echo "### CENSUS CRITERION git-snapshots refused (reported; a census must never fail a relock, and the refusal above names the actuator)"
 ########## 3. LOCK ($EXPECT_ENVS envs, no pre-existing pixi.lock) ##########
 cd "$WS" || exit 5
 LLOG=$A/${TAG}-$J.lock.log
@@ -995,6 +1089,7 @@ LW=$(( $(date +%s) - S ))
 echo "### lock rc=$LRC wall=${LW}s end $(date -Is)"
 echo "$LRC" > "$A/${TAG}-$J.rc"; echo "$LW" > "$A/${TAG}-$J.wall"
 wheel_store_census 'AFTER LOCK'
+store_census_release git-snapshots "$GIT_SNAPSHOT_GENS" || true
 
 # The READER for the stage mirror's writer. A relock that wrote through a
 # hardlink into the shared mirror has poisoned it for every later batch, and the
