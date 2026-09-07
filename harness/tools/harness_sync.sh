@@ -29,7 +29,17 @@
 #      directory and then `mv -f` over the name.  bash reads a script
 #      INCREMENTALLY: overwriting a file a running job is executing feeds it the
 #      second half of a different script.  A rename leaves the running process
-#      on the old inode and is the only safe way to write into a live task dir.
+#      second half of a different script.  A rename leaves the running process
+#      on the old inode -- BUT ONLY WHEN THE RENAMER AND THE READER SIT ON THE
+#      SAME NFS CLIENT.  A sync driven from the login node never does: NFS
+#      silly-rename protects only the RENAMING client's own opens, so a job
+#      reading that file on another node has its inode unlinked underneath it,
+#      bash's next incremental read returns an error, bash treats the error as
+#      EOF and EXITS with the status of its last completed command -- rc 0, the
+#      first rows only, and no error anywhere.  PROOF-SMOKE-1-1 measured exactly
+#      that (fixture job 5995889, five arms) and it is the signature of 5993691.
+#      So the rename is NECESSARY AND NOT SUFFICIENT, and the thing that makes a
+#      sync safe is the PRE-INSTALL READ-SET REFUSAL below (rc 6), not the mv.
 #
 # AND IT NAMES AN IN-PLACE EDIT BEFORE A JOB DIES FOR IT (`--check`).  The drift
 # check answers "does this match the commit I was told to be?"; `--check`
@@ -47,11 +57,19 @@
 #     HARNESS_REPO       default /oscar/data/stellex/glvov/agrescap/worktrees/harness-tools
 #     HARNESS_SQUEUE     the squeue to ask about PENDING jobs (default `squeue`)
 #
+#   --running-list <file>  TEST-ONLY, the guard's shim for the rc-6 check. Rows
+#          `<jid> <name> <workdir> <sbatch path or ->`, used INSTEAD of the live
+#          `squeue -t R` + `scontrol show job`. Nothing in production passes it.
+#
 #   rc 0  synced (or --check found nothing edited)
 #   rc 2  FATAL: bad arguments, no repo, no such commit, no mapping library
 #   rc 3  --check: at least one task copy differs from the last synced commit
 #   rc 4  REFUSED: a PENDING job of ours is pinned to a different commit
 #   rc 5  a file failed to install or failed its md5 verification
+#   rc 6  REFUSED: a RUNNING job of ours may still be READING a file this sync
+#         would install.  A cross-NFS-client rename is NOT atomic for a reader
+#         on another node -- it truncates that reader's script silently.
+#         (HARNESS-SYNC-3.)  Override: --force --reason "<why>".
 #
 # THE MAPPING IS NOT DUPLICATED HERE.  A writer with its own copy of the table
 # would eventually install a set its own checker does not read, which is the
@@ -81,7 +99,7 @@ SQUEUE="${HARNESS_SQUEUE:-squeue}"
 RECORD_REL="tools/.harness_synced_commit"
 RECORD="$TASK_DIR/$RECORD_REL"
 
-MODE=sync; COMMIT=; FORCE=0; REASON=; ADDS=
+MODE=sync; COMMIT=; FORCE=0; REASON=; ADDS=; RUNLIST=
 while [ $# -gt 0 ]; do
   case "$1" in
     --check)  MODE=check;;
@@ -89,6 +107,8 @@ while [ $# -gt 0 ]; do
     --add)    shift; [ -n "${1:-}" ] || { echo "### SYNC FATAL: --add needs a task-relative path" >&2; exit 2; }
               ADDS="$ADDS $1";;
     --add=*)  ADDS="$ADDS ${1#--add=}";;
+    --running-list) shift; RUNLIST="${1:-}";;
+    --running-list=*) RUNLIST="${1#--running-list=}";;
     --reason) shift; REASON="${1:-}";;
     --reason=*) REASON="${1#--reason=}";;
     -*)       echo "### SYNC FATAL: unknown flag '$1'" >&2; exit 2;;
@@ -260,6 +280,139 @@ if [ -s "$REFUSALS" ]; then
   echo "###   ^ copy this line into the lane log row for this sync."
 fi
 
+# ---- THE READ SET OF EVERY RUNNING JOB, BEFORE A SINGLE BYTE (HARNESS-SYNC-3) -
+# rc 6, and it is the guard the rename is NOT.  `mv -f` over a name is atomic
+# for readers ON THE RENAMING CLIENT.  It is not atomic for a reader on another
+# node: NFS silly-rename hides the old inode behind `.nfsXXXX` only for opens
+# THIS client holds, so the job reading the script on node2xxx has its file
+# unlinked, bash's next incremental read errors, bash treats the error as EOF,
+# and the job EXITS 0 having run only the rows it had already parsed.  That is
+# 5993691 (three tail rows lost, `### LANE_EXIT=0` over `fail=4`) and it is what
+# PROOF-SMOKE-1-1 reproduced deliberately in job 5995889.  The top-level sbatch
+# is immune -- Slurm snapshots it at submit -- but everything it reaches by
+# path (`bash "$T/tools/<f>"`, `source .../tools/<f>`) is not.
+#
+# So: the INSTALL SET (the files whose bytes would actually change) is intersected
+# with the READ SET of every RUNNING job of ours, and a non-empty intersection is
+# a REFUSAL, before the first byte.  A running job whose read set cannot be
+# DETERMINED is treated as reading EVERYTHING -- an unreadable job is not a safe
+# job (law 9).
+INSTSET="$TMP/instset.txt"; : > "$INSTSET"
+while IFS='|' read -r trel w; do
+  [ -n "$w" ] || continue
+  git -C "$REPO" cat-file blob "$SHA:$w" > "$TMP/preblob" 2>/dev/null || continue
+  if [ -f "$TASK_DIR/$trel" ] &&
+     [ "$(md5sum "$TASK_DIR/$trel" | awk '{print $1}')" = "$(md5sum "$TMP/preblob" | awk '{print $1}')" ]; then
+    continue
+  fi
+  printf '%s\n' "$trel" >> "$INSTSET"
+done < "$SET"
+
+# Every `bash|source|.` reference in a script, as a BASENAME.  A reference whose
+# basename is a variable is resolved from a same-file assignment (`FAST_ENV=$T/
+# tools/retread_fast_env.sh` then `. "$FAST_ENV"`, which is det1_proof2.sh); one
+# that still cannot be resolved prints `?` and makes the whole job unknown.
+refs_of () {                      # $1 = script path
+  local f=$1
+  grep -hoE '(^|[[:space:]])(bash|source|\.)[[:space:]]+[^[:space:];&|)]+' "$f" 2>/dev/null \
+  | awk '{print $NF}' | tr -d '\042\047' | while IFS= read -r tok; do
+      local b=${tok##*/} v r
+      case "$b" in
+        *'$'*)
+          v=${b#*\$}; v=${v#\{}; v=${v%%[^A-Za-z0-9_]*}
+          [ -n "$v" ] || { printf '?\n'; continue; }
+          r=$(sed -n "s/^[[:space:]]*$v=.*\/\([A-Za-z0-9_.-]*\.\(sh\|sbatch\|bash\)\).*/\1/p" "$f" | head -1)
+          if [ -n "$r" ]; then printf '%s\n' "$r"; else printf '?\n'; fi;;
+        *.sh|*.sbatch|*.bash) printf '%s\n' "$b";;
+        *) ;;                     # `bash -c`, `. /etc/profile`, flags: not a task copy
+      esac
+    done
+}
+
+RSHITS="$TMP/readset.txt"; : > "$RSHITS"
+if [ -s "$INSTSET" ]; then
+  RUNROWS="$TMP/run.txt"; : > "$RUNROWS"
+  if [ -n "$RUNLIST" ]; then
+    [ -f "$RUNLIST" ] || { echo "### SYNC FATAL: --running-list $RUNLIST does not exist" >&2; exit 2; }
+    grep -v '^[[:space:]]*$' "$RUNLIST" > "$RUNROWS" || :
+  else
+    "$SQUEUE" -u glvov -h -t R -o '%i %j %Z' > "$TMP/rq.txt" 2>/dev/null || : > "$TMP/rq.txt"
+    while read -r jid jname wd; do
+      [ -n "${jid:-}" ] || continue
+      cmd=$(scontrol show job "$jid" 2>/dev/null | tr ' ' '\n' | sed -n 's/^Command=//p' | head -1)
+      printf '%s %s %s %s\n' "$jid" "${jname:--}" "${wd:--}" "${cmd:--}" >> "$RUNROWS"
+    done < "$TMP/rq.txt"
+  fi
+  while read -r jid jname wd script; do
+    [ -n "${jid:-}" ] || continue
+    # IN SCOPE: the job works in this task dir, runs a script from it, or owns a
+    # pin dir here by the same name rule the PIN REPORT uses.
+    scope=0
+    case "${wd:-}"     in "$TASK_DIR"|"$TASK_DIR"/*) scope=1;; esac
+    case "${script:-}" in "$TASK_DIR"|"$TASK_DIR"/*) scope=1;; esac
+    if [ "$scope" = 0 ] && [ -n "${jname:-}" ]; then
+      stem=${jname%%-*}
+      while read -r pd; do
+        b=$(basename -- "$pd")
+        [ "$b" = "$jname" ] && scope=1
+        [ "${jname#"$b"-}" != "$jname" ] && scope=1
+        [ "${b#"$stem"}" != "$b" ] && scope=1
+      done < "$PINDIRS"
+    fi
+    [ "$scope" = 1 ] || continue
+    # THE READ SET: the job's own sbatch, plus one level down -- the driver
+    # scripts it names that sit in the job root.
+    RS="$TMP/rs.$jid.txt"; : > "$RS"
+    if [ -z "${script:-}" ] || [ "$script" = "-" ] || [ ! -f "$script" ]; then
+      printf '?\n' > "$RS"
+    else
+      refs_of "$script" > "$RS"
+      jroot=$(dirname -- "$script")
+      while IFS= read -r rb; do
+        [ "$rb" = '?' ] && continue
+        [ -f "$jroot/$rb" ] || continue
+        refs_of "$jroot/$rb" >> "$RS"
+      done < <(sort -u "$RS")
+    fi
+    if grep -qx '?' "$RS"; then
+      why=unresolved-reference
+      [ -f "${script:-/nonexistent}" ] || why=no-sbatch-found
+      while IFS= read -r trel; do
+        printf '### SYNC REFUSED rc=6 running=%s file=%s reason=%s\n' \
+          "$jid" "$(basename -- "$trel")" "$why" >> "$RSHITS"
+      done < "$INSTSET"
+      continue
+    fi
+    while IFS= read -r trel; do
+      tb=$(basename -- "$trel")
+      grep -qxF -- "$tb" "$RS" || continue
+      printf '### SYNC REFUSED rc=6 running=%s file=%s reason=read-by-%s\n' \
+        "$jid" "$tb" "$(basename -- "$script")" >> "$RSHITS"
+    done < "$INSTSET"
+  done < "$RUNROWS"
+fi
+
+if [ -s "$RSHITS" ]; then
+  sort -u "$RSHITS"
+  if [ "$FORCE" != 1 ] || [ -z "$REASON" ]; then
+    echo "### SYNC REFUSED (rc 6). The job(s) above are RUNNING ON ANOTHER NFS CLIENT and"
+    echo "###   the file(s) named are ones this sync would REWRITE. The rename-install does"
+    echo "###   NOT protect a reader on another node: its inode is unlinked under it, bash"
+    echo "###   reads an error, calls it EOF, and the job exits 0 having run half its rows."
+    echo "###   Wait for the job(s), or -- if you have MEASURED that none of them will read"
+    echo "###   the file again -- re-run with:"
+    echo "###     harness_sync.sh $COMMIT --force --reason \"<why this is the right call>\""
+    [ "$FORCE" = 1 ] && [ -z "$REASON" ] && echo "###   (--force WITHOUT --reason is still a refusal.)"
+    exit 6
+  fi
+  RS_MARK="force-readset commit=$SHA at=$(date -Is) hits=$(sort -u "$RSHITS" | wc -l) reason=$(printf '%s' "$REASON" | tr '\n' ' ')"
+  printf '%s\n' "$RS_MARK" > "$RECORD.force-readset" || {
+    echo "### SYNC FATAL: could not write $RECORD.force-readset" >&2; exit 2; }
+  echo "### SYNC FORCED over the read set of $(sort -u "$RSHITS" | awk '{print $3}' | sort -u | wc -l) RUNNING job(s) reason=$REASON"
+  echo "###   marker: $RECORD.force-readset"
+  echo "###   ^ copy this line into the lane log row for this sync."
+fi
+
 # ---- install: temp file in the TARGET dir, then mv -f -----------------------
 echo "### harness sync: task=$TASK_DIR repo=$REPO commit=$SHA files=$TOTAL"
 inst=0; same=0; failed=0
@@ -324,8 +477,10 @@ echo "### SYNC RECORDED $RECORD = $SHA"
 # gate, and it costs one squeue to print.  Three classes and they are not the
 # same problem:
 #   PENDING  the rc-4 rows above, forced through.  These die on their next start.
-#   RUNNING  SAFE: the job is past its drift gate, which it ran against the
-#            harness that was on disk when it started.  Named for the record.
+#   RUNNING  the job ran its drift gate against the harness on disk at start:
+#            past its DRIFT gate -- drift only. Whether it is still READING an
+#            installed file is a DIFFERENT question, answered BEFORE the install
+#            by the rc-6 read-set check above. Named here for the record.
 #   no job   a stale pin left over from a finished lane. Harmless until somebody
 #            submits behind it -- which is exactly what happened -- so the line
 #            says the actuator: rewrite it AT SUBMIT.
@@ -364,7 +519,7 @@ while read -r pd; do
         "$pd/HARNESS_COMMIT" "$pinsha" "$pd" >> "$PINLINES";;
     *)
       pin_run=$((pin_run + 1))
-      printf '###   %-8s %s pinned=%s job=%s %s -- SAFE, it is past its drift gate\n' \
+      printf '###   %-8s %s pinned=%s job=%s %s -- past its drift gate (drift only; read set checked pre-install)\n' \
         "$jstate" "$pd/HARNESS_COMMIT" "$pinsha" "$jid" "$jname" >> "$PINLINES";;
   esac
 done < "$PINDIRS"
