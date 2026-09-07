@@ -553,6 +553,32 @@ runsync "$RI7" "$TI7" "$WORK/I7_squeue" "$V2I7" --running-list "$WORK/I7_run.txt
   && ok "I(a1c): a reference inside \$( ) is in the read set too (5992569's harness_commit_resolve.sh line)" \
   || { bad "I(a1c): rc=$rcI7 -- a command substitution hid the reference"; sed 's/^/      /' "$WORK/I7.log"; }
 
+# a1d: the BARE DOT, both ways. det1_proof2.sh sources ONE file through a
+# variable (`FAST_ENV=$T/tools/retread_fast_env.sh` ... `. "$FAST_ENV"`) and
+# writes `$(grep -c . "$OB")` four times. A pattern that takes both makes that
+# job undeterminable -- and an undeterminable job refuses EVERY sync for its
+# whole run, which is a rule nobody can work with.
+read -r RI8 TI8 V1I8 V2I8 < <(mkfixture I8)
+mkstub "$WORK/I8_squeue"
+mkdir -p "$TI8/jobroot"
+{ echo '#!/bin/bash'; echo "FAST_ENV=$TI8/tools/a_tool.sh"; echo '. "$FAST_ENV"'; } > "$TI8/jobroot/dot.sbatch"
+printf '8000008 laneI8 %s %s\n' "$TI8" "$TI8/jobroot/dot.sbatch" > "$WORK/I8_run.txt"
+runsync "$RI8" "$TI8" "$WORK/I8_squeue" "$V2I8" --running-list "$WORK/I8_run.txt" > "$WORK/I8.log" 2>&1; rcI8=$?
+[ "$rcI8" -eq 6 ] && grep -q 'file=a_tool.sh reason=read-by-laneI8' "$WORK/I8.log" \
+  && ok "I(a1d): \`. \"\$FAST_ENV\"\` is RESOLVED to its file and refuses BY NAME, not as 'undeterminable'" \
+  || { bad "I(a1d): rc=$rcI8 -- the variable source was not resolved"; sed 's/^/      /' "$WORK/I8.log"; }
+read -r RI9 TI9 V1I9 V2I9 < <(mkfixture I9)
+mkstub "$WORK/I9_squeue"
+mkdir -p "$TI9/jobroot"
+{ echo '#!/bin/bash'; echo 'OB=/tmp/some.rows.txt'; echo 'OB_N=$(grep -c . "$OB")'
+  echo 'HP_N=$(grep -c . "$HPROV")'; echo "bash \"$TI9/tools/harness_drift_check.sh\" x"; } > "$TI9/jobroot/grep.sbatch"
+printf '8000009 laneI9 %s %s\n' "$TI9" "$TI9/jobroot/grep.sbatch" > "$WORK/I9_run.txt"
+runsync "$RI9" "$TI9" "$WORK/I9_squeue" "$V2I9" --running-list "$WORK/I9_run.txt" > "$WORK/I9.log" 2>&1; rcI9=$?
+git -C "$RI9" cat-file blob "$V2I9:harness/tools/a_tool.sh" > "$WORK/I9.blob"
+[ "$rcI9" -eq 0 ] && cmp -s "$WORK/I9.blob" "$TI9/tools/a_tool.sh" \
+  && ok "I(a1d): \`grep -c . \"\$OB\"\` is an ARGUMENT, not a source -- the job stays determinable and the sync proceeds" \
+  || { bad "I(a1d): rc=$rcI9 -- a grep argument was read as a dot-source and refused the sync"; sed 's/^/      /' "$WORK/I9.log"; }
+
 # ---- K: the live read set comes from SLURM'S OWN SNAPSHOT, not from disk ----
 # `--running-list` shims the job LIST; it cannot shim the one live call the list
 # is built from. `sbatch --wrap` and heredoc submissions leave `Command=(null)`

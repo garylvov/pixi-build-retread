@@ -314,7 +314,16 @@ done < "$SET"
 # that still cannot be resolved prints `?` and makes the whole job unknown.
 refs_of () {                      # $1 = script path
   local f=$1
-  grep -hoE '(^|[[:space:]]|[(`;&|])(bash|source|\.)[[:space:]]+[^[:space:];&|)]+' "$f" 2>/dev/null \
+  # TWO patterns, not one.  `bash` and `source` are verbs anywhere a command may
+  # start, INCLUDING inside `$( )` -- that is how 5992569 reaches
+  # harness_commit_resolve.sh.  The BARE DOT is not: in `grep -c . "$OB"` the dot
+  # is an ARGUMENT, and matching it makes det1_proof2.sh look like it sources
+  # four files it never touches, none of them resolvable, which would mark that
+  # job undeterminable and turn EVERY sync into a refusal for its whole run.
+  # So the dot is a verb only in COMMAND POSITION: line start, or after ; & | (
+  # or a backquote.
+  { grep -hoE '(^|[[:space:]]|[(`;&|])(bash|source)[[:space:]]+[^[:space:];&|)]+' "$f" 2>/dev/null
+    grep -hoE '(^|[;&|(`])[[:space:]]*\.[[:space:]]+[^[:space:];&|)]+'            "$f" 2>/dev/null; } \
   | awk '{print $NF}' | tr -d '\042\047' | while IFS= read -r tok; do
       local b=${tok##*/} v r
       case "$b" in
