@@ -91,7 +91,10 @@
 #      and the absolute path; r2 is the control (the same shape landing INSIDE
 #      the task tools/ still refuses rc 6 match=exact); r3 keeps a `$( )` hop
 #      unresolved and refusing (law 9: the expansion adds resolutions, it does
-#      not invent them); r4 is the mutation.
+#      not invent them); r4 is the mutation; r5 is the REGRESSION ARM for this
+#      lane's own first-cut defect -- `$(dirname "$0")` in a SLURM SNAPSHOT is
+#      NOT the job's $0, and substituting it cleared TEN live refusals against a
+#      /tmp path in the 07:16 dry run.
 #   J  static: the header no longer claims the rename is "the only safe way to
 #      write into a live task dir" -- it is safe only when renamer and reader are
 #      the SAME NFS client -- and the PIN REPORT no longer calls a RUNNING job
@@ -1359,6 +1362,46 @@ if [ -s "$MUT7" ] && bash -n "$MUT7" 2>/dev/null && ! grep -q 'HARNESS-SYNC-7 CH
   fi
 else
   bad "R(r4): could not build the no-chain mutant of script_refs.sh -- MUTATION ARM DID NOT RUN"
+fi
+
+# ---- r5: THE SNAPSHOT $0 TRAP, and it is a REGRESSION ARM ------------------
+# HARNESS-SYNC-7 shipped its first cut with `$(dirname "$0")` substituted by the
+# dirname of the file being parsed, on the reasoning that `$0` is knowable from
+# the text. IT IS NOT, HERE. The sync parses SLURM'S OWN SNAPSHOT (`scontrol
+# write batch_script` into the sync's temp dir); the job's real `$0` is a script
+# on a compute node. The live dry run at 07:16 09-07 measured the cost exactly:
+# TEN held readers of `tools/retread_fast_env.sh`, every one of them
+# `FAST_ENV=$(dirname "$0")/../retread_fast_env.sh`, were CLEARED against
+# `/tmp/harness_sync.XXXXXX/../retread_fast_env.sh` -- a path that does not
+# exist and that nothing will ever read. Ten missed refusals, from a resolution
+# that looked safer than the `-` it replaced.
+#
+# This arm is that fixture: a job whose script is handed to the sync from a
+# DIFFERENT DIRECTORY than the one it will run in, naming an installed file
+# through `$(dirname "$0")`. It must REFUSE.
+read -r RR5 TR5 V1R5 V2R5 < <(mkfixture R5)
+mkdir -p "$TR5/jobroot" "$WORK/R5_slurmtmp"
+mkchainjob "$WORK/R5_slurmtmp" r5.sbatch \
+  'FAST=$(dirname "$0")/../tools/a_tool.sh' \
+  'bash "$FAST"'
+mkstub "$WORK/R5_squeue"
+# THE POINT OF THE ARM: the SCRIPT path the sync reads is the snapshot in
+# $WORK/R5_slurmtmp, while the job root is $TR5/jobroot -- the production shape.
+printf '8000075 PENDING laneR5 %s %s %s\n' "$TR5" "$WORK/R5_slurmtmp/r5.sbatch" "$TR5/jobroot" > "$WORK/R5_run.txt"
+BEFORE_R5=$(md5sum "$TR5/tools/a_tool.sh" | awk '{print $1}')
+runsync "$RR5" "$TR5" "$WORK/R5_squeue" "$V2R5" --running-list "$WORK/R5_run.txt" > "$WORK/R5.log" 2>&1; rcR5=$?
+AFTER_R5=$(md5sum "$TR5/tools/a_tool.sh" | awk '{print $1}')
+if [ "$rcR5" -eq 6 ] && [ "$AFTER_R5" = "$BEFORE_R5" ] \
+   && grep -q 'SYNC REFUSED rc=6 running=8000075 .*file=a_tool.sh .*match=unresolved' "$WORK/R5.log"; then
+  ok "R(r5): REGRESSION ARM -- \$(dirname \"\$0\") in a SLURM SNAPSHOT is NOT resolved against the snapshot's temp dir; the reader still refuses rc 6 match=unresolved and nothing was written"
+else
+  bad "R(r5): rc=$rcR5 before=$BEFORE_R5 after=$AFTER_R5 -- the snapshot \$0 trap is BACK: ten live refusals were cleared by this once"
+  grep -E 'read-set OK|SYNC REFUSED rc=6' "$WORK/R5.log" | sed 's/^/      /'
+fi
+if grep -q 'read-set OK job=8000075 .*path=/tmp/' "$WORK/R5.log" || grep -q "read-set OK job=8000075 .*path=$WORK/R5_slurmtmp" "$WORK/R5.log"; then
+  bad "R(r5): a read-set OK row for 8000075 names a path under the SNAPSHOT's directory -- that is the wrong path, and a wrong path here is a MISSED REFUSAL"
+else
+  ok "R(r5): and no cleared row anywhere names a path under the snapshot's own directory"
 fi
 
 echo "### harness_sync_guard: pass=$pass fail=$fail"

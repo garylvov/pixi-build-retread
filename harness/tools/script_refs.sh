@@ -56,12 +56,16 @@
 #     check exists to prevent
 #   * a name never assigned in this snapshot (it came from the environment)
 #   * a chain deeper than 3
-#   * a BARE `$(dirname "$0")/x.sh` written directly as the argument of `bash`
-#     or `source`: the tokenizer splits on the space inside the substitution and
-#     never sees the whole token, so it yields `?` and the job reads EVERYTHING.
-#     The FORM THAT PRODUCTION USES -- `CLEANUP=$(dirname "$0")/cleanup.sh` then
-#     `bash "$CLEANUP"` -- IS resolved, because there the substitution is on the
-#     right-hand side of an assignment where the parser has the whole line.
+#   * ANY `$(dirname "$0")` form, whether written directly as `bash`'s argument
+#     or on the right-hand side of an assignment.  `$0` LOOKS knowable and IS
+#     NOT: the sync parses SLURM'S OWN SNAPSHOT of a queued job, which sits in
+#     the sync's temp dir, while the job's real `$0` is a script on a compute
+#     node.  Substituting it cleared TEN live refusals against a `/tmp/...`
+#     path nothing will ever read (see `_sr_assign`), and that is the exact
+#     error this parser exists to prevent.  `CLEANUP=$(dirname "$0")/cleanup.sh`
+#     is still placed correctly -- by `refs_of_sibling_resolved`'s SIBLING RULE,
+#     which resolves against the referring script's own directory and only when
+#     a file is really there.
 # All of those yield `-` or `?` and the caller must treat them as before: `-` is
 # possibly-that-file, `?` is reads-everything (law 9).
 
@@ -80,12 +84,27 @@ _sr_assign () {                   # $1 = script path, $2 = variable name
   n=$(printf '%s\n' "$out" | wc -l)
   [ "$n" -eq 1 ] || return 1
   [ -n "$out" ] || return 1
-  # `$(dirname "$0")` is THE ONE command substitution whose value is knowable
-  # from the text: $0 is the script being parsed, so its dirname is $d.  This is
-  # the shape phase_template/cleanup_gated.sh actually uses.  EVERY OTHER `$( )`
-  # or backquote is a value this parser cannot compute and must not guess.
-  out=$(printf '%s' "$out" | sed -e 's|\$(dirname[[:space:]][^)]*"\{0,1\}\$0"\{0,1\}[^)]*)|'"$d"'|g' -e 's|\${0%/\*}|'"$d"'|g')
+  # NO `$( )` AND NO BACKQUOTE IS RESOLVED HERE, `$(dirname "$0")` INCLUDED, AND
+  # THAT EXCLUSION IS THE FIX FOR A DEFECT THIS FUNCTION SHIPPED WITH FOR ONE
+  # DRY RUN.  The first cut of HARNESS-SYNC-7 substituted `$0` with the dirname
+  # of the file being parsed, on the reasoning that $0 is knowable.  It is not,
+  # HERE: the sync parses SLURM'S OWN SNAPSHOT of a queued job's script, which
+  # lives in the sync's temp dir, while the job's real $0 is the batch script on
+  # a compute node.  Ten held readers of `tools/retread_fast_env.sh` -- each one
+  # `FAST_ENV=$(dirname "$0")/../retread_fast_env.sh` -- resolved to
+  # `/tmp/harness_sync.XXXXXX/../retread_fast_env.sh`, a path that does not
+  # exist and that nothing will ever read, and TEN LIVE REFUSALS WERE CLEARED BY
+  # A WRONG PATH.  That is the one error class this parser exists to prevent,
+  # arriving through the door marked "knowable".
+  #
+  # Nothing is lost by refusing it.  `CLEANUP=$(dirname "$0")/cleanup.sh` --
+  # cleanup_gated.sh's real shape, arm P -- is recovered by the BASENAME
+  # heuristic below and then placed by `refs_of_sibling_resolved`'s sibling
+  # rule, which resolves against the REFERRING SCRIPT'S OWN DIRECTORY and only
+  # when a file is actually there.  That rule has the `-f` condition; this one
+  # had nothing, and duplicated it worse.
   case "$out" in *'$('*|*'`'*) return 1;; esac
+  : "$d"
   printf '%s' "$out"
 }
 

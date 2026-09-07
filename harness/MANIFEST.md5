@@ -77,7 +77,7 @@ de2c918a31b7e5fdae517cda1ccba4d4  tools/gate_head_pin.sh
 8cad0bdfc7496ee0661c4f5701a8e087  tools/harness_commit_resolve.sh
 447037c0b4249d9d3d7c084940be5cc4  tools/harness_drift_allowlist.txt
 a5d492615f7475231606ceedea2ca9a4  tools/harness_sync.sh
-9a1665a8a4dc8de206cf6bc2a95ab00c  tools/harness_sync_guard.sh
+c160685c4c2b100fff388b48b921ddef  tools/harness_sync_guard.sh
 587729c857a328049c8dd28a3d189f55  tools/harness_drift_check.sh
 4c8a892042e7de5b6ed3763562a2dd52  tools/harness_push_check.sh
 39e620e807735bdc65b09fb8078d8e82  tools/import_audit.py
@@ -113,7 +113,7 @@ c9f561484d8ef42157ba6a7532f80681  tools/pixi_shard_cache.py
 7b6d14570716273e2562aaafd0bba071  tools/proof_smoke_guard.sh
 b7b4546662fa8c555a727be04c8b08ff  tools/proof_smoke.sh
 3cdfa9cf6f7c866e184c217125781efa  tools/retread_fast_env.sh
-725a5227fc98fac5665890f344c59195  tools/script_refs.sh
+cfb37e19260285fc9f351e59dbe81ce1  tools/script_refs.sh
 ff9014ec8ab0806334b426b41e38c5a2  tools/stage_mirror.sh
 f9fb64de4b6c56ed1677f1a56d873f52  tools/stage_mirror_guard.sh
 46b5ede95808302e562b66b2e1a2201a  tools/retread_shard_mirror.sh
