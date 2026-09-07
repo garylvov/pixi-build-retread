@@ -453,6 +453,26 @@ setup_refused_check   # SETUP-REFUSED-BRANCH (MUTATION ANCHOR)
 #         unlock the reaper, because a job that reported success may have handed
 #         its roots to a successor. The two halves are independent readers of the
 #         same question and both have to say yes.
+#         CLEANUP-SEAM-2-a (2026-09-07) WIDENS THIS LIST FROM TWO TO FOUR, and
+#         the two additions are terminal failures of the same kind: a job the
+#         scheduler killed. OUT_OF_MEMORY is the cgroup OOM killer -- the run is
+#         over, its roots hold whatever it had staged, and no `.rc` will ever be
+#         written; NODE_FAIL is the node dying under it, same story. Refusing
+#         those two stranded exactly the roots this branch exists to reclaim,
+#         and a lane reading the refusal would have gone looking for evidence
+#         that cannot arrive.
+#         WHAT IS DELIBERATELY NOT ON THE LIST, and each for its own reason:
+#           CANCELLED -- an OPERATOR act, not a failure. sacct renders it
+#             `CANCELLED by <uid>`, and the state is taken as the FIRST field,
+#             so it is `CANCELLED` here and matches nothing. A cancel can be a
+#             deliberate pause with a resubmit behind it, and reaping a paused
+#             chain's roots is the one thing a cancel must not cost.
+#           REQUEUED / RESIZING / SUSPENDED / PENDING / RUNNING -- not terminal
+#             at all; the job may still write the evidence.
+#           COMPLETED -- the case arm J2 exists for: a driver that swallowed its
+#             rc and reported success may have handed its roots to a successor.
+#         Arms J8 (OUT_OF_MEMORY), J9 (NODE_FAIL) and J10 (the four negatives)
+#         are the readers.
 #
 #   (iii) NO ROOT HOLDS A SEALED (write-stripped) DIRECTORY. Same refusal, same
 #         reasoning and the same depth bound as seam 1: `source_build.rs::
@@ -489,7 +509,7 @@ setup_refused_check   # SETUP-REFUSED-BRANCH (MUTATION ANCHOR)
 #
 # Reader: cleanup_absent_root_guard.sh, arms J1-J5.
 JOB_FATAL_RE='^### ((PREAMBLE JOB REFUSED BEFORE ARM 1\. MULTIARM_JOB_FATAL=|ARM [^ ]+ WRAPPER EXIT rc=|[A-Za-z0-9_]+_EXIT=)[0-9]*[1-9][0-9]*|.* PROOF DONE job_fatal=[0-9]*[1-9][0-9]*)( |$)'
-JOB_FATAL_STATES='^(FAILED|TIMEOUT)$'
+JOB_FATAL_STATES='^(FAILED|TIMEOUT|OUT_OF_MEMORY|NODE_FAIL)$'
 JOB_FATAL_SEAL_DEPTH=$SETUP_REFUSED_DEPTH
 
 job_fatal_check () {
@@ -504,9 +524,9 @@ job_fatal_check () {
   echo "###   $row"
   # (ii) Slurm's own record, and it is allowed to overrule the row.
   st=$(sacct -j "$RJ" -X -n -o State 2>/dev/null | head -1 | awk '{print $1}')
-  echo "### JOB-FATAL sacct state for job $RJ: '${st:-<none>}' (accepted: FAILED, TIMEOUT)"
+  echo "### JOB-FATAL sacct state for job $RJ: '${st:-<none>}' (accepted: FAILED, TIMEOUT, OUT_OF_MEMORY, NODE_FAIL)"
   if ! printf '%s\n' "$st" | grep -qE "$JOB_FATAL_STATES"; then
-    echo "### JOB-FATAL NOT TAKEN: the row is a CLAIM and sacct is the FACT -- '${st:-<none>}' is not FAILED/TIMEOUT, so a driver that printed a fatal row and still exited cleanly does not unlock the reaper. The evidence conditions decide."
+    echo "### JOB-FATAL NOT TAKEN: the row is a CLAIM and sacct is the FACT -- '${st:-<none>}' is not a terminal-failure state, so a driver that printed a fatal row and still exited cleanly does not unlock the reaper. The evidence conditions decide."
     return 0
   fi
   # AND: nothing of ours still running on these roots.

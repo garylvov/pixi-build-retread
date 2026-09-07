@@ -375,6 +375,11 @@ fi
 #       task root. The old `find "$D" -maxdepth 2` found nothing, so a branch
 #       keyed on the job's own stdout was silent on the one job it was written
 #       for. The fallback must find it, ANNOUNCE the widening, and reap.
+#   J8/J9  CLEANUP-SEAM-2-a: sacct OUT_OF_MEMORY and NODE_FAIL are terminal
+#       failures too -- one arm per added state, each with its own shim.
+#   J10 the NEGATIVES, one arm per state: COMPLETED, RUNNING, PENDING and the
+#       two-word `CANCELLED by <uid>` all refuse. A widening without these is
+#       just "any state at all".
 #   J7  BOTH families in one stdout with bytes in the root: seam 1 declines OUT
 #       LOUD on the files and seam 2 decides. The ordering guarantee.
 #   J6  MUTATION: the branch's anchor line cut (counted, exactly 1) -> J1's
@@ -457,7 +462,7 @@ J2A=$W/roots/cert$TAG_J2-$RJ; mk_staged_root "$J2A"
 rc=$(runp "$BIN_DONE" "$NEWBED" "$W/J2.log" "$J2A")
 [ "$rc" = 2 ] && ok "J2: a fatal ROW with a COMPLETED accounting record refuses (rc=2)" \
   || bad "J2: rc=$rc, want 2 -- a lying row unlocked the reaper"
-grep -q 'JOB-FATAL NOT TAKEN' "$W/J2.log" && grep -q "not FAILED/TIMEOUT" "$W/J2.log" \
+grep -q 'JOB-FATAL NOT TAKEN' "$W/J2.log" && grep -q "is not a terminal-failure state" "$W/J2.log" \
   && ok "J2: and it says WHY -- the row is a claim, sacct is the fact" \
   || bad "J2: no sacct refusal row: $(grep -m1 'JOB-FATAL' "$W/J2.log" || echo '<no JOB-FATAL row at all>')"
 grep -qF "$STUBMARK" "$W/J2.log" && bad "J2: cleanup.sh was called on a job Slurm says completed" \
@@ -521,6 +526,45 @@ grep -qF '### CLEANUP JOB-FATAL roots=1 removed=1' "$W/J7.log" \
   && ok "J7: and seam 2 decided, with its own footer" || bad "J7: no JOB-FATAL footer"
 rm -rf "$HD_J7"
 
+
+# ---- J8/J9: the OTHER terminal failures the scheduler can hand us -----------
+# CLEANUP-SEAM-2-a. The list was FAILED/TIMEOUT only, so a job the cgroup OOM
+# killer took, or one whose node died under it, refused and stranded its roots
+# for the same reason 6014484 did -- the evidence can never arrive and the gate
+# waits for it anyway. These two arms are one per added state, each with its own
+# shim, because a list widened without a reader per entry is a list nobody can
+# tell is wired up.
+for ST in OUT_OF_MEMORY NODE_FAIL; do
+  BINST=$W/bin-$ST; mk_sacct "$BINST" "$ST"
+  JSA=$W/roots/cert$TAG_J1-$RJ-$ST; mk_staged_root "$JSA"
+  rc=$(runp "$BINST" "$RMBED" "$W/J8.$ST.log" "$JSA")
+  [ "$rc" = 0 ] && ok "J8/J9: sacct $ST is a terminal failure and its roots are reclaimed (rc=0)" \
+    || { bad "J8/J9: rc=$rc for sacct $ST, want 0 -- a scheduler-killed job still strands"; sed 's/^/      /' "$W/J8.$ST.log"; }
+  grep -qF '### CLEANUP JOB-FATAL roots=1 removed=1' "$W/J8.$ST.log" \
+    && ok "J8/J9: and $ST prints the JOB-FATAL footer" \
+    || bad "J8/J9: no footer for $ST: $(grep -m1 'JOB-FATAL' "$W/J8.$ST.log" || echo '<no JOB-FATAL row>')"
+done
+
+# ---- J10: the NEGATIVES, one arm per state ---------------------------------
+# The widening must not become "any state at all". COMPLETED is J2's case
+# (a swallowed rc); RUNNING and PENDING are not terminal, so the job may still
+# write the evidence; CANCELLED is an OPERATOR act with a resubmit possibly
+# behind it, and reaping a paused chain's roots is the one thing a cancel must
+# not cost. sacct renders it `CANCELLED by <uid>` and the gate takes the FIRST
+# field, so the shim prints the two-word form to prove the field split too.
+for ST in COMPLETED RUNNING PENDING "CANCELLED by 1234"; do
+  SLUG=${ST%% *}
+  BINST=$W/bin-neg-$SLUG; mk_sacct "$BINST" "$ST"
+  JNA=$W/roots/cert$TAG_J1-$RJ-N$SLUG; mk_staged_root "$JNA"
+  rc=$(runp "$BINST" "$NEWBED" "$W/J10.$SLUG.log" "$JNA")
+  if [ "$rc" = 2 ] && grep -q 'JOB-FATAL NOT TAKEN' "$W/J10.$SLUG.log" \
+     && ! grep -qF "$STUBMARK" "$W/J10.$SLUG.log" && [ -d "$JNA" ]; then
+    ok "J10: sacct '$ST' is NOT job-fatal -- refused rc 2, cleanup.sh never called, root still on disk"
+  else
+    bad "J10: sacct '$ST' gave rc=$rc (want 2) cleanup_called=$(grep -qF "$STUBMARK" "$W/J10.$SLUG.log" && echo yes || echo no) root_present=$( [ -d "$JNA" ] && echo yes || echo no)"
+    sed 's/^/      /' "$W/J10.$SLUG.log"
+  fi
+done
 # ---- J6: THE MUTATION -- the branch cut out of the new file ------------------
 MUTJ=$W/cleanup_gated.MUTJ.sh
 sed 's/^job_fatal_check   # JOB-FATAL-BRANCH (MUTATION ANCHOR)$/: # MUTATION: the job-fatal branch is cut/' "$SRC" > "$MUTJ"
