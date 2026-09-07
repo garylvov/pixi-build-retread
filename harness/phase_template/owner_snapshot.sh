@@ -96,7 +96,30 @@ JOB_ROOT=${1:-}; shift || true
 # Every one of these is a MEASURED number or an explicit policy choice, and each
 # is named so a later lane can re-measure it rather than re-guess it.
 OWNER_UNLINK_RATE_PER_S=${OWNER_UNLINK_RATE_PER_S:-200}   # rows: 212 / 205 / 205 / 214 (jobs 5992050 x2, 5999937, 6001240)
-OWNER_CENSUS_RATE_PER_S=${OWNER_CENSUS_RATE_PER_S:-1700}  # ~30 min per 3 M entries over NFS = 1667/s, rounded
+OWNER_CENSUS_RATE_PER_S=${OWNER_CENSUS_RATE_PER_S:-2800}  # rows: 2807.7 / 2915.4 (clean walks, jobs 5999937 and 6001240); see below
+# MEASURED 2026-09-07, not quoted. This read 1700 with the comment "~30 min per
+# 3 M entries over NFS = 1667/s, rounded" -- a STEWARD'S SENTENCE, never a row.
+# The walk that produces `entries=<N>` is cleanup.sh's `N=$(find "$r" | wc -l)`
+# immediately before its `### removing` row, so the interval from the PREVIOUS
+# root's `### removed` row to the NEXT root's `### removing` row is exactly one
+# census walk and nothing else. Two such CLEAN intervals exist in the logs:
+#   job 5999937 -- 3,068,868 entries in 1093 s = 2807.7/s (the slowest, and the
+#     value below):
+#       ### removed /oscar/.../certDET1F-5992569 rc=0 wall=17507s exists_after=no 2026-09-07T02:56:46-04:00
+#       ### removing /oscar/.../ws.DET1F-5992569  (entries=3068868) start 2026-09-07T03:14:59-04:00
+#   job 6001240 -- 2,154,463 entries in 739 s = 2915.4/s:
+#       ### removed /oscar/.../certD141-6001140 rc=0 wall=12050s exists_after=no 2026-09-07T04:07:08-04:00
+#       ### removing /oscar/.../ws.D141-6001140  (entries=2154463) start 2026-09-07T04:19:27-04:00
+#   job 6013780 -- a FIRST-root interval, so it also contains hostname/date/
+#     checkquota and is a LOWER BOUND, quoted only as corroboration: 3,068,868
+#     entries in <=1031 s from the gate's own `2026-09-07T03:58:29-04:00` row =
+#     >=2976.6/s:
+#       ### removing /oscar/.../ws.DET1F-5992569  (entries=3068868) start 2026-09-07T04:15:40-04:00
+# All five measurable walks land in 2807-2977/s. 2800 is below every one of them
+# and is the FLOOR of the measurements, not their mean: this term buys wall, so
+# it must under-estimate the rate, never over-estimate it. The old 1700 was
+# 1.65x conservative for no measured reason, and a term nobody can re-derive
+# from a row is the thing this constant block exists to abolish.
 OWNER_WALL_MARGIN=${OWNER_WALL_MARGIN:-2}                 # 2x on the unlink term
 # TWO metadata walks are paid per reap, not one: cleanup.sh censuses each root
 # before it unlinks (`### removing $r (entries=$N)`), and the owner re-censuses

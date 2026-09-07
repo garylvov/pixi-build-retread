@@ -80,8 +80,9 @@ wall_of () {  # $1 = log file -> the wall in SECONDS off the OWNER SNAPSHOT row
 
 ########## A. the wall is a function of the entry count ########################
 # TWO regimes, and both matter. With the shipped 3600 s floor a 100,000-entry
-# root is still SMALLER than the floor covers (2*100001/200 + 2*100001/1700 =
-# 1120 s), so a fixture at that size measures the floor and not the derivation
+# root is still SMALLER than the floor covers (2*100001/200 + 2*100001/2800 =
+# 1074 s at the measured census rate, 1120 s at the old 1700), so a fixture at
+# that size measures the floor and not the derivation
 # -- the first run of this guard (job 6014847) printed exactly that and went
 # red, which is the guard doing its job on itself. So: A1 measures the floor at
 # the shipped constants, and A2 lowers the floor through its documented
@@ -100,10 +101,12 @@ OWNER_WALL_FLOOR_S=60 bash "$SNAPTOOL" "$W/jr.fsmall" "$GATE" --roots "$SMALL" >
 OWNER_WALL_FLOOR_S=60 bash "$SNAPTOOL" "$W/jr.fbig"   "$GATE" --roots "$BIG"   > "$W/A.big.log"   2>&1; rcB=$?
 WS=$(wall_of "$W/A.small.log"); WB=$(wall_of "$W/A.big.log")
 # The PREDICTION, computed here independently of the tool: margin 2 on the
-# unlink term at 200 entries/s, plus 2 census walks at 1700 entries/s, both
+# unlink term at 200 entries/s, plus 2 census walks at 2800 entries/s (the
+# MEASURED rate -- see the constant block in owner_snapshot.sh; it read 1700, a
+# steward's sentence, until CLEANUP-WALL-2 measured five real walks), both
 # rounded up. If the tool and this line disagree, one of them is wrong and the
 # guard says so rather than accepting whatever was printed.
-WANT=$(awk -v e="$NB" 'BEGIN{u=int((e+199)/200); c=int((e+1699)/1700); print u*2 + c*2}')
+WANT=$(awk -v e="$NB" 'BEGIN{u=int((e+199)/200); c=int((e+2799)/2800); print u*2 + c*2}')
 if [ "$rcS" = 0 ] && [ "$rcB" = 0 ] && [ -n "$WS" ] && [ -n "$WB" ]; then
   ok "A2. both snapshots printed a wall row: small=${WS}s big=${WB}s (floor overridden to 60s)"
   grep -h '^### OWNER SNAPSHOT wall=' "$W/A.small.log" "$W/A.big.log" | sed 's/^/GUARD:   /'
@@ -113,7 +116,7 @@ if [ "$rcS" = 0 ] && [ "$rcB" = 0 ] && [ -n "$WS" ] && [ -n "$WB" ]; then
     fail "A2. the walls do not separate: small=${WS}s big=${WB}s -- the derivation is not reading the entry count"
   fi
   if [ "$WB" = "$WANT" ]; then
-    ok "A2. and the big root's wall is EXACTLY the formula's ${WANT}s -- 2x unlink at 200/s plus 2 census walks at 1700/s"
+    ok "A2. and the big root's wall is EXACTLY the formula's ${WANT}s -- 2x unlink at 200/s plus 2 census walks at 2800/s"
   else
     fail "A2. the derived wall ${WB}s is not the predicted ${WANT}s"
   fi
