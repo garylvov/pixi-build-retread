@@ -66,7 +66,18 @@
 #          would have shifted every later field by one and quietly emptied the
 #          read set. Nothing in production passes this flag.
 #
-#   rc 0  synced (or --check found nothing edited)
+#   rc 0  synced (or --check found nothing edited).  INCLUDING THE NO-OP: when
+#         every mapped task copy already holds the commit's bytes and no `--add`
+#         names a new file, the install set is EMPTY, and an empty install set
+#         is its own verdict -- `### SYNC NO-OP commit=<sha> files=<n>
+#         installed=0 unchanged=<n>`, rc 0, a pin mismatch TOLERATED on
+#         `reason=nothing-installed`, and `### RECORD ADVANCED <old> -> <new>
+#         bytes-identical` if the record was behind the disk.  Until
+#         HARNESS-SYNC-9 this was an rc-4 REFUSAL: the read-set block is guarded
+#         on a non-empty install set, so nothing was examined, and rc 4 read
+#         "not examined" as "unsafe".  A sync that installs nothing cannot
+#         strand anything.  (B30's landing, 2026-09-07T07:47: 21 rows, 3 jobs,
+#         every one `read-set-not-examined`, nothing moved.)
 #   rc 2  FATAL: bad arguments, no repo, no such commit, no mapping library
 #   rc 3  --check: at least one task copy differs from the last synced commit
 #   rc 4  REFUSED: a PENDING job of ours is pinned to a different commit AND
@@ -76,9 +87,14 @@
 #           reason=reads-installed-file       its read set intersects the install set
 #           reason=read-set-undeterminable    its script or a reference is unreadable
 #           reason=read-set-not-examined      it never reached a determinate read
-#                                             set (out of scope, or nothing to
-#                                             install) -- "we did not look" is
-#                                             not "we looked and it was clean"
+#                                             set -- OUT OF SCOPE. "We did not
+#                                             look" is not "we looked and it was
+#                                             clean". The OTHER way to an empty
+#                                             read set, an EMPTY INSTALL SET, is
+#                                             NOT this reason any more: it is
+#                                             reason=nothing-installed on a
+#                                             TOLERATED row (HARNESS-SYNC-9, and
+#                                             see rc 0's NO-OP above).
 #         A job whose read set is DETERMINATE and disjoint is TOLERATED on a
 #         `### PIN MISMATCH tolerated jid=<j> reason=<why>` row -- never in
 #         silence -- with reason=reads-only-job-root for the owner-snapshot shape
@@ -156,6 +172,10 @@ REPO="${HARNESS_REPO:-/oscar/data/stellex/glvov/agrescap/worktrees/harness-tools
 SQUEUE="${HARNESS_SQUEUE:-squeue}"
 RECORD_REL="tools/.harness_synced_commit"
 RECORD="$TASK_DIR/$RECORD_REL"
+# READ BEFORE ANY MODE RUNS, because the no-op arm reports whether the record
+# MOVED, and it cannot tell that after it has already been overwritten.
+REC_OLD=
+[ -f "$RECORD" ] && REC_OLD=$(sed -e 's/#.*//' -e 's/[[:space:]]//g' "$RECORD" | grep -m1 . || true)
 
 MODE=sync; COMMIT=; FORCE=0; REASON=; ADDS=; RUNLIST=
 while [ $# -gt 0 ]; do
@@ -448,15 +468,67 @@ fi
 # The row prints `state=PENDING` so the operator knows the job it must wait for
 # has not started yet, rather than looking for it on a node.
 INSTSET="$TMP/instset.txt"; : > "$INSTSET"
+# THE FILES THAT HAVE NO BLOB AT ALL ARE COUNTED, NOT SKIPPED (HARNESS-SYNC-9).
+# A mapped task file with no mapping (`$w` empty) or no blob at `$SHA` used to
+# `continue` out of this loop and vanish, which was harmless while this loop's
+# only product was the install set -- but the install loop at the bottom calls
+# exactly that file `SYNC NO-BLOB` and exits 5. So an empty install set alone
+# does NOT mean "this sync would do nothing and succeed"; it means that only
+# when nothing is unmapped or blobless too. The no-op short-circuit below reads
+# BOTH files, because a no-op that swallowed a would-be rc 5 would be the same
+# defect it exists to fix, pointed the other way.
+NOBLOB="$TMP/noblob.txt"; : > "$NOBLOB"
 while IFS='|' read -r trel w; do
-  [ -n "$w" ] || continue
-  git -C "$REPO" cat-file blob "$SHA:$w" > "$TMP/preblob" 2>/dev/null || continue
+  if [ -z "$w" ] || ! git -C "$REPO" cat-file blob "$SHA:$w" > "$TMP/preblob" 2>/dev/null; then
+    printf '%s\n' "$trel" >> "$NOBLOB"; continue
+  fi
   if [ -f "$TASK_DIR/$trel" ] &&
      [ "$(md5sum "$TASK_DIR/$trel" | awk '{print $1}')" = "$(md5sum "$TMP/preblob" | awk '{print $1}')" ]; then
     continue
   fi
   printf '%s\n' "$trel" >> "$INSTSET"
 done < "$SET"
+
+# ---- A SYNC THAT INSTALLS NOTHING CANNOT STRAND ANYTHING (HARNESS-SYNC-9) ----
+# THE DEFECT, AND IT HELD B30 FOR A MORNING. When the task dir is ALREADY at the
+# requested commit the install set is EMPTY. The read-set block below is guarded
+# on `[ -s "$INSTSET" ]`, so it never runs, so no job ever reaches a determinate
+# read set, so `$RSDET` is empty -- and the rc-4 refinement then reads every
+# pin-mismatched PENDING job as `read-set-not-examined` and REFUSES. That is
+# HARNESS-SYNC-6's own comment: "out of the read-set scope, OR THE INSTALL SET
+# WAS EMPTY SO NO JOB WAS EXAMINED AT ALL". Law 9's "we did not look is not we
+# looked and it was clean" is the right reading when there is something to look
+# FOR. Here there is not: not one byte will be renamed over, so no reader can
+# lose an inode and no queued job's drift gate can move under it. Measured:
+# B30's landing 2026-09-07T07:47 refused rc 4 with 21 rows over three jobs, ALL
+# of them `read-set-not-examined`, `rc4_tolerated=0`, and NOTHING MOVED -- a
+# sync refusing to do nothing, and a merge queue held by it.
+#
+# SO THE EMPTY INSTALL SET IS ITS OWN VERDICT, and it is a TOLERANCE, not a
+# skip: the pin-mismatched jobs are still named on `### PIN MISMATCH tolerated`
+# rows with `reason=nothing-installed`, because a judgement the machinery makes
+# on the operator's behalf must never be silent (HARNESS-SYNC-6). Every refusal
+# for a NON-EMPTY install set -- rc 4 and rc 6 alike -- is untouched: `$NOOP` is
+# 0 in every one of those runs.
+#
+# WHY IT DOES NOT `exit 0` HERE. The tail of this script is the sync's evidence
+# packet -- the ABSENT report, the PIN REPORT, the drift line from the new state
+# -- and every one of them is still true and still owed on a no-op run. (The
+# guard's own arm A2 is the live proof: its second sync is a no-op by
+# construction and asserts the ABSENT report.) So the no-op sets a flag, the
+# refusal verdict reads it, the install loop runs and writes nothing because
+# every file is `SYNC same`, and the one shared tail prints.
+NOOP=0
+if [ ! -s "$INSTSET" ] && [ ! -s "$NOBLOB" ]; then   # HARNESS-SYNC-9 NO-OP SHORT-CIRCUIT
+  NOOP=1
+  echo "### SYNC NO-OP commit=$SHA files=$TOTAL installed=0 unchanged=$TOTAL"
+  echo "###   Every mapped task copy is ALREADY $SHA's bytes and no --add names a file the"
+  echo "###   task dir lacks, so the install set is EMPTY. Nothing is renamed over, so no"
+  echo "###   RUNNING job can lose an inode (rc 6) and no PENDING job's pin can be stranded"
+  echo "###   (rc 4): a pin mismatch is TOLERATED below on reason=nothing-installed rather"
+  echo "###   than refused on read-set-not-examined. A NON-EMPTY install set refuses exactly"
+  echo "###   as before."
+fi
 
 # THE READ-SET PARSER LIVES IN tools/script_refs.sh (HARNESS-SYNC-5), because
 # phase_template/owner_snapshot.sh must copy exactly the files a job will read
@@ -667,8 +739,21 @@ while read -r r_jid r_jname r_pinfile r_pinned; do
   fi
   r_det=$(awk -v j="$r_jid" '$1==j{print $2; exit}' "$RSDET")
   if [ -z "$r_det" ]; then   # HARNESS-SYNC-6 TOLERANCE BRANCH
-    # NOT EXAMINED is not CLEAN.  The job was out of the read-set scope, or the
-    # install set was empty so no job was examined at all.  Law 9.
+    # NOT EXAMINED is not CLEAN -- the job was out of the read-set scope. Law 9.
+    #
+    # EXCEPT WHEN THERE WAS NOTHING TO EXAMINE (HARNESS-SYNC-9). The other way
+    # to reach an empty `$RSDET` is an EMPTY INSTALL SET: the read-set block is
+    # guarded on `[ -s "$INSTSET" ]` and never ran, so no job was examined --
+    # not because we declined to look, but because there is nothing this sync
+    # would write for a job to read. "We did not look" and "there was nothing
+    # to look for" have opposite verdicts and this branch used to give them the
+    # same one, which is how B30's landing refused rc 4 having moved nothing.
+    # Tolerated, on a NAMED row like every other cleared pin mismatch.
+    if [ "$NOOP" = 1 ]; then
+      printf '### PIN MISMATCH tolerated jid=%s reason=nothing-installed name=%s pin=%s %s\n' \
+        "$r_jid" "$r_jname" "$r_pinfile" "$r_pinned" >> "$REF_TOL"
+      continue
+    fi
     printf '%s %s %s %s reason=read-set-not-examined\n' \
       "$r_jid" "$r_jname" "$r_pinfile" "$r_pinned" >> "$REF_REFUSE"
     continue
@@ -785,6 +870,17 @@ fi
 printf '%s\n' "$SHA" > "$TMP/record" && mv -f "$TMP/record" "$RECORD" || {
   echo "### SYNC FAILED -- could not write $RECORD"; exit 5; }
 echo "### SYNC RECORDED $RECORD = $SHA"
+# THE HONEST STATE OF A NO-OP WHOSE RECORD WAS BEHIND (HARNESS-SYNC-9). If every
+# mapped copy already matched $SHA, the task dir was AT two commits at once for
+# the mapped set, and the record naming the older one was simply the older true
+# statement. Moving it installed nothing and hid nothing -- but it is a change to
+# what `--check` compares against tomorrow, so it is stated, with the word that
+# says WHY it was safe.
+if [ "$NOOP" = 1 ] && [ "${REC_OLD:-}" != "$SHA" ]; then
+  echo "### RECORD ADVANCED ${REC_OLD:-<none>} -> $SHA bytes-identical"
+  echo "###   nothing was installed: every mapped task copy already held these bytes, so the"
+  echo "###   record was behind the disk, not the disk behind the record."
+fi
 
 # ---- THE PIN REPORT: every job root that is NOT at the commit just synced ----
 # DET-1-1.  The rc-4 refusal above is a PRE-condition and it can only see jobs

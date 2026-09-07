@@ -110,6 +110,14 @@
 #      --force DOES; none asserted the state it LEAVES, which is how the marker
 #      it writes came to red-line both gates permanently. See the block above
 #      the arm for the measured rows.
+#   T  HARNESS-SYNC-9: A NO-OP SYNC MUST NOT REFUSE ITSELF. With the task dir
+#      already AT the commit the install set is EMPTY, the read-set block never
+#      runs, and rc 4 read the resulting empty read set as "not examined" and
+#      refused -- 21 rows over three jobs on B30's landing, nothing moved. An
+#      empty install set is now its own verdict: rc 0, a NO-OP row, the pin
+#      TOLERATED on reason=nothing-installed. t3 is the non-vacuity control and
+#      t4 the blobless hole (an empty install set is not a no-op when a mapped
+#      file has no blob -- that run still owes rc 5).
 #
 # THE MUTATION IS PINNED TO A COMMIT CONSTANT, NEVER `HEAD`: an arm that reads
 # `HEAD:<the file it guards>` starts asserting the fix against itself the moment
@@ -1561,6 +1569,126 @@ if grep -q '### SYNC ABSENT' "$WORK/S6.log"; then
 else
   bad "S(s7): --check printed no ABSENT report -- a lane running the read-only mode cannot see that the commit carries files this task dir does not have"
 fi
+
+# ---- T: HARNESS-SYNC-9 -- A NO-OP SYNC MUST NOT REFUSE ITSELF ---------------
+# THE DEFECT, WITH THE LANDING IT HELD. B30's landing 2026-09-07T07:47 refused
+# rc 4 having moved NOTHING: the task dir was ALREADY at the requested commit,
+# so the install set was EMPTY, so the read-set block (guarded on
+# `[ -s "$INSTSET" ]`) never ran, so `$RSDET` was empty -- and rc 4's refinement
+# read every pin-mismatched PENDING job as `read-set-not-examined` and refused.
+# 21 rows, three jobs, `rc4_tolerated=0`, and not one byte would have moved for
+# any of them. HARNESS-SYNC-6's own comment names the case ("or the install set
+# was empty so no job was examined at all") and gives it law 9's verdict, which
+# is the right verdict when there is something to look FOR and the wrong one
+# when there is not. A sync that installs nothing cannot strand anything.
+#   t1  at-commit fixture + a pin-mismatched PENDING job -> rc 0, the NO-OP row,
+#       the pin TOLERATED on reason=nothing-installed (never in silence), no
+#       rc-4 refusal, and nothing written
+#   t2  the record BEHIND the disk on a no-op -> `### RECORD ADVANCED <old> ->
+#       <new> bytes-identical` and the record file actually moves
+#   t3  NON-VACUITY: the SAME fixture with ONE file differing -> the old rc 4,
+#       reason=read-set-not-examined, unchanged. The fix is not a hole.
+#   t4  the blobless-file hole: an empty INSTALL set is not a no-op when a mapped
+#       task file has no blob at the commit -- that run still owes rc 5, and a
+#       no-op reading only `$INSTSET` would have swallowed it
+#   t5  THE MUTATION: the short-circuit cut -> t1's fixture refuses rc 4 again,
+#       so t1 CAN fail
+read -r RT TT V1T V2T < <(mkfixture T)
+mkstub "$WORK/T_none"                                  # no jobs at all
+runsync "$RT" "$TT" "$WORK/T_none" "$V2T" > "$WORK/T0.log" 2>&1; rcT0=$?
+[ "$rcT0" -eq 0 ] && ok "T(t0): the SETUP sync (clean tree -> $V2T) rc=0, so t1 starts AT the commit" \
+  || { bad "T(t0): the setup sync rc=$rcT0 -- arm T's fixture is not at the commit and the arm proves nothing"; sed 's/^/      /' "$WORK/T0.log"; }
+# t1: now pin a queued job to the OLDER commit and sync to the SAME commit again.
+mkdir -p "$TT/lane1"; printf '%s\n' "$V1T" > "$TT/lane1/HARNESS_COMMIT"
+mkstub "$WORK/T_squeue" "9000010 lane1-relock"
+BEFORE_T=$(md5sum "$TT/tools/a_tool.sh" | awk '{print $1}')
+runsync "$RT" "$TT" "$WORK/T_squeue" "$V2T" > "$WORK/T1.log" 2>&1; rcT1=$?
+[ "$rcT1" -eq 0 ] \
+  && ok "T(t1): THE FIX -- a sync whose install set is EMPTY no longer refuses for a pin-mismatched PENDING job (rc 0)" \
+  || { bad "T(t1): rc=$rcT1, wanted 0 -- a sync that installs nothing is still refusing"; sed 's/^/      /' "$WORK/T1.log"; }
+grep -qE "^### SYNC NO-OP commit=$V2T files=[0-9]+ installed=0 unchanged=[0-9]+\$" "$WORK/T1.log" \
+  && ok "T(t1): and it SAYS it did nothing, in one parseable row: $(grep -m1 '^### SYNC NO-OP' "$WORK/T1.log")" \
+  || { bad "T(t1): no well-formed '### SYNC NO-OP commit=$V2T files=<n> installed=0 unchanged=<n>' row"; grep -m1 'SYNC NO-OP' "$WORK/T1.log" | sed 's/^/      /'; }
+grep -qE "^### PIN MISMATCH tolerated jid=9000010 reason=nothing-installed name=lane1-relock pin=$TT/lane1/HARNESS_COMMIT pinned=$V1T\$" "$WORK/T1.log" \
+  && ok "T(t1): the pin mismatch is TOLERATED on a whole, parseable row -- reason=nothing-installed, never in silence" \
+  || { bad "T(t1): the tolerated row is missing or malformed"; grep 'PIN MISMATCH' "$WORK/T1.log" | sed 's/^/      /'; }
+grep -q 'reason=read-set-not-examined' "$WORK/T1.log" \
+  && { bad "T(t1): it still classed the job read-set-not-examined -- the empty install set is still being read as 'we did not look'"; sed 's/^/      /' "$WORK/T1.log"; } \
+  || ok "T(t1): and NOT as read-set-not-examined -- there was nothing to examine, which is not the same as declining to look"
+grep -q 'SYNC REFUSED' "$WORK/T1.log" \
+  && { bad "T(t1): a refusal was printed on a run that installs nothing"; sed 's/^/      /' "$WORK/T1.log"; } \
+  || ok "T(t1): and no SYNC REFUSED row of any kind is on the page"
+[ "$(md5sum "$TT/tools/a_tool.sh" | awk '{print $1}')" = "$BEFORE_T" ] \
+  && ok "T(t1): and rc 0 wrote nothing -- every file was already the commit's bytes" \
+  || bad "T(t1): the no-op run changed a task copy"
+grep -q '### SYNC PIN REPORT' "$WORK/T1.log" \
+  && ok "T(t1): the evidence packet survives the no-op -- the PIN REPORT still prints (it is not an early exit)" \
+  || { bad "T(t1): the no-op skipped the PIN REPORT, so a lane loses the list of job roots that will die"; sed 's/^/      /' "$WORK/T1.log"; }
+# t2: the record BEHIND the bytes. The disk is at $V2T; say the record is at $V1T.
+printf '%s\n' "$V1T" > "$TT/tools/.harness_synced_commit"
+runsync "$RT" "$TT" "$WORK/T_squeue" "$V2T" > "$WORK/T2.log" 2>&1; rcT2=$?
+grep -qE "^### RECORD ADVANCED $V1T -> $V2T bytes-identical\$" "$WORK/T2.log" \
+  && ok "T(t2): a no-op whose RECORD was behind says so -- '### RECORD ADVANCED $V1T -> $V2T bytes-identical'" \
+  || { bad "T(t2): rc=$rcT2 and no RECORD ADVANCED row"; grep -E 'RECORD|NO-OP' "$WORK/T2.log" | sed 's/^/      /'; }
+[ "$(cat "$TT/tools/.harness_synced_commit")" = "$V2T" ] \
+  && ok "T(t2): and the record file actually moved to $V2T, so --check compares against the truth" \
+  || bad "T(t2): the record still says '$(cat "$TT/tools/.harness_synced_commit")'"
+grep -q 'RECORD ADVANCED' "$WORK/T1.log" \
+  && bad "T(t2): t1's run claimed RECORD ADVANCED with the record ALREADY at the commit -- the row is unconditional" \
+  || ok "T(t2): and the row is NOT printed when the record was already right (t1 has none)"
+# t3: NON-VACUITY. One file differs, so the install set is not empty, and the
+# SAME pinned job must produce the SAME rc 4 it always did.
+git -C "$RT" cat-file blob "$V1T:harness/tools/a_tool.sh" > "$TT/tools/a_tool.sh"
+BEFORE_T3=$(md5sum "$TT/tools/a_tool.sh" | awk '{print $1}')
+runsync "$RT" "$TT" "$WORK/T_squeue" "$V2T" > "$WORK/T3.log" 2>&1; rcT3=$?
+[ "$rcT3" -eq 4 ] \
+  && ok "T(t3): NON-VACUITY -- with ONE file differing the same pinned PENDING job still refuses rc 4" \
+  || { bad "T(t3): rc=$rcT3, wanted 4 -- the no-op arm has widened into a hole"; sed 's/^/      /' "$WORK/T3.log"; }
+grep -q '^###   state=PENDING 9000010 lane1-relock .*reason=read-set-not-examined' "$WORK/T3.log" \
+  && ok "T(t3): and with the unchanged reason -- read-set-not-examined, exactly as before HARNESS-SYNC-9" \
+  || { bad "T(t3): the rc-4 row's reason changed"; grep -E '^###   state=PENDING' "$WORK/T3.log" | sed 's/^/      /'; }
+grep -q 'SYNC NO-OP' "$WORK/T3.log" \
+  && bad "T(t3): it printed a NO-OP row for a run with a non-empty install set" \
+  || ok "T(t3): and no NO-OP row is printed when there IS something to install"
+[ "$(md5sum "$TT/tools/a_tool.sh" | awk '{print $1}')" = "$BEFORE_T3" ] \
+  && ok "T(t3): and it wrote nothing while refusing" || bad "T(t3): it wrote while refusing"
+# t4: THE BLOBLESS HOLE. Nothing to install, but a mapped task file has no blob
+# at the commit -- the install loop calls that NO-BLOB and exits 5, so this run
+# is NOT a no-op. Reading only $INSTSET would have turned a rc 5 into a rc 0.
+read -r RT4 TT4 V1T4 V2T4 < <(mkfixture T4)
+mkstub "$WORK/T4_squeue"
+runsync "$RT4" "$TT4" "$WORK/T4_squeue" "$V2T4" > "$WORK/T4s.log" 2>&1
+printf 'nobody committed this\n' > "$TT4/tools/an_orphan.sh"
+runsync "$RT4" "$TT4" "$WORK/T4_squeue" "$V2T4" > "$WORK/T4.log" 2>&1; rcT4=$?
+if [ "$rcT4" -eq 5 ] && ! grep -q 'SYNC NO-OP' "$WORK/T4.log"; then
+  ok "T(t4): a mapped task file with NO BLOB at the commit is NOT a no-op -- rc 5 is still owed and no NO-OP row is printed"
+else
+  bad "T(t4): rc=$rcT4 (wanted 5) or a NO-OP row was printed -- the short-circuit swallowed a would-be rc 5"
+  grep -E 'NO-OP|NO-BLOB|SUMMARY' "$WORK/T4.log" | sed 's/^/      /'
+fi
+# t5: THE MUTATION -- cut exactly the short-circuit and t1's fixture must refuse.
+MUT9=$WORK/harness_sync_nonoop.sh
+sed 's|.*# HARNESS-SYNC-9 NO-OP SHORT-CIRCUIT$|if false; then|' "$SYNC" > "$MUT9"
+if bash -n "$MUT9" 2>/dev/null && ! grep -q 'HARNESS-SYNC-9 NO-OP SHORT-CIRCUIT' "$MUT9"; then
+  read -r RT5 TT5 V1T5 V2T5 < <(mkfixture T5)
+  mkstub "$WORK/T5_none"
+  runsync "$RT5" "$TT5" "$WORK/T5_none" "$V2T5" > "$WORK/T5s.log" 2>&1
+  mkdir -p "$TT5/lane1"; printf '%s\n' "$V1T5" > "$TT5/lane1/HARNESS_COMMIT"
+  mkstub "$WORK/T5_squeue" "9000011 lane1-relock"
+  cp -f "$MUT9" "$TT5/tools/harness_sync.sh"
+  HARNESS_REPO="$RT5" HARNESS_TASK_DIR="$TT5" HARNESS_SQUEUE="$WORK/T5_squeue" \
+    bash "$TT5/tools/harness_sync.sh" "$V2T5" > "$WORK/T5.log" 2>&1; rcT5=$?
+  if [ "$rcT5" -eq 4 ] && grep -q 'reason=read-set-not-examined' "$WORK/T5.log" \
+     && ! grep -q 'SYNC NO-OP' "$WORK/T5.log"; then
+    ok "T(t5): MUTATION -- with the short-circuit cut the SAME at-commit fixture refuses rc 4 read-set-not-examined again (rc=$rcT5), so t1 CAN fail"
+  else
+    bad "T(t5): the mutant gave rc=$rcT5 and did not reproduce the refusal -- ARM t1 IS NOT TESTING THE SHORT-CIRCUIT"
+    sed 's/^/      /' "$WORK/T5.log"
+  fi
+else
+  bad "T(t5): could not build the no-short-circuit mutant -- MUTATION ARM DID NOT RUN"
+fi
+
 echo "### harness_sync_guard: pass=$pass fail=$fail"
 [ "$fail" -eq 0 ] || exit 1
 exit 0
