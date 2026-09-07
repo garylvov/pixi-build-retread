@@ -114,6 +114,8 @@ c9f561484d8ef42157ba6a7532f80681  tools/pixi_shard_cache.py
 6960c0ac937f51969cd1d4f1e1af65c2  tools/pixi_trim_repodata.py
 7b6d14570716273e2562aaafd0bba071  tools/proof_smoke_guard.sh
 b7b4546662fa8c555a727be04c8b08ff  tools/proof_smoke.sh
+38b0cbca51b31df959b91485fec83e2d  tools/relock_capability_check.sh
+cadf10da0e832491127089362ee691d5  tools/relock_capability_check_guard.sh
 1b2523412031cb68eb4ad2a746f429e8  tools/retread_fast_env.sh
 cfb37e19260285fc9f351e59dbe81ce1  tools/script_refs.sh
 ff9014ec8ab0806334b426b41e38c5a2  tools/stage_mirror.sh
