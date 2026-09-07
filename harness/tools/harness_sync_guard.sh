@@ -1502,21 +1502,38 @@ read -r RS5 TS5 V1S5 V2S5 < <(mkfixture S5)
 mkchainjob "$TS5/jobroot" s5.sbatch "TT=$TS5" 'TTOOLS=$TT/tools' 'bash "$TTOOLS/a_tool.sh"'
 mkstub "$WORK/S5_squeue"
 printf '8000082 RUNNING laneS5 %s %s %s\n' "$TS5" "$TS5/jobroot/s5.sbatch" "$TS5/jobroot" > "$WORK/S5_run.txt"
-for d in "$TS5/tools/harness_drift_check.sh" "$RS5/harness/tools/harness_drift_check.sh"; do
-  sed -i 's/|\.harness_synced_commit|\.harness_synced_commit\.\*)/|.harness_synced_commit)/' "$d"
-done
-if grep -q '|\.harness_synced_commit\.\*)' "$TS5/tools/harness_drift_check.sh"; then
-  bad "S(s5): the mutation edited nothing -- this arm is asserting against an unmutated file and cannot fail"
+#
+# THE MUTATION IS APPLIED **AFTER** THE FORCE, AND THAT ORDER IS THE ARM.
+# Job 6019634 measured the first cut of this arm doing it the other way round
+# and it went green for a false reason: `--force` performs the whole sync, which
+# INSTALLS `tools/harness_drift_check.sh` from the commit -- so a mutation
+# written into the task copy beforehand is overwritten by the very sync it is
+# meant to change. The gate being mutated runs AFTER the force, so the mutation
+# belongs there too. (rc 3 alone would then be ambiguous -- the mutated task
+# copy is itself an EDITED file -- so the arm asserts the SPECIFIC no-blob row
+# for the marker, not the exit code.)
+S5MARK=$TS5/tools/.harness_synced_commit.force-readset
+if ! grep -q '|\.harness_synced_commit\.\*)' "$TS5/tools/harness_drift_check.sh"; then
+  bad "S(s5): the harness_drift_check.sh this guard ships beside does NOT carry the .harness_synced_commit.* glob -- this tree is the PRE-FIX state, s3 above cannot be mutated, and a forced sync here permanently red-lines both gates"
 else
   runsync "$RS5" "$TS5" "$WORK/S5_squeue" "$V2S5" --running-list "$WORK/S5_run.txt" \
           --force --reason "guard fixture mutation" > "$WORK/S5f.log" 2>&1; rcS5f=$?
-  runsync "$RS5" "$TS5" "$WORK/S5_squeue" --check > "$WORK/S5c.log" 2>&1; rcS5c=$?
-  if [ "$rcS5f" -eq 0 ] && [ "$rcS5c" -eq 3 ] \
-     && grep -q 'SYNC CHECK no-blob  tools/.harness_synced_commit.force-readset' "$WORK/S5c.log"; then
-    ok "S(s5): MUTATION -- with the exact-name skip arm restored the same force leaves --check rc 3 no-blob on its own marker. s3 CAN fail; this is the state 955d086 was left in."
+  cp -f "$TS5/tools/harness_drift_check.sh" "$WORK/S5.drift.before"
+  sed -i 's/|\.harness_synced_commit|\.harness_synced_commit\.\*)/|.harness_synced_commit)/' \
+      "$TS5/tools/harness_drift_check.sh"
+  if cmp -s "$WORK/S5.drift.before" "$TS5/tools/harness_drift_check.sh"; then
+    bad "S(s5): the mutation edited nothing -- this arm is asserting against an unmutated file and cannot fail"
+  elif [ ! -s "$S5MARK" ]; then
+    bad "S(s5): the force wrote no marker, so there is nothing for the mutated gate to trip over and s5 measures nothing (force rc=$rcS5f)"
   else
-    bad "S(s5): force rc=$rcS5f check rc=$rcS5c -- the pre-fix shape did NOT reproduce the refusal, so s3 proves nothing"
-    grep -E 'no-blob|SYNC CHECK SUMMARY' "$WORK/S5c.log" | sed 's/^/      /'
+    runsync "$RS5" "$TS5" "$WORK/S5_squeue" --check > "$WORK/S5c.log" 2>&1; rcS5c=$?
+    if [ "$rcS5f" -eq 0 ] && [ "$rcS5c" -eq 3 ] \
+       && grep -q 'SYNC CHECK no-blob  tools/.harness_synced_commit.force-readset' "$WORK/S5c.log"; then
+      ok "S(s5): MUTATION -- with the exact-name skip arm restored, the marker the force wrote makes --check refuse rc 3 with its own no-blob row. s3 CAN fail; this is the state 955d086 was left in."
+    else
+      bad "S(s5): force rc=$rcS5f check rc=$rcS5c -- the pre-fix shape did NOT reproduce the no-blob refusal on the marker, so s3 proves nothing"
+      grep -E 'no-blob|SYNC CHECK SUMMARY' "$WORK/S5c.log" | sed 's/^/      /'
+    fi
   fi
 fi
 
