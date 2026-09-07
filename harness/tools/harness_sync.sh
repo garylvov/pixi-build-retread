@@ -280,11 +280,42 @@ if [ "$MODE" = check ]; then
   # disk. Seventeen commits from four lanes lived only under agrescap/worktrees
   # on 2026-09-07 because no reader asked. It never changes this mode's rc --
   # the cert treats a non-0/3 rc as "inconclusive" -- so the row is the actor.
-  PUSH_CHECK=$(dirname "$0")/harness_push_check.sh
+  # HARNESS-SYNC-8 FINDING 2: THE SYNC INSTALLED A CALLER WITHOUT ITS CALLEE.
+  # This resolved ONE hop, `$(dirname "$0")`, and a NEW file enters the task dir
+  # only when it is `--add`ed by name -- so the moment the newly-installed task
+  # copy of this script ran, it called a path that has never existed there and
+  # printed `### PUSH LAG branch=? unpushed=?`. A criterion that can only answer
+  # `?` has no live producer (law 2), and "unpushed=0" is a stated acceptance
+  # criterion for a landing. `script_refs.sh` two blocks down has survived the
+  # same absence for the same reason: it resolves THREE hops, ending at the repo.
+  # This now does the same, and `$SELF_DIR` (from BASH_SOURCE) rather than `$0`,
+  # because `$0` is not knowable when the file is Slurm's snapshot
+  # (HARNESS-SYNC-7-1). An `--add` of tools/harness_push_check.sh is still the
+  # right end state -- the fallback is what keeps the criterion measurable until
+  # then, not a reason to skip it.
+  PUSH_CHECK=$SELF_DIR/harness_push_check.sh
+  [ -f "$PUSH_CHECK" ] || PUSH_CHECK=$TASK_DIR/tools/harness_push_check.sh
+  [ -f "$PUSH_CHECK" ] || PUSH_CHECK=$REPO/harness/tools/harness_push_check.sh
   if [ -f "$PUSH_CHECK" ]; then
+    echo "### PUSH LAG reader: $PUSH_CHECK"
     HARNESS_REPO=$REPO bash "$PUSH_CHECK" || true
   else
-    echo "### PUSH LAG branch=? unpushed=? -- harness_push_check.sh missing next to $0"
+    echo "### PUSH LAG branch=? unpushed=? -- no harness_push_check.sh at $SELF_DIR,"
+    echo "###   at $TASK_DIR/tools, nor at $REPO/harness/tools. This criterion has NO"
+    echo "###   producer and must not be reported as satisfied."
+  fi
+  # THE OTHER DIRECTION, IN THE READ-ONLY MODE TOO. The absent set was reported
+  # only by the WRITING mode, so a lane that ran `--check` -- the mode you run
+  # precisely when you are not installing -- could not see that the commit
+  # carries files this task dir does not have. That is how harness_push_check.sh
+  # was missing for a full lane without anybody being told.
+  if [ -s "$ABSENT" ]; then
+    echo "### SYNC ABSENT ($(wc -l < "$ABSENT")): in $SHA, not in the task dir, NOT installed --"
+    echo "###   the drift check does not read them either, so the writer and the checker agree."
+    echo "###   To bring one in:  harness_sync.sh $SHA --add <task path>"
+    sed 's/^/###   /' "$ABSENT"
+  else
+    echo "### SYNC ABSENT (0): the task dir carries every file $SHA maps into a scanned directory"
   fi
   if [ "$edited" -gt 0 ]; then
     echo "### SYNC CHECK REFUSED -- the file(s) named above were written by something"

@@ -76,9 +76,9 @@ de2c918a31b7e5fdae517cda1ccba4d4  tools/gate_head_pin.sh
 4d5a36d919e59c5f1631f1da82e806a2  tools/harness_commit_pin_guard.sh
 8cad0bdfc7496ee0661c4f5701a8e087  tools/harness_commit_resolve.sh
 447037c0b4249d9d3d7c084940be5cc4  tools/harness_drift_allowlist.txt
-a5d492615f7475231606ceedea2ca9a4  tools/harness_sync.sh
-c160685c4c2b100fff388b48b921ddef  tools/harness_sync_guard.sh
-587729c857a328049c8dd28a3d189f55  tools/harness_drift_check.sh
+f03771284f31bb0369e1fa1bf16de052  tools/harness_sync.sh
+335e625a551461b2d572022379d9aa5e  tools/harness_sync_guard.sh
+b84e488467c4ce2f68a94a1f20ebe739  tools/harness_drift_check.sh
 4c8a892042e7de5b6ed3763562a2dd52  tools/harness_push_check.sh
 39e620e807735bdc65b09fb8078d8e82  tools/import_audit.py
 6d2b91a7a82e1509d77fa7c2333b5f56  tools/land_fixset_sync_guard.sh

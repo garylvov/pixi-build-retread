@@ -55,9 +55,26 @@ HARNESS_SCAN_DIRS=${HARNESS_SCAN_DIRS:-"tools tools/phase_template merge-h"}
 # `.harness_synced_commit` is the single writer's own record of the last commit
 # it installed (HARNESS-SYNC-1); it is state this directory owns, has no blob
 # anywhere, and must not be read as a task copy that has gone missing.
+#
+# HARNESS-SYNC-8 FINDING 1, AND IT IS THE READER/WRITER LAW ON ITS OWN GATE. The
+# match above was an EXACT NAME, so it skipped the record and NOT the record's
+# SIDECARS. `harness_sync.sh --force` writes its audit marker to
+# `"$RECORD.force-readset"` -- four lines from the code that then refuses it --
+# and that file lives in the SCANNED directory `tools/` where it can never have
+# a blob. Measured 2026-09-07 after the one authorised force to 955d086:
+#   bash tools/harness_sync.sh --check      -> rc 3, checked=86 clean=85 edited=1
+#     SYNC CHECK no-blob  tools/.harness_synced_commit.force-readset
+#   bash tools/harness_drift_check.sh 955d086 -> rc 3, ok=84 mismatch=0 missing=1
+# `mismatch=0` in both: nothing had actually drifted, the marker WAS the whole
+# refusal. Both gates then red-line PERMANENTLY, from the moment a force
+# succeeds -- and "--check clean" is an acceptance criterion for a merge-queue
+# landing, so a force to unblock a landing blocked it instead (B30, 07:27).
+# THE MARKER IS NOT DELETED TO QUIET THE GATE: it is the audit record of an
+# authorised force and it stays on disk. The GLOB is the fix, so every sidecar
+# this writer ever hangs off its own record is state, not drift.
 harness_is_evidence () {
   case "$(basename -- "$1")" in
-    *.bak-*|*.pre-*|*.pyc|*~|.harness_synced_commit) return 0;;
+    *.bak-*|*.pre-*|*.pyc|*~|.harness_synced_commit|.harness_synced_commit.*) return 0;;
   esac
   return 1
 }

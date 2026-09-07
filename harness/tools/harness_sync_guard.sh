@@ -103,6 +103,13 @@
 #      check defines map_of when sourced with HARNESS_DRIFT_LIB, and the writer
 #      contains no map_of of its own; and both phase templates run `--check`
 #      as the first line of their drift block.
+#   S  HARNESS-SYNC-8: THE FORCE PATH AGAINST ITS OWN POST-CONDITIONS. A
+#      fixture force, then BOTH gates (`--check` and harness_drift_check.sh) run
+#      on the task dir the force left, plus the push-lag fallback and the
+#      read-only mode's ABSENT report. Every arm before this one asserted what
+#      --force DOES; none asserted the state it LEAVES, which is how the marker
+#      it writes came to red-line both gates permanently. See the block above
+#      the arm for the measured rows.
 #
 # THE MUTATION IS PINNED TO A COMMIT CONSTANT, NEVER `HEAD`: an arm that reads
 # `HEAD:<the file it guards>` starts asserting the fix against itself the moment
@@ -1404,6 +1411,139 @@ else
   ok "R(r5): and no cleared row anywhere names a path under the snapshot's own directory"
 fi
 
+
+# ---- S: HARNESS-SYNC-8 -- THE FORCE PATH AGAINST ITS OWN POST-CONDITIONS -----
+# THE DEFECT, MEASURED 2026-09-07 AFTER THE ONE AUTHORISED FORCE TO 955d086.
+# `--force` writes its audit marker to `"$RECORD.force-readset"`, i.e. into the
+# SCANNED directory `tools/`, where no commit can ever carry a blob for it. The
+# skip arm in harness_drift_check.sh matched the record by EXACT NAME, so the
+# record was skipped and its sidecar was not:
+#     bash tools/harness_sync.sh --check        -> rc 3  checked=86 clean=85 edited=1
+#       SYNC CHECK no-blob  tools/.harness_synced_commit.force-readset
+#     bash tools/harness_drift_check.sh 955d086 -> rc 3  ok=84 mismatch=0 missing=1
+# `mismatch=0` in both: NOTHING had drifted; the marker was the entire refusal,
+# and it red-lines both gates permanently from the moment a force succeeds. The
+# phase templates run `--check` as the first line of their drift block and
+# "--check clean" is an acceptance criterion for a merge-queue landing, so the
+# force written to unblock B30 is what then blocked it.
+#
+# WHY THE GUARD DID NOT CATCH IT, WHICH IS THE REAL LESSON: every existing arm
+# asserted what --force DOES (it installs) and none asserted the state it LEAVES.
+# A writer is not guarded until its own readers are run against its output.
+#
+#   s1  NON-VACUITY + the control: the fixture really does need the force (rc 6
+#       without it, nothing written).
+#   s2  the force installs (rc 0) and the marker IS on disk.
+#   s3  THE POST-CONDITION: `--check` rc 0 CLEAN and `harness_drift_check.sh`
+#       rc 0 CLEAN on that same task dir, with the marker still there.
+#   s4  the marker is NOT deleted -- it is the audit record of an authorised
+#       force and quieting the gate by removing it is the wrong fix.
+#   s5  MUTATION: the pre-fix EXACT-NAME skip arm restored -> `--check` rc 3
+#       with the no-blob row. Without this, s3 passes for free.
+#   s6  HARNESS-SYNC-8 FINDING 2: a task dir with NO tools/harness_push_check.sh
+#       still prints a REAL `### PUSH LAG` row -- the three-hop fallback -- and
+#       never `branch=? unpushed=?`, which is a criterion with no producer.
+#   s7  `--check` reports the ABSENT set. It was reported only by the WRITING
+#       mode, which is why harness_push_check.sh was missing for a whole lane
+#       with nobody told.
+read -r RS TS V1S V2S < <(mkfixture S)
+mkchainjob "$TS/jobroot" s.sbatch \
+  "TT=$TS" \
+  'TTOOLS=$TT/tools' \
+  'bash "$TTOOLS/a_tool.sh"'
+mkstub "$WORK/S_squeue"
+printf '8000081 RUNNING laneS %s %s %s\n' "$TS" "$TS/jobroot/s.sbatch" "$TS/jobroot" > "$WORK/S_run.txt"
+BEFORE_S=$(md5sum "$TS/tools/a_tool.sh" | awk '{print $1}')
+runsync "$RS" "$TS" "$WORK/S_squeue" "$V2S" --running-list "$WORK/S_run.txt" > "$WORK/S1.log" 2>&1; rcS1=$?
+AFTER_S1=$(md5sum "$TS/tools/a_tool.sh" | awk '{print $1}')
+if [ "$rcS1" -eq 6 ] && [ "$AFTER_S1" = "$BEFORE_S" ]; then
+  ok "S(s1): NON-VACUITY -- without --force this fixture refuses rc 6 and writes nothing, so the force path below is really exercised"
+else
+  bad "S(s1): rc=$rcS1 before=$BEFORE_S after=$AFTER_S1 -- wanted rc 6; the force arms would prove nothing"
+  sed 's/^/      /' "$WORK/S1.log"
+fi
+
+SMARK=$TS/tools/.harness_synced_commit.force-readset
+runsync "$RS" "$TS" "$WORK/S_squeue" "$V2S" --running-list "$WORK/S_run.txt" \
+        --force --reason "guard fixture: the single reader is a fixture job" > "$WORK/S2.log" 2>&1; rcS2=$?
+if [ "$rcS2" -eq 0 ] && grep -q '### SYNC FORCED over the read set of' "$WORK/S2.log"; then
+  ok "S(s2): --force --reason installs over the read set, rc 0"
+else
+  bad "S(s2): rc=$rcS2 -- the authorised force did not install"; sed 's/^/      /' "$WORK/S2.log"
+fi
+if [ -s "$SMARK" ]; then
+  ok "S(s2): the audit marker is on disk: $(cat "$SMARK")"
+else
+  bad "S(s2): no force-readset marker was written -- the force left no audit record and s3 would pass for free"
+fi
+
+runsync "$RS" "$TS" "$WORK/S_squeue" --check > "$WORK/S3c.log" 2>&1; rcS3c=$?
+if [ "$rcS3c" -eq 0 ] && grep -q '### SYNC CHECK CLEAN' "$WORK/S3c.log"; then
+  ok "S(s3): after an authorised force, \`--check\` is rc 0 CLEAN -- the writer's own reader tolerates what it wrote"
+else
+  bad "S(s3): --check rc=$rcS3c after a force. THE FORCE PATH RED-LINES ITS OWN GATE (HARNESS-SYNC-8 finding 1):"
+  grep -E 'no-blob|SYNC CHECK SUMMARY|SYNC CHECK REFUSED' "$WORK/S3c.log" | sed 's/^/      /'
+fi
+HARNESS_REPO="$RS" HARNESS_TASK_DIR="$TS" bash "$TS/tools/harness_drift_check.sh" "$V2S" \
+  > "$WORK/S3d.log" 2>&1; rcS3d=$?
+if [ "$rcS3d" -eq 0 ] && grep -q 'missing=0' "$WORK/S3d.log"; then
+  ok "S(s3): and harness_drift_check.sh is rc 0 with missing=0 on the same task dir -- both gates, not one"
+else
+  bad "S(s3): drift rc=$rcS3d after a force -- the marker is being read as a task copy that went missing:"
+  grep -E 'DRIFT SUMMARY|DRIFT REFUSED|no-blob' "$WORK/S3d.log" | sed 's/^/      /'
+fi
+[ -s "$SMARK" ] \
+  && ok "S(s4): and the marker is STILL on disk after both gates ran -- the gate was fixed, the audit record was not deleted" \
+  || bad "S(s4): the marker is gone -- something quieted the gate by deleting the evidence of the force"
+
+# s5 MUTATION: restore the pre-fix EXACT-NAME skip arm and the same force must
+# red-line --check again. A guard that cannot fail is a defect.
+read -r RS5 TS5 V1S5 V2S5 < <(mkfixture S5)
+mkchainjob "$TS5/jobroot" s5.sbatch "TT=$TS5" 'TTOOLS=$TT/tools' 'bash "$TTOOLS/a_tool.sh"'
+mkstub "$WORK/S5_squeue"
+printf '8000082 RUNNING laneS5 %s %s %s\n' "$TS5" "$TS5/jobroot/s5.sbatch" "$TS5/jobroot" > "$WORK/S5_run.txt"
+for d in "$TS5/tools/harness_drift_check.sh" "$RS5/harness/tools/harness_drift_check.sh"; do
+  sed -i 's/|\.harness_synced_commit|\.harness_synced_commit\.\*)/|.harness_synced_commit)/' "$d"
+done
+if grep -q '|\.harness_synced_commit\.\*)' "$TS5/tools/harness_drift_check.sh"; then
+  bad "S(s5): the mutation edited nothing -- this arm is asserting against an unmutated file and cannot fail"
+else
+  runsync "$RS5" "$TS5" "$WORK/S5_squeue" "$V2S5" --running-list "$WORK/S5_run.txt" \
+          --force --reason "guard fixture mutation" > "$WORK/S5f.log" 2>&1; rcS5f=$?
+  runsync "$RS5" "$TS5" "$WORK/S5_squeue" --check > "$WORK/S5c.log" 2>&1; rcS5c=$?
+  if [ "$rcS5f" -eq 0 ] && [ "$rcS5c" -eq 3 ] \
+     && grep -q 'SYNC CHECK no-blob  tools/.harness_synced_commit.force-readset' "$WORK/S5c.log"; then
+    ok "S(s5): MUTATION -- with the exact-name skip arm restored the same force leaves --check rc 3 no-blob on its own marker. s3 CAN fail; this is the state 955d086 was left in."
+  else
+    bad "S(s5): force rc=$rcS5f check rc=$rcS5c -- the pre-fix shape did NOT reproduce the refusal, so s3 proves nothing"
+    grep -E 'no-blob|SYNC CHECK SUMMARY' "$WORK/S5c.log" | sed 's/^/      /'
+  fi
+fi
+
+# s6: the callee is ABSENT from the task dir and the criterion must still have a
+# producer. This is the exact state 955d086's sync left behind: a NEW file enters
+# only via --add, so the freshly-installed caller called a path that never existed.
+read -r RS6 TS6 V1S6 V2S6 < <(mkfixture S6)
+rm -f "$TS6/tools/harness_push_check.sh"
+mkstub "$WORK/S6_squeue"
+runsync "$RS6" "$TS6" "$WORK/S6_squeue" "$V2S6" > "$WORK/S6s.log" 2>&1
+runsync "$RS6" "$TS6" "$WORK/S6_squeue" --check > "$WORK/S6.log" 2>&1; rcS6=$?
+S6ROW=$(grep -m1 '### PUSH LAG' "$WORK/S6.log" || true)
+if [ -n "$S6ROW" ] && ! printf '%s' "$S6ROW" | grep -q 'branch=?'; then
+  ok "S(s6): with tools/harness_push_check.sh ABSENT the fallback still produces a real row: $S6ROW"
+else
+  bad "S(s6): the push-lag criterion has no producer when the callee is absent (row: '${S6ROW:-<none>}') -- 'unpushed=0' cannot then be reported as satisfied"
+fi
+grep -q 'PUSH LAG reader:' "$WORK/S6.log" \
+  && ok "S(s6): and it NAMES which copy answered -- a clearance whose source is unknown is not auditable" \
+  || bad "S(s6): no '### PUSH LAG reader:' row -- the hop that answered is not on the record"
+
+# s7: --check reports the absent set (it was a write-mode-only report).
+if grep -q '### SYNC ABSENT' "$WORK/S6.log"; then
+  ok "S(s7): \`--check\` reports the ABSENT set: $(grep -m1 '### SYNC ABSENT' "$WORK/S6.log")"
+else
+  bad "S(s7): --check printed no ABSENT report -- a lane running the read-only mode cannot see that the commit carries files this task dir does not have"
+fi
 echo "### harness_sync_guard: pass=$pass fail=$fail"
 [ "$fail" -eq 0 ] || exit 1
 exit 0
