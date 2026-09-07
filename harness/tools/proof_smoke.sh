@@ -606,8 +606,8 @@ smoke_stage_break_links () {     # $1 = workspace; MUST run before anything lock
 # the target, REAP_PERSISTENT_DEFAULT being the mirror parent's own parent
 # (guard checks 5, 6, 7a-7c) -- 6010236's eight reaps were all under
 # /oscar/data/stellex/glvov/retread/psgm6010236.  NOT a publish under a suffixed
-# name the HIT check never looks for: the live parent holds 7 entries, 5 of them
-# .DIRTY-/.SRCLINKED- quarantines, and none of the 7 is from 6010236.  NOT a
+# name the HIT check never looks for: the live parent holds 5 entries, ALL of
+# them .DIRTY-/.SRCLINKED- quarantines, and none is from 6010236.  NOT a
 # mid-run quarantine: there is no .DIRTY-6010236, and this file has no post-run
 # mirror verify that could have written one (`stage_verify_mirror` is named in
 # the note above as BOARDED AND STILL ABSENT here, and it still is -- adding it
