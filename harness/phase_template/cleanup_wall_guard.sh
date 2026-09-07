@@ -72,36 +72,56 @@ wall_of () {  # $1 = log file -> the wall in SECONDS off the OWNER SNAPSHOT row
 }
 
 ########## A. the wall is a function of the entry count ########################
-mkdir -p "$W/jr.small" "$W/jr.big"
-bash "$SNAPTOOL" "$W/jr.small" "$W/cleanup_gated.sh" --roots "$SMALL" > "$W/A.small.log" 2>&1; rcS=$?
-bash "$SNAPTOOL" "$W/jr.big"   "$W/cleanup_gated.sh" --roots "$BIG"   > "$W/A.big.log"   2>&1; rcB=$?
-WS=$(wall_of "$W/A.small.log"); WB=$(wall_of "$W/A.big.log")
-if [ "$rcS" = 0 ] && [ "$rcB" = 0 ] && [ -n "$WS" ] && [ -n "$WB" ]; then
-  ok "A. both snapshots printed a wall row: small=${WS}s big=${WB}s"
-  grep -h '^### OWNER SNAPSHOT wall=' "$W/A.small.log" "$W/A.big.log" | sed 's/^/GUARD:   /'
-  if [ "$WB" -gt "$WS" ]; then
-    ok "A. the 100000-entry root gets a LARGER wall than the 100-entry root (${WB}s > ${WS}s)"
-  else
-    fail "A. the walls do not separate: small=${WS}s big=${WB}s -- the derivation is not reading the entry count"
-  fi
-  if [ "$WS" = 3600 ]; then
-    ok "A. the tiny root lands on the FLOOR (3600s), which is what a floor is for"
-  else
-    fail "A. the 100-entry root got ${WS}s, not the 3600s floor"
-  fi
+# TWO regimes, and both matter. With the shipped 3600 s floor a 100,000-entry
+# root is still SMALLER than the floor covers (2*100001/200 + 2*100001/1700 =
+# 1120 s), so a fixture at that size measures the floor and not the derivation
+# -- the first run of this guard (job 6014847) printed exactly that and went
+# red, which is the guard doing its job on itself. So: A1 measures the floor at
+# the shipped constants, and A2 lowers the floor through its documented
+# override so the derivation is what decides. A fixture big enough to clear a
+# one-hour floor would need ~360,000 entries and would measure NFS, not this.
+mkdir -p "$W/jr.small" "$W/jr.fsmall" "$W/jr.fbig"
+bash "$SNAPTOOL" "$W/jr.small" "$W/cleanup_gated.sh" --roots "$SMALL" > "$W/A1.small.log" 2>&1; rcS=$?
+W1S=$(wall_of "$W/A1.small.log")
+if [ "$rcS" = 0 ] && [ "$W1S" = 3600 ]; then
+  ok "A1. at the shipped constants a 101-entry root lands on the 3600s FLOOR, which is what a floor is for"
 else
-  fail "A. snapshot rc small=$rcS big=$rcB, wall rows small='$WS' big='$WB'"
-  sed 's/^/GUARD:   /' "$W/A.small.log" "$W/A.big.log"
+  fail "A1. rc=$rcS wall='$W1S' (wanted the 3600s floor)"; sed 's/^/GUARD:   /' "$W/A1.small.log"
 fi
 
+OWNER_WALL_FLOOR_S=60 bash "$SNAPTOOL" "$W/jr.fsmall" "$W/cleanup_gated.sh" --roots "$SMALL" > "$W/A.small.log" 2>&1; rcS=$?
+OWNER_WALL_FLOOR_S=60 bash "$SNAPTOOL" "$W/jr.fbig"   "$W/cleanup_gated.sh" --roots "$BIG"   > "$W/A.big.log"   2>&1; rcB=$?
+WS=$(wall_of "$W/A.small.log"); WB=$(wall_of "$W/A.big.log")
+# The PREDICTION, computed here independently of the tool: margin 2 on the
+# unlink term at 200 entries/s, plus 2 census walks at 1700 entries/s, both
+# rounded up. If the tool and this line disagree, one of them is wrong and the
+# guard says so rather than accepting whatever was printed.
+WANT=$(awk -v e="$NB" 'BEGIN{u=int((e+199)/200); c=int((e+1699)/1700); print u*2 + c*2}')
+if [ "$rcS" = 0 ] && [ "$rcB" = 0 ] && [ -n "$WS" ] && [ -n "$WB" ]; then
+  ok "A2. both snapshots printed a wall row: small=${WS}s big=${WB}s (floor overridden to 60s)"
+  grep -h '^### OWNER SNAPSHOT wall=' "$W/A.small.log" "$W/A.big.log" | sed 's/^/GUARD:   /'
+  if [ "$WB" -gt "$WS" ]; then
+    ok "A2. the $NB-entry root gets a LARGER wall than the $NS-entry root (${WB}s > ${WS}s)"
+  else
+    fail "A2. the walls do not separate: small=${WS}s big=${WB}s -- the derivation is not reading the entry count"
+  fi
+  if [ "$WB" = "$WANT" ]; then
+    ok "A2. and the big root's wall is EXACTLY the formula's ${WANT}s -- 2x unlink at 200/s plus 2 census walks at 1700/s"
+  else
+    fail "A2. the derived wall ${WB}s is not the predicted ${WANT}s"
+  fi
+else
+  fail "A2. snapshot rc small=$rcS big=$rcB, wall rows small='$WS' big='$WB'"
+  sed 's/^/GUARD:   /' "$W/A.small.log" "$W/A.big.log"
+fi
 ########## B. owner.wall is a pasteable --time ################################
-WF=$W/jr.big/owner-snapshot/owner.wall
+WF=$W/jr.fbig/owner-snapshot/owner.wall
 if [ -s "$WF" ] && grep -qE '^--time=[0-9]{2,}:[0-9]{2}:[0-9]{2}$' "$WF"; then
   ok "B. owner.wall carries a well-formed wall: $(cat "$WF")"
 else
   fail "B. owner.wall is missing or malformed: $( [ -f "$WF" ] && cat "$WF" || echo '<absent>' )"
 fi
-if grep -qE '^#SBATCH --time=[0-9]{2,}:[0-9]{2}:[0-9]{2}$' "$W/jr.big/owner-snapshot/owner.sbatch"; then
+if grep -qE '^#SBATCH --time=[0-9]{2,}:[0-9]{2}:[0-9]{2}$' "$W/jr.fbig/owner-snapshot/owner.sbatch"; then
   ok "B. the generated owner.sbatch carries the derived #SBATCH --time directive too"
 else
   fail "B. owner.sbatch has no #SBATCH --time directive -- an owner submitted without --time would take the 5-minute partition default"
@@ -110,11 +130,13 @@ fi
 ########## C. THE ACTUATOR: the owner re-derives and continues itself ##########
 # The snapshot is taken while the root holds 100 entries; the root then GROWS to
 # 100000 before the owner runs, which is exactly the shape of a real owner
-# submitted before arm 1.
+# submitted before arm 1. The floor is lowered for the same reason as A2: at
+# 3600 s both the original and the continuation would sit on the floor and the
+# re-derivation would be invisible.
 mkdir -p "$W/jr.short" "$W/bin"
 GROW=$W/roots/certGROW-2
 mkroot "$GROW" 100 >/dev/null
-bash "$SNAPTOOL" "$W/jr.short" "$W/cleanup_gated.sh" --roots "$GROW" > "$W/C.snap.log" 2>&1
+OWNER_WALL_FLOOR_S=60 bash "$SNAPTOOL" "$W/jr.short" "$W/cleanup_gated.sh" --roots "$GROW" > "$W/C.snap.log" 2>&1
 COVERS=$(sed -n 's/.*from entries=\([0-9][0-9]*\) .*/\1/p' "$W/C.snap.log" | head -1)
 seq 101 100000 | ( cd "$GROW" && xargs -n 500 touch )
 NG=$(find "$GROW" -maxdepth 16 | wc -l)
@@ -144,15 +166,15 @@ else
   fail "C. the continuation was not submitted as expected: sbatch calls=$NSUB"
   [ -s "$W/C.sbatch" ] && sed 's/^/GUARD:   sbatch /' "$W/C.sbatch"
 fi
-if [ -n "$CONT_TIME" ] && [ "$CONT_TIME" != "$(sed -n 's/^--time=//p' "$W/jr.short/owner-snapshot/owner.wall")" ]; then
-  ok "C. the continuation's wall ($CONT_TIME) is re-derived, not a copy of the original ($(cat "$W/jr.short/owner-snapshot/owner.wall"))"
+ORIG_TIME=$(sed -n 's/^--time=//p' "$W/jr.short/owner-snapshot/owner.wall")
+if [ -n "$CONT_TIME" ] && [ "$CONT_TIME" != "$ORIG_TIME" ]; then
+  ok "C. the continuation's wall ($CONT_TIME) is RE-DERIVED from the measured census, not a copy of the original ($ORIG_TIME)"
 else
-  fail "C. the continuation reused the original wall -- a continuation with the SAME too-small wall is the timeout again"
+  fail "C. the continuation reused the original wall ($ORIG_TIME) -- a continuation with the SAME too-small wall is the timeout again"
 fi
 grep -q '^### FIXTURE CLEANUP ran with' "$W/C.run.log" \
   && ok "C. and it still exec'd the frozen cleanup for what DOES fit (remove what fits, continue the rest)" \
   || fail "C. the owner never reached the frozen cleanup -- a continuation that replaces the pass instead of extending it removes nothing"
-
 ########## D. MUTATION: derivation removed -> equal walls ######################
 mkdir -p "$W/mut/phase_template" "$W/mut/tools" "$W/jr.mut.small" "$W/jr.mut.big"
 cp "$REFS" "$W/mut/tools/script_refs.sh"
@@ -161,8 +183,8 @@ sed 's/^  wall=\$(( unlink \* OWNER_WALL_MARGIN + census ))$/  wall=$OWNER_WALL_
 if cmp -s "$SNAPTOOL" "$W/mut/phase_template/owner_snapshot.sh"; then
   fail "D. the mutation did not apply -- the derivation line was not found, so D is vacuous"
 else
-  bash "$W/mut/phase_template/owner_snapshot.sh" "$W/jr.mut.small" "$W/cleanup_gated.sh" --roots "$SMALL" > "$W/D.small.log" 2>&1
-  bash "$W/mut/phase_template/owner_snapshot.sh" "$W/jr.mut.big"   "$W/cleanup_gated.sh" --roots "$BIG"   > "$W/D.big.log"   2>&1
+  OWNER_WALL_FLOOR_S=60 bash "$W/mut/phase_template/owner_snapshot.sh" "$W/jr.mut.small" "$W/cleanup_gated.sh" --roots "$SMALL" > "$W/D.small.log" 2>&1
+  OWNER_WALL_FLOOR_S=60 bash "$W/mut/phase_template/owner_snapshot.sh" "$W/jr.mut.big"   "$W/cleanup_gated.sh" --roots "$BIG"   > "$W/D.big.log"   2>&1
   MS=$(wall_of "$W/D.small.log"); MB=$(wall_of "$W/D.big.log")
   if [ -n "$MS" ] && [ "$MS" = "$MB" ]; then
     ok "D. MUTATION REPRODUCED: with the derivation replaced by the floor both roots get ${MS}s -- so arm A is measuring the derivation and not the weather"
