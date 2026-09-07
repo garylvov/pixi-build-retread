@@ -108,6 +108,34 @@
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+# OWNER-SIBLING-1 / MERGE-V-2-3 (2026-09-07). ONE resolver for every sibling
+# this script sources, because there were TWO ladders here and BOTH named only
+# the repo layout. In the REPO the pair is harness/phase_template/<this> beside
+# harness/tools/<sibling>, so `$HERE/../tools/` finds it. In the TASK layout --
+# <task>/tools/phase_template/<this> beside <task>/tools/<sibling>, which is what
+# production actually runs -- `$HERE/../tools/` resolves to <task>/tools/tools/
+# and `$HERE/` to <task>/tools/phase_template/, neither of which exists. The
+# sibling spelling, `$HERE/../`, was never tried, so every production run died
+# rc 2 while owner_export_guard.sh reported 27 arms green: every one of its
+# fixtures drives the repo-shaped copy. CLAUDE.md law 7 hazard (b) -- two copies
+# of one module is the normal state here and path order alone decides which is
+# read, so a fixture that builds one shape measures one shape.
+#
+# The ladder is the one the relock templates already use for STAGE_MIRROR_LIB:
+# every layout NAMED, none guessed. The winner is normalised to an absolute path
+# with no `..` in it, because the row below goes into a job log and a reader
+# should not have to re-derive what `<...>/phase_template/../x.sh` meant.
+owner_resolve_sibling () {          # $1 = basename; echoes the path, or nothing
+  local n=$1 c
+  for c in "$HERE/$n" "$HERE/../$n" "$HERE/../tools/$n" \
+           "/oscar/data/stellex/glvov/agrescap/tasks/retread-4-11/tools/$n"; do
+    [ -f "$c" ] || continue
+    ( cd -- "$(dirname -- "$c")" && printf '%s/%s\n' "$(pwd)" "$(basename -- "$c")" )
+    return 0
+  done
+  return 1
+}
 JOB_ROOT=${1:-}; shift || true
 
 ########## CLEANUP-WALL-1: THE CONSTANTS, EACH CITED TO THE ROWS IT CAME FROM ##
@@ -197,11 +225,7 @@ OWNER_CENSUS_COMPARE_DEPTH=${OWNER_CENSUS_COMPARE_DEPTH-16}
 # The fix is the multi-spelling ladder the relock templates already use for
 # STAGE_MIRROR_LIB: every layout named, none guessed, and the winner PRINTED so
 # a job log answers "which copy did this run import" without re-deriving it.
-OE=$HERE/owner_export.sh
-[ -f "$OE" ] || OE=$HERE/../owner_export.sh          # task:  <task>/tools/
-[ -f "$OE" ] || OE=$HERE/../tools/owner_export.sh    # repo:  harness/tools/
-[ -f "$OE" ] || OE=/oscar/data/stellex/glvov/agrescap/tasks/retread-4-11/tools/owner_export.sh
-[ -f "$OE" ] || {
+OE=$(owner_resolve_sibling owner_export.sh) || {
   echo "### OWNER SNAPSHOT REFUSED: no owner_export.sh -- the generated owner would have to"
   echo "###   build its own --export clause, and the last time two sites built that clause"
   echo "###   four owners sat held for days (REAP-3: 6013350 6013351 6014485 5841188)."
@@ -469,15 +493,19 @@ if [ "${#ROOTS[@]}" -eq 0 ] && [ -z "$UNDERIVED_REASON" ]; then
   echo "###     --allow-underived --reason \"<why this owner needs no wall>\""
   exit 2
 fi
-
-SR=$HERE/../tools/script_refs.sh
-[ -f "$SR" ] || SR=$HERE/script_refs.sh
-[ -f "$SR" ] || {
+# THE SECOND SITE OF THE SAME DEFECT (MERGE-V-2-3). This ladder named only the
+# repo layout too, so a task-layout run that somehow got past the export lib
+# would have died here instead. One resolver, both siblings, and the winner
+# printed -- a sibling nobody can see resolved is a sibling nobody can debug.
+SR=$(owner_resolve_sibling script_refs.sh) || {
   echo "### OWNER SNAPSHOT REFUSED: no script_refs.sh -- the snapshot set would have to be"
   echo "###   guessed, and a guessed set is how the one file the job sources goes missing."
+  echo "###   Looked in, in order: \$HERE/ \$HERE/../ \$HERE/../tools/ and the task tree,"
+  echo "###   with HERE=$HERE."
   exit 2; }
 # shellcheck disable=SC1090
 . "$SR"
+echo "### OWNER SNAPSHOT script_refs=$SR"
 
 SNAP=$JOB_ROOT/owner-snapshot
 mkdir -p "$SNAP" || { echo "### OWNER SNAPSHOT REFUSED: cannot create $SNAP"; exit 2; }

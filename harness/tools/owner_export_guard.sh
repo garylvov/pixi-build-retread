@@ -269,6 +269,7 @@ TASK=$W/task2
 mkdir -p "$TASK/tools/phase_template" "$TASK/merge-h" "$TASK/roots"
 cp "$SNAPT" "$TASK/tools/phase_template/owner_snapshot.sh"
 cp "$PROD"  "$TASK/tools/owner_export.sh"
+cp "$HERE/script_refs.sh" "$TASK/tools/script_refs.sh"
 printf '3333333333333333333333333333333333333333\n' > "$TASK/tools/.harness_synced_commit"
 cp "$FAKE/cleanup_gated.sh" "$TASK/merge-h/cleanup_gated.sh"
 TROOT=$TASK/roots/certE99-123456; mkdir -p "$TROOT/a/b"; : > "$TROOT/a/b/f1"; : > "$TROOT/a/f2"
@@ -287,6 +288,12 @@ if [ "$ELIB" = "$TASK/tools/owner_export.sh" ]; then
 else
   bad "E export_lib row is '$ELIB', want '$TASK/tools/owner_export.sh' -- a job log cannot say which producer it read"
 fi
+SLIB=$(grep -m1 '^### OWNER SNAPSHOT script_refs=' "$W/snapE.out" | sed 's/^### OWNER SNAPSHOT script_refs=//')
+if [ "$SLIB" = "$TASK/tools/script_refs.sh" ]; then
+  ok "E the SECOND sibling (script_refs.sh) resolved through the task spelling too, and said so ($SLIB)"
+else
+  bad "E script_refs row is '$SLIB', want '$TASK/tools/script_refs.sh' -- the second ladder still names only the repo layout"
+fi
 if [ -f "$TJR/owner-snapshot/owner.sbatch" ]; then
   ok "E the TASK-shaped copy went on to generate owner.sbatch end to end (rc=$ERC)"
 else
@@ -297,10 +304,13 @@ fi
 # Delete the two task spellings from a COPY and the SAME fixture must go back to
 # refusing rc 2. Without this, arm E says only that some ladder exists.
 MUT=$TASK/tools/phase_template/owner_snapshot.mut.sh
-grep -v '^\[ -f "\$OE" \] || OE=\$HERE/\.\./owner_export\.sh' "$SNAPT" \
-  | grep -v '^\[ -f "\$OE" \] || OE=/oscar/data/stellex/glvov/agrescap/tasks/' > "$MUT"
+# The mutation is the PRE-FIX LADDER, restored inside the one resolver: the repo
+# spellings only, exactly what shipped before MERGE-V-2-3.
+sed -e 's|^  for c in "\$HERE/\$n" "\$HERE/\.\./\$n" "\$HERE/\.\./tools/\$n" \\$|  for c in "$HERE/$n" "$HERE/../tools/$n"; do|' \
+    -e '/^           "\/oscar\/data\/stellex\/glvov\/agrescap\/tasks\/retread-4-11\/tools\/\$n"; do$/d' \
+    "$SNAPT" > "$MUT"
 MJR=$W/jobroot_mut; mkdir -p "$MJR"
-if bash -n "$MUT" 2>/dev/null && [ "$(grep -c '^\[ -f "\$OE" \] || OE=' "$MUT")" -lt "$(grep -c '^\[ -f "\$OE" \] || OE=' "$SNAPT")" ]; then
+if bash -n "$MUT" 2>/dev/null && grep -q '^  for c in "\$HERE/\$n" "\$HERE/\.\./tools/\$n"; do$' "$MUT"; then
   ( cd "$TASK" && bash "$MUT" "$MJR" "$TASK/merge-h/cleanup_gated.sh" --roots "$TROOT" ) > "$W/snapF.out" 2>&1
   MRC=$?
   if [ "$MRC" = 2 ] && grep -q 'OWNER SNAPSHOT REFUSED: no owner_export.sh' "$W/snapF.out"; then
