@@ -314,7 +314,7 @@ done < "$SET"
 # that still cannot be resolved prints `?` and makes the whole job unknown.
 refs_of () {                      # $1 = script path
   local f=$1
-  grep -hoE '(^|[[:space:]])(bash|source|\.)[[:space:]]+[^[:space:];&|)]+' "$f" 2>/dev/null \
+  grep -hoE '(^|[[:space:]]|[(`;&|])(bash|source|\.)[[:space:]]+[^[:space:];&|)]+' "$f" 2>/dev/null \
   | awk '{print $NF}' | tr -d '\042\047' | while IFS= read -r tok; do
       local b=${tok##*/} v r
       case "$b" in

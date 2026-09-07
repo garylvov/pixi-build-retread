@@ -538,6 +538,21 @@ runsync "$RI6" "$TI6" "$WORK/I6_squeue" "$V2I6" --running-list "$WORK/I6_run.txt
   && ok "I(a1b): a --wrap one-liner naming an installed file refuses rc 6 too (the 5992050 shape)" \
   || { bad "I(a1b): rc=$rcI6 -- the --wrap shape was not read"; sed 's/^/      /' "$WORK/I6.log"; }
 
+# a1c: a reference reached through a COMMAND SUBSTITUTION. 5992569's own sbatch
+# opens `HC=$(bash "$T/tools/harness_commit_resolve.sh" "$P")`; the first cut
+# required whitespace or line-start before the verb, so `$(bash` did not match
+# and harness_commit_resolve.sh silently left that job's read set. Found by
+# applying the rule by hand before syncing with it.
+read -r RI7 TI7 V1I7 V2I7 < <(mkfixture I7)
+mkstub "$WORK/I7_squeue"
+mkdir -p "$TI7/jobroot"
+{ echo '#!/bin/bash'; echo "HC=\$(bash \"$TI7/tools/a_tool.sh\" arg) || exit 6"; } > "$TI7/jobroot/sub.sbatch"
+printf '8000007 laneI7 %s %s\n' "$TI7" "$TI7/jobroot/sub.sbatch" > "$WORK/I7_run.txt"
+runsync "$RI7" "$TI7" "$WORK/I7_squeue" "$V2I7" --running-list "$WORK/I7_run.txt" > "$WORK/I7.log" 2>&1; rcI7=$?
+[ "$rcI7" -eq 6 ] && grep -q 'file=a_tool.sh' "$WORK/I7.log" \
+  && ok "I(a1c): a reference inside \$( ) is in the read set too (5992569's harness_commit_resolve.sh line)" \
+  || { bad "I(a1c): rc=$rcI7 -- a command substitution hid the reference"; sed 's/^/      /' "$WORK/I7.log"; }
+
 # ---- K: the live read set comes from SLURM'S OWN SNAPSHOT, not from disk ----
 # `--running-list` shims the job LIST; it cannot shim the one live call the list
 # is built from. `sbatch --wrap` and heredoc submissions leave `Command=(null)`
