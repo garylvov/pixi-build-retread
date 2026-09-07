@@ -270,5 +270,64 @@ else
   fail "F: PYTHONHASHSEED is not in the template's env census line"
 fi
 
+
+# ---- ARM S: THE BLOCK IS IN ALL SIX SHIPPED RELOCK TEMPLATES ----------------
+# HARNESS-CONSOL-12 (2026-09-07). Arms A-E above measure the FUNCTION and ONE
+# call site -- `$TPL`, which defaults to phaseN_relock.sh. That is how the
+# capability came to be 1/6: measured at 8f1dd88, across the six shipped relock
+# templates, `retread_relock_frontend_log` appeared in 6/6 and
+# `retread_relock_scope_and_verify` in 6/6, while `env_seed_export` appeared in
+# ONE -- phaseN, this guard's default argument. `git cat-file blob
+# 8f1dd88:harness/arms/mh1_relock.sh | grep -c seed` returned 0. The two
+# capabilities that had a READER (tools/relock_capability_check.sh) travelled;
+# the one with no reader did not, and nothing failed while it did not. Law 2
+# from the reader's side, and this arm is the reader.
+#
+# WHAT IS ASSERTED IS THE PORTABLE HALF ONLY. phaseN additionally runs
+# `"$BACKEND" preflight` and an `env | grep` row; those are phaseN's, they are
+# arms E2/E3 above, and this arm does not demand them of every template. What
+# every relock template must carry is: the ONE authority SOURCED, the export
+# called STRICT over its backend, and a REFUSAL when it fails.
+SEED_TARGETS=
+for t in "$HERE/phaseN_relock.sh" "$HERE/../arms/mh1_relock.sh" \
+         "$HERE/../arms/c29_relock.sh" "$HERE/../proof/hlgd_relock.sh" \
+         "$HERE/../instrumented/p6b_relock.sh" "$HERE/../instrumented/p6b_relock.b2.sh"; do
+  [ -f "$t" ] && SEED_TARGETS="$SEED_TARGETS $t"
+done
+SEED_N=$(printf '%s\n' $SEED_TARGETS | grep -c .)
+if [ "$SEED_N" != 6 ]; then
+  fail "S: found $SEED_N of the 6 shipped relock templates -- this arm would be green over whatever happened to be present"
+else
+  ok "S: 6 shipped relock templates found"
+  for t in $SEED_TARGETS; do
+    tn=$(basename "$t")
+    if ! grep -qE '^[[:space:]]*\.[[:space:]]+"\$ENV_SEED_LIB"$' "$t"; then
+      fail "S: $tn does not SOURCE \$ENV_SEED_LIB -- tools/env_seed.sh is the one authority (DET-1-6-1) and a wrapper that does not source it either has no seed or has a second one"
+    elif ! grep -qE '^[[:space:]]*env_seed_export "\$BACKEND"[[:space:]]*\|\|[[:space:]]*exit 15$' "$t"; then
+      fail "S: $tn does not call \`env_seed_export \"\$BACKEND\" || exit 15\` -- STRICT, over its backend, refusing on failure. $(grep -nE '^[[:space:]]*env_seed_export' "$t" | head -1 | sed 's/^/found: /')"
+    elif grep -q '^env_seed_export () {' "$t" || grep -q '^ENV_SEED_MARKER=' "$t"; then
+      fail "S: $tn carries its OWN copy of the function or the marker -- that is 58717bd's defect growing back, and det16-proof 6013332 is what it cost"
+    elif grep -qE '^[[:space:]]*(export[[:space:]]+)?PYTHONHASHSEED=[0-9]' "$t"; then
+      fail "S: $tn ASSIGNS a literal PYTHONHASHSEED -- a second authority that drifts from the backend's constant; the value is asked of the binary"
+    else
+      ok "S: $tn sources the one authority and calls env_seed_export \"\$BACKEND\" || exit 15 (STRICT, refusing)"
+    fi
+  done
+  # THE MUTATION, so arm S can fail. mh1 is the template the block was
+  # back-ported INTO; cut it back out of a COPY and S's own check must reject it.
+  MH1F=$HERE/../arms/mh1_relock.sh
+  if [ -f "$MH1F" ]; then
+    MH1FCUT=$W/mh1_F_seedcut.sh
+    sed -e '/^env_seed_export "\$BACKEND" || exit 15$/d' -e '/^\. "\$ENV_SEED_LIB"$/d' "$MH1F" > "$MH1FCUT"
+    if cmp -s "$MH1F" "$MH1FCUT"; then
+      fail "S-mut: the mutation removed NOTHING from mh1_relock.sh -- arm S is asserting against an unmutated file and cannot fail"
+    elif grep -qE '^[[:space:]]*\.[[:space:]]+"\$ENV_SEED_LIB"$' "$MH1FCUT" \
+      || grep -qE '^[[:space:]]*env_seed_export "\$BACKEND"[[:space:]]*\|\|[[:space:]]*exit 15$' "$MH1FCUT"; then
+      fail "S-mut: the cut copy still satisfies arm S's check -- the check is not reading what it claims to read"
+    else
+      ok "S-mut: with the back-ported block cut back out, mh1_relock.sh FAILS arm S's check -- F can fail, and this is the 1/6 state 8f1dd88 shipped"
+    fi
+  fi
+fi
 echo "### env_seed_export_guard: $( [ "$FAIL" = 0 ] && echo PASS || echo FAIL )"
 exit "$FAIL"

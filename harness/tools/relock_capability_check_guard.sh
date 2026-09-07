@@ -10,7 +10,7 @@
 # EXECUTED, and the template is read for a call that FORWARDS AN ARGV to it.
 #
 # ARMS
-#   A  it PASSES on every shipped template, for both capabilities. A capability
+#   A  it PASSES on every shipped template, for ALL THREE capabilities. A capability
 #      check that is red on the tree it ships with is not a check.
 #   B  a fixture template with the call REMOVED -> rc 1, and the row says the
 #      call is missing rather than something vaguer.
@@ -52,7 +52,7 @@ N=$(printf '%s\n' $TARGETS | grep -c .)
 say "targets=$N"
 
 # ---- ARM A ------------------------------------------------------------------
-for CAP in --cold-proof-arm --frontend-rust-log; do
+for CAP in --cold-proof-arm --frontend-rust-log --env-seed; do
   for t in $TARGETS; do
     out=$(bash "$TOOL" "$CAP" "$t" 2>&1); rc=$?
     if [ "$rc" = 0 ]; then ok "A $(basename "$t") $CAP -> rc 0: $out"
@@ -92,6 +92,55 @@ cmp -s "$BASETPL" "$FNOCALL" && bad "F0 the fixture is unmutated" \
   || armfix "F0" --frontend-rust-log "$FNOCALL" "never calls retread_relock_frontend_log"
 cmp -s "$BASETPL" "$FHARDV" && bad "F the fixture is unmutated -- arm F cannot fail" \
   || armfix "F" --frontend-rust-log "$FHARDV" "hardcodes 'pixi lock -v'"
+
+# ---- ARM S: the --env-seed capability, on fixtures that must answer NO -------
+# HARNESS-CONSOL-12 (2026-09-07). Arm A above proves the check says YES on all
+# six shipped templates; without these it would also say YES on a template that
+# had lost the export, and a capability check that cannot answer NO is not a
+# check. Each fixture removes exactly ONE of the three things the capability is:
+# sourcing the one authority, calling it STRICT over a backend, refusing when it
+# fails. Each is vacuity-checked against the base with `cmp -s`, the same way
+# arms B/C/F0/F are, because a sed that stopped matching would otherwise read as
+# a green.
+SNOCALL=$(mkfix seed_nocall '/^env_seed_export "\$BACKEND" || exit 15$/d')
+SOPT=$(mkfix seed_optional 's@^env_seed_export "\$BACKEND" || exit 15$@env_seed_export "$BACKEND" optional || exit 15@')
+SNOREF=$(mkfix seed_norefuse 's@^env_seed_export "\$BACKEND" || exit 15$@env_seed_export "$BACKEND"@')
+SNOSRC=$(mkfix seed_nosource '/^\. "\$ENV_SEED_LIB"$/d')
+cmp -s "$BASETPL" "$SNOCALL" && bad "S1 the fixture is unmutated -- arm S1 cannot fail" \
+  || armfix "S1" --env-seed "$SNOCALL" "never calls env_seed_export"
+cmp -s "$BASETPL" "$SOPT" && bad "S2 the fixture is unmutated -- arm S2 cannot fail" \
+  || armfix "S2" --env-seed "$SOPT" "OPTIONAL mode"
+cmp -s "$BASETPL" "$SNOREF" && bad "S3 the fixture is unmutated -- arm S3 cannot fail" \
+  || armfix "S3" --env-seed "$SNOREF" "does NOT refuse when it fails"
+cmp -s "$BASETPL" "$SNOSRC" && bad "S4 the fixture is unmutated -- arm S4 cannot fail" \
+  || armfix "S4" --env-seed "$SNOSRC" "never sources \$ENV_SEED_LIB"
+
+# ---- ARM S5: THE MUTATION THAT NAMES THE BACK-PORT --------------------------
+# mh1_relock.sh is a template this capability was ADDED to on 2026-09-07, and at
+# 8f1dd88 `git cat-file blob 8f1dd88:harness/arms/mh1_relock.sh | grep -c seed`
+# returned ZERO. Measured across the six shipped relock templates at that tip:
+# retread_relock_frontend_log 6/6, retread_relock_scope_and_verify 6/6,
+# env_seed_export 1/6 -- the two capabilities this tool already READ had been
+# back-ported and the one it did not read had not. Cut the block back out of mh1
+# and the check must say NO, or arm A's new green over mh1 proves nothing about
+# mh1 in particular.
+MH1=$HERE/../arms/mh1_relock.sh
+if [ ! -f "$MH1" ]; then
+  bad "S5 no mh1_relock.sh -- the back-port mutation did not run"
+else
+  MH1MUT=$W/mh1_seedcut.sh
+  sed '/^env_seed_export "\$BACKEND" || exit 15$/d' "$MH1" > "$MH1MUT"
+  if cmp -s "$MH1" "$MH1MUT"; then
+    bad "S5 the mutation removed NOTHING from mh1_relock.sh -- either the back-port is absent or its call line changed shape, and arm A's mh1 --env-seed green is vacuous either way"
+  else
+    sout=$(bash "$TOOL" --env-seed "$MH1MUT" 2>&1); src=$?
+    if [ "$src" = 1 ] && printf '%s' "$sout" | grep -qF -- 'never calls env_seed_export'; then
+      ok "S5 (mutation) with the back-ported block cut back out of mh1 the check answers rc 1: $sout"
+    else
+      bad "S5 rc=$src (wanted 1) on an mh1 with the export cut: $sout"
+    fi
+  fi
+fi
 
 # ---- ARM D: the stale gate, stated as a measurement --------------------------
 STALE=0

@@ -728,6 +728,48 @@ retread_relock_scope_and_verify "$C" "$@" || exit 7
 # read that absence as a result. Reader: tools/cold_proof_arm_guard.sh ARM5.
 retread_relock_frontend_log "$@"
 
+# ── DET-1-4-1 / DET-1-6-1: THE PINNED INTERPRETER HASH SEED ─────────────────
+# BACK-PORTED from phase_template/phaseN_relock.sh by HARNESS-CONSOL-12
+# (2026-09-07), at the same stage phaseN calls it: after the frontend-log
+# producer, before the lock launch.
+#
+# WHY IT WAS MISSING HERE. Across the six shipped relock templates,
+# `retread_relock_frontend_log` was 6/6 and `retread_relock_scope_and_verify`
+# was 6/6 -- and `env_seed_export` was 1/6, living in phaseN and nowhere else.
+# The two capabilities `tools/relock_capability_check.sh` READS got back-ported;
+# the one it does not read did not. That is law 2 from the reader's side: a
+# capability with no check is a capability that quietly stops travelling. The
+# check now covers this one too (`--env-seed`).
+#
+# THE FUNCTION LIVES IN tools/env_seed.sh AND IS SOURCED -- never a second
+# literal here, because a literal seed in a wrapper is a second authority that
+# drifts from the backend's constant. STRICT mode, exactly as phaseN uses it: a
+# lane that means to certify a lock must not lock under a random seed, so a
+# binary that cannot state its seed is REFUSED rather than guessed at. (The
+# `optional` mode exists for control arms whose binaries predate the verb; a
+# relock wrapper is not one.)
+#
+# WHY THE CALLER EXPORTS IT AND THE BACKEND CANNOT. The process that builds
+# `gym` 0.26.2's `requires_dist` is an in-process PEP 517 child of the pixi
+# FRONTEND, spawned by pixi's embedded uv, which the backend never execs and
+# therefore cannot pin. The only channel that reaches it is the environment pixi
+# itself was launched with. DET-1-4-1 (job 6001140, node1802) locked one
+# manifest three times on one node with one binary, varying nothing but this
+# variable: seeded twice gave gym requires_dist md5 e569ebf5..., unset gave
+# bd63668b... -- a RAW delta of 28 with a SORTED delta of 0, a pure reordering.
+ENV_SEED_LIB=$(dirname "$0")/../tools/env_seed.sh
+[ -f "$ENV_SEED_LIB" ] || ENV_SEED_LIB=$T/tools/env_seed.sh
+if [ ! -f "$ENV_SEED_LIB" ]; then
+  echo "### FATAL ENV SEED: no env_seed.sh beside this wrapper ($(dirname "$0")/../tools/)"
+  echo "###        nor at $T/tools/env_seed.sh. Locking without the pinned seed is the"
+  echo "###        DET-1-4-1 defect, so this wrapper refuses instead of continuing."
+  echo "###        ACTUATOR: sync tools/env_seed.sh, or run from a worktree that has it."
+  exit 15
+fi
+# shellcheck source=/dev/null
+. "$ENV_SEED_LIB"
+env_seed_export "$BACKEND" || exit 15
+
 # --- OPTIONAL: JOB-SCOPED WHEEL STORE, SEEDED FROM THE PERSISTENT ONE ---------
 # retread_fast_env just exported RETREAD_WHEEL_STORE=<persist root>/wheels, the
 # SHARED store. That is the right default and it is what buys index authority

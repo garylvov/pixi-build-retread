@@ -28,7 +28,7 @@
 # Either half alone is green on a tree that cannot do the thing.
 #
 #   usage: relock_capability_check.sh <--capability> <relock template path>
-#          capabilities: --cold-proof-arm      --frontend-rust-log
+#          capabilities: --cold-proof-arm      --frontend-rust-log      --env-seed
 #
 #   Prints  ### RELOCK CAPABILITY <cap> template=<name> = YES|NO (<why>)
 #   rc 0    the template can do it;  rc 1 it cannot;  rc 2 usage/environment.
@@ -47,14 +47,14 @@ set -uo pipefail
 CAP=; TPL=
 while [ "$#" -gt 0 ]; do
   case $1 in
-    --cold-proof-arm|--frontend-rust-log) CAP=$1 ;;
-    -*) echo "### RELOCK CAPABILITY REFUSED: unknown capability '$1' (known: --cold-proof-arm --frontend-rust-log)" >&2; exit 2 ;;
+    --cold-proof-arm|--frontend-rust-log|--env-seed) CAP=$1 ;;
+    -*) echo "### RELOCK CAPABILITY REFUSED: unknown capability '$1' (known: --cold-proof-arm --frontend-rust-log --env-seed)" >&2; exit 2 ;;
     *)  TPL=$1 ;;
   esac
   shift
 done
 [ -n "$CAP" ] && [ -n "$TPL" ] || {
-  echo "### RELOCK CAPABILITY REFUSED: usage: relock_capability_check.sh <--cold-proof-arm|--frontend-rust-log> <relock template>" >&2
+  echo "### RELOCK CAPABILITY REFUSED: usage: relock_capability_check.sh <--cold-proof-arm|--frontend-rust-log|--env-seed> <relock template>" >&2
   exit 2; }
 [ -f "$TPL" ] || { echo "### RELOCK CAPABILITY REFUSED: no such template: $TPL" >&2; exit 2; }
 
@@ -129,5 +129,67 @@ case $CAP in
   [ "$DEF" = 'rust_log=<unset> lock_verbosity=-v' ] \
     || say_no "with NO flag the producer is not today's behaviour ('$DEF', wanted rust_log=<unset> lock_verbosity=-v) -- adopting it would change every production relock"
   say_yes "the template forwards an argv to $FN, passes \$LOCK_VERBOSITY to pixi lock and never re-assigns it, and the producer exports the filter and drops the -v"
+  ;;
+--env-seed)
+  # HALF 1 IS DIFFERENT IN SHAPE HERE, AND IT HAS TO BE. The other two
+  # capabilities are "does the template FORWARD ITS ARGV to the producer"; this
+  # one is "does the template SOURCE the one authority and call it in STRICT
+  # mode over its backend". There is no flag to forward -- the seed is asked of
+  # the binary, never typed -- so the argv test would be vacuous and is replaced
+  # by the three things that actually make the export travel.
+  FN=env_seed_export
+  ESL=${RELOCK_ENV_SEED_LIB:-$HERE/env_seed.sh}
+  [ -f "$ESL" ] || say_no "no env_seed.sh at $ESL -- the producer cannot be executed, and a capability answered without executing it is the grep this file replaces"
+  # (1) the template SOURCES the library rather than carrying a literal seed. A
+  #     literal here is a second authority that drifts from the backend constant.
+  grep -qE '^[[:space:]]*\.[[:space:]]+"\$ENV_SEED_LIB"' "$TPL" \
+    || say_no "the template never sources \$ENV_SEED_LIB -- tools/env_seed.sh is the ONE authority and a wrapper that does not source it either has no seed or has a second one"
+  grep -qE '^[[:space:]]*(export[[:space:]]+)?PYTHONHASHSEED=' "$TPL" \
+    && say_no "the template ASSIGNS PYTHONHASHSEED itself -- a literal seed in a wrapper is exactly the second authority DET-1-6-1 removed; the value is asked of the binary"
+  # (2) it CALLS the function, over a binary, in STRICT mode. `optional` is for
+  #     control arms whose binaries predate the verb; a relock wrapper that means
+  #     to certify a lock must not lock under a random seed.
+  CALL=$(grep -nE "^[[:space:]]*$FN[[:space:]]" "$TPL" | head -1)
+  [ -n "$CALL" ] || say_no "the template never calls $FN, so the pinned seed never reaches the shell that launches pixi -- the DET-1-4-1 defect, unclosed"
+  printf '%s' "$CALL" | grep -qE "$FN[[:space:]]+\"\\\$[A-Za-z_][A-Za-z0-9_]*\"" \
+    || say_no "the template calls $FN without passing a backend binary -- the seed would be asked of nothing ($CALL)"
+  printf '%s' "$CALL" | grep -q 'optional' \
+    && say_no "the template calls $FN in OPTIONAL mode -- a verb-less binary would then lock under the ambient seed, which is the control-arm contract and not a relock's"
+  # (3) it REFUSES on failure. A wrapper that exports nothing and locks anyway is
+  #     the defect wearing the fix's call site.
+  printf '%s' "$CALL" | grep -qE '\|\|[[:space:]]*(exit|return)[[:space:]]' \
+    || say_no "the template calls $FN but does NOT refuse when it fails ($CALL) -- locking on after a failed seed export is the exact defect this block exists to close"
+
+  # ---- HALF 2: the producer is EXECUTED, in BOTH shapes ---------------------
+  # Two fixture "binaries": one carrying the verb marker and answering `env-seed`,
+  # one that predates the verb. A capability answered by grepping the template
+  # alone would pass against a library whose function had been gutted.
+  W=$(mktemp -d "${TMPDIR:-/tmp}/relockcap-seed.XXXXXX") || exit 2
+  trap 'rm -rf "$W"' EXIT
+  ( . "$ESL" >/dev/null 2>&1; printf '%s' "${ENV_SEED_MARKER:-}" ) > "$W/marker" 2>/dev/null
+  MARK=$(cat "$W/marker")
+  [ -n "$MARK" ] || say_no "env_seed.sh defines no ENV_SEED_MARKER -- the verb is detected by that marker, and without it the producer cannot tell a new binary from an old one"
+  printf '#!/usr/bin/env bash\n# %s\n[ "${1:-}" = env-seed ] && { echo 0; exit 0; }\nexit 0\n' "$MARK" > "$W/newbin"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$W/oldbin"
+  chmod +x "$W/newbin" "$W/oldbin"
+  NEWOUT=$( set +e; . "$ESL" >/dev/null 2>&1
+            unset PYTHONHASHSEED
+            "$FN" "$W/newbin" >/dev/null 2>&1; r=$?
+            echo "rc=$r seed=${PYTHONHASHSEED-<unset>}" )
+  [ "$NEWOUT" = 'rc=0 seed=0' ] \
+    || say_no "over a verb-carrying binary the producer did not export the pinned seed -- it printed '$NEWOUT', wanted 'rc=0 seed=0'"
+  STRICTOUT=$( set +e; . "$ESL" >/dev/null 2>&1
+               unset PYTHONHASHSEED
+               "$FN" "$W/oldbin" >/dev/null 2>&1; r=$?
+               echo "rc=$r seed=${PYTHONHASHSEED-<unset>}" )
+  [ "$STRICTOUT" = 'rc=15 seed=<unset>' ] \
+    || say_no "over a VERB-LESS binary STRICT mode did not refuse -- it printed '$STRICTOUT', wanted 'rc=15 seed=<unset>'; a strict mode that passes anything is not a mode"
+  OPTOUT=$( set +e; . "$ESL" >/dev/null 2>&1
+            unset PYTHONHASHSEED
+            "$FN" "$W/oldbin" optional >/dev/null 2>&1; r=$?
+            echo "rc=$r seed=${PYTHONHASHSEED-<unset>}" )
+  [ "$OPTOUT" = 'rc=0 seed=<unset>' ] \
+    || say_no "OPTIONAL mode over a verb-less binary is not today's behaviour ('$OPTOUT', wanted 'rc=0 seed=<unset>') -- the control arms depend on it running unseeded rather than refusing"
+  say_yes "the template sources tools/env_seed.sh, calls $FN over a backend in STRICT mode and refuses on failure, and the producer exports the pin for a verb-carrying binary, refuses a verb-less one in strict, and runs it unseeded in optional"
   ;;
 esac
