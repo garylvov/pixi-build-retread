@@ -129,6 +129,19 @@ fi
 
 ########## D. MUTATION: the git branch disabled -> the record wins #############
 mkdir -p "$W/mut/phase_template" "$W/mut/tools" "$W/D/jobroot"
+# THE MUTANT NEEDS THE WHOLE SIDECAR SET, not just the one file the first cut
+# copied, and this is HARNESS-CONSOL-13 item 2. owner_snapshot.sh resolves TWO
+# siblings off its own directory -- `$HERE/../tools/script_refs.sh` (SR) and
+# `$HERE/../tools/owner_export.sh` (OE, OWNER-EXPORT-1) -- and REFUSES before it
+# prints a single `### OWNER SNAPSHOT` row if either is missing. Copying only
+# script_refs.sh made the mutant refuse `no owner_export.sh` and print no rows
+# at all, so `field` read '' for both src_kind and src_commit and arm D was RED
+# for a reason that had nothing to do with the mutation: it was never exercising
+# the defect. Measured at 8f1dd88 and 66fe7ea alike (HARNESS-CONSOL-12 rows,
+# jobs 6021601 6021762 6021821 6021960 6022013 6022066). Copy every `.sh` beside
+# the real tool instead of naming them one at a time -- a list of names is the
+# thing that went stale here.
+cp "$HERE"/../tools/*.sh "$W/mut/tools/" 2>/dev/null
 cp "$REFS" "$W/mut/tools/script_refs.sh"
 sed 's|^  if git -C "\$d" rev-parse --git-dir >/dev/null 2>&1 &&$|  if false \&\&|' \
   "$SNAPTOOL" > "$W/mut/phase_template/owner_snapshot.sh"
@@ -140,7 +153,14 @@ else
        "$GR/harness/phase_template/cleanup_gated.sh" \
        --allow-underived --reason "provenance arm D mutant: never submitted, provenance rows only" > "$W/D.log" 2>&1
   KD=$(field "$W/D.log" src_kind); SD=$(field "$W/D.log" src_commit)
-  if [ "$KD" = record ] && [ "$SD" = "$PIN" ]; then
+  # VACUITY CHECK BEFORE THE VERDICT. A mutant that refused for a SETUP reason
+  # produces exactly the same empty fields as a mutant that failed to reproduce
+  # the defect, and the guard read the second story for months while the first
+  # was true. Name them apart.
+  if grep -q '^### OWNER SNAPSHOT REFUSED: no ' "$W/D.log"; then
+    fail "D. the MUTANT ENVIRONMENT is incomplete -- it refused on a missing sidecar before reaching owner_src_identity, so this arm tested nothing:"
+    grep '^### OWNER SNAPSHOT REFUSED' "$W/D.log" | sed 's/^/GUARD:   /'
+  elif [ "$KD" = record ] && [ "$SD" = "$PIN" ]; then
     ok "D. MUTATION REPRODUCED: without the git branch the SAME fixture advertises the pin ($SD) for bytes that came from $HEADA -- DET-1-6-a exactly"
   else
     fail "D. the mutant did not reproduce the defect (src_kind='$KD' src_commit='$SD') -- arm A proves nothing"
