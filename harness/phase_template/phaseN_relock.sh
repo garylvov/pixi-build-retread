@@ -847,63 +847,37 @@ echo "### PIXI_BUILD_BACKEND_OVERRIDE=$PIXI_BUILD_BACKEND_OVERRIDE"
 # execs and therefore cannot pin. The only channel that reaches it is the
 # environment pixi itself was launched with. That is this export.
 #
-# THE VALUE IS ASKED OF THE BINARY, NEVER TYPED HERE. A literal `0` in this
-# file would be a second authority for the seed, free to drift from the Rust
-# constant the backend's preflight compares against; the first time they
-# disagreed, every lock would refuse and the two `0`s would both look right.
-# `retread env-seed` prints `uv_closure::REPRODUCIBLE_PYTHON_HASH_SEED` and
-# nothing else, and it is handled before the preflight precisely so it can be
-# called to SATISFY that preflight.
+# THE FUNCTION LIVES IN `tools/env_seed.sh`, NOT HERE (DET-1-6-1). It was
+# written here by 58717bd, where the ARMS reach it and nothing else does --
+# and det16-proof 6013332 paid for that: its preamble smokes each binary
+# through `tools/proof_smoke.sh`, which launches its OWN `pixi lock` and had
+# never heard of the export, so c0ccc0d's preflight refused at second zero and
+# the job was REFUSED BEFORE ARM 1 (`### PREAMBLE FATAL: SMOKE FIX rc=1`) after
+# paying 879 s to publish the stage mirror. The smoke and the wrapper must run
+# pixi in the SAME environment or the cheap one refuses the expensive one's
+# binary for a reason that is about itself. The library carries the DET-1-4-1
+# measurement, the reason the value is asked of the binary rather than typed,
+# and the reason the verb is detected STATICALLY by a marker instead of being
+# probed by running it (an old binary answers an unknown verb by starting the
+# JSON-RPC transport and blocking on stdin -- a hang, not a refusal).
+# Readers: phase_template/env_seed_export_guard.sh, tools/proof_smoke_guard.sh
+# arms V1-V4.
 #
-# THE MARKER, AND WHY THE VERB IS NEVER PROBED BY RUNNING IT. `main.rs` handles
-# `env-seed` at the TOP of `main`; a binary built BEFORE fix/det1-env-seed
-# matches no verb, falls through to the automatic preflight and STARTS THE
-# JSON-RPC TRANSPORT -- so `<old binary> env-seed` inside `$(...)` does not
-# fail, it BLOCKS on stdin, and the relock would hang at second zero with no
-# output rather than refuse. The detection is therefore STATIC, the same shape
-# and for the same reason as `store_reap_census.sh`'s: a string that exists
-# only in a binary carrying the verb, and nothing is executed until it is
-# found. Measured, not assumed: `grep -a -c -F` of this marker is 1 in
-# `binsnaps/cand-c0ccc0d` (the verb's own binsnap) and 0 in
-# `binsnaps/cand-3f2095a` (its parent).
-# Reader: phase_template/env_seed_export_guard.sh.
-ENV_SEED_MARKER='retread env-seed: writing stdout: '
-env_seed_export () {             # $1 = backend binary; exports PYTHONHASHSEED or REFUSES
-  local bin=${1:-} seed
-  if [ -z "$bin" ] || [ ! -x "$bin" ]; then
-    echo "### FATAL ENV SEED: backend '${bin:-<unset>}' is not an executable binary."
-    echo "###        ACTUATOR: point \$BACKEND at the binsnap this run is meant to use."
-    return 15
-  fi
-  if ! grep -a -q -F -- "$ENV_SEED_MARKER" "$bin"; then
-    echo "### FATAL ENV SEED: $bin does NOT carry the \`env-seed\` verb, and this"
-    echo "###        wrapper will not guess the seed on its behalf -- a literal here"
-    echo "###        is a second authority that drifts from the backend's constant."
-    echo "###        It is also NOT probed by running it: an old binary answers an"
-    echo "###        unknown verb by starting the JSON-RPC transport and blocking on"
-    echo "###        stdin, so this refusal is what stops a silent hang."
-    echo "###        ACTUATOR: rebuild/point at a binsnap at or after fix/det1-env-seed."
-    return 15
-  fi
-  if ! seed=$("$bin" env-seed); then
-    echo "### FATAL ENV SEED: \`$bin env-seed\` exited non-zero; refusing to lock"
-    echo "###        without a pinned interpreter hash seed -- an unset seed reorders"
-    echo "###        requires_dist lines and the lock's bytes stop being a function"
-    echo "###        of its resolution (DET-1-4-1, job 6001140)."
-    echo "###        ACTUATOR: run \`$bin env-seed\` by hand and fix what it reports."
-    return 15
-  fi
-  if [ -z "$seed" ]; then
-    echo "### FATAL ENV SEED: \`$bin env-seed\` printed nothing. Exporting an EMPTY"
-    echo "###        PYTHONHASHSEED is not the same as exporting the pin -- CPython"
-    echo "###        treats empty as unset, i.e. random, so it would look like a pin"
-    echo "###        and behave like the defect. Refusing."
-    echo "###        ACTUATOR: run \`$bin env-seed\` by hand and fix what it reports."
-    return 15
-  fi
-  export PYTHONHASHSEED=$seed
-  echo "### ENV SEED exported PYTHONHASHSEED=$seed source=$bin env-seed"
-}
+# The path is resolved the way `store_reap_census.sh` below is: beside this
+# script first (a derived wrapper in a worktree gets that worktree's library),
+# then the task copy. It REFUSES rather than continuing seedless -- a missing
+# library must not degrade into the exact defect this block exists to close.
+ENV_SEED_LIB=$(dirname "$0")/../tools/env_seed.sh
+[ -f "$ENV_SEED_LIB" ] || ENV_SEED_LIB=$T/tools/env_seed.sh
+if [ ! -f "$ENV_SEED_LIB" ]; then
+  echo "### FATAL ENV SEED: no env_seed.sh beside this wrapper ($(dirname "$0")/../tools/)"
+  echo "###        nor at $T/tools/env_seed.sh. Locking without the pinned seed is the"
+  echo "###        DET-1-4-1 defect, so this wrapper refuses instead of continuing."
+  echo "###        ACTUATOR: sync tools/env_seed.sh, or run from a worktree that has it."
+  exit 15
+fi
+# shellcheck source=/dev/null
+. "$ENV_SEED_LIB"
 env_seed_export "$BACKEND" || exit 15
 
 # THE GUARD ARM, and it is the reader for the export above. The backend's

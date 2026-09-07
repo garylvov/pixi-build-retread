@@ -165,7 +165,15 @@ SMOKE_PREFIX_HEADROOM=${SMOKE_PREFIX_HEADROOM:-8}
 SMOKE_BACKEND_WORK_RE=${SMOKE_BACKEND_WORK_RE:-'conda/outputs'}
 SMOKE_FRONTEND_RE=${SMOKE_FRONTEND_RE:-'resolve_pypi\{|Preparing metadata for:|are assumed to be installed by conda|Found static `pyproject\.toml` for:'}
 # The first line worth quoting when nothing reached the frontend.
-SMOKE_ERROR_RE=${SMOKE_ERROR_RE:-'panicked at|^Error|ERROR|error\[|error:|× |failed with status'}
+# `^preflight:` IS IN THIS LIST BECAUSE ITS ABSENCE COST A JOB (DET-1-6-1). The
+# backend's own refusal says `preflight: $PYTHONHASHSEED must be `0` ...` and
+# carries neither "Error" nor "panic", so on 6013332 this extractor walked past
+# EIGHT copies of the real first error at the top of the backend log and quoted
+# the frontend's downstream `failed to solve requirements of environment
+# 'robogen'` instead -- which named the JSON-RPC transport and pointed the
+# reader at a transport bug that did not exist. A first-error extractor that
+# cannot see the first error is a reader that reports the wrong actuator.
+SMOKE_ERROR_RE=${SMOKE_ERROR_RE:-'panicked at|^Error|ERROR|error\[|error:|× |failed with status|^preflight:'}
 
 smoke_say () { echo "### SMOKE $*"; }
 
@@ -929,6 +937,41 @@ CACHE_STATE=cold
 echo "### SMOKE cache state=$CACHE_STATE (job-scoped; a second smoke in the same job root reuses it on purpose)"
 export RUST_LOG=$SMOKE_RUST_LOG
 export PIXI_BUILD_RETREAD_LOG=$SMOKE_BACKEND_LOG
+
+# ---- THE INTERPRETER HASH SEED, THROUGH THE SAME AUTHORITY AS THE WRAPPER ----
+# DET-1-6-1, and this is the whole of it: `phase_template/phaseN_relock.sh` had
+# exported the pinned PYTHONHASHSEED since 58717bd and THIS SCRIPT had not, so
+# the two launched pixi in different environments. det16-proof 6013332 smoked
+# `binsnaps/cand-c0ccc0d` -- a binary whose new `preflight()` refuses an absent
+# seed -- and the backend answered every `initialize` with
+#
+#     preflight: $PYTHONHASHSEED must be `0` in the environment that launched pixi
+#
+# eight times in three seconds. The smoke scored `BACKEND_DIED reason=
+# NO_BACKEND_WORK`, the preamble refused the job before arm 1, and the 879 s the
+# same job had just spent publishing the stage mirror bought nothing. The smoke
+# was right that the backend died and wrong about why: the fault was in the
+# environment the SMOKE built.
+#
+# `optional` IS THE MODE HERE AND STRICT IS THE WRAPPER'S, for a reason that is
+# about the controls. Every known-good binary this guard and every lane smoke
+# against -- `integration-569b0ac` is the one -- PREDATES the verb, carries no
+# `preflight` to satisfy, and would be REFUSED by strict mode. That would leave
+# the smoke able to smoke only the binary under test and no control at all,
+# which is a worse instrument than the one being fixed. `optional` relaxes
+# exactly one case, the verb's absence, and prints a row saying so; a binary
+# that HAS the verb and answers badly is still refused here.
+#
+# The row is the wrapper's row, verbatim, so ONE grep finds the seed in a
+# smoke log and in an arm log alike. Readers: tools/proof_smoke_guard.sh arms
+# V1 (the fix binary exports and reaches the frontend), V2 (the control prints
+# not-applicable and reaches the frontend), V4 (MUTATION: cut this call and V1
+# dies NO_BACKEND_WORK again, exactly as 6013332 did).
+ENV_SEED_LIB=${SMOKE_ENV_SEED_LIB:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/env_seed.sh}
+[ -f "$ENV_SEED_LIB" ] || smoke_setup_failed "no env_seed.sh at $ENV_SEED_LIB -- the smoke will not launch pixi in an environment it cannot describe"
+# shellcheck source=/dev/null
+. "$ENV_SEED_LIB" || smoke_setup_failed "could not source $ENV_SEED_LIB"
+env_seed_export "$BIN" optional || smoke_setup_failed "the env-seed export refused $BIN -- read the ### FATAL ENV SEED rows above"
 
 # ---- THE LOCK, in its own process group, polled ------------------------------
 cd "$WS" || smoke_setup_failed "cannot cd $WS"

@@ -11,7 +11,10 @@
 #   Everything this guard creates lives under a SHORT scratch root it owns and
 #   is removed on the way out.
 #
-#   PREDICTED: pass=39 fail=0 (state this in the sbatch before submitting).
+#   PREDICTED: the `### PSG PREDICTED` rows below are the authority and are
+#   stated in the sbatch before submitting. They are PREDICTIONS, not stored
+#   results: the baseline is MEASURED by running the pre-lane commit in the
+#   same job (psgm-work/psgm-guard.sbatch is the shape).
 #   PROOF-SMOKE-1-5 added SEVEN: N1-N7.  ARMS A-F STILL READ THE TASK COPY, so
 #   A1/A2 remain the unfixed coin until the harness is synced -- read them as a
 #   control on what a lane did NOT touch, never as a verdict.
@@ -41,7 +44,7 @@
 #          CHANGES, which is what S1 and S6 would otherwise pass without
 #   S8     smoke_stage CALLS it -- the function has a production call site
 #
-# ── THE THIRTY-NINE CHECKS ────────────────────────────────────────────────────
+# ── THE CHECKS ────────────────────────────────────────────────────
 #   A1  the known-good binsnap reaches the frontend            REACHED_FRONTEND
 #   A2  ... and proof_smoke.sh exits 0
 #   B1  a stub that prints a panic and exits 1                 BACKEND_DIED
@@ -96,6 +99,34 @@
 #   H6  THE MUTATION: with the acquire cut out of smoke_stage, the same fixture
 #       stages straight past a live holder.  That is 6001840, and without this
 #       arm H2 could be passing on the fixture rather than on the lock.
+#
+#   DET-1-6-1 adds SIX, V1-V6, and they are the first arms in this guard that
+#   smoke a binary CARRYING the env-seed verb.  Until now every binary this
+#   guard ran predated it, so nothing here could have caught det16-proof 6013332
+#   -- a job REFUSED BEFORE ARM 1 because the smoke launched pixi without the
+#   seed the wrapper had been exporting since 58717bd.
+#   V1  the FIX binary (binsnaps/cand-c0ccc0d) gets `### ENV SEED exported
+#       PYTHONHASHSEED=0 source=<bin> env-seed` -- the wrapper's row, verbatim,
+#       from the SMOKE, with PYTHONHASHSEED unset in the caller
+#   V2  ... and it REACHES THE FRONTEND: the smoke stops refusing the binary the
+#       lane is proving
+#   V3  the PRE-FIX control (integration-569b0ac, arm N7's own log) prints
+#       `### ENV SEED not-applicable binary lacks verb` and STILL reaches the
+#       frontend -- `optional` exists so the controls survive, and a strict
+#       smoke would have refused every one of them
+#   V4  FIXTURE: a stub carrying the marker and printing `0` yields the row with
+#       0 AND a CHILD PROCESS that sees it -- the row alone would pass for a
+#       function that forgot the `export`
+#   V5  THE MUTATION: with the one call cut out of proof_smoke.sh the SAME
+#       binary dies `BACKEND_DIED reason=NO_BACKEND_WORK`.  That is 6013332,
+#       reproduced on purpose, and without it V1/V2 could be passing on the
+#       binary rather than on the export.
+#   V6  ... and on that same mutant log the QUOTED first error is the backend's
+#       `preflight: $PYTHONHASHSEED ...` refusal.  On 6013332 SMOKE_ERROR_RE had
+#       no `^preflight:` and the extractor walked past eight copies of the real
+#       error to quote the frontend's downstream `failed to solve requirements
+#       of environment 'robogen'`, sending the reader after a JSON-RPC transport
+#       bug that did not exist.
 set -uo pipefail
 
 # THE MUTATION ARM'S COMMIT CONSTANT -- the harness tip immediately BEFORE this
@@ -128,7 +159,7 @@ chk () {  # chk <name> <condition-rc> <what was wanted> <what was seen>
 echo "### PSG proof_smoke_guard.sh  $(date -Is)  host=$(hostname -s) job=$J"
 echo "### PSG scratch=$SCR  job_root=$JOB_ROOT"
 echo "### PSG good binsnap=$GOOD"
-echo "### PSG PREDICTED full pass=44 fail=2 -- 37/2 MEASURED at 971875f (PSG-MEASURE-1) plus arm P1-P7; A1/A2 stay RED because arms A-F exec the TASK copy at \$T/tools, which this lane did NOT sync (installed HARNESS_COMMIT 8108ca4)"
+echo "### PSG PREDICTED full pass=50 fail=2 -- 37/2 MEASURED at 971875f (PSG-MEASURE-1), plus P1-P7 (unmeasured at 6b3b669) and V1-V6 (DET-1-6-1); A1/A2 stay RED because arms A-F exec the TASK copy at \$T/tools, which this lane did NOT sync (installed HARNESS_COMMIT 8108ca4)"
 echo "### PSG PREDICTED fixture-only pass=15 fail=0 -- arms S1-S8 + P1-P7, no live mirror touched"
 
 # ---- the stubs --------------------------------------------------------------
@@ -515,6 +546,119 @@ chk N6 $? "the fixed smoke PRINTS its fast-tmp mode -- the divergence from the d
 chk N7 $? "THREE consecutive REACHED_FRONTEND on one binary -- the coin HARNESS-CONSOL-5 measured (red/green/red) is gone" \
           "reached_frontend=$n7pass of 3"
 
+# ---- V: DET-1-6-1 -- the seed reaches the SMOKE's OWN pixi -------------------
+# WHAT IT WOULD HAVE CAUGHT, and it is not hypothetical: det16-proof 6013332.
+# `phaseN_relock.sh` had exported the pinned PYTHONHASHSEED since 58717bd;
+# `proof_smoke.sh` launches its own `pixi lock` and had not. The preamble smoked
+# the FIX binary `binsnaps/cand-c0ccc0d`, whose new `preflight()` refuses an
+# absent seed, and the backend log's FIRST LINE was
+#
+#     preflight: $PYTHONHASHSEED must be `0` in the environment that launched pixi
+#
+# eight times in three seconds. Verdict `BACKEND_DIED reason=NO_BACKEND_WORK
+# lock_rc=1 frontend_rows=0 backend_work_rows=0`, `### PREAMBLE FATAL: SMOKE FIX
+# rc=1`, `### DET16_EXIT=6` -- the job REFUSED BEFORE ARM 1, having already paid
+# 879 s to publish the stage mirror. No arm here existed to fail, because no arm
+# smoked a binary that HAS the verb.
+#
+# THE REPO COPY, for the reason arms G and H read it: the fix is not synced into
+# $T. Arms A-F stay on the task copy as the control on what this lane did not
+# touch.
+echo ""; echo "########## PSG ARM V -- DET-1-6-1: the seed through the SMOKE's own pixi ##########"
+VSMOKE=${PSG_SMOKE_REPO:-$REPO/harness/tools/proof_smoke.sh}
+VLIB=${PSG_ENV_SEED_LIB:-$REPO/harness/tools/env_seed.sh}
+FIX=${PSG_FIX_BINSNAP:-$T/binsnaps/cand-c0ccc0d}
+FIXBIN=$FIX; [ -d "$FIXBIN" ] && FIXBIN=$FIXBIN/pixi-build-retread
+echo "### PSG V reads $VSMOKE and $VLIB (repo copies: the fix is not synced into \$T)"
+echo "### PSG V fix binary=$FIXBIN"
+
+if [ ! -x "$FIXBIN" ]; then
+  chk V1 1 "the FIX binsnap carrying the env-seed verb is present" "no executable at $FIXBIN"
+  chk V2 1 "the FIX binary reaches the frontend under the smoke's export" "arm skipped: no $FIXBIN"
+  chk V5 1 "MUTATION: cutting the export kills the FIX smoke" "arm skipped: no $FIXBIN"
+  chk V6 1 "the quoted first error is the preflight refusal" "arm skipped: no $FIXBIN"
+else
+  V1OUT=$OUT/psg-$J-V1.out
+  # `env -u PYTHONHASHSEED` ON PURPOSE: the export under test must be the ONLY
+  # source of the seed. An inherited one would let this arm pass on the guard's
+  # environment instead of on the smoke's code.
+  SMOKE_WALL=${PSG_WALL_A:-900} env -u PYTHONHASHSEED \
+    bash "$VSMOKE" "$FIX" "$MANIFEST" "$JOB_ROOT" >"$V1OUT" 2>&1
+  v1rc=$?
+  grep -m1 '^### ENV SEED' "$V1OUT" | sed 's/^/### PSG   /'
+  grep -m1 '^### SMOKE lock ended' "$V1OUT" | cut -c1-200 | sed 's/^/### PSG   /'
+  grep -q "^### ENV SEED exported PYTHONHASHSEED=0 source=$FIXBIN env-seed$" "$V1OUT"
+  chk V1 $? "the smoke exports the seed the BINARY states, and prints the wrapper's row verbatim" \
+            "$(grep -m1 '^### ENV SEED' "$V1OUT" || echo '<no ENV SEED row at all -- this is 6013332>')"
+  [ "$v1rc" = 0 ] && grep -q '^### SMOKE REACHED_FRONTEND ' "$V1OUT"
+  chk V2 $? "and the FIX binary REACHES THE FRONTEND -- the smoke no longer refuses the binary the lane is proving" \
+            "rc=$v1rc $(grep -m1 '^### SMOKE [A-Z_]* binary=' "$V1OUT" || echo '<no verdict row>')"
+
+  # THE MUTATION, and it reproduces 6013332 exactly. One line: the call site.
+  VMUT=$SCR/proof_smoke.VMUT.sh
+  sed 's@^env_seed_export "$BIN" optional || smoke_setup_failed .*@:@' "$VSMOKE" > "$VMUT"
+  vmutn=$(diff "$VSMOKE" "$VMUT" | grep -c '^< ')
+  echo "### PSG V mutation changed $vmutn line(s) (must be exactly 1)"
+  V5OUT=$OUT/psg-$J-V5.out
+  if [ "$vmutn" = 1 ] && bash -n "$VMUT" 2>/dev/null; then
+    SMOKE_WALL=${PSG_WALL_A:-900} env -u PYTHONHASHSEED \
+      bash "$VMUT" "$FIX" "$MANIFEST" "$JOB_ROOT" >"$V5OUT" 2>&1
+    v5rc=$?
+    grep -m1 '^### SMOKE BACKEND_DIED reason=' "$V5OUT" | sed 's/^/### PSG   /'
+    [ "$v5rc" != 0 ] && grep -q '^### SMOKE BACKEND_DIED reason=NO_BACKEND_WORK' "$V5OUT"
+    chk V5 $? "MUTATION: with the export call cut (1 line) the SAME binary dies BACKEND_DIED reason=NO_BACKEND_WORK -- 6013332, reproduced, so V1/V2 can fail" \
+              "rc=$v5rc $(grep -m1 '^### SMOKE [A-Z_]* binary=' "$V5OUT" || echo '<no verdict row>')"
+    # AND THE READER FIX. On 6013332 the first-error extractor had no
+    # `^preflight:` in SMOKE_ERROR_RE, so it walked past eight copies of the real
+    # refusal and quoted the frontend's downstream `failed to solve requirements
+    # of environment 'robogen'` -- pointing the reader at a JSON-RPC transport
+    # bug that did not exist. The mutant is the only way to produce that log on
+    # purpose, so the reader is guarded on the same run that produces it.
+    grep -A2 '^### SMOKE first ERROR/panic line' "$V5OUT" | grep -q 'preflight: \$PYTHONHASHSEED must be'
+    chk V6 $? "and the QUOTED first error is the backend's preflight refusal, not the frontend's downstream transport error" \
+              "$(grep -A1 '^### SMOKE first ERROR/panic line' "$V5OUT" | tail -1 || echo '<no quoted error>')"
+  else
+    chk V5 1 "MUTATION: the no-export mutant builds and runs" "changed_lines=$vmutn -- MUTATION ARM DID NOT RUN"
+    chk V6 1 "the quoted first error is the preflight refusal" "the mutant did not build"
+  fi
+fi
+
+# V3: THE CONTROL, and it is why the smoke's mode is `optional`. Arm N7 already
+# smoked the known-good PRE-FIX binary three times through this same repo copy;
+# this arm reads its log. A verb-less binary must print the not-applicable row
+# and RUN, not refuse -- refusing it would refuse every control arm in the tree
+# and leave the smoke able to smoke only the binary under test.
+if [ -f "$OUT/psg-$J-N7-1.out" ]; then
+  grep -q '^### ENV SEED not-applicable binary lacks verb' "$OUT/psg-$J-N7-1.out" \
+    && grep -q '^### SMOKE REACHED_FRONTEND ' "$OUT/psg-$J-N7-1.out"
+  chk V3 $? "the PRE-FIX control ($GOOD) prints 'ENV SEED not-applicable binary lacks verb' and STILL reaches the frontend" \
+            "$(grep -m1 '^### ENV SEED' "$OUT/psg-$J-N7-1.out" || echo '<no ENV SEED row>')"
+else
+  chk V3 1 "the PRE-FIX control prints the not-applicable row and still reaches the frontend" "N7 run 1 log absent"
+fi
+
+# V4: THE FIXTURE, against the library the smoke sources. A stub carrying the
+# marker and answering `0` must produce the row with 0 AND be visible to a CHILD
+# PROCESS -- the row alone would pass for a function that printed it and forgot
+# the export, which is the assertion env_seed_export_guard.sh arm A makes about
+# the same function from the wrapper's side.
+VSTUB=$SCR/vstub/pixi-build-retread
+mkdir -p "$(dirname "$VSTUB")"
+{ echo '#!/usr/bin/env bash'
+  echo '# retread env-seed: writing stdout: '
+  echo 'case ${1:-} in env-seed) printf 0 ;; preflight) exit 0 ;; *) exit 9 ;; esac'; } > "$VSTUB"
+chmod +x "$VSTUB"
+V4OUT=$(env -u PYTHONHASHSEED bash -c '
+  set -u
+  . "$1"
+  env_seed_export "$2" optional
+  echo "CHILD_SEES=$(env | sed -n "s/^PYTHONHASHSEED=//p")"' _ "$VLIB" "$VSTUB" 2>&1)
+printf '%s\n' "$V4OUT" | sed 's/^/### PSG   /'
+printf '%s\n' "$V4OUT" | grep -q "^### ENV SEED exported PYTHONHASHSEED=0 source=$VSTUB env-seed$" \
+  && printf '%s\n' "$V4OUT" | grep -q '^CHILD_SEES=0$'
+chk V4 $? "a fixture backend carrying the verb marker and printing 0 gets the row with 0, and a CHILD PROCESS sees PYTHONHASHSEED=0" \
+          "$(printf '%s' "$V4OUT" | tr '\n' '|')"
+
 # ---- E: the preamble, and the mutation that removes its smoke --------------
 echo ""; echo "########## PSG ARM E -- preamble vs preamble-without-the-smoke ##########"
 cat > "$SCR/run_preamble.sh" <<'RUNNER'
@@ -889,7 +1033,7 @@ echo "### PSG per-arm verdicts:"
 for f in "$AOUT" "$BOUT" "$COUT" "$FOUT"; do
   printf '###   %-28s %s\n' "$(basename "$f")" "$(grep -m1 '^### SMOKE [A-Z_]* binary=' "$f" 2>/dev/null || echo '<none>')"
 done
-echo "### PSG SUMMARY pass=$pass fail=$fail (predicted pass=39 fail=0)"
+echo "### PSG SUMMARY pass=$pass fail=$fail (predicted pass=50 fail=2 -- see the PREDICTED row above)"
 echo "### PSG FINAL pass=$pass fail=$fail"
 if [ "$fail" -eq 0 ]; then exit 0; fi
 exit 1

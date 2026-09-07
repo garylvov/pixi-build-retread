@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# env_seed_export_guard.sh -- the reader for phaseN_relock.sh's `env_seed_export`.
+# env_seed_export_guard.sh -- the reader for tools/env_seed.sh's `env_seed_export`,
+# and for the phaseN_relock.sh call site that is its production consumer.
 #
 # WHAT IT IS FOR. DET-1-4-1 (job 6001140) locked one manifest three times on one
 # node with one binary and varied nothing but PYTHONHASHSEED in the LAUNCHING
@@ -38,16 +39,38 @@
 #   arm A must go RED -- the child stops seeing the seed. If A still passed, A
 #   would be reading the wrapper's intent instead of its effect.
 #
-# The function is lifted VERBATIM out of the shipped template (same awk extractor
+#   O1/O2 (DET-1-6-1). The function now has TWO modes, because the SMOKE calls it
+#   too and every known-good control binary in the tree predates the verb. So
+#   `optional` must (O1) let a verb-less binary through with a not-applicable row
+#   and NOTHING exported -- and still not run it, so the anti-hang assertion
+#   survives -- while (O2) STILL refusing a binary that carries the verb and then
+#   answers empty. Arm C is O1's non-vacuity pair: the SAME stub under STRICT is
+#   refused, so `optional` is a named mode and not a hole.
+#   G. And the one-authority arm: the template must SOURCE the library rather
+#   than carry its own copy of the function, which is the defect DET-1-6-1 fixed.
+#
+# The function is lifted VERBATIM out of the shipped LIBRARY (same awk extractor
 # wheel_store_census_guard.sh uses), so this guard tests the code that runs, not
 # a copy of it.
 #
-# Usage: env_seed_export_guard.sh [<template>]   (self-contained, needs only $TMPDIR)
+# WHY THE LIBRARY AND NOT THE TEMPLATE (DET-1-6-1). 58717bd defined
+# `env_seed_export` inside `phaseN_relock.sh`, where only the relock arms reached
+# it. `tools/proof_smoke.sh` launches its own `pixi lock` and did not, so
+# det16-proof 6013332 refused its own FIX binary before arm 1 -- the backend log's
+# first line was `preflight: $PYTHONHASHSEED must be `0` in the environment that
+# launched pixi`, eight times in three seconds. The function moved to
+# `tools/env_seed.sh` and both callers source it; this guard follows it there and
+# arm E keeps checking the template's CALL SITE and its reader.
+#
+# Usage: env_seed_export_guard.sh [<template>] [<library>]
+#        (self-contained, needs only $TMPDIR)
 set -u
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 TPL=${1:-$HERE/phaseN_relock.sh}
+LIB=${2:-$HERE/../tools/env_seed.sh}
 [ -f "$TPL" ] || { echo "GUARD FATAL: no template at $TPL"; exit 2; }
+[ -f "$LIB" ] || { echo "GUARD FATAL: no env_seed.sh library at $LIB -- nothing defines the export"; exit 2; }
 
 W=$(mktemp -d "${TMPDIR:-/tmp}/env-seed-export-guard.XXXXXX") || exit 2
 trap 'rm -rf "$W"' EXIT
@@ -59,10 +82,10 @@ extract () {  # $1=file $2=function name -> the function text, verbatim
   awk -v fn="$2" '$0 ~ "^"fn" \\(\\) \\{" {p=1} p {print} p && /^\}$/ {exit}' "$1"
 }
 
-FN=$(extract "$TPL" env_seed_export)
-MARKER_LINE=$(grep -m1 '^ENV_SEED_MARKER=' "$TPL")
-[ -n "$FN" ]          || { echo "GUARD FATAL: $TPL has no env_seed_export function -- nothing exports the seed"; exit 2; }
-[ -n "$MARKER_LINE" ] || { echo "GUARD FATAL: $TPL has no ENV_SEED_MARKER -- the verb-absent check cannot be static"; exit 2; }
+FN=$(extract "$LIB" env_seed_export)
+MARKER_LINE=$(grep -m1 '^ENV_SEED_MARKER=' "$LIB")
+[ -n "$FN" ]          || { echo "GUARD FATAL: $LIB has no env_seed_export function -- nothing exports the seed"; exit 2; }
+[ -n "$MARKER_LINE" ] || { echo "GUARD FATAL: $LIB has no ENV_SEED_MARKER -- the verb-absent check cannot be static"; exit 2; }
 
 # The marker VALUE, as the template spells it. The stubs below embed it (or not)
 # so the static detection is exercised on real bytes rather than on a flag.
@@ -92,7 +115,7 @@ mk_driver () {   # $1=path  $2=function text
   { echo 'set -u'
     printf '%s\n' "$MARKER_LINE"
     printf '%s\n' "$2"
-    echo 'env_seed_export "$1"; rc=$?'
+    echo 'env_seed_export "$1" "${2:-strict}"; rc=$?'
     # the CHILD. `env` is a separate process, so this is the export's effect and
     # not the assignment's appearance.
     echo 'echo "CHILD_SEES=$(env | sed -n "s/^PYTHONHASHSEED=//p")"'
@@ -106,7 +129,7 @@ if [ "$(printf '%s\n' "$FN" | wc -l)" -eq "$(printf '%s\n' "$MUT" | wc -l)" ]; t
 fi
 
 run () {   # $1=driver $2=stub -> sets OUT, RC. `timeout` is the anti-hang assertion.
-  OUT=$(timeout 20 bash "$1" "$2" 2>&1); RC=$?
+  OUT=$(timeout 20 bash "$1" "$2" "${3:-strict}" 2>&1); RC=$?
 }
 child_sees () { printf '%s\n' "$1" | sed -n 's/^CHILD_SEES=//p' | head -1; }
 
@@ -182,6 +205,51 @@ if [ "$RC" != 0 ] && printf '%s\n' "$OUT" | grep -q 'not an executable binary'; 
   ok "D: a non-executable backend is refused before anything else"
 else
   fail "D: rc=$RC; out: $(printf '%s' "$OUT" | tr '\n' '|')"
+fi
+
+########## O1. OPTIONAL mode: a verb-less binary passes, unseeded, and SAYS SO #
+# DET-1-6-1. The smoke calls the function in this mode because every known-good
+# control binary in the tree predates the verb. The stub is the SAME `exec sleep
+# 300` arm C uses, so this arm is also still an anti-hang assertion: `optional`
+# must relax the VERDICT, never the rule that a verb-less binary is not run.
+S=$(date +%s)
+run "$W/drv.sh" "$W/noverb" optional
+E=$(( $(date +%s) - S ))
+if [ "$RC" = 124 ]; then
+  fail "O1: optional mode HUNG on a verb-less binary (timeout at ${E}s) -- it probed by running instead of by the static marker"
+elif [ "$RC" = 0 ] && [ -z "$(child_sees "$OUT")" ] \
+     && printf '%s\n' "$OUT" | grep -q '^### ENV SEED not-applicable binary lacks verb' \
+     && [ "$E" -lt 15 ]; then
+  ok "O1: optional mode PASSES a verb-less binary in ${E}s (rc=0), exports NOTHING, prints the not-applicable row, and still never runs it"
+else
+  fail "O1: rc=$RC elapsed=${E}s child_sees='$(child_sees "$OUT")'; out: $(printf '%s' "$OUT" | tr '\n' '|')"
+fi
+
+########## O2. OPTIONAL is a named case, not a hole ###########################
+# The one case `optional` relaxes is the verb's ABSENCE. A binary that CARRIES
+# the verb and then answers empty is a defect in the binary, and an empty
+# PYTHONHASHSEED is random, so it must be refused in BOTH modes -- otherwise
+# `optional` would be "never refuse", and the smoke would launch pixi under a
+# random seed while printing a row that looked like a pin.
+run "$W/drv.sh" "$W/silent" optional
+if [ "$RC" != 0 ] && [ -z "$(child_sees "$OUT")" ] \
+   && printf '%s\n' "$OUT" | grep -q 'FATAL ENV SEED'; then
+  ok "O2: optional mode STILL refuses a marker-carrying binary whose verb prints nothing (rc=$RC) -- it relaxes absence, not badness"
+else
+  fail "O2: rc=$RC child_sees='$(child_sees "$OUT")'; out: $(printf '%s' "$OUT" | tr '\n' '|')"
+fi
+
+########## G. ONE AUTHORITY: the template SOURCES, it does not re-define ######
+# The DET-1-6-1 defect in one line. While the function lived only in the
+# template, `tools/proof_smoke.sh` launched pixi without it and refused the
+# template's own FIX binary before arm 1. A template that grew its own copy back
+# would restore exactly that split, and both copies would look right.
+if grep -q '^\. "\$ENV_SEED_LIB"$' "$TPL" \
+   && ! grep -q '^env_seed_export () {' "$TPL" \
+   && ! grep -q '^ENV_SEED_MARKER=' "$TPL"; then
+  ok "G: the template SOURCES $LIB and defines neither the function nor the marker itself -- one authority"
+else
+  fail "G: the template does not source the library, or has grown its own copy of env_seed_export/ENV_SEED_MARKER (the DET-1-6-1 split)"
 fi
 
 ########## E. the export has a READER in the template #########################
