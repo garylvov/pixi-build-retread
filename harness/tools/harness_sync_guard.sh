@@ -924,15 +924,25 @@ SNAPTOOL=$(dirname -- "$SYNC")/../phase_template/owner_snapshot.sh
 if [ ! -f "$SNAPTOOL" ]; then
   bad "P: no owner_snapshot.sh -- HARNESS-SYNC-5's submitter half is absent"
 else
-mkowner () {   # $1 = task dir; builds a gate that SOURCES a cleanup.sh beside it
-  local T=$1
+mkowner () {   # $1 = task dir, $2 = repo; echoes the amended v2 sha
+  # The gate's REAL shape, quoted from phase_template/cleanup_gated.sh: it names
+  # `cleanup.sh` through a variable assigned from its own directory, which is
+  # what the sibling rule has to get right.
+  local T=$1 R=$2
   printf '#!/bin/bash\nCLEANUP=$(dirname "$0")/cleanup.sh\nbash "$CLEANUP"\n' > "$T/merge-h/cleanup_gated.sh"
   printf '#!/bin/bash\necho cleanup\n' > "$T/merge-h/cleanup.sh"
   mkdir -p "$T/jobroot"
+  # The repo must carry a cleanup.sh too, or the sync maps the task file to a
+  # blob that does not exist and fails rc 5 for a reason that has nothing to do
+  # with the read set -- which is exactly what job 6009975 caught.
+  printf 'v2 cleanup CHANGED\n' > "$R/harness/phase_template/cleanup.sh"
+  git -C "$R" add -A >/dev/null 2>&1
+  git -C "$R" commit -q --amend --no-edit >/dev/null 2>&1
+  git -C "$R" rev-parse HEAD
 }
 # ---- p3 first: the snapshot itself, because p1 depends on it working --------
 read -r RP TP V1P V2P < <(mkfixture P)
-mkowner "$TP"
+V2P=$(mkowner "$TP" "$RP")
 PSNAP=$WORK/P_snapshot.log
 bash "$SNAPTOOL" "$TP/jobroot" "$TP/merge-h/cleanup_gated.sh" > "$PSNAP" 2>&1; rcP3=$?
 if [ "$rcP3" -eq 0 ] \
@@ -967,7 +977,7 @@ grep -q 'read-set OK job=8000051 file=cleanup_gated.sh' "$WORK/P1.log" \
   || { bad "P(p1): no 'read-set OK' row naming the job"; sed 's/^/      /' "$WORK/P1.log"; }
 # ---- p2: the MUTATION -- the old shape, reading the task path ---------------
 read -r RP2 TP2 V1P2 V2P2 < <(mkfixture P2)
-mkowner "$TP2"
+V2P2=$(mkowner "$TP2" "$RP2")
 mkstub "$WORK/P2_squeue"
 { echo '#!/bin/bash'; echo "bash $TP2/merge-h/cleanup_gated.sh /oscar/data/stellex/glvov/retread/certX-1"; } > "$TP2/jobroot/wrap.sbatch"
 printf '8000052 RUNNING laneP2 %s %s %s\n' "$TP2" "$TP2/jobroot/wrap.sbatch" "$TP2/jobroot" > "$WORK/P2_run.txt"
@@ -982,7 +992,7 @@ else
 fi
 # ---- p4: a hole in the snapshot is a refusal --------------------------------
 read -r RP4 TP4 V1P4 V2P4 < <(mkfixture P4)
-mkowner "$TP4"
+mkowner "$TP4" "$RP4" >/dev/null
 printf '#!/bin/bash\n. "$UNSET_SOMETHING"\n' >> "$TP4/merge-h/cleanup_gated.sh"
 bash "$SNAPTOOL" "$TP4/jobroot" "$TP4/merge-h/cleanup_gated.sh" > "$WORK/P4.log" 2>&1; rcP4=$?
 if [ "$rcP4" -ne 0 ] && grep -q 'OWNER SNAPSHOT REFUSED' "$WORK/P4.log" \
