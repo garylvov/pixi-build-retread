@@ -162,6 +162,7 @@ SMOKE_T0=$(date +%s)
 SMOKE_RC=3
 smoke_finish () {
   local wall=$(( $(date +%s) - SMOKE_T0 ))
+  smoke_stage_lock_release
   echo "### SMOKE $SMOKE_VERDICT binary=$SMOKE_BINSHA wall=${wall}s"
   exit "$SMOKE_RC"
 }
@@ -259,10 +260,166 @@ smoke_stage_key () {
   | md5sum | awk '{print $1}'
 }
 
+# ── THE STAGE MIRROR IS SHARED STATE, AND TWO SMOKES MUST NOT HOLD IT AT ONCE ──
+# PROOF-SMOKE-1-4.
+#
+# READ THIS FIRST: THE CONCURRENCY READING THIS LOCK WAS COMMISSIONED FOR IS
+# **WITHDRAWN**, AND THE MEASUREMENT THAT WITHDREW IT IS THIS LANE'S OWN.
+# The story was a removal test: 6001839 (14 checks, node2311) and 6001840 (18
+# checks, node2320) started in the SAME SECOND and 6001840 lost arm A, while the
+# chained rerun 6002138, with no sibling psg job alive, scored 18/0 -- so
+# "concurrency" was declared confirmed by removal.  THEN THIS LANE RAN
+# `proof_smoke_guard.sh` AS **6003336**, WHICH ASKED `squeue` FOR A SIBLING psg
+# JOB BEFORE STARTING AND PRINTED `no sibling psg job alive -- this run holds
+# the stage mirror alone`, AND ARM A WENT RED ANYWAY, with the identical
+# signature:
+#   ### SMOKE BACKEND_DIED reason=PREFIX_PANIC_256 lock_rc=1
+#         frontend_rows=0 backend_work_rows=16
+#   ### SMOKE   panic| ... end byte index 18446744073709551591 is out of bounds
+#         for string of length 260
+# Same binary sha (6796560...), same `psg$J/c/x` root shape, same mirror key
+# 85db7fd..., and the SAME declared budget row as both 09-06 jobs AND as the
+# GREEN control 6002138: `entry=148 composed=240 pad=256 headroom=16`.  A run
+# ALONE reproduced the failure that a run alone was supposed to rule out, so the
+# removal test was CONFOUNDED and concurrency is not the cause.
+#
+# WHAT THE CAUSE ACTUALLY IS, named by THIS FILE'S OWN detector rather than
+# inferred: `reason=PREFIX_PANIC_256`.  rattler-build pads its build prefix to
+# 256 and `256 - len` underflows above it.  The composed string was 260 while
+# the pre-lock budget check declared 240 with 16 bytes of headroom -- so THE
+# BUDGET RULE UNDERCOUNTS BY TWENTY BYTES for this manifest, and the refusal
+# that exists precisely to stop this passed a root that then panicked.  The
+# budget models the hermetic STORE ENTRY (root + 100 + SMOKE_PREFIX_TAIL); it
+# does not model the per-package BUILD prefix rattler-build composes, which
+# varies with which package the resolver reaches first -- which is the emission
+# -order instability DET-1 is about, and which is why this fails INTERMITTENTLY
+# (five of six psmoke runs red on 09-06, one green) and looks like contention
+# when it is not.  **THAT IS THE ROOT DEFECT AND THIS LANE DID NOT FIX IT.**  It
+# is boarded, not smuggled into a lock: closing it means teaching
+# `smoke_prefix_budget` a build prefix it does not currently model, against a
+# measurement this lane has not taken, and a guess would put a second wrong
+# number where one already is.
+#
+# SO WHY DOES THE LOCK STAY?  Because it guards a DIFFERENT hazard that has its
+# own evidence and never depended on the concurrency reading:
+#
+# WHAT IS ACTUALLY SHARED, because the coordinator's phrase "one shared stage
+# mirror" is nearly right and the nearly matters. The two jobs' stage PATHS were
+# never shared: `SCR=.../psg$J` and `ROOT=$SMOKE_ROOT_BASE/smk$J-$NONCE` both
+# carry the job id, and both jobs printed the SAME prefix row
+# (`entry=148 composed=240 pad=256 headroom=16`) because their job ids are the
+# same LENGTH, not because they were the same path. What is shared is one level
+# down: `cp -al` from `$SMOKE_MIRROR_ROOT/$key` gives every staged file THE
+# MIRROR'S OWN INODE, so two jobs staging from one mirror hold the same inodes,
+# and a single in-place write by either reaches the mirror and the other job's
+# workspace at once. The rsync fallback is worse still -- it `cp -al`s
+# `$SMOKE_SRC_WS/third_party` straight out of the canonical tree.
+#
+# THE CHOICE, AND WHY IT IS THE SMALLER TRUE FIX. Making the stage per-job in
+# CONTENT means a real copy instead of the hardlink farm, which is precisely the
+# cost the mirror exists to avoid, and the stage is already per-job in PATH so
+# there is nothing to move. Serialising access to the mirror is what the removal
+# test actually validated (6002138 passed BECAUSE it ran alone), it is one
+# `mkdir` on the acquire path, and it turns a corrupted share into a loud
+# refusal that names its owner. So: a NON-BLOCKING dot-sidecar try-lock beside
+# the mirror, the same shape the wheel store uses for `.<wheel>.whl.retread-
+# fill-v1.lock` -- `mkdir` rather than a file because mkdir is the create-or-fail
+# primitive that is atomic on NFS, where a noclobber redirect is not.
+#
+# WHAT THIS DOES **NOT** FIX, boarded rather than blind-fixed: the write-through
+# itself. `phaseN_relock.sh` already carries the three readers for it --
+# `stage_break_hardlinks` (cp -p + mv -f over every `-links +1` file),
+# `stage_assert_mirror_disjoint` (the mirror must share no inode with
+# $SMOKE_SRC_WS) and `stage_verify_mirror` (quarantine to `.DIRTY-$J`, set
+# MIRROR_DIRTY, exit 12) -- and `smoke_stage` has NONE of them. The live mirror
+# root carries three `.DIRTY-<jobid>` quarantines and one `.SRCLINKED-<jobid>`,
+# so that hole has fired before. Carrying those three into the smoke is a
+# SEPARATE change against a defect this lane did not measure, and it is boarded
+# as debt, not smuggled in here.
+SMOKE_STAGE_LOCK=${SMOKE_STAGE_LOCK:-1}
+# TTL is the backstop, not the mechanism: the mechanism is the owner job's
+# LIVENESS, asked of squeue at the point of use (law 5). A lock whose owner job
+# is not in the queue is dead however new it is; the TTL only covers a lock
+# whose owner id cannot be resolved at all.
+SMOKE_STAGE_LOCK_TTL=${SMOKE_STAGE_LOCK_TTL:-14400}
+# Set by a caller that stages ONCE and then runs many arms against those
+# hardlinks (proof_smoke_guard.sh is the one in tree): the lock then spans the
+# CALLER's life, not this one invocation's, and the caller removes it.
+SMOKE_STAGE_LOCK_HOLD=${SMOKE_STAGE_LOCK_HOLD:-0}
+SMOKE_STAGE_LOCK_PATH=
+SMOKE_STAGE_LOCK_MINE=0          # 1 only if THIS process created the lock
+
+smoke_stage_lock_path () {     # $1 = mirror key; THE one place this path is spelled
+  printf '%s\n' "$SMOKE_MIRROR_ROOT/.$1.smoke-stage-v1.lock"
+}
+
+smoke_stage_lock_owner () {      # $1 = lock dir; echoes the owner job id or ''
+  sed -n 's/^job=//p' "$1/owner" 2>/dev/null | head -1
+}
+
+smoke_stage_lock_acquire () {    # $1 = mirror key; rc 0 held, rc 1 BUSY
+  local key=$1 lock owner age now mine
+  [ "$SMOKE_STAGE_LOCK" = 1 ] || { echo "### SMOKE stage lock: DISABLED (SMOKE_STAGE_LOCK=0) -- concurrent smokes share the mirror's inodes"; return 0; }
+  mkdir -p "$SMOKE_MIRROR_ROOT" 2>/dev/null
+  lock=$SMOKE_MIRROR_ROOT/.$key.smoke-stage-v1.lock
+  mine=${SLURM_JOB_ID:-pid$$}
+  if mkdir "$lock" 2>/dev/null; then
+    { echo "job=$mine"; echo "host=$(hostname -s)"; echo "pid=$$"; echo "at=$(date -Is)"; } > "$lock/owner"
+    SMOKE_STAGE_LOCK_PATH=$lock; SMOKE_STAGE_LOCK_MINE=1
+    echo "### SMOKE stage lock: TAKEN $lock owner=$mine"
+    return 0
+  fi
+  owner=$(smoke_stage_lock_owner "$lock")
+  # RE-ENTRANT WITHIN A JOB. Two smokes in one job are serialised by the shell
+  # that runs them; they share a job id, and refusing the second would refuse
+  # every multi-arm driver in the tree.
+  if [ -n "$owner" ] && [ "$owner" = "$mine" ]; then
+    SMOKE_STAGE_LOCK_PATH=$lock; SMOKE_STAGE_LOCK_MINE=0
+    echo "### SMOKE stage lock: ADOPTED $lock -- already held by THIS job ($mine)"
+    return 0
+  fi
+  # A DEAD OWNER IS RECLAIMED, LOUDLY. A smoke killed mid-stage would otherwise
+  # wedge every later smoke until the TTL, which is a worse failure than the one
+  # the lock exists to stop.
+  now=$(date +%s); age=$(( now - $(stat -c %Y "$lock" 2>/dev/null || echo "$now") ))
+  if [ -n "$owner" ] && [ -z "$(squeue -h -j "$owner" -o '%i' 2>/dev/null)" ]; then
+    echo "### SMOKE STAGE LOCK STALE: $lock owner=$owner is not in the queue (age=${age}s) -- RECLAIMING"
+    rm -rf "$lock" 2>/dev/null
+    smoke_stage_lock_acquire "$key"; return $?
+  fi
+  if [ "$age" -gt "$SMOKE_STAGE_LOCK_TTL" ]; then
+    echo "### SMOKE STAGE LOCK STALE: $lock age=${age}s > TTL ${SMOKE_STAGE_LOCK_TTL}s owner='${owner:-<unreadable>}' -- RECLAIMING"
+    rm -rf "$lock" 2>/dev/null
+    smoke_stage_lock_acquire "$key"; return $?
+  fi
+  echo "### SMOKE STAGE BUSY: $lock is held by job ${owner:-<unreadable>} (age=${age}s), which is LIVE."
+  echo "###   The stage mirror hands out its OWN inodes via cp -al, so staging beside that job"
+  echo "###   would give both workspaces the same files and an in-place write by either would"
+  echo "###   reach the other and the mirror, and the live mirror root already carries three"
+  echo "###   .DIRTY-<jobid> quarantines from phaseN_relock.sh's reader, so that is not hypothetical."
+  echo "###   ACTUATOR: chain this job after ${owner:-the holder} (--dependency=afterany:${owner:-<jobid>}),"
+  echo "###   or re-run once it is terminal. SMOKE_STAGE_LOCK=0 disables the lock deliberately."
+  sed 's/^/###   owner: /' "$lock/owner" 2>/dev/null
+  return 1
+}
+
+smoke_stage_lock_release () {
+  [ "$SMOKE_STAGE_LOCK_MINE" = 1 ] || return 0
+  [ "$SMOKE_STAGE_LOCK_HOLD" = 1 ] && { echo "### SMOKE stage lock: HELD past this smoke (SMOKE_STAGE_LOCK_HOLD=1) -- the caller releases $SMOKE_STAGE_LOCK_PATH"; return 0; }
+  [ -n "$SMOKE_STAGE_LOCK_PATH" ] || return 0
+  rm -rf "$SMOKE_STAGE_LOCK_PATH" 2>/dev/null \
+    && echo "### SMOKE stage lock: RELEASED $SMOKE_STAGE_LOCK_PATH"
+  SMOKE_STAGE_LOCK_MINE=0
+  return 0
+}
+
 smoke_stage () {                 # $1 = workspace to create
   local ws=$1 key mirror S
   key=$(smoke_stage_key)
   mirror=$SMOKE_MIRROR_ROOT/$key
+  # BEFORE a single inode is handed out. A BUSY mirror is a SETUP refusal, never
+  # a verdict about the binary: the caller turns rc 1 here into SETUP_FAILED rc 3.
+  smoke_stage_lock_acquire "$key" || return 2
   mkdir -p "$ws" || return 1
   if [ -f "$mirror/.stage-mirror-key" ] && grep -qx "key=$key" "$mirror/.stage-mirror-key"; then
     echo "### SMOKE stage: mirror HIT $mirror (key $key)"
@@ -313,6 +470,12 @@ BIN=$BINSNAP
 mkdir -p "$JOB_ROOT" || smoke_setup_failed "cannot create job root $JOB_ROOT"
 SMOKE_BINSHA=$(sha256sum "$BIN" | awk '{print $1}')
 
+# The lock must come off even when this process is killed rather than finished:
+# a smoke SIGKILLed mid-run would otherwise leave the mirror BUSY until another
+# job's liveness check reclaimed it. `smoke_finish` releases on every ordinary
+# path and this covers the rest; both are idempotent.
+trap 'smoke_stage_lock_release' EXIT
+
 J=${SLURM_JOB_ID:-$$}
 # A short, UNIQUE, job-owned root.  `smk` + jobid + a 4-hex nonce keeps two
 # smokes in one job from colliding without spending bytes on a label.
@@ -347,8 +510,23 @@ smoke_prefix_budget "$XDG_CACHE_HOME" "smoke store root" || {
 if [ -n "${SMOKE_WS:-}" ] && [ -f "$WS/pixi.toml" ]; then
   echo "### SMOKE stage: REUSING the caller's workspace $WS (SMOKE_WS was set and it is staged)"
 else
-  smoke_stage "$WS" || smoke_setup_failed "could not stage a workspace at $WS"
+  smoke_stage "$WS"
+  case $? in
+    0) ;;
+    2) echo "### SMOKE reason=STAGE_BUSY -- this is a refusal about the shared stage mirror, not a"
+       echo "###   verdict about the binary. Nothing was staged and no inode was shared."
+       SMOKE_VERDICT=SETUP_FAILED; SMOKE_RC=3; smoke_finish;;
+    *) smoke_setup_failed "could not stage a workspace at $WS";;
+  esac
 fi
+# THE PATHS THIS SMOKE ACTUALLY OWNS, measured after staging. The composed
+# budget is NOT recomputed here -- `smoke_prefix_budget` above is the one
+# implementation of that rule and a second copy is how the rule drifts (this
+# file says so about the LIB seam and it applies to itself). What is printed is
+# the raw lengths, so a reader of PROOF-SMOKE-1-4's panic (`string of length
+# 260`, against two jobs that both declared composed=240) can tell a root
+# overrun from a string that never was a root of this job's at all.
+echo "### SMOKE stage paths: ws_len=${#WS} root_len=${#ROOT} cache_len=${#XDG_CACHE_HOME} lock=${SMOKE_STAGE_LOCK_PATH:-<none>}"
 rm -f "$WS/pixi.toml"; cp "$MANIFEST" "$WS/pixi.toml" || smoke_setup_failed "cannot install the manifest"
 # A lock that already exists would let pixi answer without ever instantiating a
 # backend, and the smoke would report REACHED_FRONTEND for a binary it never ran.

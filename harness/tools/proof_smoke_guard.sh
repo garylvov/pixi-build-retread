@@ -11,9 +11,9 @@
 #   Everything this guard creates lives under a SHORT scratch root it owns and
 #   is removed on the way out.
 #
-#   PREDICTED: pass=18 fail=0  (state this in the sbatch before submitting)
+#   PREDICTED: pass=24 fail=0  (state this in the sbatch before submitting)
 #
-# ── THE EIGHTEEN CHECKS ────────────────────────────────────────────────────────
+# ── THE TWENTY-FOUR CHECKS ────────────────────────────────────────────────────
 #   A1  the known-good binsnap reaches the frontend            REACHED_FRONTEND
 #   A2  ... and proof_smoke.sh exits 0
 #   B1  a stub that prints a panic and exits 1                 BACKEND_DIED
@@ -49,6 +49,25 @@
 #   G4  MUTATION, pinned to $PSG_G_OLD (the commit 6000903 ran): on G1's fixture
 #       the arms PASS and the smoke's own root is REFUSED, and there is no
 #       symmetry row anywhere.  6000903, verbatim, so G1 can fail.
+#   H1  PROOF-SMOKE-1-4: two arms of ONE job take the same stage mirror
+#       sequentially -- the second ADOPTS the lock and both return 0, because
+#       refusing a job its own lock would refuse every multi-arm driver in tree.
+#   H2  a mirror held by a DIFFERENT, LIVE job refuses `### SMOKE STAGE BUSY`
+#       rc 1 -- loudly, rather than staging beside it and sharing its inodes.
+#   H3  ... and the BUSY row names the ACTUATOR: the holder's job id to chain
+#       after.  A refusal that reaches nobody is a defect (law 9).
+#   H4  ... and it is a REFUSAL, not a panic -- matched on the Rust panic's own
+#       SHAPE, never on the word, because the first cut matched the BUSY row's
+#       own prose explaining the panic it avoids (run 6003336) and caught its
+#       own explanation. A pattern that can match the text it guards is law 14
+#       one level up.
+#   H5  THE NON-VACUITY CONTROL: a lock whose owner job is NOT in the queue is
+#       RECLAIMED, loudly.  Without it a smoke killed mid-stage would wedge
+#       every later smoke, which is a worse failure than the one being fixed --
+#       and BUSY would be the only answer the lock knows, which is not a lock.
+#   H6  THE MUTATION: with the acquire cut out of smoke_stage, the same fixture
+#       stages straight past a live holder.  That is 6001840, and without this
+#       arm H2 could be passing on the fixture rather than on the lock.
 set -uo pipefail
 
 # THE MUTATION ARM'S COMMIT CONSTANT -- the harness tip immediately BEFORE this
@@ -76,7 +95,7 @@ chk () {  # chk <name> <condition-rc> <what was wanted> <what was seen>
 echo "### PSG proof_smoke_guard.sh  $(date -Is)  host=$(hostname -s) job=$J"
 echo "### PSG scratch=$SCR  job_root=$JOB_ROOT"
 echo "### PSG good binsnap=$GOOD"
-echo "### PSG PREDICTED pass=18 fail=0"
+echo "### PSG PREDICTED pass=24 fail=0"
 
 # ---- the stubs --------------------------------------------------------------
 # They live at a path ENDING `/pixi-build-retread` because the shim readback
@@ -104,6 +123,26 @@ chmod +x "$SCR/stubdie/pixi-build-retread" "$SCR/stubsleep/pixi-build-retread"
 export SMOKE_WS=$SCR/w
 export SMOKE_CACHE=$SCR/c
 export SMOKE_ROOT=$SCR
+# PROOF-SMOKE-1-4, AND THIS IS THE PRODUCTION CALL SITE FOR THE HOLD FLAG. This
+# guard stages ONCE in arm A and then runs B..F against those hardlinks, so the
+# mirror's inodes are in use for the guard's WHOLE life, not for arm A's. Arm A's
+# smoke must therefore take the stage lock and NOT drop it at its own finish;
+# this guard drops it on the way out. Without the flag arm A would release after
+# itself and arms B..F would run unprotected -- which is the window 6001840 lost
+# arm A in. Harmless against a task copy that predates the lock (the variable is
+# simply unread there), which is what arms A-F still read today.
+export SMOKE_STAGE_LOCK_HOLD=1
+psg_release_stage_lock () {   # drop any lock in the live mirror root owned by THIS job
+  local d o n=0
+  while IFS= read -r d; do
+    o=$(sed -n 's/^job=//p' "$d/owner" 2>/dev/null | head -1)
+    [ "$o" = "$J" ] || continue
+    rm -rf "$d" 2>/dev/null && n=$((n+1)) && echo "### PSG released stage lock $d (owner=$J)"
+  done < <(find "${SMOKE_MIRROR_ROOT:-/oscar/data/stellex/glvov/agrescap/cache/retread/stage-mirror}" \
+             -maxdepth 1 -name '.*.smoke-stage-v1.lock' -type d 2>/dev/null)
+  echo "### PSG stage locks released by this job: $n"
+}
+trap 'psg_release_stage_lock' EXIT
 
 # ---- A: the known-good binary ----------------------------------------------
 echo ""; echo "########## PSG ARM A -- known good $GOOD ##########"
@@ -346,6 +385,129 @@ else
   fail=$((fail+1)); echo "### PSG FAIL G4   could not extract $PSG_G_OLD's preamble/proof_smoke -- THE MUTATION DID NOT RUN"
 fi
 
+# ---- H: PROOF-SMOKE-1-4 -- the shared stage mirror is taken under a try-lock -
+# THE HAZARD, AND A CORRECTION TO THE READING THAT COMMISSIONED THIS ARM.
+# The story was a removal test: 6001839 (14 checks, node2311) and 6001840 (18
+# checks, node2320) STARTED IN THE SAME SECOND, 22:31:16, and the second lost
+# arm A at 130 s -- `### SMOKE BACKEND_DIED`, `A2 rc=1`, quoting `end byte index
+# 18446744073709551591 is out of bounds for string of length 260`,
+# frontend_rows=0 backend_work_rows=16 -- while the chained rerun 6002138, with
+# no sibling psg job alive, scored 18/0. Concurrency was declared confirmed.
+# **THAT READING IS WITHDRAWN, BY THIS GUARD'S OWN NEXT RUN.** 6003336 asked
+# `squeue` for a sibling psg job before starting, printed `no sibling psg job
+# alive -- this run holds the stage mirror alone`, and arm A went RED anyway
+# with the identical signature and the identical declared budget row
+# (`entry=148 composed=240 pad=256 headroom=16`) that the GREEN control 6002138
+# printed. The cause is named by proof_smoke.sh's own detector --
+# `reason=PREFIX_PANIC_256`, a composed build prefix of 260 against a 256 pad --
+# and the budget check UNDERCOUNTS IT BY TWENTY BYTES. That root defect is
+# BOARDED and is NOT what these arms test.
+# WHAT THESE ARMS DO TEST is a real and separately evidenced hazard: `cp -al`
+# out of $SMOKE_MIRROR_ROOT/$key hands out THE MIRROR'S OWN inodes, so two jobs
+# staging from one mirror hold the same files and one in-place write reaches
+# both plus the mirror. The live mirror root carries three `.DIRTY-<jobid>`
+# quarantines written by phaseN_relock.sh's own reader, so the write-through has
+# fired before. The lock serialises that; it does not, and is not claimed to,
+# fix arm A.
+# These arms run against a FIXTURE mirror root under this guard's own scratch --
+# they never touch the live mirror, and they source proof_smoke.sh as a LIB so
+# no smoke is run and no binary is involved.
+echo ""; echo "########## PSG ARM H -- the stage mirror try-lock (PROOF-SMOKE-1-4) ##########"
+HDIR=$SCR/h
+mkdir -p "$HDIR/mirror" "$HDIR/src"
+printf '[project]\nname = "psg-h"\n' > "$HDIR/src/pixi.toml"
+# THE REPO COPY, DELIBERATELY, and for the same reason arms G1-G4 read it: the
+# sync that would install this fix into $T is refused while other lanes' jobs
+# are live, so the task copy is still the pre-fix bytes and asserting the fix
+# against it would assert the fix against its own absence. Arms A-F keep reading
+# $T (they are the control on what this lane did not touch).
+HSMOKE=${PSG_SMOKE_REPO:-$REPO/harness/tools/proof_smoke.sh}
+echo "### PSG H reads $HSMOKE (repo copy: the fix is not synced into \$T)"
+hsetup () {   # source proof_smoke.sh (or a mutant, \$1) as a LIB over the fixture
+  export SMOKE_MIRROR_ROOT=$HDIR/mirror
+  export SMOKE_SRC_WS=$HDIR/src
+  export PROOF_SMOKE_LIB=1
+  # shellcheck source=/dev/null
+  . "${1:-$HSMOKE}" >/dev/null 2>&1
+}
+hlock () {  # echo the lock path the LIB itself spells -- never a second copy of it
+  ( hsetup
+    smoke_stage_lock_path "$(smoke_stage_key)" )
+}
+HLOCK=$(hlock)
+# h1: TWO acquisitions from ONE job, sequentially, both succeed. A driver that
+# smokes N binaries in one job must not refuse itself -- refusing here would
+# refuse every multi-arm driver in the tree, which is a worse defect than the
+# one under repair.
+H1OUT=$SCR/h1.out
+( hsetup
+
+  K=$(smoke_stage_key)
+  smoke_stage_lock_acquire "$K"; echo "first_rc=$?"
+  smoke_stage_lock_acquire "$K"; echo "second_rc=$?"
+  smoke_stage_lock_release ) > "$H1OUT" 2>&1
+grep -q 'first_rc=0' "$H1OUT" && grep -q 'second_rc=0' "$H1OUT" && grep -q 'ADOPTED' "$H1OUT"
+chk H1 $? "two arms of ONE job take the same mirror sequentially (second ADOPTS, both rc 0)" "$(grep -E 'first_rc|second_rc' "$H1OUT" | tr '\n' ' ')"
+rm -rf "$HLOCK"
+# h2: a lock PRE-HELD by a DIFFERENT, LIVE job. The holder named in the owner
+# file is THIS guard's own job id, because the liveness check asks squeue and the
+# only job this guard is entitled to ask about is its own; the ASKER is a
+# different id, so this is exactly the "the holder is alive, refuse" branch.
+# The refusal must be the BUSY row, non-zero, and NOT a panic.
+mkdir -p "$HLOCK"
+{ echo "job=$J"; echo "host=elsewhere"; echo "pid=1"; echo "at=$(date -Is)"; } > "$HLOCK/owner"
+H2OUT=$SCR/h2.out
+( hsetup
+
+  SLURM_JOB_ID=$(( J + 1 ))          # a DIFFERENT job asking for a LIVE holder's lock
+  smoke_stage_lock_acquire "$(smoke_stage_key)"; echo "busy_rc=$?" ) > "$H2OUT" 2>&1
+grep -q '### SMOKE STAGE BUSY' "$H2OUT" && grep -q 'busy_rc=1' "$H2OUT"
+chk H2 $? "a mirror held by a LIVE foreign job refuses '### SMOKE STAGE BUSY' rc 1, loudly" "$(grep -E 'busy_rc|STAGE BUSY' "$H2OUT" | head -1)"
+grep -q "ACTUATOR: chain this job after $J" "$H2OUT"
+chk H3 $? "and the BUSY row names the ACTUATOR -- the holder's job id to chain after" "$(grep -m1 ACTUATOR "$H2OUT" || echo '<no actuator row>')"
+# THE PATTERN IS THE PANIC'S OWN SHAPE, NOT THE WORD "panic". The first cut
+# grepped `panic|out of bounds` and went RED on run 6003336 by matching the
+# REFUSAL'S OWN PROSE -- the BUSY row explained itself by naming the panic it
+# exists to avoid, so the arm caught its own explanation. A guard whose pattern
+# can match the text it guards is the law-14 defect one level up, and it is
+# fixed the same way: build the pattern so it cannot match the guard's subject
+# saying the word.
+grep -qE "thread '[^']*' panicked|panicked at |is out of bounds for string of length" "$H2OUT"
+[ $? -ne 0 ]
+chk H4 $? "and it is a REFUSAL, not a panic (no Rust panic frame anywhere in the refusal)" "$(grep -m1 -E "panicked at |out of bounds for string of length" "$H2OUT" || echo none)"
+# h5: THE NON-VACUITY CONTROL. BUSY must not be the only answer the lock knows:
+# a lock whose owner job is NOT in the queue is reclaimed, loudly, so a smoke
+# killed mid-stage cannot wedge every later smoke.
+{ echo "job=99999999"; echo "host=gone"; echo "pid=1"; echo "at=$(date -Is)"; } > "$HLOCK/owner"
+H5OUT=$SCR/h5.out
+( hsetup
+
+  SLURM_JOB_ID=$(( J + 2 ))
+  smoke_stage_lock_acquire "$(smoke_stage_key)"; echo "stale_rc=$?"
+  smoke_stage_lock_release ) > "$H5OUT" 2>&1
+grep -q '### SMOKE STAGE LOCK STALE' "$H5OUT" && grep -q 'stale_rc=0' "$H5OUT"
+chk H5 $? "a lock whose owner job is NOT in the queue is RECLAIMED loudly, not waited on forever" "$(grep -E 'stale_rc|LOCK STALE' "$H5OUT" | head -1)"
+rm -rf "$HLOCK"
+# h6: THE MUTATION. With the acquire cut out of smoke_stage, h2's fixture
+# PROCEEDS past a live holder -- which is 6001840. Without this arm h2 could be
+# passing on the fixture rather than on the lock.
+HMUT=$SCR/proof_smoke_nolock.sh
+sed 's@^  smoke_stage_lock_acquire "$key" || return 2$@  :@' "$HSMOKE" > "$HMUT"
+if bash -n "$HMUT" 2>/dev/null && ! grep -q 'smoke_stage_lock_acquire "$key" || return 2' "$HMUT"; then
+  mkdir -p "$HLOCK"
+  { echo "job=$J"; echo "host=elsewhere"; echo "pid=1"; echo "at=$(date -Is)"; } > "$HLOCK/owner"
+  H6OUT=$SCR/h6.out
+  ( hsetup "$HMUT"
+    SLURM_JOB_ID=$(( J + 3 ))
+    mkdir -p "$HDIR/ws6"
+    smoke_stage "$HDIR/ws6"; echo "mut_stage_rc=$?" ) > "$H6OUT" 2>&1
+  ! grep -q '### SMOKE STAGE BUSY' "$H6OUT"
+  chk H6 $? "MUTATION -- with the acquire cut, staging PROCEEDS past a live holder (6001840), so H2 CAN fail" "$(grep -E 'mut_stage_rc|STAGE BUSY' "$H6OUT" | head -1)"
+  rm -rf "$HLOCK"
+else
+  chk H6 1 "MUTATION -- the no-lock mutant builds and runs" "the mutant did not build: MUTATION ARM DID NOT RUN"
+fi
+
 # ---- the scratch goes FIRST, and the verdict is the LAST thing on the page --
 # ORDER MATTERS HERE AND IT IS NOT STYLE.  In `psmoke-guards` 5993691 the
 # removal ran for FIVE MINUTES (a `cp -al` workspace of 44k entries over NFS)
@@ -406,7 +568,7 @@ echo "### PSG per-arm verdicts:"
 for f in "$AOUT" "$BOUT" "$COUT" "$FOUT"; do
   printf '###   %-28s %s\n' "$(basename "$f")" "$(grep -m1 '^### SMOKE [A-Z_]* binary=' "$f" 2>/dev/null || echo '<none>')"
 done
-echo "### PSG SUMMARY pass=$pass fail=$fail (predicted pass=18 fail=0)"
+echo "### PSG SUMMARY pass=$pass fail=$fail (predicted pass=24 fail=0)"
 echo "### PSG FINAL pass=$pass fail=$fail"
 if [ "$fail" -eq 0 ]; then exit 0; fi
 exit 1
