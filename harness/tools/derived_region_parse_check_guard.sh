@@ -18,6 +18,13 @@
 #      a file it cannot inspect is decorative
 #   F  an unbalanced DOUBLE quote is caught too, so the check is about the
 #      shell's quoting and not about apostrophes
+#   G  DET-1-6-3b: a REAL copy of the template whose SUBSTITUTE region carries
+#      the dead `../retread_fast_env.sh` hop is REFUSED rc 5 -- with G1, the
+#      control that the stripped diff the drivers run sees 0 lines on it
+#   H  NON-VACUITY: the same copy with the TIP's hop passes rc 0, hop=ok
+#   I  MUTATION: with the hop block deleted from a copy of the check, the SAME
+#      stale fixture passes -- so G is a refusal, not a constant
+#   J  an absent tip template is rc 4 FATAL, never a silent pass
 set -u
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -53,6 +60,14 @@ echo 'left|^Name' | head -1
 FIXEOF
 }
 
+# The fixtures above carry NO FAST_ENV hop, so they are compared against a tip
+# that carries none either -- otherwise every one of them would be refused rc 5
+# by the hop check for a reason that has nothing to do with the arm. The hop
+# arms (G/H/I) use the REAL template and REAL derived copies of it.
+EM='### SUBSTITUTE: END'
+mk_fixture "$W/tpl_nohop.sh" 'D=${2:-a job root}'
+NOHOP=$W/tpl_nohop.sh
+
 ########## A. the shipped template passes #####################################
 if [ -f "$TPL" ]; then
   OUT=$(bash "$CHK" "$TPL" 2>&1); RC=$?
@@ -67,7 +82,7 @@ fi
 
 ########## B. the 6014197 defect, reproduced ##################################
 mk_fixture "$W/bad.sh" 'D=${2:?arg 2: this arm'"'"'s job root, which must hold HARNESS_COMMIT}'
-OUT=$(bash "$CHK" "$W/bad.sh" 2>&1); RC=$?
+OUT=$(bash "$CHK" "$W/bad.sh" "$EM" "$NOHOP" 2>&1); RC=$?
 if [ "$RC" = 3 ] \
    && printf '%s\n' "$OUT" | grep -q 'DERIVED REGION PARSE REFUSED' \
    && printf '%s\n' "$OUT" | grep -q 'line 5' \
@@ -79,7 +94,7 @@ fi
 
 ########## C. NON-VACUITY: the same fixture, apostrophe removed ###############
 mk_fixture "$W/good.sh" 'D=${2:?arg 2: this arm job root, which must hold HARNESS_COMMIT}'
-OUT=$(bash "$CHK" "$W/good.sh" 2>&1); RC=$?
+OUT=$(bash "$CHK" "$W/good.sh" "$EM" "$NOHOP" 2>&1); RC=$?
 if [ "$RC" = 0 ]; then
   ok "C: the SAME fixture with the apostrophe removed PASSES -- B fires on the quote, not on the shape"
 else
@@ -103,7 +118,7 @@ fi
 
 ########## E. no end marker -> refuse, loudly #################################
 printf '#!/usr/bin/env bash\necho hi\n' > "$W/nomark.sh"
-OUT=$(bash "$CHK" "$W/nomark.sh" 2>&1); RC=$?
+OUT=$(bash "$CHK" "$W/nomark.sh" "$EM" "$NOHOP" 2>&1); RC=$?
 if [ "$RC" = 4 ] && printf '%s\n' "$OUT" | grep -q 'has no line'; then
   ok "E: a file with no SUBSTITUTE end marker is REFUSED rc 4 -- it is not silently passed"
 else
@@ -112,12 +127,80 @@ fi
 
 ########## F. it is about quoting, not about apostrophes ######################
 mk_fixture "$W/dq.sh" 'D=${2:-a "dangling double quote}'
-OUT=$(bash "$CHK" "$W/dq.sh" 2>&1); RC=$?
+OUT=$(bash "$CHK" "$W/dq.sh" "$EM" "$NOHOP" 2>&1); RC=$?
 if [ "$RC" = 3 ]; then
   ok "F: an unbalanced DOUBLE quote in the region is refused too -- the check is the shell's quoting rules, not a pattern for one character"
 else
   fail "F: rc=$RC on an unbalanced double quote; out: $(printf '%s' "$OUT" | tr '\n' '|')"
 fi
 
+
+########## G/H/I. DET-1-6-3b: the FAST_ENV hop INSIDE the stripped region #####
+# These three run on REAL files: the shipped template as the tip, and copies of
+# it as the derived wrappers. A fixture that merely LOOKS like a wrapper would
+# not prove the tip's own hop is what gets reproduced.
+if [ -f "$TPL" ]; then
+  cp "$TPL" "$W/drv_ok.sh"
+  cp "$TPL" "$W/drv_stale.sh"
+  # THE EXACT PRE-2026-09-07 HOP, put back where det163's wrapper carried it:
+  # inside the SUBSTITUTE region, where the stripped diff cannot reach it.
+  sed -i "0,/^FAST_ENV=/s|^FAST_ENV=.*|FAST_ENV=\$(dirname \"\$0\")/../retread_fast_env.sh|" "$W/drv_stale.sh"
+  if grep -q 'dirname "\$0")/\.\./retread_fast_env\.sh' "$W/drv_stale.sh" \
+     && ! cmp -s "$W/drv_stale.sh" "$TPL"; then
+    ok "G0: the stale fixture really carries the dead ../retread_fast_env.sh hop and differs from the tip"
+  else
+    fail "G0: could not build the stale fixture from $TPL -- G/H measure nothing"
+  fi
+  # ... and the fixture is INVISIBLE to the gate that already runs: strip the
+  # SUBSTITUTE region from both and the diff is empty. This is arm D's role for
+  # the hop, and without it G proves only that a check refuses something.
+  strip_region () { awk '/^### SUBSTITUTE: BEGIN/{s=1} /^### SUBSTITUTE: END/{s=0; next} s{next} {print}' "$1"; }
+  NDIFF=$(diff <(strip_region "$TPL") <(strip_region "$W/drv_stale.sh") | grep -c '^[<>]' || true)
+  if [ "$NDIFF" = 0 ]; then
+    ok "G1: THE CONTROL -- the stripped diff the drivers run reports 0 diff lines on the stale wrapper, exactly as it did for job 6020526"
+  else
+    fail "G1: the stripped diff shows $NDIFF line(s) on the stale fixture, so it is not the invisible defect this arm is for"
+  fi
+
+  OUT=$(bash "$CHK" "$W/drv_stale.sh" "$EM" "$TPL" 2>&1); RC=$?
+  if [ "$RC" = 5 ] \
+     && printf '%s\n' "$OUT" | grep -q '^### DERIVED FAST_ENV hop=STALE tip=[0-9a-f]\{32\} derived=[0-9a-f]\{32\}$' \
+     && printf '%s\n' "$OUT" | grep -q 'ACTUATOR:'; then
+    ok "G: a derived wrapper carrying the dead hop is REFUSED rc 5 with hop=STALE and both md5s"
+  else
+    fail "G: rc=$RC (want 5); out: $(printf '%s' "$OUT" | tr '\n' '|')"
+  fi
+
+  OUT=$(bash "$CHK" "$W/drv_ok.sh" "$EM" "$TPL" 2>&1); RC=$?
+  if [ "$RC" = 0 ] && printf '%s\n' "$OUT" | grep -q '^### DERIVED FAST_ENV hop=ok tip=[0-9a-f]\{32\} derived=[0-9a-f]\{32\}$'; then
+    ok "H: NON-VACUITY -- the same wrapper with the TIP's hop passes rc 0 and prints hop=ok"
+  else
+    fail "H: rc=$RC on a wrapper that reproduces the tip verbatim; out: $(printf '%s' "$OUT" | tr '\n' '|')"
+  fi
+
+  # I. THE MUTATION. Delete the hop block from a COPY of the check and the stale
+  # fixture must sail through. A guard that cannot be made to fail is decorative.
+  awk '/^### FAST_ENV-HOP BEGIN/{m=1} !m{print} /^### FAST_ENV-HOP END/{m=0}' "$CHK" > "$W/mutant.sh"
+  if grep -q 'FAST_ENV-HOP BEGIN' "$W/mutant.sh" || ! bash -n "$W/mutant.sh" 2>/dev/null; then
+    fail "I: could not build the hop-removed mutant of $CHK"
+  else
+    OUT=$(bash "$W/mutant.sh" "$W/drv_stale.sh" "$EM" "$TPL" 2>&1); RC=$?
+    if [ "$RC" = 0 ] && ! printf '%s\n' "$OUT" | grep -q 'FAST_ENV hop='; then
+      ok "I: MUTATION -- with the hop check removed the SAME stale fixture passes rc 0, so G is a real refusal and not a constant"
+    else
+      fail "I: the mutant still refused (rc=$RC), so arm G proves nothing; out: $(printf '%s' "$OUT" | tr '\n' '|')"
+    fi
+  fi
+
+  # J. a missing tip is FATAL, not a silent pass.
+  OUT=$(bash "$CHK" "$W/drv_stale.sh" "$EM" "$W/no-such-template.sh" 2>&1); RC=$?
+  if [ "$RC" = 4 ] && printf '%s\n' "$OUT" | grep -q 'hop=FATAL'; then
+    ok "J: no tip template -> rc 4 FATAL, never a pass"
+  else
+    fail "J: rc=$RC with an absent tip; out: $(printf '%s' "$OUT" | tr '\n' '|')"
+  fi
+else
+  fail "G/H/I/J: no template at $TPL -- the hop arms cannot run"
+fi
 echo "### derived_region_parse_check_guard: $( [ "$FAIL" = 0 ] && echo PASS || echo FAIL )"
 exit "$FAIL"
