@@ -173,8 +173,21 @@ grep -q "### DERIVED" "$WORK/C.log" \
 # ---- ARM D: underivable -- no job-id token in the basename -------------------
 rcD=$(run_gate "$WORK/D.log" "$GATE" -- /oscar/data/stellex/glvov/retread/certNOJOBIDHERE)
 [ "$rcD" = 2 ] && ok "D: an underivable root refuses with exit 2" || bad "D: exit $rcD, want 2"
-grep -q -- "--export=ALL,D=" "$WORK/D.log" \
+grep -q -- "--export=D=" "$WORK/D.log" \
   && ok "D: the refusal prints the exact --export clause to add" || bad "D: the refusal does not print the export line"
+# OWNER-EXPORT-1. The clause this refusal prints is the one an operator COPIES,
+# so it is a submit path like any other: a printed `--export=ALL,...` is how the
+# defect propagates into the next driver. `ALL` may appear in the PROSE that
+# explains why it is banned, but never inside an `--export=` clause.
+if grep -oE -- '--export=[^ "]*' "$WORK/D.log" | grep -q 'ALL'; then
+  bad "D: the printed --export clause still carries ALL -- that clause is what held 6013350/6013351/6014485/5841188"
+else
+  ok "D: the printed --export clause carries NO ALL (OWNER-EXPORT-1)"
+fi
+for v in D= TAG= RJ= DRY_RUN= PATH= HOME=; do
+  grep -oE -- '--export=[^ "]*' "$WORK/D.log" | grep -q -- "$v" \
+    && ok "D: the printed clause names $v" || bad "D: the printed clause omits $v -- an owner submitted from it runs with half its contract"
+done
 grep -qi "set D to the harness directory" "$WORK/D.log" \
   && bad "D: refused with a bash parameter-expansion error" || ok "D: refused with a message, not a bash error"
 

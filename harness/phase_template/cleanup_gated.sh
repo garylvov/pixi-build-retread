@@ -94,7 +94,7 @@
 #   usage: env -u SLURM_JOB_ID sbatch --partition=batch --qos=normal \
 #            --cpus-per-task=1 --mem=4G --time=16:00:00 \
 #            --dependency=afterany:<relock job>:<cert job> \
-#            --export=ALL,D=<harness dir>,TAG=<tag>,RJ=<relock job> \
+#            --export=D=<harness dir>,TAG=<tag>,RJ=<relock job>,DRY_RUN=0,PATH=$PATH,HOME=$HOME \
 #            --wrap 'bash <this file> <root> [<root> ...]'
 #
 #   Since 2026-09-05 the three variables are DERIVED from the root arguments
@@ -205,7 +205,8 @@ derive_harness_dir() {
     if [ "$n" -gt 1 ]; then
       echo "### AMBIGUOUS D: $n directories under $T hold $tag-$rj* -- naming NONE of them:" >&2
       printf '%s\n' "$hits" | sed 's|/artifacts$||; s|^|###   candidate: |' >&2
-      echo "###   Pick one and pass it: --export=ALL,D=<harness dir>,TAG=$tag,RJ=$rj" >&2
+      echo "###   Pick one and pass it: --export=D=<harness dir>,TAG=$tag,RJ=$rj,DRY_RUN=0,PATH=\$PATH,HOME=\$HOME" >&2
+      echo "###   NO \`ALL\` in that clause -- OWNER-EXPORT-1: \`--export=ALL,...\` held 6013350/6013351/6014485/5841188." >&2
     fi
     return 1
   fi
@@ -228,7 +229,11 @@ if [ -z "${D:-}" ] || [ -z "${TAG:-}" ] || [ -z "${RJ:-}" ]; then
   echo "###   D='${D:-<unset>}' TAG='${TAG:-<unset>}' RJ='${RJ:-<unset>}'"
   echo "###   Roots given: $*"
   echo "###   Add this to the sbatch line and resubmit (fill in what is <unset>):"
-  echo "###     --export=ALL,D=<harness dir>,TAG=${TAG:-<tag>},RJ=${RJ:-<relock job>}"
+  echo "###     --export=D=<harness dir>,TAG=${TAG:-<tag>},RJ=${RJ:-<relock job>},DRY_RUN=0,PATH=\$PATH,HOME=\$HOME"
+  echo "###   NO \`ALL\` in that clause. \`--export=ALL,...\` makes Slurm retrieve the submitter's"
+  echo "###   environment on the target node, and a failed retrieval HOLDS the job instead of"
+  echo "###   refusing it: 6013350, 6013351, 6014485 and 5841188 all sat in \`user env retrieval"
+  echo "###   failed requeued held\` (OWNER-EXPORT-1 / REAP-3). tools/owner_export.sh is the producer."
   echo "###   D is the directory whose artifacts/ already holds ${TAG:-<tag>}-${RJ:-<job>}*.rc/.wall/.lock.log."
   exit 2
 fi

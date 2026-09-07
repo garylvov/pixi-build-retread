@@ -401,9 +401,32 @@ cleanup_submit_or_defer () {   # $1=dependency spec  $2..=roots
     echo "###   touching cleanup_gated.sh or cleanup.sh will refuse rc 6 until this owner"
     echo "###   FINISHES. Said out loud rather than left for the next lane to discover."
   fi
+  # OWNER-EXPORT-1 (REAP-3 finding 3). The owner is submitted with an EXPLICIT
+  # export list and never with `ALL`: `--export=ALL,D=...` makes Slurm retrieve
+  # the submitter's environment on the target node, and a retrieval failure does
+  # not refuse the job, it HOLDS it -- `user env retrieval failed requeued held`,
+  # the state 6013350/6013351/6014485/5841188 sat in (5841188 since 09-05). One
+  # producer, tools/owner_export.sh, shared with the owner's own continuation.
+  local OEX=$(dirname -- "$0")/../tools/owner_export.sh
+  [ -f "$OEX" ] || OEX=$(dirname -- "$0")/owner_export.sh
+  [ -f "$OEX" ] || OEX=${T:-/nonexistent}/tools/owner_export.sh
+  local EXPCL=
+  if [ -f "$OEX" ]; then
+    # shellcheck disable=SC1090
+    . "$OEX"
+    EXPCL=$(owner_export_clause) || {
+      echo "### CLEANUP OWNER: NOBODY -- the --export clause could not be built (rows above); roots left on disk:"
+      echo "    $*"
+      return 1; }
+  else
+    echo "### CLEANUP OWNER: no tools/owner_export.sh next to this cert -- submitting with NO"
+    echo "###   --export at all, which is the safe half of OWNER-EXPORT-1 (HARNESS-CONSOL-8's"
+    echo "###   owner 6016297 ran that way). D/TAG/RJ will be DERIVED by the gate from the root"
+    echo "###   basenames; if that derivation cannot run, the gate refuses and says so."
+  fi
   # shellcheck disable=SC2086
   clj=$(env -u SLURM_JOB_ID sbatch --parsable $CLEANUP_SBATCH_ARGS \
-        --job-name=${TAG}-cleanup --dependency=$dep \
+        --job-name=${TAG}-cleanup --dependency=$dep ${EXPCL:+"$EXPCL"} \
         --output=$A/slurm-cleanup-%j.out "$SUBMIT" "$@" 2>&1); clrc=$?
   if [ "$clrc" = 0 ]; then
     echo "### CLEANUP OWNER: job $clj (submitted by this cert job ${J:-?}; no cleanup was recorded at dispatch) -- roots: $*"
@@ -411,7 +434,7 @@ cleanup_submit_or_defer () {   # $1=dependency spec  $2..=roots
   else
     echo "### CLEANUP OWNER: NOBODY -- submit failed rc=$clrc output: $clj"
     echo "### RUN THIS BY HAND, it is the only thing that returns the inodes:"
-    echo "    env -u SLURM_JOB_ID sbatch $CLEANUP_SBATCH_ARGS --job-name=${TAG}-cleanup $SUBMIT $*"
+    echo "    env -u SLURM_JOB_ID sbatch $CLEANUP_SBATCH_ARGS --job-name=${TAG}-cleanup ${EXPCL:-} $SUBMIT $*"
   fi
   return 0
 }

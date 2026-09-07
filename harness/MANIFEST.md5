@@ -24,7 +24,7 @@ a2deab8ba099cc7a3055dc5e4f74da50  instrumented/p6b_stamp.py
 5c116bc032f62e38e1a822b44284ef06  manifests/a3b/isaaclab-2.3x-pack.pixi.toml.a3b2only.diff
 cc3a5b8dbd993448f33cc6c0329df768  manifests/a3b/README.md
 03371cea0ea723097df37b30258b7734  phase_template/census_collation_guard.sh
-7f80a45c6abd3871537d043b418bfce9  phase_template/cleanup_gated.sh
+6f9c2b902062e3fd464e3e0f1c05d128  phase_template/cleanup_gated.sh
 3f2101c6bd74757a12ba1de7e97aac5b  phase_template/cleanup_lock_evidence_guard.sh
 e893ee7f20e181181bb8205ab7edda0c  phase_template/cleanup_owner_guard.sh
 09fdce106012fa133ef2650ae7002ed5  phase_template/cleanup_wall_guard.sh
@@ -34,12 +34,12 @@ e893ee7f20e181181bb8205ab7edda0c  phase_template/cleanup_owner_guard.sh
 7a1fc4ce6b54ac46828fed8f7906f252  phase_template/lane_wrapper.sbatch
 a2515c75fe18f95fda20b4d8156728ea  phase_template/leftover_check_guard.sh
 180ae6dbf5d68f70a92eefb3619d056f  phase_template/link_mode_guard.sh
-b3b4572f3bfc5b3db39f472ec4b91bc4  phase_template/phaseN_cert.sh
+e8e04e6bef93261dbd2035ecd9a19d13  phase_template/phaseN_cert.sh
 e5016970e636d94b53d6784ff7719109  phase_template/phaseN_relock.sh
 6cbcbe998e44568d0ee8ee82fb11d1f5  phase_template/quarantine_collision_guard.sh
-3d616350a0e0f66c37e957e6a5fad750  phase_template/owner_snapshot.sh
+e0cc522d13b187bc59c4a9b3eb60d506  phase_template/owner_snapshot.sh
 aa0c70855063565f693aea5141ab146d  phase_template/owner_snapshot_provenance_guard.sh
-55f5a1b5d12a8f3ed0f1a36c3ca3eef6  phase_template/README.md
+9881f8f38d65bbd0d12f0509db780559  phase_template/README.md
 e3ae2fe962354985617f5d6fa77f5a50  phase_template/store_census_snapshot_guard.sh
 a465cea86edc07ad5adf9f96b1ebac9e  phase_template/wedge_triage_guard.sh
 c26805a4a64f89749fe352bf5aaa8381  phase_template/wedge_triage.sh
@@ -55,7 +55,7 @@ f60ea7f2564d383ef1d45d13d0cb2232  tools/b2_attribute.sh
 7da335e3f761e8682d04f2ac424ea947  tools/binsnap_fixset.txt
 338c5d78067aa05577ed082dea895211  tools/channel_mirror_server.py
 5512b11e97cd17230207302f5de4341e  tools/cleanup_absent_root_guard.sh
-d46e02ed51852f281f89d4d98184e0f4  tools/cleanup_gate_env_derivation_guard.sh
+3a7dbb71f6ba9ca5670307bdf1cef4e4  tools/cleanup_gate_env_derivation_guard.sh
 fb1a327dfbcc4456295a4577ffe03d9a  tools/cold_proof_arm_guard.sh
 c56251e11ce8ab1bd8b807c395265fd4  tools/conda_deny_proxy.py
 fa9f15499e48cf716d7537fc286782eb  tools/derived_region_parse_check.sh
@@ -95,6 +95,8 @@ b8e2a0d5ecfbcf0e7a444f13b354a8e6  tools/multiarm_preamble.sh
 5703d740537be994ecbb007272a1fa64  tools/multiarm_store_reap.sh
 cbfb1b91ab68fab2110b94fdae2446ad  tools/mutation_arms_guard.sh
 f7be958f4f868c6d22eca3ef9f382c7d  tools/mutation_arms.sh
+ce7b2d1c8d2fa3d20dec5e43c66e51f8  tools/owner_export.sh
+4a830bd82509b64ccda97b0e35a36a69  tools/owner_export_guard.sh
 1fa8e8023be66e2f6cffbb86905f1b42  tools/p6ad_freeze_guard.sh
 3232909035475da53f3762d6c4dee5ce  tools/p6ad_negctl.sh
 2a59e952d4d6701639eaefffe39e5902  tools/p6ad_PREDICTION.md

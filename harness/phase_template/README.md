@@ -186,7 +186,7 @@ same node with the same manifest and the same binary.
    env -u SLURM_JOB_ID sbatch --partition=batch --qos=normal --cpus-per-task=1 \
        --mem=4G --time=16:00:00 --job-name=<tag>-cleanup \
        --dependency=afterany:<p1 job>:<p2 job> \
-       --export=ALL,D=<T>/<newbatch>,TAG=<tag>,RJ=<p1 job> \
+       --export=D=<T>/<newbatch>,TAG=<tag>,RJ=<p1 job>,DRY_RUN=0,PATH=$PATH,HOME=$HOME \
        --output=<T>/<newbatch>/logs/slurm-cleanup-%j.out \
        <T>/<newbatch>/owner-snapshot/owner.sbatch <cert root> <cache root> <ws root>
    ```
@@ -313,7 +313,7 @@ diagnostician who wants to keep them can hold them by cancelling it.
     env -u SLURM_JOB_ID sbatch --partition=batch --qos=normal \
         --cpus-per-task=1 --mem=4G --time=16:00:00 --job-name=<tag>-cleanup \
         --dependency=afterany:<p1 job>:<p2 job> \
-        --export=ALL,D=<harness dir>,TAG=<tag>,RJ=<p1 job> \
+        --export=D=<harness dir>,TAG=<tag>,RJ=<p1 job>,DRY_RUN=0,PATH=$PATH,HOME=$HOME \
         --output=<T>/<newbatch>/logs/slurm-cleanup-%j.out \
         <harness dir>/owner-snapshot/owner.sbatch <root> ...
 

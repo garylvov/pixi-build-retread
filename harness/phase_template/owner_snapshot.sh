@@ -137,6 +137,22 @@ OWNER_WALL_MAX_S=${OWNER_WALL_MAX_S:-86400}
 # yet, which is the normal case because owners are submitted before arm 1.
 OWNER_ENTRIES_PER_ARM_EST=${OWNER_ENTRIES_PER_ARM_EST:-3600000}
 
+# OWNER-EXPORT-1. The `--export` clause has ONE producer, tools/owner_export.sh,
+# and it is sourced HERE so that `declare -f owner_export_clause` below ships it
+# into the generated owner.sbatch alongside owner_wall_check. Not optional: an
+# owner submitted with `--export=ALL,...` is held by Slurm with
+# `user env retrieval failed requeued held` and nothing in this harness reads
+# that reason, so refusing here is the loud failure law 9 asks for.
+OE=$HERE/../tools/owner_export.sh
+[ -f "$OE" ] || OE=$HERE/owner_export.sh
+[ -f "$OE" ] || {
+  echo "### OWNER SNAPSHOT REFUSED: no owner_export.sh -- the generated owner would have to"
+  echo "###   build its own --export clause, and the last time two sites built that clause"
+  echo "###   four owners sat held for days (REAP-3: 6013350 6013351 6014485 5841188)."
+  exit 2; }
+# shellcheck disable=SC1090
+. "$OE"
+
 # ONE derivation, defined once and SHIPPED into the generated owner.sbatch by
 # `declare -f` below, so the number the submitter derives and the number the
 # owner re-derives cannot drift apart into two implementations.
@@ -194,13 +210,21 @@ owner_wall_check () {            # $@ = the roots this owner was handed
     echo "    env -u SLURM_JOB_ID sbatch --partition=${SLURM_JOB_PARTITION:-batch} --qos=${SLURM_JOB_QOS:-normal} --cpus-per-task=1 --mem=4G --time=$hms $OWNER_SELF $*"
     return 0
   fi
+  # OWNER-EXPORT-1: an EXPLICIT list, never `ALL`. The continuation inherits the
+  # same contract its parent ran under, plus its own bumped counter.
+  local EXPCL
+  EXPCL=$(owner_export_clause "OWNER_CONT_N=$((OWNER_CONT_N + 1))") || {
+    echo "### OWNER WALL CONTINUATION REFUSED: the export clause could not be built (rows above)."
+    echo "###   The remainder has NO owner. RUN THIS BY HAND once the offending value is fixed:"
+    echo "    env -u SLURM_JOB_ID sbatch --partition=${SLURM_JOB_PARTITION:-batch} --qos=${SLURM_JOB_QOS:-normal} --cpus-per-task=1 --mem=4G --time=$hms $OWNER_SELF $*"
+    return 0; }
   cj=$(env -u SLURM_JOB_ID sbatch --parsable \
         --partition="${SLURM_JOB_PARTITION:-batch}" --qos="${SLURM_JOB_QOS:-normal}" \
         --cpus-per-task=1 --mem=4G --time="$hms" \
         --job-name="${SLURM_JOB_NAME:-owner}-cont" \
         --output="$OWNER_OUT_DIR/owner-cont-%j.out" \
         --dependency=afterany:"${SLURM_JOB_ID:-0}" \
-        --export=ALL,OWNER_CONT_N=$((OWNER_CONT_N + 1)) \
+        "$EXPCL" \
         "$OWNER_SELF" "$@" 2>&1); rc=$?
   if [ "$rc" = 0 ]; then
     echo "### OWNER WALL CONTINUATION submitted job=$cj time=$hms after ${SLURM_JOB_ID:-0} -- this pass removes what fits, that one finishes the remainder"
@@ -398,6 +422,11 @@ fi
   echo "OWNER_OUT_DIR=$SNAP"
   echo 'OWNER_CONT_N=${OWNER_CONT_N:-0}'
   echo 'OWNER_CONT_MAX=${OWNER_CONT_MAX:-4}'
+  # OWNER-EXPORT-1: the declared name set travels as a LITERAL beside the
+  # function, so the continuation exports what the submitter declared and not
+  # whatever a later edit of owner_export.sh happens to say.
+  echo "OWNER_EXPORT_VARS='$OWNER_EXPORT_VARS'"
+  declare -f owner_export_clause
   declare -f owner_census owner_wall_derive owner_wall_hms owner_wall_check
   echo 'owner_wall_check "$@"'
   echo "exec bash $SNAP/$FIRST \"\$@\""
