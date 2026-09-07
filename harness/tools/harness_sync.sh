@@ -384,7 +384,8 @@ done < "$SET"
 # `<basename>\t<abs path or ->`, or `?\t-` for a reference it cannot resolve.
 SR=$(dirname -- "$0")/script_refs.sh
 [ -f "$SR" ] || SR=$TASK_DIR/tools/script_refs.sh
-[ -f "$SR" ] || { echo "### SYNC FATAL: no script_refs.sh beside $0 nor at $TASK_DIR/tools -- the read-set check has no parser and a silent install is worse than a refusal" >&2; exit 2; }
+[ -f "$SR" ] || SR=$REPO/harness/tools/script_refs.sh
+[ -f "$SR" ] || { echo "### SYNC FATAL: no script_refs.sh beside $0, at $TASK_DIR/tools, nor at $REPO/harness/tools -- the read-set check has no parser and a silent install is worse than a refusal" >&2; exit 2; }
 # shellcheck disable=SC1090
 . "$SR"
 

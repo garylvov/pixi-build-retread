@@ -137,6 +137,7 @@ mkfixture () {                        # $1 = tag; echoes "<repo> <task> <v1> <v2
   printf '# allow nothing\n' > "$R/harness/tools/harness_drift_allowlist.txt"
   cp -f "$DRIFT" "$R/harness/tools/harness_drift_check.sh"
   cp -f "$SYNC"  "$R/harness/tools/harness_sync.sh"
+  cp -f "$(dirname -- "$SYNC")/script_refs.sh" "$R/harness/tools/script_refs.sh" 2>/dev/null
   git -C "$R" add -A >/dev/null 2>&1
   git -C "$R" commit -q -m v1 >/dev/null 2>&1
   local v1; v1=$(git -C "$R" rev-parse HEAD)
@@ -157,6 +158,7 @@ mkfixture () {                        # $1 = tag; echoes "<repo> <task> <v1> <v2
   git -C "$R" cat-file blob "$v1:harness/arms/an_arm.sh"               > "$T/merge-h/an_arm.sh"
   cp -f "$DRIFT" "$T/tools/harness_drift_check.sh"
   cp -f "$SYNC"  "$T/tools/harness_sync.sh"
+  cp -f "$(dirname -- "$SYNC")/script_refs.sh" "$T/tools/script_refs.sh" 2>/dev/null
   cp -f "$R/harness/tools/harness_drift_allowlist.txt" "$T/tools/harness_drift_allowlist.txt"
   echo "$R $T $v1 $v2"
 }
