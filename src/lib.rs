@@ -36,6 +36,7 @@ pub(crate) mod relax_decision;
 pub mod relaxation_record;
 pub mod repair;
 pub mod repodata;
+pub mod sdist_metadata;
 pub(crate) mod route_probe_cache;
 pub mod rpc;
 pub mod solve;

@@ -1245,6 +1245,25 @@ pub(crate) const HERMETIC_ENVIRONMENT_STORE_SPEC: MarkerStoreSpec = MarkerStoreS
     marker: crate::hermetic_build::COMPLETION_MARKER,
 };
 
+
+/// SDIST-META-2's store. Like the hermetic spec above, every field is READ
+/// FROM `sdist_metadata` rather than re-spelled here: the writer (the
+/// post-lock harvester) and the reader (the scoper's seeder) both derive their
+/// paths from those same constants through `retread sdist-meta-key`, so a
+/// generation bump moves the walk, the writer and the reader together or not
+/// at all.
+///
+/// It is the SIXTH instantiation of one walk, not a sixth reaper: the shape is
+/// `<root>/sdist-metadata/v1/<sdm-sha256>/complete.json`, identical to the
+/// build-requirements and hermetic stores to the segment.
+pub(crate) const SDIST_METADATA_STORE_SPEC: MarkerStoreSpec = MarkerStoreSpec {
+    dir: crate::sdist_metadata::CACHE_NAMESPACE,
+    row: crate::sdist_metadata::STORE_ROW,
+    reap_lock: crate::sdist_metadata::STORE_REAP_LOCK,
+    version: crate::sdist_metadata::CACHE_VERSION,
+    marker: crate::sdist_metadata::COMPLETION_MARKER,
+};
+
 const BUILD_REQUIREMENTS_STORE_DIR: &str = "build-requirements";
 
 /// The `<prefix> reap` / `<prefix> evicted` row stem, so an operator greps one

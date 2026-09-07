@@ -3,8 +3,10 @@
 //! persisting the build-requirements store, whose shape is
 //! `<root>/build-requirements/<version>/<identity>/requirements.txt`; L3-1b-4
 //! took it to FIVE with the hermetic environment store, whose shape is
-//! `<root>/hermetic-build-envs/<version>/env-<sha256>/complete.json` -- the
-//! same shape, so both are reaped by ONE walk, `source_build::reap_marker_store`.
+//! `<root>/hermetic-build-envs/<version>/env-<sha256>/complete.json`; and
+//! SDIST-META-2 took it to SIX with the prepared-sdist-metadata store,
+//! `<root>/sdist-metadata/v1/sdm-<sha256>/complete.json` -- the same shape, so
+//! all three are reaped by ONE walk, `source_build::reap_marker_store`.
 //!
 //! # Why this verb exists (STORE-REAP-1-1, law 2)
 //!
@@ -52,6 +54,13 @@ pub enum Store {
     BuildRequirements,
     /// L3-1b-4.
     HermeticEnvironments,
+    /// SDIST-META-2: the prepared-sdist-metadata store. Its writer is a
+    /// post-lock harvester and its reader is the scoper's seeder — both in the
+    /// harness, because pixi's embedded uv is what produces the metadata — so
+    /// THIS VERB is the store's only in-product reader, and the census the
+    /// cleanup template runs is the only thing that ever looks at the store as
+    /// a whole.
+    SdistMetadata,
 }
 
 impl Store {
@@ -63,6 +72,7 @@ impl Store {
             Store::Shadow => "shadow",
             Store::BuildRequirements => "build-requirements",
             Store::HermeticEnvironments => "hermetic-envs",
+            Store::SdistMetadata => crate::sdist_metadata::CACHE_NAMESPACE,
         }
     }
 
@@ -73,12 +83,15 @@ impl Store {
     /// appends the fifth on the same rule: the merge gate's readers grep
     /// summary rows by position in some places, and a reordering would move
     /// rows that this landing has no reason to move.
-    pub const ALL: [Store; 5] = [
+    /// SDIST-META-2 appends the sixth on the same rule L3-1b-3B and L3-1b-4
+    /// appended the fourth and fifth by: APPEND, NEVER REORDER.
+    pub const ALL: [Store; 6] = [
         Store::BuiltWheels,
         Store::GitSnapshots,
         Store::Shadow,
         Store::BuildRequirements,
         Store::HermeticEnvironments,
+        Store::SdistMetadata,
     ];
 
     fn parse(value: &str) -> Option<Vec<Store>> {
@@ -105,6 +118,7 @@ impl Store {
             Store::HermeticEnvironments => {
                 crate::hermetic_build::HERMETIC_ENVIRONMENT_STORE_DEFAULT_MAX_AGE_DAYS
             }
+            Store::SdistMetadata => crate::sdist_metadata::DEFAULT_MAX_AGE_DAYS,
         }
     }
 }
@@ -166,7 +180,7 @@ pub fn parse_args(args: &[String]) -> anyhow::Result<Args> {
                     anyhow::anyhow!(
                         "store-reap: --store {value}: expected one of \
                          built-wheels, git-snapshots, shadow, \
-                         build-requirements, hermetic-envs, all"
+                         build-requirements, hermetic-envs, sdist-metadata, all"
                     )
                 })?);
             }
@@ -372,6 +386,25 @@ fn reap_one(
         Store::HermeticEnvironments => {
             let report = crate::source_build::reap_marker_store(
                 &crate::source_build::HERMETIC_ENVIRONMENT_STORE_SPEC,
+                root,
+                max_age,
+                mode,
+            )?;
+            outcome.scanned = report.scanned;
+            outcome.selected = report.evicted;
+            outcome.stale_version = report.evicted_stale_version;
+            outcome.kept = report.kept;
+            outcome.skipped_locked = report.skipped_locked;
+            outcome.versions_walked = report.versions_walked;
+            outcome.skipped_concurrent = report.skipped_concurrent;
+            report.entries
+        }
+        // SDIST-META-2. THE SAME WALK AGAIN -- a third spec, not a third
+        // reaper, and the `### sdist_metadata_store` rows it prints are the
+        // census `tools/store_reap_census.sh` picks up with no new call site.
+        Store::SdistMetadata => {
+            let report = crate::source_build::reap_marker_store(
+                &crate::source_build::SDIST_METADATA_STORE_SPEC,
                 root,
                 max_age,
                 mode,
@@ -787,19 +820,19 @@ mod tests {
         assert_eq!(empty.stores, Store::ALL.to_vec());
         assert!(empty.roots.is_empty() && !empty.bytes && empty.max_age_days.is_none());
 
-        // L3-1b-4. `all` is FIVE, and each of the five is reachable by name.
-        // A hard 5 on BOTH counts rather than `Store::ALL.len()` on both sides,
+        // SDIST-META-2. `all` is SIX, and each of the six is reachable by name.
+        // A hard 6 on BOTH counts rather than `Store::ALL.len()` on both sides,
         // which would be an identity and would pass on a list that lost a
         // store. The two hard numbers must be edited together; the first run of
         // this landing's mutation matrix caught exactly that, with BASE red on
         // the second one alone.
-        assert_eq!(Store::ALL.len(), 5, "all five stores are in the fan-out");
+        assert_eq!(Store::ALL.len(), 6, "all six stores are in the fan-out");
         assert_eq!(
             parse_args(&["--store".into(), "all".into()])
                 .expect("all")
                 .stores
                 .len(),
-            5,
+            6,
         );
         for store in Store::ALL {
             assert_eq!(
@@ -1167,6 +1200,115 @@ mod tests {
         );
         assert!(
             root.join("hermetic-build-envs/v8/env-half").is_dir(),
+            "a directory with no completion marker is not an entry"
+        );
+    }
+
+    /// SDIST-META-2's half of the verb, and the CENSUS the store's harness
+    /// halves are audited by. It is the only in-product reader of the
+    /// prepared-sdist-metadata store: the writer is a post-lock harvester and
+    /// the reader is the scoper's seeder, both shell, because pixi's embedded
+    /// uv — not this backend — is what produces the metadata.
+    ///
+    /// The store's shape is asserted through
+    /// `sdist_metadata::{CACHE_NAMESPACE, CACHE_VERSION, COMPLETION_MARKER}`
+    /// rather than by re-spelling the segments, so a generation bump in the
+    /// module moves the fixture with the walk instead of leaving this test
+    /// green over a store nothing addresses.
+    #[test]
+    fn the_sdist_metadata_store_is_reached_by_name_and_by_store_all() {
+        use crate::sdist_metadata as sdm;
+
+        assert_eq!(
+            Store::parse(sdm::CACHE_NAMESPACE),
+            Some(vec![Store::SdistMetadata]),
+            "the spelling the census and an operator both type"
+        );
+        assert!(
+            Store::ALL.contains(&Store::SdistMetadata),
+            "`--store all` must fan out to the sdist-metadata store"
+        );
+        for previous in [
+            Store::BuiltWheels,
+            Store::GitSnapshots,
+            Store::Shadow,
+            Store::BuildRequirements,
+            Store::HermeticEnvironments,
+        ] {
+            assert!(
+                Store::ALL.contains(&previous),
+                "appending the sixth store displaced {}",
+                previous.as_str()
+            );
+        }
+        assert_eq!(
+            resolved_max_age_days(Store::SdistMetadata, None),
+            sdm::DEFAULT_MAX_AGE_DAYS,
+            "the horizon is the store's own constant, not a copy of 14 here"
+        );
+
+        let root = scratch("sdistmeta");
+        let dir = sdm::CACHE_NAMESPACE;
+        let marker = sdm::COMPLETION_MARKER;
+        marker_store_entry(&root, dir, sdm::CACHE_VERSION, "sdm-cur", marker, 30);
+        marker_store_entry(&root, dir, "v0", "sdm-old", marker, 30);
+        marker_store_entry(&root, dir, sdm::CACHE_VERSION, "sdm-fresh", marker, 1);
+        // A half-published entry: the payload landed, the marker did not. It is
+        // NOT an entry, which is the property the harvester's marker-last write
+        // order depends on.
+        std::fs::create_dir_all(root.join(dir).join(sdm::CACHE_VERSION).join("sdm-half"))
+            .expect("half-published");
+        std::fs::write(
+            root.join(dir)
+                .join(sdm::CACHE_VERSION)
+                .join("sdm-half")
+                .join(sdm::METADATA_FILE),
+            b"partial",
+        )
+        .expect("payload");
+        let before = tree(&root);
+
+        let dry = dry_run(&root, Store::SdistMetadata);
+        assert_eq!(
+            (
+                dry.scanned,
+                dry.selected,
+                dry.stale_version,
+                dry.versions_walked
+            ),
+            (3, 2, 1, 2),
+            "the sdist-metadata store is walked by the same rules across both generations"
+        );
+        assert_eq!(tree(&root), before, "a dry run creates nothing");
+
+        // Non-vacuity, through the fan-out the census actually runs.
+        let mut selected_by_all = 0;
+        for store in Store::ALL {
+            selected_by_all += reap_one(&root, store, 14, ReapMode::Apply, true)
+                .unwrap_or_else(|error| panic!("{} reap: {error:#}", store.as_str()))
+                .selected;
+        }
+        assert_eq!(
+            selected_by_all, 2,
+            "`all` must reach the sdist-metadata entries and nothing else in this fixture"
+        );
+        assert!(
+            root.join(dir).join("quarantine").is_dir(),
+            "an eviction RENAMES into quarantine; it never deletes"
+        );
+        assert!(
+            root.join(dir)
+                .join(sdm::CACHE_VERSION)
+                .join("sdm-fresh")
+                .join(marker)
+                .is_file(),
+            "the fresh entry is untouched"
+        );
+        assert!(
+            root.join(dir)
+                .join(sdm::CACHE_VERSION)
+                .join("sdm-half")
+                .is_dir(),
             "a directory with no completion marker is not an entry"
         );
     }

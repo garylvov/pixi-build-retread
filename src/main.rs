@@ -125,7 +125,7 @@ async fn async_main() -> anyhow::Result<()> {
     }
 
     // `retread store-reap
-    //      [--store built-wheels|git-snapshots|shadow|build-requirements|hermetic-envs|all]
+    //      [--store built-wheels|git-snapshots|shadow|build-requirements|hermetic-envs|sdist-metadata|all]
     //      [--root <dir>]... [--dry-run|--apply]
     //      [--max-age-days <n>] [--bytes]`
     //
@@ -142,6 +142,29 @@ async fn async_main() -> anyhow::Result<()> {
     if matches!(argv.get(1).map(String::as_str), Some("store-reap")) {
         let args = pixi_build_retread::store_reap::parse_args(&argv[2..])?;
         let code = pixi_build_retread::store_reap::run(&args)?;
+        std::process::exit(code);
+    }
+
+    // `retread sdist-meta-key --sdist-sha256 <hex> --uv-version <s>
+    //      --python-tag <s> --backend <s> --pythonhashseed <s>
+    //      [--store-root <dir>]`
+    //
+    // SDIST-META-2, and it exists for the same reason `repodata-universe`
+    // does: the prepared-sdist-metadata store has TWO halves in the harness --
+    // the post-lock harvester that writes an entry and the scoper's seeder that
+    // reads one -- and if each folded its own `sha256sum` the two would
+    // eventually disagree, at which point the store would read as permanently
+    // COLD rather than as broken. This verb is the one derivation both call,
+    // and it prints the entry path as well as the key so neither half joins the
+    // store's path segments itself either.
+    //
+    // Every input is an ARGUMENT. The seeder derives the key for the arm it is
+    // about to scope, standing outside that build, so reading the current
+    // process's environment would be the wrong answer as well as the wrong
+    // shape.
+    if matches!(argv.get(1).map(String::as_str), Some("sdist-meta-key")) {
+        let args = pixi_build_retread::sdist_metadata::parse_args(&argv[2..])?;
+        let code = pixi_build_retread::sdist_metadata::run(&args)?;
         std::process::exit(code);
     }
 
