@@ -1128,6 +1128,15 @@ runsync "$RN" "$TN" "$WORK/N1_squeue" "$V2N" --running-list "$WORK/N1_run.txt" >
 grep -q '^### PIN MISMATCH tolerated jid=9000001 reason=reads-only-job-root' "$WORK/N1.log" \
   && ok "N(n1): and it SAYS SO on a named row -- tolerated jid=9000001 reason=reads-only-job-root, never in silence" \
   || { bad "N(n1): no 'PIN MISMATCH tolerated jid=9000001 reason=reads-only-job-root' row"; sed 's/^/      /' "$WORK/N1.log"; }
+# THE WHOLE ROW, FIELD BY FIELD, because a row whose sha field is malformed is a
+# row no reader can parse -- and the first production run of this refinement
+# printed exactly that: `pinned=pinned=8108ca4...`, the `pinned=` prefix applied
+# twice because $REFUSALS field 4 already carries it. The arm above matched a
+# PREFIX and sailed straight past it, which is how a field defect survives a
+# guard. Asserted whole now.
+grep -qE "^### PIN MISMATCH tolerated jid=9000001 reason=reads-only-job-root name=lane1-relock pin=$TN/lane1/HARNESS_COMMIT pinned=$V1N\$" "$WORK/N1.log" \
+  && ok "N(n1): and the WHOLE row parses -- name=, pin= and a single well-formed pinned=<sha> naming $V1N" \
+  || { bad "N(n1): the tolerated row's fields are malformed"; grep 'PIN MISMATCH tolerated' "$WORK/N1.log" | sed 's/^/      /'; }
 grep -q 'SYNC REFUSED (rc 4)' "$WORK/N1.log" \
   && { bad "N(n1): it printed the rc-4 refusal anyway"; sed 's/^/      /' "$WORK/N1.log"; } \
   || ok "N(n1): and no rc-4 refusal is printed for it"

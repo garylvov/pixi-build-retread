@@ -627,7 +627,13 @@ while read -r r_jid r_jname r_pinfile r_pinned; do
   fi
   r_why=read-set-disjoint
   [ "$r_det" = yes ] && r_why=reads-only-job-root
-  printf '### PIN MISMATCH tolerated jid=%s reason=%s name=%s pin=%s pinned=%s\n' \
+  # `$r_pinned` is field 4 of a $REFUSALS row and ALREADY reads `pinned=<sha>`
+  # (see the printf that writes $REFUSALS).  Prefixing it again printed
+  # `pinned=pinned=8108ca4...` on the first production run of this refinement,
+  # 2026-09-07 -- harmless to a human, poison to any reader that parses the
+  # field, which is the whole point of putting the sha on the row.  Interpolated
+  # bare, and the guard now asserts the field EXACTLY.
+  printf '### PIN MISMATCH tolerated jid=%s reason=%s name=%s pin=%s %s\n' \
     "$r_jid" "$r_why" "$r_jname" "$r_pinfile" "$r_pinned" >> "$REF_TOL"
 done < "$REFUSALS"
 rc4_verdict
