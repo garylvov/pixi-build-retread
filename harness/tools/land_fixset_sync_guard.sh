@@ -36,6 +36,13 @@
 #      landing must not bury an existing drift under a new row.
 #   E  an uncommitted edit to the versioned copy -> REFUSE. A path-limited commit
 #      would otherwise sweep another lane's work into a merge-queue commit.
+#   J  HARNESS-SYNC-3-1: the sync refuses rc 6 (a RUNNING job of ours can still
+#      READ a file this install would rename over) -> the landing FATALs AND
+#      SAYS SO AS rc 6: it re-prints harness_sync's own `### SYNC REFUSED` rows
+#      from the file it captured, names the refusing job id in the actuator, and
+#      does NOT repeat the rc-4 "a PENDING job is pinned elsewhere" story. J2 is
+#      the mutation: with the tagged rc-6 lines cut out the same fixture leaves
+#      every one of those assertions RED.
 #
 # THE MUTATION IS PINNED TO A COMMIT CONSTANT, NEVER `HEAD`: an arm that reads
 # `HEAD:<the file it guards>` starts asserting the fix against itself the moment
@@ -292,6 +299,109 @@ if [ -s "$WORK/helper_old.sh" ]; then
   fi
 else
   bad "H2: no pinned pre-fix helper blob ($HELPER_OLD) -- MUTATION ARM DID NOT RUN"
+fi
+
+# ---- ARM J: HARNESS-SYNC-3-1 -- an rc-6 refusal must be EXPLAINED AS rc 6 ----
+# THE DEFECT. `harness_sync.sh` grew a PRE-INSTALL refusal (rc 6: a RUNNING job
+# of ours can still READ, by path, a file this sync would rename over, and a
+# cross-NFS-client rename truncates that reader and turns its exit into 0).
+# The landing path picked the refusal up for free -- `fixset_land_row.sh` treats
+# any non-zero from the sync as `### FIXSET FATAL` -- but the FATAL block's
+# explanation named ONLY rc 4, so a lander who hit rc 6 was told a PENDING job
+# was pinned elsewhere (false) and never saw the actuator. rc 6 had a producer
+# and a consumer; what it lacked was a consumer that could EXPLAIN it.
+#
+# THE SHIM. Nothing here submits a job or waits for one. The helper resolves
+# `$TASK/tools/harness_sync.sh` FIRST, so a fixture task dir carrying a
+# two-line stand-in that prints one real-shaped refusal row and exits 6 presents
+# the landing with exactly the condition, deterministically. `--running-list`
+# (harness_sync's own test-only flag) is the equivalent one level down; here the
+# thing under test is the MESSAGE, so the sync itself is the part to stub.
+#
+# J1 is the fix. J2 is the MUTATION -- the same fixture run against a copy of
+# the helper with the rc-6 lines cut out (they carry an `RC6-MSG` tag for
+# exactly this) must go RED on every one of J1's message assertions, or J1
+# cannot fail and is worthless.
+mkshim () {   # mkshim <taskdir>  -- a harness_sync.sh that refuses rc 6
+  cat > "$1/tools/harness_sync.sh" <<'SHIM'
+#!/usr/bin/env bash
+echo "### SYNC REFUSED rc=6 running=999999 file=x.sh reason=read-by-fixture-job"
+echo "### SYNC REFUSED (rc 6). The job(s) above are RUNNING ON ANOTHER NFS CLIENT."
+exit 6
+SHIM
+  chmod 755 "$1/tools/harness_sync.sh"
+}
+rc6_msgcheck () {   # rc6_msgcheck <log> -- echoes "<named> <actuator> <rows>", 1 = present
+  local L=$1 a=0 b=0 c=0
+  grep -q 'rc 6 means a RUNNING job of ours is still READING' "$L" && a=1
+  grep -q 'ACTUATOR: wait for job(s) 999999' "$L" && b=1
+  grep -q 'from harness_sync: ### SYNC REFUSED rc=6 running=999999 file=x.sh' "$L" && c=1
+  echo "$a $b $c"
+}
+
+read -r RJ TJ < <(mkfixture J)
+JBASE=$(md5sum "$TJ/tools/binsnap_fixset.txt" | awk '{print $1}')
+mkshim "$TJ"
+bash "$HELPER" "$RJ" "$TJ" "$ROW1" > "$WORK/J.log" 2>&1; rcJ=$?
+read -r JA JB JC < <(rc6_msgcheck "$WORK/J.log")
+[ "$rcJ" = 3 ] && ok "J1: a landing over an rc-6 refusal FATALs (rc=3), it does not proceed" \
+  || { bad "J1: rc=$rcJ, want 3"; sed 's/^/      /' "$WORK/J.log"; }
+grep -q '### FIXSET FATAL: harness_sync.sh .* exited 6' "$WORK/J.log" \
+  && ok "J1: the FATAL line names the sync's own rc 6" || bad "J1: the FATAL line does not name rc 6"
+[ "$JA" = 1 ] && ok "J1: it says rc 6 = a RUNNING job of ours is still READING an installed file" \
+  || bad "J1: the FATAL text never explains what rc 6 MEANS"
+[ "$JB" = 1 ] && ok "J1: it prints the ACTUATOR and QUOTES the refusing job id 999999" \
+  || bad "J1: the actuator is missing or does not name the job from the refusal row"
+[ "$JC" = 1 ] && ok "J1: it re-prints harness_sync's own SYNC REFUSED row from the captured file" \
+  || bad "J1: the refusal rows are not re-printed under the FATAL"
+grep -q 'rc 4 means a PENDING job' "$WORK/J.log" \
+  && bad "J1: an rc-6 refusal is STILL explained as rc 4 -- the defect is not fixed" \
+  || ok "J1: the rc-4 explanation is NOT printed for an rc-6 refusal"
+[ -f "$TJ/.fixset_land_sync.out" ] && grep -q '### SYNC REFUSED rc=6' "$TJ/.fixset_land_sync.out" \
+  && ok "J1: the sync's output was CAPTURED to the job root, not only streamed" \
+  || bad "J1: no captured sync output at $TJ/.fixset_land_sync.out"
+[ "$(md5sum "$TJ/tools/binsnap_fixset.txt" | awk '{print $1}')" = "$JBASE" ] \
+  && ok "J1: the refusal INSTALLED NOTHING -- the task fix set is still its pre-landing bytes" \
+  || bad "J1: the task copy was written despite the refusal"
+[ ! -f "$TJ/tools/.harness_synced_commit" ] \
+  && ok "J1: no .harness_synced_commit was recorded, so no job is told a false HARNESS_COMMIT" \
+  || bad "J1: a sync commit was recorded even though the sync refused"
+# The row IS committed before the sync runs -- that ordering is the helper's own
+# design ("a refusal here is a refusal with nothing moved EXCEPT the harness
+# commit", which is idempotent on re-run). Asserted, not assumed, so a future
+# reorder is caught here rather than in a landing.
+[ -n "$(git -C "$RJ" log --oneline -1 --format=%H)" ] && git -C "$RJ" show --stat --oneline HEAD | grep -q 'binsnap_fixset.txt' \
+  && ok "J1: the fix-set row is committed BEFORE the sync (idempotent re-run), as the helper documents" \
+  || bad "J1: the commit ordering changed -- the FATAL text's 'nothing moved except the harness commit' is now false"
+# COMMENT- AND echo-STRIPPED, for the reason arm B strips prose from land.sh and
+# H1 strips comments from the helper: the fix DOCUMENTS `--force --reason` as the
+# operator's actuator and PRINTS it as advice, so a naive grep over the whole
+# file would match the very advice it wants and assert the opposite of the truth.
+# What must not exist is an EXECUTED `--force`.
+grep -vE "^[[:space:]]*#" "$HELPER" | grep -vE "^[[:space:]]*echo " | grep -q -- '--force' \
+  && bad "J1: the helper itself passes --force to the sync -- an unattended override of a read-set refusal" \
+  || ok "J1: the helper NEVER forces the sync itself (--force appears only in comments and printed advice)"
+grep -c 'rc 4 means a PENDING job of ours is pinned' "$HELPER" | grep -qx 1 \
+  && ok "J1: the rc-4 explanation is still in the helper, unchanged" \
+  || bad "J1: the rc-4 explanation was lost while adding rc 6"
+
+# ---- ARM J2: THE MUTATION ----------------------------------------------------
+grep -v 'RC6-MSG' "$HELPER" > "$WORK/helper_norc6.sh"
+CUT=$(( $(grep -c '' "$HELPER") - $(grep -c '' "$WORK/helper_norc6.sh") ))
+[ "$CUT" -gt 0 ] && ok "J2: the mutation really removes the rc-6 message ($CUT tagged lines cut)" \
+  || bad "J2: the RC6-MSG tag matched nothing -- THE MUTATION DID NOT RUN"
+if bash -n "$WORK/helper_norc6.sh" 2>/dev/null; then
+  read -r RK TK < <(mkfixture K)
+  mkshim "$TK"
+  bash "$WORK/helper_norc6.sh" "$RK" "$TK" "$ROW1" > "$WORK/K.log" 2>&1; rcK=$?
+  read -r KA KB KC < <(rc6_msgcheck "$WORK/K.log")
+  [ "$rcK" = 3 ] && ok "J2: the mutant still FATALs (rc=3), so the ONLY difference is the message" \
+    || bad "J2: the mutant exited $rcK, not 3 -- the cut changed more than the message"
+  [ "$KA$KB$KC" = "000" ] \
+    && ok "J2: with the rc-6 text cut, ALL THREE of J1's message assertions go RED (named=$KA actuator=$KB rows=$KC)" \
+    || bad "J2: the mutant still satisfies J1 (named=$KA actuator=$KB rows=$KC) -- J1 cannot fail and is worthless"
+else
+  bad "J2: the mutant does not parse -- MUTATION ARM DID NOT RUN"
 fi
 echo "### land_fixset_sync_guard: pass=$pass fail=$fail"
 [ "$fail" -eq 0 ] || exit 1

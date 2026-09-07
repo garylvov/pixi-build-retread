@@ -48,6 +48,13 @@
 #   rc 2  REFUSED before touching anything (bad arguments, missing file, the two
 #         copies already diverged, or an uncommitted edit to the versioned copy)
 #   rc 3  the commit or the re-extraction failed -- the repo copy is restored
+#   rc 3  ALSO: harness_sync.sh refused, so the task copies were NOT advanced.
+#         Its rc is printed and EXPLAINED -- rc 4 a PENDING job pinned to another
+#         commit, rc 6 a RUNNING job of ours still READING a file this install
+#         would rename over (HARNESS-SYNC-3-1). The sync's own rows are captured
+#         to `<task>/.fixset_land_sync.out` and re-printed under the FATAL. This
+#         script NEVER passes --force; overriding a read-set refusal is a
+#         deliberate, hand-proved act, never an unattended landing's.
 #
 # Reader: land_fixset_sync_guard.sh, which lands a row into a THROWAWAY fixture
 # repo and asserts the two copies are byte-identical afterwards, and replays the
@@ -165,11 +172,40 @@ fi
 SYNC=$TASK/tools/harness_sync.sh
 [ -f "$SYNC" ] || SYNC=$REPO/harness/tools/harness_sync.sh
 [ -f "$SYNC" ] || { echo "### FIXSET FATAL: no harness_sync.sh at $TASK/tools or $REPO/harness/tools"; exit 3; }
-if ! HARNESS_TASK_DIR="$TASK" HARNESS_REPO="$REPO" bash "$SYNC" "$HC"; then
-  src=$?
+# HARNESS-SYNC-3-1. The sync's own rows are CAPTURED, not just streamed, because
+# the refusal this block has to explain is a per-file row printed BEFORE the
+# summary -- and a landing is unattended, so "it was on stdout somewhere" is not
+# a reader. `tee` into the job root keeps them on stdout AND on disk; the rows
+# are then re-read from that file with `grep`, never `tail`, because the rows
+# that matter are at the TOP of a refusal and a tail would cut exactly them.
+SYNCLOG=$TASK/.fixset_land_sync.out
+HARNESS_TASK_DIR="$TASK" HARNESS_REPO="$REPO" bash "$SYNC" "$HC" 2>&1 | tee "$SYNCLOG"
+src=${PIPESTATUS[0]}
+if [ "$src" != 0 ]; then
   echo "### FIXSET FATAL: harness_sync.sh $HC exited $src -- the task copies were NOT advanced to this landing's commit."
-  echo "###   rc 4 means a PENDING job of ours is pinned to a different commit and this sync would strand it;"
-  echo "###   let it start or drain, then re-run the landing (the fix-set row is idempotent)."
+  echo "###   the sync's own rows are captured at $SYNCLOG"
+  case "$src" in
+    4)
+      echo "###   rc 4 means a PENDING job of ours is pinned to a different commit and this sync would strand it;"
+      echo "###   let it start or drain, then re-run the landing (the fix-set row is idempotent)."
+      ;;
+    6)
+      RJIDS=$(sed -n 's/.*### SYNC REFUSED rc=6 running=\([0-9][0-9]*\).*/\1/p' "$SYNCLOG" | sort -u | tr '\n' ' ')   # RC6-MSG
+      grep -F -- '### SYNC REFUSED' "$SYNCLOG" | sed 's/^/###   from harness_sync: /'                                 # RC6-MSG
+      echo "###   rc 6 means a RUNNING job of ours is still READING a file this sync would install."                   # RC6-MSG
+      echo "###   The install is a rename from THIS node; the reader is on another NFS client, so its inode"           # RC6-MSG
+      echo "###   is unlinked under it, bash reads an error, calls it EOF, and that job exits 0 half-run."             # RC6-MSG
+      echo "###   ACTUATOR: wait for job(s) ${RJIDS:-<none named -- read the rows above>} to finish and re-run"        # RC6-MSG
+      echo "###   the landing (the fix-set row is idempotent); or, ONLY after proving by hand that the install"        # RC6-MSG
+      echo "###   set and that job's read set are disjoint, re-run the sync with --force --reason \"<why>\"."          # RC6-MSG
+      echo "###   THIS SCRIPT NEVER FORCES ON ITS OWN: a landing that overrides a read-set refusal unattended"         # RC6-MSG
+      echo "###   is the truncation this refusal exists to prevent."                                                   # RC6-MSG
+      ;;
+    *)
+      echo "###   rc $src is neither 4 (a PENDING job pinned elsewhere) nor 6 (a RUNNING job reading an"
+      echo "###   installed file) -- read the captured rows at $SYNCLOG before re-running anything."
+      ;;
+  esac
   exit 3
 fi
 if ! cmp "$RPATH" "$TPATH"; then
