@@ -60,10 +60,17 @@
 #     5992050 ws.DET1F-5989192    842018 /  4104s = 205 entries/s
 #     5999937 certDET1F-5992569  3587597 / 17507s = 205 entries/s
 #     6001240 certD141-6001140   2583379 / 12050s = 214 entries/s
-# Stable to within 5% across jobs, nodes and roots, which is what makes it a
-# planning constant rather than an observation. OWNER_UNLINK_RATE_PER_S is set
-# BELOW the slowest measured row on purpose: a wall derived from an optimistic
-# rate is the defect this file exists to remove.
+#     6017160 certD16-6013332      44354 /   211s = 210 entries/s  (CLEANUP-WALL-2,
+#       REAP-3: a 44 k root, two orders of magnitude smaller than the others, and
+#       it lands in the SAME band -- which is the strongest evidence yet that this
+#       is a per-entry cost and not a per-root one)
+# Stable to within 5% across jobs, nodes and roots and across two orders of
+# magnitude of root size, which is what makes it a planning constant rather than
+# an observation. RE-CHECKED 2026-09-07 against that fifth row: the floor of 200
+# still sits below every measurement (205 is the slowest) and is NOT raised --
+# this term buys wall, so it must under-estimate the rate, never over-estimate
+# it, and a wall derived from an optimistic rate is the defect this file exists
+# to remove. It is lowered the day a slower row is measured, and only then.
 #
 # THE CENSUS COUNTS TOWARD THE WALL. cleanup.sh walks each root with
 # `find "$r" | wc -l` and prints `### removing $r (entries=$N)` BEFORE it
@@ -136,6 +143,28 @@ OWNER_WALL_MAX_S=${OWNER_WALL_MAX_S:-86400}
 # entries (job 5999937), rounded up. Used ONLY for a root that does not exist
 # yet, which is the normal case because owners are submitted before arm 1.
 OWNER_ENTRIES_PER_ARM_EST=${OWNER_ENTRIES_PER_ARM_EST:-3600000}
+# CLEANUP-WALL-2 (2026-09-07, REAP-3 finding 2). THE CENSUS AND THE THING IT
+# SIZES WERE WALKING DIFFERENT TREES. This census used `find "$r" -maxdepth 16`
+# while the work it sizes -- cleanup.sh's `N=$(find "$r" | wc -l)` and the
+# `rm -rf` behind it -- is UNBOUNDED, so every entry deeper than 16 was invisible
+# to the wall and free to the reaper. Two measured disagreements from ONE reap
+# (job 6017160, root certD16-6013332, a static tree, the two walks six minutes
+# apart): owner_snapshot's `entries=44040` against cleanup.sh's `entries=44354`,
+# and on the earlier root `423482` against `434860`. The cause is not a race, it
+# is the depth: the smoke's `cp -al` mirror nests worktrees inside worktrees, and
+# the SETUP-REFUSED branch on that same job refused at depth 8 naming
+# `certD16-6013332/smk/w/.claude/worktrees/agent-ab947ce3406deed7e/assets/cad/
+# H1_2_wrist_no_camera.STL`. A census that under-counts buys a wall that is too
+# short, which is the exact failure mode (det1f-cleanup 5999937, TIMEOUT with a
+# root half gone) this whole file exists to remove.
+#
+# THE FIX IS TO WALK WHAT THE REAPER WALKS. The census is now unbounded, the same
+# `find "$r"` cleanup.sh runs. The old bounded count is still taken FOR ONE
+# RELEASE and printed beside it whenever the two differ, so the size of the blind
+# spot is on the record rather than in a lane's memory; set
+# OWNER_CENSUS_COMPARE_DEPTH= (empty) to drop the second walk, and delete this
+# block when the comparison has stopped being interesting.
+OWNER_CENSUS_COMPARE_DEPTH=${OWNER_CENSUS_COMPARE_DEPTH-16}
 
 # OWNER-EXPORT-1. The `--export` clause has ONE producer, tools/owner_export.sh,
 # and it is sourced HERE so that `declare -f owner_export_clause` below ships it
@@ -157,10 +186,16 @@ OE=$HERE/../tools/owner_export.sh
 # `declare -f` below, so the number the submitter derives and the number the
 # owner re-derives cannot drift apart into two implementations.
 owner_census () {                # $@ = declared roots; echoes "<entries> <present> <absent>"
-  local r n tot=0 pres=0 abs=0
+  local r n nb tot=0 pres=0 abs=0
   for r in "$@"; do
     if [ -e "$r" ]; then
-      n=$(find "$r" -maxdepth 16 2>/dev/null | wc -l)
+      # CLEANUP-WALL-2: the SAME walk cleanup.sh runs before it unlinks, so the
+      # number that buys the wall and the number the reaper prints are one walk.
+      n=$(find "$r" 2>/dev/null | wc -l)
+      if [ -n "${OWNER_CENSUS_COMPARE_DEPTH:-}" ]; then
+        nb=$(find "$r" -maxdepth "$OWNER_CENSUS_COMPARE_DEPTH" 2>/dev/null | wc -l)
+        [ "$nb" = "$n" ] || echo "### OWNER CENSUS DEPTH $r unbounded=$n depth${OWNER_CENSUS_COMPARE_DEPTH}=$nb undercount=$((n - nb)) -- the bounded walk this census used to do would have bought a wall for $nb entries and the reaper would have unlinked $n" >&2
+      fi
       tot=$((tot + n)); pres=$((pres + 1))
     else
       tot=$((tot + OWNER_ENTRIES_PER_ARM_EST * OWNER_ARMS)); abs=$((abs + 1))
@@ -415,6 +450,10 @@ fi
   echo "OWNER_WALL_FLOOR_S=$OWNER_WALL_FLOOR_S"
   echo "OWNER_WALL_MAX_S=$OWNER_WALL_MAX_S"
   echo "OWNER_ENTRIES_PER_ARM_EST=$OWNER_ENTRIES_PER_ARM_EST"
+  # CLEANUP-WALL-2: the owner re-censuses with the same unbounded walk and the
+  # same one-release comparison depth the submitter used, or the two numbers
+  # that are supposed to be one number are two again.
+  echo "OWNER_CENSUS_COMPARE_DEPTH='$OWNER_CENSUS_COMPARE_DEPTH'"
   echo "OWNER_ARMS=$OWNER_ARMS"
   echo "OWNER_WALL_COVERS=$OWNER_ENTRIES"
   echo "OWNER_WALL_S=$OWNER_WALL_S"

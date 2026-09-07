@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# cleanup_wall_guard.sh -- the reader for CLEANUP-WALL-1: a cleanup owner's
+# cleanup_wall_guard.sh -- the reader for CLEANUP-WALL-1 and -2: a cleanup owner
 # `--time` is DERIVED from the work it was handed, and an owner whose wall does
 # not cover what it finds says so and submits its own continuation.
 #
@@ -33,6 +33,11 @@
 #   E. THE PRODUCTION CALL SITE (law 2). phaseN_cert.sh's real
 #      cleanup_submit_or_defer must PASS --roots and CONSUME owner.wall. A
 #      derivation with no caller is boarded debt, not a fix.
+#   F. CLEANUP-WALL-2. The census walks what the REAPER walks. A tree DEEPER
+#      than the old `-maxdepth 16` bound is censused at the UNBOUNDED count,
+#      the wall is derived from THAT count, the disagreement with the bounded
+#      walk is printed with its size, and a mutant with the bound restored
+#      under-counts -- which is what makes F1/F2 arms and not assertions.
 #
 # Usage: cleanup_wall_guard.sh          (self-contained, needs only $TMPDIR)
 set -u
@@ -188,6 +193,11 @@ grep -q '^### FIXTURE CLEANUP ran with' "$W/C.run.log" \
 ########## D. MUTATION: derivation removed -> equal walls ######################
 mkdir -p "$W/mut/phase_template" "$W/mut/tools" "$W/jr.mut.small" "$W/jr.mut.big"
 cp "$REFS" "$W/mut/tools/script_refs.sh"
+# OWNER-EXPORT-1: owner_snapshot.sh now REFUSES without owner_export.sh beside it
+# (it must ship the clause producer into the generated sbatch by `declare -f`),
+# so a mutant copy needs the same sibling or every arm below dies rc 2 for a
+# reason that has nothing to do with the mutation.
+cp "$HERE/../tools/owner_export.sh" "$W/mut/tools/owner_export.sh"
 sed 's/^  wall=\$(( unlink \* OWNER_WALL_MARGIN + census ))$/  wall=$OWNER_WALL_FLOOR_S/' \
   "$SNAPTOOL" > "$W/mut/phase_template/owner_snapshot.sh"
 if cmp -s "$SNAPTOOL" "$W/mut/phase_template/owner_snapshot.sh"; then
@@ -220,6 +230,86 @@ else
   fail "E. $CERT not found -- the production call site could not be checked"
 fi
 
+
+########## F. CLEANUP-WALL-2: the census walks what the REAPER walks ###########
+# THE DEFECT, MEASURED ON JOB 6017160 (REAP-3). `owner_census` walked
+# `find "$r" -maxdepth 16` while the work it sizes -- cleanup.sh's
+# `N=$(find "$r" | wc -l)` and the `rm -rf` behind it -- is UNBOUNDED. On ONE
+# reap of a STATIC tree the two disagreed twice: 44040 against 44354, and 423482
+# against 434860. Not a race: the smoke's `cp -al` mirror nests worktrees inside
+# worktrees, and the same job's SETUP-REFUSED branch named a real path at depth 8
+# inside `.claude/worktrees/agent-.../assets/cad/`. A census that under-counts
+# buys a wall too short, which is 5999937's TIMEOUT with a root half gone.
+#
+#   F1  a tree DEEPER than the old bound is censused at the UNBOUNDED count --
+#       the same number `find "$r" | wc -l` gives, which is cleanup.sh's own walk.
+#   F2  the wall DERIVED from it is the wall the unbounded count buys, not the
+#       bounded one. F1 without F2 would pass a census that counts correctly and
+#       then sizes off something else.
+#   F3  the disagreement is PRINTED for this one release, with the undercount.
+#   F4  MUTATION -- the bound restored on a COPY of the producer -> the census
+#       under-counts and the derived wall is SMALLER. Without this, F1 and F2 are
+#       green against any tree shallower than the bound and prove nothing.
+DEEPGUARD=$W/roots/certDEEP-1
+mkdir -p "$DEEPGUARD" || fail "F. could not make the deep fixture"
+# 22 levels: past the old 16 bound with margin, and 40 files at the bottom so the
+# undercount is a number and not a rounding artefact.
+DPATH=$DEEPGUARD
+for i in $(seq 1 22); do DPATH=$DPATH/d$i; done
+mkdir -p "$DPATH"
+seq 1 40 | ( cd "$DPATH" && xargs -n 40 touch )
+seq 1 10 | ( cd "$DEEPGUARD" && xargs -n 10 touch )
+F_UNB=$(find "$DEEPGUARD" | wc -l)
+F_B16=$(find "$DEEPGUARD" -maxdepth 16 | wc -l)
+if [ "$F_UNB" -gt "$F_B16" ]; then
+  ok "F. NON-VACUITY: the fixture is deeper than 16 -- unbounded=$F_UNB depth16=$F_B16 undercount=$((F_UNB - F_B16))"
+else
+  fail "F. the fixture is NOT deeper than the old bound (unbounded=$F_UNB depth16=$F_B16) -- arms F1-F4 would prove nothing"
+fi
+
+FLOG=$W/F.log
+( cd "$W/task" && bash "$SNAPTOOL" "$W/task/jobF" "$GATE" --roots "$DEEPGUARD" ) > "$FLOG" 2>&1
+F_CENSUS=$(sed -n 's/^### OWNER SNAPSHOT wall=[0-9]* .* from entries=\([0-9][0-9]*\) .*/\1/p' "$FLOG" | head -1)
+F_WALL=$(wall_of "$FLOG")
+if [ "$F_CENSUS" = "$F_UNB" ]; then
+  ok "F1. the census is the UNBOUNDED count, byte-equal to cleanup.sh's own walk (entries=$F_CENSUS)"
+else
+  fail "F1. census=$F_CENSUS but the reaper will walk $F_UNB -- the wall is being bought for a tree nobody removes"
+  sed 's/^/      /' "$FLOG" | head -20
+fi
+# F2: the same derivation the file ships, computed here from the UNBOUNDED count.
+F_WANT=$(( ( (F_UNB + 199) / 200 ) * 2 + ( (F_UNB + 2799) / 2800 ) * 2 ))
+[ "$F_WANT" -lt 3600 ] && F_WANT=3600
+if [ "$F_WALL" = "$F_WANT" ]; then
+  ok "F2. the derived wall ${F_WALL}s is what the UNBOUNDED count buys at the shipped constants"
+else
+  fail "F2. wall=${F_WALL}s but the unbounded count $F_UNB buys ${F_WANT}s"
+fi
+if grep -q "### OWNER CENSUS DEPTH $DEEPGUARD unbounded=$F_UNB depth16=$F_B16 undercount=$((F_UNB - F_B16))" "$FLOG"; then
+  ok "F3. the disagreement is PRINTED with its size, not left in a lane's memory"
+else
+  fail "F3. no '### OWNER CENSUS DEPTH' row naming unbounded=$F_UNB depth16=$F_B16"
+  grep 'CENSUS DEPTH' "$FLOG" | sed 's/^/      /'
+fi
+
+# F4 MUTATION: restore the bound in a COPY and the census must under-count.
+FMUTD=$W/mutF/phase_template; mkdir -p "$FMUTD" "$W/mutF/tools"
+cp "$REFS" "$W/mutF/tools/script_refs.sh"
+cp "$HERE/../tools/owner_export.sh" "$W/mutF/tools/owner_export.sh"
+FMUT=$FMUTD/owner_snapshot.sh
+sed 's@^      n=$(find "$r" 2>/dev/null | wc -l)$@      n=$(find "$r" -maxdepth 16 2>/dev/null | wc -l)@' "$SNAPTOOL" > "$FMUT"
+if cmp -s "$SNAPTOOL" "$FMUT"; then
+  fail "F4. the mutation edited nothing -- F1/F2 are asserting against an unmutated file and cannot fail"
+else
+  FMLOG=$W/F4.log
+  ( cd "$W/task" && bash "$FMUT" "$W/task/jobF4" "$GATE" --roots "$DEEPGUARD" ) > "$FMLOG" 2>&1
+  FM_CENSUS=$(sed -n 's/^### OWNER SNAPSHOT wall=[0-9]* .* from entries=\([0-9][0-9]*\) .*/\1/p' "$FMLOG" | head -1)
+  if [ "$FM_CENSUS" = "$F_B16" ] && [ "$FM_CENSUS" != "$F_UNB" ]; then
+    ok "F4. (mutation) the bound restored -> census=$FM_CENSUS, under-counting the reaper's $F_UNB by $((F_UNB - FM_CENSUS)). F1 CAN fail."
+  else
+    fail "F4. the bounded mutant censused $FM_CENSUS (bounded=$F_B16 unbounded=$F_UNB) -- the mutation did not change the count, so F1 proves nothing"
+  fi
+fi
 echo
-[ "$FAIL" = 0 ] && echo "CLEANUP-WALL-1 GUARD: ALL GREEN" || echo "CLEANUP-WALL-1 GUARD: SOME CHECKS FAILED"
+[ "$FAIL" = 0 ] && echo "CLEANUP-WALL-1/2 GUARD: ALL GREEN" || echo "CLEANUP-WALL-1/2 GUARD: SOME CHECKS FAILED"
 exit "$FAIL"
