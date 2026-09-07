@@ -52,9 +52,16 @@ ok   () { echo "GUARD  ok : $*"; }
 
 # ---- fixtures ---------------------------------------------------------------
 # The frozen "cleanup" is a stub: this guard measures the WALL, and a guard that
-# actually unlinked something would be a guard that can destroy a root.
-printf '#!/usr/bin/env bash\necho "### FIXTURE CLEANUP ran with $*"\n' > "$W/cleanup_gated.sh"
-chmod +x "$W/cleanup_gated.sh"
+# actually unlinked something would be a guard that can destroy a root. It lives
+# in a TASK-SHAPED tree -- `merge-h/` beside a `tools/.harness_synced_commit` --
+# because DET-1-6-a made owner_snapshot.sh REFUSE a source it cannot identify,
+# and a fixture that is neither a git worktree nor a task copy is neither
+# faithful nor accepted (measured: job 6014994, rc 2 on every arm).
+mkdir -p "$W/task/merge-h" "$W/task/tools"
+printf '2222222222222222222222222222222222222222\n' > "$W/task/tools/.harness_synced_commit"
+GATE=$W/task/merge-h/cleanup_gated.sh
+printf '#!/usr/bin/env bash\necho "### FIXTURE CLEANUP ran with $*"\n' > "$GATE"
+chmod +x "$GATE"
 
 mkroot () {   # $1 = path, $2 = how many files
   mkdir -p "$1" || return 2
@@ -81,7 +88,7 @@ wall_of () {  # $1 = log file -> the wall in SECONDS off the OWNER SNAPSHOT row
 # override so the derivation is what decides. A fixture big enough to clear a
 # one-hour floor would need ~360,000 entries and would measure NFS, not this.
 mkdir -p "$W/jr.small" "$W/jr.fsmall" "$W/jr.fbig"
-bash "$SNAPTOOL" "$W/jr.small" "$W/cleanup_gated.sh" --roots "$SMALL" > "$W/A1.small.log" 2>&1; rcS=$?
+bash "$SNAPTOOL" "$W/jr.small" "$GATE" --roots "$SMALL" > "$W/A1.small.log" 2>&1; rcS=$?
 W1S=$(wall_of "$W/A1.small.log")
 if [ "$rcS" = 0 ] && [ "$W1S" = 3600 ]; then
   ok "A1. at the shipped constants a 101-entry root lands on the 3600s FLOOR, which is what a floor is for"
@@ -89,8 +96,8 @@ else
   fail "A1. rc=$rcS wall='$W1S' (wanted the 3600s floor)"; sed 's/^/GUARD:   /' "$W/A1.small.log"
 fi
 
-OWNER_WALL_FLOOR_S=60 bash "$SNAPTOOL" "$W/jr.fsmall" "$W/cleanup_gated.sh" --roots "$SMALL" > "$W/A.small.log" 2>&1; rcS=$?
-OWNER_WALL_FLOOR_S=60 bash "$SNAPTOOL" "$W/jr.fbig"   "$W/cleanup_gated.sh" --roots "$BIG"   > "$W/A.big.log"   2>&1; rcB=$?
+OWNER_WALL_FLOOR_S=60 bash "$SNAPTOOL" "$W/jr.fsmall" "$GATE" --roots "$SMALL" > "$W/A.small.log" 2>&1; rcS=$?
+OWNER_WALL_FLOOR_S=60 bash "$SNAPTOOL" "$W/jr.fbig"   "$GATE" --roots "$BIG"   > "$W/A.big.log"   2>&1; rcB=$?
 WS=$(wall_of "$W/A.small.log"); WB=$(wall_of "$W/A.big.log")
 # The PREDICTION, computed here independently of the tool: margin 2 on the
 # unlink term at 200 entries/s, plus 2 census walks at 1700 entries/s, both
@@ -136,7 +143,7 @@ fi
 mkdir -p "$W/jr.short" "$W/bin"
 GROW=$W/roots/certGROW-2
 mkroot "$GROW" 100 >/dev/null
-OWNER_WALL_FLOOR_S=60 bash "$SNAPTOOL" "$W/jr.short" "$W/cleanup_gated.sh" --roots "$GROW" > "$W/C.snap.log" 2>&1
+OWNER_WALL_FLOOR_S=60 bash "$SNAPTOOL" "$W/jr.short" "$GATE" --roots "$GROW" > "$W/C.snap.log" 2>&1
 COVERS=$(sed -n 's/.*from entries=\([0-9][0-9]*\) .*/\1/p' "$W/C.snap.log" | head -1)
 seq 101 100000 | ( cd "$GROW" && xargs -n 500 touch )
 NG=$(find "$GROW" -maxdepth 16 | wc -l)
@@ -183,8 +190,8 @@ sed 's/^  wall=\$(( unlink \* OWNER_WALL_MARGIN + census ))$/  wall=$OWNER_WALL_
 if cmp -s "$SNAPTOOL" "$W/mut/phase_template/owner_snapshot.sh"; then
   fail "D. the mutation did not apply -- the derivation line was not found, so D is vacuous"
 else
-  OWNER_WALL_FLOOR_S=60 bash "$W/mut/phase_template/owner_snapshot.sh" "$W/jr.mut.small" "$W/cleanup_gated.sh" --roots "$SMALL" > "$W/D.small.log" 2>&1
-  OWNER_WALL_FLOOR_S=60 bash "$W/mut/phase_template/owner_snapshot.sh" "$W/jr.mut.big"   "$W/cleanup_gated.sh" --roots "$BIG"   > "$W/D.big.log"   2>&1
+  OWNER_WALL_FLOOR_S=60 bash "$W/mut/phase_template/owner_snapshot.sh" "$W/jr.mut.small" "$GATE" --roots "$SMALL" > "$W/D.small.log" 2>&1
+  OWNER_WALL_FLOOR_S=60 bash "$W/mut/phase_template/owner_snapshot.sh" "$W/jr.mut.big"   "$GATE" --roots "$BIG"   > "$W/D.big.log"   2>&1
   MS=$(wall_of "$W/D.small.log"); MB=$(wall_of "$W/D.big.log")
   if [ -n "$MS" ] && [ "$MS" = "$MB" ]; then
     ok "D. MUTATION REPRODUCED: with the derivation replaced by the floor both roots get ${MS}s -- so arm A is measuring the derivation and not the weather"

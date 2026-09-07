@@ -64,9 +64,15 @@ git -C "$GR" config user.name  guard
 git -C "$GR" add -A >/dev/null 2>&1
 git -C "$GR" commit -q -m v1 >/dev/null 2>&1
 HEADA=$(git -C "$GR" rev-parse HEAD)
-# the pin record the OLD code would have printed instead, in the place it looked
-mkdir -p "$W/A/jobroot" "$W/A/tools"
+# the pin record the OLD code would have printed instead, in BOTH places it
+# looked: beside the JOB ROOT (which is what the files= row reports as
+# task_pin_record) and beside the SOURCE tree, which is where owner_src_identity
+# falls back to when it cannot see git. Without the second one arm D's mutant
+# has nothing to fall back TO and refuses instead of reproducing the defect
+# (measured: job 6014994, arm D red with src_kind='').
+mkdir -p "$W/A/jobroot" "$W/A/tools" "$GR/harness/tools"
 printf '%s\n' "$PIN" > "$W/A/tools/.harness_synced_commit"
+printf '%s\n' "$PIN" > "$GR/harness/tools/.harness_synced_commit"
 bash "$SNAPTOOL" "$W/A/jobroot/jr" "$GR/harness/phase_template/cleanup_gated.sh" > "$W/A.log" 2>&1; rcA=$?
 KA=$(field "$W/A.log" src_kind); SA=$(field "$W/A.log" src_commit)
 if [ "$rcA" = 0 ] && [ "$KA" = git ] && [ "$SA" = "$HEADA" ]; then
