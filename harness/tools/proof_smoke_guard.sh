@@ -8,8 +8,24 @@
 #   usage: bash proof_smoke_guard.sh <job root>
 #
 #   <job root> is the lane's own work dir -- the one holding HARNESS_COMMIT.
+#   MANDATORY, and a BARE call is a REFUSAL WITH A ROW since HARNESS-CONSOL-13:
+#   `### PSG REFUSED reason=no-job-root`, rc 2.  It used to be `${1:?usage}`,
+#   which writes bash's own diagnostic to stderr and exits before the first
+#   `### PSG` line -- so a runner that called it bare produced a log where
+#   `grep -c '### PSG'` was ZERO, indistinguishable from never having listed it.
 #   Everything this guard creates lives under a SHORT scratch root it owns and
 #   is removed on the way out.
+#
+#   PSG_HEAVY=1          RUN ARMS A-H, which stage against the LIVE shared stage
+#                        mirror and take its try-lock.  Without it they are
+#                        SKIPPED with a `### PSG SKIPPED heavy reason=...` row
+#                        and the fixture arms (S, P) run alone -- so a runner can
+#                        list this guard unconditionally.  Even ARMED they stand
+#                        down while a `*-proof` job of ours is RUNNING, because
+#                        that job holds the same mirror.
+#   PSG_FIXTURE_ONLY=1   the older spelling of the same skip; it names its own
+#                        reason on the row so a runner pinned to it is not
+#                        silently re-armed.
 #
 #   PREDICTED: the `### PSG PREDICTED` rows below are the authority and are
 #   stated in the sbatch before submitting. They are PREDICTIONS, not stored
@@ -133,7 +149,22 @@ set -uo pipefail
 # landing.  Pinned, never "HEAD~1": a relative ref moves under the next commit.
 PSG_PREFIX_COMMIT=9923653ff5f73cfdf6b83209b670db911b5ede2f
 
-JOB_ROOT=${1:?usage: proof_smoke_guard.sh <job root>}
+# THE BARE CALL IS A REFUSAL WITH A ROW, NOT A BASH DIAGNOSTIC (HARNESS-CONSOL-13
+# item 3, from CONSOL-8 item 5). `${1:?...}` writes its complaint to stderr in
+# bash's own words and exits before the first `### PSG` line, so a runner that
+# called this guard bare produced a log in which `grep -c '### PSG'` was ZERO --
+# indistinguishable from a guard that was never invoked at all, which is how it
+# sat unrun in the runners that listed it. A refusal must reach a reader (law 9),
+# and every reader of this guard greps `### PSG`.
+if [ "$#" -lt 1 ] || [ -z "${1:-}" ]; then
+  echo "### PSG REFUSED reason=no-job-root"
+  echo "### PSG   usage: proof_smoke_guard.sh <job root>   -- the lane's own work dir, the one holding HARNESS_COMMIT."
+  echo "### PSG   Nothing ran: the arms write their logs under <job root>/artifacts and there is no such root."
+  echo "### PSG SUMMARY pass=0 fail=1 refused=no-job-root"
+  echo "### PSG FINAL pass=0 fail=1"
+  exit 2
+fi
+JOB_ROOT=$1
 T=${PSG_TASK:-/oscar/data/stellex/glvov/agrescap/tasks/retread-4-11}
 REPO=${PSG_REPO:-/oscar/data/stellex/glvov/agrescap/worktrees/harness-tools}
 MANIFEST=${PSG_MANIFEST:-/oscar/data/stellex/glvov/imprint-data/pixi.toml}
@@ -407,12 +438,33 @@ grep -q '^    smoke_stage_build_mirror "\$mirror" "\$key"; rc=\$?$' "$PS_UNDER_T
 chk P7 $? "smoke_stage's MISS branch CALLS smoke_stage_build_mirror -- the publish has a production call site" "no call site found"
 rm -rf "$PFX"
 
+# ---- THE HEAVY GATE (HARNESS-CONSOL-13 item 3) ------------------------------
+# Arms A-H below run a REAL lock against the LIVE shared stage mirror and take
+# its try-lock. That is why no runner could safely include this guard: a run
+# that collided with a live `*-proof` job either lost the mirror lock (arm H2's
+# own `### SMOKE STAGE BUSY`) or made the proof job lose it. The arms are now
+# OPT-IN -- `PSG_HEAVY=1` -- and even then they stand down while a proof job is
+# RUNNING, so a runner can list this guard unconditionally and get the fixture
+# arms every time and the heavy arms only when the queue is clear.
+#
+# THE SKIP IS A ROW, never silence: `### PSG SKIPPED heavy reason=...`, so a log
+# that skipped and a log that never reached the gate do not read alike.
+psg_running_proof_jobs () {   # job ids of RUNNING jobs whose NAME carries -proof
+  command -v squeue >/dev/null 2>&1 || { echo ""; return 0; }
+  squeue -u "${USER:-$(id -un)}" -h -t RUNNING -o '%i %j' 2>/dev/null \
+    | awk 'index($2, "-proof") > 0 { printf "%s%s", (n++ ? "," : ""), $1 } END { print "" }'
+}
+PSG_SKIP_HEAVY=
 if [ -n "${PSG_FIXTURE_ONLY:-}" ]; then
-  # A cheap CPU job can run the fixture arms alone. The heavy arms below stage
-  # against the LIVE shared mirror and take its try-lock; a lane that only
-  # changed a fixture-testable function should not have to pay that, or contend
-  # with a running relock for the mirror.
-  echo "### PSG FIXTURE-ONLY: skipping arms A-N (they stage against the live mirror)"
+  PSG_SKIP_HEAVY="fixture-only"
+elif [ "${PSG_HEAVY:-0}" != 1 ]; then
+  PSG_SKIP_HEAVY="not-armed (set PSG_HEAVY=1 to run arms A-H against the live mirror)"
+else
+  PSG_PROOF_JOBS=$(psg_running_proof_jobs)
+  [ -n "$PSG_PROOF_JOBS" ] && PSG_SKIP_HEAVY="proof-job-running jobs=$PSG_PROOF_JOBS"
+fi
+if [ -n "$PSG_SKIP_HEAVY" ]; then
+  echo "### PSG SKIPPED heavy reason=$PSG_SKIP_HEAVY -- arms A-H stage against the LIVE shared mirror and take its try-lock; the fixture arms above ran"
   echo "### PSG SUMMARY pass=$pass fail=$fail (FIXTURE-ONLY subset)"
   rmdir "$SCR" 2>/dev/null
   echo "### PSG FINAL pass=$pass fail=$fail"
