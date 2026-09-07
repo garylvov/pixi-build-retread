@@ -435,16 +435,20 @@ smoke_stage_key () {
 # fill-v1.lock` -- `mkdir` rather than a file because mkdir is the create-or-fail
 # primitive that is atomic on NFS, where a noclobber redirect is not.
 #
-# WHAT THIS DOES **NOT** FIX, boarded rather than blind-fixed: the write-through
-# itself. `phaseN_relock.sh` already carries the three readers for it --
-# `stage_break_hardlinks` (cp -p + mv -f over every `-links +1` file),
-# `stage_assert_mirror_disjoint` (the mirror must share no inode with
-# $SMOKE_SRC_WS) and `stage_verify_mirror` (quarantine to `.DIRTY-$J`, set
-# MIRROR_DIRTY, exit 12) -- and `smoke_stage` has NONE of them. The live mirror
-# root carries three `.DIRTY-<jobid>` quarantines and one `.SRCLINKED-<jobid>`,
-# so that hole has fired before. Carrying those three into the smoke is a
-# SEPARATE change against a defect this lane did not measure, and it is boarded
-# as debt, not smuggled in here.
+# WHAT THIS LANE FIXED AND WHAT IS STILL BOARDED. `phaseN_relock.sh` carries
+# three readers for the write-through -- `stage_break_links` (cp -p + mv -f over
+# every `-links +1` file), `stage_assert_mirror_disjoint` (the mirror must share
+# no inode with $SMOKE_SRC_WS) and `stage_verify_mirror` (quarantine to
+# `.DIRTY-$J`, set MIRROR_DIRTY, exit 12) -- and `smoke_stage` had NONE of them.
+# The live mirror root carries four `.DIRTY-<jobid>` quarantines and one
+# `.SRCLINKED-<jobid>`, so that hole has fired repeatedly; the fourth,
+# `.DIRTY-6001140`, was measured to THIS file (see smoke_stage_break_links).
+# STAGE-MIRROR-1 carries the FIRST of the three across: the smoke now breaks the
+# hardlinks it is about to write through. The other two -- the disjointness
+# assertion and the post-run mirror verify with its quarantine and non-zero exit
+# -- are still absent here, and are boarded rather than smuggled in: they change
+# what a smoke DOES on failure (quarantine, exit 12), which is a verdict change
+# and needs its own measurement.
 SMOKE_STAGE_LOCK=${SMOKE_STAGE_LOCK:-1}
 # TTL is the backstop, not the mechanism: the mechanism is the owner job's
 # LIVENESS, asked of squeue at the point of use (law 5). A lock whose owner job
@@ -522,6 +526,68 @@ smoke_stage_lock_release () {
   return 0
 }
 
+# STAGE-MIRROR-1. THE SMOKE `cp -al`s OUT OF THE SHARED MIRROR AND, UNTIL THIS
+# FUNCTION EXISTED, BROKE NOTHING -- so every file the backend writes IN PLACE
+# was written straight through the mirror's inode, into the mirror and into
+# every other job staged from it.
+#
+# MEASURED, NOT ASSUMED, AND IT IS THIS FILE THAT DID IT. D141 job 6001140 arm 3
+# quarantined the shared mirror 85db7fdb... at 00:30:58 on 2026-09-07 over
+# EXACTLY ONE file:
+#   f 9635 ... pypi-packs/pm-newton-pack/retread-probe-trace-pm-newton-pack.json
+#   f 9632 ...
+# and the relock template is NOT the writer. Its `stage_break_links` already
+# names `retread-probe-trace-*.json`, and the proof is in the inodes: arm 3's own
+# workspace copy has links=1 and an inode of its own, its content dated 23:54,
+# while the mirror's copy is a DIFFERENT inode dated 00:29:24 carrying THREE
+# links. 00:29:24 falls inside job 6006079 (psb-guard2, 00:24:07-01:06:12), whose
+# log says `### SMOKE stage: mirror HIT .../85db7fdbbf51206a0cb57fa0d55e0e74`.
+# The smoke wrote it; the relock's post-lock verify is merely what noticed.
+#
+# THE SET IS DERIVED FROM THE WRITER, NOT ACCUMULATED FROM INCIDENTS.
+# `is_managed_snapshot_output` in the backend's `src/source_build.rs` is the
+# product's OWN answer to "which names do I write into a tree I was handed":
+# `retread-progress-*.log`, `retread-audit.json` / `retread-audit-*.json`,
+# `retread-probe-trace-*.json`, and `retread-*.lock.json`. Adding one more
+# literal per incident is how a list like this stays permanently one incident
+# behind.
+#
+# AND A SECOND, BROADER SWEEP, because a shell list and a Rust function are two
+# authorities and they will drift. Every regular file at the TOP LEVEL of each
+# `pypi-packs/<pack>/` is broken outright -- that is the directory the backend is
+# handed and the only place it writes these artefacts, it is a few files per pack
+# rather than a payload tree, and it costs nothing next to a poisoned mirror.
+# The wheel payloads deeper in the tree stay shared: every writer that produces a
+# .whl goes temp-file -> rename, which replaces a directory entry and leaves a
+# hardlinked twin's inode alone.
+#
+# Reader: tools/proof_smoke_guard.sh, arm S.
+smoke_break_one () {             # $1 = file; give it its own inode, preserving content+mode
+  cp -p "$1" "$1.smkbrk.$$" 2>/dev/null || return 1
+  mv -f "$1.smkbrk.$$" "$1"
+}
+
+smoke_stage_break_links () {     # $1 = workspace; MUST run before anything locks
+  local ws=$1 n=0 t=0 p=0 S f
+  S=$(date +%s)
+  while IFS= read -r f; do smoke_break_one "$f" && n=$((n+1)); done < <(
+    find "$ws" -path "$ws/third_party" -prune -o -type f -links +1 \
+      \( -name 'retread-progress-*.log' -o -name 'retread-probe-trace-*.json' \
+         -o -name 'retread-audit*.json' -o -name 'retread-*.lock.json' \
+         -o -name '*.retread-cache' \) -print 2>/dev/null)
+  while IFS= read -r f; do smoke_break_one "$f" && p=$((p+1)); done < <(
+    find "$ws/pypi-packs" -mindepth 2 -maxdepth 2 -type f -links +1 -print 2>/dev/null)
+  # third_party's *.egg-info/*.txt files are rewritten in place by setuptools
+  # during a lock, and the rsync path `cp -al`s third_party straight out of the
+  # READ-ONLY canonical tree, so this sweep matters more there, not less.
+  while IFS= read -r f; do smoke_break_one "$f" && t=$((t+1)); done < <(
+    find "$ws/third_party" -type f -links +1 -size -1048576c \
+      \( -path '*.egg-info/*' -o -name '*.egg-link' -o -path '*.dist-info/*' \
+         -o -path '*/__pycache__/*' -o -name '*.pth' \) -print 2>/dev/null)
+  echo "### SMOKE stage: broke $n in-place-written hardlink(s) + $p under pypi-packs/*/ + $t under third_party, wall=$(( $(date +%s) - S ))s"
+  echo "### SMOKE stage: files still sharing an inode with the mirror (expected -- atomic-rename writers): $(find "$ws" -path "$ws/third_party" -prune -o -type f -links +1 -print 2>/dev/null | wc -l)"
+}
+
 smoke_stage () {                 # $1 = workspace to create
   local ws=$1 key mirror S
   key=$(smoke_stage_key)
@@ -552,6 +618,8 @@ smoke_stage () {                 # $1 = workspace to create
     cp -al "$SMOKE_SRC_WS/third_party" "$ws/third_party" || return 1
     echo "### SMOKE stage: rsync+cp -al wall=$(( $(date +%s) - S ))s"
   fi
+  # NOTHING may lock against these inodes until they are the job's own.
+  smoke_stage_break_links "$ws" || return 1
   # the per-run writable bits, never shared with the mirror
   rm -rf "$ws/.pixi"; mkdir -p "$ws/.pixi"
   [ -f "$SMOKE_SRC_WS/.pixi/config.toml" ] && cp "$SMOKE_SRC_WS/.pixi/config.toml" "$ws/.pixi/config.toml"

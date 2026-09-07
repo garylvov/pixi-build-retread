@@ -79,7 +79,7 @@ e02808a84a7409e9b96a577fbae3dfe9  tools/moved_rows_match_guard.sh
 62db5ba03d4644ccd514f1727db6f7c3  tools/moved_rows_match.sh
 00e4cbab1c56c0f8cdd613bf116bec8c  tools/msgpack_min_guard.py
 5d4435226ca639942f2227c290e09953  tools/msgpack_min.py
-e00d870cc3e71398e7f59000b35bfe0c  tools/multiarm_preamble.sh
+b8e2a0d5ecfbcf0e7a444f13b354a8e6  tools/multiarm_preamble.sh
 36af6a82e5884fb1a98251f206dad185  tools/multiarm_store_reap_guard.sh
 5703d740537be994ecbb007272a1fa64  tools/multiarm_store_reap.sh
 cbfb1b91ab68fab2110b94fdae2446ad  tools/mutation_arms_guard.sh
@@ -99,8 +99,8 @@ ca28f32b8c5556397f7a965fba6e72b8  tools/p6af2h_probe4_uvenv.sh
 c34a4e3a1a8834b073b997fc94230a9f  tools/pixi_merge_run_exports.py
 c9f561484d8ef42157ba6a7532f80681  tools/pixi_shard_cache.py
 6960c0ac937f51969cd1d4f1e1af65c2  tools/pixi_trim_repodata.py
-0ef3871a8e527e5eb4d4451a71a6edc0  tools/proof_smoke_guard.sh
-f3833278fa16020e5bd4c78b90d7a5b2  tools/proof_smoke.sh
+01da0730e6219ebd1d30410961540c8d  tools/proof_smoke_guard.sh
+ccc0d5e86341360be9a34e6d2ed6865d  tools/proof_smoke.sh
 dd16a8c662b31dda554a2bdc052ba94d  tools/retread_fast_env.sh
 46b5ede95808302e562b66b2e1a2201a  tools/retread_shard_mirror.sh
 bdd93cc2798a27301e793bdc6931be06  tools/sdist_build_poison_guard.sh

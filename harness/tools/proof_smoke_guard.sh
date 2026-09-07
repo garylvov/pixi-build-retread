@@ -11,7 +11,7 @@
 #   Everything this guard creates lives under a SHORT scratch root it owns and
 #   is removed on the way out.
 #
-#   PREDICTED: pass=31 fail=0 (state this in the sbatch before submitting).
+#   PREDICTED: pass=39 fail=0 (state this in the sbatch before submitting).
 #   PROOF-SMOKE-1-5 added SEVEN: N1-N7.  ARMS A-F STILL READ THE TASK COPY, so
 #   A1/A2 remain the unfixed coin until the harness is synced -- read them as a
 #   control on what a lane did NOT touch, never as a verdict.
@@ -27,7 +27,21 @@
 #   N7  THREE consecutive REACHED_FRONTEND in ONE job: the red/green/red coin
 #       HARNESS-CONSOL-5 measured across 6003336/6003619/6003855 is retired
 #
-# ── THE THIRTY-ONE CHECKS ────────────────────────────────────────────────────
+#   STAGE-MIRROR-1 adds EIGHT, S1-S8, and they are FIXTURE-ONLY: no binary and
+#   no live mirror, so PSG_FIXTURE_ONLY=1 runs them alone in a cheap CPU job
+#   rather than contending with a running relock for the shared mirror.
+#   S1-S3  the staged probe-trace / audit / third_party egg-info copies each
+#          come out of staging with link count 1 -- their own inodes
+#   S4     a pack-directory file the NAME LIST does not carry is broken anyway,
+#          by the pypi-packs/*/ sweep: the belt to the name list's braces
+#   S5     NON-VACUITY: the wheel payload one level deeper is STILL shared, so
+#          the break is targeted and not a disguised full copy
+#   S6     writing the staged trace leaves the mirror BYTE-IDENTICAL
+#   S7     MUTATION: smoke_break_one made a no-op -> links=2 and the mirror
+#          CHANGES, which is what S1 and S6 would otherwise pass without
+#   S8     smoke_stage CALLS it -- the function has a production call site
+#
+# ── THE THIRTY-NINE CHECKS ────────────────────────────────────────────────────
 #   A1  the known-good binsnap reaches the frontend            REACHED_FRONTEND
 #   A2  ... and proof_smoke.sh exits 0
 #   B1  a stub that prints a panic and exits 1                 BACKEND_DIED
@@ -93,6 +107,11 @@ T=${PSG_TASK:-/oscar/data/stellex/glvov/agrescap/tasks/retread-4-11}
 REPO=${PSG_REPO:-/oscar/data/stellex/glvov/agrescap/worktrees/harness-tools}
 MANIFEST=${PSG_MANIFEST:-/oscar/data/stellex/glvov/imprint-data/pixi.toml}
 GOOD=${PSG_GOOD_BINSNAP:-$T/binsnaps/integration-569b0ac}
+# Arm S sources the proof_smoke.sh SITTING BESIDE THIS GUARD, so a fresh
+# worktree of a commit tests THAT commit. Arms A-F still exec the task copy at
+# $T/tools -- that split is deliberate and is what makes A1/A2 a control on what
+# a lane did NOT sync.
+PS_UNDER_TEST=${PSG_PROOF_SMOKE:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/proof_smoke.sh}
 J=${SLURM_JOB_ID:-$$}
 # SHORT, because the length rule is one of the things under test and a guard
 # that cannot stage its own control is not a guard.
@@ -109,7 +128,7 @@ chk () {  # chk <name> <condition-rc> <what was wanted> <what was seen>
 echo "### PSG proof_smoke_guard.sh  $(date -Is)  host=$(hostname -s) job=$J"
 echo "### PSG scratch=$SCR  job_root=$JOB_ROOT"
 echo "### PSG good binsnap=$GOOD"
-echo "### PSG PREDICTED pass=24 fail=0"
+echo "### PSG PREDICTED pass=39 fail=0 (24 was stale from PROOF-SMOKE-1-1 and had drifted through three landings; corrected here)"
 
 # ---- the stubs --------------------------------------------------------------
 # They live at a path ENDING `/pixi-build-retread` because the shim readback
@@ -158,6 +177,100 @@ psg_release_stage_lock () {   # drop any lock in the live mirror root owned by T
 }
 trap 'psg_release_stage_lock' EXIT
 
+
+# ---- S: STAGE-MIRROR-1 -- the smoke must not write through the shared mirror -
+# FIXTURE-ONLY, no binary, no live mirror: the question is whether `cp -al` +
+# `smoke_stage_break_links` leaves the workspace's copies on their own inodes,
+# and a fixture answers it exactly. The function is SOURCED out of the shipped
+# proof_smoke.sh (PROOF_SMOKE_LIB=1), so this arm tests the code that runs.
+#
+# WHAT IT WOULD HAVE CAUGHT, measured: D141 job 6001140 arm 3 quarantined the
+# shared mirror over one file, pypi-packs/pm-newton-pack/retread-probe-trace-
+# pm-newton-pack.json, whose mirror copy was rewritten at 00:29:24 inside job
+# 6006079's window -- a psb-guard2 smoke whose own log records
+# `### SMOKE stage: mirror HIT .../85db7fdbbf51206a0cb57fa0d55e0e74`.
+echo ""; echo "########## PSG ARM S -- the smoke's hardlink break (fixture) ##########"
+SFX=$(mktemp -d "${TMPDIR:-/tmp}/psg-arm-s.XXXXXX")
+(
+  set -u
+  MIR=$SFX/mirror; WSX=$SFX/ws
+  mkdir -p "$MIR/pypi-packs/pm-newton-pack" "$MIR/third_party/pkg.egg-info" "$MIR/pypi-packs/pm-newton-pack/dist"
+  printf 'trace-v1\n'  > "$MIR/pypi-packs/pm-newton-pack/retread-probe-trace-pm-newton-pack.json"
+  printf 'audit-v1\n'  > "$MIR/pypi-packs/pm-newton-pack/retread-audit-pm-newton-pack.json"
+  printf 'sidecar-v1\n'> "$MIR/pypi-packs/pm-newton-pack/some-other-sidecar.txt"
+  printf 'wheelbytes\n'> "$MIR/pypi-packs/pm-newton-pack/dist/pkg-1.0-py3-none-any.whl"
+  printf 'reqs-v1\n'   > "$MIR/third_party/pkg.egg-info/requires.txt"
+  cp -al "$MIR" "$WSX"
+  BEFORE=$SFX/mirror.before.tsv; AFTER=$SFX/mirror.after.tsv
+  find "$MIR" -mindepth 1 -printf '%y\t%s\t%P\n' | LC_ALL=C sort > "$BEFORE"
+  PROOF_SMOKE_LIB=1 . "$PS_UNDER_TEST" || exit 90
+  smoke_stage_break_links "$WSX" || exit 91
+  # every path the lock can WRITE is now the workspace's own
+  h () { stat -c %h "$1"; }
+  printf 'S_TRACE=%s\n'   "$(h "$WSX/pypi-packs/pm-newton-pack/retread-probe-trace-pm-newton-pack.json")"
+  printf 'S_AUDIT=%s\n'   "$(h "$WSX/pypi-packs/pm-newton-pack/retread-audit-pm-newton-pack.json")"
+  printf 'S_SIDECAR=%s\n' "$(h "$WSX/pypi-packs/pm-newton-pack/some-other-sidecar.txt")"
+  printf 'S_EGG=%s\n'     "$(h "$WSX/third_party/pkg.egg-info/requires.txt")"
+  printf 'S_WHEEL=%s\n'   "$(h "$WSX/pypi-packs/pm-newton-pack/dist/pkg-1.0-py3-none-any.whl")"
+  # the write the backend actually performs: truncate-and-write, in place
+  printf 'trace-v2-longer\n' > "$WSX/pypi-packs/pm-newton-pack/retread-probe-trace-pm-newton-pack.json"
+  find "$MIR" -mindepth 1 -printf '%y\t%s\t%P\n' | LC_ALL=C sort > "$AFTER"
+  LC_ALL=C diff -q "$BEFORE" "$AFTER" >/dev/null && printf 'S_MIRROR=IDENTICAL\n' || printf 'S_MIRROR=CHANGED\n'
+) > "$SFX/out.txt" 2>&1
+SOUT=$(cat "$SFX/out.txt")
+sfield () { printf '%s\n' "$SOUT" | sed -n "s/^$1=//p" | head -1; }
+[ "$(sfield S_TRACE)" = 1 ]; chk S1 $? "the staged probe-trace json has link count 1 (its own inode)" "links=$(sfield S_TRACE) out=$(printf '%s' "$SOUT" | tr '\n' '|')"
+[ "$(sfield S_AUDIT)" = 1 ]; chk S2 $? "the staged audit json has link count 1" "links=$(sfield S_AUDIT)"
+[ "$(sfield S_EGG)" = 1 ];   chk S3 $? "the staged third_party egg-info file has link count 1" "links=$(sfield S_EGG)"
+# the broader pypi-packs/*/ sweep: a name the literal list does NOT carry
+[ "$(sfield S_SIDECAR)" = 1 ]; chk S4 $? "a pack-directory file the NAME LIST does not carry is broken anyway (the pypi-packs/*/ sweep)" "links=$(sfield S_SIDECAR)"
+# the NON-VACUITY control: if everything were broken this arm would prove nothing
+[ "$(sfield S_WHEEL)" = 2 ]; chk S5 $? "the wheel payload one level DEEPER is STILL shared (links=2) -- the break is targeted, not a full copy" "links=$(sfield S_WHEEL)"
+[ "$(sfield S_MIRROR)" = IDENTICAL ]; chk S6 $? "writing the staged trace leaves the mirror BYTE-IDENTICAL" "mirror=$(sfield S_MIRROR)"
+# ---- S-mut: a REAL code mutation, not a rearranged fixture ------------------
+# `smoke_break_one` is turned into a no-op -- the function still runs, still
+# counts, still prints its row, and breaks nothing. S1 and S6 must then go RED.
+# Without this arm they would pass on a fixture that never had a hardlink.
+PS_MUT=$SFX/proof_smoke.mut.sh
+sed 's%^smoke_break_one () {%smoke_break_one () { return 0 ;  # MUTATION: the break is a no-op%' "$PS_UNDER_TEST" > "$PS_MUT"
+if cmp -s "$PS_UNDER_TEST" "$PS_MUT"; then
+  chk S7 1 "the mutation changes smoke_break_one" "the mutant is byte-identical -- the arm is vacuous"
+else
+(
+  set -u
+  MIR=$SFX/m2; WSX=$SFX/w2
+  mkdir -p "$MIR/pypi-packs/pm-newton-pack"
+  printf 'trace-v1\n' > "$MIR/pypi-packs/pm-newton-pack/retread-probe-trace-pm-newton-pack.json"
+  cp -al "$MIR" "$WSX"
+  B=$SFX/m2.before; A2=$SFX/m2.after
+  find "$MIR" -mindepth 1 -printf '%y\t%s\t%P\n' | LC_ALL=C sort > "$B"
+  PROOF_SMOKE_LIB=1 . "$PS_MUT" || exit 90
+  smoke_stage_break_links "$WSX" >/dev/null || exit 91
+  printf 'M_LINKS=%s\n' "$(stat -c %h "$WSX/pypi-packs/pm-newton-pack/retread-probe-trace-pm-newton-pack.json")"
+  printf 'trace-v2-longer\n' > "$WSX/pypi-packs/pm-newton-pack/retread-probe-trace-pm-newton-pack.json"
+  find "$MIR" -mindepth 1 -printf '%y\t%s\t%P\n' | LC_ALL=C sort > "$A2"
+  LC_ALL=C diff -q "$B" "$A2" >/dev/null && printf 'M_MIRROR=IDENTICAL\n' || printf 'M_MIRROR=CHANGED\n'
+) > "$SFX/mut.txt" 2>&1
+MOUT=$(cat "$SFX/mut.txt")
+mfield () { printf '%s\n' "$MOUT" | sed -n "s/^$1=//p" | head -1; }
+[ "$(mfield M_LINKS)" = 2 ] && [ "$(mfield M_MIRROR)" = CHANGED ]
+chk S7 $? "MUTATION: with smoke_break_one a no-op the staged copy keeps links=2 and the write CHANGES the mirror -- S1/S6 measure the break, not the fixture" "links=$(mfield M_LINKS) mirror=$(mfield M_MIRROR) out=$(printf '%s' "$MOUT" | tr '\n' '|')"
+fi
+grep -q '^  smoke_stage_break_links "\$ws" || return 1$' "$PS_UNDER_TEST"
+chk S8 $? "smoke_stage CALLS smoke_stage_break_links -- the function has a production call site" "no call site found"
+rm -rf "$SFX"
+
+if [ -n "${PSG_FIXTURE_ONLY:-}" ]; then
+  # A cheap CPU job can run the fixture arms alone. The heavy arms below stage
+  # against the LIVE shared mirror and take its try-lock; a lane that only
+  # changed a fixture-testable function should not have to pay that, or contend
+  # with a running relock for the mirror.
+  echo "### PSG FIXTURE-ONLY: skipping arms A-N (they stage against the live mirror)"
+  echo "### PSG SUMMARY pass=$pass fail=$fail (FIXTURE-ONLY subset)"
+  rmdir "$SCR" 2>/dev/null
+  echo "### PSG FINAL pass=$pass fail=$fail"
+  [ "$fail" -eq 0 ] && exit 0 || exit 1
+fi
 # ---- A: the known-good binary ----------------------------------------------
 echo ""; echo "########## PSG ARM A -- known good $GOOD ##########"
 AOUT=$OUT/psg-$J-A.out
@@ -660,7 +773,7 @@ echo "### PSG per-arm verdicts:"
 for f in "$AOUT" "$BOUT" "$COUT" "$FOUT"; do
   printf '###   %-28s %s\n' "$(basename "$f")" "$(grep -m1 '^### SMOKE [A-Z_]* binary=' "$f" 2>/dev/null || echo '<none>')"
 done
-echo "### PSG SUMMARY pass=$pass fail=$fail (predicted pass=31 fail=0)"
+echo "### PSG SUMMARY pass=$pass fail=$fail (predicted pass=39 fail=0)"
 echo "### PSG FINAL pass=$pass fail=$fail"
 if [ "$fail" -eq 0 ]; then exit 0; fi
 exit 1
