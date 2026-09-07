@@ -343,7 +343,8 @@ SNAP=$T/binsnaps/p6ab-616cfec/pixi-build-retread
 EXPECT_SHA_PIN=6ef2f5209022738f99cc785ece1c52970aca708cdae9d7b317542a78161464c5
 SNAP_COMMIT=616cfec
 UVBIN=/oscar/data/stellex/glvov/tasks/retread-cold-solve/verify_fixes/artifacts/uvbin
-FAST_ENV=$T/tools/retread_fast_env.sh
+FAST_ENV=$(dirname "$0")/../tools/retread_fast_env.sh    # persistent caches; fallback below
+[ -f "$FAST_ENV" ] || FAST_ENV=$T/tools/retread_fast_env.sh
 
 # --- cache roots: shared for arm OFF, isolated clone for arm ON --------------
 SHARED_CACHE=/oscar/data/stellex/glvov/agrescap/cache/retread
@@ -500,6 +501,25 @@ else
   ls -l "$SNAP"; "$SNAP" --version 2>&1 | head -2
 fi
 [ -f "$FAST_ENV" ] || { echo "FATAL: persistent-cache snippet $FAST_ENV missing"; exit 8; }
+# --- FAST_ENV RESOLUTION, REPORTED (HARNESS-CONSOL-10, 2026-09-07) -----------
+# CLAUDE.md law 7 hazard (b): two copies of one module are the normal state
+# here, and path order alone decides which a process imports. Until today four
+# of the seven harnesses that source this file named `../retread_fast_env.sh`,
+# a path that has never existed in the harness repo, so they ALWAYS fell
+# through to the task-dir copy while the other two read the repo copy -- the
+# two halves of one campaign silently importing different bytes. One rule now:
+# the repo's `tools/` copy first, the task-dir copy as the fallback. Two things
+# make it auditable instead of a convention: the resolved path is PRINTED, so
+# `grep '### FAST_ENV resolved='` over any job log answers "which copy did this
+# run import"; and two candidates that DIFFER refuse by md5 rather than letting
+# path order pick a winner nobody logged.
+FAST_ENV_ALT=$T/tools/retread_fast_env.sh
+if [ -f "$FAST_ENV" ] && [ -f "$FAST_ENV_ALT" ] && [ "$FAST_ENV" != "$FAST_ENV_ALT" ]; then
+  FE_A=$(md5sum "$FAST_ENV" | awk '{print $1}')
+  FE_B=$(md5sum "$FAST_ENV_ALT" | awk '{print $1}')
+  [ "$FE_A" = "$FE_B" ] || { echo "### FATAL two retread_fast_env.sh candidates DIFFER -- $FAST_ENV=$FE_A vs $FAST_ENV_ALT=$FE_B; sync the task tree, do not let path order choose"; exit 8; }
+fi
+echo "### FAST_ENV resolved=$FAST_ENV"
 [ -f "$CLEANED" ] || { echo "FATAL: manifest under test $CLEANED missing"; exit 9; }
 echo "### manifest md5: $(md5sum "$CLEANED")"
 GOT_CM=$(md5sum "$CLEANED" | awk '{print $1}')

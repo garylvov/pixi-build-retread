@@ -137,6 +137,7 @@ mkfixture () {                        # $1 = tag; echoes "<repo> <task> <v1> <v2
   printf '# allow nothing\n' > "$R/harness/tools/harness_drift_allowlist.txt"
   cp -f "$DRIFT" "$R/harness/tools/harness_drift_check.sh"
   cp -f "$SYNC"  "$R/harness/tools/harness_sync.sh"
+  cp -f "$(dirname -- "$SYNC")/harness_push_check.sh" "$R/harness/tools/harness_push_check.sh" 2>/dev/null
   cp -f "$(dirname -- "$SYNC")/script_refs.sh" "$R/harness/tools/script_refs.sh" 2>/dev/null
   git -C "$R" add -A >/dev/null 2>&1
   git -C "$R" commit -q -m v1 >/dev/null 2>&1
@@ -158,6 +159,7 @@ mkfixture () {                        # $1 = tag; echoes "<repo> <task> <v1> <v2
   git -C "$R" cat-file blob "$v1:harness/arms/an_arm.sh"               > "$T/merge-h/an_arm.sh"
   cp -f "$DRIFT" "$T/tools/harness_drift_check.sh"
   cp -f "$SYNC"  "$T/tools/harness_sync.sh"
+  cp -f "$(dirname -- "$SYNC")/harness_push_check.sh" "$T/tools/harness_push_check.sh" 2>/dev/null
   cp -f "$(dirname -- "$SYNC")/script_refs.sh" "$T/tools/script_refs.sh" 2>/dev/null
   cp -f "$R/harness/tools/harness_drift_allowlist.txt" "$T/tools/harness_drift_allowlist.txt"
   echo "$R $T $v1 $v2"
@@ -1007,6 +1009,68 @@ if [ "$rcP4" -ne 0 ] && grep -q 'OWNER SNAPSHOT REFUSED' "$WORK/P4.log" \
 else
   bad "P(p4): rc=$rcP4 -- an unresolvable reference must refuse, not freeze a partial set"; sed 's/^/      /' "$WORK/P4.log"
 fi
+fi
+
+# ---- Q: HARNESS-CONSOL-10 -- --check names the PUSH LAG, not just the drift --
+# The lane-close checklist gained a second row. On 2026-09-07 seventeen commits
+# from four lanes existed only under agrescap/worktrees while --check reported
+# CLEAN, because "clean" only ever meant "the task copies are the commit's
+# bytes". Two arms: the row is emitted at all (q1), and it carries a REAL
+# number read from a REAL remote (q2). q3 is the mutation.
+read -r RQ TQ vQ1 vQ2 <<< "$(mkfixture Q)"
+mkstub "$WORK/Q_squeue" ""
+printf '%s\n' "$vQ1" > "$TQ/tools/.harness_synced_commit"
+runsync "$RQ" "$TQ" "$WORK/Q_squeue" --check > "$WORK/Q1.log" 2>&1
+grep -q '^### PUSH LAG branch=' "$WORK/Q1.log" \
+  && ok "Q(q1): --check prints a PUSH LAG row beside the SYNC CHECK SUMMARY" \
+  || { bad "Q(q1): --check printed no PUSH LAG row"; sed 's/^/      /' "$WORK/Q1.log"; }
+grep -q '^### SYNC CHECK SUMMARY' "$WORK/Q1.log" \
+  && ok "Q(q1): the drift summary is still printed -- the new row did not replace it" \
+  || bad "Q(q1): the SYNC CHECK SUMMARY row is gone"
+
+# q2: a real bare remote, one commit pushed, TWO left behind. The number has to
+# be 2 and the rc has to be 1, or the row is decoration.
+git init -q --bare "$WORK/Q_remote.git" 2>/dev/null
+git -C "$RQ" remote add private "$WORK/Q_remote.git" 2>/dev/null
+QBR=$(git -C "$RQ" symbolic-ref --quiet --short HEAD)
+git -C "$RQ" push -q private "$vQ1:refs/heads/$QBR" 2>/dev/null
+printf 'v3 tool\n' > "$RQ/harness/tools/a_tool.sh"
+git -C "$RQ" add -A >/dev/null 2>&1; git -C "$RQ" commit -q -m v3 >/dev/null 2>&1
+PC=$TQ/tools/harness_push_check.sh
+HARNESS_REPO="$RQ" bash "$PC" > "$WORK/Q2.log" 2>&1; rcQ2=$?
+if [ "$rcQ2" -eq 1 ] && grep -q "^### PUSH LAG branch=$QBR unpushed=2 " "$WORK/Q2.log"; then
+  ok "Q(q2): two commits behind the remote -> unpushed=2 rc=1"
+else
+  bad "Q(q2): rc=$rcQ2, wanted 1 with unpushed=2"; sed 's/^/      /' "$WORK/Q2.log"
+fi
+grep -q 'fast-forward: bash -c .*push private' "$WORK/Q2.log" \
+  && ok "Q(q2): the lag row names the command that fixes it" \
+  || bad "Q(q2): the lag row does not say what to run"
+git -C "$RQ" push -q private "$QBR" 2>/dev/null
+HARNESS_REPO="$RQ" bash "$PC" > "$WORK/Q2b.log" 2>&1; rcQ2b=$?
+if [ "$rcQ2b" -eq 0 ] && grep -q "unpushed=0 " "$WORK/Q2b.log"; then
+  ok "Q(q2): after the push, unpushed=0 rc=0 -- the reader can go quiet"
+else
+  bad "Q(q2): after a real push rc=$rcQ2b, wanted 0"; sed 's/^/      /' "$WORK/Q2b.log"
+fi
+# a branch on NO remote is not 0 unpushed, it is ALL of them
+git -C "$RQ" checkout -q -b orphan-q 2>/dev/null
+HARNESS_REPO="$RQ" bash "$PC" > "$WORK/Q2c.log" 2>&1; rcQ2c=$?
+if [ "$rcQ2c" -eq 1 ] && grep -q 'unpushed=ALL .*remote=ABSENT' "$WORK/Q2c.log"; then
+  ok "Q(q2): a branch the remote has never seen reports ALL, not 0"
+else
+  bad "Q(q2): a branch absent from the remote gave rc=$rcQ2c"; sed 's/^/      /' "$WORK/Q2c.log"
+fi
+git -C "$RQ" checkout -q "$QBR" 2>/dev/null
+
+# q3: THE MUTATION -- a checker that always says 0 must make q2 red.
+sed -e 's|^\[ "\$N" -eq 0 \] && exit 0$|[ 1 -eq 1 ] \&\& exit 0|' "$PC" > "$WORK/Q_mut.sh"
+git -C "$RQ" reset -q --hard "$vQ2" 2>/dev/null
+HARNESS_REPO="$RQ" bash "$WORK/Q_mut.sh" > "$WORK/Q3.log" 2>&1; rcQ3=$?
+if [ "$rcQ3" -eq 0 ]; then
+  ok "Q(q3): the mutation (always exit 0) is REACHABLE -- q2's rc=1 is a real assertion"
+else
+  bad "Q(q3): the mutation did not change the rc (got $rcQ3) -- q2 cannot fail"
 fi
 echo "### harness_sync_guard: pass=$pass fail=$fail"
 [ "$fail" -eq 0 ] || exit 1

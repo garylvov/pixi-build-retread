@@ -283,7 +283,7 @@ EXPECT_SHA_PIN=
 UVBIN=/oscar/data/stellex/glvov/tasks/retread-cold-solve/verify_fixes/artifacts/uvbin
 VERDICT=$T/p4l-cert-p4k/artifacts/cert_verdict.sh
 CERT_BASELINE=$T/p4l-cert-p4k/artifacts/cert_results.5175534.att_corrected.tsv
-FAST_ENV=$(dirname "$0")/../retread_fast_env.sh
+FAST_ENV=$(dirname "$0")/../tools/retread_fast_env.sh
 [ -f "$FAST_ENV" ] || FAST_ENV=$T/tools/retread_fast_env.sh
 CLEANUP=$(dirname "$0")/cleanup.sh
 [ -f "$CLEANUP" ] || CLEANUP=$T/tools/phase_template/cleanup.sh
@@ -595,6 +595,26 @@ export PIXI_BUILD_RETREAD_LOG=pixi_build_retread=debug,warn RUST_BACKTRACE=1 PIX
 unset RUST_LOG
 
 # PERSISTENT CACHES -- after the job-scoped block (it overrides the three cache
+# --- FAST_ENV RESOLUTION, REPORTED (HARNESS-CONSOL-10, 2026-09-07) -----------
+# CLAUDE.md law 7 hazard (b): two copies of one module are the normal state
+# here, and path order alone decides which a process imports. Until today four
+# of the seven harnesses that source this file named `../retread_fast_env.sh`,
+# a path that has never existed in the harness repo, so they ALWAYS fell
+# through to the task-dir copy while the other two read the repo copy -- the
+# two halves of one campaign silently importing different bytes. One rule now:
+# the repo's `tools/` copy first, the task-dir copy as the fallback. Two things
+# make it auditable instead of a convention: the resolved path is PRINTED, so
+# `grep '### FAST_ENV resolved='` over any job log answers "which copy did this
+# run import"; and two candidates that DIFFER refuse by md5 rather than letting
+# path order pick a winner nobody logged.
+FAST_ENV_ALT=$T/tools/retread_fast_env.sh
+if [ -f "$FAST_ENV" ] && [ -f "$FAST_ENV_ALT" ] && [ "$FAST_ENV" != "$FAST_ENV_ALT" ]; then
+  FE_A=$(md5sum "$FAST_ENV" | awk '{print $1}')
+  FE_B=$(md5sum "$FAST_ENV_ALT" | awk '{print $1}')
+  [ "$FE_A" = "$FE_B" ] || { echo "### FATAL two retread_fast_env.sh candidates DIFFER -- $FAST_ENV=$FE_A vs $FAST_ENV_ALT=$FE_B; sync the task tree, do not let path order choose"; exit 2; }
+fi
+echo "### FAST_ENV resolved=$FAST_ENV"
+
 # dirs) and after RETREAD_FAST_TMP_ROOT + SLURM_JOB_ID exist.
 # shellcheck source=/dev/null
 . "$FAST_ENV"

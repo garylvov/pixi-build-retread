@@ -61,7 +61,8 @@ if [ "$#" -gt 0 ]; then
 else
   TARGETS=
   for t in "$HERE/../phase_template/phaseN_relock.sh" "$HERE/../arms/mh1_relock.sh" \
-           "$HERE/../arms/c29_relock.sh" "$HERE/../proof/hlgd_relock.sh"; do
+           "$HERE/../arms/c29_relock.sh" "$HERE/../proof/hlgd_relock.sh" \
+           "$HERE/../instrumented/p6b_relock.sh" "$HERE/../instrumented/p6b_relock.b2.sh"; do
     [ -f "$t" ] && TARGETS="$TARGETS $t"
   done
 fi

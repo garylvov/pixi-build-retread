@@ -45,9 +45,38 @@ for E in $ENVS; do printf '%s\tsys\tprint(1)\n' "$E" >> "$W/probes.tsv"; done
 : > "$W/baseline.tsv"
 printf '#!/bin/sh\nexit 0\n' > "$W/verdict.sh"; chmod +x "$W/verdict.sh"
 # A stub fast env that does the ONE thing the real one does to this question.
+# Every retread_* function phaseN_cert.sh calls between here and the point-of-use
+# line must be stubbed FAITHFULLY w.r.t. UV_LINK_MODE (i.e. it must not touch it
+# unless the real one does). The FIXTURE COMPLETENESS section below is the reader
+# that refuses when the cert grows a call this stub never got -- which is exactly
+# how this guard went red at a2ca72d (C31-4 added retread_scope_sdist_builds and
+# the stub kept defining only retread_fast_env, so every case died at
+# "### FATAL retread_scope_sdist_builds refused" with rc=2).
 cat > "$W/fastenv.sh" <<'FE'
 retread_fast_env () { export UV_LINK_MODE=copy; echo "guard fast env: UV_LINK_MODE=copy"; return 0; }
+# C31-4. The real one job-scopes the uv sdist build trees and re-exports the two
+# cache dirs; it does NOT touch UV_LINK_MODE (grep it: there is no UV_LINK_MODE
+# between `retread_scope_sdist_builds ()` and the end of that function), so a
+# stub that is silent about the link mode is the faithful one.
+retread_scope_sdist_builds () { echo "guard scope sdist builds: root=$1 (stub, UV_LINK_MODE untouched)"; return 0; }
 FE
+# The cert reaches four scripts as siblings of $FAST_ENV. Three have an
+# absent-branch by design and are deliberately left absent here; the fourth is a
+# hard FATAL, so the fixture must supply it.
+FIXTURE_OPTIONAL_SIBLINGS="harness_sync.sh harness_commit_resolve.sh harness_drift_check.sh"
+printf '#!/bin/sh\nexit 0\n' > "$W/sdist_build_poison_guard.sh"; chmod +x "$W/sdist_build_poison_guard.sh"
+
+say "== FIXTURE COMPLETENESS: the stub covers every dependency the cert grew =="
+FIXMISS=""
+for FN in $(grep -oE '\bretread_[a-z_]+\b' "$HERE/phaseN_cert.sh" | sort -u); do
+  grep -q "^$FN ()" "$W/fastenv.sh" || FIXMISS="$FIXMISS fn:$FN"
+done
+for SIB in $(grep -oE 'dirname "\$FAST_ENV"\)/[A-Za-z0-9_]+\.sh' "$HERE/phaseN_cert.sh" | sed 's|.*)/||' | sort -u); do
+  [ -f "$W/$SIB" ] && continue
+  case " $FIXTURE_OPTIONAL_SIBLINGS " in *" $SIB "*) ;; *) FIXMISS="$FIXMISS sib:$SIB";; esac
+done
+if [ -z "$FIXMISS" ]; then say "  PASS  (stub covers every retread_* call and every required FAST_ENV sibling)"
+else say "  FAIL  the cert reaches dependencies this fixture does not supply:$FIXMISS"; FAIL=1; fi
 
 derive() { # dst mode
   sed -e "s|^SNAP=.*|SNAP=$W/pixi-build-retread|" \
@@ -59,6 +88,7 @@ derive() { # dst mode
       -e "s|^VERDICT=.*|VERDICT=$W/verdict.sh|" \
       -e "s|^CERT_BASELINE=.*|CERT_BASELINE=$W/baseline.tsv|" \
       -e "s|^FAST_ENV=.*|FAST_ENV=$W/fastenv.sh|" \
+      -e "s|^FAST_ENV_ALT=.*|FAST_ENV_ALT=\$FAST_ENV|" \
       -e "s|^\[ -f \"\$FAST_ENV\" \].*||" \
       -e "s|^C=/oscar.*|C=$W/c|" \
       ${2:+-e "s|^CERT_UV_LINK_MODE=.*|CERT_UV_LINK_MODE=$2|"} "$HERE/phaseN_cert.sh" > "$1"

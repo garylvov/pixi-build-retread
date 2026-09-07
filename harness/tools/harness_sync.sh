@@ -256,6 +256,17 @@ if [ "$MODE" = check ]; then
     fi
   done < "$SET"
   echo "### SYNC CHECK SUMMARY commit=$SHA checked=$TOTAL clean=$okc edited=$edited"
+  # LANE-CLOSE CHECKLIST, second row (HARNESS-CONSOL-10). "Every task copy is
+  # still the commit's bytes" says nothing about whether that COMMIT left this
+  # disk. Seventeen commits from four lanes lived only under agrescap/worktrees
+  # on 2026-09-07 because no reader asked. It never changes this mode's rc --
+  # the cert treats a non-0/3 rc as "inconclusive" -- so the row is the actor.
+  PUSH_CHECK=$(dirname "$0")/harness_push_check.sh
+  if [ -f "$PUSH_CHECK" ]; then
+    HARNESS_REPO=$REPO bash "$PUSH_CHECK" || true
+  else
+    echo "### PUSH LAG branch=? unpushed=? -- harness_push_check.sh missing next to $0"
+  fi
   if [ "$edited" -gt 0 ]; then
     echo "### SYNC CHECK REFUSED -- the file(s) named above were written by something"
     echo "###   other than harness_sync.sh since the last sync. Do not re-edit them in"
