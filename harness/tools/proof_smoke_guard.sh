@@ -128,7 +128,8 @@ chk () {  # chk <name> <condition-rc> <what was wanted> <what was seen>
 echo "### PSG proof_smoke_guard.sh  $(date -Is)  host=$(hostname -s) job=$J"
 echo "### PSG scratch=$SCR  job_root=$JOB_ROOT"
 echo "### PSG good binsnap=$GOOD"
-echo "### PSG PREDICTED pass=39 fail=0 (24 was stale from PROOF-SMOKE-1-1 and had drifted through three landings; corrected here)"
+echo "### PSG PREDICTED full pass=44 fail=2 -- 37/2 MEASURED at 971875f (PSG-MEASURE-1) plus arm P1-P7; A1/A2 stay RED because arms A-F exec the TASK copy at \$T/tools, which this lane did NOT sync (installed HARNESS_COMMIT 8108ca4)"
+echo "### PSG PREDICTED fixture-only pass=15 fail=0 -- arms S1-S8 + P1-P7, no live mirror touched"
 
 # ---- the stubs --------------------------------------------------------------
 # They live at a path ENDING `/pixi-build-retread` because the shim readback
@@ -259,6 +260,121 @@ fi
 grep -q '^  smoke_stage_break_links "\$ws" || return 1$' "$PS_UNDER_TEST"
 chk S8 $? "smoke_stage CALLS smoke_stage_break_links -- the function has a production call site" "no call site found"
 rm -rf "$SFX"
+
+# ---- P: PROOF-SMOKE-1-6 -- the miss path must BANK the mirror ---------------
+# FIXTURE-ONLY, and that is not a convenience: the thing under test is a WRITE
+# to $SMOKE_MIRROR_ROOT, so an arm that ran against the live root would create
+# the very mirror the lane is forbidden to touch.  Both variables are exported
+# into a subshell pointing at a temp tree, so this arm builds, publishes and
+# adopts mirrors that are entirely its own.  The functions are SOURCED out of
+# the shipped proof_smoke.sh (PROOF_SMOKE_LIB=1), so this tests the code that
+# runs rather than a copy of it.
+echo ""; echo "########## PSG ARM P -- PROOF-SMOKE-1-6: the miss path must BANK the mirror ##########"
+PFX=$(mktemp -d "${TMPDIR:-/tmp}/psg-arm-p.XXXXXX")
+# A source tree deep enough to exercise the fan-out's THREE bands: files at
+# depth <=2, entries at depth exactly 3, and a directory at depth 3 whose
+# contents ride in on its recursive cp -al.  A shallower fixture would pass
+# while the fan-out silently dropped a band.
+psg_p_srcws () {
+  mkdir -p "$1/a/b/c" "$1/third_party/pkg.egg-info" || return 1
+  printf '[project]\nname="psg-arm-p"\n' > "$1/pixi.toml"
+  printf 'depth2\n' > "$1/a/f2.txt"
+  printf 'depth3\n' > "$1/a/b/f3.txt"
+  printf 'depth4\n' > "$1/a/b/c/f4.txt"
+  printf 'reqs\n'   > "$1/third_party/pkg.egg-info/requires.txt"
+}
+psg_p_two_smokes () {   # $1 = proof_smoke under test, $2 = scratch; TWO smokes, one job
+  (
+    set -u
+    export SMOKE_SRC_WS=$2/src SMOKE_MIRROR_ROOT=$2/mirror
+    psg_p_srcws "$SMOKE_SRC_WS" || exit 90
+    mkdir -p "$SMOKE_MIRROR_ROOT" || exit 90
+    PROOF_SMOKE_LIB=1 . "$1" || exit 91
+    KEY=$(smoke_stage_key); echo "P_KEY=$KEY"
+    smoke_stage "$2/ws1" || exit 92
+    smoke_stage "$2/ws2" || exit 93
+    echo "P_STAMP=$( [ -f "$SMOKE_MIRROR_ROOT/$KEY/.stage-mirror-key" ] && echo yes || echo no )"
+    echo "P_TEMP=$(find "$SMOKE_MIRROR_ROOT" -maxdepth 1 -name '*.building.*' | wc -l)"
+    for w in ws1 ws2; do
+      echo "P_${w}=$( [ -s "$2/$w/a/f2.txt" ] && [ -s "$2/$w/a/b/f3.txt" ] \
+                   && [ -s "$2/$w/a/b/c/f4.txt" ] \
+                   && [ -s "$2/$w/third_party/pkg.egg-info/requires.txt" ] && echo ok || echo missing )"
+    done
+    sh=0
+    for r in a/f2.txt a/b/f3.txt a/b/c/f4.txt third_party/pkg.egg-info/requires.txt; do
+      [ "$(stat -c %i "$SMOKE_MIRROR_ROOT/$KEY/$r" 2>/dev/null)" \
+        = "$(stat -c %i "$SMOKE_SRC_WS/$r" 2>/dev/null)" ] && sh=$((sh+1))
+    done
+    echo "P_SHARED=$sh"
+  ) > "$2/out.txt" 2>&1
+}
+mkdir -p "$PFX/base"; psg_p_two_smokes "$PS_UNDER_TEST" "$PFX/base"
+POUT=$(cat "$PFX/base/out.txt")
+pfield () { printf '%s\n' "$POUT" | sed -n "s/^$1=//p" | head -1; }
+PPUB=$(grep -c 'SMOKE stage: PUBLISHED root=' "$PFX/base/out.txt")
+PHIT=$(grep -c 'SMOKE stage: mirror HIT'      "$PFX/base/out.txt")
+PMISS=$(grep -c 'SMOKE stage: NO mirror for key' "$PFX/base/out.txt")
+
+[ "$PPUB" = 1 ] && [ "$(pfield P_STAMP)" = yes ]
+chk P1 $? "the first smoke on an EMPTY mirror root PUBLISHES its staged tree into the live root and stamps it" \
+         "published_rows=$PPUB stamp=$(pfield P_STAMP) out=$(printf '%s' "$POUT" | tr '\n' '|')"
+[ "$(pfield P_SHARED)" = 0 ]
+chk P2 $? "the BANKED mirror shares NO inode with \$SMOKE_SRC_WS -- what gets published is a real copy, not the .SRCLINKED poison" \
+         "shared=$(pfield P_SHARED) of 4 sampled"
+[ "$PHIT" = 1 ] && [ "$PMISS" = 1 ]
+chk P3 $? "a second smoke in the SAME job HITs the banked mirror -- exactly one HIT row and exactly one miss, so the one-time cost was paid once" \
+         "hit_rows=$PHIT miss_rows=$PMISS"
+[ "$(pfield P_ws1)" = ok ] && [ "$(pfield P_ws2)" = ok ] && [ "$(pfield P_TEMP)" = 0 ]
+chk P4 $? "BOTH workspaces carry the full payload across all three fan-out bands and no *.building.* temp is left behind" \
+         "ws1=$(pfield P_ws1) ws2=$(pfield P_ws2) leftover_temps=$(pfield P_TEMP)"
+
+# ---- P5: the live root appears between stage and publish --------------------
+# The DETERMINISTIC form of that race: the live root is already there when the
+# publish is attempted, so `mv -T` refuses and the loser must discard its temp
+# and adopt the winner -- no timing, nothing to lose a race to.
+(
+  set -u
+  export SMOKE_SRC_WS=$PFX/src2 SMOKE_MIRROR_ROOT=$PFX/mirror2
+  psg_p_srcws "$SMOKE_SRC_WS" || exit 90
+  mkdir -p "$SMOKE_MIRROR_ROOT" || exit 90
+  PROOF_SMOKE_LIB=1 . "$PS_UNDER_TEST" || exit 91
+  KEY=$(smoke_stage_key); M=$SMOKE_MIRROR_ROOT/$KEY
+  mkdir -p "$M"; printf 'key=%s\nsrc=THE-WINNER\n' "$KEY" > "$M/.stage-mirror-key"
+  printf 'winner-payload\n' > "$M/winner.txt"
+  B=$(md5sum "$M/.stage-mirror-key" | awk '{print $1}')
+  smoke_stage_build_mirror "$M" "$KEY" >/dev/null 2>&1; echo "P_ADOPT_RC=$?"
+  echo "P_ADOPT_TEMP=$(find "$SMOKE_MIRROR_ROOT" -maxdepth 1 -name '*.building.*' | wc -l)"
+  echo "P_ADOPT_KEPT=$( [ "$(md5sum "$M/.stage-mirror-key" | awk '{print $1}')" = "$B" ] \
+                     && [ -s "$M/winner.txt" ] && echo yes || echo no )"
+) > "$PFX/adopt.txt" 2>&1
+AOUT=$(cat "$PFX/adopt.txt")
+afield () { printf '%s\n' "$AOUT" | sed -n "s/^$1=//p" | head -1; }
+[ "$(afield P_ADOPT_RC)" = 3 ] && [ "$(afield P_ADOPT_TEMP)" = 0 ] && [ "$(afield P_ADOPT_KEPT)" = yes ]
+chk P5 $? "when the live root appeared meanwhile the builder DISCARDS its temp and adopts (rc 3), leaving the winner's mirror byte-untouched" \
+         "rc=$(afield P_ADOPT_RC) leftover_temps=$(afield P_ADOPT_TEMP) winner_intact=$(afield P_ADOPT_KEPT) out=$(printf '%s' "$AOUT" | tr '\n' '|')"
+
+# ---- P6: MUTATION -- cut the publish's stamp --------------------------------
+# The stamp is what makes a published tree FINDABLE: the HIT check keys on it.
+# Send it to /dev/null and the tree is still renamed into place but no later
+# smoke can ever recognise it -- which is the 6010236 defect exactly, a mirror
+# root the next smoke misses. P3 must go RED.
+PS_PMUT=$PFX/proof_smoke.pmut.sh
+sed 's%> "$b/.stage-mirror-key"%> /dev/null%' "$PS_UNDER_TEST" > "$PS_PMUT"
+pmutn=$(diff <(cat "$PS_UNDER_TEST") <(cat "$PS_PMUT") | grep -c '^<')
+if [ "$pmutn" != 1 ]; then
+  fail=$((fail+1))
+  echo "### PSG FAIL P6   the mutation changed $pmutn lines, want 1 -- a mutation that does not mutate proves nothing"
+else
+  mkdir -p "$PFX/mut"; psg_p_two_smokes "$PS_PMUT" "$PFX/mut"
+  MHIT=$(grep -c 'SMOKE stage: mirror HIT'         "$PFX/mut/out.txt")
+  MMISS=$(grep -c 'SMOKE stage: NO mirror for key' "$PFX/mut/out.txt")
+  [ "$MHIT" = 0 ] && [ "$MMISS" = 2 ]
+  chk P6 $? "MUTATION: with the mirror stamp never written the second smoke MISSES again (0 HIT rows, 2 miss rows) -- P3 measures the publish, not the fixture" \
+           "hit_rows=$MHIT miss_rows=$MMISS out=$(tr '\n' '|' < "$PFX/mut/out.txt")"
+fi
+grep -q '^    smoke_stage_build_mirror "\$mirror" "\$key"; rc=\$?$' "$PS_UNDER_TEST"
+chk P7 $? "smoke_stage's MISS branch CALLS smoke_stage_build_mirror -- the publish has a production call site" "no call site found"
+rm -rf "$PFX"
 
 if [ -n "${PSG_FIXTURE_ONLY:-}" ]; then
   # A cheap CPU job can run the fixture arms alone. The heavy arms below stage

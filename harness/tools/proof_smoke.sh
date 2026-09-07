@@ -588,8 +588,114 @@ smoke_stage_break_links () {     # $1 = workspace; MUST run before anything lock
   echo "### SMOKE stage: files still sharing an inode with the mirror (expected -- atomic-rename writers): $(find "$ws" -path "$ws/third_party" -prune -o -type f -links +1 -print 2>/dev/null | wc -l)"
 }
 
+# ── THE MISS PATH MUST BANK ITS ONE-TIME COST (PROOF-SMOKE-1-6) ─────────────
+# MEASURED, job 6010236 arm A: `### SMOKE stage: NO mirror for key 85db7fdb...
+# -- rsync path (one-time cost)` then `rsync+cp -al wall=748s`, and the live
+# mirror root was ABSENT both BEFORE and AFTER that job (`### PSGM MIRROR
+# BEFORE live root ABSENT` / `### PSGM MIRROR AFTER live root ABSENT`).
+# Twelve minutes of real bytes, paid and thrown away -- because the else-branch
+# below rsync'd straight into the JOB'S OWN workspace and never wrote $mirror at
+# all.  Nothing under $SMOKE_MIRROR_ROOT was ever created by this file: its ONLY
+# mention of `.stage-mirror-key` was the HIT check that READS it.  So the next
+# smoke missed, and paid again.  "One-time cost" was a claim the row made and
+# the path did not honour -- the mirror was every smoke's cost, not one smoke's.
+#
+# THE THREE THINGS IT IS NOT, each falsified rather than assumed.  NOT the
+# reaper: `multiarm_store_reap.sh` refuses every path not strictly under
+# REAP_JOB_ROOT AND refuses again when a declared PERSISTENT root is at or under
+# the target, REAP_PERSISTENT_DEFAULT being the mirror parent's own parent
+# (guard checks 5, 6, 7a-7c) -- 6010236's eight reaps were all under
+# /oscar/data/stellex/glvov/retread/psgm6010236.  NOT a publish under a suffixed
+# name the HIT check never looks for: the live parent holds 7 entries, 5 of them
+# .DIRTY-/.SRCLINKED- quarantines, and none of the 7 is from 6010236.  NOT a
+# mid-run quarantine: there is no .DIRTY-6010236, and this file has no post-run
+# mirror verify that could have written one (`stage_verify_mirror` is named in
+# the note above as BOARDED AND STILL ABSENT here, and it still is -- adding it
+# changes what a smoke DOES on failure, which is a verdict change and is not
+# this lane's).  The mirror was simply never created.
+#
+# THE FIX IS THE ONE phaseN_relock.sh's `stage_build_mirror` ALREADY GOT RIGHT:
+# build into a SIBLING temp under the mirror PARENT and `mv -T` it into the live
+# root.  Sibling because a rename is atomic only within one filesystem, and `-T`
+# because it REFUSES to move into an existing directory -- which is exactly the
+# concurrent-builder resolution wanted: the loser discards its temp and ADOPTS
+# the winner's mirror.  A reader therefore never sees a half-built mirror, only
+# no mirror or a whole one.
+#
+# AND third_party IS RSYNC'D AS A REAL COPY, NEVER `cp -al`.  Hardlinking it out
+# of $SMOKE_SRC_WS is fine for a workspace that dies with the job and is POISON
+# for a mirror that outlives it: every later workspace staged from such a mirror
+# would be hardlinked into the read-only canonical tree, and setuptools'
+# in-place egg_info rewrite would land in imprint-data.  That is not
+# hypothetical -- it is the `.SRCLINKED-<jobid>` quarantine sitting in the live
+# parent right now.  `smoke_stage_assert_mirror_disjoint` is the reader for that
+# writer and it runs BEFORE the publish, so a poisoned mirror is discarded
+# instead of shared.
+#
+# Reader: tools/proof_smoke_guard.sh, arm P.
+
+smoke_stage_cp_al_from_mirror () {  # $1 = mirror, $2 = workspace; THE one fan-out
+  local mirror=$1 ws=$2
+  ( cd "$mirror" && find . -mindepth 1 -maxdepth 2 -type d -printf '%P\n' ) \
+    | grep -vF '.stage-mirror-' | sed "s|^|$ws/|" | tr '\n' '\0' \
+    | xargs -0 -r -n 64 -P "$SMOKE_STAGE_PAR" mkdir -p || return 1
+  # TWO finds, not one expression: -mindepth/-maxdepth are GLOBAL options in
+  # GNU find, so a combined expression silently drops every shallow file.
+  { ( cd "$mirror" && find . -mindepth 1 -maxdepth 2 ! -type d -printf '%P\n' )
+    ( cd "$mirror" && find . -mindepth 3 -maxdepth 3            -printf '%P\n' ) } \
+    | grep -vF '.stage-mirror-' | tr '\n' '\0' \
+    | xargs -0 -r -I{} -P "$SMOKE_STAGE_PAR" cp -al "$mirror/{}" "$ws/{}" || return 1
+}
+
+smoke_stage_assert_mirror_disjoint () {  # $1 = tree; must share NO inode with $SMOKE_SRC_WS
+  local b=$1 rel n=0 shared=0
+  while IFS= read -r rel; do
+    [ -f "$SMOKE_SRC_WS/$rel" ] || continue
+    n=$((n+1))
+    [ "$(stat -c %i "$b/$rel" 2>/dev/null)" = "$(stat -c %i "$SMOKE_SRC_WS/$rel" 2>/dev/null)" ] \
+      && shared=$((shared+1))
+  done < <( ( cd "$b" && find . -type f -printf '%P\n' 2>/dev/null ) \
+              | grep -vF '.stage-mirror-' | shuf -n 50 )
+  echo "### SMOKE stage: mirror-vs-source inode check: sampled $n, shared $shared (want 0)"
+  [ "$shared" = 0 ]
+}
+
+smoke_stage_build_mirror () {    # $1 = live root, $2 = key; rc 0 PUBLISHED, 3 ADOPTED, 1 failed
+  local m=$1 key=$2 b jid S
+  # $J is defined in the NON-sourceable half, below the PROOF_SMOKE_LIB guard,
+  # so this half must resolve the job id for itself or a sourcing caller gets
+  # an unbound variable instead of a mirror.
+  jid=${SLURM_JOB_ID:-$$}
+  b=$m.building.$jid
+  mkdir -p "$SMOKE_MIRROR_ROOT" 2>/dev/null
+  rm -rf "$b" 2>/dev/null
+  mkdir -p "$b" || return 1
+  S=$(date +%s)
+  rsync -a --exclude '/.pixi/' --exclude '/pixi.lock' --exclude '/pixi.lock.*' \
+           --exclude '/logs/' --exclude '/results/' --exclude '/scratchpad/' \
+           --exclude '/third_party/' "$SMOKE_SRC_WS/" "$b/" || { rm -rf "$b"; return 1; }
+  mkdir -p "$b/third_party" || { rm -rf "$b"; return 1; }
+  rsync -a "$SMOKE_SRC_WS/third_party/" "$b/third_party/" || { rm -rf "$b"; return 1; }
+  echo "### SMOKE stage: mirror build rsync wall=$(( $(date +%s) - S ))s (third_party a REAL COPY, not cp -al)"
+  smoke_stage_assert_mirror_disjoint "$b" || {
+    echo "### SMOKE stage: FATAL -- the built mirror shares inodes with $SMOKE_SRC_WS; DISCARDED, not published"
+    rm -rf "$b"; return 1; }
+  # The stamp is what makes a published tree FINDABLE: the HIT check keys on it,
+  # so it is written last, into the temp, and becomes visible only at the rename.
+  { echo "key=$key"; echo "src=$SMOKE_SRC_WS"
+    echo "pixi_toml_md5=$(md5sum "$SMOKE_SRC_WS/pixi.toml" | awk '{print $1}')"
+    echo "git_head=$(git -C "$SMOKE_SRC_WS" rev-parse HEAD 2>/dev/null || echo nogit)"
+    echo "built_by_job=$jid"; echo "built_at=$(date -Is)"; } > "$b/.stage-mirror-key" \
+    || { rm -rf "$b"; return 1; }
+  if mv -T "$b" "$m" 2>/dev/null; then return 0; fi
+  # -T refused: a live root appeared while we staged. Discard ours, adopt theirs.
+  rm -rf "$b"
+  [ -f "$m/.stage-mirror-key" ] || return 1
+  return 3
+}
+
 smoke_stage () {                 # $1 = workspace to create
-  local ws=$1 key mirror S
+  local ws=$1 key mirror S rc
   key=$(smoke_stage_key)
   mirror=$SMOKE_MIRROR_ROOT/$key
   # BEFORE a single inode is handed out. A BUSY mirror is a SETUP refusal, never
@@ -599,24 +705,20 @@ smoke_stage () {                 # $1 = workspace to create
   if [ -f "$mirror/.stage-mirror-key" ] && grep -qx "key=$key" "$mirror/.stage-mirror-key"; then
     echo "### SMOKE stage: mirror HIT $mirror (key $key)"
     S=$(date +%s)
-    ( cd "$mirror" && find . -mindepth 1 -maxdepth 2 -type d -printf '%P\n' ) \
-      | grep -vF '.stage-mirror-' | sed "s|^|$ws/|" | tr '\n' '\0' \
-      | xargs -0 -r -n 64 -P "$SMOKE_STAGE_PAR" mkdir -p || return 1
-    # TWO finds, not one expression: -mindepth/-maxdepth are GLOBAL options in
-    # GNU find, so a combined expression silently drops every shallow file.
-    { ( cd "$mirror" && find . -mindepth 1 -maxdepth 2 ! -type d -printf '%P\n' )
-      ( cd "$mirror" && find . -mindepth 3 -maxdepth 3            -printf '%P\n' ) } \
-      | grep -vF '.stage-mirror-' | tr '\n' '\0' \
-      | xargs -0 -r -I{} -P "$SMOKE_STAGE_PAR" cp -al "$mirror/{}" "$ws/{}" || return 1
+    smoke_stage_cp_al_from_mirror "$mirror" "$ws" || return 1
     echo "### SMOKE stage: cp -al wall=$(( $(date +%s) - S ))s"
   else
     echo "### SMOKE stage: NO mirror for key $key -- rsync path (one-time cost)"
     S=$(date +%s)
-    rsync -a --exclude '/.pixi/' --exclude '/pixi.lock' --exclude '/pixi.lock.*' \
-             --exclude '/logs/' --exclude '/results/' --exclude '/scratchpad/' \
-             --exclude '/third_party/' "$SMOKE_SRC_WS/" "$ws/" || return 1
-    cp -al "$SMOKE_SRC_WS/third_party" "$ws/third_party" || return 1
-    echo "### SMOKE stage: rsync+cp -al wall=$(( $(date +%s) - S ))s"
+    smoke_stage_build_mirror "$mirror" "$key"; rc=$?
+    case $rc in
+      0) echo "### SMOKE stage: PUBLISHED root=$mirror wall=$(( $(date +%s) - S ))s" ;;
+      3) echo "### SMOKE stage: mirror HIT $mirror (key $key) -- the live root appeared while we staged; our temp was discarded" ;;
+      *) return 1 ;;
+    esac
+    S=$(date +%s)
+    smoke_stage_cp_al_from_mirror "$mirror" "$ws" || return 1
+    echo "### SMOKE stage: cp -al wall=$(( $(date +%s) - S ))s"
   fi
   # NOTHING may lock against these inodes until they are the job's own.
   smoke_stage_break_links "$ws" || return 1
