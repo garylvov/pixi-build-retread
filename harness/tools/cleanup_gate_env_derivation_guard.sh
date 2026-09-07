@@ -177,16 +177,28 @@ grep -q -- "--export=D=" "$WORK/D.log" \
   && ok "D: the refusal prints the exact --export clause to add" || bad "D: the refusal does not print the export line"
 # OWNER-EXPORT-1. The clause this refusal prints is the one an operator COPIES,
 # so it is a submit path like any other: a printed `--export=ALL,...` is how the
-# defect propagates into the next driver. `ALL` may appear in the PROSE that
-# explains why it is banned, but never inside an `--export=` clause.
-if grep -oE -- '--export=[^ "]*' "$WORK/D.log" | grep -q 'ALL'; then
-  bad "D: the printed --export clause still carries ALL -- that clause is what held 6013350/6013351/6014485/5841188"
+# defect propagates into the next driver.
+#
+# READ THE CLAUSE LINE, NOT EVERY `--export=` TOKEN ON THE PAGE. Job 6020490
+# measured the first cut of this arm failing on a CORRECT gate for two reasons
+# that were both the arm's: it scanned every `--export=` substring in the log, so
+# it matched the PROSE row that names `--export=ALL,...` in order to forbid it;
+# and it cut each token at the first space, so a placeholder written
+# `<harness dir>` truncated the clause after `D=<harness` and every later name
+# read as "omitted". The clause is now taken from the ROW THAT IS THE CLAUSE --
+# `###<spaces>--export=...` and nothing else -- and the gate's placeholders are
+# hyphenated, because a clause with a space in it was never pasteable anyway.
+DCL=$(sed -n 's/^###[[:space:]]*\(--export=[^ ]*\).*/\1/p' "$WORK/D.log" | head -1)
+if [ -z "$DCL" ]; then
+  bad "D: no line of the refusal IS an --export clause (a clause mentioned inside a sentence is not one an operator can copy)"
+elif printf '%s' "$DCL" | grep -q 'ALL'; then
+  bad "D: the printed --export clause still carries ALL -- that clause is what held 6013350/6013351/6014485/5841188: $DCL"
 else
-  ok "D: the printed --export clause carries NO ALL (OWNER-EXPORT-1)"
+  ok "D: the printed --export clause carries NO ALL (OWNER-EXPORT-1): $DCL"
 fi
 for v in D= TAG= RJ= DRY_RUN= PATH= HOME=; do
-  grep -oE -- '--export=[^ "]*' "$WORK/D.log" | grep -q -- "$v" \
-    && ok "D: the printed clause names $v" || bad "D: the printed clause omits $v -- an owner submitted from it runs with half its contract"
+  printf '%s' "$DCL" | grep -q -- "$v" \
+    && ok "D: the printed clause names $v" || bad "D: the printed clause omits $v -- an owner submitted from it runs with half its contract ($DCL)"
 done
 grep -qi "set D to the harness directory" "$WORK/D.log" \
   && bad "D: refused with a bash parameter-expansion error" || ok "D: refused with a message, not a bash error"

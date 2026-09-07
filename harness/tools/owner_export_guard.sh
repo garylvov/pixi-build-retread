@@ -164,8 +164,18 @@ fi
 # ---- ARM D: THE CONTINUATION, EXECUTED --------------------------------------
 # A real generated owner.sbatch, run with a shimmed sbatch and a wall too small
 # for the census it takes, so owner_wall_check MUST take the continuation branch.
+#
+# THE FIXTURE IS TASK-SHAPED, and it has to be. DET-1-6-a made owner_snapshot.sh
+# REFUSE a source whose provenance it cannot identify -- "Freezing it would put a
+# copy of nobody-knows-what in the job root under a row claiming provenance" --
+# so a stub in a bare temp directory is neither a git worktree nor a task copy
+# and every arm below dies rc 2 for a reason that has nothing to do with the
+# export clause. Job 6020490 measured exactly that. `merge-h/` beside a
+# `tools/.harness_synced_commit` is the shape cleanup_wall_guard.sh already uses
+# for the same tool and the same reason.
 JR=$W/jobroot; mkdir -p "$JR"
-FAKE=$W/fakescripts; mkdir -p "$FAKE"
+FAKE=$W/task/merge-h; mkdir -p "$FAKE" "$W/task/tools"
+printf '3333333333333333333333333333333333333333\n' > "$W/task/tools/.harness_synced_commit"
 cat > "$FAKE/cleanup_gated.sh" <<'EOS'
 #!/usr/bin/env bash
 echo "### FIXTURE cleanup_gated: roots=$*"
