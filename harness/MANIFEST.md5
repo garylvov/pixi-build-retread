@@ -53,7 +53,7 @@ f60ea7f2564d383ef1d45d13d0cb2232  tools/b2_attribute.sh
 62e2b386e47ce1d93d7bb92ce758d124  tools/binsnap_ancestry_guard_test.sh
 7da335e3f761e8682d04f2ac424ea947  tools/binsnap_fixset.txt
 338c5d78067aa05577ed082dea895211  tools/channel_mirror_server.py
-1828f0ccc4b7708e933308c59e483a7c  tools/cleanup_absent_root_guard.sh
+470156448c6c119c68d575505fc1bfc5  tools/cleanup_absent_root_guard.sh
 d46e02ed51852f281f89d4d98184e0f4  tools/cleanup_gate_env_derivation_guard.sh
 c56251e11ce8ab1bd8b807c395265fd4  tools/conda_deny_proxy.py
 fa9f15499e48cf716d7537fc286782eb  tools/derived_region_parse_check.sh

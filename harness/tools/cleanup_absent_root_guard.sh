@@ -51,7 +51,7 @@
 #       S1's fixture is stranded again, rc 2, no footer. S1 can fail.
 #
 # ── CLEANUP-SEAM-2 (2026-09-07), the same file, one seam further on again ────
-#   J1-J6  a job that died MID-ARM, after staging: its roots hold BYTES, so the
+#   J1-J7  a job that died MID-ARM, after staging: its roots hold BYTES, so the
 #       seam-1 branch declines and a SECOND branch decides. The full arm list
 #       sits at the J block below.
 #
@@ -375,6 +375,8 @@ fi
 #       task root. The old `find "$D" -maxdepth 2` found nothing, so a branch
 #       keyed on the job's own stdout was silent on the one job it was written
 #       for. The fallback must find it, ANNOUNCE the widening, and reap.
+#   J7  BOTH families in one stdout with bytes in the root: seam 1 declines OUT
+#       LOUD on the files and seam 2 decides. The ordering guarantee.
 #   J6  MUTATION: the branch's anchor line cut (counted, exactly 1) -> J1's
 #       fixture is stranded again, rc 2, no footer. J1 can fail.
 JF_ROW='### ARM W1 WRAPPER EXIT rc=7 arm wall=865s 2026-09-07T04:41:35-04:00'
@@ -437,9 +439,16 @@ grep -qF '### CLEANUP JOB-FATAL roots=2 removed=2' "$W/J1.log" \
 grep -qF "fatal_row=\"$JF_ROW\"" "$W/J1.log" \
   && ok "J1: and the footer QUOTES the row it acted on" \
   || bad "J1: the footer does not quote the fatal row: $(grep -F 'CLEANUP JOB-FATAL' "$W/J1.log" || echo '<none>')"
-grep -q 'SETUP-REFUSED NOT TAKEN' "$W/J1.log" \
-  && ok "J1: seam 1 DECLINED first (the roots hold bytes) -- the two branches are distinct" \
-  || bad "J1: seam 1 said nothing about declining; the fixture may not hold files"
+# MEASURED RED, job 6016160: this asserted `SETUP-REFUSED NOT TAKEN` and went
+# red while the branch had worked perfectly. Seam 1 does not decline a mid-arm
+# death -- it never speaks at all, because its regex is
+# PREAMBLE/SMOKE-refusal-only and a driver that ran two arms prints none of
+# those rows. Seam 1 returns at its own `[ -n "$row" ] || return 0`, exactly as
+# arm S3 requires it to for any job it was not written for. The SCOPING property
+# is what this row is really about, so it asserts the silence.
+grep -q 'SETUP-REFUSED' "$W/J1.log" \
+  && bad "J1: seam 1 spoke for a job that printed no preamble refusal row: $(grep -m1 'SETUP-REFUSED' "$W/J1.log")" \
+  || ok "J1: seam 1 is SILENT -- its regex is preamble-refusal-only, so a mid-arm death is not its case at all"
 { [ ! -e "$J1A" ] && [ ! -e "$J1B" ]; } \
   && ok "J1: both roots are really gone from disk" || bad "J1: a root survived"
 
@@ -488,6 +497,29 @@ grep -q "### JOB STDOUT: none under D=" "$W/J5.log" \
 grep -qF '### CLEANUP JOB-FATAL roots=1 removed=1' "$W/J5.log" \
   && ok "J5: the footer counts the one root" || bad "J5: footer wrong"
 [ ! -e "$J5A" ] && ok "J5: the root is really gone" || bad "J5: the root survived"
+
+# ---- J7: THE OVERLAP -- both families in one stdout, and roots with BYTES ----
+# The arm J1 was reaching for. A stdout can carry BOTH a preamble refusal row and
+# a job-fatal row (the preamble's own row is in both families by construction:
+# `MULTIARM_JOB_FATAL=1`), and then the ONLY thing that separates the two
+# branches is the state of the roots. With bytes in them, seam 1 must DECLINE
+# out loud -- `SETUP-REFUSED NOT TAKEN ... holds file(s)` -- and seam 2 must then
+# decide. That is the ordering guarantee: the more specific branch votes first
+# and hands over, rather than the two racing on the same fixture.
+TAG_J7=GUARDJ7$$;  HD_J7=$T/guard-j7-$$
+mkdir -p "$HD_J7/artifacts" "$HD_J7/logs"
+printf '%s\n' "$TAG_J7-$RJ owed roots" > "$HD_J7/artifacts/$TAG_J7-$RJ.reap-owed.txt"
+{ printf '%s\n' "$SR_ROW3"; printf '%s\n' "$JF_ROW"; } > "$HD_J7/logs/j7guard-$RJ.out"
+J7A=$W/roots/cert$TAG_J7-$RJ; mk_staged_root "$J7A"
+rc=$(runp "$BIN_FAILED" "$RMBED" "$W/J7.log" "$J7A")
+[ "$rc" = 0 ] && ok "J7: with BOTH families in one stdout and bytes in the root, the roots are still reclaimed (rc=0)" \
+  || { bad "J7: rc=$rc, want 0"; sed 's/^/      /' "$W/J7.log"; }
+grep -q 'SETUP-REFUSED NOT TAKEN' "$W/J7.log" && grep -q 'holds file(s)' "$W/J7.log" \
+  && ok "J7: seam 1 DECLINED OUT LOUD on the bytes -- the more specific branch votes first and hands over" \
+  || bad "J7: seam 1 did not decline on the files: $(grep -m1 'SETUP-REFUSED' "$W/J7.log" || echo '<silent>')"
+grep -qF '### CLEANUP JOB-FATAL roots=1 removed=1' "$W/J7.log" \
+  && ok "J7: and seam 2 decided, with its own footer" || bad "J7: no JOB-FATAL footer"
+rm -rf "$HD_J7"
 
 # ---- J6: THE MUTATION -- the branch cut out of the new file ------------------
 MUTJ=$W/cleanup_gated.MUTJ.sh
