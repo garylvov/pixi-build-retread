@@ -175,11 +175,25 @@ smoke_setup_failed () {
 # Returns 0 when the root is short enough, 1 when it is not.  PRINTS the two
 # measured numbers either way, because "it passed" is only readable if the
 # margin is on the page.
-smoke_prefix_budget () {
-  local root=$1 label=${2:-store root} entry len composed
+#
+# PROOF-SMOKE-1-3 (2026-09-06): the ARITHMETIC is split out of the VERDICT.
+# `multiarm_preamble.sh` has to COMPARE two roots -- the smoke's store root
+# against the LONGEST arm's -- before either is judged, and the only way to do
+# that with the rule as it stood was to re-derive the entry path beside it, i.e.
+# a second copy of a length rule.  `smoke_prefix_composed` is that one number,
+# `smoke_prefix_budget` is the one verdict, and both read `smoke_prefix_entry`.
+smoke_prefix_entry () {
   # the longest entry this store root can produce: <root>/retread/
   # hermetic-build-envs/v8/env-<64 hex>
-  entry="$root/retread/hermetic-build-envs/v8/env-$(printf 'a%.0s' $(seq 1 64))"
+  printf '%s/retread/hermetic-build-envs/v8/env-%s' "$1" "$(printf 'a%.0s' $(seq 1 64))"
+}
+smoke_prefix_composed () {
+  local entry; entry=$(smoke_prefix_entry "$1")
+  printf '%s' "$(( ${#entry} + SMOKE_PREFIX_TAIL ))"
+}
+smoke_prefix_budget () {
+  local root=$1 label=${2:-store root} entry len composed
+  entry=$(smoke_prefix_entry "$root")
   len=${#entry}
   composed=$(( len + SMOKE_PREFIX_TAIL ))
   echo "### SMOKE PREFIX BUDGET $label entry=$len composed=$composed pad=$SMOKE_PREFIX_PAD headroom=$(( SMOKE_PREFIX_PAD - composed )) root=$root"

@@ -35,6 +35,11 @@
 #      exactly as before. The refusal prints the two lists separately, and a call
 #      in which EVERY root is absent is a no-op that exits 0 rather than handing
 #      `cleanup.sh` a list of names.
+#   5. A JOB THE PREAMBLE REFUSED BEFORE ARM 1 HAS NO EVIDENCE AND NEVER WILL
+#      (CLEANUP-SEAM-1, 2026-09-06). Condition 1 waits for artifacts a job that
+#      ran no arm cannot write, so it kept `certDET141-6000903` and
+#      `ws.DET141-6000903` -- six empty directories -- forever. The branch above
+#      the conditions is `setup_refused_check`; the full reasoning sits at it.
 #
 # 2026-09-04 ROOT FIX (inode sweep 2, jobs 5764454/5764455 deleted NOTHING).
 # Two defects, both of them the same mistake -- treating a NAME SHAPE as the
@@ -260,6 +265,97 @@ if [ "${#PRESENT_ROOTS[@]}" -eq 0 ]; then
   echo "###   calling $CLEANUP."
   exit 0
 fi
+
+# --- CLEANUP-SEAM-1: A JOB THE PREAMBLE REFUSED BEFORE ARM 1 -----------------
+# MEASURED on det141-cleanup 6000916, the afterany owner of det141-proof 6000903.
+# 6000903 was refused by `multiarm_preamble.sh` in ELEVEN SECONDS -- its own
+# smoke's store root composed past the 256-byte pad -- so NO ARM RAN, and a job
+# that never ran an arm never writes `<TAG>-<J>.rc`, `.wall` or `.lock.log`.
+# Condition 1 then reported `### MISSING/EMPTY artifact:` three times, `###
+# recorded lock rc=missing (from <none>)`, and `### CLEANUP REFUSED -- nothing
+# deleted`, keeping `certDET141-6000903` and `ws.DET141-6000903`: SIX EMPTY
+# DIRECTORIES, no data, no lock, nothing to protect. And it would refuse them
+# again for the rest of time, because the evidence it waits for can never
+# arrive.
+#
+# THIS IS A SEAM DEFECT IN A PAIR, NOT A BUG IN EITHER FILE. The preamble's
+# SUCCESS CASE is refusing early and cheaply (that is the whole point of the
+# smoke); this gate's evidence condition assumes a run that got far enough to
+# produce evidence. Every future preamble refusal strands its roots the same way.
+#
+# THE BRANCH, and it sits ABOVE the conditions for the same reason MERGE-T-2's
+# all-absent no-op does -- with nothing to protect, the evidence conditions get
+# no vote:
+#   (i)   the relock job's OWN STDOUT under $D carries a preamble refusal row,
+#   (ii)  every present root holds NO file at all within the depth bound, and
+#   (iii) no directory under it is SEALED (write stripped -- the shape
+#         `multiarm_store_reap.sh` renames aside rather than deletes; there the
+#         proof is dev:inode containment plus write-stripped directories, and
+#         the containment half is `cleanup.sh`'s job on the line below).
+# Then the roots are removed THROUGH `cleanup.sh`, which is where the
+# containment refusals live -- this branch decides, it does not delete.
+#
+# A SEALED TREE IS THE REFUSAL THIS BRANCH KEEPS. Write-stripped directories
+# mean a rattler-build store really provisioned under that root; a run that got
+# that far is not a run the preamble refused before arm 1, whatever its stdout
+# says, and it refuses exactly as it does today.
+#
+# Reader: cleanup_absent_root_guard.sh, arms S1-S4.
+SETUP_REFUSED_RE='^### (PREAMBLE JOB REFUSED BEFORE ARM 1|PREAMBLE FATAL:|SMOKE SETUP_FAILED)'
+SETUP_REFUSED_DEPTH=8
+
+setup_refused_stdout () {
+  # The relock job's own stdout, found by its JOB ID under the harness dir --
+  # `find -maxdepth` per HANDOFF section 2, never a full-tree walk. Job names
+  # differ per lane (`$D/logs/det141-6000903.out`), the job id does not.
+  find "$D" -maxdepth 2 -type f -name "*$RJ*.out" 2>/dev/null | sort
+}
+
+setup_refused_check () {
+  local outs row r n files sealed deep removed=0 crc
+  outs=$(setup_refused_stdout)
+  [ -n "$outs" ] || return 0
+  row=$(printf '%s\n' "$outs" | while IFS= read -r f; do
+          grep -m1 -E "$SETUP_REFUSED_RE" "$f" 2>/dev/null && break
+        done)
+  [ -n "$row" ] || return 0
+  echo "### SETUP-REFUSED: the relock job $RJ refused itself before arm 1. Its own stdout says:"
+  echo "###   $row"
+  # Every present root must be provably empty AND unsealed, or this branch does
+  # not fire at all and the refusal below stands.
+  for r in "${PRESENT_ROOTS[@]+"${PRESENT_ROOTS[@]}"}"; do
+    deep=$(find "$r" -mindepth "$SETUP_REFUSED_DEPTH" -maxdepth "$SETUP_REFUSED_DEPTH" 2>/dev/null | head -1)
+    if [ -n "$deep" ]; then
+      echo "### SETUP-REFUSED NOT TAKEN: $r still has entries at depth $SETUP_REFUSED_DEPTH ($deep) -- emptiness cannot be proved inside the depth bound, so the evidence conditions decide."
+      return 0
+    fi
+    files=$(find "$r" -maxdepth "$SETUP_REFUSED_DEPTH" ! -type d 2>/dev/null | head -5)
+    sealed=$(find "$r" -maxdepth "$SETUP_REFUSED_DEPTH" -type d ! -writable 2>/dev/null | head -5)
+    n=$(find "$r" -maxdepth "$SETUP_REFUSED_DEPTH" -type d 2>/dev/null | wc -l)
+    echo "### SETUP-REFUSED root $r: dirs=$n files=$(printf '%s\n' "$files" | grep -c .) sealed_dirs=$(printf '%s\n' "$sealed" | grep -c .)"
+    if [ -n "$files" ]; then
+      echo "### SETUP-REFUSED NOT TAKEN: $r holds file(s) -- a root with bytes in it is not a root a preamble refusal left behind:"
+      printf '%s\n' "$files" | sed 's/^/###     /'
+      return 0
+    fi
+    if [ -n "$sealed" ]; then
+      echo "### SETUP-REFUSED NOT TAKEN: $r holds SEALED (write-stripped) director(ies) -- a provisioned store, so a run that reached the backend. Refusing exactly as before:"
+      printf '%s\n' "$sealed" | sed 's/^/###     /'
+      return 0
+    fi
+  done
+  echo "### SETUP-REFUSED TAKEN: ${#PRESENT_ROOTS[@]} present root(s), no file, no sealed tree, and no evidence can ever arrive for a job that ran no arm. Handing them to $CLEANUP (which owns the containment refusals)."
+  bash "$CLEANUP" "${PRESENT_ROOTS[@]}"; crc=$?
+  for r in "${PRESENT_ROOTS[@]+"${PRESENT_ROOTS[@]}"}"; do
+    if [ -e "$r" ]; then echo "### SETUP-REFUSED kept  $r (still on disk)"
+    else echo "### SETUP-REFUSED removed $r"; removed=$((removed + 1)); fi
+  done
+  echo "### CLEANUP SETUP-REFUSED roots=${#PRESENT_ROOTS[@]} removed=$removed cleanup_rc=$crc"
+  if [ "$crc" = 0 ] && [ "$removed" = "${#PRESENT_ROOTS[@]}" ]; then exit 0; fi
+  echo "### SETUP-REFUSED INCOMPLETE -- $CLEANUP returned $crc and $removed of ${#PRESENT_ROOTS[@]} root(s) are gone. Law 9: this rc reaches Slurm."
+  exit 2
+}
+setup_refused_check   # SETUP-REFUSED-BRANCH (MUTATION ANCHOR)
 
 # --- condition 1: the evidence is in the task root ----------------------------
 # A harness that GZIPS its lock log into the task root satisfies condition 1

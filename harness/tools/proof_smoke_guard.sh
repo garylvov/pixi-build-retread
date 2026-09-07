@@ -11,9 +11,9 @@
 #   Everything this guard creates lives under a SHORT scratch root it owns and
 #   is removed on the way out.
 #
-#   PREDICTED: pass=14 fail=0  (state this in the sbatch before submitting)
+#   PREDICTED: pass=18 fail=0  (state this in the sbatch before submitting)
 #
-# ── THE FOURTEEN CHECKS ────────────────────────────────────────────────────────
+# ── THE EIGHTEEN CHECKS ────────────────────────────────────────────────────────
 #   A1  the known-good binsnap reaches the frontend            REACHED_FRONTEND
 #   A2  ... and proof_smoke.sh exits 0
 #   B1  a stub that prints a panic and exits 1                 BACKEND_DIED
@@ -41,6 +41,14 @@
 #       before it could have run a smoke.
 #   F1  an unsatisfiable REQUIRED_UV is SETUP_FAILED rc=3 naming both versions --
 #       the guard for the pin that arm A of 5993691 proved was missing.
+#   G1  PROOF-SMOKE-1-3: on 6000903's OWN roots (a six-character tag) the arms
+#       fit and the SMOKE is not refused either.  Pure path arithmetic, no lock.
+#   G2  ... and the same with an EIGHT-character tag.
+#   G3  when the ARMS themselves overrun, the job still refuses and the refusal
+#       names the ARM budget -- shortening the smoke would fix nothing there.
+#   G4  MUTATION, pinned to $PSG_G_OLD (the commit 6000903 ran): on G1's fixture
+#       the arms PASS and the smoke's own root is REFUSED, and there is no
+#       symmetry row anywhere.  6000903, verbatim, so G1 can fail.
 set -uo pipefail
 
 # THE MUTATION ARM'S COMMIT CONSTANT -- the harness tip immediately BEFORE this
@@ -68,7 +76,7 @@ chk () {  # chk <name> <condition-rc> <what was wanted> <what was seen>
 echo "### PSG proof_smoke_guard.sh  $(date -Is)  host=$(hostname -s) job=$J"
 echo "### PSG scratch=$SCR  job_root=$JOB_ROOT"
 echo "### PSG good binsnap=$GOOD"
-echo "### PSG PREDICTED pass=14 fail=0"
+echo "### PSG PREDICTED pass=18 fail=0"
 
 # ---- the stubs --------------------------------------------------------------
 # They live at a path ENDING `/pixi-build-retread` because the shim readback
@@ -222,6 +230,122 @@ tail -6 "$FOUT"
 { [ "$frc" = 3 ] && grep -q '^### SMOKE SETUP_FAILED ' "$FOUT" && grep -q 'retread.s preflight wants 99.99.99' "$FOUT"; }
 chk F1 $? "an unsatisfiable REQUIRED_UV is SETUP_FAILED rc=3, naming both versions -- not a verdict about the binary" "rc=$frc $(grep -m1 '^### SMOKE [A-Z_]* binary=' "$FOUT" || echo '<no verdict row>')"
 
+# ---- G: the smoke root against the ARMS' roots (PROOF-SMOKE-1-3) ------------
+# THE DEFECT, MEASURED, not imagined: det141-proof 6000903 died in ELEVEN
+# SECONDS. Its three arm cache homes `$C/x<N>` composed to 247 (headroom 9) and
+# PASSED; its smoke's DEFAULT store root `$C/smk/c/x` composed to 252 (headroom
+# 4) and was REFUSED. The smoke exists to ask the CHEAP question before the arms
+# commit -- a smoke root LONGER than an arm root makes it ask a HARDER one, and
+# every driver re-cut onto this preamble with a six-character tag inherits that.
+#
+# THESE ARMS ARE PURE ARITHMETIC ON PATH LENGTHS: no binary, no stage, no lock,
+# nothing created on disk. The roots are NAMES, measured at their real byte
+# lengths under the real `/oscar/data/stellex/glvov/retread` base, and G1's is
+# 6000903's own root, character for character.
+#
+# THE SUBJECT IS THE REPO COPY, deliberately, and it is the same choice
+# `cleanup_absent_root_guard.sh` makes: this guard runs BEFORE the sync that
+# installs the fix into `$T/tools/`, so a G arm reading the task copy would test
+# the file the fix is not in yet. Arms A-F keep reading the task copies, which
+# is what makes them a control on the unchanged behaviour.
+echo ""; echo "########## PSG ARM G -- the smoke root vs the ARMS' roots ##########"
+PSG_G_PRE=${PSG_G_PRE:-$REPO/harness/tools/multiarm_preamble.sh}
+PSG_G_SMK=${PSG_G_SMK:-$REPO/harness/tools/proof_smoke.sh}
+# THE MUTATION'S COMMIT CONSTANT: the harness tip this lane opened on, the one
+# 6000903 ran. Pinned, never HEAD~1.
+PSG_G_OLD=${PSG_G_OLD:-8108ca48b21533d92a9371c8ef289877fd311eb8}
+RB=/oscar/data/stellex/glvov/retread
+
+cat > "$SCR/run_prefix.sh" <<'GRUNNER'
+#!/usr/bin/env bash
+# $1 smoke lib, $2 preamble, $3 cache root, $4 arm count, $5 new|old,
+# $6 (old only) the smoke store root the OLD default composes.
+set -uo pipefail
+PROOF_SMOKE_LIB=1 . "$1" || exit 9
+# shellcheck source=/dev/null
+. "$2" || exit 9
+MULTIARM_CACHE_ROOT=$3
+MULTIARM_ARMS=$4
+arms_rc=0
+for n in $(seq 1 "$4"); do
+  multiarm_prefix_check "$(multiarm_arm_cache_home "$n")" "arm $n cache home" || arms_rc=1
+done
+if [ "$5" = new ]; then sroot=$(multiarm_smoke_store_root); else sroot=$6; fi
+smoke_rc=0
+smoke_prefix_budget "$sroot" "smoke store root" || smoke_rc=1
+echo "### PSG-G ARMS_RC=$arms_rc SMOKE_RC=$smoke_rc mode=$5 smoke_root=$sroot"
+sym_rc=9
+if declare -F multiarm_smoke_prefix_symmetry >/dev/null 2>&1; then
+  sym_rc=0; multiarm_smoke_prefix_symmetry || sym_rc=1
+else
+  echo "### PSG-G no multiarm_smoke_prefix_symmetry in $2 -- a pre-fix preamble"
+fi
+echo "### PSG-G SYM_RC=$sym_rc"
+GRUNNER
+chmod +x "$SCR/run_prefix.sh"
+
+grun () {  # grun <log> <smoke lib> <preamble> <cache root> <arms> <mode> [old root]
+  # `SMOKE_CACHE`/`SMOKE_ROOT`/`SMOKE_WS` are EXPORTED above for arms A-F, and
+  # `multiarm_smoke_cache_home` honours an override by design -- so a G arm that
+  # inherited them would measure the guard's own scratch instead of the fixture,
+  # and would pass whatever the preamble did. They are stripped per call.
+  local log=$1; shift
+  env -u SMOKE_CACHE -u SMOKE_ROOT -u SMOKE_WS bash "$SCR/run_prefix.sh" "$@" >"$log" 2>&1
+  cat "$log"
+}
+gval () { sed -n "s/.*$2=\([^ ]*\).*/\1/p" "$1" | head -1; }
+
+# G1: 6000903's own shape -- a SIX-character tag, three arms.
+G1C=$RB/certDET141-6000903
+G1LOG=$OUT/psg-$J-G1.out
+grun "$G1LOG" "$PSG_G_SMK" "$PSG_G_PRE" "$G1C" 3 new
+{ [ "$(gval "$G1LOG" ARMS_RC)" = 0 ] && [ "$(gval "$G1LOG" SMOKE_RC)" = 0 ] && [ "$(gval "$G1LOG" SYM_RC)" = 0 ]; }
+chk G1 $? "a 6-character tag: arms fit AND the smoke is NOT refused (6000903's exact roots)" \
+  "arms=$(gval "$G1LOG" ARMS_RC) smoke=$(gval "$G1LOG" SMOKE_RC) sym=$(gval "$G1LOG" SYM_RC)"
+
+# G2: an EIGHT-character tag, on a root two bytes shorter, so the arms still
+# clear the headroom band and the question stays about the SMOKE.
+G2C=$RB/gDET14100-6000903
+G2LOG=$OUT/psg-$J-G2.out
+grun "$G2LOG" "$PSG_G_SMK" "$PSG_G_PRE" "$G2C" 3 new
+{ [ "$(gval "$G2LOG" ARMS_RC)" = 0 ] && [ "$(gval "$G2LOG" SMOKE_RC)" = 0 ] && [ "$(gval "$G2LOG" SYM_RC)" = 0 ]; }
+chk G2 $? "an 8-character tag: arms fit AND the smoke is NOT refused" \
+  "arms=$(gval "$G2LOG" ARMS_RC) smoke=$(gval "$G2LOG" SMOKE_RC) sym=$(gval "$G2LOG" SYM_RC)"
+
+# G3: THE ARMS THEMSELVES OVERRUN. The job must still refuse, and the refusal
+# must name the ARM budget -- shortening the smoke would fix nothing here.
+G3C=$RB/certAVERYLONGTAGINDEED-6000903
+G3LOG=$OUT/psg-$J-G3.out
+grun "$G3LOG" "$PSG_G_SMK" "$PSG_G_PRE" "$G3C" 3 new
+{ [ "$(gval "$G3LOG" ARMS_RC)" = 1 ] && [ "$(gval "$G3LOG" SMOKE_RC)" = 1 ] \
+  && grep -q 'SMOKE PREFIX SYMMETRY .*max_arm_composed=' "$G3LOG" \
+  && grep -q 'arm 3 cache home' "$G3LOG"; }
+chk G3 $? "arms that overrun refuse the job AND the symmetry row names the ARM budget" \
+  "arms=$(gval "$G3LOG" ARMS_RC) smoke=$(gval "$G3LOG" SMOKE_RC) sym_row=$(grep -c 'SMOKE PREFIX SYMMETRY' "$G3LOG")"
+
+# G4: THE MUTATION -- 6000903's own preamble, extracted from the commit it ran,
+# on G1's fixture. The OLD default suffix is READ OUT of the old file rather
+# than restated here: a guard that hardcodes the thing it is mutating away from
+# stops testing the moment that default moves.
+G4PRE=$SCR/multiarm_preamble.$PSG_G_OLD.sh
+G4SMK=$SCR/proof_smoke.$PSG_G_OLD.sh
+G4LOG=$OUT/psg-$J-G4.out
+if git -C "$REPO" show "$PSG_G_OLD:harness/tools/multiarm_preamble.sh" > "$G4PRE" 2>/dev/null && [ -s "$G4PRE" ] \
+   && git -C "$REPO" show "$PSG_G_OLD:harness/tools/proof_smoke.sh" > "$G4SMK" 2>/dev/null && [ -s "$G4SMK" ]; then
+  OLDSUF=$(grep -oE 'SMOKE_CACHE:-\$MULTIARM_CACHE_ROOT[^}]*' "$G4PRE" | head -1 | sed 's/.*MULTIARM_CACHE_ROOT//')
+  echo "### PSG-G the pinned $PSG_G_OLD preamble's smoke cache default is \$MULTIARM_CACHE_ROOT$OLDSUF"
+  if [ -z "$OLDSUF" ]; then
+    fail=$((fail+1)); echo "### PSG FAIL G4   could not read the old smoke-cache default out of $PSG_G_OLD -- WRONG PIN, G1 proves nothing"
+  else
+    grun "$G4LOG" "$G4SMK" "$G4PRE" "$G1C" 3 old "$G1C$OLDSUF/x"
+    { [ "$(gval "$G4LOG" ARMS_RC)" = 0 ] && [ "$(gval "$G4LOG" SMOKE_RC)" = 1 ] && [ "$(gval "$G4LOG" SYM_RC)" = 9 ]; }
+    chk G4 $? "THE DEFECT, REPRODUCED: at $PSG_G_OLD the arms PASS and the smoke's own root is REFUSED, with no symmetry row anywhere -- 6000903 verbatim" \
+      "arms=$(gval "$G4LOG" ARMS_RC) smoke=$(gval "$G4LOG" SMOKE_RC) sym=$(gval "$G4LOG" SYM_RC)"
+  fi
+else
+  fail=$((fail+1)); echo "### PSG FAIL G4   could not extract $PSG_G_OLD's preamble/proof_smoke -- THE MUTATION DID NOT RUN"
+fi
+
 # ---- the scratch goes FIRST, and the verdict is the LAST thing on the page --
 # ORDER MATTERS HERE AND IT IS NOT STYLE.  In `psmoke-guards` 5993691 the
 # removal ran for FIVE MINUTES (a `cp -al` workspace of 44k entries over NFS)
@@ -282,7 +406,7 @@ echo "### PSG per-arm verdicts:"
 for f in "$AOUT" "$BOUT" "$COUT" "$FOUT"; do
   printf '###   %-28s %s\n' "$(basename "$f")" "$(grep -m1 '^### SMOKE [A-Z_]* binary=' "$f" 2>/dev/null || echo '<none>')"
 done
-echo "### PSG SUMMARY pass=$pass fail=$fail (predicted pass=14 fail=0)"
+echo "### PSG SUMMARY pass=$pass fail=$fail (predicted pass=18 fail=0)"
 echo "### PSG FINAL pass=$pass fail=$fail"
 if [ "$fail" -eq 0 ]; then exit 0; fi
 exit 1

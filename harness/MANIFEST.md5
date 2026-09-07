@@ -24,7 +24,7 @@ a2deab8ba099cc7a3055dc5e4f74da50  instrumented/p6b_stamp.py
 5c116bc032f62e38e1a822b44284ef06  manifests/a3b/isaaclab-2.3x-pack.pixi.toml.a3b2only.diff
 cc3a5b8dbd993448f33cc6c0329df768  manifests/a3b/README.md
 ff372fca5de0277efa02c3d65e1cea7e  phase_template/census_collation_guard.sh
-a7b4036ad033be0f29e87312b7d7f42c  phase_template/cleanup_gated.sh
+49fd2a525a3ee059e96862afb514bab7  phase_template/cleanup_gated.sh
 3f2101c6bd74757a12ba1de7e97aac5b  phase_template/cleanup_lock_evidence_guard.sh
 e893ee7f20e181181bb8205ab7edda0c  phase_template/cleanup_owner_guard.sh
 8cc39f42cf0dcda7c93878195cbac569  phase_template/cleanup.sh
@@ -47,7 +47,7 @@ f60ea7f2564d383ef1d45d13d0cb2232  tools/b2_attribute.sh
 62e2b386e47ce1d93d7bb92ce758d124  tools/binsnap_ancestry_guard_test.sh
 7e30cbbcdd00dbb4596c2f31937de6a2  tools/binsnap_fixset.txt
 338c5d78067aa05577ed082dea895211  tools/channel_mirror_server.py
-d952f7f60f22643c98312477d4a7fc20  tools/cleanup_absent_root_guard.sh
+c742abaa0fda01afbafa3b9418557fbf  tools/cleanup_absent_root_guard.sh
 d46e02ed51852f281f89d4d98184e0f4  tools/cleanup_gate_env_derivation_guard.sh
 c56251e11ce8ab1bd8b807c395265fd4  tools/conda_deny_proxy.py
 2f0be92999054f5e2e53e0a6520c0934  tools/driver_exit_baseline.txt
@@ -77,7 +77,7 @@ e02808a84a7409e9b96a577fbae3dfe9  tools/moved_rows_match_guard.sh
 62db5ba03d4644ccd514f1727db6f7c3  tools/moved_rows_match.sh
 00e4cbab1c56c0f8cdd613bf116bec8c  tools/msgpack_min_guard.py
 5d4435226ca639942f2227c290e09953  tools/msgpack_min.py
-5c5bd930e1de2674db9e17c6d045f3be  tools/multiarm_preamble.sh
+e00d870cc3e71398e7f59000b35bfe0c  tools/multiarm_preamble.sh
 36af6a82e5884fb1a98251f206dad185  tools/multiarm_store_reap_guard.sh
 5703d740537be994ecbb007272a1fa64  tools/multiarm_store_reap.sh
 cbfb1b91ab68fab2110b94fdae2446ad  tools/mutation_arms_guard.sh
@@ -97,8 +97,8 @@ ca28f32b8c5556397f7a965fba6e72b8  tools/p6af2h_probe4_uvenv.sh
 c34a4e3a1a8834b073b997fc94230a9f  tools/pixi_merge_run_exports.py
 c9f561484d8ef42157ba6a7532f80681  tools/pixi_shard_cache.py
 6960c0ac937f51969cd1d4f1e1af65c2  tools/pixi_trim_repodata.py
-67bb0844e23264e0eac5ffcd0b2fdcc3  tools/proof_smoke_guard.sh
-95fe8b0e5f0206d223eea81690dfb8e5  tools/proof_smoke.sh
+e65b5ee422df7ded8eaa677e4da43e25  tools/proof_smoke_guard.sh
+b28bef92b39262699c814d383a7d8618  tools/proof_smoke.sh
 dd16a8c662b31dda554a2bdc052ba94d  tools/retread_fast_env.sh
 46b5ede95808302e562b66b2e1a2201a  tools/retread_shard_mirror.sh
 bdd93cc2798a27301e793bdc6931be06  tools/sdist_build_poison_guard.sh

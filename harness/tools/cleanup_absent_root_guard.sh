@@ -39,6 +39,17 @@
 #   M5  the fix is SCOPED: a PRESENT root with missing evidence refuses on the
 #       old file and on the new one alike.
 #
+# ── CLEANUP-SEAM-1 (2026-09-06), the same file, one seam further on ──────────
+#   S1  a job whose stdout carries a preamble refusal row, with EMPTY roots ->
+#       removed through `cleanup.sh`, footer `### CLEANUP SETUP-REFUSED roots=2
+#       removed=2`, each path named, the refusal row it acted on quoted.
+#   S2  the same, but one root holds a SEALED (write-stripped) subtree -> refused
+#       exactly as today, `cleanup.sh` never called, nothing deleted.
+#   S3  a present root whose job printed NO refusal row -> the old refusal,
+#       verbatim, and the branch says nothing at all. The fix is scoped.
+#   S4  MUTATION: the branch's anchor line cut (counted, must be exactly 1) ->
+#       S1's fixture is stranded again, rc 2, no footer. S1 can fail.
+#
 # NOTHING IS EVER DELETED BY THIS GUARD.  The gate under test is run from a COPY
 # in a temp dir beside a STUB `cleanup.sh` that only prints a marker, so the real
 # deletion machinery is not on the path at all; the one root that EXISTS is a
@@ -211,6 +222,121 @@ if git -C "$REPO" show "$T2_OLD:harness/phase_template/cleanup_gated.sh" > "$T2F
     || bad "M5: present-root refusal moved: old=$rc new=$rcn"
 else
   bad "M4: could not extract $T2_OLD:harness/phase_template/cleanup_gated.sh -- THE MERGE-T-2 MUTATION DID NOT RUN"
+fi
+
+# ---- S1-S4: CLEANUP-SEAM-1, the preamble-refused job ------------------------
+# 6000916 refused `certDET141-6000903` and `ws.DET141-6000903` forever: 6000903
+# was refused by the preamble in 11 s, ran NO arm, and so could never write the
+# `.rc`/`.wall`/`.lock.log` condition 1 waits for. Six empty directories, kept
+# by a gate that was doing exactly what it was written to do.
+#
+# THE FIXTURES ARE THE REAL SHAPE, not a sketch: the harness dir holds the ONE
+# artifact such a job does write (`<TAG>-<J>.reap-owed.txt`, which is what
+# `det141-work/artifacts/` actually held) so `derive_harness_dir` still finds D
+# while every condition-1 artifact is missing, and the stdout carries the three
+# rows 6000903 printed, verbatim.
+SR_ROW1='### SMOKE SETUP_FAILED binary=eb032bf58ca94cdafc2ebcd4fdef66ad07bf4b25bd57b73f50b9e91c9aaa7575 wall=0s'
+SR_ROW2='### PREAMBLE FATAL: SMOKE FIX rc=3 -- this binary did not reach the frontend'
+SR_ROW3='### PREAMBLE JOB REFUSED BEFORE ARM 1. MULTIARM_JOB_FATAL=1'
+
+mk_refused_harness () {   # mk_refused_harness <dir> <tag> <rj> <refused: yes|no>
+  mkdir -p "$1/artifacts" "$1/logs"
+  printf '%s\n' "$2-$3 owed roots" > "$1/artifacts/$2-$3.reap-owed.txt"
+  if [ "$4" = yes ]; then
+    printf '%s\n%s\n%s\n' "$SR_ROW1" "$SR_ROW2" "$SR_ROW3" > "$1/logs/srguard-$3.out"
+  else
+    printf '### PREAMBLE CLEAN: pin+drift ok\n### ARM 1 lock rc=0\n' > "$1/logs/srguard-$3.out"
+  fi
+}
+TAG_SR=GUARDSR$$;  HD_SR=$T/guard-sr-$$;  mk_refused_harness "$HD_SR" "$TAG_SR" "$RJ" yes
+TAG_NR=GUARDNR$$;  HD_NR=$T/guard-nr-$$;  mk_refused_harness "$HD_NR" "$TAG_NR" "$RJ" no
+trap 'chmod -R u+w "$W" 2>/dev/null; rm -rf "$HD_BAD" "$HD_OK" "$HD_SR" "$HD_NR" "$W"' EXIT
+
+# A bed whose stub cleanup.sh REALLY removes, so S1 measures a removal instead of
+# asserting one. It can only ever reach this guard's own temp dir: the stub
+# refuses any path that is not under $W, which no real root ever is.
+mk_bed_rm () {
+  mkdir -p "$1"
+  cp "$2" "$1/cleanup_gated.sh"
+  { printf '#!/usr/bin/env bash\n'
+    printf 'echo "%s $*"\n' "$STUBMARK"
+    printf 'rc=0\nfor r in "$@"; do case "$r" in %s/*) rm -rf "$r";; *) echo "### [guard stub] REFUSED outside the guard temp dir: $r"; rc=1;; esac; done\nexit $rc\n' "$W"
+  } > "$1/cleanup.sh"
+}
+RMBED=$W/newrm; mk_bed_rm "$RMBED" "$SRC"
+
+mk_empty_root () { mkdir -p "$1/smk/c/x" "$1/smk/c/d"; }
+
+# ---- S1: refused before arm 1, empty roots -> REMOVED ------------------------
+S1A=$W/roots/cert$TAG_SR-$RJ;  mk_empty_root "$S1A"
+S1B=$W/roots/ws.$TAG_SR-$RJ;   mkdir -p "$S1B"
+rc=$(run "$RMBED" "$W/S1.log" "$S1A" "$S1B")
+[ "$rc" = 0 ] && ok "S1: a preamble-refused job's empty roots are reclaimed (rc=0)" \
+  || { bad "S1: rc=$rc, want 0 -- this is 6000916's permanent refusal"; sed 's/^/      /' "$W/S1.log"; }
+grep -qF '### CLEANUP SETUP-REFUSED roots=2 removed=2' "$W/S1.log" \
+  && ok "S1: the footer counts both roots and both removals" \
+  || bad "S1: footer wrong: $(grep -F 'SETUP-REFUSED roots=' "$W/S1.log" || echo '<no footer>')"
+grep -qF "### SETUP-REFUSED removed $S1A" "$W/S1.log" && grep -qF "### SETUP-REFUSED removed $S1B" "$W/S1.log" \
+  && ok "S1: and it names each removed path" \
+  || bad "S1: per-path removal rows missing"
+# THE ROW IT QUOTES IS THE FIRST MATCH IN THE FILE, NOT THE LAST, and job
+# 6001818 is what says so: this arm asserted `$SR_ROW3` and went RED while the
+# branch had fired correctly, because `grep -m1` over a stdout that carries all
+# three rows returns `SMOKE SETUP_FAILED` -- the row printed FIRST. Asserting a
+# later row would be asserting an implementation detail the gate never promised.
+grep -qF "$SR_ROW1" "$W/S1.log" \
+  && ok "S1: the decision QUOTES the relock job's own refusal row (the first one its stdout carries)" \
+  || bad "S1: the refusal row it acted on is not on the page: $(grep -m1 'SETUP-REFUSED: the relock job' "$W/S1.log" || echo '<no decision row>')"
+{ [ ! -e "$S1A" ] && [ ! -e "$S1B" ]; } \
+  && ok "S1: both roots are really gone from disk" || bad "S1: a root survived"
+grep -q 'CLEANUP REFUSED' "$W/S1.log" \
+  && bad "S1: it still printed the old refusal" || ok "S1: no stranding refusal was printed"
+
+# ---- S2: refused before arm 1, but a SEALED subtree -> refuse as today -------
+S2A=$W/roots/cert$TAG_SR-$RJ-S2; mk_empty_root "$S2A"; chmod a-w "$S2A/smk/c/x"
+rc=$(run "$NEWBED" "$W/S2.log" "$S2A")
+[ "$rc" = 2 ] && ok "S2: a SEALED (write-stripped) subtree still refuses (rc=2)" || bad "S2: rc=$rc, want 2"
+grep -q 'SETUP-REFUSED NOT TAKEN' "$W/S2.log" && grep -q 'SEALED' "$W/S2.log" \
+  && ok "S2: and it says WHY -- a provisioned store is not a job that ran no arm" \
+  || bad "S2: no sealed-tree refusal row: $(grep -c 'SETUP-REFUSED' "$W/S2.log") SETUP-REFUSED rows"
+grep -qF "$STUBMARK" "$W/S2.log" && bad "S2: cleanup.sh was called over a sealed tree" \
+  || ok "S2: cleanup.sh was NOT called"
+[ -d "$S2A" ] && ok "S2: the root is still on disk" || bad "S2: THE SEALED ROOT WAS DELETED"
+chmod -R u+w "$S2A" 2>/dev/null
+
+# ---- S3: NO refusal row -> the old refusal, unchanged ------------------------
+S3A=$W/roots/cert$TAG_NR-$RJ; mk_empty_root "$S3A"
+rc=$(run "$NEWBED" "$W/S3.log" "$S3A")
+[ "$rc" = 2 ] && ok "S3: a present root whose job printed NO refusal row still refuses (rc=2) -- the fix is scoped" \
+  || bad "S3: rc=$rc, want 2 -- the branch fired on a job that was never refused"
+grep -q 'SETUP-REFUSED' "$W/S3.log" \
+  && bad "S3: the branch spoke at all for a job with no refusal row" \
+  || ok "S3: the branch is silent and condition 1 decides, exactly as before"
+grep -q '### CLEANUP REFUSED -- nothing deleted' "$W/S3.log" \
+  && ok "S3: and the old refusal is printed verbatim" || bad "S3: no old refusal row"
+[ -d "$S3A" ] && ok "S3: nothing was deleted" || bad "S3: THE ROOT IS GONE"
+
+# ---- S4: THE MUTATION -- the branch cut out of the new file ------------------
+# Not a pinned old commit: this defect is being fixed in the same commit the
+# guard lands in, so there is no prior file that HAS the fix to revert. The
+# mutation is the anchor line, and it is COUNTED -- a mutation that does not
+# mutate proves nothing (PSG E2's rule).
+MUTF=$W/cleanup_gated.MUT.sh
+sed 's/^setup_refused_check   # SETUP-REFUSED-BRANCH (MUTATION ANCHOR)$/: # MUTATION: the setup-refused branch is cut/' "$SRC" > "$MUTF"
+mutn=$(diff "$SRC" "$MUTF" | grep -c '^< ')
+if [ "$mutn" -ne 1 ]; then
+  bad "S4: the mutation changed $mutn line(s), want exactly 1 -- S1 cannot fail, so it proves nothing"
+else
+  MUTBED=$W/mut; mk_bed_rm "$MUTBED" "$MUTF"
+  S4A=$W/roots/cert$TAG_SR-$RJ-S4; mk_empty_root "$S4A"
+  rc=$(run "$MUTBED" "$W/S4.log" "$S4A")
+  { [ "$rc" = 2 ] && grep -q '### CLEANUP REFUSED -- nothing deleted' "$W/S4.log"; } \
+    && ok "S4: THE DEFECT, REPRODUCED -- with the branch cut, 6000916's permanent refusal comes straight back (rc=$rc)" \
+    || bad "S4: the mutant did not reproduce the stranding (rc=$rc) -- S1 cannot fail; read $W/S4.log"
+  grep -qF '### CLEANUP SETUP-REFUSED' "$W/S4.log" \
+    && bad "S4: the mutant still printed the footer -- the anchor is not the branch" \
+    || ok "S4: and the mutant prints no SETUP-REFUSED footer at all"
+  [ -d "$S4A" ] && ok "S4: the mutant left the root stranded, which is the whole finding" || bad "S4: the mutant deleted it anyway"
 fi
 
 echo "### MERGE-N-1 absent-root guard: pass=$pass fail=$fail"

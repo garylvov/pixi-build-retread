@@ -61,7 +61,11 @@
 #    provisioned and locked; 168+92 = 260 underflowed `256 - len` and panicked
 #    in `rattler_build_core/src/types/directories.rs` before ANY FIX arm
 #    provisioned.  The parent proof sat EXACTLY on the boundary and nobody knew.
-#    Every arm's store root is measured here, before the job stages anything.
+#    Every arm's store root is measured here, before the job stages anything --
+#    AND SO IS THE SMOKE'S, AGAINST THE LONGEST ARM'S (PROOF-SMOKE-1-3).  6000903
+#    refused itself in 11 s because the smoke's default root was five bytes
+#    longer than an arm's; the smoke root is now DERIVED from the arm template
+#    and both composed lengths print on one `SMOKE PREFIX SYMMETRY` row.
 #
 # 5. ARM WORKSPACE NAMING.  `<base>/ws.<TAG>-<jid>/a<N>` -- one per-job PARENT,
 #    not four job-named siblings in the shared `retread/` directory.  That is
@@ -220,8 +224,50 @@ multiarm_prefix_check () {
   smoke_prefix_budget "$root" "$label"
 }
 
+# PROOF-SMOKE-1-3.  THE SMOKE'S OWN ROOT IS MEASURED HERE TOO, AND AGAINST THE
+# ARMS -- BECAUSE IT WAS FIVE BYTES LONGER THAN THEIRS AND NOBODY COULD SEE IT.
+# MEASURED on det141-proof 6000903, which died in ELEVEN SECONDS: the three arm
+# cache homes `$C/x<N>` composed to 247 with headroom 9 and PASSED, and the
+# smoke's own default store root `$C/smk/c/x` composed to 252 with headroom 4
+# and REFUSED, so the job refused itself over a root the arms would never have
+# used.  The smoke exists to ask the CHEAP question before the arms; a smoke
+# root LONGER than an arm root makes it ask a HARDER one, and every driver
+# re-cut onto this preamble with a six-character tag inherited that.
+#
+# The fix is the DERIVATION, not the check: `multiarm_smoke_cache_home` hands
+# the smoke `$C` itself, so its store root is `$C/x` -- SHORTER, by
+# construction, than every `$C/x<N>` an arm can name, for any arm count and any
+# tag.  The comparison is then asserted rather than assumed, and BOTH composed
+# lengths are printed on one row, so the next asymmetry is visible in the log of
+# the job that has it instead of in the post-mortem of the job it killed.
+multiarm_smoke_cache_home () { printf '%s' "${SMOKE_CACHE:-$MULTIARM_CACHE_ROOT}"; }
+# The path proof_smoke.sh will export as XDG_CACHE_HOME (`$CACHE/x`), which is
+# the root its own budget measures.  One template, read from the one caller.
+multiarm_smoke_store_root () { printf '%s/x' "$(multiarm_smoke_cache_home)"; }
+# The LONGEST arm root this job can name: the widest arm index, not arm 1.
+multiarm_max_arm_cache_home () { multiarm_arm_cache_home "${MULTIARM_ARMS:-1}"; }
+
+multiarm_smoke_prefix_symmetry () {
+  local sroot mroot sc mc
+  sroot=$(multiarm_smoke_store_root)
+  mroot=$(multiarm_max_arm_cache_home)
+  sc=$(smoke_prefix_composed "$sroot")
+  mc=$(smoke_prefix_composed "$mroot")
+  multiarm_say "SMOKE PREFIX SYMMETRY arms=${MULTIARM_ARMS:-1} smoke_composed=$sc max_arm_composed=$mc pad=${SMOKE_PREFIX_PAD:-256} smoke_root=$sroot max_arm_root=$mroot"
+  if [ "$sc" -gt "$mc" ]; then
+    multiarm_fatal "the SMOKE's store root composes to $sc and the longest ARM's to $mc -- the smoke would be refused for a length the arms never pay (6000903 exactly). The preamble DERIVES the smoke root from the arm template; something handed it a longer one, so unset the SMOKE_CACHE override in the driver rather than shortening the arms."
+    return 1
+  fi
+  return 0
+}
+
 multiarm_prefix_check_all () {
   local n ok=1 home
+  # THE SYMMETRY ROW FIRST, so both numbers are on the page BEFORE any refusal
+  # -- a refusal that names only the root it refused is how 6000903 read.
+  multiarm_smoke_prefix_symmetry || ok=0
+  multiarm_prefix_check "$(multiarm_smoke_store_root)" "smoke store root" \
+    || { multiarm_fatal "the SMOKE's store root composes past the 256-byte pad -- SHORTEN THE ROOT, NOT THE CHECK"; ok=0; }
   for n in $(seq 1 "${MULTIARM_ARMS:-1}"); do
     home=$(multiarm_arm_cache_home "$n")
     multiarm_prefix_check "$home" "arm $n cache home" || { multiarm_fatal "arm $n's store root composes past the 256-byte pad -- SHORTEN THE ROOT, NOT THE CHECK"; ok=0; }
@@ -267,10 +313,16 @@ multiarm_smoke_all () {
     # the expensive half and the question each smoke asks is about the BINARY.
     # The caches are shared for the same reason -- the first smoke pays the cold
     # repodata fetch, the rest do not.
+    #
+    # THE CACHE IS THE ONE ROOT THE 256-BYTE PAD MEASURES, so it is DERIVED
+    # (PROOF-SMOKE-1-3) rather than spelled out here: `multiarm_smoke_cache_home`
+    # is `$C`, the smoke's store root is `$C/x`, and that is shorter than every
+    # `$C/x<N>` an arm can name.  `SMOKE_ROOT`/`SMOKE_WS` stay under `smk/`
+    # because the workspace path is not what the pad measures.
     SMOKE_WALL=$MULTIARM_SMOKE_WALL \
     SMOKE_ROOT=${SMOKE_ROOT:-$MULTIARM_CACHE_ROOT/smk} \
     SMOKE_WS=${SMOKE_WS:-$MULTIARM_CACHE_ROOT/smk/w} \
-    SMOKE_CACHE=${SMOKE_CACHE:-$MULTIARM_CACHE_ROOT/smk/c} \
+    SMOKE_CACHE=$(multiarm_smoke_cache_home) \
       bash "$smoke" "$bin" "$MULTIARM_SMOKE_MANIFEST" "$MULTIARM_JOB_ROOT"
     rc=$?
     if [ "$rc" -ne 0 ]; then
