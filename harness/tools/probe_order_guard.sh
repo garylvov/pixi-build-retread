@@ -50,8 +50,14 @@ for rel in $TEMPLATES; do
   f=$H/$rel
   [ -f "$f" ] || { bad "A: no template at $rel"; continue; }
   NT=$((NT+1))
-  PL=$(grep -n '"\$SNAP" --version' "$f" | head -1 | cut -d: -f1)
-  SL=$(grep -n 'env_seed_export "\$BACKEND"' "$f" | head -1 | cut -d: -f1)
+  # ANCHORED AT LINE START, and that is not cosmetic: the comment this fix added
+  # QUOTES the probe, so an unanchored grep found the explanation and measured
+  # its line number instead of the code's. Measured on job 6023496: arm B cut
+  # `# FIX. \`"$SNAP" --version\` used to run beside the \`ls -l\`...` and ran a
+  # comment. A scan that can match prose about the code is the same class of
+  # defect as a scan that can match itself (CLAUDE.md law 14).
+  PL=$(grep -n '^[[:space:]]*"\$SNAP" --version' "$f" | head -1 | cut -d: -f1)
+  SL=$(grep -n '^[[:space:]]*env_seed_export "\$BACKEND"' "$f" | head -1 | cut -d: -f1)
   if [ -z "$PL" ] || [ -z "$SL" ]; then
     bad "A: $rel has probe=${PL:-none} export=${SL:-none} -- a template with one and not the other cannot be ordered, and is not silently skipped"
     continue
@@ -100,8 +106,8 @@ fi
 ########## B and C: the template's OWN two lines, both orders #################
 SRC=$H/arms/mh1_relock.sh
 [ -f "$SRC" ] || SRC=$H/phase_template/phaseN_relock.sh
-PROBE=$(grep -m1 '"\$SNAP" --version' "$SRC" | sed 's/^[[:space:]]*//')
-EXPORTL=$(grep -m1 'env_seed_export "\$BACKEND"' "$SRC" | sed 's/^[[:space:]]*//')
+PROBE=$(grep -m1 '^[[:space:]]*"\$SNAP" --version' "$SRC" | sed 's/^[[:space:]]*//')
+EXPORTL=$(grep -m1 '^[[:space:]]*env_seed_export "\$BACKEND"' "$SRC" | sed 's/^[[:space:]]*//')
 if [ -z "$PROBE" ] || [ -z "$EXPORTL" ]; then
   bad "B/C: could not cut both lines out of $SRC -- the executed arms did not run"
 else

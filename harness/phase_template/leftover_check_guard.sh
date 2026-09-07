@@ -202,7 +202,13 @@ fi
 # the regex. H2 is the mutation: strip the CITATION pair from the same copies
 # and the same regex must fire, or H is measuring nothing.
 say "== H: MERGE-V-2-1, a previous batch's JOB ID in LEFTOVER_RE =="
-B30_TOKENS='6000717|6014471|b30|B30|mCA|mCB'
+# THE TOKEN SET IS THE JOB ID MERGE-V-2-1 NAMED, and nothing more. A first cut
+# spliced in `b30|B30|mCA|mCB` as well and arm H went RED on both templates --
+# correctly: those strings appear all over the prose that EXPLAINS the merge
+# campaign, and a real LEFTOVER_RE for a derived batch would not carry a lane
+# name that its own commentary uses in every other paragraph. Widening a guard's
+# regex past what the defect was is how a guard starts reporting its own fixture.
+B30_TOKENS='6000717'
 H_OK=1
 for REL in phaseN_relock.sh ../arms/mh1_relock.sh; do
   SRCF=$HERE/$REL

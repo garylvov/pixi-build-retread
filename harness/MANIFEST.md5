@@ -34,7 +34,7 @@ f767b333ee61acbc8c8ea4abfb8090f2  phase_template/README.md
 ba303c2cd1f2c2c4261567b4496c78ed  phase_template/env_seed_export_guard.sh
 883d517a614357c59a463f8cdbd9ba4d  phase_template/expect_sha_gate_guard.sh
 7a1fc4ce6b54ac46828fed8f7906f252  phase_template/lane_wrapper.sbatch
-305a91b492a3d92202275b5079576b84  phase_template/leftover_check_guard.sh
+9ee752f23f3590b5c653d4fe947c6be4  phase_template/leftover_check_guard.sh
 180ae6dbf5d68f70a92eefb3619d056f  phase_template/link_mode_guard.sh
 440439c4ecd7bb84d272cec249d27aa1  phase_template/owner_snapshot.sh
 62c2899e8832e49566e855d7dc20a73b  phase_template/owner_snapshot_provenance_guard.sh
@@ -114,7 +114,7 @@ ca28f32b8c5556397f7a965fba6e72b8  tools/p6af2h_probe4_uvenv.sh
 c34a4e3a1a8834b073b997fc94230a9f  tools/pixi_merge_run_exports.py
 c9f561484d8ef42157ba6a7532f80681  tools/pixi_shard_cache.py
 6960c0ac937f51969cd1d4f1e1af65c2  tools/pixi_trim_repodata.py
-eefc05396fc4014a64a76a28e8f80218  tools/probe_order_guard.sh
+67cc222f4a831c99b934ad2bea8f2489  tools/probe_order_guard.sh
 b7b4546662fa8c555a727be04c8b08ff  tools/proof_smoke.sh
 310ca37036fe3629cd60abf9567021ae  tools/proof_smoke_guard.sh
 8681ef17860e0a934983508f8f346de0  tools/proof_smoke_guard_runner_guard.sh
