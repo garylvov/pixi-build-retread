@@ -126,7 +126,7 @@ fi
 
 ########## D. MUTATION: sampling restored -> the linked tree publishes #########
 MUT=$W/stage_mirror.sampled.sh
-sed "s@  LC_ALL=C sort > \"\$wd/tree\"@  LC_ALL=C sort | head -n 50 > \"\$wd/tree\"@" "$LIB" > "$MUT"
+sed "s@LC_ALL=C sort > \"\$wd/tree\"@LC_ALL=C sort | head -n 50 > \"\$wd/tree\"@" "$LIB" > "$MUT"
 if cmp -s "$LIB" "$MUT"; then
   fail "D. the mutation did not apply -- the enumeration line was not found, so D is vacuous"
 else

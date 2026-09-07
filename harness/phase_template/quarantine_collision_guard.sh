@@ -46,6 +46,16 @@ ok   () { echo "GUARD  ok : $*"; }
 
 FUNCS=$W/stage_funcs.sh
 awk '/^STAGE_METHOD=/{f=1} f&&/^if \[ ! -e "\$WS\/\.cert-staged" \]/{exit} f{print}' "$TPL" > "$FUNCS"
+# PROOF-SMOKE-1-7 landed after this guard was written: the extracted block now
+# SOURCES tools/stage_mirror.sh and refuses (exit 14) without it, which is how
+# job 6015434 turned every arm here into rc 14. Providing a dependency is the
+# guard's job; the sibling candidate in that block resolves to whatever sits
+# beside the extract.
+for cand in "$HERE/../tools/stage_mirror.sh" "$HERE/stage_mirror.sh"; do
+  [ -f "$cand" ] && { cp "$cand" "$(dirname -- "$FUNCS")/stage_mirror.sh"; break; }
+done
+[ -f "$(dirname -- "$FUNCS")/stage_mirror.sh" ] \
+  || { echo "GUARD FATAL: no stage_mirror.sh beside $TPL -- the extracted staging block cannot be sourced"; exit 2; }
 grep -q '^stage_quarantine () {' "$FUNCS" || { echo "GUARD FATAL: no stage_quarantine in $TPL"; exit 2; }
 ok "extracted $(grep -c '^stage_[a-z_]* ()' "$FUNCS") stage functions from phaseN_relock.sh"
 
