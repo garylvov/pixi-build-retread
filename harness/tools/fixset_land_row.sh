@@ -192,17 +192,23 @@ if [ "$src" != 0 ]; then
     6)
       RJIDS=$(sed -n 's/.*### SYNC REFUSED rc=6 running=\([0-9][0-9]*\).*/\1/p' "$SYNCLOG" | sort -u | tr '\n' ' ')   # RC6-MSG
       grep -F -- '### SYNC REFUSED' "$SYNCLOG" | sed 's/^/###   from harness_sync: /'                                 # RC6-MSG
-      echo "###   rc 6 means a RUNNING job of ours is still READING a file this sync would install."                   # RC6-MSG
-      echo "###   The install is a rename from THIS node; the reader is on another NFS client, so its inode"           # RC6-MSG
+      echo "###   rc 6 means a job of ours would READ a file this sync would install. Each row carries"              # RC6-MSG
+      echo "###   state=, and the two states are refused for two different reasons:"                                  # RC6-MSG
+      echo "###   state=RUNNING -- a RUNNING job of ours is still READING that file right now. The install"           # RC6-MSG
+      echo "###   is a rename from THIS node; the reader is on another NFS client, so its inode"                      # RC6-MSG
       echo "###   is unlinked under it, bash reads an error, calls it EOF, and that job exits 0 half-run."             # RC6-MSG
-      echo "###   ACTUATOR: wait for job(s) ${RJIDS:-<none named -- read the rows above>} to finish and re-run"        # RC6-MSG
+      echo "###   state=PENDING -- the job has not STARTED, so it would run whatever bytes this sync leaves"           # RC6-MSG
+      echo "###   behind rather than the ones it was submitted against. An afterany cleanup owner submitted"           # RC6-MSG
+      echo "###   with --wrap owns no pin dir, so rc 4 never saw it either (HARNESS-SYNC-4)."                          # RC6-MSG
+      echo "###   ACTUATOR: wait for job(s) ${RJIDS:-<none named -- read the rows above>} to FINISH (a state=PENDING"   # RC6-MSG
+      echo "###   job must run AND finish, not merely start) and re-run"                                              # RC6-MSG
       echo "###   the landing (the fix-set row is idempotent); or, ONLY after proving by hand that the install"        # RC6-MSG
       echo "###   set and that job's read set are disjoint, re-run the sync with --force --reason \"<why>\"."          # RC6-MSG
       echo "###   THIS SCRIPT NEVER FORCES ON ITS OWN: a landing that overrides a read-set refusal unattended"         # RC6-MSG
       echo "###   is the truncation this refusal exists to prevent."                                                   # RC6-MSG
       ;;
     *)
-      echo "###   rc $src is neither 4 (a PENDING job pinned elsewhere) nor 6 (a RUNNING job reading an"
+      echo "###   rc $src is neither 4 (a PENDING job pinned elsewhere) nor 6 (a RUNNING or PENDING job reading an"
       echo "###   installed file) -- read the captured rows at $SYNCLOG before re-running anything."
       ;;
   esac

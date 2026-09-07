@@ -58,18 +58,37 @@
 #     HARNESS_SQUEUE     the squeue to ask about PENDING jobs (default `squeue`)
 #
 #   --running-list <file>  TEST-ONLY, the guard's shim for the rc-6 check. Rows
-#          `<jid> <name> <workdir> <sbatch path or ->`, used INSTEAD of the live
-#          `squeue -t R` + `scontrol show job`. Nothing in production passes it.
+#          `<jid> <state> <name> <workdir> <sbatch path or -> [<job root>]`,
+#          used INSTEAD of the live `squeue -t R,PD` + `scontrol show job`.
+#          `<state>` is RUNNING or PENDING and is REQUIRED -- a row whose second
+#          field is neither is a FATAL rc 2, not a row silently read as a name,
+#          because that is how a stale four-field row from before HARNESS-SYNC-4
+#          would have shifted every later field by one and quietly emptied the
+#          read set. Nothing in production passes this flag.
 #
 #   rc 0  synced (or --check found nothing edited)
 #   rc 2  FATAL: bad arguments, no repo, no such commit, no mapping library
 #   rc 3  --check: at least one task copy differs from the last synced commit
 #   rc 4  REFUSED: a PENDING job of ours is pinned to a different commit
 #   rc 5  a file failed to install or failed its md5 verification
-#   rc 6  REFUSED: a RUNNING job of ours may still be READING a file this sync
-#         would install.  A cross-NFS-client rename is NOT atomic for a reader
-#         on another node -- it truncates that reader's script silently.
-#         (HARNESS-SYNC-3.)  Override: --force --reason "<why>".
+#   rc 6  REFUSED: a job of ours -- RUNNING **or PENDING** -- would READ a file
+#         this sync would install.  Every refusal row carries `state=`, and the
+#         two states are refused for two DIFFERENT reasons that happen to have
+#         the same answer (wait for the job):
+#           state=RUNNING  the job is reading that file NOW, on another node.  A
+#             cross-NFS-client rename is NOT atomic for it -- its inode is
+#             unlinked under it, bash calls the read error EOF, and it exits 0
+#             having run half its rows.  (HARNESS-SYNC-3.)
+#           state=PENDING  the job has not started, so it will read the bytes
+#             that are on disk WHENEVER Slurm starts it -- not the ones it was
+#             submitted against.  A sync landing between the parent's end and
+#             the dependent's start silently swaps the script it runs, and
+#             NOTHING anywhere reports that.  rc 4 does not cover this: rc 4 is
+#             a PIN DIR check, and a `sbatch --wrap 'bash .../cleanup_gated.sh'`
+#             cleanup owner has no pin dir at all -- it was invisible to rc 4
+#             for having no pin and to rc 6 for not being RUNNING.
+#             (HARNESS-SYNC-4.)
+#         Override: --force --reason "<why>".
 #
 # THE MAPPING IS NOT DUPLICATED HERE.  A writer with its own copy of the table
 # would eventually install a set its own checker does not read, which is the
@@ -293,10 +312,24 @@ fi
 # path (`bash "$T/tools/<f>"`, `source .../tools/<f>`) is not.
 #
 # So: the INSTALL SET (the files whose bytes would actually change) is intersected
-# with the READ SET of every RUNNING job of ours, and a non-empty intersection is
-# a REFUSAL, before the first byte.  A running job whose read set cannot be
+# with the READ SET of every job of ours, and a non-empty intersection is
+# a REFUSAL, before the first byte.  A job whose read set cannot be
 # DETERMINED is treated as reading EVERYTHING -- an unreadable job is not a safe
 # job (law 9).
+#
+# AND "EVERY JOB" MEANS PENDING TOO (HARNESS-SYNC-4).  The first cut asked
+# `squeue -t R` only, and that left a hole with a live example sitting in it:
+# det141-cleanup 6001240, an `afterany:6001140` owner submitted as
+# `sbatch --wrap 'bash <task dir>/merge-h/cleanup_gated.sh <roots>'`.  It has NO
+# PIN DIR, so the rc-4 pin check could not see it; it is not RUNNING, so this
+# check could not see it either; and a sync landing in the window between its
+# parent finishing and Slurm starting it would have silently changed the bytes
+# of the cleanup it then runs -- with no drift refusal, no rc 4, no rc 6 and
+# nothing in any log.  A PENDING job's script is READABLE the same way a running
+# one's is (`scontrol write batch_script <jid> -` works in state PD, measured on
+# 6001240), so it is parsed by the same `refs_of` and refused by the same rc.
+# The row prints `state=PENDING` so the operator knows the job it must wait for
+# has not started yet, rather than looking for it on a node.
 INSTSET="$TMP/instset.txt"; : > "$INSTSET"
 while IFS='|' read -r trel w; do
   [ -n "$w" ] || continue
@@ -344,9 +377,23 @@ if [ -s "$INSTSET" ]; then
   if [ -n "$RUNLIST" ]; then
     [ -f "$RUNLIST" ] || { echo "### SYNC FATAL: --running-list $RUNLIST does not exist" >&2; exit 2; }
     grep -v '^[[:space:]]*$' "$RUNLIST" > "$RUNROWS" || :
+    # THE STATE COLUMN IS REQUIRED AND VALIDATED (HARNESS-SYNC-4).  Before this
+    # lane a row was `<jid> <name> <workdir> <script>`; state was inserted at
+    # field 2, so a stale row would read `<name>` as the state and shift every
+    # later field by one -- an empty read set and a SILENT install, which is the
+    # exact class of defect this whole block exists to stop.  Refuse loudly.
+    while read -r _j st _rest; do
+      case "${st:-}" in
+        RUNNING|PENDING) ;;
+        *) echo "### SYNC FATAL: --running-list $RUNLIST row for job ${_j:-?} has state='${st:-}';" >&2
+           echo "###   rows are '<jid> <state> <name> <workdir> <sbatch or -> [<job root>]'" >&2
+           echo "###   and <state> must be RUNNING or PENDING (HARNESS-SYNC-4)." >&2
+           exit 2;;
+      esac
+    done < "$RUNROWS"
   else
-    "$SQUEUE" -u glvov -h -t R -o '%i %j %Z' > "$TMP/rq.txt" 2>/dev/null || : > "$TMP/rq.txt"
-    while read -r jid jname wd; do
+    "$SQUEUE" -u glvov -h -t R,PD -o '%i %T %j %Z' > "$TMP/rq.txt" 2>/dev/null || : > "$TMP/rq.txt"
+    while read -r jid jstate jname wd; do
       [ -n "${jid:-}" ] || continue
       cmd=$(scontrol show job "$jid" 2>/dev/null | tr ' ' '\n' | sed -n 's/^Command=//p' | head -1)
       jroot="${wd:--}"
@@ -363,10 +410,10 @@ if [ -s "$INSTSET" ]; then
       else
         script=-
       fi
-      printf '%s %s %s %s %s\n' "$jid" "${jname:--}" "${wd:--}" "$script" "$jroot" >> "$RUNROWS"
+      printf '%s %s %s %s %s %s\n' "$jid" "${jstate:-RUNNING}" "${jname:--}" "${wd:--}" "$script" "$jroot" >> "$RUNROWS"
     done < "$TMP/rq.txt"
   fi
-  while read -r jid jname wd script jroot; do
+  while read -r jid jstate jname wd script jroot; do
     [ -n "${jid:-}" ] || continue
     if [ -z "${jroot:-}" ]; then
       if [ "${script:--}" != "-" ] && [ -f "$script" ]; then jroot=$(dirname -- "$script"); else jroot=${wd:--}; fi
@@ -403,16 +450,16 @@ if [ -s "$INSTSET" ]; then
       why=unresolved-reference
       [ -f "${script:-/nonexistent}" ] || why=no-sbatch-found
       while IFS= read -r trel; do
-        printf '### SYNC REFUSED rc=6 running=%s file=%s reason=%s\n' \
-          "$jid" "$(basename -- "$trel")" "$why" >> "$RSHITS"
+        printf '### SYNC REFUSED rc=6 running=%s state=%s file=%s reason=%s\n' \
+          "$jid" "${jstate:-RUNNING}" "$(basename -- "$trel")" "$why" >> "$RSHITS"
       done < "$INSTSET"
       continue
     fi
     while IFS= read -r trel; do
       tb=$(basename -- "$trel")
       grep -qxF -- "$tb" "$RS" || continue
-      printf '### SYNC REFUSED rc=6 running=%s file=%s reason=read-by-%s\n' \
-        "$jid" "$tb" "$jname" >> "$RSHITS"
+      printf '### SYNC REFUSED rc=6 running=%s state=%s file=%s reason=read-by-%s\n' \
+        "$jid" "${jstate:-RUNNING}" "$tb" "$jname" >> "$RSHITS"
     done < "$INSTSET"
   done < "$RUNROWS"
 fi
@@ -420,12 +467,18 @@ fi
 if [ -s "$RSHITS" ]; then
   sort -u "$RSHITS"
   if [ "$FORCE" != 1 ] || [ -z "$REASON" ]; then
-    echo "### SYNC REFUSED (rc 6). The job(s) above are RUNNING ON ANOTHER NFS CLIENT and"
-    echo "###   the file(s) named are ones this sync would REWRITE. The rename-install does"
-    echo "###   NOT protect a reader on another node: its inode is unlinked under it, bash"
-    echo "###   reads an error, calls it EOF, and the job exits 0 having run half its rows."
-    echo "###   Wait for the job(s), or -- if you have MEASURED that none of them will read"
-    echo "###   the file again -- re-run with:"
+    echo "### SYNC REFUSED (rc 6). The file(s) named are ones this sync would REWRITE, and"
+    echo "###   each row's state= says which way that job would be hurt:"
+    echo "###   state=RUNNING -- the job is READING that file NOW, ON ANOTHER NFS CLIENT."
+    echo "###     The rename-install does NOT protect a reader on another node: its inode is"
+    echo "###     unlinked under it, bash reads an error, calls it EOF, and the job exits 0"
+    echo "###     having run half its rows."
+    echo "###   state=PENDING -- the job has NOT STARTED. It will run whatever bytes are on"
+    echo "###     disk when Slurm starts it, not the ones it was submitted against, and a"
+    echo "###     dependency owner starting after this sync would silently run a different"
+    echo "###     script with nothing anywhere reporting it. (HARNESS-SYNC-4.)"
+    echo "###   Wait for the job(s) -- a PENDING one has to RUN and FINISH, not just start --"
+    echo "###   or, if you have MEASURED that none of them will read the file, re-run with:"
     echo "###     harness_sync.sh $COMMIT --force --reason \"<why this is the right call>\""
     [ "$FORCE" = 1 ] && [ -z "$REASON" ] && echo "###   (--force WITHOUT --reason is still a refusal.)"
     exit 6
@@ -433,7 +486,7 @@ if [ -s "$RSHITS" ]; then
   RS_MARK="force-readset commit=$SHA at=$(date -Is) hits=$(sort -u "$RSHITS" | wc -l) reason=$(printf '%s' "$REASON" | tr '\n' ' ')"
   printf '%s\n' "$RS_MARK" > "$RECORD.force-readset" || {
     echo "### SYNC FATAL: could not write $RECORD.force-readset" >&2; exit 2; }
-  echo "### SYNC FORCED over the read set of $(sort -u "$RSHITS" | awk '{print $3}' | sort -u | wc -l) RUNNING job(s) reason=$REASON"
+  echo "### SYNC FORCED over the read set of $(sort -u "$RSHITS" | sed -n 's/.* running=\([^ ]*\) .*/\1/p' | sort -u | wc -l) RUNNING/PENDING job(s) reason=$REASON"
   echo "###   marker: $RECORD.force-readset"
   echo "###   ^ copy this line into the lane log row for this sync."
 fi

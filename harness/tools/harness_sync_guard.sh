@@ -51,6 +51,20 @@
 #      alone still refuses; `--force --reason` proceeds and leaves the marker.
 #      MUTATION: with the read-set check cut out, the same fixture INSTALLS the
 #      file arm a1 saved -- without which a1 cannot fail.
+#   L  HARNESS-SYNC-4: a PENDING job of ours reads too, and NOTHING saw it. An
+#      `afterany` cleanup owner submitted with `sbatch --wrap 'bash <task
+#      dir>/merge-h/cleanup_gated.sh …'` (6001240 is one, live) owns no PIN DIR,
+#      so rc 4 misses it, and is not RUNNING, so arm I's rc 6 missed it too: a
+#      sync landing between its parent's end and its own start rewrote the script
+#      it would then run, silently. So the read set is computed for state PD as
+#      well as R, refused with the SAME rc 6 and a `state=` field on every row.
+#      A DISJOINT PENDING read set still installs (b2) -- otherwise a task dir
+#      holding 25 queued jobs could never be synced again. MUTATION: cutting the
+#      PD half of the filter (`-t R`) makes the queued job invisible again and
+#      the same fixture INSTALLS, so b4 can fail. And the `--running-list` state
+#      column is REQUIRED (b6): a stale four-field row is a FATAL rc 2, because
+#      read one field out of step it yields an EMPTY read set and a silent
+#      install -- the very defect this block exists to prevent.
 #   J  static: the header no longer claims the rename is "the only safe way to
 #      write into a live task dir" -- it is safe only when renamer and reader are
 #      the SAME NFS client -- and the PIN REPORT no longer calls a RUNNING job
@@ -444,7 +458,7 @@ mkjob () {          # $1 = task dir; writes an sbatch + a driver that reads $2
 read -r RI TI V1I V2I < <(mkfixture I)
 mkstub "$WORK/I_squeue"
 mkjob "$TI" tools/a_tool.sh
-printf '8000001 laneI %s %s\n' "$TI" "$TI/jobroot/j.sbatch" > "$WORK/I_run.txt"
+printf '8000001 RUNNING laneI %s %s\n' "$TI" "$TI/jobroot/j.sbatch" > "$WORK/I_run.txt"
 git -C "$RI" cat-file blob "$V2I:harness/tools/a_tool.sh" > "$WORK/I.blob"
 BEFORE_I=$(md5sum "$TI/tools/a_tool.sh" | awk '{print $1}')
 WANT_I=$(md5sum "$WORK/I.blob" | awk '{print $1}')
@@ -454,9 +468,9 @@ WANT_I=$(md5sum "$WORK/I.blob" | awk '{print $1}')
 runsync "$RI" "$TI" "$WORK/I_squeue" "$V2I" --running-list "$WORK/I_run.txt" > "$WORK/I.log" 2>&1; rcI=$?
 [ "$rcI" -eq 6 ] && ok "I(a1): a RUNNING job whose driver reads an installed file makes the sync refuse rc 6" \
                  || { bad "I(a1): rc=$rcI, wanted 6"; sed 's/^/      /' "$WORK/I.log"; }
-grep -q '^### SYNC REFUSED rc=6 running=8000001 file=a_tool.sh' "$WORK/I.log" \
-  && ok "I(a1): the refusal row NAMES the job id and the file" \
-  || { bad "I(a1): no 'SYNC REFUSED rc=6 running=8000001 file=a_tool.sh' row"; sed 's/^/      /' "$WORK/I.log"; }
+grep -q '^### SYNC REFUSED rc=6 running=8000001 state=RUNNING file=a_tool.sh' "$WORK/I.log" \
+  && ok "I(a1): the refusal row NAMES the job id and the file and the STATE" \
+  || { bad "I(a1): no 'SYNC REFUSED rc=6 running=8000001 state=RUNNING file=a_tool.sh' row"; sed 's/^/      /' "$WORK/I.log"; }
 AFTER_I=$(md5sum "$TI/tools/a_tool.sh" | awk '{print $1}')
 [ "$AFTER_I" = "$BEFORE_I" ] && [ "$AFTER_I" != "$WANT_I" ] \
   && ok "I(a1): NOTHING was written -- the file is still $AFTER_I, still not $V2I's bytes" \
@@ -465,7 +479,7 @@ AFTER_I=$(md5sum "$TI/tools/a_tool.sh" | awk '{print $1}')
 read -r RI2 TI2 V1I2 V2I2 < <(mkfixture I2)
 mkstub "$WORK/I2_squeue"
 mkjob "$TI2" tools/harness_drift_check.sh          # same bytes at v1 and v2: not installed
-printf '8000002 laneI2 %s %s\n' "$TI2" "$TI2/jobroot/j.sbatch" > "$WORK/I2_run.txt"
+printf '8000002 RUNNING laneI2 %s %s\n' "$TI2" "$TI2/jobroot/j.sbatch" > "$WORK/I2_run.txt"
 runsync "$RI2" "$TI2" "$WORK/I2_squeue" "$V2I2" --running-list "$WORK/I2_run.txt" > "$WORK/I2.log" 2>&1; rcI2=$?
 git -C "$RI2" cat-file blob "$V2I2:harness/tools/a_tool.sh" > "$WORK/I2.blob"
 [ "$rcI2" -eq 0 ] && cmp -s "$WORK/I2.blob" "$TI2/tools/a_tool.sh" \
@@ -476,7 +490,7 @@ grep -q 'SYNC REFUSED rc=6' "$WORK/I2.log" && bad "I(a2): it refused anyway" \
 # a3: a RUNNING job whose sbatch cannot be found reads EVERYTHING (law 9)
 read -r RI3 TI3 V1I3 V2I3 < <(mkfixture I3)
 mkstub "$WORK/I3_squeue"
-printf '8000003 laneI3 %s -\n' "$TI3" > "$WORK/I3_run.txt"
+printf '8000003 RUNNING laneI3 %s -\n' "$TI3" > "$WORK/I3_run.txt"
 BEFORE_I3=$(md5sum "$TI3/tools/a_tool.sh" | awk '{print $1}')
 runsync "$RI3" "$TI3" "$WORK/I3_squeue" "$V2I3" --running-list "$WORK/I3_run.txt" > "$WORK/I3.log" 2>&1; rcI3=$?
 [ "$rcI3" -eq 6 ] && ok "I(a3): a RUNNING job with NO discoverable sbatch is treated as reading everything -- rc 6" \
@@ -489,7 +503,7 @@ grep -q 'reason=no-sbatch-found' "$WORK/I3.log" \
 read -r RI4 TI4 V1I4 V2I4 < <(mkfixture I4)
 mkstub "$WORK/I4_squeue"
 mkjob "$TI4" tools/a_tool.sh
-printf '8000004 laneI4 %s %s\n' "$TI4" "$TI4/jobroot/j.sbatch" > "$WORK/I4_run.txt"
+printf '8000004 RUNNING laneI4 %s %s\n' "$TI4" "$TI4/jobroot/j.sbatch" > "$WORK/I4_run.txt"
 runsync "$RI4" "$TI4" "$WORK/I4_squeue" "$V2I4" --running-list "$WORK/I4_run.txt" --force > "$WORK/I4a.log" 2>&1; rcI4a=$?
 [ "$rcI4a" -eq 6 ] && ok "I(a4): --force WITHOUT --reason is still a refusal" || bad "I(a4): bare --force returned $rcI4a"
 runsync "$RI4" "$TI4" "$WORK/I4_squeue" "$V2I4" --running-list "$WORK/I4_run.txt" \
@@ -511,7 +525,7 @@ if bash -n "$MUT3" 2>/dev/null && ! grep -q 'SYNC REFUSED rc=6' "$MUT3"; then
   read -r RI5 TI5 V1I5 V2I5 < <(mkfixture I5)
   mkstub "$WORK/I5_squeue"
   mkjob "$TI5" tools/a_tool.sh
-  printf '8000005 laneI5 %s %s\n' "$TI5" "$TI5/jobroot/j.sbatch" > "$WORK/I5_run.txt"
+  printf '8000005 RUNNING laneI5 %s %s\n' "$TI5" "$TI5/jobroot/j.sbatch" > "$WORK/I5_run.txt"
   cp -f "$MUT3" "$TI5/tools/harness_sync.sh"
   git -C "$RI5" cat-file blob "$V2I5:harness/tools/a_tool.sh" > "$WORK/I5.blob"
   HARNESS_REPO="$RI5" HARNESS_TASK_DIR="$TI5" HARNESS_SQUEUE="$WORK/I5_squeue" \
@@ -532,7 +546,7 @@ mkstub "$WORK/I6_squeue"
 mkdir -p "$TI6/jobroot"
 { echo '#!/bin/sh'; echo '# This script was created by sbatch --wrap.'; echo
   echo "bash $TI6/tools/a_tool.sh arg1 arg2"; } > "$TI6/jobroot/wrap.sh"
-printf '8000006 laneI6 %s %s\n' "$TI6" "$TI6/jobroot/wrap.sh" > "$WORK/I6_run.txt"
+printf '8000006 RUNNING laneI6 %s %s\n' "$TI6" "$TI6/jobroot/wrap.sh" > "$WORK/I6_run.txt"
 runsync "$RI6" "$TI6" "$WORK/I6_squeue" "$V2I6" --running-list "$WORK/I6_run.txt" > "$WORK/I6.log" 2>&1; rcI6=$?
 [ "$rcI6" -eq 6 ] && grep -q 'file=a_tool.sh' "$WORK/I6.log" \
   && ok "I(a1b): a --wrap one-liner naming an installed file refuses rc 6 too (the 5992050 shape)" \
@@ -547,7 +561,7 @@ read -r RI7 TI7 V1I7 V2I7 < <(mkfixture I7)
 mkstub "$WORK/I7_squeue"
 mkdir -p "$TI7/jobroot"
 { echo '#!/bin/bash'; echo "HC=\$(bash \"$TI7/tools/a_tool.sh\" arg) || exit 6"; } > "$TI7/jobroot/sub.sbatch"
-printf '8000007 laneI7 %s %s\n' "$TI7" "$TI7/jobroot/sub.sbatch" > "$WORK/I7_run.txt"
+printf '8000007 RUNNING laneI7 %s %s\n' "$TI7" "$TI7/jobroot/sub.sbatch" > "$WORK/I7_run.txt"
 runsync "$RI7" "$TI7" "$WORK/I7_squeue" "$V2I7" --running-list "$WORK/I7_run.txt" > "$WORK/I7.log" 2>&1; rcI7=$?
 [ "$rcI7" -eq 6 ] && grep -q 'file=a_tool.sh' "$WORK/I7.log" \
   && ok "I(a1c): a reference inside \$( ) is in the read set too (5992569's harness_commit_resolve.sh line)" \
@@ -562,7 +576,7 @@ read -r RI8 TI8 V1I8 V2I8 < <(mkfixture I8)
 mkstub "$WORK/I8_squeue"
 mkdir -p "$TI8/jobroot"
 { echo '#!/bin/bash'; echo "FAST_ENV=$TI8/tools/a_tool.sh"; echo '. "$FAST_ENV"'; } > "$TI8/jobroot/dot.sbatch"
-printf '8000008 laneI8 %s %s\n' "$TI8" "$TI8/jobroot/dot.sbatch" > "$WORK/I8_run.txt"
+printf '8000008 RUNNING laneI8 %s %s\n' "$TI8" "$TI8/jobroot/dot.sbatch" > "$WORK/I8_run.txt"
 runsync "$RI8" "$TI8" "$WORK/I8_squeue" "$V2I8" --running-list "$WORK/I8_run.txt" > "$WORK/I8.log" 2>&1; rcI8=$?
 [ "$rcI8" -eq 6 ] && grep -q 'file=a_tool.sh reason=read-by-laneI8' "$WORK/I8.log" \
   && ok "I(a1d): \`. \"\$FAST_ENV\"\` is RESOLVED to its file and refuses BY NAME, not as 'undeterminable'" \
@@ -572,13 +586,166 @@ mkstub "$WORK/I9_squeue"
 mkdir -p "$TI9/jobroot"
 { echo '#!/bin/bash'; echo 'OB=/tmp/some.rows.txt'; echo 'OB_N=$(grep -c . "$OB")'
   echo 'HP_N=$(grep -c . "$HPROV")'; echo "bash \"$TI9/tools/harness_drift_check.sh\" x"; } > "$TI9/jobroot/grep.sbatch"
-printf '8000009 laneI9 %s %s\n' "$TI9" "$TI9/jobroot/grep.sbatch" > "$WORK/I9_run.txt"
+printf '8000009 RUNNING laneI9 %s %s\n' "$TI9" "$TI9/jobroot/grep.sbatch" > "$WORK/I9_run.txt"
 runsync "$RI9" "$TI9" "$WORK/I9_squeue" "$V2I9" --running-list "$WORK/I9_run.txt" > "$WORK/I9.log" 2>&1; rcI9=$?
 git -C "$RI9" cat-file blob "$V2I9:harness/tools/a_tool.sh" > "$WORK/I9.blob"
 [ "$rcI9" -eq 0 ] && cmp -s "$WORK/I9.blob" "$TI9/tools/a_tool.sh" \
   && ok "I(a1d): \`grep -c . \"\$OB\"\` is an ARGUMENT, not a source -- the job stays determinable and the sync proceeds" \
   || { bad "I(a1d): rc=$rcI9 -- a grep argument was read as a dot-source and refused the sync"; sed 's/^/      /' "$WORK/I9.log"; }
 
+
+# ---- L: HARNESS-SYNC-4 -- a PENDING job READS TOO, and rc 4 never saw it ----
+# THE HOLE, WITH A LIVE EXAMPLE IN IT. det141-cleanup 6001240 is an
+# `afterany:6001140` owner submitted as
+# `sbatch --wrap 'bash <task dir>/merge-h/cleanup_gated.sh <roots>'`. It owns NO
+# PIN DIR, so the rc-4 pin check cannot see it. It is not RUNNING, so the rc-6
+# read-set check (arms I) could not see it either. A sync landing in the window
+# between 6001140 finishing and Slurm starting 6001240 would therefore have
+# rewritten cleanup_gated.sh underneath it, with no drift refusal, no rc 4, no
+# rc 6 and nothing in any log -- the job would simply have run a script nobody
+# chose for it. HARNESS-PREAMBLE-1 deferred its own sync BY HAND for exactly
+# this reason, which is the tell that the rule was missing from the machinery.
+# So the read set is now computed for state PD as well as R, and the refusal row
+# carries `state=` because "wait for job X" means something different when X has
+# not started: the operator must wait for it to RUN and FINISH, not just start.
+mkpdjob () {        # $1 = task dir; writes a --wrap-shaped script reading $2
+  local T=$1 reads=$2
+  mkdir -p "$T/jobroot"
+  { echo '#!/bin/sh'; echo '# This script was created by sbatch --wrap.'; echo
+    echo "bash $T/$reads /some/cert /some/ws"; } > "$T/jobroot/wrap.sh"
+}
+# b1: a PENDING job whose --wrap line names a file this sync WOULD rewrite
+read -r RL TL V1L V2L < <(mkfixture L)
+mkstub "$WORK/L_squeue"
+mkpdjob "$TL" tools/a_tool.sh
+printf '8000011 PENDING laneL %s %s\n' "$TL" "$TL/jobroot/wrap.sh" > "$WORK/L_run.txt"
+git -C "$RL" cat-file blob "$V2L:harness/tools/a_tool.sh" > "$WORK/L.blob"
+BEFORE_L=$(md5sum "$TL/tools/a_tool.sh" | awk '{print $1}')
+WANT_L=$(md5sum "$WORK/L.blob" | awk '{print $1}')
+[ "$BEFORE_L" != "$WANT_L" ] \
+  && ok "L(b1): NON-VACUITY BEFORE -- tools/a_tool.sh is $BEFORE_L and $V2L says $WANT_L, so it IS in the install set" \
+  || bad "L(b1): the fixture file already matches the commit -- the arm would prove nothing"
+runsync "$RL" "$TL" "$WORK/L_squeue" "$V2L" --running-list "$WORK/L_run.txt" > "$WORK/L.log" 2>&1; rcL=$?
+[ "$rcL" -eq 6 ] && ok "L(b1): a PENDING job whose script reads an installed file refuses rc 6 -- the SAME rc as RUNNING" \
+                 || { bad "L(b1): rc=$rcL, wanted 6"; sed 's/^/      /' "$WORK/L.log"; }
+grep -q '^### SYNC REFUSED rc=6 running=8000011 state=PENDING file=a_tool.sh reason=read-by-laneL' "$WORK/L.log" \
+  && ok "L(b1): and the row says state=PENDING, so the operator knows the job has NOT STARTED" \
+  || { bad "L(b1): no 'rc=6 running=8000011 state=PENDING file=a_tool.sh reason=read-by-laneL' row"; sed 's/^/      /' "$WORK/L.log"; }
+AFTER_L=$(md5sum "$TL/tools/a_tool.sh" | awk '{print $1}')
+[ "$AFTER_L" = "$BEFORE_L" ] && [ "$AFTER_L" != "$WANT_L" ] \
+  && ok "L(b1): NON-VACUITY AFTER -- nothing was written; the file is still $AFTER_L and still not $V2L's bytes" \
+  || bad "L(b1): the sync wrote the file it refused over ($BEFORE_L -> $AFTER_L)"
+# b2: a PENDING job whose read set is DISJOINT must NOT block the sync. Without
+# this arm the fix could be "refuse whenever anything is queued", which in a task
+# dir carrying 25 held PD jobs would mean the harness could never be synced again.
+read -r RL2 TL2 V1L2 V2L2 < <(mkfixture L2)
+mkstub "$WORK/L2_squeue"
+mkpdjob "$TL2" tools/harness_drift_check.sh        # same bytes at v1 and v2: not installed
+printf '8000012 PENDING laneL2 %s %s\n' "$TL2" "$TL2/jobroot/wrap.sh" > "$WORK/L2_run.txt"
+runsync "$RL2" "$TL2" "$WORK/L2_squeue" "$V2L2" --running-list "$WORK/L2_run.txt" > "$WORK/L2.log" 2>&1; rcL2=$?
+git -C "$RL2" cat-file blob "$V2L2:harness/tools/a_tool.sh" > "$WORK/L2.blob"
+[ "$rcL2" -eq 0 ] && cmp -s "$WORK/L2.blob" "$TL2/tools/a_tool.sh" \
+  && ok "L(b2): a PENDING job with a DISJOINT read set does not block the sync (rc 0, installed)" \
+  || { bad "L(b2): rc=$rcL2 -- a disjoint PENDING read set must not refuse"; sed 's/^/      /' "$WORK/L2.log"; }
+grep -q 'SYNC REFUSED rc=6' "$WORK/L2.log" && bad "L(b2): it refused anyway" \
+                                           || ok "L(b2): and it printed no rc-6 row at all"
+# b3: a PENDING job whose script cannot be read is treated as reading EVERYTHING
+read -r RL3 TL3 V1L3 V2L3 < <(mkfixture L3)
+mkstub "$WORK/L3_squeue"
+printf '8000013 PENDING laneL3 %s -\n' "$TL3" > "$WORK/L3_run.txt"
+BEFORE_L3=$(md5sum "$TL3/tools/a_tool.sh" | awk '{print $1}')
+runsync "$RL3" "$TL3" "$WORK/L3_squeue" "$V2L3" --running-list "$WORK/L3_run.txt" > "$WORK/L3.log" 2>&1; rcL3=$?
+[ "$rcL3" -eq 6 ] && ok "L(b3): a PENDING job with NO readable script is treated as reading everything -- rc 6 (law 9)" \
+                  || { bad "L(b3): rc=$rcL3, wanted 6"; sed 's/^/      /' "$WORK/L3.log"; }
+grep -q 'state=PENDING file=a_tool.sh reason=no-sbatch-found' "$WORK/L3.log" \
+  && ok "L(b3): and the row carries BOTH the state and the reason it could not be determined" \
+  || { bad "L(b3): no 'state=PENDING ... reason=no-sbatch-found' row"; sed 's/^/      /' "$WORK/L3.log"; }
+[ "$(md5sum "$TL3/tools/a_tool.sh" | awk '{print $1}')" = "$BEFORE_L3" ] \
+  && ok "L(b3): nothing written there either" || bad "L(b3): it wrote after refusing"
+# b4: THE LIVE PATH. `--running-list` shims the job LIST, so b1-b3 prove the
+# state PLUMBING and nothing about the `squeue -t` filter the list stands in for.
+# This arm drives the REAL squeue call through a stub that behaves like squeue --
+# it honours `-t` and answers only for the format carrying %T -- so a PENDING job
+# only reaches the check if the filter actually asks for PD.
+mkstub_states () {  # $1=path $2=RUNNING rows $3=PENDING rows; models `squeue -t`
+  local p=$1 rtext=$2 ptext=$3
+  [ -n "$rtext" ] && printf '%s\n' "$rtext" > "$p.R" || : > "$p.R"
+  [ -n "$ptext" ] && printf '%s\n' "$ptext" > "$p.PD" || : > "$p.PD"
+  { echo '#!/usr/bin/env bash'
+    echo 'fmt=; t=R'
+    echo 'while [ $# -gt 0 ]; do'
+    echo '  case "$1" in'
+    echo '    -t) shift; t=${1:-};;  -t?*) t=${1#-t};;'
+    echo '    -o) shift; fmt=${1:-};; -o?*) fmt=${1#-o};;'
+    echo '  esac; shift'
+    echo 'done'
+    echo '# only the read-set query asks for %T; the rc-4 pin query must see nothing here'
+    echo 'case "$fmt" in *%T*) ;; *) exit 0;; esac'
+    echo "case \",\$t,\" in *,R,*)  [ -s '$p.R' ]  && cat '$p.R';;  esac"
+    echo "case \",\$t,\" in *,PD,*) [ -s '$p.PD' ] && cat '$p.PD';; esac"
+    echo 'exit 0'
+  } > "$p"
+  chmod 755 "$p"
+}
+read -r RL4 TL4 V1L4 V2L4 < <(mkfixture L4)
+mkstub_states "$WORK/L4_squeue" "" "8000014 PENDING laneL4 $TL4"
+git -C "$RL4" cat-file blob "$V2L4:harness/tools/a_tool.sh" > "$WORK/L4.blob"
+BEFORE_L4=$(md5sum "$TL4/tools/a_tool.sh" | awk '{print $1}')
+WANT_L4=$(md5sum "$WORK/L4.blob" | awk '{print $1}')
+[ "$BEFORE_L4" != "$WANT_L4" ] \
+  && ok "L(b4): NON-VACUITY -- a_tool.sh is $BEFORE_L4, $V2L4 says $WANT_L4, so it IS in the install set" \
+  || bad "L(b4): the fixture already matches the commit -- the live-path arm would prove nothing"
+runsync "$RL4" "$TL4" "$WORK/L4_squeue" "$V2L4" > "$WORK/L4.log" 2>&1; rcL4=$?
+[ "$rcL4" -eq 6 ] && ok "L(b4): THE LIVE squeue PATH lists PENDING jobs -- a queued job of ours refuses rc 6 with no --running-list at all" \
+                  || { bad "L(b4): rc=$rcL4, wanted 6 -- the production squeue query does not reach PENDING jobs"; sed 's/^/      /' "$WORK/L4.log"; }
+grep -q 'state=PENDING' "$WORK/L4.log" \
+  && ok "L(b4): and the live-path row carries state=PENDING too" \
+  || { bad "L(b4): the live-path refusal row has no state=PENDING"; sed 's/^/      /' "$WORK/L4.log"; }
+[ "$(md5sum "$TL4/tools/a_tool.sh" | awk '{print $1}')" = "$BEFORE_L4" ] \
+  && ok "L(b4): and it wrote nothing" || bad "L(b4): it wrote after refusing"
+# b5: THE MUTATION, and it cuts exactly one thing: the PD half of the state
+# filter. With `-t R` the queued job is never listed, the read set is empty, and
+# the same fixture INSTALLS -- which is what made 6001240 invisible. Without this
+# arm, b4 could be passing on the stub rather than on the filter.
+# The sanity check targets the CODE line (`-t R,PD -o`), not the bare string: the
+# header comment ALSO says `squeue -t R,PD`, and a first cut that asserted the
+# string was absent everywhere never built the mutant at all -- guard run 6002444,
+# "MUTATION ARM DID NOT RUN". That is the arm catching its own defect.
+MUT4=$WORK/harness_sync_runningonly.sh
+sed 's/-t R,PD -o/-t R -o/' "$SYNC" > "$MUT4"
+if bash -n "$MUT4" 2>/dev/null && ! grep -q -- "-t R,PD -o" "$MUT4" && grep -q -- "-t R -o" "$MUT4"; then
+  read -r RL5 TL5 V1L5 V2L5 < <(mkfixture L5)
+  mkstub_states "$WORK/L5_squeue" "" "8000015 PENDING laneL5 $TL5"
+  cp -f "$MUT4" "$TL5/tools/harness_sync.sh"
+  git -C "$RL5" cat-file blob "$V2L5:harness/tools/a_tool.sh" > "$WORK/L5.blob"
+  HARNESS_REPO="$RL5" HARNESS_TASK_DIR="$TL5" HARNESS_SQUEUE="$WORK/L5_squeue" \
+    bash "$TL5/tools/harness_sync.sh" "$V2L5" > "$WORK/L5.log" 2>&1; rcL5=$?
+  if [ "$rcL5" -ne 6 ] && cmp -s "$WORK/L5.blob" "$TL5/tools/a_tool.sh"; then
+    ok "L(b5): MUTATION -- with the PD half of the state filter cut (\`-t R\`) the sync rc=$rcL5 INSTALLS over the queued job, so b4 CAN fail"
+  else
+    bad "L(b5): the \`-t R\` mutant still refused (rc=$rcL5) or did not install -- ARM b4 IS NOT TESTING THE PD STATE FILTER"
+  fi
+else
+  bad "L(b5): could not build the -t R mutant -- MUTATION ARM DID NOT RUN"
+fi
+# b6: the state column is REQUIRED, and a row without it is a FATAL, not a row
+# read one field out of step. A four-field row is what every --running-list
+# fixture looked like before this lane; read with the new parser it would make
+# `<name>` the state, shift the script one field left, and hand the check an
+# EMPTY read set -- a silent install, which is the defect this block exists for.
+read -r RL6 TL6 V1L6 V2L6 < <(mkfixture L6)
+mkstub "$WORK/L6_squeue"
+mkjob "$TL6" tools/a_tool.sh
+printf '8000016 laneL6 %s %s\n' "$TL6" "$TL6/jobroot/j.sbatch" > "$WORK/L6_run.txt"   # the OLD four-field shape
+BEFORE_L6=$(md5sum "$TL6/tools/a_tool.sh" | awk '{print $1}')
+runsync "$RL6" "$TL6" "$WORK/L6_squeue" "$V2L6" --running-list "$WORK/L6_run.txt" > "$WORK/L6.log" 2>&1; rcL6=$?
+[ "$rcL6" -eq 2 ] && ok "L(b6): a --running-list row with no state column is FATAL rc 2, not silently misparsed" \
+                  || { bad "L(b6): rc=$rcL6, wanted 2 -- a stale four-field row was accepted"; sed 's/^/      /' "$WORK/L6.log"; }
+grep -q "state='laneL6'" "$WORK/L6.log" \
+  && ok "L(b6): and the FATAL NAMES the field it read and the row shape it wanted" \
+  || { bad "L(b6): the FATAL does not name the bad state field"; sed 's/^/      /' "$WORK/L6.log"; }
+[ "$(md5sum "$TL6/tools/a_tool.sh" | awk '{print $1}')" = "$BEFORE_L6" ] \
+  && ok "L(b6): and it wrote nothing before refusing" || bad "L(b6): it wrote before the FATAL"
 # ---- K: the live read set comes from SLURM'S OWN SNAPSHOT, not from disk ----
 # `--running-list` shims the job LIST; it cannot shim the one live call the list
 # is built from. `sbatch --wrap` and heredoc submissions leave `Command=(null)`

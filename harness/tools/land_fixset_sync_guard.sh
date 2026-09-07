@@ -325,17 +325,17 @@ fi
 mkshim () {   # mkshim <taskdir>  -- a harness_sync.sh that refuses rc 6
   cat > "$1/tools/harness_sync.sh" <<'SHIM'
 #!/usr/bin/env bash
-echo "### SYNC REFUSED rc=6 running=999999 file=x.sh reason=read-by-fixture-job"
-echo "### SYNC REFUSED (rc 6). The job(s) above are RUNNING ON ANOTHER NFS CLIENT."
+echo "### SYNC REFUSED rc=6 running=999999 state=PENDING file=x.sh reason=read-by-fixture-job"
+echo "### SYNC REFUSED (rc 6). The file(s) named are ones this sync would REWRITE."
 exit 6
 SHIM
   chmod 755 "$1/tools/harness_sync.sh"
 }
 rc6_msgcheck () {   # rc6_msgcheck <log> -- echoes "<named> <actuator> <rows>", 1 = present
   local L=$1 a=0 b=0 c=0
-  grep -q 'rc 6 means a RUNNING job of ours is still READING' "$L" && a=1
+  grep -q 'state=RUNNING -- a RUNNING job of ours is still READING that file right now' "$L" && grep -q 'state=PENDING -- the job has not STARTED' "$L" && a=1
   grep -q 'ACTUATOR: wait for job(s) 999999' "$L" && b=1
-  grep -q 'from harness_sync: ### SYNC REFUSED rc=6 running=999999 file=x.sh' "$L" && c=1
+  grep -q 'from harness_sync: ### SYNC REFUSED rc=6 running=999999 state=PENDING file=x.sh' "$L" && c=1
   echo "$a $b $c"
 }
 
