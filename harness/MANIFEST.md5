@@ -128,8 +128,9 @@ bdd93cc2798a27301e793bdc6931be06  tools/sdist_build_poison_guard.sh
 3dade9dfa3fe4cc0a16cb74529357732  tools/sdist_build_scope_guard.sh
 1c3729ccc1e9ba22803430aee01dc279  tools/shard_mirror.py
 1ebeef4acc3423ed32836b8c4f2da395  tools/stage_manifest_collation_guard.sh
-ff9014ec8ab0806334b426b41e38c5a2  tools/stage_mirror.sh
+fe427606078f3a7ccd9b789544b77b6a  tools/stage_mirror.sh
 f9fb64de4b6c56ed1677f1a56d873f52  tools/stage_mirror_guard.sh
+f8050ddf1fbe086b8a7f66f2e2ffb7bf  tools/stage_mirror_reap_guard.sh
 608d43b992a6f1f98974850ccb3983b0  tools/store_reap_census.sh
 3ed7d6f49541acf0cabb22062b6892de  tools/store_reap_census_guard.sh
 7b69763812988d4d090fce81096e6779  tools/test_stage_mirror.sh

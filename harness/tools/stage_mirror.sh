@@ -45,6 +45,8 @@
 #
 #   stage_mirror_inode_check <tree> <source>   rc 0 disjoint, 1 SHARED, 2 cannot check
 #   stage_mirror_census <tree>                 the census a mirror publishes
+#   stage_mirror_reap_building <parent> [minage_m]  remove UNFINISHED .building temps
+#   stage_mirror_repromote <dirty dir>         rename a false-positive quarantine back
 
 STAGE_MIRROR_SHARED_SHOW=${STAGE_MIRROR_SHARED_SHOW:-10}   # how many shared paths to print
 
@@ -92,5 +94,128 @@ stage_mirror_inode_check () {    # $1 = tree, $2 = source tree
     echo "###        through into the read-only canonical tree."
     return 1
   fi
+  return 0
+}
+
+# ── STAGE-MIRROR-3: the two things that can be done to a mirror parent ───────
+#
+# WHY THESE LIVE HERE AND NOT IN THE REAPER. The mirror parent
+# `$STAGE_MIRROR_ROOT` is a DECLARED PERSISTENT root: `cleanup.sh` refuses every
+# path under `agrescap/cache/retread` BY NAME, and `multiarm_store_reap.sh`
+# refuses it the same way. That containment is correct and is not being
+# loosened -- a general-purpose reaper let loose on the mirror parent is how a
+# 10.72 GB mirror gets deleted on a verdict nobody measured, twice. What is
+# needed instead is a verb narrow enough that it cannot express the dangerous
+# act: each one below can touch exactly ONE class of name, proves its
+# precondition by measurement, and prints a counted footer.
+#
+# THE TWO ARTEFACTS, both left by 2026-09-07 and both measured:
+#
+#   1. `<key>.building.<jid>-<TAG>-<pid>` -- a PARTIAL cp -al tree that was
+#      never renamed into place. `85db7fdbbf51206a0cb57fa0d55e0e74.building.
+#      999999-MH1-2247202` is one: hc14-guard 6023585 ran `bash
+#      arms/mh1_relock.sh` with SLURM_JOB_ID forced to 999999, the template ran
+#      for real, and the temp is what it got to before it was killed. 12908
+#      entries against the finished mirror's 44117, and NO `.stage-mirror-key`
+#      -- an unfinished build by construction, since the key is written last.
+#      Note the job id: 999999 is not a job, it is a guard's placeholder, and a
+#      non-existent id must read as NOT RUNNING rather than as unknown.
+#
+#   2. `<key>.DIRTY-<jid>-<TAG>-<epoch>` -- a mirror quarantined by a PRE-LOCK
+#      verify. mCB-relock 6022684 quarantined `…74` at 09:42 as
+#      `…74.DIRTY-6022684-MCB-1788788544` on a diff that was PURE REORDERING:
+#      STAGE-MIRROR-2's locale bug, a census written under one collation and
+#      re-walked under another. Measured at 10:26 with the one-producer census
+#      below: a fresh `LC_ALL=C` walk of that quarantine is 44117 rows, and
+#      `diff` against its own stored `.stage-mirror-manifest.tsv` is EMPTY --
+#      md5 41faec6000ed5e269232e7d0b0e7c35b for both. It was never dirty. With
+#      no live key present, re-promoting it saves a ~15 minute rebuild; the
+#      alternative is to let the next relock rebuild 10.72 GB to get back a tree
+#      we can prove we already have.
+#
+# NEITHER VERB DELETES A MIRROR. `reap_building` removes only unfinished temps,
+# and `repromote` only RENAMES. Neither will act while the name it would touch
+# could still belong to a running job, and neither will act on a bare key.
+
+stage_mirror_reap_building () {   # $1 = mirror parent, $2 = min age minutes (default 60)
+  local parent=$1 minage=${2:-60} d b jid qst age now n_seen=0 n_removed=0 n_refused=0
+  [ -d "$parent" ] || { echo "### stage-reap: no mirror parent at $parent"; return 2; }
+  now=$(date +%s)
+  # -maxdepth 1 -mindepth 1: only direct children of the parent, never a walk.
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    b=${d##*/}
+    # THE NAME IS THE WHOLE PERMISSION. Anything that is not `<key>.building.<jid>-…`
+    # is not this verb's business -- a bare key, a .DIRTY, a .SRCLINKED all fall
+    # through untouched, and there is no flag that widens this.
+    case "$b" in
+      *.building.[0-9]*-*) ;;
+      *) continue ;;
+    esac
+    n_seen=$((n_seen+1))
+    jid=${b#*.building.}; jid=${jid%%-*}
+    # A jid that no scheduler knows returns EMPTY here, which is NOT RUNNING.
+    # 999999 is exactly that case and it must not read as "cannot tell".
+    qst=$(squeue -j "$jid" -h -o '%t' 2>/dev/null | paste -sd,)
+    if [ -n "$qst" ]; then
+      echo "### stage-reap REFUSED $b: job $jid is still in the queue ($qst) -- it may be building this very temp"
+      n_refused=$((n_refused+1)); continue
+    fi
+    age=$(( (now - $(stat -c %Y "$d")) / 60 ))
+    if [ "$age" -lt "$minage" ]; then
+      echo "### stage-reap REFUSED $b: mtime is ${age}m old, younger than the ${minage}m floor"
+      n_refused=$((n_refused+1)); continue
+    fi
+    # A finished mirror carries a key. If one is here the name lied about being
+    # a temp, and this verb has no business with a finished tree.
+    if [ -f "$d/.stage-mirror-key" ]; then
+      echo "### stage-reap REFUSED $b: it carries a .stage-mirror-key, so it is a FINISHED mirror wearing a temp's name"
+      n_refused=$((n_refused+1)); continue
+    fi
+    echo "### stage-reap removing $b (job $jid not in queue, mtime ${age}m, entries $(find "$d" -maxdepth 6 2>/dev/null | wc -l), no key)"
+    rm -rf -- "$d" && n_removed=$((n_removed+1))
+  done <<EOF
+$(find "$parent" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | LC_ALL=C sort)
+EOF
+  echo "### STAGE-REAP BUILDING parent=$parent seen=$n_seen removed=$n_removed refused=$n_refused minage=${minage}m"
+  return 0
+}
+
+stage_mirror_repromote () {   # $1 = the .DIRTY-<...> directory to promote back
+  local d=$1 parent b key live wd rc
+  [ -d "$d" ] || { echo "### stage-repromote: no directory at $d"; return 2; }
+  parent=$(cd -- "$(dirname -- "$d")" && pwd); b=${d##*/}
+  case "$b" in
+    *.DIRTY-*) ;;
+    *) echo "### stage-repromote REFUSED $b: only a .DIRTY-<...> quarantine can be promoted"; return 2 ;;
+  esac
+  key=${b%%.DIRTY-*}
+  live=$parent/$key
+  # A LIVE KEY IS AN ABSOLUTE REFUSAL. Promoting over one would replace a mirror
+  # some running job may be staged from, which is the accident this whole family
+  # of files exists to prevent.
+  if [ -e "$live" ]; then
+    echo "### stage-repromote REFUSED $b: a live key already exists at $live -- nothing to restore"
+    return 1
+  fi
+  [ -f "$d/.stage-mirror-manifest.tsv" ] || {
+    echo "### stage-repromote REFUSED $b: no .stage-mirror-manifest.tsv, so the quarantine verdict cannot be re-tested"
+    return 1; }
+  wd=$(mktemp -d "${TMPDIR:-/tmp}/stage-repromote.XXXXXX") || return 2
+  # ONE PRODUCER. This is `stage_mirror_census`, the same function every writer
+  # and reader uses, so a promotion cannot be decided by a second implementation
+  # of "what is in this tree" -- which is the defect STAGE-MIRROR-2 was.
+  stage_mirror_census "$d" > "$wd/now.tsv"
+  LC_ALL=C sort -- "$d/.stage-mirror-manifest.tsv" > "$wd/stored.tsv"
+  if ! diff -q -- "$wd/stored.tsv" "$wd/now.tsv" >/dev/null 2>&1; then
+    echo "### stage-repromote REFUSED $b: the tree does NOT match its own stored manifest -- it really is dirty. Diff head:"
+    diff -- "$wd/stored.tsv" "$wd/now.tsv" 2>/dev/null | head -10 | sed 's/^/###   /'
+    echo "### STAGE-REPROMOTE promoted=0 refused=1 key=$key stored_rows=$(wc -l < "$wd/stored.tsv") now_rows=$(wc -l < "$wd/now.tsv")"
+    rm -rf "$wd"; return 1
+  fi
+  echo "### stage-repromote $b matches its stored manifest EXACTLY ($(wc -l < "$wd/now.tsv") rows, md5 $(md5sum "$wd/now.tsv" | awk '{print $1}')) -- the quarantine was a false positive"
+  rm -rf "$wd"
+  mv -T -- "$d" "$live" || { echo "### stage-repromote FAILED to rename $b -> $key"; return 1; }
+  echo "### STAGE-REPROMOTE promoted=1 refused=0 key=$key from=$b entries=$(grep '^entries=' "$live/.stage-mirror-key" 2>/dev/null | cut -d= -f2)"
   return 0
 }
