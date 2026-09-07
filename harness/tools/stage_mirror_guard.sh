@@ -42,8 +42,26 @@ set -u
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 LIB=$HERE/stage_mirror.sh
 SMOKE=$HERE/proof_smoke.sh
-TPL=$HERE/../phase_template/phaseN_relock.sh
-for f in "$LIB" "$SMOKE" "$TPL"; do [ -f "$f" ] || { echo "GUARD FATAL: $f not found"; exit 2; }; done
+# HARNESS-CONSOL-8 (2026-09-07). THE TEMPLATE UNDER TEST WAS ONE HARDCODED
+# SCALAR. `arms/mh1_relock.sh` carries this transformation too -- its
+# `stage_assert_mirror_disjoint` body is exactly `stage_mirror_inode_check "$1"
+# "$SRC_WS"`, it resolves STAGE_MIRROR_LIB and is FATAL without it, and it has
+# the same `stage_manifest` with the LC_ALL=C sort pin -- and no guard read it
+# for any of them. Worse than an unread file: `arms/` is the DERIVATION SOURCE
+# for every merge lane's relock script (README.md), and the lane log shows seven
+# merge lanes in two days doing `git cat-file blob <sha>:harness/arms/
+# mh1_relock.sh`. A defect that lands here is copied forward into all of them.
+#
+# Only the THREE assertions that actually read the template are per-target (B's
+# relock-gate agreement, C's manifest-less mirror, E's census equality); arms A,
+# D and the rest read $LIB/$SMOKE/the fixture and are global. Looping the whole
+# file would re-run rsync and the 203-file fixture per target for no new reading.
+# A target that is not present is skipped, not fatal -- `arms/` is additive.
+TARGETS=$HERE/../phase_template/phaseN_relock.sh
+for extra in "$HERE/../arms/mh1_relock.sh"; do
+  [ -f "$extra" ] && TARGETS="$TARGETS $extra"
+done
+for f in "$LIB" "$SMOKE" $TARGETS; do [ -f "$f" ] || { echo "GUARD FATAL: $f not found"; exit 2; }; done
 
 W=$(mktemp -d "${TMPDIR:-/tmp}/stage-mirror-guard.XXXXXX") || exit 2
 trap 'rm -rf "$W"' EXIT
@@ -97,24 +115,35 @@ if [ "$rcB" = 0 ] && printf '%s' "$OUTB" | grep -q "enumerated $NSRC shared 0"; 
 else
   fail "B. rc=$rcB on a real copy"
 fi
-RDJ=$(awk '/^stage_assert_mirror_disjoint \(\) \{/{p=1} p{print} p&&/^\}$/{exit}' "$TPL")
-OUTBR=$( . "$LIB" >/dev/null 2>&1; eval "$RDJ"; SRC_WS=$SRC; stage_assert_mirror_disjoint "$REAL" ); rcBR=$?
-if [ "$rcBR" = 0 ] && printf '%s' "$OUTBR" | grep -q 'enumerated'; then
-  ok "B. phaseN_relock.sh's gate accepts the same tree through the same authority (rc 0)"
-else
-  fail "B. the relock gate disagreed with the smoke gate on one tree (rc=$rcBR)"
-  printf '%s\n' "$OUTBR" | sed 's/^/GUARD:   /'
-fi
+for TPL in $TARGETS; do
+  TN=$(basename "$TPL")
+  RDJ=$(awk '/^stage_assert_mirror_disjoint \(\) \{/{p=1} p{print} p&&/^\}$/{exit}' "$TPL")
+  if [ -z "$RDJ" ]; then
+    fail "B. $TN has no stage_assert_mirror_disjoint to extract -- this arm is vacuous for it"
+    continue
+  fi
+  OUTBR=$( . "$LIB" >/dev/null 2>&1; eval "$RDJ"; SRC_WS=$SRC; stage_assert_mirror_disjoint "$REAL" ); rcBR=$?
+  if [ "$rcBR" = 0 ] && printf '%s' "$OUTBR" | grep -q 'enumerated'; then
+    ok "B. $TN's gate accepts the same tree through the same authority (rc 0)"
+  else
+    fail "B. $TN's relock gate disagreed with the smoke gate on one tree (rc=$rcBR)"
+    printf '%s\n' "$OUTBR" | sed 's/^/GUARD:   /'
+  fi
+done
 
 ########## C. the 6014471 regression, and rc 2 is not a verdict ################
 rm -f "$REAL/.stage-mirror-manifest.tsv"
-OUTC=$( . "$LIB" >/dev/null 2>&1; eval "$RDJ"; SRC_WS=$SRC; stage_assert_mirror_disjoint "$REAL" ); rcC=$?
-if [ "$rcC" = 0 ]; then
-  ok "C. a mirror with NO .stage-mirror-manifest.tsv is CHECKED and PASSES -- 6014471's quarantine cannot recur"
-else
-  fail "C. rc=$rcC -- a manifest-less mirror is still unjudgeable, which is the incident"
-  printf '%s\n' "$OUTC" | sed 's/^/GUARD:   /'
-fi
+for TPL in $TARGETS; do
+  TN=$(basename "$TPL")
+  RDJ=$(awk '/^stage_assert_mirror_disjoint \(\) \{/{p=1} p{print} p&&/^\}$/{exit}' "$TPL")
+  OUTC=$( . "$LIB" >/dev/null 2>&1; eval "$RDJ"; SRC_WS=$SRC; stage_assert_mirror_disjoint "$REAL" ); rcC=$?
+  if [ "$rcC" = 0 ]; then
+    ok "C. $TN: a mirror with NO .stage-mirror-manifest.tsv is CHECKED and PASSES -- 6014471's quarantine cannot recur"
+  else
+    fail "C. $TN: rc=$rcC -- a manifest-less mirror is still unjudgeable, which is the incident"
+    printf '%s\n' "$OUTC" | sed 's/^/GUARD:   /'
+  fi
+done
 OUTC2=$(stage_mirror_inode_check "$W/no-such-tree" "$SRC"); rcC2=$?
 if [ "$rcC2" = 2 ] && printf '%s' "$OUTC2" | grep -q 'CANNOT RUN' \
    && ! printf '%s' "$OUTC2" | grep -q 'HARDLINKED'; then
@@ -174,16 +203,23 @@ else
   fail "E. rc=$rcE key=$( [ -s "$MR/k1/.stage-mirror-key" ] && echo yes || echo no ) census=$( [ -s "$MR/k1/.stage-mirror-manifest.tsv" ] && echo yes || echo no )"
   printf '%s\n' "$OUTE" | tail -5 | sed 's/^/GUARD:   /'
 fi
-SM=$(awk '/^stage_manifest \(\) \{/{p=1} p{print} p&&/^\}$/{exit}' "$TPL")
-{ echo 'set -u'; printf '%s\n' "$SM"; echo 'stage_manifest "$1"'; } > "$W/sm.sh"
-bash "$W/sm.sh" "$REAL" > "$W/sm.out" 2>/dev/null
 ( . "$LIB" >/dev/null 2>&1; stage_mirror_census "$REAL" ) > "$W/smc.out" 2>/dev/null
-if [ -s "$W/sm.out" ] && cmp -s "$W/sm.out" "$W/smc.out"; then
-  ok "E. stage_mirror_census and phaseN_relock.sh's stage_manifest agree byte for byte ($(wc -l < "$W/sm.out") rows)"
-else
-  fail "E. the two censuses DISAGREE -- a mirror published by one and verified by the other would look written-through"
-  diff "$W/sm.out" "$W/smc.out" 2>/dev/null | head -5 | sed 's/^/GUARD:   /'
-fi
+for TPL in $TARGETS; do
+  TN=$(basename "$TPL")
+  SM=$(awk '/^stage_manifest \(\) \{/{p=1} p{print} p&&/^\}$/{exit}' "$TPL")
+  if [ -z "$SM" ]; then
+    fail "E. $TN has no stage_manifest to extract -- this arm is vacuous for it"
+    continue
+  fi
+  { echo 'set -u'; printf '%s\n' "$SM"; echo 'stage_manifest "$1"'; } > "$W/sm.$TN.sh"
+  bash "$W/sm.$TN.sh" "$REAL" > "$W/sm.$TN.out" 2>/dev/null
+  if [ -s "$W/sm.$TN.out" ] && cmp -s "$W/sm.$TN.out" "$W/smc.out"; then
+    ok "E. stage_mirror_census and $TN's stage_manifest agree byte for byte ($(wc -l < "$W/sm.$TN.out") rows)"
+  else
+    fail "E. $TN's census and the authority's DISAGREE -- a mirror published by one and verified by the other would look written-through"
+    diff "$W/sm.$TN.out" "$W/smc.out" 2>/dev/null | head -5 | sed 's/^/GUARD:   /'
+  fi
+done
 
 echo
 [ "$FAIL" = 0 ] && echo "PROOF-SMOKE-1-7 GUARD: ALL GREEN" || echo "PROOF-SMOKE-1-7 GUARD: SOME CHECKS FAILED"

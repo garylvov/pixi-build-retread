@@ -36,7 +36,7 @@ a2515c75fe18f95fda20b4d8156728ea  phase_template/leftover_check_guard.sh
 063ba387f091f6c66eb73ccdc632c70d  phase_template/link_mode_guard.sh
 b844b4798a797dd8d072deb0a1c86e8b  phase_template/phaseN_cert.sh
 42e7a479dd257e9fa8b46a432c942960  phase_template/phaseN_relock.sh
-f0b551a142cf8b6e2b8a658944226c3d  phase_template/quarantine_collision_guard.sh
+6cbcbe998e44568d0ee8ee82fb11d1f5  phase_template/quarantine_collision_guard.sh
 50b7200856323fbd0731c0f27a447d41  phase_template/owner_snapshot.sh
 aa0c70855063565f693aea5141ab146d  phase_template/owner_snapshot_provenance_guard.sh
 55f5a1b5d12a8f3ed0f1a36c3ca3eef6  phase_template/README.md
@@ -111,7 +111,7 @@ b7b4546662fa8c555a727be04c8b08ff  tools/proof_smoke.sh
 dd16a8c662b31dda554a2bdc052ba94d  tools/retread_fast_env.sh
 8ead634bfa020525eabee2a7a57b0182  tools/script_refs.sh
 ff9014ec8ab0806334b426b41e38c5a2  tools/stage_mirror.sh
-a03023af88c7c712fa4e39a1043347fa  tools/stage_mirror_guard.sh
+f9fb64de4b6c56ed1677f1a56d873f52  tools/stage_mirror_guard.sh
 46b5ede95808302e562b66b2e1a2201a  tools/retread_shard_mirror.sh
 bdd93cc2798a27301e793bdc6931be06  tools/sdist_build_poison_guard.sh
 da8aed178eda8db9d349a23d784bd8b6  tools/sdist_build_scope_guard.sh
