@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# quarantine_collision_guard.sh -- the reader for DET-1-6-b: a quarantine name
+# two arms of one job can both produce is not a quarantine.
+#
+# THE DEFECT. Every quarantine in phaseN_relock.sh was `mv "$x" "$x.<KIND>-$J"`,
+# one name per JOB -- and a multi-arm job runs several arms under one job id.
+# The second arm's `mv` finds a DIRECTORY at that name and, being mv, moves the
+# tree INSIDE it: the first quarantine now contains the second, the outer
+# manifest describes neither, and a reader looking for `<mirror>.DIRTY-<job>`
+# finds two different failures nested. The live mirror root already carries four
+# `.DIRTY-<jobid>` and one `.SRCLINKED-<jobid>`, so this is a shape that fires.
+# The same name-per-job mistake was in the BUILD temp (`$m.building.$J`, in both
+# phaseN_relock.sh and proof_smoke.sh), where the next arm's `rm -rf` deletes the
+# previous arm's half-built mirror -- 10.72 GB of real bytes.
+#
+# THE ARMS:
+#   A. two quarantines of the same mirror path in ONE job, from two arm tags:
+#      two SIBLING directories, and neither inside the other.
+#   B. the collision itself, made deterministic by shimming `date` to a fixed
+#      epoch so both calls compute the SAME name: the second must REFUSE and
+#      leave the tree where it is. Three fields make a collision unlikely; only
+#      the check makes nesting impossible.
+#   C. MUTATION -- the pre-fix line, verbatim (`mv "$1" "$1.$2-$J"`): the same
+#      fixture must NEST, or arm A is measuring nothing.
+#   D. law 2, the call sites: no `.<KIND>-$J` rename survives in
+#      phaseN_relock.sh, all three sites go through stage_quarantine, and both
+#      build temps carry a pid.
+#
+# The REAL functions are extracted from phaseN_relock.sh with the same awk
+# test_stage_mirror.sh uses -- never a re-implementation, except in arm C where
+# the re-implementation IS the defect being reproduced.
+#
+# Usage: quarantine_collision_guard.sh          (self-contained, needs $TMPDIR)
+set -u
+
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+TPL=$HERE/phaseN_relock.sh
+SMOKE=$HERE/../tools/proof_smoke.sh
+[ -f "$TPL" ] || { echo "GUARD FATAL: $TPL not found"; exit 2; }
+
+W=$(mktemp -d "${TMPDIR:-/tmp}/quarantine-guard.XXXXXX") || exit 2
+trap 'rm -rf "$W"' EXIT
+FAIL=0
+fail () { echo "GUARD FAIL: $*"; FAIL=1; }
+ok   () { echo "GUARD  ok : $*"; }
+
+FUNCS=$W/stage_funcs.sh
+awk '/^STAGE_METHOD=/{f=1} f&&/^if \[ ! -e "\$WS\/\.cert-staged" \]/{exit} f{print}' "$TPL" > "$FUNCS"
+grep -q '^stage_quarantine () {' "$FUNCS" || { echo "GUARD FATAL: no stage_quarantine in $TPL"; exit 2; }
+ok "extracted $(grep -c '^stage_[a-z_]* ()' "$FUNCS") stage functions from phaseN_relock.sh"
+
+mkmirror () { mkdir -p "$1/pypi-packs"; printf 'payload\n' > "$1/pypi-packs/f.txt"; }
+sibs ()     { find "$(dirname "$1")" -maxdepth 1 -name "$(basename "$1").DIRTY-*" | sort; }
+
+########## A. two arms of one job, same mirror path #############################
+M=$W/A/mirror
+mkdir -p "$W/A"
+mkmirror "$M"
+OUT1=$( . "$FUNCS" >/dev/null 2>&1; J=7770001 TAG=D6A; stage_quarantine "$M" DIRTY )
+mkmirror "$M"
+OUT2=$( . "$FUNCS" >/dev/null 2>&1; J=7770001 TAG=D6B; stage_quarantine "$M" DIRTY )
+printf '%s\n%s\n' "$OUT1" "$OUT2" | sed 's/^/GUARD:   /'
+N=$(sibs "$M" | wc -l)
+NEST=$(find "$W/A" -maxdepth 3 -path "*mirror.DIRTY-*/mirror" | wc -l)
+if [ "$N" = 2 ] && [ "$NEST" = 0 ]; then
+  ok "A. two arms of job 7770001 produced TWO SIBLING quarantines, neither inside the other"
+  sibs "$M" | sed 's/^/GUARD:   /'
+else
+  fail "A. quarantines=$N nested=$NEST (wanted 2 siblings, 0 nested)"
+  find "$W/A" -maxdepth 3 | sed 's/^/GUARD:   /'
+fi
+case "$OUT1" in *"$M.DIRTY-7770001-D6A-"*) ok "A. the name carries job id AND arm tag AND a timestamp" ;;
+  *) fail "A. the quarantine name does not carry job+arm+timestamp: $OUT1" ;; esac
+
+########## B. a real collision REFUSES rather than nests ########################
+mkdir -p "$W/bin" "$W/B"
+printf '#!/usr/bin/env bash\necho 1757000000\n' > "$W/bin/date"; chmod +x "$W/bin/date"
+MB=$W/B/mirror
+mkmirror "$MB"
+OB1=$( . "$FUNCS" >/dev/null 2>&1; PATH=$W/bin:$PATH J=7770002 TAG=D6A; stage_quarantine "$MB" DIRTY )
+mkmirror "$MB"
+OB2=$( . "$FUNCS" >/dev/null 2>&1; PATH=$W/bin:$PATH J=7770002 TAG=D6A; stage_quarantine "$MB" DIRTY ); rcB2=$?
+printf '%s\n%s\n' "$OB1" "$OB2" | sed 's/^/GUARD:   /'
+NB=$(sibs "$MB" | wc -l)
+if [ "$rcB2" = 3 ] && printf '%s' "$OB2" | grep -q 'QUARANTINE NAME COLLISION' \
+   && [ "$NB" = 1 ] && [ -d "$MB" ]; then
+  ok "B. a genuine name collision REFUSES rc 3, leaves the tree at $MB, and does not nest"
+else
+  fail "B. rc=$rcB2 quarantines=$NB mirror_still_there=$( [ -d "$MB" ] && echo yes || echo no )"
+fi
+
+########## C. MUTATION: the pre-fix line, and it must NEST ######################
+MUT=$W/mut_funcs.sh
+awk '/^stage_quarantine \(\) \{/{p=1; print "stage_quarantine () {  # PRE-FIX, verbatim"; print "  mv \"$1\" \"$1.$2-$J\" 2>/dev/null && echo \"### stage: quarantined -> $1.$2-$J\""; print "}"; next} p&&/^}$/{p=0; next} p{next} {print}' "$FUNCS" > "$MUT"
+if ! grep -q 'PRE-FIX, verbatim' "$MUT"; then
+  fail "C. the mutant could not be built -- stage_quarantine was not found, so C is vacuous"
+else
+  MC=$W/C/mirror
+  mkdir -p "$W/C"
+  mkmirror "$MC"
+  ( . "$MUT" >/dev/null 2>&1; J=7770003 TAG=D6A; stage_quarantine "$MC" DIRTY ) >/dev/null
+  mkmirror "$MC"
+  ( . "$MUT" >/dev/null 2>&1; J=7770003 TAG=D6B; stage_quarantine "$MC" DIRTY ) >/dev/null
+  if [ -d "$MC.DIRTY-7770003/mirror" ]; then
+    ok "C. MUTATION REPRODUCED: with the pre-fix line the second arm's tree is NESTED at $MC.DIRTY-7770003/mirror -- arm A is measuring the fix"
+  else
+    fail "C. the pre-fix line did not nest -- arm A proves nothing"
+    find "$W/C" -maxdepth 3 | sed 's/^/GUARD:   /'
+  fi
+fi
+
+########## D. law 2: every call site goes through the helper ####################
+LEFT=$(grep -nE 'mv "\$[A-Za-z_]+" "\$[A-Za-z_]+\.(DIRTY|SRCLINKED|stale)-\$J"' "$TPL")
+if [ -z "$LEFT" ]; then
+  ok "D. no job-id-only quarantine rename survives in phaseN_relock.sh"
+else
+  fail "D. a hand-rolled quarantine rename is still there:"; printf '%s\n' "$LEFT" | sed 's/^/GUARD:   /'
+fi
+NCALL=$(grep -c 'stage_quarantine "' "$TPL")
+if [ "$NCALL" -ge 3 ]; then
+  ok "D. all three quarantine sites in phaseN_relock.sh call stage_quarantine ($NCALL call sites)"
+else
+  fail "D. only $NCALL stage_quarantine call sites in phaseN_relock.sh -- one of the three was missed"
+fi
+if grep -q 'b="\$1.building.\$J-\$arm-\$\$"' "$TPL"; then
+  ok "D. phaseN_relock.sh's mirror build temp carries the arm tag and this process's pid"
+else
+  fail "D. the build temp in phaseN_relock.sh is still one name per JOB -- the next arm's rm -rf deletes it"
+fi
+if [ -f "$SMOKE" ]; then
+  if grep -q 'b=\$m.building.\$jid-' "$SMOKE"; then
+    ok "D. proof_smoke.sh's publish temp carries the arm tag and pid too"
+  else
+    fail "D. proof_smoke.sh still builds into \$m.building.\$jid -- the same collision on the publish path"
+  fi
+else
+  fail "D. $SMOKE not found -- the publish path could not be checked"
+fi
+
+echo
+[ "$FAIL" = 0 ] && echo "DET-1-6-b GUARD: ALL GREEN" || echo "DET-1-6-b GUARD: SOME CHECKS FAILED"
+exit "$FAIL"

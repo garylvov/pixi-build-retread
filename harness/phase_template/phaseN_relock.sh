@@ -427,7 +427,17 @@ stage_manifest () {              # what the mirror holds, minus its own two stam
 }
 
 stage_build_mirror () {          # ONE-TIME per key. Returns non-zero on failure.
-  local m=$1 key=$2 b="$1.building.$J"
+  # DET-1-6-b, the same collision from the other end: the temp used to be
+  # `$1.building.$J`, one name per JOB, and a job runs several arms. Arm 2's
+  # `rm -rf` on that name deletes arm 1's half-built mirror -- 10.72 GB of real
+  # bytes -- and the two then race into one rename. The name now carries the arm
+  # tag and THIS PROCESS's pid, so it cannot be another arm's, and the cleanup
+  # path names the temp this call actually created (STAGE_BUILD_TMP) instead of
+  # reconstructing a name that might be someone else's.
+  local m=$1 key=$2 arm b
+  arm=${STAGE_QUARANTINE_ARM:-${TAG:-arm}}
+  b="$1.building.$J-$arm-$$"
+  STAGE_BUILD_TMP=$b
   echo "### stage(mirror): BUILDING $m (key $key) -- this is the once-per-key cost"
   rm -rf "$b" 2>/dev/null
   mkdir -p "$b" || return 1
@@ -559,6 +569,39 @@ src_tp_fingerprint () {          # a DIRECT reader on the read-only canonical tr
     -printf '%i %T@ %s %P\n' 2>/dev/null | LC_ALL=C sort
 }
 
+# DET-1-6-b: A QUARANTINE NAME THAT TWO ARMS OF ONE JOB CAN BOTH PRODUCE IS NOT
+# A QUARANTINE. Every quarantine here used to be `mv "$x" "$x.<KIND>-$J"`, and a
+# multi-arm job runs several arms under ONE job id: the second arm's `mv` finds
+# a DIRECTORY already at that name and, being mv, moves the tree INSIDE it. The
+# first quarantine then contains the second, the outer manifest describes
+# neither, and the reader that goes looking for `<mirror>.DIRTY-<job>` finds a
+# tree whose contents are two different failures nested. The live mirror root
+# already carries four `.DIRTY-<jobid>` and one `.SRCLINKED-<jobid>`, so this is
+# a shape that fires, not a hypothesis.
+#
+# The name now carries job id, ARM TAG and a timestamp, and -- because three
+# fields still cannot make a collision impossible, only unlikely -- the target
+# is CHECKED and a collision REFUSES rather than nests. A refusal leaves the
+# tree where it is, which is recoverable; a nest is not.
+stage_quarantine () {            # $1 = path to move aside, $2 = kind (DIRTY|SRCLINKED|stale)
+  local src=$1 kind=$2 arm dst
+  arm=${STAGE_QUARANTINE_ARM:-${TAG:-arm}}      # read at the point of use, never remembered
+  dst="$src.$kind-${J:-nojob}-$arm-$(date +%s)"
+  if [ -e "$dst" ]; then
+    echo "### stage: QUARANTINE NAME COLLISION -- $dst already exists."
+    echo "###   REFUSING to move: an mv of a directory onto an existing directory NESTS it,"
+    echo "###   and a quarantine inside a quarantine describes neither failure. $src is"
+    echo "###   left exactly where it is. Move it aside by hand and say which arm made it."
+    return 3
+  fi
+  if mv "$src" "$dst" 2>/dev/null; then
+    echo "### stage: quarantined -> $dst"
+    return 0
+  fi
+  echo "### stage: QUARANTINE FAILED -- could not mv $src to $dst; the tree is untouched"
+  return 3
+}
+
 stage_verify_mirror () {         # the READER for stage_build_mirror's writer
   local m=$1
   [ -f "$m/.stage-mirror-manifest.tsv" ] || { echo "### stage: no mirror manifest at $m -- cannot verify"; return 0; }
@@ -571,7 +614,7 @@ stage_verify_mirror () {         # the READER for stage_build_mirror's writer
     echo "###        input was written through. Quarantining the mirror; the next"
     echo "###        job rebuilds it. Diff head:"
     LC_ALL=C diff "$m/.stage-mirror-manifest.tsv" "$now" | head -20
-    mv "$m" "$m.DIRTY-$J" 2>/dev/null && echo "### stage: quarantined -> $m.DIRTY-$J"
+    stage_quarantine "$m" DIRTY
     MIRROR_DIRTY=1
   fi
 }
@@ -592,11 +635,11 @@ if [ ! -e "$WS/.cert-staged" ]; then
        grep -qx "key=$STAGE_KEY" "$STAGE_MIRROR/.stage-mirror-key"; then
       echo "### stage: mirror key MATCHES -- warm path"
     else
-      [ -e "$STAGE_MIRROR" ] && { echo "### stage: mirror key MISMATCH -- rebuilding"; mv "$STAGE_MIRROR" "$STAGE_MIRROR.stale-$J"; }
+      [ -e "$STAGE_MIRROR" ] && { echo "### stage: mirror key MISMATCH -- rebuilding"; stage_quarantine "$STAGE_MIRROR" stale || { echo "### stage: FATAL -- a stale mirror that cannot be moved aside would be REBUILT INTO, and the rebuild would inherit its files"; exit 13; }; }
       mkdir -p "$STAGE_MIRROR_ROOT"
       stage_build_mirror "$STAGE_MIRROR" "$STAGE_KEY" || {
         echo "### stage: mirror build FAILED -- falling back to the rsync path"
-        rm -rf "$STAGE_MIRROR.building.$J" 2>/dev/null; STAGE_USED=rsync; STAGE_MIRROR=; }
+        rm -rf "${STAGE_BUILD_TMP:-}" 2>/dev/null; STAGE_USED=rsync; STAGE_MIRROR=; }
     fi
     if [ -n "$STAGE_MIRROR" ]; then
       # Before a single file is hardlinked out of it: is the mirror a real copy?
@@ -604,7 +647,7 @@ if [ ! -e "$WS/.cert-staged" ]; then
       # it would re-open the hole, so it is quarantined and rebuilt here.
       stage_assert_mirror_disjoint "$STAGE_MIRROR" || {
         echo "### stage: mirror shares inodes with $SRC_WS -- quarantining and rebuilding"
-        mv "$STAGE_MIRROR" "$STAGE_MIRROR.SRCLINKED-$J" 2>/dev/null
+        stage_quarantine "$STAGE_MIRROR" SRCLINKED || { echo "### stage: FATAL -- a source-linked mirror that cannot be moved aside would be rebuilt INTO, handing this job the very inodes the check refused"; exit 13; }
         stage_build_mirror "$STAGE_MIRROR" "$STAGE_KEY" \
           && stage_assert_mirror_disjoint "$STAGE_MIRROR" \
           || { echo "### stage: FATAL -- could not produce a mirror disjoint from $SRC_WS"; exit 13; }

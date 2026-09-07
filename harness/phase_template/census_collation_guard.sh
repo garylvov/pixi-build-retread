@@ -121,6 +121,13 @@ for TPL in $TARGETS; do
   # ---- B. the REAL stage_verify_mirror, cross-locale, must say INTACT ------
   SV=$(extract "$TPL" stage_verify_mirror)
   [ -n "$SV" ] || { fail "$NAME: could not extract stage_verify_mirror"; continue; }
+  # DET-1-6-b: stage_verify_mirror quarantines through stage_quarantine now, so
+  # the driver must carry that function too -- an extracted function whose helper
+  # is missing does not quarantine at all, and this arm would then pass by
+  # accident. And the quarantine NAME now carries job+arm+timestamp, so the
+  # assertion is a GLOB: an exact `.DIRTY-999999` would silently stop matching.
+  SQ=$(extract "$TPL" stage_quarantine)
+  [ -n "$SQ" ] || { fail "$NAME: could not extract stage_quarantine"; continue; }
   MIR=$W/$NAME.mirror
   rm -rf "$MIR"; cp -a "$FIX" "$MIR"
   # the census stamp is written by the BUILDING job, here under C
@@ -128,18 +135,19 @@ for TPL in $TARGETS; do
   printf 'key=guard\n' > "$MIR/.stage-mirror-key"
   VDRV=$W/$NAME.verify.sh
   { echo 'set -u'; echo 'A=$2; TAG=GUARD; J=999999; MIRROR_DIRTY=0'
-    printf '%s\n' "$SM"; printf '%s\n' "$SV"
+    printf '%s\n' "$SM"; printf '%s\n' "$SQ"; printf '%s\n' "$SV"
     echo 'stage_verify_mirror "$1"'; echo 'exit $MIRROR_DIRTY'; } > "$VDRV"
   mkdir -p "$W/$NAME.art"
+  quarantined () { ls -d "$MIR".DIRTY-* >/dev/null 2>&1 && echo yes || echo no; }
   # the VERIFYING job is a different job and inherits a different locale
   VOUT=$(LC_ALL=$ALT bash "$VDRV" "$MIR" "$W/$NAME.art" 2>&1); VRC=$?
   if [ "$VRC" = 0 ] && printf '%s' "$VOUT" | grep -q 'mirror INTACT' \
-     && [ ! -e "$MIR.DIRTY-999999" ]; then
+     && [ "$(quarantined)" = no ]; then
     ok "$NAME: B. stage_verify_mirror under $ALT reports INTACT, no quarantine"
   else
-    fail "$NAME: B. FALSE FATAL reproduced (rc=$VRC, quarantined=$( [ -e "$MIR.DIRTY-999999" ] && echo yes || echo no ))"
+    fail "$NAME: B. FALSE FATAL reproduced (rc=$VRC, quarantined=$(quarantined))"
     printf '%s\n' "$VOUT" | head -8 | sed 's/^/GUARD:   /'
-    rm -rf "$MIR.DIRTY-999999"
+    rm -rf "$MIR".DIRTY-*
   fi
 
   # ---- C. NEGATIVE CONTROL: unpin it and the same fixture MUST disagree ----

@@ -674,7 +674,12 @@ smoke_stage_build_mirror () {    # $1 = live root, $2 = key; rc 0 PUBLISHED, 3 A
   # so this half must resolve the job id for itself or a sourcing caller gets
   # an unbound variable instead of a mirror.
   jid=${SLURM_JOB_ID:-$$}
-  b=$m.building.$jid
+  # DET-1-6-b. `$m.building.$jid` is ONE name per JOB, and a job runs several
+  # arms: the next arm's `rm -rf` on that name deletes the previous arm's
+  # half-published mirror, and two arms that reach the rename together race into
+  # one live root. The pid makes the temp THIS PROCESS's, which is the only way
+  # the `rm -rf` below is provably ours to do.
+  b=$m.building.$jid-${SMOKE_ARM_TAG:-${TAG:-arm}}-$$
   mkdir -p "$SMOKE_MIRROR_ROOT" 2>/dev/null
   rm -rf "$b" 2>/dev/null
   mkdir -p "$b" || return 1
