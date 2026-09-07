@@ -62,6 +62,17 @@ echo 'name = "demo-under-test"' > "$CLEANED"
 FUNCS=$ROOT/stage_funcs.sh
 awk '/^STAGE_METHOD=/{f=1} f&&/^if \[ ! -e "\$WS\/\.cert-staged" \]/{exit} f{print}' "$TMPL" > "$FUNCS"
 grep -q 'stage_build_mirror ()'  "$FUNCS" || { echo "FATAL: could not extract stage_* from $TMPL"; exit 2; }
+# PROOF-SMOKE-1-7: the extracted block SOURCES tools/stage_mirror.sh -- the one
+# inode-disjointness authority -- so the fixture must put it beside the extract
+# or the block refuses (exit 14) and this test dies with it. Providing a
+# dependency is the guard's job; faking it would be measuring a different file.
+for cand in "$(dirname -- "$TMPL")/../tools/stage_mirror.sh" \
+            "$(dirname -- "$TMPL")/../stage_mirror.sh" \
+            "$(dirname -- "$TMPL")/stage_mirror.sh"; do
+  [ -f "$cand" ] && { cp "$cand" "$(dirname -- "$FUNCS")/stage_mirror.sh"; break; }
+done
+[ -f "$(dirname -- "$FUNCS")/stage_mirror.sh" ] \
+  || { echo "FATAL: no stage_mirror.sh beside $TMPL -- the extracted staging block cannot be sourced"; exit 2; }
 grep -q 'stage_verify_mirror ()' "$FUNCS" || { echo "FATAL: no stage_verify_mirror in $TMPL"; exit 2; }
 echo "### extracted $(grep -c '^stage_[a-z_]* ()' "$FUNCS") stage functions from $TMPL"
 

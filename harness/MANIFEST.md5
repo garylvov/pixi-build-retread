@@ -1,5 +1,5 @@
 dd9ccd3499306f8d08b3e6a2c5e8863a  arms/c29_relock.sh
-b1c7278084d2722f7e9be43d5b660edc  arms/mh1_relock.sh
+31c1560813626172db7918ff5bf15415  arms/mh1_relock.sh
 9ab99495ea47bef0ce5f4fda0c0ba9d3  arms/README.md
 ba125b0f353f4b5cdb40763cd5836e5a  inode-cleanup/backup-snapshots.sh
 f97d001102793377b7ff219430e97a64  inode-cleanup/bc_clean.sbatch
@@ -35,7 +35,7 @@ e8e163eafe17927064ef2e24f448bbfc  phase_template/cleanup_wall_guard.sh
 a2515c75fe18f95fda20b4d8156728ea  phase_template/leftover_check_guard.sh
 063ba387f091f6c66eb73ccdc632c70d  phase_template/link_mode_guard.sh
 b844b4798a797dd8d072deb0a1c86e8b  phase_template/phaseN_cert.sh
-e15dc87c7b541f346b6a32e184561cf4  phase_template/phaseN_relock.sh
+42e7a479dd257e9fa8b46a432c942960  phase_template/phaseN_relock.sh
 68ed12b6ae680320bb7ce8a1e7f11fef  phase_template/quarantine_collision_guard.sh
 f21819b527b182edbcf572acb0c97bd9  phase_template/owner_snapshot.sh
 aa0c70855063565f693aea5141ab146d  phase_template/owner_snapshot_provenance_guard.sh
@@ -44,7 +44,7 @@ e3ae2fe962354985617f5d6fa77f5a50  phase_template/store_census_snapshot_guard.sh
 a465cea86edc07ad5adf9f96b1ebac9e  phase_template/wedge_triage_guard.sh
 c26805a4a64f89749fe352bf5aaa8381  phase_template/wedge_triage.sh
 09145148ded67bdc997646a6dc2f9836  phase_template/wheel_store_census_guard.sh
-a1499dc758856b5a30ea16d566ffffe0  proof/hlgd_relock.sh
+5c8ea71c6424afbb87f42e131b359ff5  proof/hlgd_relock.sh
 2c1c174bdb5cc830d9bed4100ffb3fd3  README.md
 252a6cf77606e900a65ded3d59c06124  tools/arm_lock_sha_count_guard.sh
 5f70649013b2bf100dfb91dcc49bef44  tools/arm_lock_sha_count.sh
@@ -107,16 +107,18 @@ c34a4e3a1a8834b073b997fc94230a9f  tools/pixi_merge_run_exports.py
 c9f561484d8ef42157ba6a7532f80681  tools/pixi_shard_cache.py
 6960c0ac937f51969cd1d4f1e1af65c2  tools/pixi_trim_repodata.py
 7b6d14570716273e2562aaafd0bba071  tools/proof_smoke_guard.sh
-4947eacac5759190d4792b704ba268de  tools/proof_smoke.sh
+b7b4546662fa8c555a727be04c8b08ff  tools/proof_smoke.sh
 dd16a8c662b31dda554a2bdc052ba94d  tools/retread_fast_env.sh
 8ead634bfa020525eabee2a7a57b0182  tools/script_refs.sh
+ff9014ec8ab0806334b426b41e38c5a2  tools/stage_mirror.sh
+2b1974cd3f72cc8f172953d7afc04bb1  tools/stage_mirror_guard.sh
 46b5ede95808302e562b66b2e1a2201a  tools/retread_shard_mirror.sh
 bdd93cc2798a27301e793bdc6931be06  tools/sdist_build_poison_guard.sh
 da8aed178eda8db9d349a23d784bd8b6  tools/sdist_build_scope_guard.sh
 1c3729ccc1e9ba22803430aee01dc279  tools/shard_mirror.py
 3ed7d6f49541acf0cabb22062b6892de  tools/store_reap_census_guard.sh
 608d43b992a6f1f98974850ccb3983b0  tools/store_reap_census.sh
-4555925b41bc08ba5efb7bbb7b40f167  tools/test_stage_mirror.sh
+7b69763812988d4d090fce81096e6779  tools/test_stage_mirror.sh
 f4b1d2839ad51722d0f7a84b8482042b  tools/wheel_store_env_guard.sh
 955d184896115e611a763c60c490b5d8  tools/wheel_store_reclaim_guard.sh
 2d407ccacdbc4490300533092959185d  tools/wheel_store_reclaim.sh

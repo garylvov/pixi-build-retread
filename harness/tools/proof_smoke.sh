@@ -127,6 +127,23 @@ SMOKE_REQUIRED_UV=${SMOKE_REQUIRED_UV:-0.12.5}
 SMOKE_WALL=${SMOKE_WALL:-900}
 SMOKE_POLL=${SMOKE_POLL:-2}
 SMOKE_MIRROR_ROOT=${SMOKE_MIRROR_ROOT:-/oscar/data/stellex/glvov/agrescap/cache/retread/stage-mirror}
+# PROOF-SMOKE-1-7: the ONE inode-disjointness authority, sourced by this file and
+# by phase_template/phaseN_relock.sh. Two implementations of "does this tree
+# share inodes with imprint-data" is how a publish gated on 50 sampled files
+# handed a mirror to a reader that judged it by a different rule (job 6014471).
+STAGE_MIRROR_LIB=$(dirname -- "${BASH_SOURCE[0]}")/stage_mirror.sh
+# the task layout is $T/tools/phase_template beside $T/tools, the repo layout is
+# harness/phase_template beside harness/tools -- both spellings, and neither guessed.
+[ -f "$STAGE_MIRROR_LIB" ] || STAGE_MIRROR_LIB=$(dirname -- "${BASH_SOURCE[0]}")/../stage_mirror.sh
+[ -f "$STAGE_MIRROR_LIB" ] || STAGE_MIRROR_LIB=$(dirname -- "${BASH_SOURCE[0]}")/../tools/stage_mirror.sh
+[ -f "$STAGE_MIRROR_LIB" ] || STAGE_MIRROR_LIB=/oscar/data/stellex/glvov/agrescap/tasks/retread-4-11/tools/stage_mirror.sh
+if [ -f "$STAGE_MIRROR_LIB" ]; then
+  . "$STAGE_MIRROR_LIB"
+else
+  echo "### stage: FATAL -- stage_mirror.sh is missing, and it is the only thing that"
+  echo "###        decides whether a mirror is hardlinked into the canonical tree."
+  exit 14
+fi
 SMOKE_STAGE_PAR=${SMOKE_STAGE_PAR:-16}
 # The short root.  SHORT IS THE POINT (see the prefix panic above): every byte
 # spent here is a byte the hermetic entry path cannot have.
@@ -656,16 +673,15 @@ smoke_stage_cp_al_from_mirror () {  # $1 = mirror, $2 = workspace; THE one fan-o
 }
 
 smoke_stage_assert_mirror_disjoint () {  # $1 = tree; must share NO inode with $SMOKE_SRC_WS
-  local b=$1 rel n=0 shared=0
-  while IFS= read -r rel; do
-    [ -f "$SMOKE_SRC_WS/$rel" ] || continue
-    n=$((n+1))
-    [ "$(stat -c %i "$b/$rel" 2>/dev/null)" = "$(stat -c %i "$SMOKE_SRC_WS/$rel" 2>/dev/null)" ] \
-      && shared=$((shared+1))
-  done < <( ( cd "$b" && find . -type f -printf '%P\n' 2>/dev/null ) \
-              | grep -vF '.stage-mirror-' | shuf -n 50 )
-  echo "### SMOKE stage: mirror-vs-source inode check: sampled $n, shared $shared (want 0)"
-  [ "$shared" = 0 ]
+  # PROOF-SMOKE-1-7. This used to sample 50 files with `shuf -n 50`, and a
+  # PUBLISH gated on 50 of 44,113 files is gated on nothing: one hardlinked file
+  # is enough for every job staged off the mirror to write through into
+  # imprint-data, and a 50-file sample finds it about one time in 900. The
+  # enumeration is the ONE authority in tools/stage_mirror.sh, which the reader
+  # in phaseN_relock.sh calls too -- a publish and the check that judges it must
+  # not be two different rules. rc 2 (cannot check) refuses here as well: a
+  # publish is a writer, and an unchecked writer publishes to everyone.
+  stage_mirror_inode_check "$1" "$SMOKE_SRC_WS"
 }
 
 smoke_stage_build_mirror () {    # $1 = live root, $2 = key; rc 0 PUBLISHED, 3 ADOPTED, 1 failed
@@ -695,6 +711,14 @@ smoke_stage_build_mirror () {    # $1 = live root, $2 = key; rc 0 PUBLISHED, 3 A
     rm -rf "$b"; return 1; }
   # The stamp is what makes a published tree FINDABLE: the HIT check keys on it,
   # so it is written last, into the temp, and becomes visible only at the rename.
+  # PROOF-SMOKE-1-7: publish the CENSUS as well as the key. A smoke-published
+  # mirror carried only .stage-mirror-key, and phaseN_relock.sh reads
+  # .stage-mirror-manifest.tsv both to check inode disjointness (before this
+  # lane) and to detect a write-through afterwards (stage_verify_mirror, still).
+  # Without it 6014471 quarantined this mirror as SRCLINKED for a check that
+  # never ran, and every smoke-published mirror had the write-through detector
+  # silently switched off. Written BEFORE the key, which is the visibility stamp.
+  stage_mirror_census "$b" > "$b/.stage-mirror-manifest.tsv" || { rm -rf "$b"; return 1; }
   { echo "key=$key"; echo "src=$SMOKE_SRC_WS"
     echo "pixi_toml_md5=$(md5sum "$SMOKE_SRC_WS/pixi.toml" | awk '{print $1}')"
     echo "git_head=$(git -C "$SMOKE_SRC_WS" rev-parse HEAD 2>/dev/null || echo nogit)"

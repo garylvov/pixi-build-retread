@@ -265,6 +265,19 @@ BACKEND=$SNAP
 # the mirror for the next batch. That pair is the reader for this writer.
 STAGE_METHOD=mirror
 STAGE_MIRROR_ROOT=/oscar/data/stellex/glvov/agrescap/cache/retread/stage-mirror
+STAGE_MIRROR_LIB=$(dirname -- "${BASH_SOURCE[0]}")/stage_mirror.sh
+# the task layout is $T/tools/phase_template beside $T/tools, the repo layout is
+# harness/phase_template beside harness/tools -- both spellings, and neither guessed.
+[ -f "$STAGE_MIRROR_LIB" ] || STAGE_MIRROR_LIB=$(dirname -- "${BASH_SOURCE[0]}")/../stage_mirror.sh
+[ -f "$STAGE_MIRROR_LIB" ] || STAGE_MIRROR_LIB=$(dirname -- "${BASH_SOURCE[0]}")/../tools/stage_mirror.sh
+[ -f "$STAGE_MIRROR_LIB" ] || STAGE_MIRROR_LIB=/oscar/data/stellex/glvov/agrescap/tasks/retread-4-11/tools/stage_mirror.sh
+if [ -f "$STAGE_MIRROR_LIB" ]; then
+  . "$STAGE_MIRROR_LIB"
+else
+  echo "### stage: FATAL -- stage_mirror.sh is missing, and it is the only thing that"
+  echo "###        decides whether a mirror is hardlinked into the canonical tree."
+  exit 14
+fi
 STAGE_PAR=16          # cp -al here is NFS-RPC-latency bound, not CPU bound
 STAGE_RSYNC_EXCLUDES=( --exclude '/.pixi/' --exclude '/third_party/'
   --exclude '/assets/' --exclude '/groot-sonic-data/' --exclude '/logs/'
@@ -375,26 +388,23 @@ stage_build_mirror () {          # ONE-TIME per key. Returns non-zero on failure
 }
 
 stage_assert_mirror_disjoint () { # the mirror must share NO inode with $SRC_WS
-  # The reader for the "real copy, not cp -al" writer above, and the guard that
-  # would have caught the defect the day it landed. If any mirror file shares an
-  # inode with $SRC_WS then every workspace staged from the mirror is hardlinked
-  # into the read-only canonical tree, and an in-place write inside a job lands
-  # in imprint-data. 50 files sampled from the mirror's own manifest.
-  local m=$1 n=0 shared=0 p a b
-  [ -f "$m/.stage-mirror-manifest.tsv" ] || { echo "### stage: no mirror manifest -- cannot check inode disjointness"; return 1; }
-  while IFS= read -r p; do
-    [ -f "$m/$p" ] && [ -f "$SRC_WS/$p" ] || continue
-    a=$(stat -c %i "$m/$p" 2>/dev/null); b=$(stat -c %i "$SRC_WS/$p" 2>/dev/null)
-    n=$((n+1))
-    if [ -n "$a" ] && [ "$a" = "$b" ]; then shared=$((shared+1)); echo "###   SHARED INODE $a  $p"; fi
-  done < <(awk -F'\t' '$1=="f"{print $4}' "$m/.stage-mirror-manifest.tsv" 2>/dev/null | shuf -n 50)
-  echo "### stage: mirror-vs-source inode check: sampled $n, shared $shared (want 0)"
-  [ "$n" -gt 0 ] || { echo "### stage: sampled NOTHING -- the check is vacuous, treating as failure"; return 1; }
-  [ "$shared" = 0 ] || {
-    echo "### stage: FATAL -- the mirror is HARDLINKED to $SRC_WS. Every job staged"
-    echo "###        from it writes through into the read-only canonical tree."
-    return 1; }
-  return 0
+  # The reader for the "real copy, not cp -al" writer above. If any mirror file
+  # shares an inode with $SRC_WS then every workspace staged from the mirror is
+  # hardlinked into the read-only canonical tree, and an in-place write inside a
+  # job lands in imprint-data.
+  #
+  # PROOF-SMOKE-1-7. This read `$m/.stage-mirror-manifest.tsv` to know what to
+  # sample, and sampled 50 of its rows. Both halves were defects. It could not
+  # check a mirror somebody else built without that file -- proof_smoke.sh's
+  # publish wrote only `.stage-mirror-key` -- and it returned 1 for "cannot
+  # check", the same rc as "hardlinked", so the caller printed a hardlink
+  # verdict for a check that never ran and quarantined a 10.72 GB mirror as
+  # SRCLINKED (job 6014471, mirror published 03:55:59 by smoke job 6013332).
+  # The check is now the ONE enumeration in tools/stage_mirror.sh, which walks
+  # the tree instead of asking its builder's bookkeeping, keys on (device,
+  # inode) rather than an inode number alone, and answers rc 2 for "cannot
+  # check" so no caller can confuse the two again.
+  stage_mirror_inode_check "$1" "$SRC_WS"
 }
 
 stage_mirror_hit () {            # cp -al the mirror into $WS, fanned out
