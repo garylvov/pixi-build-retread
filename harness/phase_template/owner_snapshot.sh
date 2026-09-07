@@ -319,8 +319,14 @@ copy_one () {                    # $1 = absolute path of a script to freeze
   seen="$seen$b "
   n=$((n+1))
   # follow what it reads, with the SAME parser the sync judges with
-  while IFS=$'\t' read -r rb rp; do
+  # THREE fields since HARNESS-SYNC-7 -- the third is the provenance of the
+  # second (`via=A->B`, `via=sibling`, or `-`).  It is read into its own
+  # variable and not left to fall into $rp: two fields against a three-field
+  # producer puts a literal tab and `via=...` on the end of the PATH, and every
+  # `-f "$rp"` then fails, which is a snapshot silently missing files.
+  while IFS=$'\t' read -r rb rp rvia; do
     [ -n "${rb:-}" ] || continue
+    : "${rvia:=-}"
     if [ "$rb" = '?' ]; then
       echo "### OWNER SNAPSHOT REFUSED: $b contains a reference this parser cannot resolve."
       echo "###   A snapshot with a hole is worse than none: the job would read the LIVE"

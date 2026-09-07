@@ -83,6 +83,15 @@
 #      reads an installed file still refuses rc 4 with its rc-6 rows beside it
 #      (n2); one whose read set is undeterminable, or was never examined, still
 #      refuses (n3, n3b -- law 9). n4 is the mutation.
+#   R  HARNESS-SYNC-7: a path built from LITERAL variables is a KNOWN path.
+#      det162-proof 6015646 blocked the queue as a RUNNING rc-6 hit on two files
+#      it never read -- `WT=<literal>`, `WTH=$WT/harness`,
+#      `MOVED_ROWS=$WTH/tools/moved_row_halves.sh` -- a chain whose value is in
+#      the text. r1 is that shape, resolved, installing, and PRINTING the chain
+#      and the absolute path; r2 is the control (the same shape landing INSIDE
+#      the task tools/ still refuses rc 6 match=exact); r3 keeps a `$( )` hop
+#      unresolved and refusing (law 9: the expansion adds resolutions, it does
+#      not invent them); r4 is the mutation.
 #   J  static: the header no longer claims the rename is "the only safe way to
 #      write into a live task dir" -- it is safe only when renamer and reader are
 #      the SAME NFS client -- and the PIN REPORT no longer calls a RUNNING job
@@ -1212,6 +1221,144 @@ if bash -n "$MUT6" 2>/dev/null && ! grep -q 'HARNESS-SYNC-6 TOLERANCE BRANCH' "$
   fi
 else
   bad "N(n4): could not build the no-tolerance mutant -- MUTATION ARM DID NOT RUN"
+fi
+
+
+# ---- R: HARNESS-SYNC-7 -- a path built from LITERAL variables is a KNOWN path -
+# THE DEFECT, and it cost the merge queue a whole morning. det162-proof 6015646
+# sat as a RUNNING rc-6 blocker on `moved_row_halves.sh` and
+# `multiarm_preamble.sh` while reading NEITHER task copy: its driver assigns
+# `WT=<a literal worktree path>`, then `WTH=$WT/harness`, then
+# `MOVED_ROWS=$WTH/tools/moved_row_halves.sh`, and sources
+# `"$WTH/tools/multiarm_preamble.sh"`. Every hop is a literal in the SAME file,
+# so the absolute path is as knowable from the text as `/abs/path` is -- the
+# parser simply stopped at the `$` and the check then assumed the worst about a
+# path it could have computed. That is not caution, it is an unread fact, and
+# law 9 does not licence refusing on one.
+#
+#   r1  THE det162 SHAPE: a three-hop chain to a tree OUTSIDE the task dir is
+#       RESOLVED, the sync INSTALLS (rc 0), and the row SAYS how -- with the
+#       variable chain and the absolute path, so the clearance can be audited.
+#   r2  THE CONTROL, and without it r1 is worthless: the SAME chain shape whose
+#       literal points INTO the task tools/ resolves to the file the sync would
+#       rewrite and still REFUSES rc 6, match=exact.
+#   r3  a hop assigned from a COMMAND SUBSTITUTION is not knowable from the text
+#       and stays unresolved -- refused rc 6, match=unresolved (law 9).
+#   r4  THE MUTATION: with the chain branch cut, r1's fixture refuses again, so
+#       r1 CAN fail.
+mkchainjob () {   # $1 = job root dir, $2 = file name, $3.. = body lines
+  local jr=$1 fn=$2; shift 2
+  mkdir -p "$jr"
+  { echo '#!/bin/bash'; for l in "$@"; do printf '%s\n' "$l"; done; } > "$jr/$fn"
+  chmod 755 "$jr/$fn"
+}
+
+# ---- r1: the det162 chain, resolving OUTSIDE the task tree ------------------
+read -r RR1 TR1 V1R1 V2R1 < <(mkfixture R1)
+R1OUT=$WORK/R1_outside
+mkdir -p "$R1OUT/harness/tools"
+printf 'outside tool\n' > "$R1OUT/harness/tools/a_tool.sh"
+printf 'outside exec\n' > "$R1OUT/harness/tools/an_exec.sh"
+mkchainjob "$TR1/jobroot" r1.sbatch \
+  "WT=$R1OUT" \
+  'WTH=$WT/harness' \
+  'A_TOOL=$WTH/tools/a_tool.sh' \
+  'bash "$A_TOOL"' \
+  'source "$WTH/tools/an_exec.sh"'
+mkstub "$WORK/R1_squeue"
+printf '8000071 RUNNING laneR1 %s %s %s\n' "$TR1" "$TR1/jobroot/r1.sbatch" "$TR1/jobroot" > "$WORK/R1_run.txt"
+git -C "$RR1" cat-file blob "$V2R1:harness/tools/a_tool.sh" > "$WORK/R1.blob"
+BEFORE_R1=$(md5sum "$TR1/tools/a_tool.sh" | awk '{print $1}')
+WANT_R1=$(md5sum "$WORK/R1.blob" | awk '{print $1}')
+[ "$BEFORE_R1" != "$WANT_R1" ] \
+  && ok "R(r1): NON-VACUITY -- tools/a_tool.sh is $BEFORE_R1 and $V2R1 says $WANT_R1, so it IS in the install set and the job DOES name that basename" \
+  || bad "R(r1): the fixture tool already matches the commit -- the arm would prove nothing"
+runsync "$RR1" "$TR1" "$WORK/R1_squeue" "$V2R1" --running-list "$WORK/R1_run.txt" > "$WORK/R1.log" 2>&1; rcR1=$?
+if [ "$rcR1" -eq 0 ] && cmp -s "$WORK/R1.blob" "$TR1/tools/a_tool.sh"; then
+  ok "R(r1): a three-hop LITERAL chain to a tree outside the task dir no longer blocks the sync -- rc 0 and a_tool.sh installed with a live RUNNING job naming that basename"
+else
+  bad "R(r1): rc=$rcR1 -- the det162 shape must resolve and install"; sed 's/^/      /' "$WORK/R1.log"
+fi
+if grep -q 'read-set OK job=8000071 file=a_tool.sh match=resolved-literal via=A_TOOL->WTH->WT ' "$WORK/R1.log"; then
+  ok "R(r1): and it SAYS HOW -- the row carries match=resolved-literal and the whole chain A_TOOL->WTH->WT, not a bare clearance"
+else
+  bad "R(r1): no row naming match=resolved-literal with the A_TOOL->WTH->WT chain"; grep 'read-set OK' "$WORK/R1.log" | sed 's/^/      /'
+fi
+if grep -q "read-set OK job=8000071 file=a_tool.sh .*path=$R1OUT/harness/tools/a_tool.sh reason=reads-outside-install-set" "$WORK/R1.log"; then
+  ok "R(r1): the ABSOLUTE resolved path is printed and classed reads-outside-install-set -- the reason the refusal was wrong, on the record"
+else
+  bad "R(r1): the row does not print the absolute path with reason=reads-outside-install-set"; grep 'read-set OK' "$WORK/R1.log" | sed 's/^/      /'
+fi
+grep -q 'read-set OK job=8000071 file=an_exec.sh match=resolved-literal via=WTH->WT ' "$WORK/R1.log" \
+  && ok "R(r1): the TWO-hop form (\`source \"\$WTH/tools/an_exec.sh\"\`, det162's multiarm_preamble shape) resolves too, via=WTH->WT" \
+  || { bad "R(r1): the two-hop source form did not resolve"; grep 'read-set OK' "$WORK/R1.log" | sed 's/^/      /'; }
+
+# ---- r2: THE CONTROL -- the same chain, pointing INTO the task tools/ --------
+read -r RR2 TR2 V1R2 V2R2 < <(mkfixture R2)
+mkchainjob "$TR2/jobroot" r2.sbatch \
+  "TT=$TR2" \
+  'TTOOLS=$TT/tools' \
+  'A_TOOL=$TTOOLS/a_tool.sh' \
+  'bash "$A_TOOL"'
+mkstub "$WORK/R2_squeue"
+printf '8000072 RUNNING laneR2 %s %s %s\n' "$TR2" "$TR2/jobroot/r2.sbatch" "$TR2/jobroot" > "$WORK/R2_run.txt"
+BEFORE_R2=$(md5sum "$TR2/tools/a_tool.sh" | awk '{print $1}')
+runsync "$RR2" "$TR2" "$WORK/R2_squeue" "$V2R2" --running-list "$WORK/R2_run.txt" > "$WORK/R2.log" 2>&1; rcR2=$?
+AFTER_R2=$(md5sum "$TR2/tools/a_tool.sh" | awk '{print $1}')
+if [ "$rcR2" -eq 6 ] && [ "$AFTER_R2" = "$BEFORE_R2" ] \
+   && grep -q 'SYNC REFUSED rc=6 running=8000072 .*file=a_tool.sh .*match=exact' "$WORK/R2.log"; then
+  ok "R(r2): CONTROL -- the SAME literal-chain shape resolving INTO the task tools/ is refused rc 6 match=exact and nothing was written. r1 is the chain being COMPUTED, not the check going blind."
+else
+  bad "R(r2): rc=$rcR2 before=$BEFORE_R2 after=$AFTER_R2 -- a chain that lands on the installed file must still refuse"; sed 's/^/      /' "$WORK/R2.log"
+fi
+
+# ---- r3: a hop assigned from a COMMAND SUBSTITUTION stays unresolved ---------
+read -r RR3 TR3 V1R3 V2R3 < <(mkfixture R3)
+mkchainjob "$TR3/jobroot" r3.sbatch \
+  'ROOT=$(cd /tmp && pwd)' \
+  'bash "$ROOT/tools/a_tool.sh"'
+mkstub "$WORK/R3_squeue"
+printf '8000073 RUNNING laneR3 %s %s %s\n' "$TR3" "$TR3/jobroot/r3.sbatch" "$TR3/jobroot" > "$WORK/R3_run.txt"
+BEFORE_R3=$(md5sum "$TR3/tools/a_tool.sh" | awk '{print $1}')
+runsync "$RR3" "$TR3" "$WORK/R3_squeue" "$V2R3" --running-list "$WORK/R3_run.txt" > "$WORK/R3.log" 2>&1; rcR3=$?
+AFTER_R3=$(md5sum "$TR3/tools/a_tool.sh" | awk '{print $1}')
+if [ "$rcR3" -eq 6 ] && [ "$AFTER_R3" = "$BEFORE_R3" ] \
+   && grep -q 'SYNC REFUSED rc=6 running=8000073 .*file=a_tool.sh .*match=unresolved' "$WORK/R3.log"; then
+  ok "R(r3): a hop whose value is a COMMAND SUBSTITUTION is not in the text, stays unresolved and still refuses rc 6 -- the expansion adds resolutions, it does not invent them"
+else
+  bad "R(r3): rc=$rcR3 before=$BEFORE_R3 after=$AFTER_R3 -- a \$( ) hop must not be guessed"; sed 's/^/      /' "$WORK/R3.log"
+fi
+
+# ---- r4: THE MUTATION -- cut the chain branch and r1 must go red -------------
+SRSRC=$(dirname -- "$SYNC")/script_refs.sh
+MUT7=$WORK/script_refs_nochain.sh
+if [ -f "$SRSRC" ]; then
+  sed 's|^\([[:space:]]*\)if ex=.*# HARNESS-SYNC-7 CHAIN BRANCH$|\1if false; then|' "$SRSRC" > "$MUT7"
+else
+  : > "$MUT7"
+fi
+if [ -s "$MUT7" ] && bash -n "$MUT7" 2>/dev/null && ! grep -q 'HARNESS-SYNC-7 CHAIN BRANCH' "$MUT7"; then
+  read -r RR4 TR4 V1R4 V2R4 < <(mkfixture R4)
+  R4OUT=$WORK/R4_outside
+  mkdir -p "$R4OUT/harness/tools"
+  printf 'outside tool\n' > "$R4OUT/harness/tools/a_tool.sh"
+  mkchainjob "$TR4/jobroot" r4.sbatch \
+    "WT=$R4OUT" \
+    'WTH=$WT/harness' \
+    'A_TOOL=$WTH/tools/a_tool.sh' \
+    'bash "$A_TOOL"'
+  cp -f "$MUT7" "$TR4/tools/script_refs.sh"
+  mkstub "$WORK/R4_squeue"
+  printf '8000074 RUNNING laneR4 %s %s %s\n' "$TR4" "$TR4/jobroot/r4.sbatch" "$TR4/jobroot" > "$WORK/R4_run.txt"
+  runsync "$RR4" "$TR4" "$WORK/R4_squeue" "$V2R4" --running-list "$WORK/R4_run.txt" > "$WORK/R4.log" 2>&1; rcR4=$?
+  if [ "$rcR4" -eq 6 ] && grep -q 'SYNC REFUSED rc=6 running=8000074 .*file=a_tool.sh .*match=unresolved' "$WORK/R4.log"; then
+    ok "R(r4): MUTATION -- with the chain branch cut, the SAME det162 shape refuses rc 6 match=unresolved again (rc=$rcR4), so r1 CAN fail"
+  else
+    bad "R(r4): the mutant gave rc=$rcR4 and did not refuse on a_tool.sh -- ARM r1 IS NOT TESTING THE RESOLUTION"
+    sed 's/^/      /' "$WORK/R4.log"
+  fi
+else
+  bad "R(r4): could not build the no-chain mutant of script_refs.sh -- MUTATION ARM DID NOT RUN"
 fi
 
 echo "### harness_sync_guard: pass=$pass fail=$fail"

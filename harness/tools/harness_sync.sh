@@ -553,14 +553,31 @@ if [ -s "$INSTSET" ]; then
     while IFS= read -r trel; do
       tb=$(basename -- "$trel")
       cut -f1 "$RS" | grep -qxF -- "$tb" || continue
-      verdict=$(awk -F'\t' -v b="$tb" -v want="$TASK_DIR/$trel" '
-        $1==b { seen=1; if ($2=="-") unresolved=1; else if ($2==want) exact=1; else other=1 }
-        END { if (!seen) print "none"; else if (unresolved) print "unresolved";
-              else if (exact) print "exact"; else print "elsewhere" }' "$RS")
+      # HARNESS-SYNC-7: the verdict now carries the PATH it resolved to and the
+      # VARIABLE CHAIN that produced it, because a cleared refusal that cannot
+      # be audited is a refusal cleared on trust.
+      vinfo=$(awk -F'\t' -v b="$tb" -v want="$TASK_DIR/$trel" '
+        $1==b { seen=1
+                if ($2=="-") unresolved=1
+                else if ($2==want) exact=1
+                else { other=1; if (op=="") { op=$2; ov=($3==""?"-":$3) } } }
+        END { if (!seen) v="none"; else if (unresolved) v="unresolved";
+              else if (exact) v="exact"; else v="elsewhere";
+              printf "%s\t%s\t%s", v, (op==""?"-":op), (ov==""?"-":ov) }' "$RS")
+      verdict=${vinfo%%$'\t'*}
+      vrest=${vinfo#*$'\t'}; rpath=${vrest%%$'\t'*}; rvia=${vrest#*$'\t'}
       case "$verdict" in
         elsewhere)
-          printf '###   read-set OK job=%s file=%s -- every reference to that basename resolves elsewhere (owner snapshot); not a read of %s\n' \
-            "$jid" "$tb" "$TASK_DIR/$trel"
+          # WHICH KIND of elsewhere, named rather than lumped: a path computed
+          # from a literal variable chain says `resolved-literal` and prints the
+          # chain; a path outside this task tree cannot be a read of anything
+          # this sync installs, and says so.
+          rmatch=resolved-elsewhere
+          case "$rvia" in via=-|-|'') ;; *) rmatch=resolved-literal;; esac
+          rscope=reads-outside-install-set
+          case "$rpath" in "$TASK_DIR"/*) rscope=reads-another-task-path;; esac
+          printf '###   read-set OK job=%s file=%s match=%s %s path=%s reason=%s -- every reference to that basename resolves elsewhere (owner snapshot); not a read of %s\n' \
+            "$jid" "$tb" "$rmatch" "$rvia" "$rpath" "$rscope" "$TASK_DIR/$trel"
           continue;;
         none) continue;;
       esac

@@ -37,7 +37,7 @@ a2515c75fe18f95fda20b4d8156728ea  phase_template/leftover_check_guard.sh
 b3b4572f3bfc5b3db39f472ec4b91bc4  phase_template/phaseN_cert.sh
 e5016970e636d94b53d6784ff7719109  phase_template/phaseN_relock.sh
 6cbcbe998e44568d0ee8ee82fb11d1f5  phase_template/quarantine_collision_guard.sh
-50b7200856323fbd0731c0f27a447d41  phase_template/owner_snapshot.sh
+3d616350a0e0f66c37e957e6a5fad750  phase_template/owner_snapshot.sh
 aa0c70855063565f693aea5141ab146d  phase_template/owner_snapshot_provenance_guard.sh
 55f5a1b5d12a8f3ed0f1a36c3ca3eef6  phase_template/README.md
 e3ae2fe962354985617f5d6fa77f5a50  phase_template/store_census_snapshot_guard.sh
@@ -76,8 +76,8 @@ de2c918a31b7e5fdae517cda1ccba4d4  tools/gate_head_pin.sh
 4d5a36d919e59c5f1631f1da82e806a2  tools/harness_commit_pin_guard.sh
 8cad0bdfc7496ee0661c4f5701a8e087  tools/harness_commit_resolve.sh
 447037c0b4249d9d3d7c084940be5cc4  tools/harness_drift_allowlist.txt
-3cebe2b3d38e418a8bf2dbbb6fbf43c8  tools/harness_sync.sh
-3229b656bb60483f579f705fb812b194  tools/harness_sync_guard.sh
+a5d492615f7475231606ceedea2ca9a4  tools/harness_sync.sh
+9a1665a8a4dc8de206cf6bc2a95ab00c  tools/harness_sync_guard.sh
 587729c857a328049c8dd28a3d189f55  tools/harness_drift_check.sh
 4c8a892042e7de5b6ed3763562a2dd52  tools/harness_push_check.sh
 39e620e807735bdc65b09fb8078d8e82  tools/import_audit.py
@@ -113,7 +113,7 @@ c9f561484d8ef42157ba6a7532f80681  tools/pixi_shard_cache.py
 7b6d14570716273e2562aaafd0bba071  tools/proof_smoke_guard.sh
 b7b4546662fa8c555a727be04c8b08ff  tools/proof_smoke.sh
 3cdfa9cf6f7c866e184c217125781efa  tools/retread_fast_env.sh
-8ead634bfa020525eabee2a7a57b0182  tools/script_refs.sh
+725a5227fc98fac5665890f344c59195  tools/script_refs.sh
 ff9014ec8ab0806334b426b41e38c5a2  tools/stage_mirror.sh
 f9fb64de4b6c56ed1677f1a56d873f52  tools/stage_mirror_guard.sh
 46b5ede95808302e562b66b2e1a2201a  tools/retread_shard_mirror.sh
