@@ -43,6 +43,20 @@
 #      does NOT repeat the rc-4 "a PENDING job is pinned elsewhere" story. J2 is
 #      the mutation: with the tagged rc-6 lines cut out the same fixture leaves
 #      every one of those assertions RED.
+#   M  LAND-IDEM-1: THE STATE THIS TOOL CREATES FOR ITSELF. It commits the row
+#      and THEN calls the sync, and the sync can refuse -- leaving the repo copy
+#      one row ahead of the task copy. The divergence pre-check sits ABOVE the
+#      `already carries` arm, so until this lane the tool's own refusal made its
+#      own re-run refuse rc 2 (MERGE-U 2026-09-06 rc 4, then MERGE-U-2
+#      2026-09-07 rc 2 on the re-run, which never reached the sync at all).
+#      M1  repo = task + EXACTLY this landing's row -> `### FIXSET RESUME`, the
+#          run CONTINUES to the sync, and the sync's own rc is the run's answer:
+#          M1a with the REAL sync (rc 0, copies identical, record written) and
+#          M1b with the rc-6 shim (still FATAL rc 3 -- resume is not a bypass).
+#      M2  repo ahead by a DIFFERENT row -> still REFUSE rc 2, no sync called.
+#      M3  repo ahead by TWO rows (this landing's AND another) -> REFUSE rc 2.
+#      M4  THE MUTATION: the resume branch forced false. M1's fixture must then
+#          refuse rc 2 again, or M1 is passing on something other than the fix.
 #
 # THE MUTATION IS PINNED TO A COMMIT CONSTANT, NEVER `HEAD`: an arm that reads
 # `HEAD:<the file it guards>` starts asserting the fix against itself the moment
@@ -107,16 +121,35 @@ mkfixture () {   # mkfixture <name> ; echoes "<repo> <taskdir>"
   # a fixture that cannot exercise the call site would guard nothing. The empty
   # allowlist is seeded BEFORE the landing on purpose: created afterwards it is
   # itself an unsynced write and `--check` correctly calls it edited.
-  cp -f "$REPO/harness/tools/harness_sync.sh" "$REPO/harness/tools/harness_drift_check.sh" "$r/harness/tools/"
-  : > "$r/harness/tools/harness_drift_allowlist.txt"
+  #
+  # LAND-IDEM-1 ADDENDUM, and it is a defect this guard was carrying, not a
+  # convenience. HARNESS-SYNC-5 moved the read-set parser OUT of harness_sync.sh
+  # into `tools/script_refs.sh` and made its absence a FATAL rc 2 ("a silent
+  # install is worse than a refusal"), and HARNESS-CONSOL-10 added
+  # `tools/harness_push_check.sh` to the `--check` path -- but this fixture
+  # builder was never taught either name. So from HARNESS-SYNC-5 onward EVERY
+  # arm here that reaches the real sync (A, C, H1) died on
+  # `### SYNC FATAL: no script_refs.sh ...`, and the guard sat RED at 10 rows
+  # with nobody reading it: `hc10-guard.sbatch`'s GUARDS list does not name this
+  # file, so HARNESS-CONSOL-10's 121/0 was harness_sync_guard's, never this
+  # one's. Measured here at 63f4f86: rc=1 pass=42 fail=10. That is the reader
+  # half of law 2 missing at the fixture level -- harness_sync_guard.sh's own
+  # mkfixture copies BOTH files, and this one is the copy that drifted.
+  # The set is a LIST so the next file the sync starts requiring is added once.
+  local SYNCDEPS="harness_sync.sh harness_drift_check.sh script_refs.sh harness_push_check.sh"
   local f
-  for f in binsnap_fixset.txt harness_sync.sh harness_drift_check.sh harness_drift_allowlist.txt; do
+  for f in $SYNCDEPS; do
+    cp -f "$REPO/harness/tools/$f" "$r/harness/tools/$f" \
+      || { echo "FATAL: mkfixture cannot copy harness/tools/$f from $REPO" >&2; return 3; }
+  done
+  : > "$r/harness/tools/harness_drift_allowlist.txt"
+  for f in binsnap_fixset.txt harness_drift_allowlist.txt $SYNCDEPS; do
     cp -f "$r/harness/tools/$f" "$t/tools/$f"
   done
-  git -C "$r" add -- "$RREL" harness/MANIFEST.md5 harness/tools/harness_sync.sh \
-      harness/tools/harness_drift_check.sh harness/tools/harness_drift_allowlist.txt
-  git -C "$r" commit -q -m base -- "$RREL" harness/MANIFEST.md5 harness/tools/harness_sync.sh \
-      harness/tools/harness_drift_check.sh harness/tools/harness_drift_allowlist.txt
+  local ADD=("$RREL" harness/MANIFEST.md5 harness/tools/harness_drift_allowlist.txt)
+  for f in $SYNCDEPS; do ADD+=("harness/tools/$f"); done
+  git -C "$r" add -- "${ADD[@]}"
+  git -C "$r" commit -q -m base -- "${ADD[@]}"
   echo "$r $t"
 }
 
@@ -466,6 +499,143 @@ if bash -n "$WORK/helper_norc4both.sh" 2>/dev/null && ! grep -q "if grep -q '###
   fi
 else
   bad "J4: could not build the rc-4-readback mutant -- MUTATION ARM DID NOT RUN"
+fi
+
+# ---- ARM M: LAND-IDEM-1 -- the tool's OWN leftover must RESUME, not refuse ---
+# THE DEFECT, WITH TWO DATED LANDINGS IN IT. MERGE-K-2 ordered the work
+# commit-then-sync ("a refusal here is a refusal with nothing moved") and
+# LAND-SYNC-1 then routed the task-copy install through `harness_sync.sh`, which
+# REFUSES rc 4 / rc 6 by design. Every such refusal therefore leaves the repo
+# copy one row ahead and the task copy untouched -- and the `cmp -s` divergence
+# pre-check, which exists to stop a landing burying SOMEBODY ELSE's drift, sits
+# ABOVE the `already carries` arm. So the writer that creates the divergence was
+# not a reader of it (law 2), and the helper's own header claim of idempotence
+# was false in exactly the state the helper produces. MERGE-U hit rc 4 on
+# 2026-09-06T22:41; MERGE-U-2's re-run on 2026-09-07T06:33 got rc 2 from this
+# very check and never reached the sync.
+#
+# THE FIX IS A CONTENT TEST, so these arms are about what is compared, not about
+# line counts: repo-minus-task must be EXACTLY the row being landed, and
+# task-minus-repo must be empty. M2 and M3 are the arms that keep the fix from
+# degenerating into "one extra line is fine".
+mkstate_a () {   # mkstate_a <repo> <task> <row>  -- reproduce the post-refusal state
+  # EXACTLY what the previous attempt did: append the row to the versioned copy,
+  # rewrite the MANIFEST row for it, commit BOTH path-limited -- and leave the
+  # task copy alone, because the sync it then called refused before writing.
+  local r=$1 t=$2 row=$3
+  printf '%s\n' "$row" >> "$r/$RREL"
+  md5sum "$r/$RREL" | awk '{print $1 "  tools/binsnap_fixset.txt"}' > "$r/harness/MANIFEST.md5"
+  git -C "$r" commit -q -m 'previous attempt: the row, committed before the sync refused' \
+    -- "$RREL" harness/MANIFEST.md5
+}
+# ---- M1a: the RESUME path end to end, through the REAL sync -----------------
+read -r RM TM < <(mkfixture M)
+mkstate_a "$RM" "$TM" "$ROW1"
+M1COMMIT=$(git -C "$RM" rev-parse HEAD)
+cmp -s "$RM/$RREL" "$TM/tools/binsnap_fixset.txt" \
+  && bad "M1a: NON-VACUITY -- the fixture copies are identical, so the resume path is never entered" \
+  || ok "M1a: NON-VACUITY -- the fixture reproduces the post-refusal state (repo one row ahead, task untouched)"
+bash "$HELPER" "$RM" "$TM" "$ROW1" > "$WORK/M1a.log" 2>&1; rcM1a=$?
+grep -q '### FIXSET RESUME: repo already carries this row' "$WORK/M1a.log" \
+  && ok "M1a: THE FIX -- it prints ### FIXSET RESUME instead of refusing its own leftover" \
+  || { bad "M1a: no RESUME row -- the tool still refuses the state it creates"; sed 's/^/      /' "$WORK/M1a.log"; }
+grep -q '### FIXSET REFUSE: the two fix-set copies already differ' "$WORK/M1a.log" \
+  && { bad "M1a: it ALSO printed the rc-2 refusal"; sed 's/^/      /' "$WORK/M1a.log"; } \
+  || ok "M1a: and it does NOT print the 'already differ' refusal on the resumable state"
+grep -q '### harness sync:' "$WORK/M1a.log" \
+  && ok "M1a: the run CONTINUED TO THE SYNC -- the writer was actually called" \
+  || { bad "M1a: the sync was never called, so the gap is still open"; sed 's/^/      /' "$WORK/M1a.log"; }
+[ "$rcM1a" = 0 ] && ok "M1a: and the run's rc IS the sync's rc (0 here, the sync succeeded)" \
+  || { bad "M1a: rc=$rcM1a, want 0"; sed 's/^/      /' "$WORK/M1a.log"; }
+cmp "$RM/$RREL" "$TM/tools/binsnap_fixset.txt" \
+  && ok "M1a: the two copies are BYTE-IDENTICAL afterwards -- the gap is closed" \
+  || bad "M1a: the copies still differ after the resumed landing"
+git -C "$RM" cat-file blob "$M1COMMIT:$RREL" > "$WORK/M1a.blob" 2>/dev/null
+cmp "$WORK/M1a.blob" "$TM/tools/binsnap_fixset.txt" \
+  && ok "M1a: and the task copy is the COMMIT'S OWN BLOB, installed by the sync, not a hand write" \
+  || bad "M1a: the task copy is not $M1COMMIT's bytes"
+[ "$(git -C "$RM" rev-parse HEAD)" = "$M1COMMIT" ] \
+  && ok "M1a: NO SECOND COMMIT was cut -- the resume appends nothing" \
+  || bad "M1a: it committed the row a second time ($M1COMMIT -> $(git -C "$RM" rev-parse HEAD))"
+[ "$(grep -c '^deadbee ' "$RM/$RREL")" = 1 ] \
+  && ok "M1a: the row appears exactly ONCE in the versioned copy" \
+  || bad "M1a: the row was duplicated by the resume"
+grep -q "### FIXSET HARNESS_COMMIT=$M1COMMIT" "$WORK/M1a.log" \
+  && ok "M1a: it prints the HARNESS_COMMIT the next job must carry, as a successful landing does" \
+  || bad "M1a: no HARNESS_COMMIT row on the resumed landing"
+# ---- M1b: resume is a HAND-OFF, not a bypass -------------------------------
+# The rc the run reports on the resumed path must be the SYNC's, or "resume"
+# would mean "skip the writer's refusal", which is the truncation rc 6 exists to
+# prevent. Same state, same row, a sync that refuses rc 6.
+read -r RMB TMB < <(mkfixture Mb)
+mkstate_a "$RMB" "$TMB" "$ROW1"
+MB_TASK_BEFORE=$(md5sum "$TMB/tools/binsnap_fixset.txt" | awk '{print $1}')
+mkshim "$TMB"
+bash "$HELPER" "$RMB" "$TMB" "$ROW1" > "$WORK/M1b.log" 2>&1; rcM1b=$?
+grep -q '### FIXSET RESUME: repo already carries this row' "$WORK/M1b.log" \
+  && ok "M1b: the resumable state still RESUMES when the sync is going to refuse" \
+  || { bad "M1b: no RESUME row"; sed 's/^/      /' "$WORK/M1b.log"; }
+[ "$rcM1b" = 3 ] && ok "M1b: and the run FATALs rc 3 on the sync's rc 6 -- resume is a hand-off, not a bypass" \
+  || { bad "M1b: rc=$rcM1b, want 3"; sed 's/^/      /' "$WORK/M1b.log"; }
+grep -q 'ACTUATOR: wait for job(s) 999999' "$WORK/M1b.log" \
+  && ok "M1b: the rc-6 actuator is still printed on the resumed path" \
+  || bad "M1b: the resumed path lost the rc-6 explanation"
+[ "$(md5sum "$TMB/tools/binsnap_fixset.txt" | awk '{print $1}')" = "$MB_TASK_BEFORE" ] \
+  && ok "M1b: and the refusal INSTALLED NOTHING -- the task copy is still its pre-run bytes" \
+  || bad "M1b: the task copy moved despite the sync refusing"
+# ---- M2: repo ahead by a DIFFERENT row -> still REFUSE ----------------------
+read -r RM2 TM2 < <(mkfixture M2)
+mkstate_a "$RM2" "$TM2" '7777777 somebody-elses-landing'
+M2_REPO_BEFORE=$(md5sum "$RM2/$RREL" | awk '{print $1}')
+M2_HEAD=$(git -C "$RM2" rev-parse HEAD)
+bash "$HELPER" "$RM2" "$TM2" "$ROW1" > "$WORK/M2.log" 2>&1; rcM2=$?
+[ "$rcM2" = 2 ] && ok "M2: a divergence that is NOT this landing's row still refuses rc 2" \
+  || { bad "M2: rc=$rcM2, want 2 -- the resume branch is too wide"; sed 's/^/      /' "$WORK/M2.log"; }
+grep -q '### FIXSET RESUME' "$WORK/M2.log" \
+  && bad "M2: it RESUMED over somebody else's row -- the fix buries the drift it was meant to stop" \
+  || ok "M2: and it prints no RESUME row"
+grep -q '### harness sync:' "$WORK/M2.log" \
+  && bad "M2: it called the sync anyway after refusing" || ok "M2: the sync was NOT called"
+[ "$(md5sum "$RM2/$RREL" | awk '{print $1}')" = "$M2_REPO_BEFORE" ] \
+  && [ "$(git -C "$RM2" rev-parse HEAD)" = "$M2_HEAD" ] \
+  && ok "M2: it appended nothing and committed nothing while refusing" \
+  || bad "M2: it moved the repo copy or cut a commit while refusing"
+grep -q "the RESUMABLE divergence is repo = task + exactly 'deadbee fixture-row-one'" "$WORK/M2.log" \
+  && ok "M2: the refusal SAYS what the resumable case is and names the rows it actually found" \
+  || { bad "M2: the refusal does not distinguish itself from the resumable case"; sed 's/^/      /' "$WORK/M2.log"; }
+# ---- M3: repo ahead by TWO rows -> REFUSE -----------------------------------
+# This landing's row AND another. "The repo carries my row" is NOT the test; the
+# test is that my row is the ONLY thing it carries that the task does not.
+read -r RM3 TM3 < <(mkfixture M3)
+mkstate_a "$RM3" "$TM3" "$ROW1"
+mkstate_a "$RM3" "$TM3" '6666666 a-second-unlanded-row'
+bash "$HELPER" "$RM3" "$TM3" "$ROW1" > "$WORK/M3.log" 2>&1; rcM3=$?
+[ "$rcM3" = 2 ] && ok "M3: repo ahead by TWO rows refuses rc 2 even though one of them IS this landing's" \
+  || { bad "M3: rc=$rcM3, want 2 -- 'the repo carries my row' is being used as the test"; sed 's/^/      /' "$WORK/M3.log"; }
+grep -q '### FIXSET RESUME' "$WORK/M3.log" \
+  && bad "M3: it RESUMED with an extra unlanded row in the versioned copy" \
+  || ok "M3: and it prints no RESUME row"
+grep -q '### harness sync:' "$WORK/M3.log" \
+  && bad "M3: it called the sync anyway" || ok "M3: the sync was NOT called"
+# ---- M4: THE MUTATION -- the resume branch forced false ---------------------
+# Cut exactly one thing: the predicate that recognises the tool's own leftover.
+# M1's fixture must then go back to refusing rc 2, or M1 cannot fail.
+sed 's|.*# LAND-IDEM-1 RESUME BRANCH$|  if false; then|' "$HELPER" > "$WORK/helper_noresume.sh"
+if bash -n "$WORK/helper_noresume.sh" 2>/dev/null \
+   && ! grep -q 'LAND-IDEM-1 RESUME BRANCH' "$WORK/helper_noresume.sh" \
+   && grep -q '^  if false; then$' "$WORK/helper_noresume.sh"; then
+  read -r RM4 TM4 < <(mkfixture M4)
+  mkstate_a "$RM4" "$TM4" "$ROW1"
+  bash "$WORK/helper_noresume.sh" "$RM4" "$TM4" "$ROW1" > "$WORK/M4.log" 2>&1; rcM4=$?
+  if [ "$rcM4" = 2 ] && grep -q '### FIXSET REFUSE: the two fix-set copies already differ' "$WORK/M4.log" \
+     && ! grep -q '### FIXSET RESUME' "$WORK/M4.log" && ! grep -q '### harness sync:' "$WORK/M4.log"; then
+    ok "M4: MUTATION -- with the resume branch forced false the SAME fixture refuses rc 2 and never reaches the sync, so M1 CAN fail (this is MERGE-U-2's landing, reproduced)"
+  else
+    bad "M4: the mutant gave rc=$rcM4 without the rc-2 refusal -- ARM M1 IS NOT TESTING THE RESUME BRANCH"
+    sed 's/^/      /' "$WORK/M4.log"
+  fi
+else
+  bad "M4: could not build the no-resume mutant -- MUTATION ARM DID NOT RUN"
 fi
 
 echo "### land_fixset_sync_guard: pass=$pass fail=$fail"

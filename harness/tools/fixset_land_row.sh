@@ -46,7 +46,9 @@
 #   rc 0  the row is present in both homes, they are byte-identical, and the
 #         commit that says so is printed
 #   rc 2  REFUSED before touching anything (bad arguments, missing file, the two
-#         copies already diverged, or an uncommitted edit to the versioned copy)
+#         copies diverged BY SOMETHING OTHER THAN THIS LANDING'S OWN ROW -- see
+#         the idempotence note below -- or an uncommitted edit to the versioned
+#         copy)
 #   rc 3  the commit or the re-extraction failed -- the repo copy is restored
 #   rc 3  ALSO: harness_sync.sh refused, so the task copies were NOT advanced.
 #         Its rc is printed and EXPLAINED -- rc 4 a PENDING job pinned to another
@@ -56,9 +58,28 @@
 #         script NEVER passes --force; overriding a read-set refusal is a
 #         deliberate, hand-proved act, never an unattended landing's.
 #
+# IDEMPOTENCE, CORRECTED (LAND-IDEM-1, 2026-09-07).  This header used to claim
+# flatly that a re-run "finds the row already present and takes the `already
+# carries` arm".  THAT WAS FALSE IN THE ONE STATE THIS SCRIPT ITSELF CREATES.
+# The order of work is COMMIT-THEN-SYNC (MERGE-K-2), and LAND-SYNC-1 made the
+# sync able to refuse.  When it refuses, the repo copy is one row ahead -- THIS
+# landing's row -- and the task copy is untouched; the divergence pre-check sits
+# ABOVE the `already carries` arm, so the tool's own refusal made the tool's own
+# re-run refuse rc 2, one gate earlier, forever.  Measured twice: MERGE-U's
+# landing refused rc 4 on 2026-09-06T22:41 and left the gap; MERGE-U-2's re-run
+# on 2026-09-07T06:33 hit rc 2 on that gap and never reached the sync at all.
+# So there are now TWO re-run paths and both are idempotent:
+#   * the copies AGREE and the repo carries the key -> `### FIXSET already
+#     carries` (unchanged);
+#   * the copies differ by EXACTLY this landing's row, nothing else -> `###
+#     FIXSET RESUME`, and the run continues to the sync, which is the writer
+#     that closes the gap.  Any other divergence is still rc 2.
+#
 # Reader: land_fixset_sync_guard.sh, which lands a row into a THROWAWAY fixture
-# repo and asserts the two copies are byte-identical afterwards, and replays the
-# pre-MERGE-K-2 append from the pinned commit to show that same assertion failing.
+# repo and asserts the two copies are byte-identical afterwards, replays the
+# pre-MERGE-K-2 append from the pinned commit to show that same assertion
+# failing, and (arms M1-M4) drives the RESUME state, the two divergences that
+# must still refuse, and the mutation that cuts the resume branch out.
 set -uo pipefail
 export PATH=/users/glvov/.pixi/bin:/users/glvov/.local/bin:$PATH   # git-lfs, or the commit dies
 
@@ -91,13 +112,45 @@ git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 || {
 # The two copies must ALREADY agree, or this landing would bury an existing
 # divergence under a new row. Direct file arguments -- a piped compare is a known
 # false-mismatch source in this environment (CLAUDE.md law 15).
+#
+# LAND-IDEM-1. Except for ONE divergence, which is not somebody else's: the one
+# this landing's OWN previous attempt created by committing the row and then
+# being refused by the sync. That state is distinguished BY CONTENT, never by
+# md5 and never by "the repo has more lines": the set of rows the repo carries
+# and the task does not must be EXACTLY this landing's row, and the task must
+# carry no row the repo lacks. Two extra rows, a DIFFERENT extra row, or any
+# task-side row is somebody else's divergence and burying it under a new row is
+# precisely what this check exists to stop -- those all still refuse rc 2.
+# Whitespace is normalised for the comparison (a row differing only in spacing
+# is the same row, and refusing on it would be a false blocker); the FILES are
+# never rewritten here, the sync installs the task copy from the commit.
+fixset_norm () {   # normalise ONE fix-set copy for content comparison
+  sed -e 's/[[:space:]][[:space:]]*/ /g' -e 's/^ //' -e 's/ $//' -e '/^$/d' -- "$1" | LC_ALL=C sort
+}
 if ! cmp -s "$RPATH" "$TPATH"; then
-  echo "### FIXSET REFUSE: the two fix-set copies already differ, and nothing was appended."
-  echo "###   repo $RPATH md5=$(md5sum "$RPATH" | awk '{print $1}')"
-  echo "###   task $TPATH md5=$(md5sum "$TPATH" | awk '{print $1}')"
-  echo "###   Reconcile them from a commit first, never by editing one side:"
-  echo "###     git -C $REPO cat-file blob <commit>:$RREL > $TPATH"
-  exit 2
+  NROW=$(printf '%s\n' "$ROW" | sed -e 's/[[:space:]][[:space:]]*/ /g' -e 's/^ //' -e 's/ $//')
+  ONLY_REPO=$(comm -23 <(fixset_norm "$RPATH") <(fixset_norm "$TPATH"))
+  ONLY_TASK=$(comm -13 <(fixset_norm "$RPATH") <(fixset_norm "$TPATH"))
+  if [ -z "$ONLY_TASK" ] && [ "$ONLY_REPO" = "$NROW" ]; then   # LAND-IDEM-1 RESUME BRANCH
+    echo "### FIXSET RESUME: repo already carries this row; task copy behind by exactly it — proceeding to sync"
+    echo "###   repo $RPATH md5=$(md5sum "$RPATH" | awk '{print $1}')"
+    echo "###   task $TPATH md5=$(md5sum "$TPATH" | awk '{print $1}')"
+    echo "###   the ONE row the repo carries and the task does not is '$NROW', which is this"
+    echo "###   landing's own row: a previous attempt committed it and then the sync refused."
+    echo "###   Nothing is appended and nothing is hand-edited -- harness_sync.sh installs the"
+    echo "###   task copy FROM the commit, which is the only writer allowed to (LAND-SYNC-1)."
+  else
+    echo "### FIXSET REFUSE: the two fix-set copies already differ, and nothing was appended."
+    echo "###   repo $RPATH md5=$(md5sum "$RPATH" | awk '{print $1}')"
+    echo "###   task $TPATH md5=$(md5sum "$TPATH" | awk '{print $1}')"
+    echo "###   Reconcile them from a commit first, never by editing one side:"
+    echo "###     git -C $REPO cat-file blob <commit>:$RREL > $TPATH"
+    echo "###   (LAND-IDEM-1: the RESUMABLE divergence is repo = task + exactly '$NROW' and"
+    echo "###    nothing else. Here the repo-only rows are: ${ONLY_REPO:-<none>}"
+    echo "###    and the task-only rows are: ${ONLY_TASK:-<none>} -- so this is NOT this"
+    echo "###    landing's own leftover and it is not this landing's to bury.)"
+    exit 2
+  fi
 fi
 
 # A path-limited commit would sweep in an uncommitted edit somebody else is
@@ -167,8 +220,16 @@ fi
 # landing that would strand a queued job now says so, by name, at the moment it
 # happens, instead of that job dying three hours later on "drift". land.sh
 # treats a non-zero here as its exit-11 refusal WITH NOTHING MOVED except the
-# harness commit, which is idempotent: re-running the landing after the queue
-# drains finds the row already present and takes the `already carries` arm.
+# harness commit.
+#
+# AND THAT "EXCEPT" IS THE WHOLE OF LAND-IDEM-1. The harness commit having moved
+# is exactly what leaves the two copies one row apart, so re-running the landing
+# after the queue drains does NOT reach the `already carries` arm -- it reaches
+# the divergence pre-check above it, which until 2026-09-07 refused rc 2 on the
+# tool's own leftover. It now takes the `### FIXSET RESUME` path instead, proves
+# by CONTENT that the only gap is this landing's row, and comes straight back
+# here to call the writer again. Re-running a refused landing is therefore
+# idempotent in both states, which is what the refusal always assumed.
 SYNC=$TASK/tools/harness_sync.sh
 [ -f "$SYNC" ] || SYNC=$REPO/harness/tools/harness_sync.sh
 [ -f "$SYNC" ] || { echo "### FIXSET FATAL: no harness_sync.sh at $TASK/tools or $REPO/harness/tools"; exit 3; }
