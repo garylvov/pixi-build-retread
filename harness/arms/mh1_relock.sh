@@ -377,8 +377,30 @@ stage_rsync_path () {            # the pre-p12 path, unchanged
 stage_manifest () {              # what the mirror holds, minus its own two stamp files.
   # -mindepth 1 drops the mirror root, whose mtime moves whenever a stamp file
   # is written; -F because no real path here contains ".stage-mirror-".
-  find "$1" -mindepth 1 -xdev -printf '%y\t%s\t%T@\t%P\n' | grep -vF '.stage-mirror-' | sort
+  # LC_ALL=C ON THE SORT IS LOAD-BEARING, NOT HYGIENE. This census is written
+  # once by the building job and re-walked later by a DIFFERENT job, and the two
+  # are compared with `diff`. glibc's en_US.UTF-8 collation ignores `_`, `-` and
+  # case at the primary level, so two jobs that inherited different locales sort
+  # the same file set into different orders and the diff is non-empty on a tree
+  # nothing touched. That is what `ml1` 5752248 did: a FALSE FATAL exit 12 that
+  # quarantined the shared stage mirror and cost the next job 459 s / 62 GB of
+  # re-staging, while both censuses diff to 0 lines once C-sorted. Every writer
+  # AND every reader of this census pins LC_ALL=C; the pin is per-command so it
+  # is greppable and cannot be lost when the function is moved.
+  # Reader: phase_template/census_collation_guard.sh.
+  find "$1" -mindepth 1 -xdev -printf '%y\t%s\t%T@\t%P\n' | grep -vF '.stage-mirror-' | LC_ALL=C sort
 }
+# STAGE-MIRROR-2 (2026-09-07). THE BODY ABOVE IS phaseN_relock.sh'S, VERBATIM.
+# Until now THIS file's copy ended in a bare `| sort` while phaseN_relock.sh,
+# proof/hlgd_relock.sh and tools/stage_mirror.sh's stage_mirror_census all ended
+# `| LC_ALL=C sort` -- the one divergent copy, in the file every merge lane's
+# relock is cut from. mCB-relock 6022684 wrote its manifest under one collation
+# and re-walked it under another, `diff` was non-empty on a tree nothing had
+# touched, and the job declared `the mirror CHANGED under this job` and
+# QUARANTINED the shared mirror. Measured after the fact: LC_ALL=C sort of the
+# live listing has the same md5 as the stored manifest, 44117 rows on both
+# sides. CLAUDE.md law 7 hazard (b) in its purest form -- two copies of one
+# function, and only one of them was right.
 
 stage_build_mirror () {          # ONE-TIME per key. Returns non-zero on failure.
   # DET-1-6-b: one temp name per JOB is one name for every ARM, and the next
@@ -512,7 +534,7 @@ src_tp_fingerprint () {          # a DIRECT reader on the read-only canonical tr
   # write that reaches imprint-data by any route at all -- including one that
   # never touches the mirror -- is caught by the job that did it.
   find "$SRC_WS/third_party" -type f "${STAGE_TP_WRITABLE[@]}" \
-    -printf '%i %T@ %s %P\n' 2>/dev/null | sort
+    -printf '%i %T@ %s %P\n' 2>/dev/null | LC_ALL=C sort
 }
 
 # DET-1-6-b: A QUARANTINE NAME THAT TWO ARMS OF ONE JOB CAN BOTH PRODUCE IS NOT
@@ -553,13 +575,30 @@ stage_verify_mirror () {         # the READER for stage_build_mirror's writer
   [ -f "$m/.stage-mirror-manifest.tsv" ] || { echo "### stage: no mirror manifest at $m -- cannot verify"; return 0; }
   local now=$A/${TAG}-$J.stage-mirror-now.tsv
   stage_manifest "$m" > "$now"
-  if diff -q "$m/.stage-mirror-manifest.tsv" "$now" >/dev/null; then
+  # STAGE-MIRROR-2 (2026-09-07). THE COMPARISON IS A SET COMPARISON, and the
+  # belt is deliberate beside the LC_ALL=C brace on stage_manifest. The stored
+  # manifest was written by a DIFFERENT job, possibly by an OLDER template --
+  # mCB-relock 6022684's was, and its writer ended in a bare `sort` -- so the
+  # bytes on disk may carry a collation this job cannot reproduce and never
+  # will. Sorting BOTH sides C before comparing means a collation difference
+  # can no longer read as a change at all, whatever wrote the file: only a row
+  # that is genuinely present on one side and absent on the other survives.
+  # 6022684 quarantined the shared mirror on a tree nothing had touched --
+  # 44117 rows both sides, identical md5 once C-sorted -- and a quarantine is
+  # not a warning: the next job pays a full re-stage for it.
+  local stored=$now.stored-c live=$now.live-c
+  LC_ALL=C sort -- "$m/.stage-mirror-manifest.tsv" > "$stored"
+  LC_ALL=C sort -- "$now" > "$live"
+  if cmp -s -- "$stored" "$live"; then
     echo "### stage: mirror INTACT ($m)"
+    rm -f -- "$stored" "$live"
   else
     echo "### stage: FATAL-CLASS -- the mirror CHANGED under this job. A hardlinked"
     echo "###        input was written through. Quarantining the mirror; the next"
-    echo "###        job rebuilds it. Diff head:"
-    diff "$m/.stage-mirror-manifest.tsv" "$now" | head -20
+    echo "###        job rebuilds it. Both sides are LC_ALL=C sorted, so this is a"
+    echo "###        SET difference and not a collation difference. Diff head:"
+    diff "$stored" "$live" | head -20
+    rm -f -- "$stored" "$live"
     stage_quarantine "$m" DIRTY
     MIRROR_DIRTY=1
   fi

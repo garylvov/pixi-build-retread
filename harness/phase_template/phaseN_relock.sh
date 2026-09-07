@@ -640,13 +640,30 @@ stage_verify_mirror () {         # the READER for stage_build_mirror's writer
   [ -f "$m/.stage-mirror-manifest.tsv" ] || { echo "### stage: no mirror manifest at $m -- cannot verify"; return 0; }
   local now=$A/${TAG}-$J.stage-mirror-now.tsv
   stage_manifest "$m" > "$now"
-  if LC_ALL=C diff -q "$m/.stage-mirror-manifest.tsv" "$now" >/dev/null; then
+  # STAGE-MIRROR-2 (2026-09-07). THE COMPARISON IS A SET COMPARISON, and the
+  # belt is deliberate beside the LC_ALL=C brace on stage_manifest. The stored
+  # manifest was written by a DIFFERENT job, possibly by an OLDER template --
+  # mCB-relock 6022684's was, and its writer ended in a bare `sort` -- so the
+  # bytes on disk may carry a collation this job cannot reproduce and never
+  # will. Sorting BOTH sides C before comparing means a collation difference
+  # can no longer read as a change at all, whatever wrote the file: only a row
+  # that is genuinely present on one side and absent on the other survives.
+  # 6022684 quarantined the shared mirror on a tree nothing had touched --
+  # 44117 rows both sides, identical md5 once C-sorted -- and a quarantine is
+  # not a warning: the next job pays a full re-stage for it.
+  local stored=$now.stored-c live=$now.live-c
+  LC_ALL=C sort -- "$m/.stage-mirror-manifest.tsv" > "$stored"
+  LC_ALL=C sort -- "$now" > "$live"
+  if cmp -s -- "$stored" "$live"; then
     echo "### stage: mirror INTACT ($m)"
+    rm -f -- "$stored" "$live"
   else
     echo "### stage: FATAL-CLASS -- the mirror CHANGED under this job. A hardlinked"
     echo "###        input was written through. Quarantining the mirror; the next"
-    echo "###        job rebuilds it. Diff head:"
-    LC_ALL=C diff "$m/.stage-mirror-manifest.tsv" "$now" | head -20
+    echo "###        job rebuilds it. Both sides are LC_ALL=C sorted, so this is a"
+    echo "###        SET difference and not a collation difference. Diff head:"
+    diff "$stored" "$live" | head -20
+    rm -f -- "$stored" "$live"
     stage_quarantine "$m" DIRTY
     MIRROR_DIRTY=1
   fi

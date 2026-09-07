@@ -196,45 +196,72 @@ fi
 # ── ARM H: MERGE-V-2-1. A JOB ID IS A PREVIOUS BATCH'S TOKEN ────────────────
 # The tip's sdist-scoping paragraph cited `mCA job 6000717` as a plain comment,
 # outside every marked region. The check greps comments ON PURPOSE, so the
-# moment a derived batch put that campaign's ids into LEFTOVER_RE the shipped
-# template would exit 9 AGAINST ITSELF -- for a deliberate citation, not a
-# botched derivation. H drives exactly that: the real templates, with the ids in
-# the regex. H2 is the mutation: strip the CITATION pair from the same copies
-# and the same regex must fire, or H is measuring nothing.
-say "== H: MERGE-V-2-1, a previous batch's JOB ID in LEFTOVER_RE =="
+# moment a derived batch put that id into LEFTOVER_RE the shipped template would
+# exit 9 AGAINST ITSELF -- for a deliberate citation, not a botched derivation.
+#
+# THE ARM RUNS THE CHECK, NOT THE HARNESS, AND THAT DISTINCTION COST A JOB.
+# The first cut of this arm did what arms A-C do -- `bash <template>` -- and
+# that is only safe while the check EXITS 9 early. Once the template is clean,
+# `bash arms/mh1_relock.sh` keeps going: past the gates, into stage_build_mirror,
+# against the SHARED stage mirror under STAGE_MIRROR_ROOT, with SLURM_JOB_ID
+# forced to 999999. Guard job 6023585 did exactly that and sat there for minutes
+# building a mirror; the Aug-19 leftovers `…building.999999-MH1-…` in the mirror
+# root are older evidence of the same shape. A guard that can write production
+# state is not fixture-only however green it prints. So H CUTS the check --
+# the LEFTOVER_RE line and the marked LEFTOVER-CHECK region, verbatim, from the
+# template -- and runs THAT over the template as data. One substitution is made
+# and it is asserted below: the region scans `"$0"`, and the probe must scan the
+# TEMPLATE instead of itself.
+#
 # THE TOKEN SET IS THE JOB ID MERGE-V-2-1 NAMED, and nothing more. A first cut
 # spliced in `b30|B30|mCA|mCB` as well and arm H went RED on both templates --
-# correctly: those strings appear all over the prose that EXPLAINS the merge
-# campaign, and a real LEFTOVER_RE for a derived batch would not carry a lane
-# name that its own commentary uses in every other paragraph. Widening a guard's
-# regex past what the defect was is how a guard starts reporting its own fixture.
+# correctly: those strings are all over the prose that EXPLAINS the merge
+# campaign, and no real derived batch would put a lane name its own commentary
+# uses in every paragraph into its regex. Widening a guard's regex past what the
+# defect was is how a guard starts reporting its own fixture.
+say "== H: MERGE-V-2-1, a previous batch's JOB ID in LEFTOVER_RE =="
 B30_TOKENS='6000717'
-H_OK=1
+
+mk_leftover_probe () {   # $1 = template, $2 = out probe, $3 = extra regex alternatives
+  { echo '#!/usr/bin/env bash'
+    echo 'set -uo pipefail'
+    echo 'TARGET=${1:?the file to scan}'
+    grep -m1 "^LEFTOVER_RE='" "$1" | sed "s@^LEFTOVER_RE='@LEFTOVER_RE='$3|@"
+    awk '/^### LEFTOVER-CHECK BEGIN/{p=1; next} /^### LEFTOVER-CHECK END/{p=0} p' "$1" \
+      | sed 's@"\$0")@"$TARGET")@'
+  } > "$2"
+}
+
 for REL in phaseN_relock.sh ../arms/mh1_relock.sh; do
   SRCF=$HERE/$REL
-  [ -f "$SRCF" ] || { say "  FAIL  H no file at $SRCF"; FAIL=1; H_OK=0; continue; }
+  [ -f "$SRCF" ] || { say "  FAIL  H no file at $SRCF"; FAIL=1; continue; }
   B=$(basename "$REL")
   mkdir -p "$W/h"
-  HP=$W/h/$B
-  sed "s@^LEFTOVER_RE='@LEFTOVER_RE='$B30_TOKENS|@" "$SRCF" > "$HP"
-  if ! grep -q "LEFTOVER_RE='$B30_TOKENS|" "$HP"; then
-    say "  FAIL  H could not widen LEFTOVER_RE in $B -- the arm did not run"; FAIL=1; H_OK=0; continue
+  HP=$W/h/probe-$B
+  mk_leftover_probe "$SRCF" "$HP" "$B30_TOKENS"
+  if ! grep -q "LEFTOVER_RE='$B30_TOKENS|" "$HP" \
+     || ! grep -q 'leftover-token self-check' "$HP" \
+     || ! grep -q '"\$TARGET")' "$HP" \
+     || grep -q '"\$0")' "$HP" \
+     || ! bash -n "$HP" 2>/dev/null; then
+    say "  FAIL  H could not cut the check out of $B -- the arm did not run"; FAIL=1; continue
   fi
-  OUT=$(run "$HP"); RC=$?
-  if printf '%s' "$OUT" | grep -q 'leftover-token self-check: clean'; then
-    say "  PASS  H $B is clean with B30's tokens ($B30_TOKENS) in LEFTOVER_RE"
+  say "  PASS  H the check was CUT from $B ($(wc -l < "$HP") lines), and the probe scans the template, never itself"
+  OUT=$(bash "$HP" "$SRCF" 2>&1); RC=$?
+  if [ "$RC" = 0 ] && printf '%s' "$OUT" | grep -q 'leftover-token self-check: clean'; then
+    say "  PASS  H $B is clean with $B30_TOKENS in LEFTOVER_RE"
   else
     say "  FAIL  H $B trips its own leftover check on a deliberate citation (rc=$RC):"
     printf '%s\n' "$OUT" | grep -m4 -E '6000717|leftover-token' | sed 's/^/          /'
-    FAIL=1; H_OK=0
+    FAIL=1
   fi
-  # H2. THE MUTATION: the citation pair removed, the same widened regex.
+  # H2. THE MUTATION: the citation pair removed from the SCANNED FILE.
   HM=$W/h/mut-$B
-  grep -v '^### CITATION BEGIN' "$HP" | grep -v '^### CITATION END' > "$HM"
-  if [ "$(grep -c '^### CITATION' "$HM")" != 0 ] || [ "$(grep -c '^### CITATION' "$HP")" = 0 ]; then
-    say "  FAIL  H2 could not build the citation-stripped mutant of $B"; FAIL=1
+  grep -v '^### CITATION BEGIN' "$SRCF" | grep -v '^### CITATION END' > "$HM"
+  if [ "$(grep -c '^### CITATION' "$HM")" != 0 ] || [ "$(grep -c '^### CITATION' "$SRCF")" = 0 ]; then
+    say "  FAIL  H2 could not build the citation-stripped copy of $B"; FAIL=1
   else
-    OUT=$(run "$HM"); RC=$?
+    OUT=$(bash "$HP" "$HM" 2>&1); RC=$?
     if [ "$RC" = 9 ] && printf '%s' "$OUT" | grep -q '6000717'; then
       say "  PASS  H2 MUTATION -- with the CITATION pair removed $B exits 9 naming 6000717, so H is a real exemption"
     else
@@ -242,6 +269,5 @@ for REL in phaseN_relock.sh ../arms/mh1_relock.sh; do
     fi
   fi
 done
-[ "$H_OK" = 1 ] && say "  PASS  H no shipped template names a previous batch's job id outside a marked region"
 [ "$FAIL" = 0 ] && { say "leftover-check guard (with MERGE-N-4 arms): ALL PASS"; exit 0; }
 say "leftover-check guard (with MERGE-N-4 arms): FAILED"; exit 1
