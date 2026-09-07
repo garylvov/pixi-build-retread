@@ -80,6 +80,15 @@ Scripts and READMEs only. No logs, no `artifacts/`, no `.tsv` outputs, no
 evidence of a particular run, not the harness.
 
 `MANIFEST.md5` records the md5 of every file in this directory as committed.
+Its order is `LC_ALL=C sort` BY PATH, and `tools/manifest_regen.sh` is the one
+thing that writes it: `manifest_regen.sh <harness dir> --write` regenerates it,
+`--check` says whether the tracked file is what the generator would write (a row
+that MOVED is drift too). Two exclusions, both inherited from the file as it was
+hand-maintained: `MANIFEST.md5` itself, and `tools/__pycache__/` (interpreter
+bytes, rebuilt on any run). Until 2026-09-07 there was no generator and the
+order reproduced under nothing, so the file could only be edited a row at a time
+— `tools/fixset_land_row.sh` still rewrites exactly the one row it owns, which
+is `--check`-clean because it changes a digest in place and never an order.
 
 2026-09-03 02:22 synced FROM task dir (one-time); from here the repo is the
 source and the task dir is synced FROM it before each campaign.
