@@ -176,9 +176,15 @@ fi
 JR=$W/jobroot; mkdir -p "$JR"
 FAKE=$W/task/merge-h; mkdir -p "$FAKE" "$W/task/tools"
 printf '3333333333333333333333333333333333333333\n' > "$W/task/tools/.harness_synced_commit"
+# CLEANUP-WALL-3 (2026-09-07): the stub now prints the `### removed <root>` row
+# in cleanup.sh's shape. A continuation is EARNED by a pass since CLEANUP-WALL-3
+# -- a pass that removed nothing was not cut short, it was done or refused -- so
+# a stub that removes nothing gets no continuation and arm D would measure
+# nothing. It still unlinks nothing: it prints the row and returns.
 cat > "$FAKE/cleanup_gated.sh" <<'EOS'
 #!/usr/bin/env bash
 echo "### FIXTURE cleanup_gated: roots=$*"
+for r in "$@"; do echo "### removed $r rc=0 wall=0s exists_after=YES (FIXTURE: nothing was unlinked)"; done
 exit 0
 EOS
 chmod +x "$FAKE/cleanup_gated.sh"
@@ -204,7 +210,13 @@ EOS
   chmod +x "$SHIMD/sbatch"
   # OWNER_WALL_COVERS is written into the sbatch by the generator; force it to 0
   # so the live census (which is >0) exceeds it and the continuation branch runs.
-  sed 's/^OWNER_WALL_COVERS=.*/OWNER_WALL_COVERS=0/' "$OSB" > "$W/owner.forced.sbatch"
+  # CLEANUP-WALL-3: the pressure term goes with it. The continuation now also
+  # requires the pass to have consumed OWNER_WALL_PRESSURE_NUM/DEN of a DERIVED
+  # wall; 0/5 is always reached, so this arm keeps measuring the export clause
+  # and not the clock. (An owner that had to burn 4/5 of a 3600 s wall to reach
+  # its own sbatch line would be a guard that measures NFS.)
+  sed -e 's/^OWNER_WALL_COVERS=.*/OWNER_WALL_COVERS=0/' \
+      -e 's/^OWNER_WALL_PRESSURE_NUM=.*/OWNER_WALL_PRESSURE_NUM=0/' "$OSB" > "$W/owner.forced.sbatch"
   ( export PATH=$SHIMD:$PATH SLURM_JOB_ID=111111 SLURM_JOB_NAME=guard-owner
     export D=/tmp/harnessdir TAG=D99 RJ=123456 DRY_RUN=0
     bash "$W/owner.forced.sbatch" "$ROOTD" ) > "$W/owner.out" 2>&1

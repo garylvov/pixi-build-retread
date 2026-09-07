@@ -185,6 +185,19 @@ OE=$HERE/../tools/owner_export.sh
 # ONE derivation, defined once and SHIPPED into the generated owner.sbatch by
 # `declare -f` below, so the number the submitter derives and the number the
 # owner re-derives cannot drift apart into two implementations.
+# CLEANUP-WALL-3 (2026-09-07). THE ABSENT-ROOT ESTIMATE IS A SUBMIT-TIME DEVICE
+# AND IT WAS BEING USED AT RUN TIME. At submit the roots do not exist yet -- the
+# owner is queued `--dependency=afterany:<relock job>` before the job that
+# creates them has run -- so an absent root has to be ESTIMATED or the wall would
+# be derived for an empty tree. Inside the OWNER that reasoning is inverted:
+# there, absent means the tree is not there, so there is nothing to unlink and
+# nothing to size. Measured: det163-cleanup-cont 6020524 censused
+# `entries=14400000 present=0 absent=4` -- 14.4 million phantom entries for four
+# roots that did not exist -- and every row downstream of that number was wrong.
+# The generated owner.sbatch sets OWNER_CENSUS_ESTIMATE_ABSENT=0; the submitter
+# leaves it at 1.
+OWNER_CENSUS_ESTIMATE_ABSENT=${OWNER_CENSUS_ESTIMATE_ABSENT:-1}
+
 owner_census () {                # $@ = declared roots; echoes "<entries> <present> <absent>"
   local r n nb tot=0 pres=0 abs=0
   for r in "$@"; do
@@ -198,7 +211,11 @@ owner_census () {                # $@ = declared roots; echoes "<entries> <prese
       fi
       tot=$((tot + n)); pres=$((pres + 1))
     else
-      tot=$((tot + OWNER_ENTRIES_PER_ARM_EST * OWNER_ARMS)); abs=$((abs + 1))
+      # CLEANUP-WALL-3: estimate only where an estimate is the only thing there
+      # is -- at submit, before the tree exists.
+      [ "$OWNER_CENSUS_ESTIMATE_ABSENT" = 0 ] ||
+        tot=$((tot + OWNER_ENTRIES_PER_ARM_EST * OWNER_ARMS))
+      abs=$((abs + 1))
     fi
   done
   echo "$tot $pres $abs"
@@ -229,26 +246,115 @@ owner_wall_hms () {              # $1 = seconds -> HH:MM:SS, rounded UP to the m
 # die at the wall: it says so on one row and submits its own continuation for
 # whatever it cannot finish. cleanup_gated.sh's ABSENT-root branch makes the
 # second pass a no-op on any root the first one finished.
-owner_wall_check () {            # $@ = the roots this owner was handed
-  local c pres abs new nc cj rc hms
+# CLEANUP-WALL-3 (2026-09-07). THE CONTINUATION WAS SUBMITTED BEFORE THE PASS RAN
+# AND AGAINST A WALL THAT WAS NEVER DERIVED.
+#
+# THE DEFECT, MEASURED. `owner_wall_check` ran at job START, on the line above
+# `exec bash <snap>/cleanup_gated.sh`, so its verdict could not depend on
+# anything the pass did -- the gate had not spoken yet. Its whole test was
+# `[ "$c" -gt "$OWNER_WALL_COVERS" ]`, and OWNER_WALL_COVERS is 0 for every owner
+# whose submitter passed no `--roots` (det163_proof.sh's submit_owner calls
+# `owner_snapshot.sh "$jr" "$gate"` and nothing else; the tool DID say so --
+# `### OWNER SNAPSHOT wall=UNDERIVED roots=0` is in det163-6020526.out -- and
+# nobody read it, which is law 9's detector with no actuator). Against covers=0
+# ANY census is "short", so every owner submitted a continuation, and the
+# continuation did it again, four deep, until the cap. Thirty det163-cleanup jobs
+# on 2026-09-07 08:07-08:25, twenty-four of them continuations, every one of them
+# reaching a pass that had nothing to do or refused:
+#   6020506 -> `### OWNER WALL CENSUS entries=10800004 present=1 absent=3 covers=0 wall=0s`
+#              `### OWNER WALL SHORT census=10800004 covers=0 derived=86400s`
+#              `### OWNER WALL CONTINUATION submitted job=6020524` -- and only
+#              THEN `### CLEANUP SETUP-REFUSED roots=1 removed=1`.
+#   6020524 -> census entries=14400000 present=0 absent=4, continuation 6020542,
+#              then `### NOTHING TO DO -- every root named is ABSENT`.
+#   6020631/6020952/6021096 -> census present=1, continuation each time, then
+#              `### JOB-FATAL NOT TAKEN` and `### CLEANUP REFUSED -- nothing deleted`
+#              on all three; the tree they were "continuing" is one the gate
+#              refuses on purpose, and no number of passes will change that.
+#
+# THE FIX. A continuation is earned by a pass, not predicted before one. It runs
+# AFTER the gate and continues only when ALL of these hold:
+#   * this pass actually removed something -- at least one `### removed` row. A
+#     pass that removed nothing cannot be short of wall: it is done, or refused.
+#   * something is left -- the post-pass census over PRESENT roots is > 0.
+#   * the gate did not reach a terminal decision. NOTHING TO DO, CLEANUP REFUSED,
+#     JOB-FATAL NOT TAKEN and a SETUP-REFUSED that left nothing behind are all
+#     answers, not interruptions.
+#   * the pass ended for WALL reasons, which requires the owner to HAVE a wall:
+#     OWNER_WALL_S > 0 and the pass consumed OWNER_WALL_PRESSURE_NUM/DEN of it.
+#     An owner with an underived wall cannot be short of it, and saying so out
+#     loud is what turns the UNDERIVED row into an actuator.
+# The depth cap stays as the last resort it always was, and still prints the
+# hand-run line when it bites.
+OWNER_WALL_PRESSURE_NUM=${OWNER_WALL_PRESSURE_NUM:-4}   # continue only past 4/5 of
+OWNER_WALL_PRESSURE_DEN=${OWNER_WALL_PRESSURE_DEN:-5}   # the derived wall
+
+# The pre-pass row. It MEASURES and it says so; it does not decide. Shipped into
+# the generated owner.sbatch by `declare -f` with everything else.
+owner_wall_census_row () {       # $@ = the roots this owner was handed
+  local c pres abs hms
   read -r c pres abs < <(owner_census "$@")
   hms=$(owner_wall_hms "$OWNER_WALL_S")
   echo "### OWNER WALL CENSUS entries=$c present=$pres absent=$abs covers=$OWNER_WALL_COVERS wall=${OWNER_WALL_S}s ($hms) cont=$OWNER_CONT_N"
-  [ "$c" -gt "$OWNER_WALL_COVERS" ] || return 0
+  if [ "$OWNER_WALL_S" -le 0 ]; then
+    echo "### OWNER WALL UNDERIVED: this owner was generated with no --roots, so covers=$OWNER_WALL_COVERS"
+    echo "###   and wall=0s are placeholders, not measurements. It will run its pass, but it"
+    echo "###   CANNOT conclude it was cut short by a wall it never had, and it will not"
+    echo "###   continue itself. Fix the submit site to pass --roots <root>... ."
+  fi
+  return 0
+}
+
+# The post-pass decision. $1 = the gate's rc, $2 = the pass log, $3.. = roots.
+owner_continue_check () {
+  local prc=$1 plog=$2; shift 2
+  local removed=0 c pres abs new nc cj rc hms el reason=
+  # NO `|| echo 0` HERE. `grep -c` PRINTS its count and THEN exits 1 when the
+  # count is zero, so `$(grep -c ... || echo 0)` captures "0\n0" -- measured on
+  # 2026-09-07: the row would read `removed=0 0` and every `[ "$removed" -gt 0 ]`
+  # below would die "integer expression expected" into the owner's own stdout.
+  # `grep -c` always prints a number, so the count needs no fallback; the `:=`
+  # covers only the case where $plog is absent and grep never ran.
+  [ -f "$plog" ] && removed=$(grep -c '^### removed ' "$plog" 2>/dev/null)
+  case $removed in ''|*[!0-9]*) removed=0 ;; esac
+  read -r c pres abs < <(owner_census "$@")
+  el=${SECONDS:-0}
+  echo "### OWNER PASS RESULT rc=$prc removed=$removed remaining=$c present=$pres absent=$abs elapsed=${el}s wall=${OWNER_WALL_S}s cont=$OWNER_CONT_N"
+
+  # the terminal decisions, each named by the row that carries it
+  if [ -f "$plog" ]; then
+    grep -q '^### NOTHING TO DO'        "$plog" && reason='the gate said NOTHING TO DO -- every root ABSENT'
+    [ -n "$reason" ] || { grep -q '^### CLEANUP REFUSED'   "$plog" && reason='the gate said CLEANUP REFUSED -- nothing deleted, and a refusal is an answer'; }
+    [ -n "$reason" ] || { grep -q '^### JOB-FATAL NOT TAKEN' "$plog" && reason='the gate said JOB-FATAL NOT TAKEN -- a sealed store it refuses on purpose'; }
+  fi
+  [ -n "$reason" ] || [ "$removed" -gt 0 ] || reason="this pass removed nothing (no '### removed' row), so it was not cut short -- it was done or refused"
+  [ -n "$reason" ] || [ "$c" -gt 0 ] || reason='nothing is left: the post-pass census over the present roots is 0'
+  [ -n "$reason" ] || [ "$OWNER_WALL_S" -gt 0 ] || reason='this owner has no derived wall (wall=0s, covers=0), so it cannot have been short of one -- see the OWNER WALL UNDERIVED row'
+  [ -n "$reason" ] || [ $(( el * OWNER_WALL_PRESSURE_DEN )) -ge $(( OWNER_WALL_S * OWNER_WALL_PRESSURE_NUM )) ] ||
+    reason="it used ${el}s of a ${OWNER_WALL_S}s wall, under $OWNER_WALL_PRESSURE_NUM/$OWNER_WALL_PRESSURE_DEN of it, so the wall is not what stopped it"
+  if [ -n "$reason" ]; then
+    echo "### OWNER NO CONTINUATION: $reason."
+    return 0
+  fi
+
   read -r new nc < <(owner_wall_derive "$c")
   hms=$(owner_wall_hms "$new")
-  echo "### OWNER WALL SHORT census=$c covers=$OWNER_WALL_COVERS derived=${new}s ($hms) rate=$OWNER_UNLINK_RATE_PER_S margin=$OWNER_WALL_MARGIN census_allow=$nc"
+  echo "### OWNER WALL SHORT census=$c covers=$OWNER_WALL_COVERS derived=${new}s ($hms) rate=$OWNER_UNLINK_RATE_PER_S margin=$OWNER_WALL_MARGIN census_allow=$nc removed=$removed"
   if [ "$OWNER_CONT_N" -ge "$OWNER_CONT_MAX" ]; then
-    echo "### OWNER WALL CONTINUATION REFUSED: this is continuation $OWNER_CONT_N of at most $OWNER_CONT_MAX."
+    echo "### OWNER WALL CONTINUATION CAP HIT depth=$OWNER_CONT_N max=$OWNER_CONT_MAX removed=$removed remaining=$c"
     echo "###   A chain that never ends is not an actuator either. RUN THIS BY HAND -- it is the"
-    echo "###   only thing that returns the remaining inodes:"
+    echo "###   only thing that returns the remaining $c inodes:"
     echo "    env -u SLURM_JOB_ID sbatch --partition=${SLURM_JOB_PARTITION:-batch} --qos=${SLURM_JOB_QOS:-normal} --cpus-per-task=1 --mem=4G --time=$hms $OWNER_SELF $*"
     return 0
   fi
   # OWNER-EXPORT-1: an EXPLICIT list, never `ALL`. The continuation inherits the
-  # same contract its parent ran under, plus its own bumped counter.
+  # same contract its parent ran under, plus its own bumped counter -- and, since
+  # CLEANUP-WALL-3, what its parent actually did, so the chain is readable from
+  # any one of its logs.
   local EXPCL
-  EXPCL=$(owner_export_clause "OWNER_CONT_N=$((OWNER_CONT_N + 1))") || {
+  EXPCL=$(owner_export_clause "OWNER_CONT_N=$((OWNER_CONT_N + 1))" \
+                              "OWNER_CONT_PARENT=${SLURM_JOB_ID:-0}" \
+                              "OWNER_CONT_PARENT_REMOVED=$removed") || {
     echo "### OWNER WALL CONTINUATION REFUSED: the export clause could not be built (rows above)."
     echo "###   The remainder has NO owner. RUN THIS BY HAND once the offending value is fixed:"
     echo "    env -u SLURM_JOB_ID sbatch --partition=${SLURM_JOB_PARTITION:-batch} --qos=${SLURM_JOB_QOS:-normal} --cpus-per-task=1 --mem=4G --time=$hms $OWNER_SELF $*"
@@ -262,7 +368,8 @@ owner_wall_check () {            # $@ = the roots this owner was handed
         "$EXPCL" \
         "$OWNER_SELF" "$@" 2>&1); rc=$?
   if [ "$rc" = 0 ]; then
-    echo "### OWNER WALL CONTINUATION submitted job=$cj time=$hms after ${SLURM_JOB_ID:-0} -- this pass removes what fits, that one finishes the remainder"
+    echo "### CONTINUATION depth=$((OWNER_CONT_N + 1)) parent=${SLURM_JOB_ID:-0} parent_removed=$removed job=$cj time=$hms remaining=$c"
+    echo "### OWNER WALL CONTINUATION submitted job=$cj time=$hms after ${SLURM_JOB_ID:-0} -- this pass removed $removed and hit its wall, that one finishes the remaining $c"
   else
     echo "### OWNER WALL CONTINUATION FAILED rc=$rc output: $cj"
     echo "###   The remainder has NO owner. RUN THIS BY HAND:"
@@ -466,9 +573,26 @@ fi
   # whatever a later edit of owner_export.sh happens to say.
   echo "OWNER_EXPORT_VARS='$OWNER_EXPORT_VARS'"
   declare -f owner_export_clause
-  declare -f owner_census owner_wall_derive owner_wall_hms owner_wall_check
-  echo 'owner_wall_check "$@"'
-  echo "exec bash $SNAP/$FIRST \"\$@\""
+  # CLEANUP-WALL-3: inside the owner an absent root is an absent tree, not an
+  # estimate (the estimate exists only for the submit, before the tree does).
+  echo 'OWNER_CENSUS_ESTIMATE_ABSENT=0'
+  echo "OWNER_WALL_PRESSURE_NUM=$OWNER_WALL_PRESSURE_NUM"
+  echo "OWNER_WALL_PRESSURE_DEN=$OWNER_WALL_PRESSURE_DEN"
+  echo 'OWNER_CONT_PARENT=${OWNER_CONT_PARENT:-0}'
+  echo 'OWNER_CONT_PARENT_REMOVED=${OWNER_CONT_PARENT_REMOVED:-0}'
+  echo 'echo "### CONTINUATION depth=$OWNER_CONT_N parent=$OWNER_CONT_PARENT parent_removed=$OWNER_CONT_PARENT_REMOVED"'
+  declare -f owner_census owner_wall_derive owner_wall_hms owner_wall_census_row owner_continue_check
+  # CLEANUP-WALL-3: MEASURE, RUN, THEN DECIDE -- in that order. This used to be
+  # `owner_wall_check "$@"` followed by `exec bash <gate>`, which put the
+  # continuation decision BEFORE the only thing that could inform it. The gate's
+  # rc is preserved to the letter: a refusing owner still exits 2, it just no
+  # longer spawns a successor to refuse again.
+  echo 'owner_wall_census_row "$@"'
+  echo "OWNER_PASS_LOG=\$OWNER_OUT_DIR/owner-pass-\${SLURM_JOB_ID:-0}.log"
+  echo "bash $SNAP/$FIRST \"\$@\" 2>&1 | tee \"\$OWNER_PASS_LOG\""
+  echo 'OWNER_PASS_RC=${PIPESTATUS[0]}'
+  echo 'owner_continue_check "$OWNER_PASS_RC" "$OWNER_PASS_LOG" "$@"'
+  echo 'exit "$OWNER_PASS_RC"'
 } > "$SNAP/owner.sbatch" || { echo "### OWNER SNAPSHOT REFUSED: cannot write $SNAP/owner.sbatch"; exit 2; }
 chmod +x "$SNAP/owner.sbatch"
 

@@ -995,9 +995,19 @@ if [ "$rcP3" -eq 0 ] \
 else
   bad "P(p3): rc=$rcP3"; sed 's/^/      /' "$PSNAP"
 fi
-grep -qF "exec bash $TP/jobroot/owner-snapshot/cleanup_gated.sh" "$TP/jobroot/owner-snapshot/owner.sbatch" \
+# CLEANUP-WALL-3 (2026-09-07): this read `exec bash <frozen>` until the owner
+# stopped EXEC'ing its gate. It cannot exec any more -- the continuation decision
+# now runs AFTER the pass and needs the pass's rc and log, and an `exec` replaces
+# the shell that would make it. The claim this arm actually holds is unchanged
+# and is the one restated here: the frozen copy is named by a LITERAL absolute
+# path, because a `$SNAP/...` there reads back unresolved and the sync goes on
+# refusing. The rc is preserved by `exit "$OWNER_PASS_RC"`, asserted below.
+grep -qF "bash $TP/jobroot/owner-snapshot/cleanup_gated.sh" "$TP/jobroot/owner-snapshot/owner.sbatch" \
   && ok "P(p3): the generated sbatch names the frozen copy by LITERAL absolute path (a variable there would read back unresolved and go on refusing)" \
-  || { bad "P(p3): owner.sbatch does not exec the frozen copy by literal path"; sed 's/^/      /' "$TP/jobroot/owner-snapshot/owner.sbatch"; }
+  || { bad "P(p3): owner.sbatch does not run the frozen copy by literal path"; sed 's/^/      /' "$TP/jobroot/owner-snapshot/owner.sbatch"; }
+grep -q '^exit "\$OWNER_PASS_RC"$' "$TP/jobroot/owner-snapshot/owner.sbatch" \
+  && ok "P(p3): and it exits the PASS's rc -- the owner no longer exec's the gate, so the rc has to be carried by hand or every refusal would read as success" \
+  || { bad "P(p3): owner.sbatch does not end in exit \"\$OWNER_PASS_RC\" -- the gate's rc is dropped"; sed 's/^/      /' "$TP/jobroot/owner-snapshot/owner.sbatch"; }
 # ---- p1: the sync now installs over that owner ------------------------------
 mkstub "$WORK/P_squeue"
 printf '8000051 RUNNING laneP %s %s %s\n' "$TP" "$TP/jobroot/owner-snapshot/owner.sbatch" "$TP/jobroot/owner-snapshot" > "$WORK/P_run.txt"

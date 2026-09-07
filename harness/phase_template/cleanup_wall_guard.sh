@@ -26,7 +26,16 @@
 #      by the generated owner.sbatch after the root grew to 100,000: it must
 #      print `### OWNER WALL SHORT census=<n> covers=100` and RESUBMIT ITSELF
 #      with a larger derived wall. `sbatch` is shimmed to a recorder, so the
-#      resubmit is measured and nothing is queued.
+#      resubmit is measured and nothing is queued. CLEANUP-WALL-3 added the
+#      halves that made the continuation EARNED: C0 that the decision follows
+#      the pass, and the `removed=`/parent rows on it.
+#   C2. THE CAP stays loud -- at depth 4 it refuses the 5th link, prints the
+#      hand-run line, and submits NOTHING.
+#   C3. THE UNDERIVED WALL, which is the det163 shape: an owner generated with no
+#      `--roots` has covers=0 and wall=0s, cannot be short of a wall it never
+#      had, and must run its pass and submit NOTHING. Before CLEANUP-WALL-3 this
+#      fixture continued on every run -- 24 of the 30 det163-cleanup jobs of
+#      2026-09-07 08:07-08:25 were links of that chain.
 #   D. MUTATION -- the guard must be able to fail. A copy of owner_snapshot.sh
 #      with the derivation replaced by the floor gives the two roots of arm A
 #      EQUAL walls. If D does not reproduce that, A proves nothing.
@@ -65,7 +74,11 @@ ok   () { echo "GUARD  ok : $*"; }
 mkdir -p "$W/task/merge-h" "$W/task/tools"
 printf '2222222222222222222222222222222222222222\n' > "$W/task/tools/.harness_synced_commit"
 GATE=$W/task/merge-h/cleanup_gated.sh
-printf '#!/usr/bin/env bash\necho "### FIXTURE CLEANUP ran with $*"\n' > "$GATE"
+# CLEANUP-WALL-3: the stub also emits the `### removed <root> rc=...` row, in
+# the shape cleanup.sh line 108 emits it, because since CLEANUP-WALL-3 a
+# continuation is EARNED by a pass that removed something and arm C's stub
+# removed nothing. It still unlinks nothing -- it prints the row and returns.
+printf '#!/usr/bin/env bash\necho "### FIXTURE CLEANUP ran with $*"\nfor r in "$@"; do echo "### removed $r rc=0 wall=0s exists_after=YES (FIXTURE: nothing was unlinked)"; done\nexit 0\n' > "$GATE"
 chmod +x "$GATE"
 
 mkroot () {   # $1 = path, $2 = how many files
@@ -148,13 +161,36 @@ fi
 # submitted before arm 1. The floor is lowered for the same reason as A2: at
 # 3600 s both the original and the continuation would sit on the floor and the
 # re-derivation would be invisible.
+#
+# CLEANUP-WALL-3 (2026-09-07) REWROTE THIS ARM, AND THE REASON IS THAT IT COULD
+# ONLY SAY YES. Until today every arm here asserted that a continuation HAPPENS
+# and not one asserted that one does NOT, so a guard that was all green sat over
+# a runaway: on 2026-09-07 08:07-08:25 thirty det163-cleanup jobs ran, twenty-four
+# of them self-submitted continuations, and every one of them reached a pass that
+# had nothing to do (`### NOTHING TO DO`) or refused (`### CLEANUP REFUSED`,
+# `### JOB-FATAL NOT TAKEN`) -- because the decision ran at job START, above
+# `exec bash <gate>`, against `OWNER_WALL_COVERS` that is 0 for any owner whose
+# submitter passed no `--roots`. Against covers=0 every census is "short".
+# C now proves the YES half with the halves that were missing (the pass removed
+# something, the census is non-zero, the wall is real and consumed); C2 proves
+# the cap; C3 proves the NO half on the exact det163 shape. The three
+# no-continuation arms over the gate's own verdicts live in
+# cleanup_owner_guard.sh, whose subject -- exactly ONE owner per root -- is what
+# a continuation chain violates 24 times over.
+#
+# OWNER_WALL_PRESSURE_NUM=0 is set at SNAPSHOT time (the generated owner.sbatch
+# carries the value as a literal assignment, so setting it on the owner's own env
+# would be overwritten). 0/5 of any wall is always reached, which makes this arm
+# test the continuation CONDITION and not the clock: a fixture that had to burn
+# 4/5 of a real wall would measure NFS.
 mkdir -p "$W/jr.short" "$W/bin"
 GROW=$W/roots/certGROW-2
 mkroot "$GROW" 100 >/dev/null
-OWNER_WALL_FLOOR_S=60 bash "$SNAPTOOL" "$W/jr.short" "$GATE" --roots "$GROW" > "$W/C.snap.log" 2>&1
+OWNER_WALL_FLOOR_S=60 OWNER_WALL_PRESSURE_NUM=0 \
+  bash "$SNAPTOOL" "$W/jr.short" "$GATE" --roots "$GROW" > "$W/C.snap.log" 2>&1
 COVERS=$(sed -n 's/.*from entries=\([0-9][0-9]*\) .*/\1/p' "$W/C.snap.log" | head -1)
 seq 101 100000 | ( cd "$GROW" && xargs -n 500 touch )
-NG=$(find "$GROW" -maxdepth 16 | wc -l)
+NG=$(find "$GROW" | wc -l)
 cat > "$W/bin/sbatch" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$SBATCH_LOG"
@@ -164,22 +200,56 @@ chmod +x "$W/bin/sbatch"
 : > "$W/C.sbatch"
 SBATCH_LOG=$W/C.sbatch PATH=$W/bin:$PATH SLURM_JOB_ID=8800001 SLURM_JOB_NAME=guard-cleanup \
   bash "$W/jr.short/owner-snapshot/owner.sbatch" "$GROW" > "$W/C.run.log" 2>&1; rcC=$?
-if grep -q "^### OWNER WALL SHORT census=$NG covers=$COVERS " "$W/C.run.log"; then
-  ok "C. the owner MEASURED the growth and said so: $(grep -m1 '^### OWNER WALL SHORT' "$W/C.run.log")"
+# C0: the order. MEASURE, RUN, THEN DECIDE -- the pass's rows must appear BEFORE
+# the continuation decision, because the decision reading them is the whole fix.
+LN_PASS=$(grep -n '^### FIXTURE CLEANUP ran with' "$W/C.run.log" | head -1 | cut -d: -f1)
+LN_DEC=$(grep -n '^### OWNER PASS RESULT ' "$W/C.run.log" | head -1 | cut -d: -f1)
+if [ -n "$LN_PASS" ] && [ -n "$LN_DEC" ] && [ "$LN_DEC" -gt "$LN_PASS" ]; then
+  ok "C0. the pass ran BEFORE the continuation decision (gate row line $LN_PASS, decision row line $LN_DEC) -- the pre-fix owner decided at line 0"
 else
-  fail "C. no '### OWNER WALL SHORT census=$NG covers=$COVERS' row (rc=$rcC)"
+  fail "C0. the decision does not follow the pass (gate row line='$LN_PASS' decision row line='$LN_DEC') -- the continuation cannot be reading anything the pass did"
   sed 's/^/GUARD:   /' "$W/C.run.log"
+fi
+if grep -q "^### OWNER PASS RESULT rc=0 removed=1 remaining=$NG " "$W/C.run.log"; then
+  ok "C. the pass result is MEASURED and printed: $(grep -m1 '^### OWNER PASS RESULT' "$W/C.run.log")"
+else
+  fail "C. no '### OWNER PASS RESULT rc=0 removed=1 remaining=$NG' row (rc=$rcC)"
+  grep '^### OWNER PASS RESULT' "$W/C.run.log" | sed 's/^/GUARD:   /'
+  sed 's/^/GUARD:   /' "$W/C.run.log"
+fi
+if grep -q "^### OWNER WALL SHORT census=$NG covers=$COVERS .* removed=1$" "$W/C.run.log"; then
+  ok "C. the owner MEASURED the growth and said so, with what it removed on the row: $(grep -m1 '^### OWNER WALL SHORT' "$W/C.run.log")"
+else
+  fail "C. no '### OWNER WALL SHORT census=$NG covers=$COVERS ... removed=1' row (rc=$rcC)"
+  sed 's/^/GUARD:   /' "$W/C.run.log"
+fi
+if grep -q '^### CONTINUATION depth=1 parent=8800001 parent_removed=1 ' "$W/C.run.log"; then
+  ok "C. and the chain is readable from this one log: $(grep -m1 '^### CONTINUATION depth=1' "$W/C.run.log")"
+else
+  fail "C. no '### CONTINUATION depth=1 parent=8800001 parent_removed=1' row -- a chain whose links do not name their parent cannot be traced from any one of its logs"
+  grep '^### CONTINUATION' "$W/C.run.log" | sed 's/^/GUARD:   /'
 fi
 NSUB=$(wc -l < "$W/C.sbatch" | tr -d ' ')
 CONT_TIME=$(sed -n 's/.*--time=\([0-9:]*\).*/\1/p' "$W/C.sbatch" | head -1)
 if [ "$NSUB" = 1 ] && grep -q -- "$W/jr.short/owner-snapshot/owner.sbatch" "$W/C.sbatch" \
    && grep -q -- '--dependency=afterany:8800001' "$W/C.sbatch" \
-   && grep -q -- 'OWNER_CONT_N=1' "$W/C.sbatch"; then
-  ok "C. it resubmitted ITSELF for the remainder: 1 sbatch call, --time=$CONT_TIME, behind afterany:8800001, OWNER_CONT_N=1"
+   && grep -q -- 'OWNER_CONT_N=1' "$W/C.sbatch" \
+   && grep -q -- 'OWNER_CONT_PARENT=8800001' "$W/C.sbatch" \
+   && grep -q -- 'OWNER_CONT_PARENT_REMOVED=1' "$W/C.sbatch"; then
+  ok "C. it resubmitted ITSELF for the remainder: 1 sbatch call, --time=$CONT_TIME, behind afterany:8800001, OWNER_CONT_N=1, parent and parent_removed carried"
   sed 's/^/GUARD:   sbatch /' "$W/C.sbatch"
 else
   fail "C. the continuation was not submitted as expected: sbatch calls=$NSUB"
   [ -s "$W/C.sbatch" ] && sed 's/^/GUARD:   sbatch /' "$W/C.sbatch"
+fi
+# OWNER-EXPORT-1 stays enforced on the row CLEANUP-WALL-3 rewrote: `--export=ALL`
+# makes Slurm retrieve the submitter's environment on the target node, and a
+# failed retrieval HOLDS the job -- 6013350/6013351/6014485/5841188.
+if grep -q -- '--export=ALL' "$W/C.sbatch"; then
+  fail "C. the continuation line carries --export=ALL -- that is the held-job shape OWNER-EXPORT-1 removed"
+  sed 's/^/GUARD:   sbatch /' "$W/C.sbatch"
+else
+  ok "C. and the continuation line carries NO --export=ALL (OWNER-EXPORT-1 holds across the rewrite)"
 fi
 ORIG_TIME=$(sed -n 's/^--time=//p' "$W/jr.short/owner-snapshot/owner.wall")
 if [ -n "$CONT_TIME" ] && [ "$CONT_TIME" != "$ORIG_TIME" ]; then
@@ -188,8 +258,64 @@ else
   fail "C. the continuation reused the original wall ($ORIG_TIME) -- a continuation with the SAME too-small wall is the timeout again"
 fi
 grep -q '^### FIXTURE CLEANUP ran with' "$W/C.run.log" \
-  && ok "C. and it still exec'd the frozen cleanup for what DOES fit (remove what fits, continue the rest)" \
+  && ok "C. and it still ran the frozen cleanup for what DOES fit (remove what fits, continue the rest)" \
   || fail "C. the owner never reached the frozen cleanup -- a continuation that replaces the pass instead of extending it removes nothing"
+if [ "$rcC" = 0 ]; then
+  ok "C. the owner exits the GATE's rc (0) -- the continuation machinery does not invent an exit status"
+else
+  fail "C. the owner exited $rcC while the gate exited 0 -- the pass's rc was not preserved"
+fi
+
+# ---- C2, THE CAP: it stays loud, and it is the last resort, not the control --
+: > "$W/C2.sbatch"
+SBATCH_LOG=$W/C2.sbatch PATH=$W/bin:$PATH SLURM_JOB_ID=8800002 SLURM_JOB_NAME=guard-cleanup \
+  OWNER_CONT_N=4 bash "$W/jr.short/owner-snapshot/owner.sbatch" "$GROW" > "$W/C2.run.log" 2>&1
+C2SUB=$(wc -l < "$W/C2.sbatch" | tr -d ' ')
+if grep -q "^### OWNER WALL CONTINUATION CAP HIT depth=4 max=4 removed=1 remaining=$NG$" "$W/C2.run.log" \
+   && grep -q '^    env -u SLURM_JOB_ID sbatch --partition=' "$W/C2.run.log" \
+   && [ "$C2SUB" = 0 ]; then
+  ok "C2. at the cap it refuses the 5th link, prints the hand-run line, and submits nothing: $(grep -m1 'CAP HIT' "$W/C2.run.log")"
+else
+  fail "C2. the cap did not bite as expected (sbatch calls=$C2SUB)"
+  grep -E 'CAP HIT|env -u SLURM_JOB_ID' "$W/C2.run.log" | sed 's/^/GUARD:   /'
+  [ -s "$W/C2.sbatch" ] && sed 's/^/GUARD:   sbatch /' "$W/C2.sbatch"
+fi
+
+# ---- C3, THE UNDERIVED WALL: the det163 shape, exactly ----------------------
+# An owner generated with NO `--roots` has OWNER_WALL_COVERS=0 and OWNER_WALL_S=0
+# -- placeholders, not measurements -- and det163_proof.sh's submit_owner
+# generated exactly that (`### OWNER SNAPSHOT wall=UNDERIVED roots=0` is in
+# det163-6020526.out twice). Before CLEANUP-WALL-3 this fixture produced a
+# continuation on EVERY run, four deep, which is the whole chain. It must now
+# print the UNDERIVED row, say out loud that it will not continue, and submit
+# nothing: that is what turns a row nobody read into an actuator (law 9).
+mkdir -p "$W/jr.und"
+OWNER_WALL_FLOOR_S=60 OWNER_WALL_PRESSURE_NUM=0 \
+  bash "$SNAPTOOL" "$W/jr.und" "$GATE" > "$W/C3.snap.log" 2>&1; rcU=$?
+if [ "$rcU" = 0 ] && [ -f "$W/jr.und/owner-snapshot/owner.sbatch" ]; then
+  : > "$W/C3.sbatch"
+  SBATCH_LOG=$W/C3.sbatch PATH=$W/bin:$PATH SLURM_JOB_ID=8800003 SLURM_JOB_NAME=guard-cleanup \
+    bash "$W/jr.und/owner-snapshot/owner.sbatch" "$GROW" > "$W/C3.run.log" 2>&1
+  C3SUB=$(wc -l < "$W/C3.sbatch" | tr -d ' ')
+  grep -q '^### OWNER WALL UNDERIVED' "$W/C3.run.log" \
+    && ok "C3. the owner NAMES its underived wall at run time: $(grep -m1 '^### OWNER WALL UNDERIVED' "$W/C3.run.log")" \
+    || { fail "C3. no '### OWNER WALL UNDERIVED' row -- the placeholder is being read as a measurement"; sed 's/^/GUARD:   /' "$W/C3.run.log"; }
+  grep -q '^### OWNER NO CONTINUATION: this owner has no derived wall' "$W/C3.run.log" \
+    && ok "C3. and it REFUSES to continue on it: $(grep -m1 '^### OWNER NO CONTINUATION' "$W/C3.run.log")" \
+    || { fail "C3. no '### OWNER NO CONTINUATION: this owner has no derived wall' row"; grep '^### OWNER' "$W/C3.run.log" | sed 's/^/GUARD:   /'; }
+  if [ "$C3SUB" = 0 ]; then
+    ok "C3. and the calls file is EMPTY -- no continuation, as a byte fact and not as a missing log line"
+  else
+    fail "C3. the underived owner submitted $C3SUB continuation(s) -- this is det163's chain, unfixed"
+    sed 's/^/GUARD:   sbatch /' "$W/C3.sbatch"
+  fi
+  grep -q '^### FIXTURE CLEANUP ran with' "$W/C3.run.log" \
+    && ok "C3. and it still RAN its pass -- an underived wall stops the continuation, never the cleanup" \
+    || fail "C3. the underived owner never ran its pass"
+else
+  fail "C3. the snapshot tool would not generate an underived owner (rc=$rcU) -- C3 did not run"
+  sed 's/^/GUARD:   /' "$W/C3.snap.log"
+fi
 ########## D. MUTATION: derivation removed -> equal walls ######################
 mkdir -p "$W/mut/phase_template" "$W/mut/tools" "$W/jr.mut.small" "$W/jr.mut.big"
 cp "$REFS" "$W/mut/tools/script_refs.sh"
