@@ -565,13 +565,21 @@ fn run_path_source_manifest(args: &[String]) -> anyhow::Result<()> {
              pass --no-pack-shims to copy the canonical manifest through)"
         );
     }
-    let (text, rewrites, outcomes) = psm::effective_manifest_text(
+    let (text, rewrites, outcomes, derived) = psm::effective_manifest_text(
         &packs,
         &workspace,
         &records_dir,
         &manifest_text,
         shims,
     )?;
+    // WHERE EACH RECORD CAME FROM, before anything that uses it. Nothing under
+    // `<pack>/path-sources/` has to exist: the record is derived from the
+    // manifest entry and the tree's own metadata, and a file that IS there can
+    // only confirm it (`derived=confirmed`). A run whose rows all say
+    // `derived=yes` wrote nothing into the workspace to get there.
+    for record in &derived {
+        println!("{}", record.row());
+    }
     if !shims {
         println!(
             "### PACK SHIM disabled (--no-pack-shims): {} copied unchanged, the \
@@ -591,6 +599,28 @@ fn run_path_source_manifest(args: &[String]) -> anyhow::Result<()> {
     }
 
     if check {
+        // The derived-vs-canonical diff, line for line. It is printed BEFORE
+        // the verdict because it is the thing an auditor reads: a transform
+        // that moved a line nobody expected is a defect even when `--check`
+        // is otherwise satisfied, and a check that only says match/no-match
+        // cannot show that.
+        let canon: Vec<&str> = manifest_text.lines().collect();
+        let eff: Vec<&str> = text.lines().collect();
+        if canon.len() == eff.len() {
+            for (n, (a, b)) in canon.iter().zip(eff.iter()).enumerate() {
+                if a != b {
+                    println!("### PACK SHIM DIFF line={} -{}", n + 1, a);
+                    println!("### PACK SHIM DIFF line={} +{}", n + 1, b);
+                }
+            }
+        } else {
+            println!(
+                "### PACK SHIM DIFF line-count moved {} -> {} (the transform is \
+                 line-preserving, so this is a defect)",
+                canon.len(),
+                eff.len()
+            );
+        }
         let found = std::fs::read_to_string(&out).unwrap_or_default();
         if found == text {
             println!("### PACK SHIM CHECK {} matches", out.display());

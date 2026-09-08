@@ -65,14 +65,29 @@ const SHIM_REL: &str = "pypi-packs/isaaclab-2.3x-pack/sources/pace-sim2real";
 
 /// A workspace in the production shape: a CANONICAL manifest whose
 /// `[pypi-dependencies]` entry points at the REAL tree (not at the shim), a
-/// pack directory holding the hand-written record, and the tree's own
-/// `*.egg-info/PKG-INFO`.
-fn canonical_workspace(label: &str) -> std::path::PathBuf {
+/// pack directory, and the tree's own `*.egg-info/PKG-INFO`.
+///
+/// `records = true` also writes the hand-editable record file. It is a
+/// PARAMETER and not a fixture constant because the two states are two
+/// different production claims: `imprint-data` has NO record files anywhere
+/// (`find imprint-data -maxdepth 4 -path '*path-sources*'` returns nothing),
+/// so `false` is the shape the daily relock actually meets, and `true` is the
+/// shape where a record exists and may only CONFIRM what the tree already says.
+///
+/// THE MANIFEST DECLARES THE PACK, and that line is load-bearing rather than
+/// scenery: the derivation asks which pack a path source sits BESIDE, so a
+/// workspace that names a pack only on the command line has not said what the
+/// pack is for. The live manifest declares it the same way — `[feature.pace]`
+/// carries `"isaaclab-2.3x-pack" = { path = "./pypi-packs/isaaclab-2.3x-pack" }`
+/// next to its `pace_sim2real` entry.
+fn canonical_workspace_opt(label: &str, records: bool) -> std::path::PathBuf {
     let root = scratch(label);
     std::fs::write(
         root.join("pixi.toml"),
         format!(
             "[workspace]\nname = \"ws\"\n\n# a prose mention of {PACE_REL} must NOT move\n\
+             [dependencies]\n\
+             \"isaaclab-2.3x-pack\" = {{ path = \"./{PACK_REL}\" }}\n\
              [pypi-dependencies]\n\
              pace_sim2real = {{ path = \"{PACE_REL}\", editable = true }}\n"
         ),
@@ -87,18 +102,25 @@ fn canonical_workspace(label: &str) -> std::path::PathBuf {
          Requires-Python: >=3.10\nRequires-Dist: psutil\nRequires-Dist: cmaes\n\nbody\n",
     )
     .unwrap();
-    std::fs::create_dir_all(root.join(PACK_REL).join("path-sources")).unwrap();
+    std::fs::create_dir_all(root.join(PACK_REL)).unwrap();
     std::fs::write(root.join(PACK_REL).join("pixi.toml"), "[package]\n").unwrap();
-    std::fs::write(
-        root.join(PACK_REL).join("path-sources").join("pace-sim2real.toml"),
-        format!(
-            "# Path-source metadata record for `pace-sim2real`. SOURCE OF TRUTH.\n\
-             path = \"{PACE_REL}\"\nversion = \"0.1.2\"\n\
-             requires-python = \">=3.10\"\ndependencies = [\"psutil\", \"cmaes\"]\n"
-        ),
-    )
-    .unwrap();
+    if records {
+        std::fs::create_dir_all(root.join(PACK_REL).join("path-sources")).unwrap();
+        std::fs::write(
+            root.join(PACK_REL).join("path-sources").join("pace-sim2real.toml"),
+            format!(
+                "# Path-source metadata record for `pace-sim2real`.\n\
+                 path = \"{PACE_REL}\"\nversion = \"0.1.2\"\n\
+                 requires-python = \">=3.10\"\ndependencies = [\"psutil\", \"cmaes\"]\n"
+            ),
+        )
+        .unwrap();
+    }
     root
+}
+
+fn canonical_workspace(label: &str) -> std::path::PathBuf {
+    canonical_workspace_opt(label, true)
 }
 
 fn retread(args: &[&str]) -> std::process::Output {
@@ -261,6 +283,112 @@ fn path_source_manifest_writes_the_effective_manifest_to_out() {
          passed on it would be a guard that cannot fail: {}",
         String::from_utf8_lossy(&mismatch.stderr)
     );
+}
+
+#[test]
+fn path_source_manifest_derives_its_records_with_no_record_file_on_disk() {
+    // THE PRODUCTION SHAPE, END TO END, THROUGH THE REAL BINARY. `imprint-data`
+    // has no `path-sources/` directory anywhere and never has, so the daily
+    // relock's default `PACK_SHIM_MODE=on` refused at 2m26s (job 6073129) and
+    // C35 arm 3's 138 s only ever passed because `c34_threearm.sh`'s
+    // `pack_stage_content` MANUFACTURED the record into its own workspace from
+    // a shell literal. This drives the same verb the daily template calls, over
+    // a workspace with NOTHING under `path-sources/`, and requires it to
+    // produce the same effective manifest.
+    let root = canonical_workspace_opt("derive-no-record", false);
+    assert!(
+        !root.join(PACK_REL).join("path-sources").exists(),
+        "this test is only meaningful with no record on disk"
+    );
+    let out = root.join("pixi.toml");
+    let canonical = std::fs::read_to_string(&out).unwrap();
+
+    let output = retread(&[
+        "path-source-manifest",
+        "--workspace",
+        root.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+        "--pack",
+        root.join(PACK_REL).to_str().unwrap(),
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "the verb still requires a record file.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    // The derivation says so in its own row, and says it derived rather than
+    // confirmed -- there is nothing on disk to confirm.
+    assert!(
+        stdout.contains("### PATH SOURCE RECORD project=pace-sim2real")
+            && stdout.contains(&format!("source={PACE_REL}"))
+            && stdout.contains("derived=yes"),
+        "no derivation row, so nothing can read where the record came from:\n{stdout}"
+    );
+
+    let effective = std::fs::read_to_string(&out).unwrap();
+    assert_ne!(effective, canonical, "the verb wrote nothing:\n{stdout}");
+    assert!(effective.contains(&format!("path = \"{SHIM_REL}\"")), "{effective}");
+    assert!(!effective.contains(&format!("path = \"{PACE_REL}\"")), "{effective}");
+
+    // The shim is materialized from the DERIVED record and carries every field
+    // uv needs statically -- the whole point of the transform.
+    let shim_text =
+        std::fs::read_to_string(root.join(SHIM_REL).join("pyproject.toml")).unwrap();
+    for field in ["name", "version", "requires-python", "dependencies"] {
+        assert!(shim_text.contains(field), "{field} missing:\n{shim_text}");
+    }
+    assert!(shim_text.contains("0.1.2"), "the tree's version:\n{shim_text}");
+    assert!(shim_text.contains("psutil"), "the tree's deps:\n{shim_text}");
+
+    // AND IT IS THE SAME DOCUMENT THE RECORD FILE PRODUCES, so the two
+    // producers cannot drift: a record may confirm, never override.
+    let with_record = canonical_workspace_opt("derive-with-record", true);
+    let out2 = with_record.join("pixi.toml");
+    let confirmed = retread(&[
+        "path-source-manifest",
+        "--workspace",
+        with_record.to_str().unwrap(),
+        "--out",
+        out2.to_str().unwrap(),
+        "--pack",
+        with_record.join(PACK_REL).to_str().unwrap(),
+    ]);
+    assert!(confirmed.status.success(), "{}", String::from_utf8_lossy(&confirmed.stderr));
+    assert!(
+        String::from_utf8_lossy(&confirmed.stdout).contains("derived=confirmed"),
+        "a record that agrees must report itself as a CONFIRMATION"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&out2).unwrap(),
+        effective,
+        "the derived and the confirmed effective manifests differ"
+    );
+
+    // A record that DISAGREES is a refusal naming both sides, never a silent
+    // preference. Without this the confirmation above could be a no-op.
+    std::fs::write(
+        with_record.join(PACK_REL).join("path-sources").join("pace-sim2real.toml"),
+        format!(
+            "path = \"{PACE_REL}\"\nversion = \"9.9\"\n\
+             requires-python = \">=3.10\"\ndependencies = [\"psutil\", \"cmaes\"]\n"
+        ),
+    )
+    .unwrap();
+    let lying = retread(&[
+        "path-source-manifest",
+        "--workspace",
+        with_record.to_str().unwrap(),
+        "--out",
+        out2.to_str().unwrap(),
+        "--pack",
+        with_record.join(PACK_REL).to_str().unwrap(),
+    ]);
+    assert!(!lying.status.success(), "a lying record was accepted");
+    let err = String::from_utf8_lossy(&lying.stderr);
+    assert!(err.contains("9.9") && err.contains("0.1.2"), "both sides must be named: {err}");
 }
 
 // WHERE THESE RUN. The certifying gate (`tools/gate_build.sh`) runs

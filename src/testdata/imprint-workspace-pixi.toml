@@ -1,0 +1,1003 @@
+[workspace]
+channels = [
+  "https://prefix.dev/conda-forge",
+  "https://prefix.dev/pixi-build-backends",
+]
+name = "imprint"
+platforms = [
+  { name = "linux-64-base", platform = "linux-64", glibc = "2.34" },
+  { name = "linux-64-cuda-12", platform = "linux-64", cuda = "12", glibc = "2.34" },
+  { name = "linux-64-cuda-11", platform = "linux-64", cuda = "11", glibc = "2.34" },
+  { name = "linux-64-cuda-12-glibc-2-35", platform = "linux-64", cuda = "12", glibc = "2.35" },
+  { name = "linux-aarch64-jetson", platform = "linux-aarch64", linux = "5.15", glibc = "2.35", cuda = "12.6" },
+]
+version = "0.1.0"
+preview = ["pixi-build"]
+build-variants = { python = ["3"] }
+# Map conda package names to the PyPI names required by retreaded simulator
+# wheels and mixed conda/PyPI environments.
+# NOTE: every channel keyed here MUST be declared in [workspace].channels or in
+# some active feature's `channels` list; `pixi add` hard-fails otherwise (this
+# broke when the pytorch-channel features were commented out during slimming).
+# TODO(pixi>=0.71): migrate to structured conda-pypi-map
+conda-pypi-map = { "https://prefix.dev/conda-forge" = "patches/conda_pypi_map.json", "https://conda.anaconda.org/pytorch" = "patches/conda_pypi_map.json", "https://prefix.dev/pytorch" = "patches/conda_pypi_map.json" }
+
+[workspace.target.linux-aarch64.build-variants]
+c_stdlib = ["sysroot"]
+c_stdlib_version = ["2.17"]
+
+# Global PyPI options - extra indexes for NVIDIA and MuJoCo packages
+[pypi-options]
+extra-index-urls = ["https://pypi.org/simple", "https://pypi.nvidia.com", "https://py.mujoco.org"]
+index-strategy = "unsafe-best-match"
+
+# Override malformed dependencies from mujoco-warp and newton git packages
+# [pypi-options.dependency-overrides]
+# warp-lang = ">=1.11.0.dev0"
+# mujoco = ">=3.3.7"
+
+#### Base Bare Bones Environment
+
+[dependencies] # Global dependencies across all environments
+python = "==3.12"
+pip = ">=25.1.1,<26"
+hatchling = ">=1.27.0,<2"
+numpy = ">=1.26.4,<3"
+matplotlib = ">=3.10.3,<4"
+jupyter = ">=1.1.1,<2"
+ipywidgets = ">=8.1.5,<9"
+toml = ">=0.10.2,<0.11"
+doit = ">=0.37.0,<0.38"
+
+
+[tasks]
+doit = "python -m tasks.doit_run"
+
+[feature.doit-task-runner.tasks]
+doit = "python -m tasks.doit_run"
+
+[feature.doit-task-runner.dependencies]
+doit = ">=0.36.0,<0.38"
+
+[target.unix.activation]
+scripts = ["scripts/post-install.bash"] # pip  install the package in editable mode
+
+#### All possible environment combinations
+[feature.platform-base]
+platforms = ["linux-64-base"]
+
+[feature.platform-cuda]
+platforms = ["linux-64-cuda-12"]
+
+[feature.platform-robogen]
+platforms = ["linux-64-cuda-11"]
+
+[feature.platform-isaac]
+platforms = ["linux-64-cuda-12-glibc-2-35"]
+
+[feature.platform-jetson]
+platforms = ["linux-aarch64-jetson"]
+
+[environments]
+default = { features = ["platform-base"] }
+cpu = { features = ["platform-base", "cpu", "tensorboard-tools"] } # All you need for bare-bones
+test = { features = ["platform-base", "test", "cpu"] } # This environment is relied upon by default by the CI
+tensorboard-tools = { features = ["platform-base", "doit-task-runner", "tensorboard-tools"], no-default-feature = true } # Terminal TensorBoard log inspection and plotting
+
+## The following environment combinations are optional and can safely be removed if not needed.
+gpu = { features = ["platform-cuda", "gpu", ] }
+test-gpu = { features = ["platform-cuda", "gpu", "test", ] }
+unitree-rl-gym = { features = ["platform-cuda", "doit-task-runner", "unitree-rl-gym"], no-default-feature = true }
+holosoma = { features = ["platform-cuda", "doit-task-runner", "holosoma"], no-default-feature = true }
+unitree-rl-lab-gpu = { features = ["platform-isaac", "doit-task-runner", "isaaclab-unitree", "unitree-rl-lab"], no-default-feature = true } # consolidated onto isaaclab-2.3x-pack
+groot-sonic-gpu = { features = ["platform-isaac", "doit-task-runner", "isaaclab-sonic", "groot-sonic"], no-default-feature = true }
+viral-gpu = { features = ["platform-isaac", "doit-task-runner", "isaaclab-viral", "viral"], no-default-feature = true }
+uwlab-gpu = { features = ["platform-isaac", "doit-task-runner", "isaaclab-uwlab", "uwlab"], no-default-feature = true } # consolidated onto isaaclab-2.3x-pack
+flashsac-gpu = { features = ["platform-isaac", "doit-task-runner", "flashsac"], no-default-feature = true }
+# Backend 4.8.8 preserves Hover's explicit PyPI Torch 2.5.1 ownership; the
+# generated pack metadata no longer exposes the old conda Torch edge.
+hover-gpu = { features = ["platform-isaac", "doit-task-runner", "isaaclab-hover", "hover"], no-default-feature = true }
+# re-enabled 2026-07-12: locks GREEN under published backend 4.5.3 via the curated
+# [feature.sage] closure + sage-isaac-pack (isaacsim 4.2.0.2, extscache — builds
+# clean, retread_version=4.5.3 confirmed). PLAN Phase-3.1 deps-from refinement
+# (grok server/pyproject.toml like protomotions-deps-pack) was evaluated and
+# DEFERRED: third_party/sage server/pyproject.toml is a hostile deps-from source
+# — 10 deps would need dropping (4 isaacsim self-refs the pack already owns; 2
+# git-source builds nvdiffrast/pytorch3d; 4 local editables omni-isaac-lab×3 /
+# m2t2 / pointnet2_ops / nvidia-curobo all pinned to nonexistent /home/hongchix
+# paths via [tool.uv.sources]) AND it carries a HARD pin conflict against the
+# env's own conda block (server pillow==9.3.0 vs [feature.sage] pillow>=10,<13)
+# plus divergent unvalidated pins (diffusers 0.35.1 vs curated 0.11.1). Swapping
+# the validated closure for it would regress a green env for a pin-cleanup
+# nicety — kept the curated closure; revisit if upstream cleans server pyproject.
+sage = { features = ["platform-isaac", "doit-task-runner", "sage"], no-default-feature = true } # includes the required sage-isaac-pack
+# re-enabled 2026-07-12: locks GREEN under published backend 4.5.3 (legacy torch
+# 2.0.0+cu117 / gym 0.21.0 / ray 1.13.0 / ompl 2.0.0 closure resolves clean).
+robogen = { features = ["platform-robogen", "doit-task-runner", "robogen"], no-default-feature = true }
+ros2-humble-gpu = { features = ["platform-cuda", "gpu", "ros2-humble"] }
+ros2-humble-cpu = { features = ["platform-base", "cpu", "ros2-humble"] }
+
+# Isaac Sim 6.0.0.1 + IsaacLab 3.0 beta2, with CUDA/PyTorch owned by gpu.
+isaaclab-gpu-latest = { features = ["platform-isaac", "doit-task-runner", "isaaclab-latest", "gpu"], no-default-feature = true }
+newton-gpu = { features = ["platform-cuda", "newton", "robojudo", "gpu"] }
+
+# ProtoMotions (https://nvlabs.github.io/ProtoMotions/) environments.
+pm-isaaclab = { features = ["platform-isaac", "doit-task-runner", "pm-isaaclab"], no-default-feature = true }
+pm-newton-gpu = { features = ["platform-cuda", "doit-task-runner", "pm-newton", "gpu"], no-default-feature = true }
+pm-mujoco = { features = ["platform-base", "doit-task-runner", "cpu", "pm-mujoco"], no-default-feature = true }
+# RoboJuDo sim2real-style verification harness (see
+# src/imprint/protomotions/robojudo_verify.py, `doit robojudo:verify`).
+# CPU-only (onnxruntime CPUExecutionProvider is hardcoded by RoboJuDo's tracker
+# policy) -- kept as its own env/feature (not folded into pm-mujoco) because it's
+# a different Python package (third_party/RoboJuDo submodule) with its own,
+# much lighter dependency set. This replaces the conda env described in
+# docs/verbose/protomotions-h1_2-full-workflow.md Section 2.5 -- this machine
+# has no conda/miniforge install and the project otherwise standardizes on
+# pixi for every other env, so a conda env would be a one-off inconsistent
+# with the rest of the repo.
+# Track 2 sys-ID envs. Isolated no-default environments keep the heavy stacks out
+# of unrelated shells: figaroh drags in the conda Pinocchio stack; pace drags in
+# the multi-GB Isaac isaac-pack. Install explicitly with `pixi install -e figaroh`
+# / `pixi install -e pace`. SAGE (the third Track-2 tool) needs no env here --
+# its light analysis half is folded into the `robojudo` env above.
+pace = { features = ["platform-isaac", "doit-task-runner", "pace"], no-default-feature = true }
+
+# ROS 2 Jazzy variants (mirror the Humble envs; see [feature.ros2-jazzy]).
+ros2-jazzy-gpu = { features = ["platform-cuda", "gpu", "ros2-jazzy"] }
+ros2-jazzy-cpu = { features = ["platform-base", "cpu", "ros2-jazzy"] }
+jetson = { features = ["platform-jetson", "doit-task-runner", "jetson"], no-default-feature = true }
+# Now, for the other environment configurations.
+# Feel free to ignore and delete features you don't need!
+
+[feature.cpu.dependencies]
+rich = ">=13.7,<16"
+huggingface_hub = ">=1.16,<2"
+
+#### Jetson JetPack 6.1 Environment---------------------------------------------------------------
+# Native-only deployment environment for Jetson Orin running JetPack 6.1.
+# CUDA is owned by JetPack on the host: do not add conda CUDA toolkit packages
+# or compose this feature with the x86_64 Isaac/GPU features.
+[feature.jetson]
+
+[feature.jetson.dependencies]
+python = "==3.10.20"
+pip = "*"
+cyclonedds = "==0.10.5"
+cyclonedds-python-binding = { path = "./packages/cyclonedds-python-binding" }
+
+[feature.jetson.activation.env]
+CYCLONEDDS_HOME = "$CONDA_PREFIX"
+
+# Artifact verdict: NOT fully migratable. Retread rejects the NVIDIA wheel because
+# its decoded filename version does not match its internal METADATA version.
+# Migration is forbidden regardless: this aarch64 wall is audit-only.
+[feature.jetson.pypi-dependencies]
+torch = { url = "https://developer.download.nvidia.com/compute/redist/jp/v61/pytorch/torch-2.5.0a0%2B872d972e41.nv24.08.17622132-cp310-cp310-linux_aarch64.whl#sha256=6f75fd2d2ef840ede1a90dbcf40a5458214bee26cc803fa510cda2e8978d972a" }
+numpy = "==1.26.1"
+networkx = "==3.4.2"
+etils = "==1.13.0"
+opencv-python = "==4.10.0.84"
+mujoco = "==3.2.3"
+onnxruntime = "==1.23.2"
+imprint = { path = ".", editable = true }
+unitree_sdk2py = { path = "third_party/unitree_sdk2_python", editable = true }
+
+#### Test Environment----------------------------------------------------------------------------
+# This environment is relied upon by default by the CI in .github/workflows/pre-commit.yml
+[feature.test.dependencies]
+pytest = ">=7.0.0"
+pre-commit = ">=3.6.0"
+
+#### TensorBoard Log Tools-----------------------------------------------------------------------
+[feature.tensorboard-tools.dependencies]
+python = "==3.12"
+pip = ">=25.1.1,<26"
+tensorboard = ">=2.20,<3"
+
+[feature.tensorboard-tools.pypi-dependencies]
+uniplot = ">=0.23.1,<0.24"
+
+#### GPU Environment-----------------------------------------------------------------------------
+[feature.gpu]
+# Channels would go here.
+
+# Set CUDA_HOME for torch.compile/Triton to find ptxas
+[feature.gpu.activation.env]
+CUDA_HOME = "$CONDA_PREFIX"
+# Prioritize the env's own libs on the loader path. Two reasons on shared HPC
+# (OSCAR/CCV): (1) some site module systems leak libstdc++ into LD_LIBRARY_PATH,
+# shadowing conda's newer one (GLIBCXX_3.4.30 ImportError); (2) conda pytorch's
+# libtorch_cuda.so needs conda nccl (in $CONDA_PREFIX/lib) rather than a stale
+# bundled CUDA lib. Prepending $CONDA_PREFIX/lib makes the env authoritative.
+LD_LIBRARY_PATH = "$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"
+
+# Thank you to Matthew Feickert for the system requirements tip!
+# https://pixi.sh/latest/workspace/system_requirements/
+# https://matthewfeickert-talks.github.io/reproducible-ml-for-scientists-with-pixi-scipy-2025/cuda-conda
+[feature.gpu.dependencies]
+# Keep the torch family on conda. conda-forge's PyTorch 2.10 GPU builds require CUDA 12.9.
+cuda-version = "==12.9" # retread:pin
+cuda-nvcc_linux-64 = "12.9.*"
+cuda-toolkit = "12.9.*"
+pytorch-gpu = "==2.10.0" # retread:pin
+torchvision = "==0.25.0" # retread:pin
+torchaudio = "==2.10.0" # retread:pin
+imageio = ">=2.37.0,<3"
+scikit-image = ">=0.25.2,<0.26"
+
+[feature.gpu.pypi-dependencies]
+# Special thank you to @MiroPsota for these wheels
+# https://github.com/facebookresearch/pytorch3d/discussions/1752?
+pytorch3d = { version = "==0.7.9+d9839a9pt2.10.0cu128", index = "https://miropsota.github.io/torch_packages_builder" }
+mujoco = ">=3.3.3"
+mujoco-mjx = "*"
+
+#### Unitree RL Gym Environment-----------------------------------------------------------------
+# Isolated because the upstream Unitree setup targets Python 3.8, while the
+# default project environments target Python 3.12.
+[feature.unitree-rl-gym]
+channels = [
+  { channel = "https://prefix.dev/pytorch", priority = 200 },
+  { channel = "https://prefix.dev/nvidia", priority = 100 },
+  "https://prefix.dev/conda-forge",
+]
+[feature.unitree-rl-gym.dependencies]
+unitree-rl-gym-pack = { path = "./pypi-packs/unitree-rl-gym-pack" }
+python = "==3.8"
+pip = ">=24,<25"
+doit = ">=0.36.0,<0.38"
+setuptools = ">=65,<69"
+wheel = ">=0.43,<1"
+numpy = ">=1.20.3,<1.21"
+matplotlib = ">=3.6,<3.8"
+pyyaml = ">=6,<7"
+scipy = ">=1.7,<1.11"
+tomli = ">=2,<3"
+xkeyboard-config = ">=2.47,<3"
+[feature.unitree-rl-gym.target.unix.activation]
+scripts = ["scripts/post-install.bash"]
+
+#### Holosoma Environment (Amazon FAR) ------------------------------------------------------------
+# Isolated no-default environment for pulling holosoma's reward + randomization
+# terms into the H1_2 env. The retread pack owns Holosoma's sibling source
+# wheels and normalizes their upstream dependency metadata; the root feature owns
+# the runtime NumPy/PyTorch/CUDA contract.
+[feature.holosoma]
+channels = [
+  "https://prefix.dev/conda-forge",
+  "https://prefix.dev/pytorch",
+  "https://prefix.dev/nvidia",
+]
+[feature.holosoma.activation.env]
+CUDA_HOME = "$CONDA_PREFIX"
+MUJOCO_GL = "egl"
+LD_LIBRARY_PATH = "$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"
+[feature.holosoma.dependencies]
+holosoma-pack = { path = "./pypi-packs/holosoma-pack" }
+python = "==3.11"
+pip = ">=25.1.1,<26"
+numpy = "==1.26.4"
+# Keep Holosoma's Torch family on conda. This mirrors the current root GPU
+# stack without inheriting the unrelated pytorch3d/mujoco-mjx dependencies.
+cuda-version = "==12.9"
+cuda-nvcc_linux-64 = "12.9.*"
+cuda-toolkit = "12.9.*"
+pytorch-gpu = "==2.10.0"
+[feature.holosoma.target.unix.activation]
+scripts = ["scripts/post-install.bash"]
+
+#### RoboGen Environment------------------------------------------------------------------------
+# RoboGen uses a legacy CUDA 11.7-era PyTorch, Ray 1.x/RLlib, old Gym,
+# PyBullet, and OMPL stack. Keep it as a no-default root environment so the
+# stack is available from the canonical manifest without constraining default
+# project environments.
+[feature.robogen]
+[feature.robogen.dependencies]
+robogen-pack = { path = "./pypi-packs/robogen-pack" }
+python = ">=3.10,<3.11"
+pip = ">=23,<24"
+setuptools = ">=65,<66"
+wheel = ">=0.38,<1"
+click = ">=7,<=8.0.4"
+numpy = ">=1.26,<2"
+scipy = ">=1.10,<1.11"
+pandas = ">=1.5,<1.6"
+pyyaml = ">=6,<7"
+pillow = ">=9.4,<10"
+matplotlib-base = ">=3.7,<3.8"
+scikit-learn = ">=1.3,<1.4"
+imageio = ">=2.26,<3"
+ffmpeg = ">=4,<5"
+gym = "==0.21.0"
+[feature.robogen.target.unix.activation]
+scripts = ["scripts/post-install.bash"]
+
+#### Unitree RL Lab Environment-----------------------------------------------------------------
+# Unitree RL Lab's README targets Isaac Sim 5.1.0 + Isaac Lab 2.3.0 on Python 3.11.
+# Keep it separate from the root Isaac Sim 6 / Python 3.12 packs.
+[feature.isaaclab-unitree.dependencies]
+"isaaclab-2.3x-pack" = { path = "./pypi-packs/isaaclab-2.3x-pack" } # consolidated shared Isaac Sim 5.1 / IsaacLab v2.3.2 stack
+python = "==3.11"
+pip = ">=25.1.1,<26"
+setuptools = ">=68,<81"
+wheel = ">=0.43,<1"
+cuda-version = "==12.8"
+cuda-nvcc_linux-64 = "12.8.*"
+cuda-toolkit = "12.8.*"
+# Keep compiled sim2sim binaries below the Ubuntu 22.04 host ABI. The next
+# conda-forge sysroot after 2.34 is 2.39 and emits binaries this host cannot run.
+sysroot_linux-64 = ">=2.34,<2.35"
+gxx_linux-64 = ">=12"
+gcc_linux-64 = ">=12"
+binutils_linux-64 = ">=2.40"
+cmake = ">3.6"
+# Version owner: without this provider the bundled closure drifts Pillow.
+numpy = "<2"
+pillow = "==10.4.0"
+# Isaac Sim 5.1's Kit prebundle can appear ahead of the environment on
+# sys.path during full GUI startup. Keep FastAPI/Pydantic on versions that do
+# not require newer typing_extensions APIs than Kit 107's bundled copy exposes.
+fastapi = "==0.115.7" # retread:pin
+pydantic = ">=2.11,<2.12"
+typing-extensions = ">=4.12.2,<4.13"
+
+[feature.isaaclab-unitree.pypi-dependencies]
+torch = { version = "==2.7.0", index = "https://download.pytorch.org/whl/cu128" }
+torchvision = { version = "==0.22.0", index = "https://download.pytorch.org/whl/cu128" }
+torchaudio = { version = "==2.7.0", index = "https://download.pytorch.org/whl/cu128" }
+
+[feature.isaaclab-unitree.activation.env]
+CUDA_HOME = "$CONDA_PREFIX"
+[feature.isaaclab-unitree.target.unix.activation]
+scripts = ["scripts/post-install.bash"]
+[feature.unitree-rl-lab.dependencies]
+argcomplete = ">=3.0,<4"
+doit = ">=0.37.0,<0.38"
+boost-cpp = ">=1.84,<1.90"
+yaml-cpp = ">=0.8,<0.9"
+fmt = ">=11,<12"
+spdlog = ">=1.15,<2"
+glfw = ">=3.4,<4"
+libgl-devel = ">=1.7,<2"
+libegl-devel = ">=1.7,<2"
+[feature.unitree-rl-lab.pypi-dependencies]
+# Isaac Sim 5.1's retread closure emits pycares>=4.8,<4.9 for Python 3.11.
+# aiodns 4 requires pycares>=5 and imports symbols absent from pycares 4.8, so
+# keep aiodns on the compatible 3.x PyPI line.
+aiodns = ">=3.1,<4"
+[feature.unitree-rl-lab.target.unix.activation]
+scripts = ["scripts/post-install.bash"]
+
+#### GR00T SONIC Environment--------------------------------------------------------------------
+# GEAR-SONIC targets Isaac Lab 2.3.2 / Isaac Sim 5.1 on Python 3.11.
+# Keep it separate from the root Isaac Sim 6 / Python 3.12 packs by using a
+# dedicated no-default environment and retread pack.
+[feature.isaaclab-sonic]
+[feature.isaaclab-sonic.dependencies]
+isaaclab-sonic-pack = { path = "./pypi-packs/isaaclab-sonic-pack" }
+python = "==3.11"
+pip = ">=25.1.1,<26"
+setuptools = ">=68,<81"
+wheel = ">=0.43,<1"
+cuda-version = "==12.8"
+cuda-nvcc_linux-64 = "12.8.*"
+cuda-toolkit = "12.8.*"
+sysroot_linux-64 = ">=2.35"
+gxx_linux-64 = ">=12"
+gcc_linux-64 = ">=12"
+binutils_linux-64 = ">=2.40"
+cmake = ">3.6"
+
+[feature.isaaclab-sonic.pypi-dependencies]
+torch = { version = "==2.7.0", index = "https://download.pytorch.org/whl/cu128" }
+torchvision = { version = "==0.22.0", index = "https://download.pytorch.org/whl/cu128" }
+torchaudio = { version = "==2.7.0", index = "https://download.pytorch.org/whl/cu128" }
+
+[feature.isaaclab-sonic.activation.env]
+CUDA_HOME = "$CONDA_PREFIX"
+[feature.isaaclab-sonic.target.unix.activation]
+scripts = ["scripts/post-install.bash"]
+[feature.groot-sonic.dependencies]
+# App-owned: the pack audit has no direct Joblib edge.
+joblib = ">=1.3,<2"
+# Version owners: the bundled closure otherwise drifts from the saved solve.
+tqdm = ">=4.66,<5"
+easydict = ">=1.10,<2"
+loguru = ">=0.7,<1"
+# The pack probe selected a prerelease lxml 7; keep the stable <7 contract.
+lxml = ">=5,<7"
+mediapy = ">=1.2,<2"
+# Keep the conda/PyPI bridge on the previously solved provider versions.
+scipy = ">=1.15,<1.18"
+fsspec = ">=2023.1.0,<=2026.4.0"
+aiohttp = ">=3.8,<4"
+[feature.groot-sonic.target.unix.activation]
+scripts = ["scripts/post-install.bash"]
+
+#### VIRAL / GR00T VisualSim2Real Environment-----------------------------------------------------
+# GR00T-VisualSim2Real's VIRAL branch documents Isaac Sim 5.1 on Python 3.11.
+# Keep it isolated from SONIC and the root Isaac Sim 6 pack because upstream
+# can change independently even though today's declared simulator stack matches
+# the Isaac Sim 5.1 / PyTorch 2.7 line.
+[feature.isaaclab-viral]
+[feature.isaaclab-viral.dependencies]
+isaaclab-viral-pack = { path = "./pypi-packs/isaaclab-viral-pack" }
+python = "==3.11"
+pip = ">=25.1.1,<26"
+setuptools = ">=68,<81"
+wheel = ">=0.43,<1"
+cuda-version = "==12.8"
+sysroot_linux-64 = ">=2.35"
+
+[feature.isaaclab-viral.pypi-dependencies]
+torch = { version = "==2.7.0", index = "https://download.pytorch.org/whl/cu128" }
+torchvision = { version = "==0.22.0", index = "https://download.pytorch.org/whl/cu128" }
+
+[feature.isaaclab-viral.activation.env]
+CUDA_HOME = "$CONDA_PREFIX"
+[feature.isaaclab-viral.target.unix.activation]
+scripts = ["scripts/post-install.bash"]
+# post-install installs the upstream gr00t package editable with --no-deps so
+# Pixi remains the single locked owner of torch, OpenCV, Isaac, and HF deps.
+[feature.viral.dependencies]
+# App-owned: the pack audit has no direct OmegaConf edge.
+omegaconf = ">=2.3,<3"
+loguru = ">=0.7,<1"
+onnxruntime = ">=1.20,<2"
+pandas = ">=2.2,<3"
+termcolor = ">=2.4,<4"
+rich = ">=13.7,<16"
+plotly = ">=5.22,<7"
+datasets = ">=3,<5"
+git-lfs = ">=3,<4"
+# Datasets requires the fsspec HTTP extra; the pack does not own this cap.
+fsspec = ">=2023.1.0,<=2026.4.0"
+aiohttp = ">=3.8,<4"
+[feature.viral.pypi-dependencies]
+# RESTORED 2026-08-19 (cert Phase 2): viral-gpu lost tensordict — load-bearing INTENT; PyPI on purpose (conda build pulls a second PyTorch).
+tensordict = "==0.8.3"
+[feature.viral.target.unix.activation]
+scripts = ["scripts/post-install.bash"]
+
+#### UWLab / OmniReset Environment---------------------------------------------------------------
+# UWLab v1.2.0 declares Isaac Sim 5.1 on Python 3.11. Keep it isolated from
+# SONIC and VIRAL because upstream UWLab's IsaacLab pin can move independently.
+[feature.isaaclab-uwlab]
+[feature.isaaclab-uwlab.dependencies]
+"isaaclab-2.3x-pack" = { path = "./pypi-packs/isaaclab-2.3x-pack" } # consolidated shared Isaac Sim 5.1 / IsaacLab v2.3.2 stack
+python = "==3.11"
+pip = ">=25.1.1,<26"
+setuptools = ">=68,<81"
+wheel = ">=0.43,<1"
+cuda-version = "==12.8"
+cuda-nvcc_linux-64 = "12.8.*"
+cuda-toolkit = "12.8.*"
+sysroot_linux-64 = ">=2.35"
+gxx_linux-64 = ">=12"
+gcc_linux-64 = ">=12"
+binutils_linux-64 = ">=2.40"
+cmake = ">3.6"
+
+[feature.isaaclab-uwlab.pypi-dependencies]
+torch = { version = "==2.7.0", index = "https://download.pytorch.org/whl/cu128" }
+torchvision = { version = "==0.22.0", index = "https://download.pytorch.org/whl/cu128" }
+torchaudio = { version = "==2.7.0", index = "https://download.pytorch.org/whl/cu128" }
+
+[feature.isaaclab-uwlab.activation.env]
+CUDA_HOME = "$CONDA_PREFIX"
+[feature.isaaclab-uwlab.target.unix.activation]
+scripts = ["scripts/post-install.bash"]
+# post-install installs only UWLab's source packages editable with --no-deps so
+# Pixi remains the single locked owner of Isaac, Torch, PyTorch3D, and runtime
+# dependencies. Do not run third_party/UWLab/uwlab.sh --install in this repo.
+[feature.uwlab.dependencies]
+git-lfs = ">=3,<4"
+# App-owned: the pack audit has no direct OmegaConf edge.
+omegaconf = ">=2.3,<3"
+# Version owners: the bundled closure otherwise drifts from the saved solve.
+tqdm = ">=4.66,<5"
+zarr = "==2.18.3"
+numcodecs = "==0.13.1"
+cmaes = ">=0.11,<1"
+pybullet = ">=3.2.7,<4"
+[feature.uwlab.pypi-dependencies]
+# opencv from PyPI (opencv-python): conda py-opencv 4.9 pulls ffmpeg 4.x which conflicts with the
+# newer ffmpeg the Isaac/vtk stack needs, and lacks a clean py311 build. pip wheel bundles ffmpeg.
+# (hypervisor 2026-07-15, operator-authorized; part of the Isaac-5.1 py311 conda->pypi migration)
+opencv-python = ">=4.9,<5"
+pytorch3d = { url = "https://github.com/MiroPsota/torch_packages_builder/releases/download/pytorch3d-0.7.8/pytorch3d-0.7.8%2Bpt2.7.0cu128-cp311-cp311-linux_x86_64.whl" }
+# RESTORED 2026-08-19 (cert Phase 2: uwlab tensordict intent)
+tensordict = "==0.8.3"
+# INTENT: Isaac Sim 5.1 wheels hard-pin portalocker==2.7.0 (cross-major vs float 4.1.0); one owner (cert FINAL 2026-08-20).
+portalocker = "==2.7.0"
+[feature.uwlab.target.unix.activation]
+scripts = ["scripts/post-install.bash"]
+
+#### FlashSAC Environment------------------------------------------------------------------------
+# FlashSAC's upstream Python 3.11 path intentionally uses a PyTorch/JAX stack
+# that must stay isolated from the Isaac Sim environments. The retread pack
+# names only FlashRL as the root; retread resolves the wheel closure.
+[feature.flashsac]
+[feature.flashsac.dependencies]
+flashsac-pack = { path = "./pypi-packs/flashsac-pack" }
+python = ">=3.11,<3.12"
+cuda-version = ">=12.8,<13"
+cuda-nvcc_linux-64 = ">=12.8,<13"
+# torch's wheel links libcusparseLt.so.0. cuSPARSELt is NOT part of the
+# cuda-version metapackage, so the conda CUDA stack alone does not provide it
+# and every `import torch` here fails without this. Native library, so it
+# belongs on the conda side with the rest of the CUDA stack.
+cusparselt = "*"
+# Native requirements whose root constraints are not reproduced by the audit.
+patchelf = ">=0.17,<0.18"
+xkeyboard-config = ">=2.47,<3"
+[feature.flashsac.pypi-dependencies]
+# retread cannot emit these as conda dependencies for Python 3.11: rliable has
+# no conda candidate, and conda gym builds stop before cp311. Keep only these
+# direct upstream dependencies in Pixi's PyPI solve instead of copying
+# FlashSAC's transitive dependency closure.
+gym = ">=0.26.0"
+rliable = ">=1.2.0,<2"
+[feature.flashsac.activation.env]
+CUDA_HOME = "$CONDA_PREFIX"
+[feature.flashsac.target.unix.activation]
+scripts = ["scripts/post-install.bash"]
+
+#### HOVER Environment---------------------------------------------------------------------------
+# HOVER targets Isaac Lab 2.0.0 / Isaac Sim 4.5.0 on Python 3.10.
+# Keep it separate from the root Isaac Sim 6 and Isaac Sim 5.1 packs by using a
+# dedicated no-default environment and retread pack.
+[feature.isaaclab-hover]
+channels = ["https://prefix.dev/conda-forge", "https://conda.anaconda.org/pytorch", "https://prefix.dev/pytorch", "https://prefix.dev/nvidia"]
+
+[feature.isaaclab-hover.dependencies]
+isaaclab-hover-pack = { path = "./pypi-packs/isaaclab-hover-pack" }
+python = ">=3.10.12,<3.11"
+pip = ">=25.1,<26"
+setuptools = ">=68,<81"
+wheel = ">=0.43,<1"
+toml = ">=0.10.2,<0.11"
+
+cuda-version = "==12.4"
+cuda-nvcc_linux-64 = "12.4.*"
+cuda-libraries-dev = "12.4.*"
+
+sysroot_linux-64 = ">=2.35"
+gxx_linux-64 = ">=12"
+gcc_linux-64 = ">=12"
+binutils_linux-64 = ">=2.40"
+cmake = ">=3.26"
+make = ">=4"
+pkg-config = ">=0.29"
+ninja = ">=1.11,<2"
+
+# These remain raw Requires-Dist edges in the audit, not emitted providers.
+numpy = "==1.26.4"
+scipy = ">=1.15,<1.16"
+pillow = ">=11.0.0,<12"
+matplotlib = ">=3.10,<4"
+imageio = ">=2.37,<3"
+pyyaml = ">=6,<7"
+joblib = ">=1.2,<2"
+easydict = ">=1.10,<2"
+gymnasium = ">=1.0,<2"
+h5py = ">=3.14,<4"
+hydra-core = ">=1.3,<2"
+moviepy = ">=1.0,<3"
+# Own the saved provider; the pack's raw <3.4 metadata otherwise selects 3.3.
+prettytable = "==3.18.0"
+
+[feature.isaaclab-hover.activation.env]
+CUDA_HOME = "$CONDA_PREFIX"
+
+[feature.isaaclab-hover.target.unix.activation]
+scripts = ["scripts/post-install.bash"]
+
+[feature.hover.dependencies]
+# App-owned: the pack audit has no direct psutil edge.
+psutil = ">=5.9,<8"
+
+[feature.hover.pypi-dependencies]
+dataclass-wizard = ">=0.22,<1"
+mujoco = ">=3.2,<4"
+glfw = ">=2.5,<3"
+tyro = ">=0.8,<1"
+
+[feature.hover.target.unix.activation]
+scripts = ["scripts/post-install.bash"]
+
+#### SAGE Environment-----------------------------------------------------------------------------
+# SAGE targets Isaac Sim 4.2.0.2 / Python 3.10 / CUDA 12.4 / PyTorch 2.5.1.
+# Keep it separate from the root Isaac Sim 6 and Isaac Sim 5.1 packs.
+[feature.sage]
+channels = ["https://prefix.dev/conda-forge", "https://conda.anaconda.org/pytorch", "https://prefix.dev/pytorch", "https://prefix.dev/nvidia"]
+
+[feature.sage.activation.env]
+CUDA_HOME = "$CONDA_PREFIX"
+
+[feature.sage.dependencies]
+sage-isaac-pack = { path = "./pypi-packs/sage-isaac-pack" }
+python = ">=3.10.12,<3.11"
+pip = ">=25.1,<26"
+setuptools = ">=68,<81"
+wheel = ">=0.43,<1"
+toml = ">=0.10.2,<0.11"
+
+# Keep core Torch and OpenCV on conda. Torchvision/torchaudio come through the
+# retread pack because the exact 2.5.1 / CUDA 12.4 builds are not available on conda.
+cuda-version = "==12.4"
+cuda-nvcc_linux-64 = "12.4.*"
+cuda-libraries-dev = "12.4.*"
+pytorch = { version = "==2.5.1", build = "py3.10_cuda12.4_cudnn9.1.0_0", channel = "https://conda.anaconda.org/pytorch" }
+pytorch-cuda = { version = "==12.4", channel = "https://conda.anaconda.org/pytorch" }
+pytorch-mutex = { version = "==1.0", build = "cuda", channel = "https://conda.anaconda.org/pytorch" }
+torchtriton = { version = "==3.1.0", build = "py310", channel = "https://conda.anaconda.org/pytorch" }
+py-opencv = ">=4.11,<4.12"
+
+sysroot_linux-64 = ">=2.35"
+gxx_linux-64 = ">=12"
+gcc_linux-64 = ">=12"
+binutils_linux-64 = ">=2.40"
+cmake = ">=3.26"
+make = ">=4"
+pkg-config = ">=0.29"
+ninja = ">=1.11,<2"
+
+imageio = ">=2.37,<3"
+ffmpeg = ">=6,<8"
+h5py = ">=3.14,<4"
+python-dotenv = ">=1.1,<2"
+scikit-image = ">=0.20,<0.21"
+scikit-learn = ">=1.7,<1.8"
+seaborn = ">=0.13,<0.14"
+rtree = ">=1.4,<2"
+shapely = ">=2.1,<3"
+trimesh = ">=4.8,<5"
+requests = ">=2.32,<3"
+tqdm = ">=4.67,<5"
+# The pack probe selected newer AWS patch lines; keep SAGE's narrower pins.
+boto3 = ">=1.43,<1.43.1"
+botocore = ">=1.43,<1.43.1"
+s3transfer = ">=0.17,<0.18"
+
+# Retread 4.10.48 hermetically builds the former compress-json and evdev sdist
+# blockers, so sage-isaac-pack now owns the complete 37-entry PyPI wall.
+
+[feature.sage.target.unix.activation]
+scripts = ["scripts/post-install.bash"]
+
+
+#### ROS 2 Environment---------------------------------------------------------------------------
+[feature.ros2-humble]
+# "https://prefix.dev/robostack-[humble|jazzy|kilted]"
+channels = ["https://prefix.dev/robostack-humble", "https://prefix.dev/conda-forge", ]
+[feature.ros2-humble.dependencies]
+# For minimal dep set
+ros-humble-ros-core	= "*"
+# For full feature set
+ros-humble-rviz2 = "*"
+ros-humble-rosbag2 = "*"
+ros-humble-rosbag2-storage-mcap = "*"
+
+compilers = "*"
+cmake = "<4" # openmesh 1.2.1 CMakeLists needs cmake_minimum_required <3.5, removed in cmake 4
+pkg-config = "*"
+make = "*"
+ninja = "*"
+
+colcon-common-extensions = "*" # needed for using humble_ws/colcon-defaults.yaml
+colcon-mixin = "*"
+# Maybe extra colcon stuff...
+colcon-devtools = "*"
+colcon-parallel-executor = "*"
+colcon-defaults = "*"
+colcon-package-selection = "*"
+colcon-python-setup-py = "*"
+colcon-recursive-crawl = "*"
+colcon-ros = "*"
+
+# " error: option --editable not recognized for setuptools==80.1.0 " occurs for building ROS 2 Humble Python Packages
+setuptools = ">=59.6.0,<=79.0.1"
+
+[feature.ros2-humble.target.unix.activation]
+scripts = ["scripts/post-install.bash"]
+
+#### ROS 2 Jazzy Environment----------------------------------------------------------------------
+# Mirrors [feature.ros2-humble] for the jazzy_ws colcon workspace. Builds with
+# `pixi run -e ros2-jazzy-cpu build-ros-jazzy`; the activation sources the jazzy
+# overlay + points COLCON_DEFAULTS_FILE at jazzy_ws/colcon-defaults.yaml.
+[feature.ros2-jazzy]
+# "https://prefix.dev/robostack-[humble|jazzy|kilted]"
+channels = ["https://prefix.dev/robostack-jazzy", "https://prefix.dev/conda-forge", ]
+[feature.ros2-jazzy.dependencies]
+# For minimal dep set
+ros-jazzy-ros-core = "*"
+# For full feature set
+ros-jazzy-rviz2 = "*"
+ros-jazzy-rosbag2 = "*"
+ros-jazzy-rosbag2-storage-mcap = "*"
+
+compilers = "*"
+cmake = "<4" # openmesh 1.2.1 CMakeLists needs cmake_minimum_required <3.5, removed in cmake 4
+pkg-config = "*"
+make = "*"
+ninja = "*"
+
+colcon-common-extensions = "*" # needed for using jazzy_ws/colcon-defaults.yaml
+colcon-mixin = "*"
+colcon-devtools = "*"
+colcon-parallel-executor = "*"
+colcon-defaults = "*"
+colcon-package-selection = "*"
+colcon-python-setup-py = "*"
+colcon-recursive-crawl = "*"
+colcon-ros = "*"
+
+# Same setuptools cap as Humble: setuptools 80+ drops `--editable`, breaking
+# colcon-python-setup-py builds of ROS 2 Python packages.
+setuptools = ">=59.6.0,<=79.0.1"
+
+[feature.ros2-jazzy.target.unix.activation]
+scripts = ["scripts/post-install.bash"]
+
+### Isaac Lab Latest Environment-----------------------------------------------------------------
+# Mirrors the proven pixidock_template composition while keeping this
+# no-default environment's Python and runtime compatibility pins explicit.
+[feature.isaaclab-latest]
+[feature.isaaclab-latest.dependencies]
+isaac-pack-latest = { path = "./pypi-packs/isaac-pack-latest" }
+# INTENT: Isaac Sim 6.0 wheels hard-pin trimesh==4.11.1; conda owns it so the env pypi closure (mujoco/pytorch3d) cannot float to 5.x (F11 t5 single-owner; cert rerun 2026-08-20).
+trimesh = "==4.11.1"
+python = "==3.12"
+sysroot_linux-64 = ">=2.35"
+gxx_linux-64 = ">=12"
+gcc_linux-64 = ">=12"
+binutils_linux-64 = ">=2.40"
+cmake = ">3.6"
+numpy = "==2.3.1" # retread:pin
+ipywidgets = ">=8.1.5,<9"
+rich = ">=13.3.3,<15"
+[feature.isaaclab-latest.pypi-dependencies]
+# INTENT: Isaac Sim 6.0 wheels hard-pin portalocker==2.7.0 (cross-major vs the env float 4.1.0); declared here so one owner exists (cert closing rerun 2026-08-20).
+portalocker = "==2.7.0"
+[feature.isaaclab-latest.target.unix.activation]
+scripts = ["scripts/post-install.bash"]
+
+### Newton Environment---------------------------------------------------------------------------
+[feature.newton.dependencies]
+newton-pack-latest = { path = "./pypi-packs/newton-pack-latest" }
+# Newton's simulation extras are not emitted as pack run dependencies.
+mujoco-python = ">=3.8,<3.9"
+mujoco-warp = ">=3.8.0.3,<3.9"
+newton-actuators = ">=0.1.0,<0.1.1"
+
+### ProtoMotions IsaacLab Environment-------------------------------------------------------------
+# ProtoMotions (https://nvlabs.github.io/ProtoMotions/) targets IsaacLab 2.3.0 / Isaac Sim 5.1.0
+# on Python 3.11. Kept isolated from the root Isaac Sim 6 pack and the other IsaacLab-derived
+# packs via a dedicated no-default environment and retread pack (pm-isaaclab-pack).
+[feature.pm-isaaclab]
+[feature.pm-isaaclab.dependencies]
+"isaaclab-2.3x-pack" = { path = "./pypi-packs/isaaclab-2.3x-pack" } # consolidated shared Isaac Sim 5.1 / IsaacLab v2.3.2 stack (was pm-isaaclab-pack @ v2.3.0, bumped to v2.3.2)
+"protomotions-deps-pack" = { path = "./pypi-packs/protomotions-deps-pack" } # retread-deps-from proof: ProtoMotions' requirements_isaaclab.txt pulled live from git instead of hand-listed below
+python = "==3.11"
+pip = ">=25.1.1,<26"
+setuptools = ">=68,<81"
+wheel = ">=0.43,<1"
+toml = ">=0.10.2,<0.11"
+cuda-version = "==12.8"
+cuda-nvcc_linux-64 = "12.8.*"
+cuda-toolkit = "12.8.*"
+sysroot_linux-64 = ">=2.35"
+gxx_linux-64 = ">=12"
+gcc_linux-64 = ">=12"
+binutils_linux-64 = ">=2.40"
+cmake = ">3.6"
+# ProtoMotions accepts NumPy >=1.21.1, while IsaacLab's Numba 0.59 line
+# requires NumPy <2. Keep the environment on the previously proven release.
+numpy = "==1.26.4"
+# Harmonize ProtoMotions' broad framework roots with IsaacLab's authoritative
+# wheel constraints so the two source packs share one conda provider set.
+transformers = "==4.57.6"
+trimesh = ">=4.5.1,<4.6"
+moviepy = "==2.2.1"
+# Isaac Sim's Kit runtime (libcarb.so) needs GLIBCXX_3.4.30, which the host's spack
+# gcc-runtime libstdc++ (picked up via LD_LIBRARY_PATH) lacks -- "Unable to bootstrap
+# inner kit kernel". Pull a newer libstdc++ from conda-forge and put $CONDA_PREFIX/lib
+# first on LD_LIBRARY_PATH so it's found before the spack one.
+libstdcxx-ng = ">=13"
+[feature.pm-isaaclab.pypi-dependencies]
+torch = { version = "==2.7.0", index = "https://download.pytorch.org/whl/cu128" }
+torchvision = { version = "==0.22.0", index = "https://download.pytorch.org/whl/cu128" }
+torchaudio = { version = "==2.7.0", index = "https://download.pytorch.org/whl/cu128" }
+# imprint itself: pm-* envs set no-default-feature = true, which skips the
+# [target.unix.activation] post-install.bash that installs this for other envs --
+# without it, `doit` tasks fail with ModuleNotFoundError: No module named 'imprint'
+# (tasks/_launchers.py imports imprint.resource_limits).
+imprint = { path = ".", editable = true }
+# ProtoMotions itself (third_party/ProtoMotions submodule), plus its
+# requirements_isaaclab.txt closure not already covered by the retread wheels above.
+protomotions = { path = "third_party/ProtoMotions", editable = true }
+# The 12 framework deps formerly hand-listed here (tensordict, lightning,
+# scikit-image, rtree, trimesh, typer, transformers, easydict, hydra-core,
+# moviepy, dm_control, pandas) now come from protomotions-deps-pack's
+# `retread-deps-from` root (upstream requirements_isaaclab.txt at the
+# submodule's pinned rev) instead of being hand-copied here.
+[feature.pm-isaaclab.activation.env]
+CUDA_HOME = "$CONDA_PREFIX"
+LD_LIBRARY_PATH = "$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"
+OMNI_KIT_ACCEPT_EULA = "YES"
+[feature.pm-isaaclab.target.unix.activation]
+scripts = ["scripts/post-install.bash"]
+### ProtoMotions Newton Environment---------------------------------------------------------------
+# ProtoMotions targets Newton 1.0.0, pinned separately from newton-pack-latest (which tracks a
+# newer Newton release needing mujoco>=3.8) in pypi-packs/pm-newton-pack/. pm-newton-pack resolves
+# the official Newton 1.0.0 wheel with its `examples` extra; the workspace pins below own the
+# compatible mujoco==3.5.0 and mujoco-warp==3.5.0.2 wheels. This does NOT compose with
+# [feature.newton] (that feature's conda mujoco-warp/mujoco-python pins target the newer Newton
+# release and directly conflict with this pin). Composes with [feature.gpu] (torch/cuda) via the
+# pm-newton-gpu env.
+[feature.pm-newton.dependencies]
+pm-newton-pack = { path = "./pypi-packs/pm-newton-pack" }
+# openmesh==1.2.1 (pypi-dependencies below) ships no cp312 wheel; its sdist
+# needs a C++ toolchain at install time, same as the isaaclab features.
+gxx_linux-64 = ">=12"
+cmake = "<4" # openmesh 1.2.1 CMakeLists needs cmake_minimum_required <3.5, removed in cmake 4
+# Deliberately no python pin: retread-python="3.12" in pm-newton-pack, and ProtoMotions only
+# requires 3.10+ (3.11+ preferred) for Newton, which 3.12 satisfies.
+# Artifact verdict: NOT fully migratable. openmesh==1.2.1 is the sole blocker;
+# keep the entire wall feature-owned until Retread can build hermetic native sdists.
+[feature.pm-newton.pypi-dependencies]
+# See the pm-isaaclab section above: no-default-feature = true skips the
+# post-install.bash step that installs this for other envs, and `doit` needs it.
+imprint = { path = ".", editable = true }
+protomotions = { path = "third_party/ProtoMotions", editable = true }
+# pm-newton-pack's retread-relax policy ("patch-then-minor-then-major-then-last-resort")
+# silently bumped mujoco/mujoco-warp from the pack's intended 3.5.0/3.5.0.2 (matching
+# Newton 1.0.0's requirements_newton.txt) all the way to 3.10.0/3.10.0.1 -- something
+# else in this env's solve (numpy 2.x?) was incompatible with the old pins, so retread
+# relaxed upward to find ANY installable combination. That newer mujoco breaks at
+# RUNTIME (not solve time): Newton's SolverMuJoCo._convert_to_mjc -> body.add_joint(...)
+# raises "TypeError: stiffness should be a numeric scalar or list." for every robot
+# (reproduced with both the H1_2 checkpoint and ProtoMotions' own bundled G1 checkpoint --
+# not H1_2-specific). Pin explicitly back down to force the version Newton 1.0.0 expects.
+mujoco = "==3.5.0" # retread:pin
+mujoco-warp = "==3.5.0.2" # retread:pin
+tensordict = "==0.9.0"
+lightning = "*"
+scikit-image = "*"
+rtree = ">=1.2,<2"      # was ==1.2.0; ranged 08-20 so co-resident isaaclab (isaacsim pins 1.3.0) converges
+trimesh = "*"
+typer = ">=0.6.1"
+transformers = ">=4.20.1"
+easydict = "*"
+wandb = ">=0.23,<1"     # was ==0.23.0; ranged 08-20 for co-resident convergence (isaaclab resolves 0.28.2)
+sentry-sdk = "==2.0.0"
+hydra-core = ">=1.3.2,<1.4"
+moviepy = "*"
+dm_control = "==1.0.37"
+pandas = "*"
+openmesh = "==1.2.1"
+tensorboardX = "*"
+# Same gap as pm-mujoco (see its pypi-dependencies comment): rest of
+# requirements_newton.txt not covered by the retread wheels above. Hit at
+# inference_agent.py runtime (torch.load's pickle class resolution walks most of
+# the ProtoMotions module tree), not by a bare `import protomotions`.
+matplotlib = "*"
+termcolor = ">=1.1.0"
+rich = "*"
+wheel = "*"
+# setuptools deliberately unpinned (unlike pm-mujoco/requirements_newton.txt's
+# ==69.5.1): pm-newton-gpu's conda solve (via the gpu feature) already resolves
+# setuptools==82.0.1, and requirements_newton.txt's exact pin conflicts with it.
+numpy = ">=1.21.1"
+
+### ProtoMotions MuJoCo Environment---------------------------------------------------------------
+# ProtoMotions' MuJoCo backend is CPU-only and single-environment only (num_envs=1), useful for
+# debugging without a GPU. No retread pack needed: mujoco is a plain PyPI/conda dependency here.
+[feature.pm-mujoco.dependencies]
+python = ">=3.10,<3.11"
+mujoco-python = ">=3.0.0"
+[feature.pm-mujoco.pypi-dependencies]
+# See the pm-isaaclab section above: no-default-feature = true skips the
+# post-install.bash step that installs this for other envs, and `doit` needs it.
+imprint = { path = ".", editable = true }
+protomotions = { path = "third_party/ProtoMotions", editable = true }
+onnxruntime = "*"
+# `onnx` (the proto/writer package, distinct from onnxruntime) is required by
+# torch.onnx.export's legacy TorchScript exporter (dynamo=False, used by
+# deployment/export_bm_tracker_onnx.py) -- without it export fails at the
+# proto-serialization step with "Module onnx is not installed!", after the
+# full forward-pass trace already succeeded. Not pulled in transitively by
+# onnxruntime or torch.
+onnx = "*"
+# Full pypi-dependencies list below mirrors third_party/ProtoMotions/requirements_mujoco.txt.
+# The original pack only smoke-tested `import mujoco, protomotions`; inference_agent.py's
+# torch.load of resolved_configs pulls in most of the ProtoMotions module tree via pickle
+# class resolution, hitting transitive imports (dm_control, matplotlib, etc.) that a bare
+# `import protomotions` never touches.
+dm_control = "==1.0.37"
+pyyaml = ">=6,<7"
+tensordict = "==0.9.0"
+lightning = "*"
+scikit-image = "*"
+rtree = ">=1.2,<2"      # was ==1.2.0; ranged 08-20 so co-resident isaaclab (isaacsim pins 1.3.0) converges
+trimesh = "*"
+typer = ">=0.6.1"
+transformers = ">=4.20.1"
+easydict = "*"
+wandb = ">=0.23,<1"     # was ==0.23.0; ranged 08-20 for co-resident convergence (isaaclab resolves 0.28.2)
+sentry-sdk = "==2.0.0"
+hydra-core = ">=1.3.2,<1.4"
+moviepy = "*"
+pandas = "*"
+openmesh = "==1.2.1"
+tensorboardX = "*"
+matplotlib = "*"
+termcolor = ">=1.1.0"
+rich = "*"
+wheel = "*"
+setuptools = "==69.5.1" # retread:pin
+numpy = ">=1.21.1"
+
+### RoboJuDo Deploy Stack ---------------------------------------------------------------
+# Sim2real-style verification harness (imprint.protomotions.robojudo_rollout, run
+# via tasks/protomotions.py's `doit robojudo:verify`). Supersedes the "robojudo" conda env
+# from docs/verbose/protomotions-h1_2-full-workflow.md Section 2.5 -- this machine has
+# no conda/miniforge, and the rest of the repo standardizes on pixi, so a pixi feature
+# (mirroring pm-mujoco above) is the consistent choice here instead of installing conda
+# just for this one env.
+#
+# Composed INTO newton-gpu rather than standing alone: RoboJuDo replays a tracker
+# policy against a physics backend, and Newton is the backend imprint targets. The
+# two halves it does not own are deliberately absent from the pack and inherited
+# from the composed env -- torch from [feature.gpu] (conda pytorch-gpu) and mujoco
+# from [feature.newton] (mujoco-python 3.8.x). Upstream declares both unpinned, so
+# the env's pins satisfy them.
+#
+# The dependency list is NOT restated here: robojudo-pack carries
+# retread-deps-from pointing at upstream's requirements.txt at the same git rev
+# the third_party/RoboJuDo submodule pins, so upstream stays the single source of
+# truth and the two can never drift (same pattern as protomotions-deps-pack).
+[feature.robojudo.dependencies]
+robojudo-pack = { path = "./pypi-packs/robojudo-pack" }
+
+### figaroh-plus Environment (Track 2 sys-ID: Pinocchio parametric ID) -------
+# Identifies rigid-body inertias + joint friction from measured torque tau via a
+# Newton-Euler linear regressor (figaroh.identification, built on Pinocchio).
+# ISOLATED feature, exposed only through the no-default `figaroh` environment so
+# the heavy conda Pinocchio stack (eigenpy/hpp-fcl/coal/boost/casadi) never
+# perturbs the robojudo/gpu shells. Adapter: imprint.figaroh (npz ->
+# q/dq/ddq/tau CSVs in URDF Pinocchio joint order + an identification YAML).
+# from_mjcf is unimplemented upstream, so H1_2 is fed as URDF
+# (third_party/unitree_rl_gym/resources/robots/h1_2/h1_2.urdf).
+[feature.pace]
+[feature.pace.activation.env]
+CUDA_HOME = "$CONDA_PREFIX"
+
+[feature.pace.dependencies]
+# Repointed off the Isaac Sim 6 isaac-pack onto the consolidated Isaac Sim 5.1 /
+# IsaacLab v2.3.2 shared pack. pace's README targets Isaac Sim 5.0/latest so 5.1
+# is compatible. The shared pack carries only the isaac bundle (no torch), so the
+# torch/cuda rows that isaac-pack's Sim-6 closure used to supply are pinned here
+# to the 5.1 line (mirrors feature.isaaclab-viral). Env stays [lock-skip:minimal]
+# (inactive) until its own cold lock + smoke is run in a follow-up.
+"isaaclab-2.3x-pack" = { path = "./pypi-packs/isaaclab-2.3x-pack" }
+python = "==3.11"
+pip = ">=25.1,<26"
+setuptools = ">=68,<81"
+wheel = ">=0.43,<1"
+cuda-version = "==12.8"
+sysroot_linux-64 = ">=2.35"
+# Version owner: without this provider the bundled closure drifts Pillow.
+numpy = ">=1.26,<1.27"
+pillow = "==10.4.0"
+
+[feature.pace.pypi-dependencies]
+torch = { version = "==2.7.0", index = "https://download.pytorch.org/whl/cu128" }
+torchvision = { version = "==0.22.0", index = "https://download.pytorch.org/whl/cu128" }
+imprint = { path = ".", editable = true }
+cmaes = "*"
+pace_sim2real = { path = "third_party/pace-sim2real/source/pace_sim2real", editable = true }
+
+[feature.pace.target.unix.activation]
+scripts = ["scripts/post-install.bash"]

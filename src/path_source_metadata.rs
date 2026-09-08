@@ -648,8 +648,32 @@ pub fn generate_shims_against(
         );
     }
     let records = load_records(pack_dir, records_dir)?;
+    generate_shims_from(pack_dir, workspace_root, only, manifest_text, &records)
+}
+
+/// [`generate_shims_against`], but against records the caller already holds.
+///
+/// The ONE writer, kept behind one name so the two producers of records — the
+/// files on disk that `path-source-refresh` maintains, and the derivation in
+/// [`derive_records`] — write byte-identical shims. A second writer for the
+/// derived half would be exactly the drift the `--shims` verb's doc comment
+/// warns about one function up.
+pub fn generate_shims_from(
+    pack_dir: &Path,
+    workspace_root: &Path,
+    only: Option<&str>,
+    manifest_text: &str,
+    records: &[PathSourceRecord],
+) -> Result<Vec<PathSourceOutcome>> {
+    if !pack_dir.join("pixi.toml").is_file() {
+        bail!(
+            "{} is not a pack directory: it holds no pixi.toml. retread \
+             generates path-source shims into a PACK and nowhere else.",
+            pack_dir.display()
+        );
+    }
     let mut outcomes = Vec::with_capacity(records.len());
-    for record in &records {
+    for record in records {
         if let Some(only) = only
             && only != record.project
         {
@@ -1148,11 +1172,420 @@ impl ShimRewrite {
     }
 }
 
+// ---------------------------------------------------------------------------
+// DERIVATION — the record is a FUNCTION of the manifest and the tree
+// ---------------------------------------------------------------------------
+//
+// WHY THIS EXISTS. The record file was described above as "the only
+// hand-edited artifact". Measured against production that claim was the whole
+// defect: `pypi-packs/*/path-sources/` does not exist in `imprint-data` at
+// all, so the daily relock's default `PACK_SHIM_MODE=on` refused at
+// `path-sources holds no <project>.toml record` (SHIM-PROOF-1) and the one
+// arm that ever passed did so because its harness MANUFACTURED the two
+// records into a disposable workspace from shell literals. Writing those
+// literals into `imprint-data` by hand would have made the manufactured
+// artifact permanent instead of removing it.
+//
+// Every field of both fabricated records is a fact something else already
+// states:
+//
+// | field            | who already states it                                  |
+// |------------------|--------------------------------------------------------|
+// | project key      | the workspace manifest's `[pypi-dependencies]` KEY      |
+// | `path`           | that entry's own `path =` value                         |
+// | `version`        | the tree (`*.egg-info/PKG-INFO`, `config/extension.toml`, `setup.py`) |
+// | `requires-python`| the same three readers                                  |
+// | `dependencies`   | PKG-INFO's `Requires-Dist` lines                        |
+// | target pack      | the manifest scope that declares BOTH the pack and the source |
+//
+// So the record is derived, and a record file on disk may only CONFIRM it.
+// Nothing is required to exist, and a disagreement is a loud refusal naming
+// both sides rather than a silent preference for either.
+
+/// One record the derivation produced, with the evidence for where each half
+/// of it came from.
+#[derive(Debug, Clone)]
+pub struct DerivedRecord {
+    /// The record itself. `record.file` names the CONFIRMING file — which may
+    /// not exist; it is still the path a refusal tells the operator to look at.
+    pub record: PathSourceRecord,
+    /// The pack that stands in for this source.
+    pub pack: PathBuf,
+    /// True when a record file existed on disk and agreed field-for-field.
+    pub confirmed: bool,
+    /// The generated shim directory, absolute.
+    pub shim: PathBuf,
+}
+
+impl DerivedRecord {
+    /// The evidence row, one per derived record.
+    pub fn row(&self) -> String {
+        format!(
+            "### PATH SOURCE RECORD project={} source={} pack={} derived={} shim={}",
+            self.record.project,
+            self.record.entry.path,
+            self.pack.display(),
+            if self.confirmed { "confirmed" } else { "yes" },
+            self.shim.display()
+        )
+    }
+}
+
+/// One manifest scope: the default feature, or one `[feature.X]` block.
+///
+/// A SCOPE, not an environment. Feature-to-environment resolution is
+/// `workspace::WorkspaceManifest`'s job and it deliberately is not used here:
+/// the question this asks is "which pack does this source sit beside in the
+/// manifest as written", and env inheritance would make every source sit
+/// beside every pack of every env that activates it.
+#[derive(Debug, Default)]
+struct ManifestScope {
+    name: String,
+    /// `path` values of conda `[dependencies]` entries — the packs.
+    conda_paths: Vec<String>,
+    /// `(raw key, path)` of `[pypi-dependencies]` entries declaring a `path`.
+    pypi_paths: Vec<(String, String)>,
+}
+
+/// Collect the `path` values of every `path`-declaring entry in `table`.
+fn path_entries(container: &toml::Value, key: &str) -> Vec<(String, String)> {
+    let underscored = key.replace('-', "_");
+    let Some(table) = container
+        .get(key)
+        .or_else(|| container.get(underscored.as_str()))
+        .and_then(|v| v.as_table())
+    else {
+        return Vec::new();
+    };
+    table
+        .iter()
+        .filter_map(|(name, value)| {
+            let path = value.as_table()?.get("path")?.as_str()?;
+            Some((name.clone(), path.to_string()))
+        })
+        .collect()
+}
+
+/// Both dependency tables of one scope, including everything the scope's
+/// `[target.<sel>.…]` sub-tables declare.
+///
+/// The targets are read because a source declared only under `target.unix`
+/// would otherwise be INVISIBLE to the derivation while still being a real
+/// PEP 517 metadata build in the lock — a silent miss, which is the one
+/// failure mode this whole capability exists to make impossible.
+fn scope_from(name: &str, container: &toml::Value) -> ManifestScope {
+    let mut scope = ManifestScope {
+        name: name.to_string(),
+        conda_paths: path_entries(container, "dependencies")
+            .into_iter()
+            .map(|(_, p)| p)
+            .collect(),
+        pypi_paths: path_entries(container, "pypi-dependencies"),
+    };
+    if let Some(targets) = container.get("target").and_then(|v| v.as_table()) {
+        for target in targets.values() {
+            scope
+                .conda_paths
+                .extend(path_entries(target, "dependencies").into_iter().map(|(_, p)| p));
+            scope
+                .pypi_paths
+                .extend(path_entries(target, "pypi-dependencies"));
+        }
+    }
+    scope
+}
+
+/// Every scope of the manifest: the root table, then each `[feature.X]`.
+fn manifest_scopes(manifest_text: &str) -> Result<Vec<ManifestScope>> {
+    let parsed: toml::Value = toml::from_str(manifest_text)
+        .context("parsing the workspace manifest to derive its path sources")?;
+    let mut scopes = vec![scope_from("(default)", &parsed)];
+    if let Some(features) = parsed.get("feature").and_then(|v| v.as_table()) {
+        for (name, value) in features {
+            scopes.push(scope_from(name, value));
+        }
+    }
+    Ok(scopes)
+}
+
+/// `workspace_root/rel`, canonicalized, or `None` when nothing is there.
+fn resolve_under(canonical_root: &Path, rel: &str) -> Option<PathBuf> {
+    canonical_root.join(rel).canonicalize().ok()
+}
+
+/// True when `pack`'s own manifest declares a wheel for `project` — the
+/// tiebreak when one scope declares more than one pack.
+///
+/// It is a FACT and not a preference: a pack that builds the project's own
+/// distribution is the pack that stands in for its tree. `pm-isaaclab`
+/// declares `isaaclab-2.3x-pack` and `protomotions-deps-pack` side by side and
+/// only the latter carries
+/// `[package.build.config.retread-wheels] protomotions = { git = … }`.
+fn pack_builds_project(pack_dir: &Path, project: &str) -> Result<bool> {
+    let manifest = pack_dir.join("pixi.toml");
+    let text = std::fs::read_to_string(&manifest)
+        .with_context(|| format!("reading {}", manifest.display()))?;
+    let parsed: toml::Value = toml::from_str(&text)
+        .with_context(|| format!("parsing {} as a pack manifest", manifest.display()))?;
+    let Some(wheels) = parsed
+        .get("package")
+        .and_then(|p| p.get("build"))
+        .and_then(|b| b.get("config"))
+        .and_then(|c| c.get("retread-wheels"))
+        .and_then(|w| w.as_table())
+    else {
+        return Ok(false);
+    };
+    Ok(wheels
+        .keys()
+        .any(|k| normalize_dist_name(k) == normalize_dist_name(project)))
+}
+
+/// A manifest entry that already points at a generated shim: recover the real
+/// tree it stands for from the shim's own `package-dir`.
+///
+/// This is what keeps the transform a FIXED POINT once the records are derived
+/// rather than read. On an already-effective manifest the real tree is no
+/// longer declared anywhere, so the only remaining statement of it is the shim
+/// the previous run generated — and reading it back is a real reader for a
+/// real writer, not a special case.
+fn real_tree_behind_shim(shim_dir: &Path, canonical_root: &Path) -> Result<String> {
+    let file = shim_dir.join("pyproject.toml");
+    let text = std::fs::read_to_string(&file).with_context(|| {
+        format!(
+            "the manifest declares {} as a path source, but its generated \
+             pyproject.toml cannot be read. A manifest pointing at a shim that \
+             does not exist would resolve to nothing at all",
+            shim_dir.display()
+        )
+    })?;
+    let parsed: toml::Value = toml::from_str(&text)
+        .with_context(|| format!("parsing {} as a generated shim", file.display()))?;
+    let rel = parsed
+        .get("tool")
+        .and_then(|t| t.get("setuptools"))
+        .and_then(|s| s.get("package-dir"))
+        .and_then(|p| p.get(""))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} carries no [tool.setuptools.package-dir] \"\" entry, so the \
+                 real tree it stands for cannot be recovered",
+                file.display()
+            )
+        })?;
+    let real = shim_dir.join(rel).canonicalize().with_context(|| {
+        format!("resolving {rel} from {} to the real tree", shim_dir.display())
+    })?;
+    pathdiff_from_root(canonical_root, &real)
+}
+
+/// Derive one record per path source the named packs stand in for.
+///
+/// THE ONE AUTHORITY for "what is a path source of this workspace" is the
+/// workspace manifest, read here and nowhere else in this module.
+/// `workspace::parse_direct_source_pypi_names` was considered and does NOT
+/// fit: it answers a different question (which pypi names are direct sources
+/// of ANY of `url`/`path`/`git`) and returns names only, with no path value
+/// and no way to tell a `path` from a `git`. Both halves are load-bearing
+/// here, so this reads the `path` entries itself.
+///
+/// SELECTION, in full, because every step of it is a refusal somewhere:
+///
+/// 1. A source is a candidate only if some scope declares BOTH it and one of
+///    the named packs. `unitree_sdk2py` lives in `feature.jetson`, which
+///    declares no pack of ours, so it is not shimmed — the same source whose
+///    misreading produced the `unitree-sdk2py` bare-registry-root refusal.
+/// 2. A source resolving to the workspace root itself is skipped:
+///    `imprint = { path = "." }` is declared beside both packs and a workspace
+///    cannot be a shim of itself.
+/// 3. A source already resolving INSIDE a named pack's shim directory is
+///    already repointed; its real tree is recovered from the shim.
+/// 4. One candidate pack wins outright. More than one is decided by
+///    [`pack_builds_project`], and anything that does not leave exactly one
+///    REFUSES naming every candidate.
+pub fn derive_records(
+    packs: &[PathBuf],
+    workspace_root: &Path,
+    records_dir: &str,
+    manifest_text: &str,
+) -> Result<Vec<DerivedRecord>> {
+    let canonical_root = workspace_root
+        .canonicalize()
+        .with_context(|| format!("canonicalizing {}", workspace_root.display()))?;
+
+    // Canonical pack directory -> the argument that named it.
+    let mut named_packs: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for pack_dir in packs {
+        let canonical = pack_dir
+            .canonicalize()
+            .with_context(|| format!("canonicalizing pack {}", pack_dir.display()))?;
+        named_packs.push((canonical, pack_dir.clone()));
+    }
+
+    // project -> (path as declared, declaring scopes, candidate packs)
+    let mut candidates: BTreeMap<String, (String, Vec<String>, Vec<PathBuf>)> = BTreeMap::new();
+    for scope in manifest_scopes(manifest_text)? {
+        let scope_packs: Vec<PathBuf> = scope
+            .conda_paths
+            .iter()
+            .filter_map(|p| resolve_under(&canonical_root, p))
+            .filter_map(|resolved| {
+                named_packs
+                    .iter()
+                    .find(|(canonical, _)| *canonical == resolved)
+                    .map(|(_, named)| named.clone())
+            })
+            .collect();
+        if scope_packs.is_empty() {
+            continue;
+        }
+        for (raw_name, path) in &scope.pypi_paths {
+            let project = normalize_dist_name(raw_name);
+            if project.is_empty() {
+                continue;
+            }
+            let Some(resolved) = resolve_under(&canonical_root, path) else {
+                bail!(
+                    "[feature.{}] declares `{raw_name} = {{ path = \"{path}\" }}` beside a \
+                     path-source pack, but nothing is at that path. A source the lock \
+                     will try to build and this transform cannot see is the silent slow \
+                     path this refuses to leave in place.",
+                    scope.name
+                );
+            };
+            if resolved == canonical_root {
+                continue; // `imprint = { path = "." }` — the workspace itself.
+            }
+            let slot = candidates.entry(project).or_insert_with(|| {
+                (path.clone(), Vec::new(), Vec::new())
+            });
+            if slot.0 != *path {
+                bail!(
+                    "`{raw_name}` is declared with two different paths: \"{}\" and \
+                     \"{path}\". One project is one tree; the effective manifest can \
+                     repoint it at one shim only.",
+                    slot.0
+                );
+            }
+            slot.1.push(scope.name.clone());
+            for pack in &scope_packs {
+                if !slot.2.contains(pack) {
+                    slot.2.push(pack.clone());
+                }
+            }
+        }
+    }
+
+    let mut derived = Vec::new();
+    for (project, (declared_path, scopes, mut pack_candidates)) in candidates {
+        if pack_candidates.len() > 1 {
+            let mut builders = Vec::new();
+            for pack in &pack_candidates {
+                if pack_builds_project(pack, &project)? {
+                    builders.push(pack.clone());
+                }
+            }
+            if builders.len() != 1 {
+                bail!(
+                    "`{project}` is declared in [feature.{}] beside {} packs \
+                     ({}), and {} of them build `{project}` \
+                     ([package.build.config.retread-wheels]). Exactly one pack must \
+                     stand in for one source: the effective manifest can point it at \
+                     one shim only.",
+                    scopes.join("], [feature."),
+                    pack_candidates.len(),
+                    pack_candidates
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    builders.len()
+                );
+            }
+            pack_candidates = builders;
+        }
+        let pack = pack_candidates.remove(0);
+        let shim = pack.join(SHIMS_DIR).join(&project);
+
+        // Already repointed? Then the declared path IS the shim and the real
+        // tree is recovered from it.
+        let declared = resolve_under(&canonical_root, &declared_path);
+        let inside_shim = declared
+            .as_ref()
+            .zip(shim.canonicalize().ok())
+            .is_some_and(|(d, s)| *d == s);
+        let real_path = if inside_shim {
+            real_tree_behind_shim(&shim, &canonical_root)?
+        } else {
+            declared_path.clone()
+        };
+
+        let tree = canonical_root.join(&real_path);
+        let facts = tree_facts(&tree)
+            .with_context(|| format!("reading the facts `{project}`'s tree states at {}", tree.display()))?;
+        let seed = PathSourceEntry {
+            path: real_path.clone(),
+            ..PathSourceEntry::default()
+        };
+        let entry = record_from_tree(&project, &seed, &facts).with_context(|| {
+            format!(
+                "deriving the path-source record for `{project}` from {}",
+                tree.display()
+            )
+        })?;
+
+        // A record file on disk may CONFIRM and may never be required.
+        let file = pack.join(records_dir).join(format!("{project}.toml"));
+        let mut confirmed = false;
+        if file.is_file() {
+            let text = std::fs::read_to_string(&file)
+                .with_context(|| format!("reading {}", file.display()))?;
+            let on_disk: PathSourceEntry = toml::from_str(&text)
+                .with_context(|| format!("parsing {} as a path-source record", file.display()))?;
+            let mut want = entry.clone();
+            // `packages-include` is a fact about the tree's LAYOUT that no
+            // reader states, so a record is allowed to be the only statement
+            // of it and carrying it forward is not a disagreement.
+            want.packages_include = on_disk.packages_include.clone();
+            if on_disk != want {
+                bail!(
+                    "{} disagrees with the tree it describes. The record says\n  \
+                     {on_disk:?}\nand {} states\n  {want:?}\nThe derivation is what \
+                     gets locked; a record may only confirm it. Either delete the \
+                     record or run `path-source-refresh --pack {} --workspace {} \
+                     --project {project} --write`.",
+                    file.display(),
+                    tree.display(),
+                    pack.display(),
+                    workspace_root.display()
+                );
+            }
+            confirmed = true;
+        }
+
+        derived.push(DerivedRecord {
+            record: PathSourceRecord {
+                project,
+                file,
+                entry,
+            },
+            pack,
+            confirmed,
+            shim,
+        });
+    }
+    Ok(derived)
+}
 /// The canonical manifest, transformed. `text` is what gets locked.
 #[derive(Debug, Clone)]
 pub struct EffectiveManifest {
     pub text: String,
     pub rewrites: Vec<ShimRewrite>,
+    /// The records the transform DERIVED, in project order. Present so the
+    /// caller can print where each one came from: a derivation nobody can read
+    /// back is the same defect as a record nobody wrote.
+    pub derived: Vec<DerivedRecord>,
 }
 
 impl EffectiveManifest {
@@ -1160,15 +1593,23 @@ impl EffectiveManifest {
     pub fn rows(&self) -> Vec<String> {
         self.rewrites.iter().map(ShimRewrite::row).collect()
     }
+
+    /// One row per derived record, in project order.
+    pub fn derivation_rows(&self) -> Vec<String> {
+        self.derived.iter().map(DerivedRecord::row).collect()
+    }
 }
 
 /// Rewrite every declared path source in `manifest_text` to the pack shim that
 /// stands in for it.
 ///
-/// A pure function of (records, workspace layout, manifest text): the same
-/// inputs give the same bytes, and running it on its own output changes
-/// nothing. It reads the packs' records and the workspace layout; it writes
-/// nothing at all.
+/// A pure function of (manifest text, workspace layout, the trees' own
+/// metadata): the same inputs give the same bytes, and running it on its own
+/// output changes nothing. It writes nothing at all.
+///
+/// The records are DERIVED — see [`derive_records`]. Nothing has to exist
+/// under `<pack>/<records_dir>/` for this to work, and what does exist there
+/// may only confirm the derivation.
 ///
 /// It REFUSES rather than falling back to the slow path, in every case where
 /// the fast path would silently not happen:
@@ -1176,11 +1617,13 @@ impl EffectiveManifest {
 /// * a `--pack` argument that is not a pack directory (missing, or holding no
 ///   `pixi.toml`) — a missing pack is the one failure that would otherwise
 ///   look exactly like success;
-/// * a pack that holds no record — a listed pack with no producer is the
-///   law-2 defect this capability exists to avoid;
-/// * a record naming a `path` no manifest entry declares, where the shim is
-///   not declared either — the record is stale and repointing nothing would
-///   quietly leave a 1 800 s metadata build in place.
+/// * a named pack that stands in for NO declared path source — a listed pack
+///   with nothing to do is the law-2 defect this capability exists to avoid,
+///   and it is the shape a stale `--pack` argument takes;
+/// * a record file on disk that disagrees with the tree it describes;
+/// * a derived source that the manifest declares neither at its real path nor
+///   at its shim — repointing nothing would quietly leave a 1 800 s metadata
+///   build in place.
 pub fn plan_effective_manifest(
     packs: &[PathBuf],
     workspace_root: &Path,
@@ -1194,10 +1637,6 @@ pub fn plan_effective_manifest(
         .canonicalize()
         .with_context(|| format!("canonicalizing {}", workspace_root.display()))?;
 
-    let mut text = manifest_text.to_string();
-    let mut rewrites: Vec<ShimRewrite> = Vec::new();
-    let mut seen: BTreeMap<String, PathBuf> = BTreeMap::new();
-
     for pack_dir in packs {
         if !pack_dir.join("pixi.toml").is_file() {
             bail!(
@@ -1208,58 +1647,61 @@ pub fn plan_effective_manifest(
                 pack_dir.display()
             );
         }
-        let records = load_records(pack_dir, records_dir)?;
-        if records.is_empty() {
+    }
+
+    let derived = derive_records(packs, workspace_root, records_dir, manifest_text)?;
+
+    // A named pack that stands in for nothing is a gate with no producer: the
+    // argument list and the manifest disagree and one of them is stale.
+    for pack_dir in packs {
+        if !derived.iter().any(|d| &d.pack == pack_dir) {
             bail!(
-                "{}/{} holds no <project>.toml record, but the pack was named as a \
-                 source of path-source shims. Either write the record or drop the \
-                 pack from the argument list.",
-                pack_dir.display(),
-                records_dir
+                "{} was named as a source of path-source shims, but no \
+                 `[pypi-dependencies]` entry declaring a `path` appears in any \
+                 manifest scope that also declares this pack. There is nothing for \
+                 it to stand in for. Either declare the source beside the pack or \
+                 drop the pack from the argument list.",
+                pack_dir.display()
             );
         }
-        for record in &records {
-            if let Some(other) = seen.get(&record.project) {
-                bail!(
-                    "two packs declare a path-source record for `{}`: {} and {}. \
-                     The workspace manifest can point at only one shim.",
-                    record.project,
-                    other.display(),
-                    pack_dir.display()
-                );
-            }
-            seen.insert(record.project.clone(), pack_dir.clone());
-
-            let shim_dir = pack_dir.join(SHIMS_DIR).join(&record.project);
-            let to = pathdiff_from_root(&canonical_root, &shim_dir)?;
-            let from = record.entry.path.trim_end_matches('/').to_string();
-            if from.is_empty() {
-                bail!("{}: `path` is empty", record.file.display());
-            }
-            let (next, lines) = repoint_path_entries(&text, &from, &to);
-            let already = lines == 0 && declares_path(&text, &to);
-            if lines == 0 && !already {
-                bail!(
-                    "{} names path = \"{from}\", but no `[pypi-dependencies]` entry \
-                     in the workspace manifest declares it and the shim \
-                     \"{to}\" is not declared either. The record is stale: \
-                     repointing nothing would leave the PEP 517 metadata build in \
-                     place and the lock slow, so this refuses instead.",
-                    record.file.display()
-                );
-            }
-            text = next;
-            rewrites.push(ShimRewrite {
-                project: record.project.clone(),
-                from,
-                to,
-                pack: pack_dir.clone(),
-                lines,
-                already,
-            });
-        }
     }
-    Ok(EffectiveManifest { text, rewrites })
+
+    let mut text = manifest_text.to_string();
+    let mut rewrites: Vec<ShimRewrite> = Vec::new();
+
+    for record in &derived {
+        let to = pathdiff_from_root(&canonical_root, &record.shim)?;
+        let from = record.record.entry.path.trim_end_matches('/').to_string();
+        if from.is_empty() {
+            bail!("{}: `path` is empty", record.record.file.display());
+        }
+        let (next, lines) = repoint_path_entries(&text, &from, &to);
+        let already = lines == 0 && declares_path(&text, &to);
+        if lines == 0 && !already {
+            bail!(
+                "`{}` was derived with path = \"{from}\", but no `[pypi-dependencies]` \
+                 entry in the workspace manifest declares it and the shim \
+                 \"{to}\" is not declared either. Repointing nothing would leave the \
+                 PEP 517 metadata build in place and the lock slow, so this refuses \
+                 instead.",
+                record.record.project
+            );
+        }
+        text = next;
+        rewrites.push(ShimRewrite {
+            project: record.record.project.clone(),
+            from,
+            to,
+            pack: record.pack.clone(),
+            lines,
+            already,
+        });
+    }
+    Ok(EffectiveManifest {
+        text,
+        rewrites,
+        derived,
+    })
 }
 
 /// [`plan_effective_manifest`] plus the shim materialisation, in the one order
@@ -1278,12 +1720,22 @@ pub fn generate_effective_manifest(
     let effective = plan_effective_manifest(packs, workspace_root, records_dir, manifest_text)?;
     let mut outcomes = Vec::new();
     for pack_dir in packs {
-        outcomes.extend(generate_shims_against(
+        // THE DERIVED RECORDS, not the files on disk. Reloading from disk here
+        // would reintroduce the whole defect one level down: production has no
+        // files there, so the planner would repoint the manifest at shims that
+        // were never written and every entry would resolve to nothing.
+        let mine: Vec<PathSourceRecord> = effective
+            .derived
+            .iter()
+            .filter(|d| &d.pack == pack_dir)
+            .map(|d| d.record.clone())
+            .collect();
+        outcomes.extend(generate_shims_from(
             pack_dir,
             workspace_root,
-            records_dir,
             None,
             &effective.text,
+            &mine,
         )?);
     }
     Ok((effective, outcomes))
@@ -1301,13 +1753,28 @@ pub fn effective_manifest_text(
     records_dir: &str,
     manifest_text: &str,
     shims: bool,
-) -> Result<(String, Vec<ShimRewrite>, Vec<PathSourceOutcome>)> {
+) -> Result<(
+    String,
+    Vec<ShimRewrite>,
+    Vec<PathSourceOutcome>,
+    Vec<DerivedRecord>,
+)> {
     if !shims {
-        return Ok((manifest_text.to_string(), Vec::new(), Vec::new()));
+        return Ok((
+            manifest_text.to_string(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ));
     }
     let (effective, outcomes) =
         generate_effective_manifest(packs, workspace_root, records_dir, manifest_text)?;
-    Ok((effective.text, effective.rewrites, outcomes))
+    Ok((
+        effective.text,
+        effective.rewrites,
+        outcomes,
+        effective.derived,
+    ))
 }
 
 /// Replace `path = "<from>"` with `path = "<to>"` on every manifest line that
@@ -1871,8 +2338,21 @@ mod effective_manifest_tests {
         "[workspace]\n",
         "name = \"imprint\"\n",
         "\n",
+        // `feature.jetson` declares a path source beside NO pack of ours. It
+        // must NOT be shimmed, and it is here so that fact is TESTED and not
+        // merely true: this is the `unitree_sdk2py` shape whose misreading
+        // produced a bare registry root for a distribution on no index.
+        "[feature.jetson.pypi-dependencies]\n",
+        "imprint = { path = \".\", editable = true }\n",
+        "unitree_sdk2py = { path = \"third_party/unitree_sdk2_python\", editable = true }\n",
+        "\n",
         "# ProtoMotions itself (third_party/ProtoMotions submodule), plus its\n",
+        // Two packs side by side in one scope: the tiebreak's live shape.
+        "[feature.pm-isaaclab.dependencies]\n",
+        "\"isaaclab-2.3x-pack\" = { path = \"./pypi-packs/isaaclab-2.3x-pack\" }\n",
+        "\"protomotions-deps-pack\" = { path = \"./pypi-packs/protomotions-deps-pack\" }\n",
         "[feature.pm-isaaclab.pypi-dependencies]\n",
+        "imprint = { path = \".\", editable = true }\n",
         "protomotions = { path = \"third_party/ProtoMotions\", editable = true }\n",
         "\n",
         "[feature.pm-newton.pypi-dependencies]\n",
@@ -1882,7 +2362,10 @@ mod effective_manifest_tests {
         "protomotions = { path = \"third_party/ProtoMotions\", editable = true }\n",
         "# Full pypi-dependencies list below mirrors third_party/ProtoMotions/requirements_mujoco.txt.\n",
         "\n",
+        "[feature.pace.dependencies]\n",
+        "\"isaaclab-2.3x-pack\" = { path = \"./pypi-packs/isaaclab-2.3x-pack\" }\n",
         "[feature.pace.pypi-dependencies]\n",
+        "imprint = { path = \".\", editable = true }\n",
         "pace_sim2real = { path = \"third_party/pace-sim2real/source/pace_sim2real\", editable = true }\n",
     );
 
@@ -1939,10 +2422,31 @@ mod effective_manifest_tests {
         std::fs::write(egg.join("PKG-INFO"), info).unwrap();
     }
 
-    fn pack(root: &Path, rel: &str, project: &str, entry: &PathSourceEntry) -> PathBuf {
+    /// A pack directory with NO record in it — production's actual shape, and
+    /// now the shape every guard below starts from.
+    ///
+    /// The manifest carries `[package.build.config.retread-wheels]` for the
+    /// project the pack builds, because that is the fact that decides which of
+    /// two co-declared packs stands in for a source. It is not decoration: with
+    /// it removed, `pm-isaaclab`'s two packs are indistinguishable and the
+    /// derivation refuses.
+    fn bare_pack(root: &Path, rel: &str, builds: &str) -> PathBuf {
         let dir = root.join(rel);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("pixi.toml"),
+            format!(
+                "[package]\n\n[package.build.config.retread-wheels]\n\
+                 \"{builds}\" = {{ version = \"==1.0.0\" }}\n"
+            ),
+        )
+        .unwrap();
+        dir
+    }
+
+    fn pack(root: &Path, rel: &str, project: &str, entry: &PathSourceEntry) -> PathBuf {
+        let dir = bare_pack(root, rel, project);
         std::fs::create_dir_all(dir.join(RECORDS_DIR_DEFAULT)).unwrap();
-        std::fs::write(dir.join("pixi.toml"), "[package]\n").unwrap();
         std::fs::write(
             dir.join(RECORDS_DIR_DEFAULT).join(format!("{project}.toml")),
             render_record(project, entry),
@@ -1951,8 +2455,23 @@ mod effective_manifest_tests {
         dir
     }
 
-    /// The live shape: canonical manifest on disk, two packs, two real trees.
+    /// PRODUCTION'S SHAPE: canonical manifest, two packs holding NO records,
+    /// two real trees stating their own facts. This is what
+    /// `find imprint-data -maxdepth 4 -path '*path-sources*'` returns nothing
+    /// for, and the transform has to work from exactly this and nothing more.
     fn fixture(label: &str) -> (PathBuf, Vec<PathBuf>) {
+        let root = test_dir(label);
+        std::fs::write(root.join("pixi.toml"), CANONICAL).unwrap();
+        real_tree(&root, PACE_REL, "pace-sim2real", &pace_entry());
+        real_tree(&root, PM_REL, "protomotions", &pm_entry());
+        let isaac = bare_pack(&root, ISAAC_PACK, "pace-sim2real");
+        let pm = bare_pack(&root, PM_PACK, "protomotions");
+        (root, vec![isaac, pm])
+    }
+
+    /// The same, with the (optional) record files written beside the packs, so
+    /// the CONFIRMING path is driven too.
+    fn fixture_with_records(label: &str) -> (PathBuf, Vec<PathBuf>) {
         let root = test_dir(label);
         std::fs::write(root.join("pixi.toml"), CANONICAL).unwrap();
         real_tree(&root, PACE_REL, "pace-sim2real", &pace_entry());
@@ -2056,11 +2575,12 @@ mod effective_manifest_tests {
     #[test]
     fn the_opt_out_reproduces_the_canonical_manifest() {
         let (root, packs) = fixture("optout");
-        let (text, rewrites, outcomes) =
+        let (text, rewrites, outcomes, derived) =
             effective_manifest_text(&packs, &root, RECORDS_DIR_DEFAULT, CANONICAL, false).unwrap();
         assert_eq!(text, CANONICAL);
         assert!(rewrites.is_empty());
         assert!(outcomes.is_empty());
+        assert!(derived.is_empty());
         for pack_dir in &packs {
             assert!(
                 !pack_dir.join(SHIMS_DIR).exists(),
@@ -2070,17 +2590,24 @@ mod effective_manifest_tests {
         }
         // The ON path through the SAME entry point does move the four lines,
         // so this guard can fail in both directions.
-        let (on, rewrites, _) =
+        let (on, rewrites, _, derived) =
             effective_manifest_text(&packs, &root, RECORDS_DIR_DEFAULT, CANONICAL, true).unwrap();
         assert_ne!(on, CANONICAL);
         assert_eq!(rewrites.len(), 2);
+        assert_eq!(derived.len(), 2);
     }
 
-    /// GUARD D — a missing pack directory REFUSES. Never a silent fall back to
-    /// the original path sources: that failure is invisible in the lock and
-    /// costs the 84 % pole back.
+    /// GUARD D — a `--pack` that cannot do the job REFUSES, in both of its
+    /// shapes, and never falls back to the original path sources: that failure
+    /// is invisible in the lock and costs the 84 % pole back.
+    ///
+    /// The SECOND half is the one that changed when the records became
+    /// derived. "The pack holds no record" is no longer a defect — production
+    /// holds no records at all, which is the whole point — so the refusal is
+    /// now about the pack having nothing to STAND IN FOR: no manifest scope
+    /// declares both it and a path source.
     #[test]
-    fn a_missing_pack_directory_is_refused_and_never_falls_back() {
+    fn a_pack_that_cannot_do_the_job_is_refused_and_never_falls_back() {
         let (root, mut packs) = fixture("missing");
         packs.push(root.join("pypi-packs/there-is-no-such-pack"));
         let error = plan_effective_manifest(&packs, &root, RECORDS_DIR_DEFAULT, CANONICAL)
@@ -2089,43 +2616,260 @@ mod effective_manifest_tests {
         assert!(text.contains("there-is-no-such-pack"), "{text}");
         assert!(text.contains("not a pack directory"), "{text}");
 
-        // A pack that exists but holds no record is the same defect: a gate
-        // with no producer.
-        let empty = root.join("pypi-packs/empty-pack");
-        std::fs::create_dir_all(&empty).unwrap();
-        std::fs::write(empty.join("pixi.toml"), "[package]\n").unwrap();
+        // A real pack directory that no scope declares beside a path source is
+        // a gate with no producer.
+        let orphan = bare_pack(&root, "pypi-packs/orphan-pack", "nothing-at-all");
         let error =
-            plan_effective_manifest(&[empty.clone()], &root, RECORDS_DIR_DEFAULT, CANONICAL)
-                .expect_err("a pack with no record must refuse");
-        assert!(format!("{error:#}").contains("holds no <project>.toml record"));
-    }
-
-    /// GUARD E — a record naming a path the manifest does not declare is
-    /// STALE, and repointing nothing is the failure that looks like success.
-    #[test]
-    fn a_record_no_manifest_entry_declares_is_refused() {
-        let (root, _) = fixture("stale");
-        let mut entry = pace_entry();
-        entry.path = "third_party/moved-away".to_string();
-        real_tree(&root, "third_party/moved-away", "pace-sim2real", &entry);
-        let stale = pack(&root, "pypi-packs/stale-pack", "pace-sim2real", &entry);
-        let error = plan_effective_manifest(&[stale], &root, RECORDS_DIR_DEFAULT, CANONICAL)
-            .expect_err("a record nothing declares must refuse");
+            plan_effective_manifest(&[orphan.clone()], &root, RECORDS_DIR_DEFAULT, CANONICAL)
+                .expect_err("a pack that stands in for nothing must refuse");
         let text = format!("{error:#}");
-        assert!(text.contains("third_party/moved-away"), "{text}");
-        assert!(text.contains("stale"), "{text}");
+        assert!(text.contains("orphan-pack"), "{text}");
+        assert!(text.contains("nothing for it to stand in for"), "{text}");
     }
 
-    /// GUARD F — two packs claiming the same project is refused. The manifest
-    /// can point at one shim, so a second claim is a silent overwrite.
+    /// GUARD E — the TOML parser and the line rewriter must agree about what
+    /// a `path` is, and a manifest where they do not is refused.
+    ///
+    /// The derivation reads the manifest as TOML; the repoint is line-wise and
+    /// substring-exact, because a parse-and-re-emit round trip would rewrite
+    /// the whole hand-maintained file and make the diff unreviewable. An
+    /// escaped path is where those two readings come apart: `/` parses to
+    /// `/`, so the derivation sees the real tree and the rewriter finds no line
+    /// carrying it. Repointing nothing while reporting success is the failure
+    /// that looks exactly like the fast path, so it refuses instead.
     #[test]
-    fn two_packs_claiming_one_project_is_refused() {
+    fn a_path_the_parser_and_the_rewriter_read_differently_is_refused() {
+        let root = test_dir("escaped");
+        let escaped = concat!(
+            "[workspace]\n",
+            "name = \"imprint\"\n",
+            "\n",
+            "[feature.pace.dependencies]\n",
+            "\"isaaclab-2.3x-pack\" = { path = \"./pypi-packs/isaaclab-2.3x-pack\" }\n",
+            "[feature.pace.pypi-dependencies]\n",
+            "pace_sim2real = { path = \"third_party/pace-sim2real/source\\u002Fpace_sim2real\" }\n",
+        );
+        std::fs::write(root.join("pixi.toml"), escaped).unwrap();
+        real_tree(&root, PACE_REL, "pace-sim2real", &pace_entry());
+        let isaac = bare_pack(&root, ISAAC_PACK, "pace-sim2real");
+        let error = plan_effective_manifest(&[isaac], &root, RECORDS_DIR_DEFAULT, escaped)
+            .expect_err("a path the rewriter cannot find must refuse");
+        let text = format!("{error:#}");
+        assert!(text.contains("pace-sim2real"), "{text}");
+        assert!(text.contains("Repointing nothing"), "{text}");
+    }
+
+    /// GUARD F — two packs that both claim one source is refused, naming
+    /// every candidate. `pm-isaaclab` really does declare two packs side by
+    /// side, so the tiebreak is load-bearing and its failure has to be loud:
+    /// the effective manifest can point one entry at one shim.
+    #[test]
+    fn two_packs_that_both_build_one_project_is_refused() {
         let (root, packs) = fixture("dup");
-        let dup = pack(&root, "pypi-packs/dup-pack", "protomotions", &pm_entry());
-        let mut all = packs;
-        all.push(dup);
-        let error = plan_effective_manifest(&all, &root, RECORDS_DIR_DEFAULT, CANONICAL)
-            .expect_err("a duplicate project claim must refuse");
-        assert!(format!("{error:#}").contains("two packs declare a path-source record"));
+        // Make the isaaclab pack ALSO claim to build protomotions, so the
+        // `retread-wheels` tiebreak no longer separates the two.
+        std::fs::write(
+            root.join(ISAAC_PACK).join("pixi.toml"),
+            "[package]\n\n[package.build.config.retread-wheels]\n\
+             \"pace-sim2real\" = { version = \"==1.0.0\" }\n\
+             \"protomotions\" = { version = \"==1.0.0\" }\n",
+        )
+        .unwrap();
+        let error = plan_effective_manifest(&packs, &root, RECORDS_DIR_DEFAULT, CANONICAL)
+            .expect_err("two packs building one project must refuse");
+        let text = format!("{error:#}");
+        assert!(text.contains("isaaclab-2.3x-pack"), "{text}");
+        assert!(text.contains("protomotions-deps-pack"), "{text}");
+        assert!(text.contains("Exactly one pack must"), "{text}");
+
+        // And with NEITHER pack building it, the tiebreak is equally undecided
+        // and equally loud — the guard fails in both directions.
+        std::fs::write(
+            root.join(ISAAC_PACK).join("pixi.toml"),
+            "[package]\n\n[package.build.config.retread-wheels]\n\
+             \"pace-sim2real\" = { version = \"==1.0.0\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(PM_PACK).join("pixi.toml"),
+            "[package]\n\n[package.build.config.retread-wheels]\n\
+             \"something-else\" = { version = \"==1.0.0\" }\n",
+        )
+        .unwrap();
+        let error = plan_effective_manifest(&packs, &root, RECORDS_DIR_DEFAULT, CANONICAL)
+            .expect_err("no pack building the project must refuse too");
+        assert!(format!("{error:#}").contains("Exactly one pack must"));
+    }
+
+    // -----------------------------------------------------------------------
+    // THE DERIVATION
+    // -----------------------------------------------------------------------
+
+    /// GUARD G — a source declared beside NO pack of ours is not shimmed.
+    ///
+    /// `unitree_sdk2py` lives in `feature.jetson`, which declares no pack this
+    /// run named. Deriving a record for it would repoint an aarch64-only
+    /// source at a linux-64 pack's shim — the same misreading that produced a
+    /// bare registry root for a distribution that exists on no index. And
+    /// `imprint = { path = "." }` is declared beside BOTH packs and is still
+    /// not shimmed: a workspace cannot be a shim of itself.
+    #[test]
+    fn a_source_beside_no_named_pack_and_the_workspace_itself_are_not_shimmed() {
+        let (root, packs) = fixture("scope");
+        let planned = plan_effective_manifest(&packs, &root, RECORDS_DIR_DEFAULT, CANONICAL)
+            .expect("the transform must plan from a manifest with unrelated sources in it");
+        let projects: Vec<&str> = planned
+            .derived
+            .iter()
+            .map(|d| d.record.project.as_str())
+            .collect();
+        assert_eq!(projects, vec!["pace-sim2real", "protomotions"], "{projects:?}");
+        assert!(planned.text.contains(
+            "unitree_sdk2py = { path = \"third_party/unitree_sdk2_python\", editable = true }"
+        ));
+        assert!(planned.text.contains("imprint = { path = \".\", editable = true }"));
+    }
+
+    /// GUARD H — THE RECORDS ARE DERIVED, and every field of the two the C34
+    /// harness fabricated from shell literals comes back byte-for-byte from
+    /// the manifest and the trees, with NOTHING under `<pack>/path-sources/`.
+    ///
+    /// This is the guard that fails the moment anyone restores a
+    /// "the record file is required" branch: `fixture` writes no records at
+    /// all, which is `imprint-data`'s measured shape.
+    #[test]
+    fn the_records_are_derived_from_the_manifest_and_the_trees_with_no_file_on_disk() {
+        let (root, packs) = fixture("derive");
+        for pack_dir in &packs {
+            assert!(
+                !pack_dir.join(RECORDS_DIR_DEFAULT).exists(),
+                "{} holds records; this guard must run against production's shape",
+                pack_dir.display()
+            );
+        }
+        let planned = plan_effective_manifest(&packs, &root, RECORDS_DIR_DEFAULT, CANONICAL)
+            .expect("the derivation must work with no record file anywhere");
+
+        assert_eq!(planned.derived.len(), 2);
+        let pace = &planned.derived[0];
+        assert_eq!(pace.record.project, "pace-sim2real");
+        assert_eq!(pace.record.entry, pace_entry());
+        assert_eq!(pace.pack, root.join(ISAAC_PACK));
+        assert!(!pace.confirmed);
+        let pm = &planned.derived[1];
+        assert_eq!(pm.record.project, "protomotions");
+        assert_eq!(pm.record.entry, pm_entry());
+        // The TIEBREAK: `pm-isaaclab` declares both packs and only this one
+        // builds `protomotions`.
+        assert_eq!(pm.pack, root.join(PM_PACK));
+        assert!(!pm.confirmed);
+
+        let rows = planned.derivation_rows();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(
+            rows[0].starts_with(
+                "### PATH SOURCE RECORD project=pace-sim2real \
+                 source=third_party/pace-sim2real/source/pace_sim2real pack="
+            ),
+            "{rows:?}"
+        );
+        assert!(rows.iter().all(|r| r.contains(" derived=yes ")), "{rows:?}");
+        assert!(rows[1].ends_with(&format!(
+            "shim={}",
+            root.join(PM_PACK).join(SHIMS_DIR).join("protomotions").display()
+        )), "{rows:?}");
+
+        // The derived text is the same text the record files produce, so the
+        // two producers cannot drift.
+        let (root2, packs2) = fixture_with_records("confirm");
+        let confirmed = plan_effective_manifest(&packs2, &root2, RECORDS_DIR_DEFAULT, CANONICAL)
+            .expect("a record that agrees must confirm, not refuse");
+        assert_eq!(confirmed.text, planned.text);
+        assert!(confirmed.derived.iter().all(|d| d.confirmed));
+        assert!(
+            confirmed
+                .derivation_rows()
+                .iter()
+                .all(|r| r.contains(" derived=confirmed ")),
+            "{:?}",
+            confirmed.derivation_rows()
+        );
+    }
+
+    /// GUARD I — a record file that DISAGREES with the tree it describes is a
+    /// loud refusal naming both sides, never a silent preference for either.
+    ///
+    /// A record may only confirm. If it could override, the hand-written half
+    /// would be back and the lock would be built from a claim nothing checks.
+    #[test]
+    fn a_record_that_disagrees_with_the_tree_refuses_naming_both() {
+        let (root, packs) = fixture_with_records("disagree");
+        let mut lying = pm_entry();
+        lying.version = "9.9".to_string();
+        std::fs::write(
+            root.join(PM_PACK)
+                .join(RECORDS_DIR_DEFAULT)
+                .join("protomotions.toml"),
+            render_record("protomotions", &lying),
+        )
+        .unwrap();
+        let error = plan_effective_manifest(&packs, &root, RECORDS_DIR_DEFAULT, CANONICAL)
+            .expect_err("a record disagreeing with its tree must refuse");
+        let text = format!("{error:#}");
+        assert!(text.contains("protomotions.toml"), "{text}");
+        assert!(text.contains("disagrees with the tree"), "{text}");
+        assert!(text.contains("9.9"), "the record's claim is not in the refusal: {text}");
+        assert!(text.contains("3.1"), "the tree's fact is not in the refusal: {text}");
+    }
+
+    /// GUARD J — THE ORACLE. The transform, run on the REAL canonical
+    /// `imprint-data/pixi.toml` with NO record file anywhere, produces the
+    /// effective manifest the campaign already measured: 45 393 bytes, the
+    /// four `p6mb` lines and nothing else moved.
+    ///
+    /// `src/testdata/imprint-workspace-pixi.toml` is a byte copy of that file
+    /// (md5 `9711eb990bfe211d498d1635a60e0d07`, 45 298 B). The effective
+    /// manifest's md5 is `4ad488b961b7682c8d4938811179887f` — BOTH the md5 of
+    /// the operator's hand edit `b1-scratch/pixi.toml.p6mb` and the md5 C34
+    /// arm 3 asserted. This crate carries no md5, so the length and the exact
+    /// four-line diff stand for it here and the gate job hashes the CLI's own
+    /// output; the two together are the same claim.
+    #[test]
+    fn the_real_canonical_manifest_derives_the_measured_effective_manifest() {
+        const REAL: &str = include_str!("testdata/imprint-workspace-pixi.toml");
+        assert_eq!(REAL.len(), 45_298, "the canonical copy moved under this guard");
+
+        let root = test_dir("oracle");
+        std::fs::write(root.join("pixi.toml"), REAL).unwrap();
+        real_tree(&root, PACE_REL, "pace-sim2real", &pace_entry());
+        real_tree(&root, PM_REL, "protomotions", &pm_entry());
+        let isaac = bare_pack(&root, ISAAC_PACK, "pace-sim2real");
+        let pm = bare_pack(&root, PM_PACK, "protomotions");
+
+        let planned = plan_effective_manifest(&[isaac, pm], &root, RECORDS_DIR_DEFAULT, REAL)
+            .expect("the real manifest must derive its own records");
+
+        assert_eq!(planned.derived.len(), 2, "repointed=2");
+        assert_eq!(planned.rewrites.len(), 2);
+        assert_eq!(planned.text.len(), 45_393, "the measured effective size");
+
+        let (deleted, added) = diff_lines(REAL, &planned.text);
+        assert_eq!(deleted.len(), 4, "{deleted:?}");
+        assert_eq!(added.len(), 4, "{added:?}");
+        for line in &added {
+            assert!(
+                line.contains("pypi-packs/protomotions-deps-pack/sources/protomotions")
+                    || line.contains("pypi-packs/isaaclab-2.3x-pack/sources/pace-sim2real"),
+                "an unexpected line moved: {line}"
+            );
+        }
+        // Three `pm-*` features share one record; `pace` has one entry.
+        let lines: Vec<usize> = planned.rewrites.iter().map(|r| r.lines).collect();
+        assert_eq!(lines, vec![1, 3], "{:?}", planned.rows());
+
+        // And the two records are the ones C34's `pack_stage_content` typed in
+        // as shell literals — the derivation's oracle.
+        assert_eq!(planned.derived[0].record.entry, pace_entry());
+        assert_eq!(planned.derived[1].record.entry, pm_entry());
     }
 }
