@@ -6319,6 +6319,65 @@ fn artifact_uv_cache_dir(base: &Path, target: &ResolutionTarget) -> PathBuf {
     base.join("v3").join(target.artifact_cache_identity())
 }
 
+// ── THE BACKEND'S uv CACHE ROOT HAS TO BE SAYABLE (N27-RETREAD-71) ───────────
+//
+// MEASURED, MERGE-B36 relock 2 (job 6069286). The sdist-metadata harvester was
+// taught in HARVEST-1 to read the BACKEND's uv cache as a second stream, and it
+// took that cache to be `$UV_CACHE_DIR` -- the variable the relock template
+// exports and pixi's embedded uv honours. The backend does not use it. This
+// function's `base` comes from `handler`'s `cache_dir.join("uv-cache")`, and
+// `cache_dir` is `RETREAD_CACHE_DIR` (or, when fast-tmp judges that root slow,
+// `fast.ns.retread_cache_dir()`), so relock 2's backend built under
+//   .../g/fast-tmp/retread-glvov/<ns>/job-6069286/caches/retread/uv-cache/v3/<id>
+// while the harvester scanned `.../certMDG-6069286/uv-overlay` and printed
+//   ### SDIST-META HARVEST-STREAM stream=backend ... scanned=0 reason=no-sdists-v9-pypi
+// for two dists it had watched uv prepare in the same log. A reader with no
+// writer: the stream was declared, read, and pointed at a directory this
+// process never touches.
+//
+// NOTHING IN THE ENVIRONMENT CAN TELL A HARNESS THAT PATH. It is composed here,
+// per resolution target, from a base the backend may itself have redirected --
+// the harness that spawned us cannot derive it, and a second derivation in
+// shell would be exactly the stale reader this campaign keeps paying for. So
+// the writer says it, once per target, in a row, and the harvester's
+// `--backend-cache` comes from these rows.
+//
+// The announce and the path are ONE call on purpose: a wrapper that returns the
+// directory it just named cannot drift from it. Announcing the BASE, or the
+// `resolution_identity` sibling namespace, are both invisible to the eye (two
+// 64-hex names under one `v3/`) and both fatal to a harvester that scans what
+// the row says. `announced_backend_uv_cache_root_is_the_directory_uv_is_given`
+// is the guard for both.
+pub(crate) const BACKEND_UV_CACHE_ROOT_MESSAGE: &str = "uv closure: backend uv cache root";
+
+/// The single producer of the row's SHAPE. The harvester takes everything after
+/// the last `cache_root=` to end of row, so the path is the final field and
+/// nothing may be appended after it.
+pub(crate) fn backend_uv_cache_root_row(
+    bundle: &str,
+    target_identity: &str,
+    cache_root: &Path,
+) -> String {
+    format!(
+        "{BACKEND_UV_CACHE_ROOT_MESSAGE} bundle={bundle} target={target_identity} cache_root={}",
+        cache_root.display()
+    )
+}
+
+/// [`artifact_uv_cache_dir`] plus the row that names what it returned.
+fn announced_artifact_uv_cache_dir(
+    base: &Path,
+    target: &ResolutionTarget,
+    bundle: &str,
+) -> PathBuf {
+    let dir = artifact_uv_cache_dir(base, target);
+    tracing::info!(
+        "{}",
+        backend_uv_cache_root_row(bundle, &target.artifact_cache_identity(), &dir)
+    );
+    dir
+}
+
 async fn acquire_closure_project_lock(project_dir: &Path) -> Result<ClosureProjectLock> {
     let parent = project_dir
         .parent()
@@ -7903,7 +7962,7 @@ pub(crate) async fn compute_closure_for_target(
     );
     let req = &normalized_req;
     let project_dir_storage = resolution_project_dir(project_dir, target);
-    let uv_cache_dir_storage = artifact_uv_cache_dir(uv_cache_dir, target);
+    let uv_cache_dir_storage = announced_artifact_uv_cache_dir(uv_cache_dir, target, &req.bundle);
     let project_dir = project_dir_storage.as_path();
     let uv_cache_dir = uv_cache_dir_storage.as_path();
     let resolution_identity = target.resolution_identity();
@@ -16104,6 +16163,46 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
         let arm_cache = artifact_uv_cache_dir(cache, &arm);
         assert_ne!(x86_cache, arm_cache);
         assert_eq!(x86_cache.file_name().unwrap().to_string_lossy().len(), 64);
+    }
+
+    // -- N27-RETREAD-71: the backend's uv cache root, as the harness reads it --
+
+    #[test]
+    fn announced_backend_uv_cache_root_is_the_directory_uv_is_given() {
+        // MERGE-B36 relock 2 scanned `$UV_CACHE_DIR` for a backend that had
+        // built under `<retread cache dir>/uv-cache/v3/<artifact identity>` and
+        // reported `scanned=0 reason=no-sdists-v9-pypi` for dists it had just
+        // watched uv prepare. The announce wrapper is now the ONLY way the
+        // resolve path names this directory, so the row cannot name one uv did
+        // not get -- and these are the two swaps that would be invisible.
+        let cache = Path::new("/tmp/uv-cache");
+        let target = ResolutionTarget::from_parts("3.11", "linux-64", Some((2, 35)));
+        let announced = announced_artifact_uv_cache_dir(cache, &target, "isaaclab-2-3x-pack");
+        assert_eq!(announced, artifact_uv_cache_dir(cache, &target));
+        // (a) the LEAF, not the base a harvester would have to re-derive.
+        assert_eq!(announced.parent().unwrap(), cache.join("v3"));
+        // (b) the ARTIFACT identity, not its `resolution_identity` sibling:
+        //     both are 64 hex under one `v3/`, and only one of them is where uv
+        //     writes `sdists-v9/pypi/<name>/<version>/<rev>/metadata.msgpack`.
+        let leaf = announced.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(leaf, target.artifact_cache_identity());
+        assert_ne!(leaf, target.resolution_identity());
+    }
+
+    #[test]
+    fn the_backend_uv_cache_root_row_parses_the_way_the_harvester_reads_it() {
+        // The reader is `sdist_metadata_harvest.sh`, which takes everything
+        // after the LAST `cache_root=` to end of row and scans that directory.
+        // A field appended after the path silently feeds it a path plus junk,
+        // which shows up as another honest-looking `scanned=0`.
+        let row = backend_uv_cache_root_row("pack", "abc123", Path::new("/x/uv-cache/v3/abc123"));
+        assert!(row.starts_with(BACKEND_UV_CACHE_ROOT_MESSAGE));
+        assert_eq!(
+            row.rsplit_once("cache_root=").unwrap().1,
+            "/x/uv-cache/v3/abc123"
+        );
+        assert!(row.contains(" bundle=pack "));
+        assert!(row.contains(" target=abc123 "));
     }
 
     #[test]
