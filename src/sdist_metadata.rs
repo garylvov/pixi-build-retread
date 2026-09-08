@@ -180,6 +180,18 @@ pub const REVISION_HTTP_MAX_BYTES: u64 = 1 << 20;
 /// writes the PyPI file URL verbatim.
 const URL_MARKER: &[u8] = b"https://";
 
+/// The msgpack head of the COMPACT shape: a two-element array whose FIRST
+/// element is the revision id. This is what the uv embedded in pixi 0.73.0
+/// writes, and it is the only shape SDIST-META-3 had measured.
+const REVISION_COMPACT_HEAD: u8 = 0x92;
+
+/// The first entry key of the NAMED-MAP shape: the fixstr `"id"`. The head byte
+/// is a `fixmap` whose ARITY is deliberately not checked — uv 0.12.5 writes
+/// three fields (`id`, `hashes`, `size`) and a fourth would not move the
+/// revision id. What is checked is that the first entry is `id`, because that
+/// is what puts the revision id exactly where the compact shape puts it.
+const REVISION_NAMED_MAP_ID_KEY: [u8; 3] = [0xa2, b'i', b'd'];
+
 /// How long an unreferenced entry may sit before the reaper QUARANTINES it, in
 /// days. 14, the same horizon as the other five stores, on the standing
 /// argument that housekeeping horizons which differ for no stated reason are
@@ -200,6 +212,88 @@ pub struct RevisionPointer {
     pub revision_id: String,
     /// The artefact's identity: URL and ETag.
     pub source: SourceIdentity,
+    /// WHICH of the two measured shapes the file was written in. It is not a
+    /// key field — the identity is the same under both — but it is printed, so
+    /// a harvest log says which uv wrote the shard it read.
+    pub layout: RevisionLayout,
+}
+
+/// The two MEASURED shapes of `revision.http`, and the ONE place that names
+/// them. HARVEST-3 found the second one the only way it could be found: job
+/// 6070596's harvester refused BOTH backend candidates with
+/// `revision.http-unreadable`, `first byte 0x83, expected 0x92`, while the same
+/// two dists were admitted from pixi's own cache root in the same run.
+///
+/// The two writers are different uv BUILDS, not a corrupted file:
+///
+///   * pixi 0.73.0's EMBEDDED uv writes `92 b0 <16-byte id> 90 <url><etag>`;
+///   * the standalone `uv 0.12.5` the backend spawns (measured live on job
+///     6072919, `uv --version` = `uv 0.12.5 (x86_64-unknown-linux-gnu)`,
+///     sha256 `e4b86c0c…d976ce`) writes
+///     `83 a2 "id" b0 <16-byte id> a6 "hashes" 91 92 a6 "Sha256" d9 40 <64 hex>
+///      a4 "size" ce <u32> <url><etag>`.
+///
+/// Both land in a directory named `sdists-v9`, so the CACHE VERSION does not
+/// distinguish them and a reader that keys on the directory name would still be
+/// wrong. The URL and the ETag are byte-identical between the two for the same
+/// dist — measured on antlr4-python3-runtime 4.9.3, ETag
+/// `ecdf93d9a4c8acd16ec3ade04e2b5195` under both — which is why one key rule
+/// covers both and a backend-side shard HITS a pixi-side entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevisionLayout {
+    /// `92 <str id> <hashes> <url><etag>` — pixi's embedded uv.
+    CompactArray,
+    /// `8N a2 "id" <str id> …` — the standalone uv the backend spawns.
+    NamedMap,
+}
+
+impl RevisionLayout {
+    /// The word that goes in the key row's `shape=` field.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CompactArray => "compact-array",
+            Self::NamedMap => "named-map",
+        }
+    }
+
+    /// The offset at which the revision id's msgpack STRING HEADER begins.
+    /// Past this one number the two shapes are read by the same code.
+    fn id_header_at(self) -> usize {
+        match self {
+            Self::CompactArray => 1,
+            Self::NamedMap => 1 + REVISION_NAMED_MAP_ID_KEY.len(),
+        }
+    }
+
+    /// Decide the shape from the head byte, refusing anything that is neither.
+    fn of(bytes: &[u8]) -> anyhow::Result<Self> {
+        let head = *bytes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("sdist-meta-key: revision.http is empty"))?;
+        match head {
+            REVISION_COMPACT_HEAD => Ok(Self::CompactArray),
+            // A non-empty `fixmap`. `0x80` is the EMPTY map and cannot carry an
+            // id, so it is refused with everything else.
+            0x81..=0x8f => {
+                if bytes.get(1..1 + REVISION_NAMED_MAP_ID_KEY.len())
+                    != Some(&REVISION_NAMED_MAP_ID_KEY[..])
+                {
+                    anyhow::bail!(
+                        "sdist-meta-key: revision.http opens a msgpack map (first byte \
+                         0x{head:02x}) whose first key is not the fixstr \"id\"; the revision id \
+                         is not where either measured uv shape puts it"
+                    );
+                }
+                Ok(Self::NamedMap)
+            }
+            other => anyhow::bail!(
+                "sdist-meta-key: revision.http opens with neither measured uv shape (first byte \
+                 0x{other:02x}); expected 0x92, the two-element msgpack array pixi's embedded uv \
+                 writes, or a msgpack map 0x81..0x8f whose first key is \"id\", which uv 0.12.5 \
+                 writes; this is not a uv revision pointer"
+            ),
+        }
+    }
 }
 
 /// The sdist URL and the ETag uv revalidates it with. See the module docs: this
@@ -234,8 +328,11 @@ pub fn source_digest(source: &SourceIdentity) -> String {
 /// cache policy, which is why a general msgpack decoder would not read the
 /// whole thing anyway. What is parsed, and nothing else:
 ///
-///  1. `0x92` — the two-element array the file opens with. Anything else is
-///     refused by shape rather than skipped past.
+///  1. THE HEAD, which selects one of the two measured [`RevisionLayout`]s:
+///     `0x92`, the two-element array pixi's embedded uv writes, or a msgpack
+///     map whose first key is `"id"`, which uv 0.12.5 writes. Anything else is
+///     refused by shape rather than skipped past. The head is the ONLY place
+///     the two shapes differ; past step 2 there is one code path.
 ///  2. A msgpack string header (`fixstr` `0xa0..=0xbf`, or `str8` `0xd9`) and
 ///     its bytes — the revision id.
 ///  3. The FIRST `https://` anywhere after it, run to the first `"` — the URL.
@@ -249,25 +346,18 @@ pub fn source_digest(source: &SourceIdentity) -> String {
 /// fresh one — is STEPPED OVER, not decoded. That is the ONE-RULE property:
 /// the same code path, and the same key, whether the digest is there or not.
 pub fn parse_revision_http(bytes: &[u8]) -> anyhow::Result<RevisionPointer> {
-    let head = *bytes
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("sdist-meta-key: revision.http is empty"))?;
-    if head != 0x92 {
-        anyhow::bail!(
-            "sdist-meta-key: revision.http does not open with the 2-element msgpack array \
-             (first byte 0x{head:02x}, expected 0x92); this is not a uv revision pointer"
-        );
-    }
-    let (id_start, id_len) = match bytes.get(1).copied() {
-        Some(b @ 0xa0..=0xbf) => (2usize, (b & 0x1f) as usize),
+    let layout = RevisionLayout::of(bytes)?;
+    let at = layout.id_header_at();
+    let (id_start, id_len) = match bytes.get(at).copied() {
+        Some(b @ 0xa0..=0xbf) => (at + 1, (b & 0x1f) as usize),
         Some(0xd9) => (
-            3usize,
-            *bytes.get(2).ok_or_else(|| {
+            at + 2,
+            *bytes.get(at + 1).ok_or_else(|| {
                 anyhow::anyhow!("sdist-meta-key: revision.http truncated in its str8 length")
             })? as usize,
         ),
         other => anyhow::bail!(
-            "sdist-meta-key: revision.http byte 1 is {other:?}, not a msgpack string header; \
+            "sdist-meta-key: revision.http byte {at} is {other:?}, not a msgpack string header; \
              the revision id cannot be read"
         ),
     };
@@ -351,6 +441,7 @@ pub fn parse_revision_http(bytes: &[u8]) -> anyhow::Result<RevisionPointer> {
             url,
             etag: format!("{weak}{etag_body}"),
         },
+        layout,
     })
 }
 
@@ -1131,12 +1222,13 @@ pub fn run(args: &Args) -> anyhow::Result<i32> {
     let key = entry_key(&inputs);
     println!(
         "### SDIST-META KEY key={key} version={CACHE_VERSION} rev={} source_digest={digest} \
-         url={} etag={} store={} entry={}",
+         url={} etag={} store={} entry={} shape={}",
         pointer.revision_id,
         pointer.source.url,
         pointer.source.etag,
         generation_dir(&root).display(),
         entry_dir(&root, &key).display(),
+        pointer.layout.as_str(),
     );
     Ok(0)
 }
@@ -1181,6 +1273,55 @@ mod tests {
         v.extend_from_slice(&[0u8; 16]);
         v
     }
+
+    /// THE ANTLR4 SDIST AS **PIXI'S EMBEDDED UV** WROTE IT, copied byte for
+    /// byte out of the entry job 6070596 admitted from its lock stream
+    /// (`sdm-892c5e68…/revision.http`, 523 B): the compact array, the 16-byte
+    /// revision id, the EMPTY hashes array, the URL, the quoted ETag. Only the
+    /// rkyv trailer is abbreviated.
+    fn compact_antlr4_bytes() -> Vec<u8> {
+        let mut v = vec![0x92u8, 0xb0];
+        v.extend_from_slice(b"8E6v8CLpEHF2ADFq");
+        v.push(0x90);
+        v.extend_from_slice(ANTLR4_URL_AND_ETAG);
+        v.extend_from_slice(&[0u8; 16]);
+        v
+    }
+
+    /// THE SAME SDIST AS **UV 0.12.5** WROTE IT — the shape job 6070596's
+    /// harvester refused twice with `revision.http-unreadable`. Reproduced on
+    /// job 6072919 by running that exact uv binary into a fresh cache dir, and
+    /// copied byte for byte from its `sdists-v9/pypi/antlr4-python3-runtime/
+    /// 4.9.3/revision.http` (617 B): the three-key map `{id, hashes, size}`,
+    /// the id as a 16-byte fixstr, the hashes list uv 0.12.5 still writes, the
+    /// `size` field the compact shape has no room for, then THE SAME URL AND
+    /// THE SAME ETAG.
+    fn named_map_antlr4_bytes() -> Vec<u8> {
+        let mut v = vec![0x83u8];
+        v.extend_from_slice(&[0xa2, b'i', b'd']);
+        v.push(0xb0);
+        v.extend_from_slice(b"2eXOvAXyXSk44ju_");
+        v.extend_from_slice(&[0xa6]);
+        v.extend_from_slice(b"hashes");
+        v.extend_from_slice(&[0x91, 0x92, 0xa6]);
+        v.extend_from_slice(b"Sha256");
+        v.extend_from_slice(&[0xd9, 0x40]);
+        v.extend_from_slice(
+            b"f224469b4168294902bb1efa80a8bf7855f24c99aef99cbefc1bcd3cce77881b",
+        );
+        v.extend_from_slice(&[0xa4]);
+        v.extend_from_slice(b"size");
+        v.extend_from_slice(&[0xce, 0x00, 0x01, 0xc9, 0x2a]);
+        v.extend_from_slice(ANTLR4_URL_AND_ETAG);
+        v.extend_from_slice(&[0u8; 16]);
+        v
+    }
+
+    /// The identity half, shared by the two fixtures because it is shared by
+    /// the two FILES — that is the measurement the whole fix rests on.
+    const ANTLR4_URL_AND_ETAG: &[u8] = b"https://files.pythonhosted.org/packages/3e/38/\
+        7859ff46355f76f8d19459005ca000b6e7012f2f1ca597746cbcd1fbfe5e/\
+        antlr4-python3-runtime-4.9.3.tar.gz\"ecdf93d9a4c8acd16ec3ade04e2b5195\"";
 
     fn facts() -> ArmFacts {
         ArmFacts {
@@ -1268,6 +1409,58 @@ mod tests {
             error.to_string().contains("ETag"),
             "the refusal must NAME the ETag: {error}"
         );
+    }
+
+    /// HARVEST-3's REASON FOR EXISTING, and the guard that goes red the moment
+    /// someone puts the `head != 0x92` check back. Job 6070596 refused BOTH of
+    /// its backend candidates with `first byte 0x83, expected 0x92` while
+    /// admitting the same dists from pixi's cache root in the same run.
+    #[test]
+    fn the_named_map_shape_the_backends_uv_writes_parses() {
+        let bytes = named_map_antlr4_bytes();
+        assert_eq!(bytes[0], 0x83, "the fixture must be the map shape uv 0.12.5 writes");
+        let p = parse_revision_http(&bytes).expect("the named-map shape must parse");
+        assert_eq!(p.revision_id, "2eXOvAXyXSk44ju_");
+        assert_eq!(p.layout, RevisionLayout::NamedMap);
+        assert_eq!(p.source.etag, "ecdf93d9a4c8acd16ec3ade04e2b5195");
+        assert!(p.source.url.ends_with("antlr4-python3-runtime-4.9.3.tar.gz"));
+    }
+
+    /// ONE KEY ACROSS THE TWO WRITERS. The backend's uv and pixi's uv wrote the
+    /// same dist into two differently-shaped files with byte-identical URL and
+    /// ETag; the store must therefore see the backend's shard as a HIT on the
+    /// pixi-side entry, not as a second entry. If the shape ever leaked into
+    /// the key this goes red.
+    #[test]
+    fn the_two_writers_shapes_give_one_source_digest() {
+        let compact = parse_revision_http(&compact_antlr4_bytes()).expect("compact parses");
+        let named = parse_revision_http(&named_map_antlr4_bytes()).expect("named map parses");
+        assert_ne!(
+            compact.revision_id, named.revision_id,
+            "the two writers gave the shard different revision ids; the fixtures are real files"
+        );
+        assert_ne!(compact.layout, named.layout, "the fixtures must differ in shape");
+        assert_eq!(compact.source, named.source, "the identity must be the same");
+        assert_eq!(
+            source_digest(&compact.source),
+            source_digest(&named.source),
+            "the file's SHAPE moved the key; a backend shard would open a second entry"
+        );
+    }
+
+    /// The map shape is accepted by its FIRST KEY, not by its head byte alone.
+    /// A map that opens with something else is not a revision pointer, and the
+    /// refusal must say so rather than read a length off the wrong offset.
+    #[test]
+    fn a_map_whose_first_key_is_not_id_is_refused_by_name() {
+        let mut v = vec![0x83u8, 0xa4];
+        v.extend_from_slice(b"size");
+        v.extend_from_slice(&[0xce, 0x00, 0x01, 0xc9, 0x2a]);
+        v.extend_from_slice(ANTLR4_URL_AND_ETAG);
+        let error = parse_revision_http(&v).expect_err("a map without a leading id must refuse");
+        assert!(error.to_string().contains("\"id\""), "{error}");
+        let empty_map = parse_revision_http(&[0x80u8]).expect_err("an empty map must refuse");
+        assert!(empty_map.to_string().contains("0x80"), "{empty_map}");
     }
 
     /// A file that is not a revision pointer at all is refused by SHAPE, on its
