@@ -5597,7 +5597,17 @@ impl Handler {
                         missing,
                     }) = refusal.as_ref()
                     {
-                        println!(
+                        // STDERR, NEVER STDOUT, AND THIS IS NOT A STYLE
+                        // CHOICE. `rpc.rs` owns `tokio::io::stdout()` as the
+                        // JSON-RPC channel: a `println!` from inside a handler
+                        // interleaves a `###` row into the protocol stream and
+                        // corrupts the very lock it is reporting on. There is
+                        // exactly one `println!` anywhere in this module's
+                        // ancestry and it is not in a handler. The harness
+                        // already tees backend STDERR into `<arm>.backend.log`
+                        // (the `SHIM` every relock template writes), so this is
+                        // also where every other backend row a lane greps lands.
+                        eprintln!(
                             "### built-outputs REFUSED key={key} reason=repodata_universe mismatch stored={missing} job={}",
                             std::env::var("SLURM_JOB_ID")
                                 .unwrap_or_else(|_| "none".to_string()),
