@@ -218,6 +218,20 @@ async fn async_main() -> anyhow::Result<()> {
         return run_path_source_refresh(&argv[2..]);
     }
 
+    // `retread path-source-manifest` -- the pre-lock half of
+    // `retread-path-source-metadata`, and the reason the canonical manifest
+    // never has to carry the repoint. It reads the canonical `pixi.toml`,
+    // materializes each pack's shims, and writes an EFFECTIVE manifest whose
+    // path-source entries point at those shims. The lock driver stages that
+    // file into the disposable workspace it already builds. Nothing is written
+    // to the canonical tree, and `--no-pack-shims` reproduces its bytes.
+    if matches!(
+        argv.get(1).map(String::as_str),
+        Some("path-source-manifest")
+    ) {
+        return run_path_source_manifest(&argv[2..]);
+    }
+
     if matches!(
         argv.get(1).map(String::as_str),
         Some("install" | "verify" | "solve" | "lock")
@@ -447,6 +461,132 @@ fn run_path_source_refresh(args: &[String]) -> anyhow::Result<()> {
         );
         std::process::exit(3);
     }
+    Ok(())
+}
+
+/// `retread path-source-manifest --workspace <dir> --pack <dir> [--pack <dir>…]
+///  --out <file> [--records-dir <rel>] [--no-pack-shims] [--check]`
+///
+/// Emits the EFFECTIVE manifest: the canonical `<workspace>/pixi.toml` with
+/// every declared path source repointed at the pack shim that carries its
+/// static PEP 621 metadata. The canonical file is read and never written.
+///
+/// Exit 0 = `--out` holds the effective manifest (and, without
+/// `--no-pack-shims`, every shim is materialized). Exit 4 (`--check` only) =
+/// the file at `--out` is not what the transform produces.
+fn run_path_source_manifest(args: &[String]) -> anyhow::Result<()> {
+    use pixi_build_retread::path_source_metadata as psm;
+
+    let mut packs: Vec<PathBuf> = Vec::new();
+    let mut workspace: Option<PathBuf> = None;
+    let mut out: Option<PathBuf> = None;
+    let mut records_dir = psm::RECORDS_DIR_DEFAULT.to_string();
+    let mut shims = true;
+    let mut check = false;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--pack" => packs.push(PathBuf::from(it.next().ok_or_else(|| {
+                anyhow::anyhow!("path-source-manifest: --pack <dir> requires a value")
+            })?)),
+            "--workspace" => {
+                workspace = Some(PathBuf::from(it.next().ok_or_else(|| {
+                    anyhow::anyhow!("path-source-manifest: --workspace <dir> requires a value")
+                })?));
+            }
+            "--out" => {
+                out = Some(PathBuf::from(it.next().ok_or_else(|| {
+                    anyhow::anyhow!("path-source-manifest: --out <file> requires a value")
+                })?));
+            }
+            "--records-dir" => {
+                records_dir = it
+                    .next()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("path-source-manifest: --records-dir <rel> requires a value")
+                    })?
+                    .clone();
+            }
+            // The opt-out. It is a real control, not a comment: it reproduces
+            // the canonical bytes, so a lock driver can bisect the transform
+            // itself without editing anything.
+            "--no-pack-shims" => shims = false,
+            "--check" => check = true,
+            other => anyhow::bail!("path-source-manifest: unknown arg {other}"),
+        }
+    }
+    let workspace = workspace
+        .ok_or_else(|| anyhow::anyhow!("path-source-manifest: --workspace <dir> required"))?;
+    let out = out.ok_or_else(|| anyhow::anyhow!("path-source-manifest: --out <file> required"))?;
+    let canonical = workspace.join("pixi.toml");
+    let manifest_text = std::fs::read_to_string(&canonical)
+        .map_err(|e| anyhow::anyhow!("reading {}: {e}", canonical.display()))?;
+
+    if shims && packs.is_empty() {
+        anyhow::bail!(
+            "path-source-manifest: at least one --pack <dir> is required (or \
+             pass --no-pack-shims to copy the canonical manifest through)"
+        );
+    }
+    let (text, rewrites, outcomes) = psm::effective_manifest_text(
+        &packs,
+        &workspace,
+        &records_dir,
+        &manifest_text,
+        shims,
+    )?;
+    if !shims {
+        println!(
+            "### PACK SHIM disabled (--no-pack-shims): {} copied unchanged, the \
+             frontend will run a PEP 517 metadata build for every path source",
+            canonical.display()
+        );
+    }
+    for rewrite in &rewrites {
+        println!("{}", rewrite.row());
+    }
+    for outcome in &outcomes {
+        println!(
+            "### PACK SHIM FILE {} {}",
+            outcome.verb(),
+            outcome.shim().display()
+        );
+    }
+
+    if check {
+        let found = std::fs::read_to_string(&out).unwrap_or_default();
+        if found == text {
+            println!("### PACK SHIM CHECK {} matches", out.display());
+            return Ok(());
+        }
+        eprintln!(
+            "path-source-manifest: {} is not the manifest this transform produces \
+             ({} bytes on disk vs {} generated). Re-run without --check.",
+            out.display(),
+            found.len(),
+            text.len()
+        );
+        std::process::exit(4);
+    }
+
+    if let Some(parent) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| anyhow::anyhow!("creating {}: {e}", parent.display()))?;
+    }
+    // Sibling temp + rename: the effective manifest is routinely written into a
+    // workspace that was `cp -al`'d out of a shared mirror, where a write in
+    // place would reach every other link.
+    let tmp = out.with_extension("retread-tmp");
+    std::fs::write(&tmp, text.as_bytes())
+        .map_err(|e| anyhow::anyhow!("writing {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &out)
+        .map_err(|e| anyhow::anyhow!("renaming {} -> {}: {e}", tmp.display(), out.display()))?;
+    println!(
+        "### PACK SHIM MANIFEST {} ({} bytes) from {}",
+        out.display(),
+        std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0),
+        canonical.display()
+    );
     Ok(())
 }
 
