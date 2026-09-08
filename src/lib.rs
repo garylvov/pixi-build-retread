@@ -5,6 +5,7 @@
 
 pub mod audit;
 pub mod built_output_store;
+pub mod cli_verbs;
 pub mod compat;
 pub mod concurrency;
 pub mod conda_solve;

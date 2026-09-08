@@ -275,6 +275,23 @@ async fn async_main() -> anyhow::Result<()> {
         };
     }
 
+    // AN UNHANDLED VERB IS A REFUSAL, NOT A SILENT BACKEND START
+    // (N27-RETREAD-65, SHIM-AUTO-2). Every arm above `return`s or
+    // `std::process::exit`s, so an `argv[1]` that reaches this line was
+    // dispatched by NOBODY, and until now it fell through to the transport
+    // below and exited 0 on a closed stdin -- which made C34 job 6066294 arm 3
+    // read a verb its binsnap did not carry as a pass. The condition is
+    // STRUCTURAL (fall-through), not a second copy of the dispatch table; the
+    // decision and its message are `cli_verbs`, which is a library module so
+    // that `cargo test --lib` -- the certifying gate -- actually runs the
+    // guards for it.
+    if let Some(verb) = pixi_build_retread::cli_verbs::verb_candidate(&argv) {
+        anyhow::bail!(pixi_build_retread::cli_verbs::unknown_verb_message(
+            verb,
+            env!("CARGO_PKG_VERSION")
+        ));
+    }
+
     // AUTOMATIC PREFLIGHT. Runs on every RPC invocation before the transport
     // starts, so a misconfigured uv fails here in milliseconds instead of
     // surfacing twenty minutes into a staged build. Diagnostics go to stderr;
