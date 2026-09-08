@@ -8190,32 +8190,49 @@ pub fn python_version_from_conda_url(url: &str) -> Option<&str> {
     if version.is_empty() { None } else { Some(version) }
 }
 
-/// EVERY environment in `pixi.lock`, each with the CPython version it resolved
-/// to on `subdir` -- or `None` when that environment locks no `python` package
-/// at all.
+/// What [`locked_python_versions_by_env`] recovers, and the distinction that
+/// took a real run to find.
 ///
-/// WHY EVERY ENVIRONMENT AND NOT JUST THE RESOLVED ONES (law 9). An environment
-/// whose interpreter cannot be read is the exact case that a single carried
-/// `python_tag` hides: it looks identical to an environment that agrees with
-/// the carried value. Returning `None` for it, by name, is what lets the caller
-/// refuse loudly instead of defaulting.
+/// MEASURED, job 6058035, on the canonical `pixi.lock.MDA-6054364.cert`: 27
+/// environments, and `jetson` locks NOTHING on `linux-64` -- its packages sit
+/// under the v7 platform key `p5`, whose `subdir` is `linux-aarch64`. Collapsing
+/// that into "no `python`, refuse" made the producer refuse the whole canonical
+/// lock over an environment that is not on this platform at all. An environment
+/// that is ABSENT here and an environment that is PRESENT with no interpreter
+/// are opposite facts and must not share a return value.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LockedPythons {
+    /// Environments with at least one package on this subdir. `None` means the
+    /// environment is here and locks no `python` -- the case that must refuse.
+    pub present: BTreeMap<String, Option<String>>,
+    /// Environments the lock has, that lock nothing on this subdir. Not an
+    /// error, and not silence either: it is counted in the producer's row.
+    pub absent: Vec<String>,
+}
+
+/// Every environment in `pixi.lock` split into [`LockedPythons`]: those present
+/// on `subdir` with the CPython they resolved (or `None`), and those absent.
+///
+/// WHY `None` IS KEPT RATHER THAN DROPPED (law 9). An environment whose
+/// interpreter cannot be read is the exact case that a single carried
+/// `python_tag` hides: it looks identical to one that agrees with the carried
+/// value. Returning it by name is what lets the caller refuse loudly.
 ///
 /// Errors only when the lock itself will not parse. A missing `python` is data,
 /// not a parse failure.
-pub fn locked_python_versions_by_env(
-    text: &str,
-    subdir: &str,
-) -> Result<BTreeMap<String, Option<String>>> {
+pub fn locked_python_versions_by_env(text: &str, subdir: &str) -> Result<LockedPythons> {
     let lock: PixiLockFile =
         serde_yaml::from_str(text).context("parsing pixi.lock for per-environment interpreters")?;
     let platform_keys = pixi_lock_platform_keys(&lock, subdir);
-    let mut out: BTreeMap<String, Option<String>> = BTreeMap::new();
+    let mut out = LockedPythons::default();
     for (env, locked_env) in &lock.environments {
         let mut found: Option<String> = None;
+        let mut on_subdir = false;
         for (key, entries) in &locked_env.packages {
             if !platform_keys.contains(key.as_str()) {
                 continue;
             }
+            on_subdir = true;
             for entry in entries {
                 let Some(url) = &entry.conda else { continue };
                 let Some(version) = python_version_from_conda_url(url) else {
@@ -8238,7 +8255,11 @@ pub fn locked_python_versions_by_env(
                 }
             }
         }
-        out.insert(env.clone(), found);
+        if on_subdir {
+            out.present.insert(env.clone(), found);
+        } else {
+            out.absent.push(env.clone());
+        }
     }
     Ok(out)
 }

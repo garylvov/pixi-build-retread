@@ -588,26 +588,39 @@ pub fn python_tag_from_version(version: &str) -> anyhow::Result<String> {
     Ok(format!("cp{major}{minor}"))
 }
 
-/// Every environment in `lock_text`, each with the tag of the interpreter IT
-/// resolved — never one value carried across all of them.
+/// Every environment `lock_text` locks ON `subdir`, each with the tag of the
+/// interpreter IT resolved — never one value carried across all of them, and
+/// never an environment that is not on this platform at all.
 ///
-/// An environment that locks no `python` is returned as an `Err` naming it,
-/// because for THIS caller it is not data: a key field that cannot be measured
-/// is the state SDM-PYTAG-1 exists to stop being papered over.
-pub fn env_python_tags_from_lock(
-    lock_text: &str,
-    subdir: &str,
-) -> anyhow::Result<Vec<EnvPythonTag>> {
-    let by_env = crate::workspace::locked_python_versions_by_env(lock_text, subdir)?;
-    if by_env.is_empty() {
+/// AN ENVIRONMENT PRESENT HERE WITH NO `python` IS AN `Err` NAMING IT: a key
+/// field that cannot be measured is the state SDM-PYTAG-1 exists to stop being
+/// papered over. AN ENVIRONMENT ABSENT FROM THIS SUBDIR IS NOT THAT, and job
+/// 6058035 is why the two are separated — `jetson` locks only `linux-aarch64`
+/// in the canonical workspace, and treating that as an unmeasurable field made
+/// the producer refuse a lock it had read correctly. Absent environments come
+/// back in [`TagSet::absent`] and are counted in the row.
+pub struct TagSet {
+    pub tags: Vec<EnvPythonTag>,
+    /// Environments the lock has that lock nothing on this subdir.
+    pub absent: Vec<String>,
+}
+
+pub fn env_python_tags_from_lock(lock_text: &str, subdir: &str) -> anyhow::Result<TagSet> {
+    let locked = crate::workspace::locked_python_versions_by_env(lock_text, subdir)?;
+    if locked.present.is_empty() {
         anyhow::bail!(
-            "sdist-meta python tag: the lock declares no environments on {subdir}; there is \
-             nothing to derive a per-environment tag from"
+            "sdist-meta python tag: the lock locks no environment on {subdir} (it has {}); \
+             there is nothing to derive a per-environment tag from",
+            if locked.absent.is_empty() {
+                "no environments at all".to_string()
+            } else {
+                locked.absent.join(", ")
+            }
         );
     }
     let mut untagged: Vec<&str> = Vec::new();
-    let mut out = Vec::with_capacity(by_env.len());
-    for (env, version) in &by_env {
+    let mut out = Vec::with_capacity(locked.present.len());
+    for (env, version) in &locked.present {
         let Some(version) = version else {
             untagged.push(env.as_str());
             continue;
@@ -621,13 +634,16 @@ pub fn env_python_tags_from_lock(
     }
     if !untagged.is_empty() {
         anyhow::bail!(
-            "sdist-meta python tag: {} environment(s) lock no `python` on {subdir} and their \
-             key field cannot be measured: {}",
+            "sdist-meta python tag: {} environment(s) lock packages on {subdir} but no \
+             `python`, so their key field cannot be measured: {}",
             untagged.len(),
             untagged.join(", ")
         );
     }
-    Ok(out)
+    Ok(TagSet {
+        tags: out,
+        absent: locked.absent,
+    })
 }
 
 /// The tag of an INSTALLED environment, read from `<prefix>/lib/python<M>.<m>`.
@@ -775,7 +791,7 @@ pub fn parse_tag_args(args: &[String]) -> anyhow::Result<TagArgs> {
 }
 
 /// Resolve the rows a [`TagArgs`] asks for.
-pub fn tag_rows(args: &TagArgs) -> anyhow::Result<Vec<EnvPythonTag>> {
+pub fn tag_rows(args: &TagArgs) -> anyhow::Result<TagSet> {
     match args {
         TagArgs::Lock { lock, subdir, env } => {
             let text = std::fs::read_to_string(lock).map_err(|e| {
@@ -784,43 +800,63 @@ pub fn tag_rows(args: &TagArgs) -> anyhow::Result<Vec<EnvPythonTag>> {
             let all = env_python_tags_from_lock(&text, subdir)?;
             let Some(env) = env else { return Ok(all) };
             let picked: Vec<EnvPythonTag> =
-                all.iter().filter(|t| &t.env == env).cloned().collect();
+                all.tags.iter().filter(|t| &t.env == env).cloned().collect();
             if picked.is_empty() {
+                // NAME WHICH KIND OF ABSENCE IT IS. "no such environment" and
+                // "that environment is not on this platform" send a caller to
+                // two different fixes, and job 6058035 is the run that proved
+                // the second one is real (`jetson`, linux-aarch64 only).
+                let where_ = if all.absent.iter().any(|a| a == env) {
+                    format!("environment `{env}` locks nothing on {subdir}")
+                } else {
+                    format!("no environment `{env}` at all")
+                };
                 anyhow::bail!(
-                    "sdist-meta-python-tags: {} has no environment `{env}` on {subdir}; it has: {}",
+                    "sdist-meta-python-tags: {} has {where_}; on {subdir} it has: {}",
                     lock.display(),
-                    all.iter()
+                    all.tags
+                        .iter()
                         .map(|t| t.env.as_str())
                         .collect::<Vec<_>>()
                         .join(", ")
                 );
             }
-            Ok(picked)
+            Ok(TagSet {
+                tags: picked,
+                absent: all.absent,
+            })
         }
-        TagArgs::Prefix { env, prefix } => Ok(vec![env_python_tag_from_prefix(env, prefix)?]),
+        TagArgs::Prefix { env, prefix } => Ok(TagSet {
+            tags: vec![env_python_tag_from_prefix(env, prefix)?],
+            absent: Vec::new(),
+        }),
     }
 }
 
+
 pub fn run_tags(args: &TagArgs) -> anyhow::Result<i32> {
-    let rows = tag_rows(args)?;
-    for row in &rows {
+    let set = tag_rows(args)?;
+    let rows = &set.tags;
+    for row in rows {
         println!("{}", row.row());
     }
-    let distinct = distinct_tags(&rows);
-    let source = rows
-        .first()
-        .map(|r| r.source.as_str())
-        .unwrap_or("none");
+    let distinct = distinct_tags(rows);
+    let source = rows.first().map(|r| r.source.as_str()).unwrap_or("none");
     // THE SUMMARY IS THE ROW THAT MATTERS TO THE SEEDER. `distinct_tags=1` is
     // the only shape a single overlay can be seeded for under one key; anything
     // higher and the consumer must key per environment or refuse. It is printed
     // rather than enforced here because this verb is the PRODUCER — the policy
     // belongs to the call site (N27-RETREAD-25).
     println!(
-        "{TAG_ROW_STEM} TOTAL envs={} distinct_tags={} tags={} source={source}",
+        "{TAG_ROW_STEM} TOTAL envs={} distinct_tags={} tags={} absent_on_subdir={} source={source}",
         rows.len(),
         distinct.len(),
         distinct.join(","),
+        if set.absent.is_empty() {
+            "0".to_string()
+        } else {
+            format!("{}:{}", set.absent.len(), set.absent.join(","))
+        },
     );
     Ok(0)
 }
@@ -909,8 +945,7 @@ impl Args {
                     subdir: subdir.clone(),
                     env: Some(env.clone()),
                 };
-                let rows = tag_rows(&args)?;
-                let row = rows.into_iter().next().ok_or_else(|| {
+                let row = tag_rows(&args)?.tags.into_iter().next().ok_or_else(|| {
                     anyhow::anyhow!("sdist-meta-key: no tag row for environment `{env}`")
                 })?;
                 (row.python_tag.clone(), Some(row))
@@ -1548,8 +1583,10 @@ mod tests {
 
     #[test]
     fn two_environments_on_two_pythons_derive_two_different_tags() {
-        let rows = env_python_tags_from_lock(two_env_lock(), "linux-64")
+        let set = env_python_tags_from_lock(two_env_lock(), "linux-64")
             .expect("the fixture lock parses");
+        let rows = set.tags;
+        assert!(set.absent.is_empty(), "both environments are on linux-64");
         assert_eq!(rows.len(), 2, "every environment gets a row: {rows:?}");
         let gpu = rows.iter().find(|r| r.env == "gpu").expect("gpu row");
         let legacy = rows.iter().find(|r| r.env == "legacy").expect("legacy row");
@@ -1573,7 +1610,7 @@ mod tests {
     /// cross-interpreter collision the fifth field exists to prevent.
     #[test]
     fn the_per_environment_tags_move_the_entry_key() {
-        let rows = env_python_tags_from_lock(two_env_lock(), "linux-64").unwrap();
+        let rows = env_python_tags_from_lock(two_env_lock(), "linux-64").unwrap().tags;
         let key_for = |tag: &str| {
             entry_key(&KeyInputs {
                 source_digest: "d".repeat(64),
@@ -1608,6 +1645,59 @@ mod tests {
         let error = env_python_tags_from_lock(lock, "linux-64")
             .expect_err("an unmeasurable key field must refuse");
         assert!(error.to_string().contains("headless"), "{error}");
+    }
+
+    /// AN ENVIRONMENT ON ANOTHER PLATFORM IS NOT AN UNMEASURABLE ONE, and it
+    /// took a real run to separate them: job 6058035 drove the producer at the
+    /// canonical `pixi.lock.MDA-6054364.cert` and it REFUSED with
+    /// `1 environment(s) lock no `python` on linux-64 … : jetson` — because
+    /// `jetson`'s packages sit under the lock-v7 platform key whose `subdir` is
+    /// `linux-aarch64`. Refusing a whole 27-environment lock over an
+    /// environment that is not on this platform is the producer being wrong,
+    /// not the lock. This fixture is that shape in miniature.
+    #[test]
+    fn an_environment_absent_on_this_subdir_is_not_a_missing_interpreter() {
+        let lock = "platforms:\n\
+                   - name: p1\n\
+                   \x20 subdir: linux-64\n\
+                   - name: p5\n\
+                   \x20 subdir: linux-aarch64\n\
+                    environments:\n\
+                   \x20 gpu:\n\
+                   \x20   packages:\n\
+                   \x20     p1:\n\
+                   \x20     - conda: https://prefix.dev/conda-forge/linux-64/python-3.12.0-hab00c5b_0_cpython.conda\n\
+                   \x20 jetson:\n\
+                   \x20   packages:\n\
+                   \x20     p5:\n\
+                   \x20     - conda: https://prefix.dev/conda-forge/linux-aarch64/python-3.10.20-h4f76b5d_1_cpython.conda\n\
+                    packages: []\n";
+        let set = env_python_tags_from_lock(lock, "linux-64")
+            .expect("an off-platform environment must not refuse the lock");
+        assert_eq!(set.tags.len(), 1);
+        assert_eq!(set.tags[0].env, "gpu");
+        assert_eq!(set.absent, vec!["jetson".to_string()]);
+
+        // …and asking for it BY NAME still refuses, naming which absence it is.
+        let dir = scratch("aarch64");
+        let path = dir.join("pixi.lock");
+        std::fs::write(&path, lock).unwrap();
+        let error = tag_rows(&TagArgs::Lock {
+            lock: path,
+            subdir: "linux-64".to_string(),
+            env: Some("jetson".to_string()),
+        })
+        .expect_err("an off-platform environment has no tag on this subdir");
+        assert!(
+            error.to_string().contains("locks nothing on linux-64"),
+            "the refusal must say WHICH absence it is: {error}"
+        );
+
+        // The same lock read on the OTHER subdir flips which is which.
+        let other = env_python_tags_from_lock(lock, "linux-aarch64").unwrap();
+        assert_eq!(other.tags.len(), 1);
+        assert_eq!(other.tags[0].python_tag, "cp310");
+        assert_eq!(other.absent, vec!["gpu".to_string()]);
     }
 
     #[test]
