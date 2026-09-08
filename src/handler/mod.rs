@@ -5043,6 +5043,21 @@ impl Handler {
                 .map_err(|e| RpcError::invalid_params(e.to_string()))?;
         }
 
+        // N27-RETREAD-113: subpackage-enumeration rules are shape-checked here
+        // too, so a malformed `glob` or a duplicate `exclude` refuses at
+        // initialize time -- before any clone is attempted for it.
+        for (rule_name, rule) in &config.subpackages {
+            rule.validate(rule_name)
+                .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+            if !config.git_sources.contains_key(&rule.from) {
+                return Err(RpcError::invalid_params(format!(
+                    "retread-subpackages `{rule_name}`: `from = \"{}\"` names no \
+                     [retread-git-sources] entry",
+                    rule.from
+                )));
+            }
+        }
+
         // v4.4.0: the `retread-resolver` knob was removed -- uv is the only
         // resolver. The legacy cascade/resolvo mirror-solver was deleted in
         // v4.2.0. The field is still parsed (so old manifests load under
@@ -5133,6 +5148,65 @@ impl Handler {
         // when there's no workspace directory or no ledger yet.
         if let Some(ws) = workspace_dir.as_deref() {
             crate::pack_overrides::merge_ledger_overrides(&mut config, ws, &params.manifest_path);
+        }
+
+        // N27-RETREAD-113: expand `[retread-subpackages]` rules into ordinary
+        // `[retread-wheels]` entries HERE -- before `config` is stored in
+        // handler state -- so every downstream reader (resolve_all, the
+        // incremental-add matcher, `courier::config_fingerprint`'s
+        // `declared_config`, the recipe emitter) sees exactly the entries a
+        // hand-typed pack would have declared and knows nothing about rules.
+        // Expanding once at the single point where the config becomes state is
+        // what keeps the two resolve paths from disagreeing about a pack's
+        // wheel set.
+        //
+        // Identity: the derived entries carry the same `from` + `subdirectory`
+        // + `extras` the typed entries carried, and the rules table is consumed
+        // (left empty), so `config_fingerprint` -- which digests wheel entries
+        // field by field and never sees the rules -- produces the SAME
+        // fingerprint as the pre-transform manifest. A pack converted to a rule
+        // must therefore reuse its existing built wheels and built-output store
+        // keys; a change there would mean the transform was not a rename.
+        if !config.subpackages.is_empty() {
+            let cache_dir = params.cache_directory.as_path();
+            let mut leases = Vec::new();
+            let mut checkouts: std::collections::BTreeMap<String, (String, PathBuf)> =
+                Default::default();
+            for (rule_name, rule) in &config.subpackages {
+                let src = config.git_sources.get(&rule.from).ok_or_else(|| {
+                    RpcError::invalid_params(format!(
+                        "retread-subpackages `{rule_name}`: `from = \"{}\"` names no \
+                         [retread-git-sources] entry",
+                        rule.from
+                    ))
+                })?;
+                // The rev is already pinned by the pack; this is the same
+                // checkout every `from = "<name>"` entry builds out of, so a
+                // rule costs no extra fetch.
+                let checkout =
+                    crate::source_build::ensure_git_checkout(&src.url, &src.rev, cache_dir)
+                        .await
+                        .map_err(|error| {
+                            RpcError::internal(format!(
+                                "retread-subpackages `{rule_name}`: materializing {} @ {}: \
+                                 {error:#}",
+                                src.url, src.rev
+                            ))
+                        })?;
+                checkouts.insert(
+                    rule_name.clone(),
+                    (src.rev.clone(), checkout.root().to_path_buf()),
+                );
+                // Hold the reader lease until the enumeration has read the tree.
+                leases.push(checkout);
+            }
+            let rows = crate::subpackages::expand(&mut config, &checkouts)
+                .map_err(|error| RpcError::invalid_params(format!("{error:#}")))?;
+            drop(leases);
+            for row in rows {
+                println!("{row}");
+                tracing::info!("{row}");
+            }
         }
 
         let mut state = self.state.write().await;

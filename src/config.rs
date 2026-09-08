@@ -751,6 +751,39 @@ pub struct RetreadConfig {
     #[serde(default, rename = "retread-git-sources", alias = "git-sources")]
     pub git_sources: BTreeMap<String, NamedGitSource>,
 
+    /// v4.13.0 (N27-RETREAD-113): tree subpackage enumeration rules, keyed by
+    /// rule name. ONE declaration replaces the hand-typed enumeration of a
+    /// monorepo's subpackages that nine packs were each re-typing as 5-15
+    /// `[retread-wheels]` entries differing only in `subdirectory`.
+    ///
+    /// A rule names a `[retread-git-sources]` entry (`from`) and a tree-level
+    /// enumeration rule (`glob`, of the shape `<prefix>/*` or `*`). At
+    /// resolution time retread checks out the source's pinned rev, enumerates
+    /// the directories the glob selects, keeps those that carry a Python build
+    /// file ([`SUBPACKAGE_BUILD_FILES`]), and synthesizes one `[retread-wheels]`
+    /// entry per kept directory -- `from` = the rule's source, `subdirectory` =
+    /// the enumerated path, entry key = the directory name with `_` -> `-`.
+    ///
+    /// ```toml
+    /// [package.build.config.retread-git-sources.isaaclab]
+    /// url = "https://github.com/isaac-sim/IsaacLab.git"
+    /// rev = "37ddf626871758333d6ed89cf64ad702aef127d0"
+    ///
+    /// [package.build.config.retread-subpackages]
+    /// isaaclab = { from = "isaaclab", glob = "source/*", expect = 5, exclude = ["isaaclab_contrib"], extras = { isaaclab_rl = ["all"] } }
+    /// ```
+    ///
+    /// `expect` is REQUIRED and is the number of subpackages the rule includes
+    /// after `exclude` is applied. It is the whole safety property: the tree is
+    /// enumerated, but a tree that gains a subpackage (an upstream addition, or
+    /// an operator bumping `rev`) does NOT silently gain a wheel -- the arity
+    /// stops matching and retread refuses, naming the included set. Inclusion of
+    /// a new subpackage is a decision the pack has to write down. A name in
+    /// `exclude` that the tree does not contain refuses the same way, so a
+    /// removal or rename upstream is equally loud.
+    #[serde(default, rename = "retread-subpackages", alias = "subpackages")]
+    pub subpackages: BTreeMap<String, SubpackageRule>,
+
     /// Conda build number for the produced packages. Bump to force
     /// re-resolution downstream after a policy change.
     #[serde(default, rename = "retread-build-number", alias = "build-number")]
@@ -1647,6 +1680,110 @@ pub enum GitSubmodules {
     /// the Python distribution does not package (vendored C++ sources,
     /// hardware SDKs, docs), which the build's own packaging config decides.
     Ignore,
+}
+
+/// One tree-enumeration rule: "this pack draws its subpackages from THAT tree,
+/// by THIS rule" -- see [`RetreadConfig::subpackages`].
+///
+/// Expanded by [`crate::subpackages::expand`] into ordinary [`WheelEntry`]
+/// values before anything downstream reads `retread_wheels`, so every consumer
+/// of a source-built entry -- the resolver, `pip wheel`, the auto-data walk,
+/// the courier spec -- sees exactly the entries a hand-typed pack would have
+/// produced and needs no knowledge of this rule.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct SubpackageRule {
+    /// Name of the `[retread-git-sources]` entry supplying the tree's
+    /// `url` + `rev`. The tree is declared ONCE, here.
+    pub from: String,
+
+    /// The enumeration rule over the tree, of the shape `<prefix>/*` (e.g.
+    /// `source/*`) or bare `*` (the repo root's children). Exactly one `*`,
+    /// always the final path component: this is a tree-level enumeration, not
+    /// a general glob, and anything else is a load error naming the rule.
+    pub glob: String,
+
+    /// Number of subpackages this rule contributes AFTER `exclude`. Required.
+    /// A mismatch refuses the build -- see [`RetreadConfig::subpackages`].
+    pub expect: usize,
+
+    /// Directory names (as they appear in the tree, e.g. `isaaclab_contrib`,
+    /// NOT the `-` entry key) the pack deliberately does not build. Every name
+    /// listed must exist in the tree, so a stale exclusion is loud.
+    #[serde(default)]
+    pub exclude: Vec<String>,
+
+    /// Per-subpackage `extras`, keyed by the same tree directory name. This is
+    /// intent -- which optional dependency groups this pack wants -- and stays
+    /// typed; only the enumeration itself is derived. Every key must name an
+    /// INCLUDED subpackage.
+    #[serde(default)]
+    pub extras: BTreeMap<String, Vec<String>>,
+}
+
+impl SubpackageRule {
+    /// The glob's fixed prefix (`source/*` -> `Some("source")`, `*` -> `None`)
+    /// after checking the shape. Called at initialize time so a malformed rule
+    /// refuses before any clone is attempted.
+    pub fn glob_prefix(&self, rule_name: &str) -> Result<Option<&str>> {
+        let glob = self.glob.trim();
+        if glob != self.glob {
+            return Err(anyhow!(
+                "retread-subpackages `{rule_name}`: `glob` must not have leading \
+                 or trailing whitespace"
+            ));
+        }
+        if glob.matches('*').count() != 1 {
+            return Err(anyhow!(
+                "retread-subpackages `{rule_name}`: `glob = \"{glob}\"` must contain \
+                 exactly one `*` (this enumerates one directory level, it is not a \
+                 general glob)"
+            ));
+        }
+        if glob == "*" {
+            return Ok(None);
+        }
+        let Some(prefix) = glob.strip_suffix("/*") else {
+            return Err(anyhow!(
+                "retread-subpackages `{rule_name}`: `glob = \"{glob}\"` must be `*` or \
+                 end in `/*` -- the `*` is the final path component"
+            ));
+        };
+        if prefix.is_empty()
+            || prefix.starts_with('/')
+            || prefix.contains('\\')
+            || std::path::Path::new(prefix)
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return Err(anyhow!(
+                "retread-subpackages `{rule_name}`: `glob = \"{glob}\"` prefix must be a \
+                 relative path inside the tree without `.` or `..` components"
+            ));
+        }
+        Ok(Some(prefix))
+    }
+
+    /// Shape checks that need no tree. Run at initialize time alongside
+    /// [`WheelEntry::validate`].
+    pub fn validate(&self, rule_name: &str) -> Result<()> {
+        if self.from.trim().is_empty() {
+            return Err(anyhow!(
+                "retread-subpackages `{rule_name}`: `from` must name a \
+                 [retread-git-sources] entry"
+            ));
+        }
+        self.glob_prefix(rule_name)?;
+        let mut seen = std::collections::BTreeSet::new();
+        for name in &self.exclude {
+            if !seen.insert(name.as_str()) {
+                return Err(anyhow!(
+                    "retread-subpackages `{rule_name}`: `exclude` lists `{name}` twice"
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl WheelEntry {
