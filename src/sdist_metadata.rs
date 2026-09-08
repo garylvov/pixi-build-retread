@@ -599,6 +599,7 @@ pub fn python_tag_from_version(version: &str) -> anyhow::Result<String> {
 /// in the canonical workspace, and treating that as an unmeasurable field made
 /// the producer refuse a lock it had read correctly. Absent environments come
 /// back in [`TagSet::absent`] and are counted in the row.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TagSet {
     pub tags: Vec<EnvPythonTag>,
     /// Environments the lock has that lock nothing on this subdir.
