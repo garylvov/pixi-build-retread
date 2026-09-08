@@ -590,17 +590,141 @@ pub fn materialize_declared_path_sources(
              must be the one the workspace manifest declares."
         );
     };
-    let outcomes = generate_shims(&pack_dir, workspace_root, records_dir, None)?;
-    if outcomes.is_empty() {
+    // ONE AUTHORITY FOR "WHAT THE RECORDS ARE" (N27-RETREAD-115). This used to
+    // call `generate_shims`, which loads `<pack>/<records_dir>/<project>.toml`
+    // from disk and refused when that directory was empty. SHIM-AUTO-3 made the
+    // `path-source-manifest` verb DERIVE the same records from the workspace
+    // manifest plus the trees' own metadata and stopped writing those files, so
+    // the two producers of one capability read two different paths and the gate
+    // key became a lock-killing precondition with no producer: C36 arm 3
+    // (job 6082196) died at the first `initialize` RPC in 0.17 s of CPU on the
+    // refusal this block used to raise. The backend now runs the SAME
+    // derivation, so `retread-path-source-metadata = true` is a gate WITH a
+    // producer and no file has to exist anywhere.
+    let manifest_file = workspace_root.join("pixi.toml");
+    let manifest_text = std::fs::read_to_string(&manifest_file)
+        .with_context(|| format!("reading {}", manifest_file.display()))?;
+    let backend = backend_records(&pack_dir, workspace_root, records_dir, &manifest_text)?;
+    if backend.records.is_empty() {
         bail!(
-            "retread-path-source-metadata = true but {}/{} holds no \
-             <project>.toml record. A gate with no producer is a defect: either \
-             write the records or drop the key.",
+            "retread-path-source-metadata = true but {} declares no \
+             `[pypi-dependencies]` path source pointing into {}/{}. The records \
+             are DERIVED from the manifest and the trees — the same derivation \
+             `path-source-manifest` runs — so nothing under {}/{} is required or \
+             read to satisfy this key. A gate with no producer is a defect: lock \
+             the EFFECTIVE manifest (`pixi-build-retread path-source-manifest \
+             --pack {} --workspace {} --out <file>`) or drop the key.{}",
+            manifest_file.display(),
             pack_dir.display(),
-            records_dir
+            SHIMS_DIR,
+            pack_dir.display(),
+            records_dir,
+            pack_dir.display(),
+            workspace_root.display(),
+            if backend.elsewhere.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " Derived beside this pack but declared at no shim of it: {}.",
+                    backend.elsewhere.join(", ")
+                )
+            }
         );
     }
+    // THE ROW. A derivation nobody can read back is the same defect as a record
+    // nobody wrote, so the backend prints what it derived before it writes.
+    tracing::info!("{}", backend.row(&pack_dir));
+    let outcomes = generate_shims_from(
+        &pack_dir,
+        workspace_root,
+        None,
+        &manifest_text,
+        &backend.records,
+    )?;
     Ok(outcomes)
+}
+
+/// The records ONE pack's backend stands behind, derived — never loaded.
+///
+/// [`derive_records`] answers "which source does which pack stand in for" from
+/// the manifest's SCOPES, which is the right question for the verb because the
+/// verb is given every pack at once and can break a tie with
+/// `pack_builds_project`. A backend is given exactly one pack and cannot see
+/// the others, so a source co-declared beside two packs would be derived for
+/// whichever pack happened to be asking. The manifest itself settles it: an
+/// effective manifest points each source at exactly one pack's
+/// `sources/<project>`, so a derived record whose shim THIS pack's directory
+/// does not own belongs to another pack's backend and is reported, never
+/// written. It is the same reader/writer tie `materialize_one` enforces one
+/// level down, asked as a selection instead of a refusal.
+#[derive(Debug, Clone)]
+pub struct BackendRecords {
+    /// The records this pack must materialise, in project order.
+    pub records: Vec<PathSourceRecord>,
+    /// How many of them a record file on disk CONFIRMED field-for-field.
+    pub confirmed: usize,
+    /// Sources derived beside this pack whose shim the manifest points
+    /// elsewhere — another pack's backend owns them.
+    pub elsewhere: Vec<String>,
+}
+
+impl BackendRecords {
+    /// The evidence row, printed by `initialize` before anything is written.
+    pub fn row(&self, pack_dir: &Path) -> String {
+        format!(
+            "### PATH SOURCE RECORDS backend derived={} confirmed={} source={} pack={} elsewhere={}",
+            self.records.len(),
+            self.confirmed,
+            if !self.records.is_empty() && self.confirmed == self.records.len() {
+                "file"
+            } else {
+                "derived"
+            },
+            pack_dir.display(),
+            if self.elsewhere.is_empty() {
+                "none".to_string()
+            } else {
+                self.elsewhere.join(",")
+            },
+        )
+    }
+}
+
+/// Derive the records for one pack. See [`BackendRecords`].
+pub fn backend_records(
+    pack_dir: &Path,
+    workspace_root: &Path,
+    records_dir: &str,
+    manifest_text: &str,
+) -> Result<BackendRecords> {
+    let canonical_root = workspace_root
+        .canonicalize()
+        .with_context(|| format!("canonicalizing {}", workspace_root.display()))?;
+    let packs = [pack_dir.to_path_buf()];
+    let derivation = derive_records(&packs, workspace_root, records_dir, manifest_text)?;
+    let mut records = Vec::new();
+    let mut confirmed = 0usize;
+    let mut elsewhere = derivation.elsewhere;
+    for record in derivation.records {
+        let shim_rel = pathdiff_from_root(&canonical_root, &record.shim)?;
+        if declares_path(manifest_text, &shim_rel) {
+            if record.confirmed {
+                confirmed += 1;
+            }
+            records.push(record.record);
+        } else {
+            elsewhere.push(format!(
+                "{} (this pack's shim would be \"{shim_rel}\", which the manifest \
+                 does not declare)",
+                record.record.project
+            ));
+        }
+    }
+    Ok(BackendRecords {
+        records,
+        confirmed,
+        elsewhere,
+    })
 }
 
 /// Generate (or refresh) every shim this pack's records describe.
@@ -1341,6 +1465,24 @@ fn pack_builds_project(pack_dir: &Path, project: &str) -> Result<bool> {
         .any(|k| normalize_dist_name(k) == normalize_dist_name(project)))
 }
 
+/// What one derivation produced: the records, and every source it deliberately
+/// did NOT claim.
+///
+/// `elsewhere` exists because the derivation is now run by TWO callers with
+/// different visibility. The verb is handed every pack at once and can break a
+/// two-pack tie with `pack_builds_project`; a BACKEND is handed exactly one
+/// pack and cannot see its siblings, so a source co-declared beside two packs
+/// (`pm-isaaclab` declares `isaaclab-2.3x-pack` and `protomotions-deps-pack`
+/// side by side) would otherwise be claimed by whichever backend asked. A
+/// dropped source with no row is exactly the silent miss this capability
+/// exists to make impossible, so it is carried out and every caller states
+/// what it does with it.
+#[derive(Debug, Clone, Default)]
+pub struct Derivation {
+    pub records: Vec<DerivedRecord>,
+    pub elsewhere: Vec<String>,
+}
+
 /// A manifest entry that already points at a generated shim: recover the real
 /// tree it stands for from the shim's own `package-dir`.
 ///
@@ -1404,12 +1546,15 @@ fn real_tree_behind_shim(shim_dir: &Path, canonical_root: &Path) -> Result<Strin
 /// 4. One candidate pack wins outright. More than one is decided by
 ///    [`pack_builds_project`], and anything that does not leave exactly one
 ///    REFUSES naming every candidate.
+/// 5. A source the manifest already points at ANOTHER pack's generated shim
+///    belongs to that pack and is carried out in [`Derivation::elsewhere`],
+///    never claimed and never silently dropped.
 pub fn derive_records(
     packs: &[PathBuf],
     workspace_root: &Path,
     records_dir: &str,
     manifest_text: &str,
-) -> Result<Vec<DerivedRecord>> {
+) -> Result<Derivation> {
     let canonical_root = workspace_root
         .canonicalize()
         .with_context(|| format!("canonicalizing {}", workspace_root.display()))?;
@@ -1478,6 +1623,7 @@ pub fn derive_records(
     }
 
     let mut derived = Vec::new();
+    let mut elsewhere = Vec::new();
     for (project, (declared_path, scopes, mut pack_candidates)) in candidates {
         if pack_candidates.len() > 1 {
             let mut builders = Vec::new();
@@ -1515,6 +1661,27 @@ pub fn derive_records(
             .as_ref()
             .zip(shim.canonicalize().ok())
             .is_some_and(|(d, s)| *d == s);
+        // ANOTHER PACK'S SHIM. The manifest already points this source at a
+        // generated `sources/<project>` that is not this pack's, so the pack
+        // that stands in for it is that one, not this one. Deriving it here
+        // would read a shim directory as if it were a source tree — a shim
+        // states no version anywhere `tree_facts` looks — and would then write
+        // a second, competing shim for one source. Carried out as a row.
+        let declared_is_other_shim = !inside_shim
+            && declared
+                .as_ref()
+                .and_then(|d| d.parent())
+                .and_then(|p| p.file_name())
+                .and_then(|s| s.to_str())
+                == Some(SHIMS_DIR);
+        if declared_is_other_shim {
+            elsewhere.push(format!(
+                "{project} (the manifest declares it at \"{declared_path}\", another \
+                 pack's generated shim; {} does not stand in for it)",
+                pack.display()
+            ));
+            continue;
+        }
         let real_path = if inside_shim {
             real_tree_behind_shim(&shim, &canonical_root)?
         } else {
@@ -1575,7 +1742,10 @@ pub fn derive_records(
             shim,
         });
     }
-    Ok(derived)
+    Ok(Derivation {
+        records: derived,
+        elsewhere,
+    })
 }
 /// The canonical manifest, transformed. `text` is what gets locked.
 #[derive(Debug, Clone)]
@@ -1649,7 +1819,20 @@ pub fn plan_effective_manifest(
         }
     }
 
-    let derived = derive_records(packs, workspace_root, records_dir, manifest_text)?;
+    let derivation = derive_records(packs, workspace_root, records_dir, manifest_text)?;
+    // The verb is given EVERY pack, so a source it declined to claim was
+    // declared at the shim of a pack nobody named. Repointing nothing and
+    // saying nothing is the silent miss; refusing names both halves.
+    if !derivation.elsewhere.is_empty() {
+        bail!(
+            "the workspace manifest points {} at a generated shim of a pack that \
+             was not named on this command line. Either name that pack with \
+             --pack or repoint the source at its real tree: {}",
+            derivation.elsewhere.len(),
+            derivation.elsewhere.join("; ")
+        );
+    }
+    let derived = derivation.records;
 
     // A named pack that stands in for nothing is a gate with no producer: the
     // argument list and the manifest disagree and one of them is stale.
@@ -1851,15 +2034,33 @@ mod tests {
     const PACK_REL: &str = "pypi-packs/isaaclab-2.3x-pack";
     const SHIM_REL: &str = "pypi-packs/isaaclab-2.3x-pack/sources/pace-sim2real";
 
-    /// A workspace whose manifest points `pace_sim2real` at the SHIM (which is
-    /// what p6m-b's manifest change does), a pack directory, and a real tree
-    /// carrying its own `*.egg-info/PKG-INFO` — pace-sim2real's live shape.
+    /// A workspace in the shape a BACKEND actually meets: the EFFECTIVE
+    /// manifest (`pace_sim2real` already pointing at the shim), the pack
+    /// declared beside it as a conda path dependency, a real tree carrying its
+    /// own `*.egg-info/PKG-INFO`, and a STALE shim from a previous run.
+    ///
+    /// Every one of those four is load-bearing now that the records are DERIVED
+    /// rather than loaded (N27-RETREAD-115), and each was absent from the
+    /// fixture this replaces:
+    ///   * the `[dependencies]` entry is what makes the pack a pack of this
+    ///     scope — `derive_records` shims a source only when some scope
+    ///     declares BOTH it and the pack, and a fixture without it derived
+    ///     nothing while production derived two;
+    ///   * `[package.build.config.retread-wheels]` in the pack manifest is the
+    ///     fact that breaks a two-pack tie, which is production's shape;
+    ///   * the stale shim is how an already-effective manifest still names its
+    ///     real tree (`real_tree_behind_shim`), and it is what the verb leaves
+    ///     behind for the backend in the same job. Its metadata is deliberately
+    ///     WRONG so regeneration is a write and the idempotence guard still has
+    ///     two distinguishable outcomes to assert.
     fn workspace(label: &str) -> PathBuf {
         let root = test_dir(label);
         std::fs::write(
             root.join("pixi.toml"),
             format!(
-                "[workspace]\nname = \"ws\"\n\n[pypi-dependencies]\n\
+                "[workspace]\nname = \"ws\"\n\n[dependencies]\n\
+                 \"isaaclab-2.3x-pack\" = {{ path = \"{PACK_REL}\" }}\n\n\
+                 [pypi-dependencies]\n\
                  pace_sim2real = {{ path = \"{SHIM_REL}\", editable = true }}\n"
             ),
         )
@@ -1881,8 +2082,31 @@ mod tests {
         )
         .unwrap();
         std::fs::create_dir_all(root.join(PACK_REL)).unwrap();
-        std::fs::write(root.join(PACK_REL).join("pixi.toml"), "[package]\n").unwrap();
+        std::fs::write(
+            root.join(PACK_REL).join("pixi.toml"),
+            "[package]\n\n[package.build.config.retread-wheels]\n\
+             \"pace-sim2real\" = { version = \"==1.0.0\" }\n",
+        )
+        .unwrap();
+        stale_shim(&root);
         root
+    }
+
+    /// The shim a previous run left behind, with STALE metadata. Only its
+    /// `package-dir` has to be right: that is the one field
+    /// `real_tree_behind_shim` reads back to recover the real tree an already
+    /// effective manifest no longer names.
+    fn stale_shim(root: &Path) {
+        let dir = root.join(SHIM_REL);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut stale = pace_entry();
+        stale.version = "0.0.0-stale".to_string();
+        let rel_to_real = relative_from_shim(SHIM_REL, PACE_REL);
+        std::fs::write(
+            dir.join("pyproject.toml"),
+            render_shim_pyproject("pace-sim2real", &stale, &rel_to_real),
+        )
+        .unwrap();
     }
 
     fn pace_entry() -> PathSourceEntry {
@@ -2069,12 +2293,14 @@ mod tests {
         assert!(!fake.join(SHIMS_DIR).exists(), "it created a shim anyway");
     }
 
-    /// GUARD 4 — drift on `version`. The record is a claim about a tree that
-    /// upstream bumps; a stale claim is a lock that names a version the
-    /// installed tree does not have. The refusal names the RECORD FILE (what to
-    /// edit) and the tree file that disagrees.
+    /// GUARD 4 — a record file that DISAGREES with the tree, met on the BACKEND
+    /// path. The record is no longer the source of truth: the derivation is,
+    /// and a file beside the pack may only confirm it. So a stale `version` in
+    /// a file is a loud refusal naming the file and BOTH values, and it fires
+    /// inside `Handler::initialize`'s own call and not only in the CLI verb —
+    /// which is the half N27-RETREAD-115 found had no coverage at all.
     #[test]
-    fn a_record_whose_version_drifts_from_the_tree_is_refused_naming_both_files() {
+    fn a_record_file_that_disagrees_with_the_tree_is_refused_on_the_backend_path() {
         let root = workspace("drift-version");
         let mut entry = pace_entry();
         entry.version = "0.9.9".to_string();
@@ -2094,12 +2320,20 @@ mod tests {
             "must name the file to edit: {text}"
         );
         assert!(
-            text.contains("PKG-INFO"),
-            "must name the tree file that disagrees: {text}"
+            text.contains("disagrees with the tree"),
+            "must say the record lost to the derivation: {text}"
         );
         assert!(
-            !root.join(SHIM_REL).exists(),
-            "a drifted record must not produce a shim"
+            text.contains(PACE_REL),
+            "must name the tree it disagrees with: {text}"
+        );
+        // The stale shim from the previous run is still exactly as it was: a
+        // refusal writes nothing.
+        assert!(
+            std::fs::read_to_string(root.join(SHIM_REL).join("pyproject.toml"))
+                .unwrap()
+                .contains("0.0.0-stale"),
+            "a refused run rewrote the shim"
         );
     }
 
@@ -2130,11 +2364,13 @@ mod tests {
             )
             .expect_err("drift on {label} must be refused");
             let text = format!("{error:#}");
+            assert!(text.contains("disagrees with the tree"), "{label}: {text}");
             assert!(
-                text.contains("path-source record drift"),
-                "{label}: {text}"
+                std::fs::read_to_string(root.join(SHIM_REL).join("pyproject.toml"))
+                    .unwrap()
+                    .contains("0.0.0-stale"),
+                "{label}: shim written anyway"
             );
-            assert!(!root.join(SHIM_REL).exists(), "{label}: shim written anyway");
         }
     }
 
@@ -2205,11 +2441,18 @@ mod tests {
     #[test]
     fn a_shim_the_workspace_manifest_does_not_declare_is_refused() {
         let root = workspace("undeclared");
-        // point the manifest back at the real tree, as it reads before p6m-b
+        // Point the manifest back at the real tree, as it reads before p6m-b --
+        // i.e. the CANONICAL manifest, which is what a lock driver that sets the
+        // gate key without generating the effective manifest hands the backend.
+        // That is C36 arm 3's shape with the gate key kept, and it must refuse
+        // naming the shim path to declare rather than write a directory nothing
+        // resolves.
         std::fs::write(
             root.join("pixi.toml"),
             format!(
-                "[workspace]\nname = \"ws\"\n\n[pypi-dependencies]\n\
+                "[workspace]\nname = \"ws\"\n\n[dependencies]\n\
+                 \"isaaclab-2.3x-pack\" = {{ path = \"{PACK_REL}\" }}\n\n\
+                 [pypi-dependencies]\n\
                  pace_sim2real = {{ path = \"{PACE_REL}\", editable = true }}\n"
             ),
         )
@@ -2223,30 +2466,60 @@ mod tests {
         .expect_err("an undeclared shim must be refused");
         let text = format!("{error:#}");
         assert!(text.contains(SHIM_REL), "must name the path to declare: {text}");
-        assert!(!root.join(SHIM_REL).exists());
+        assert!(
+            text.contains("A gate with no producer is a defect"),
+            "the refusal must still state the law it enforces: {text}"
+        );
+        assert!(
+            text.contains("path-source-manifest"),
+            "the refusal must name the actuator that fixes it: {text}"
+        );
     }
 
     /// GUARD 9 — a record whose `path` escapes the workspace root is refused
     /// before anything is read or written.
+    ///
+    /// Driven through `generate_shims_from`, the ONE writer, with the record
+    /// handed in. That is deliberate and it is the only honest way to drive it
+    /// now: the derivation cannot produce such a record (it reads `path` out of
+    /// the manifest, under the root), so on the backend path a `..` in a FILE
+    /// is caught one step earlier as a disagreement. The escape check still
+    /// guards every caller of the writer — `path-source-refresh --shims` reads
+    /// files and reaches it with whatever they say — and a guard that could no
+    /// longer fail would be a defect, so it is pointed at the caller that can
+    /// still reach it.
     #[test]
     fn a_path_escaping_the_workspace_root_is_refused() {
         let root = workspace("escape");
         let mut entry = pace_entry();
         entry.path = "../elsewhere".to_string();
-        write_record(&root, "pace-sim2real", &entry);
-        let error = materialize_declared_path_sources(
-            &config(Some(true)),
-            Some(&root),
-            Some(&pack_manifest(&root)),
+        let file = write_record(&root, "pace-sim2real", &entry);
+        let manifest_text = std::fs::read_to_string(root.join("pixi.toml")).unwrap();
+        let record = PathSourceRecord {
+            project: "pace-sim2real".to_string(),
+            file,
+            entry,
+        };
+        let error = generate_shims_from(
+            &root.join(PACK_REL),
+            &root,
+            None,
+            &manifest_text,
+            std::slice::from_ref(&record),
         )
         .expect_err("`..` must be refused");
         assert!(format!("{error:#}").contains("may not escape the workspace root"));
     }
 
-    /// GUARD 10 — the gate. Off (the default) writes nothing at all, so merging
-    /// this changes no existing lock; on with no record is an error rather than
-    /// a silent no-op, because a gate with no producer is the defect this
-    /// campaign keeps re-finding.
+    /// GUARD 10 — the gate, both directions, and the direction that INVERTED
+    /// at N27-RETREAD-115.
+    ///
+    /// OFF (the default) still writes nothing at all, so merging this changes
+    /// no existing lock. ON with NO record file anywhere used to be the fatal
+    /// refusal that killed C36 arm 3's lock in 0.17 s; it is now the ordinary
+    /// production path, because the records are derived. `source=derived` in
+    /// the row is what says the shim came from the derivation and not from a
+    /// file — the distinction the whole campaign turns on.
     #[test]
     fn the_gate_governs_both_directions() {
         let root = workspace("gate-off");
@@ -2255,16 +2528,192 @@ mod tests {
             materialize_declared_path_sources(&config(None), Some(&root), Some(&pack_manifest(&root)))
                 .unwrap();
         assert!(outcomes.is_empty());
-        assert!(!root.join(SHIM_REL).exists());
+        assert!(
+            std::fs::read_to_string(root.join(SHIM_REL).join("pyproject.toml"))
+                .unwrap()
+                .contains("0.0.0-stale"),
+            "the gate was off and the shim was regenerated anyway"
+        );
 
         let bare = workspace("gate-on-empty");
-        let error = materialize_declared_path_sources(
+        assert_eq!(
+            find_records(&bare),
+            0,
+            "the point of this guard is that NO record file exists"
+        );
+        let outcomes = materialize_declared_path_sources(
             &config(Some(true)),
             Some(&bare),
             Some(&pack_manifest(&bare)),
         )
-        .expect_err("gate on with no records must be an error");
-        assert!(format!("{error:#}").contains("A gate with no producer is a defect"));
+        .expect("gate on with no record file is production's shape, not an error");
+        assert_eq!(outcomes.len(), 1);
+        assert!(matches!(outcomes[0], PathSourceOutcome::Written { .. }));
+        assert_eq!(
+            find_records(&bare),
+            0,
+            "satisfying the gate must not write a record file"
+        );
+
+        let manifest_text = std::fs::read_to_string(bare.join("pixi.toml")).unwrap();
+        let derived = backend_records(
+            &bare.join(PACK_REL),
+            &bare,
+            RECORDS_DIR_DEFAULT,
+            &manifest_text,
+        )
+        .unwrap();
+        assert_eq!(derived.records.len(), 1);
+        assert_eq!(derived.confirmed, 0);
+        assert_eq!(derived.records[0].entry, pace_entry());
+        let row = derived.row(&bare.join(PACK_REL));
+        assert!(
+            row.starts_with("### PATH SOURCE RECORDS backend derived=1 confirmed=0 source=derived"),
+            "{row}"
+        );
+
+        // And with the file back beside the pack the SAME shim is produced and
+        // the row says `file` — the two producers cannot drift because there is
+        // only one, and the file only confirms it.
+        let shim = bare.join(SHIM_REL).join("pyproject.toml");
+        let bytes = std::fs::read_to_string(&shim).unwrap();
+        write_record(&bare, "pace-sim2real", &pace_entry());
+        let again = materialize_declared_path_sources(
+            &config(Some(true)),
+            Some(&bare),
+            Some(&pack_manifest(&bare)),
+        )
+        .expect("a record that agrees must confirm, not refuse");
+        assert!(matches!(again[0], PathSourceOutcome::Unchanged { .. }));
+        assert_eq!(bytes, std::fs::read_to_string(&shim).unwrap());
+        let confirmed = backend_records(
+            &bare.join(PACK_REL),
+            &bare,
+            RECORDS_DIR_DEFAULT,
+            &manifest_text,
+        )
+        .unwrap();
+        assert_eq!(confirmed.confirmed, 1);
+        assert!(
+            confirmed
+                .row(&bare.join(PACK_REL))
+                .contains("derived=1 confirmed=1 source=file"),
+            "{}",
+            confirmed.row(&bare.join(PACK_REL))
+        );
+    }
+
+    /// How many `<project>.toml` records exist anywhere under the workspace.
+    /// The claim "no file was read" is only worth making if the absence is
+    /// measured rather than assumed.
+    fn find_records(root: &Path) -> usize {
+        let mut n = 0;
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&d) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p
+                    .parent()
+                    .and_then(|d| d.file_name())
+                    .and_then(|s| s.to_str())
+                    == Some(RECORDS_DIR_DEFAULT)
+                    && p.extension().and_then(|s| s.to_str()) == Some("toml")
+                {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    /// GUARD 10b — a source co-declared beside this pack whose shim the
+    /// manifest points into ANOTHER pack is not this backend's to write.
+    ///
+    /// This is the one question the verb never has to ask and a backend always
+    /// does: `pm-isaaclab` declares `isaaclab-2.3x-pack` and
+    /// `protomotions-deps-pack` side by side, so the isaaclab pack's backend —
+    /// which cannot see the other pack — derives `protomotions` as its own
+    /// candidate and would generate a second, competing shim for it. The
+    /// manifest settles it, and the source that is not ours is REPORTED in the
+    /// row rather than silently dropped.
+    #[test]
+    fn a_source_whose_shim_the_manifest_points_into_another_pack_is_not_written() {
+        let root = workspace("co-declared");
+        // A second source, declared in the same scope as this pack, whose shim
+        // the manifest points into a pack this backend is not.
+        let other_shim = "pypi-packs/protomotions-deps-pack/sources/protomotions";
+        let text = std::fs::read_to_string(root.join("pixi.toml")).unwrap();
+        std::fs::write(
+            root.join("pixi.toml"),
+            format!("{text}protomotions = {{ path = \"{other_shim}\", editable = true }}\n"),
+        )
+        .unwrap();
+        // The real tree behind that other shim, and the other pack's shim.
+        std::fs::create_dir_all(root.join("third_party/ProtoMotions/protomotions")).unwrap();
+        std::fs::write(
+            root.join("third_party/ProtoMotions/protomotions/__init__.py"),
+            "",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("third_party/ProtoMotions/protomotions.egg-info"))
+            .unwrap();
+        std::fs::write(
+            root.join("third_party/ProtoMotions/protomotions.egg-info/PKG-INFO"),
+            "Metadata-Version: 2.1\nName: protomotions\nVersion: 3.1\n\
+             Requires-Python: >=3.8\n\nbody\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join(other_shim)).unwrap();
+        let pm = PathSourceEntry {
+            path: "third_party/ProtoMotions".to_string(),
+            version: "3.1".to_string(),
+            requires_python: Some(">=3.8".to_string()),
+            dependencies: Vec::new(),
+            packages_include: Vec::new(),
+        };
+        std::fs::write(
+            root.join(other_shim).join("pyproject.toml"),
+            render_shim_pyproject(
+                "protomotions",
+                &pm,
+                &relative_from_shim(other_shim, "third_party/ProtoMotions"),
+            ),
+        )
+        .unwrap();
+
+        let manifest_text = std::fs::read_to_string(root.join("pixi.toml")).unwrap();
+        let mine = backend_records(
+            &root.join(PACK_REL),
+            &root,
+            RECORDS_DIR_DEFAULT,
+            &manifest_text,
+        )
+        .unwrap();
+        assert_eq!(mine.records.len(), 1, "{:?}", mine.records);
+        assert_eq!(mine.records[0].project, "pace-sim2real");
+        assert_eq!(mine.elsewhere.len(), 1, "{:?}", mine.elsewhere);
+        assert!(mine.elsewhere[0].contains("protomotions"), "{:?}", mine.elsewhere);
+        assert!(
+            mine.row(&root.join(PACK_REL)).contains("elsewhere=protomotions ("),
+            "{}",
+            mine.row(&root.join(PACK_REL))
+        );
+
+        materialize_declared_path_sources(
+            &config(Some(true)),
+            Some(&root),
+            Some(&pack_manifest(&root)),
+        )
+        .expect("the source that IS ours must still be written");
+        assert!(
+            !root.join(PACK_REL).join(SHIMS_DIR).join("protomotions").exists(),
+            "this backend wrote a competing shim for another pack's source"
+        );
     }
 
     /// GUARD 11 — the shim write never goes through a hardlink. A staged
@@ -2277,10 +2726,14 @@ mod tests {
         use std::os::unix::fs::MetadataExt as _;
         let root = workspace("hardlink");
         write_record(&root, "pace-sim2real", &pace_entry());
-        let shim_dir = root.join(SHIM_REL);
-        std::fs::create_dir_all(&shim_dir).unwrap();
-        let shim = shim_dir.join("pyproject.toml");
-        std::fs::write(&shim, "STALE SHIM\n").unwrap();
+        // The STALE shim the fixture leaves behind is the one that gets
+        // hardlinked. It has to stay parseable, not a scrap of text: an already
+        // effective manifest names its real tree ONLY through this file, so a
+        // shim of garbage is a different failure (an unreadable derivation) and
+        // would stop this guard short of the write it exists to watch.
+        let shim = root.join(SHIM_REL).join("pyproject.toml");
+        let stale_bytes = std::fs::read_to_string(&shim).unwrap();
+        assert!(stale_bytes.contains("0.0.0-stale"));
 
         let mirror = test_dir("hardlink-mirror").join("pyproject.toml");
         std::fs::hard_link(&shim, &mirror).unwrap();
@@ -2295,7 +2748,7 @@ mod tests {
 
         assert_eq!(
             std::fs::read_to_string(&mirror).unwrap(),
-            "STALE SHIM\n",
+            stale_bytes,
             "the shared inode was modified through its other link"
         );
         assert_eq!(std::fs::metadata(&shim).unwrap().nlink(), 1);
@@ -2871,5 +3324,141 @@ mod effective_manifest_tests {
         // as shell literals — the derivation's oracle.
         assert_eq!(planned.derived[0].record.entry, pace_entry());
         assert_eq!(planned.derived[1].record.entry, pm_entry());
+    }
+
+    /// GUARD K — THE TWO PRODUCERS ARE ONE (N27-RETREAD-115).
+    ///
+    /// The backend's `Handler::initialize` path, driven on the EFFECTIVE
+    /// manifest the verb just produced from the REAL canonical
+    /// `imprint-data/pixi.toml`, with `retread-path-source-metadata = true` set
+    /// and NOT ONE record file anywhere — the exact configuration that killed
+    /// C36 arm 3's `pixi lock` at the first RPC in 0.17 s of CPU (job 6082196:
+    /// `retread-path-source-metadata = true but …/path-sources holds no
+    /// <project>.toml record`). It must now initialise, and the shims it writes
+    /// must be BYTE-IDENTICAL to the verb's, one pack at a time, because there
+    /// is only one derivation and only one writer.
+    ///
+    /// The oracle beneath it is GUARD J's: 45 393 bytes of effective manifest
+    /// and two repointed sources, which is the `4ad488b961b7682c8d4938811179887f`
+    /// the campaign has measured on four jobs.
+    #[test]
+    fn the_backend_derives_the_same_shims_the_verb_does_with_no_record_file_on_disk() {
+        const REAL: &str = include_str!("testdata/imprint-workspace-pixi.toml");
+        let root = test_dir("backend-oracle");
+        std::fs::write(root.join("pixi.toml"), REAL).unwrap();
+        real_tree(&root, PACE_REL, "pace-sim2real", &pace_entry());
+        real_tree(&root, PM_REL, "protomotions", &pm_entry());
+        let isaac = bare_pack(&root, ISAAC_PACK, "pace-sim2real");
+        let pm = bare_pack(&root, PM_PACK, "protomotions");
+        let packs = vec![isaac.clone(), pm.clone()];
+
+        // --- the VERB, exactly as the lock driver runs it -------------------
+        let (effective, outcomes) =
+            generate_effective_manifest(&packs, &root, RECORDS_DIR_DEFAULT, REAL)
+                .expect("the verb must derive its own records");
+        assert_eq!(effective.text.len(), 45_393, "the measured effective size");
+        assert_eq!(effective.derived.len(), 2, "repointed=2");
+        assert_eq!(outcomes.len(), 2);
+        let verb_bytes: Vec<(PathBuf, String)> = outcomes
+            .iter()
+            .map(|o| {
+                let file = o.shim().join("pyproject.toml");
+                let text = std::fs::read_to_string(&file).unwrap();
+                (file, text)
+            })
+            .collect();
+
+        // The effective manifest is what gets locked, so it is what the backend
+        // reads back out of the workspace.
+        std::fs::write(root.join("pixi.toml"), &effective.text).unwrap();
+        // Make every shim STALE so a no-op cannot masquerade as agreement.
+        for (file, _) in &verb_bytes {
+            let text = std::fs::read_to_string(file).unwrap();
+            std::fs::write(file, text.replace("version = \"", "version = \"0.0.0-stale")).unwrap();
+        }
+
+        // --- the BACKEND, one pack at a time, gate on, no record file -------
+        assert_eq!(
+            walk_count(&root, RECORDS_DIR_DEFAULT),
+            0,
+            "the whole claim is that no record file exists"
+        );
+        let mut cfg: RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-wheels": { "placeholder": { "version": "==1.0.0" } },
+        }))
+        .unwrap();
+        cfg.path_source_metadata = Some(true);
+        let manifest_text = std::fs::read_to_string(root.join("pixi.toml")).unwrap();
+        let mut rows = Vec::new();
+        for pack in &packs {
+            let backend = backend_records(pack, &root, RECORDS_DIR_DEFAULT, &manifest_text)
+                .expect("the backend must derive its own pack's records");
+            assert_eq!(backend.records.len(), 1, "{pack:?}: {:?}", backend.records);
+            assert_eq!(backend.confirmed, 0, "no file confirmed anything");
+            rows.push(backend.row(pack));
+
+            let produced =
+                materialize_declared_path_sources(&cfg, Some(&root), Some(&pack.join("pixi.toml")))
+                    .expect("the gate must now have a producer");
+            assert_eq!(produced.len(), 1);
+            assert!(
+                matches!(produced[0], PathSourceOutcome::Written { .. }),
+                "{produced:?}"
+            );
+        }
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            assert!(
+                row.starts_with(
+                    "### PATH SOURCE RECORDS backend derived=1 confirmed=0 source=derived"
+                ),
+                "{row}"
+            );
+        }
+
+        // --- one derivation, one writer: the same bytes ---------------------
+        for (file, want) in &verb_bytes {
+            assert_eq!(
+                &std::fs::read_to_string(file).unwrap(),
+                want,
+                "the backend and the verb disagree about {}",
+                file.display()
+            );
+        }
+        assert_eq!(
+            walk_count(&root, RECORDS_DIR_DEFAULT),
+            0,
+            "satisfying the gate wrote a record file"
+        );
+        // And running it again is a no-op, so a committed shim never diffs.
+        for pack in &packs {
+            let again =
+                materialize_declared_path_sources(&cfg, Some(&root), Some(&pack.join("pixi.toml")))
+                    .unwrap();
+            assert!(matches!(again[0], PathSourceOutcome::Unchanged { .. }));
+        }
+    }
+
+    /// How many `*.toml` files sit in a `<dir>` directory anywhere under `root`.
+    fn walk_count(root: &Path, dir: &str) -> usize {
+        let mut n = 0;
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&d) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.parent().and_then(|d| d.file_name()).and_then(|s| s.to_str())
+                    == Some(dir)
+                    && p.extension().and_then(|s| s.to_str()) == Some("toml")
+                {
+                    n += 1;
+                }
+            }
+        }
+        n
     }
 }

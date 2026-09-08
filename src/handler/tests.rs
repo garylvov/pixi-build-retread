@@ -12815,22 +12815,43 @@ async fn initialize_generates_the_pack_source_shim_and_never_touches_the_source_
             "Metadata-Version: 2.1\nName: pace_sim2real\nVersion: 0.1.2\nRequires-Python: >=3.10\nRequires-Dist: psutil\nRequires-Dist: cmaes\n\nbody\n",
         )
         .unwrap();
-        // the workspace manifest points at the SHIM, not at the tree
+        // THE EFFECTIVE MANIFEST -- the one a lock actually resolves. It points
+        // `pace_sim2real` at the SHIM, and it declares the PACK beside it as a
+        // conda path dependency. The second half is not decoration: since
+        // N27-RETREAD-115 the backend DERIVES its records, and `derive_records`
+        // claims a source only for a pack some scope declares alongside it. A
+        // manifest without the pack entry derives nothing at all, which is a
+        // shape production never has.
         std::fs::write(
             root.join("pixi.toml"),
             format!(
-                "[workspace]\nchannels = []\n\n[pypi-dependencies]\npace_sim2real = {{ path = \"{SHIM}\", editable = true }}\n"
+                "[workspace]\nchannels = []\n\n[dependencies]\n\"isaaclab-2.3x-pack\" = {{ path = \"{PACK}\" }}\n\n[pypi-dependencies]\npace_sim2real = {{ path = \"{SHIM}\", editable = true }}\n"
             ),
         )
         .unwrap();
-        // the pack, and its hand-editable record beside the manifest
-        std::fs::create_dir_all(root.join(PACK).join("path-sources")).unwrap();
-        std::fs::write(root.join(PACK).join("pixi.toml"), "[package]\n").unwrap();
+        // The pack. NO RECORD FILE IS WRITTEN, and that is the point: this
+        // fixture used to hand `initialize` a `path-sources/pace-sim2real.toml`
+        // heredoc, which is exactly the input SHIM-AUTO-3 stopped producing and
+        // C36 arm 3 then died for want of. The backend must now get every field
+        // from the manifest entry plus the tree's own PKG-INFO. (The pack
+        // directory has to be created explicitly now: the line that made it was
+        // the `create_dir_all(PACK/path-sources)` this fix deleted.)
+        std::fs::create_dir_all(root.join(PACK)).unwrap();
         std::fs::write(
-            root.join(PACK).join("path-sources").join("pace-sim2real.toml"),
-            format!(
-                "path = \"{REL}\"\nversion = \"0.1.2\"\nrequires-python = \">=3.10\"\ndependencies = [\"psutil\", \"cmaes\"]\n"
-            ),
+            root.join(PACK).join("pixi.toml"),
+            "[package]\n\n[package.build.config.retread-wheels]\n\"pace-sim2real\" = { version = \"==1.0.0\" }\n",
+        )
+        .unwrap();
+        // The STALE shim a previous run left behind. An already-effective
+        // manifest no longer names the real tree anywhere, so the shim's own
+        // `package-dir` is the only remaining statement of it and the
+        // derivation reads it back. Its metadata is deliberately wrong, so
+        // "the gate is off" and "the gate ran" are distinguishable outcomes.
+        std::fs::create_dir_all(root.join(SHIM)).unwrap();
+        std::fs::write(
+            root.join(SHIM).join("pyproject.toml"),
+            "[project]\nname = \"pace-sim2real\"\nversion = \"0.0.0-stale\"\n\n\
+             [tool.setuptools.package-dir]\n\"\" = \"../../../../third_party/pace-sim2real/source/pace_sim2real\"\n",
         )
         .unwrap();
         root
@@ -12907,7 +12928,16 @@ async fn initialize_generates_the_pack_source_shim_and_never_touches_the_source_
         "the source tree gained or lost an entry"
     );
 
-    // OFF (key absent): nothing is generated at all.
+    // AND THE RECORD FILE WAS NEVER REQUIRED OR WRITTEN. The whole claim of
+    // N27-RETREAD-115 is that `retread-path-source-metadata = true` is now a
+    // gate with a producer, so the absence is measured rather than assumed.
+    assert!(
+        !root.join(PACK).join("path-sources").exists(),
+        "initialize created a records directory; the derivation must need none"
+    );
+
+    // OFF (key absent): nothing is generated at all -- the stale shim the
+    // fixture left behind is still exactly as stale as it was.
     let root_off = fixture("off");
     let mut gate_off = declared.clone();
     gate_off
@@ -12919,8 +12949,10 @@ async fn initialize_generates_the_pack_source_shim_and_never_touches_the_source_
         .await
         .expect("initialize failed");
     assert!(
-        !root_off.join(SHIM).exists(),
-        "the gate is off and a shim was generated anyway"
+        std::fs::read_to_string(root_off.join(SHIM).join("pyproject.toml"))
+            .unwrap()
+            .contains("0.0.0-stale"),
+        "the gate is off and the shim was regenerated anyway"
     );
 
     let _ = std::fs::remove_dir_all(&root);
