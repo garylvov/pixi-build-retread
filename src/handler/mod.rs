@@ -5168,7 +5168,13 @@ impl Handler {
         // must therefore reuse its existing built wheels and built-output store
         // keys; a change there would mean the transform was not a rename.
         if !config.subpackages.is_empty() {
-            let cache_dir = params.cache_directory.as_path();
+            let cache_dir = params.cache_directory.as_deref().ok_or_else(|| {
+                RpcError::invalid_params(
+                    "retread-subpackages: no cache_directory was provided, so the \
+                     declared tree cannot be materialized. A rule enumerates a git \
+                     checkout; there is nowhere to put one.",
+                )
+            })?;
             let mut leases = Vec::new();
             let mut checkouts: std::collections::BTreeMap<String, (String, PathBuf)> =
                 Default::default();
