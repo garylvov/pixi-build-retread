@@ -263,10 +263,20 @@ pub struct Accepted {
 
 /// How one consulted document is spelled in a refusal row: enough to identify
 /// it and to say WHICH of its facts moved, and nothing that is a path.
+///
+/// N27-RETREAD-62 added the URL-derived channel key, because it is now half of
+/// the comparison and a record written before the fix carries none -- a
+/// refusal that printed only the URL could not be told apart from a refusal
+/// for moved content.
 fn document_label(document: &crate::repodata::RepodataDocument) -> String {
+    let key = if document.channel_key.is_empty() {
+        "<no channel key: a record older than N27-RETREAD-62>"
+    } else {
+        document.channel_key.as_str()
+    };
     format!(
-        "{}/{}@{}",
-        document.channel, document.subdir, document.sha256
+        "{}/{}#{}@{}",
+        document.channel, document.subdir, key, document.sha256
     )
 }
 
@@ -309,6 +319,13 @@ pub fn encode<T: serde::Serialize, A: serde::Serialize>(
 /// CONDA-OUT-2: `reader_documents` is the reader's own on-disk snapshot
 /// (`repodata::snapshot_documents_at`). An adoption requires that every
 /// document the stored resolution consulted is still in it, byte-identical.
+///
+/// N27-RETREAD-62: "still in it" is decided on
+/// [`RepodataDocument::adoption_identity`](crate::repodata::RepodataDocument::adoption_identity)
+/// -- the URL-derived channel key, the subdir and the content hash -- and
+/// NEVER on the whole document, because `channel` is a human label whose two
+/// producers spell it differently by construction. Comparing it made every
+/// stored record unadoptable by every reader, including the one that wrote it.
 pub fn decode(
     bytes: &[u8],
     expected_inputs_digest: &str,
@@ -340,13 +357,23 @@ pub fn decode(
             missing: "<the record names no consulted document>".to_string(),
         });
     }
-    let present: std::collections::BTreeSet<&crate::repodata::RepodataDocument> =
-        reader_documents.iter().collect();
-    if let Some(missing) = record
-        .consulted_repodata
-        .iter()
-        .find(|document| !present.contains(document))
-    {
+    // N27-RETREAD-62. THE COMPARISON IS `adoption_identity`, NOT THE WHOLE
+    // DOCUMENT. Comparing whole documents compared `channel` too, and
+    // `channel` has two producers that spell it differently by construction:
+    // the writer holds the URL `sparse()` was called with, the reader holds
+    // only a filename and rendered `conda_forge#<hex>` from it. No record
+    // could ever be adopted -- relock 6063566 read `hit=0 miss=14
+    // published=14` with every refusal naming a document the SAME process's
+    // `conda_universe` row listed as consulted eleven seconds later. The rule
+    // CONDA-OUT-2 wrote is unchanged: containment of the consulted set in the
+    // reader's world, decided on CONTENT and on a URL-derived key, never on a
+    // path.
+    if let Some(missing) = record.consulted_repodata.iter().find(|document| {
+        document.channel_key.is_empty()
+            || !reader_documents
+                .iter()
+                .any(|present| present.adoption_identity() == document.adoption_identity())
+    }) {
         return Err(Refusal::Universe {
             recorded: record.consulted_repodata.len(),
             missing: document_label(missing),
@@ -639,6 +666,7 @@ mod tests {
             subdir: "linux-64".to_string(),
             sha256: sha256.to_string(),
             bytes: 4096,
+            channel_key: crate::repodata::channel_subdir_key(channel, "linux-64"),
         }
     }
 
@@ -921,7 +949,16 @@ mod tests {
         match decode(&bytes, "digest-a", &short) {
             Err(Refusal::Universe { recorded, missing }) => {
                 assert_eq!(recorded, 2);
-                assert_eq!(missing, "https://conda.anaconda.org/nvidia/linux-64@bb22");
+                assert_eq!(
+                    missing,
+                    format!(
+                        "https://conda.anaconda.org/nvidia/linux-64#{}@bb22",
+                        crate::repodata::channel_subdir_key(
+                            "https://conda.anaconda.org/nvidia",
+                            "linux-64"
+                        )
+                    )
+                );
             }
             other => panic!("an absent consulted document must refuse: {other:?}"),
         }
@@ -1001,6 +1038,186 @@ mod tests {
             encoded("digest-a", &reversed),
             "the writer must sort and dedup the consulted set"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // N27-RETREAD-62. THE TWO HALVES OF THE ADOPTION RULE MUST NAME ONE
+    // DOCUMENT THE SAME WAY.
+    //
+    // Every CONDA-OUT-2 guard above builds BOTH halves of the comparison with
+    // the same fixture helper, so all of them pass while production cannot
+    // adopt anything: in production the reader's half comes from
+    // `repodata::universe_from_cache_root` (which has only a filename and
+    // renders `channel` as `<slug>#<hex>`) and the writer's from
+    // `repodata::record_document` (which has the URL `sparse()` was called
+    // with). MEASURED on relock 6063566: hit=0 miss=14 published=14.
+    //
+    // The guards below take the reader's half from the REAL reader producer,
+    // so a fixture can never be the only thing that compares.
+    // ---------------------------------------------------------------
+
+    /// A document as the shared repodata cache stores it: the filename scheme
+    /// `repodata::disk_cache_path` writes, which is the only thing the reader
+    /// half ever sees.
+    fn plant(root: &Path, channel_url: &str, subdir: &str, body: &[u8]) {
+        let dir = root.join("retread-repodata");
+        std::fs::create_dir_all(&dir).expect("repodata dir");
+        let slug = channel_url
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or("channel")
+            .replace(|c: char| !c.is_ascii_alphanumeric(), "_");
+        let key = crate::repodata::channel_subdir_key(channel_url, subdir);
+        std::fs::write(dir.join(format!("{slug}--{subdir}--{key}.json")), body)
+            .expect("planting a repodata document");
+    }
+
+    /// The writer's half, built EXACTLY as `repodata::record_document` builds
+    /// it: the channel URL it called `sparse()` with, the subdir, the content
+    /// identity of the very bytes it parsed, and the URL-derived key. The sha
+    /// and byte count are taken from the reader's own fold of the same file,
+    /// because that is the same fingerprint function both halves run.
+    fn as_the_writer_named_it(
+        reader: &[crate::repodata::RepodataDocument],
+        channel_url: &str,
+        subdir: &str,
+    ) -> crate::repodata::RepodataDocument {
+        let key = crate::repodata::channel_subdir_key(channel_url, subdir);
+        let seen = reader
+            .iter()
+            .find(|document| document.channel_key == key && document.subdir == subdir)
+            .expect("the planted document must be in the reader's fold");
+        crate::repodata::RepodataDocument {
+            channel: channel_url.to_string(),
+            subdir: subdir.to_string(),
+            sha256: seen.sha256.clone(),
+            bytes: seen.bytes,
+            channel_key: key,
+        }
+    }
+
+    const N27_62_CHANNEL: &str = "https://prefix.dev/conda-forge";
+    const N27_62_BODY: &[u8] = br#"{"packages":{"n27-62":{"build":"0"}}}"#;
+
+    /// N27-RETREAD-62 GUARD 1 — TWO JOBS, TWO CACHE ROOTS, ONE CONTENT: THE
+    /// SECOND ADOPTS.
+    ///
+    /// RED ON 5ebfbb6: `decode` compared whole `RepodataDocument`s, and the
+    /// reader's `channel` (`conda_forge#<hex>`, rendered from the filename)
+    /// can never equal the writer's (`https://prefix.dev/conda-forge`), so
+    /// this decode returned `Refusal::Universe` naming a document that is
+    /// demonstrably right there -- which is the shape of every one of the 14
+    /// refusals in relock 6063566's backend log.
+    ///
+    /// MUTATION ARM: restore path identity to the comparison -- swap
+    /// `document.adoption_identity()` back to whole-document containment in
+    /// `decode`, or make `universe_from_cache_root_inner` stop recovering
+    /// `channel_key` from the filename's third field -- and this goes red.
+    #[test]
+    fn n27_62_a_record_published_under_one_cache_root_is_adopted_under_another() {
+        let publisher = Scratch::new("n27-62-publisher");
+        let requester = Scratch::new("n27-62-requester");
+        plant(publisher.path(), N27_62_CHANNEL, "linux-64", N27_62_BODY);
+        plant(requester.path(), N27_62_CHANNEL, "linux-64", N27_62_BODY);
+
+        let published_world =
+            crate::repodata::universe_from_cache_root(publisher.path()).unwrap();
+        let consulted =
+            vec![as_the_writer_named_it(&published_world, N27_62_CHANNEL, "linux-64")];
+        let bytes = encoded("digest-n27-62", &consulted);
+
+        // The requester's world comes from the REAL reader producer over a
+        // DIFFERENT directory. Identical content, different path.
+        let reader = crate::repodata::universe_from_cache_root(requester.path()).unwrap();
+        assert_eq!(reader.len(), 1, "one planted document");
+
+        // NON-VACUITY, and the whole defect in one line: the two halves are
+        // NOT equal as whole documents. If they were, this guard would pass on
+        // the broken code too.
+        assert_ne!(
+            reader[0], consulted[0],
+            "the reader's label and the writer's URL must still differ -- \
+             otherwise this guard is not about the thing that was wrong"
+        );
+        assert_eq!(
+            reader[0].adoption_identity(),
+            consulted[0].adoption_identity(),
+            "and their ADOPTION identity must be one thing"
+        );
+
+        let accepted = decode(&bytes, "digest-n27-62", &reader)
+            .expect("identical content under another cache root must adopt");
+        assert_eq!(accepted.payload, serde_json::json!({"outputs": []}));
+    }
+
+    /// N27-RETREAD-62 GUARD 2 — DIFFERENT CONTENT STILL REFUSES.
+    ///
+    /// The rule CONDA-OUT-2 wrote is not weakened by naming the channel
+    /// differently: a channel that refreshed in place under the SAME name and
+    /// the SAME URL-derived key must still refuse, or guard 1 would have been
+    /// bought by comparing nothing.
+    #[test]
+    fn n27_62_a_requester_whose_document_content_moved_still_refuses() {
+        let publisher = Scratch::new("n27-62-moved-pub");
+        let requester = Scratch::new("n27-62-moved-req");
+        plant(publisher.path(), N27_62_CHANNEL, "linux-64", N27_62_BODY);
+        plant(
+            requester.path(),
+            N27_62_CHANNEL,
+            "linux-64",
+            br#"{"packages":{"n27-62":{"build":"1"}}}"#,
+        );
+
+        let published_world =
+            crate::repodata::universe_from_cache_root(publisher.path()).unwrap();
+        let consulted =
+            vec![as_the_writer_named_it(&published_world, N27_62_CHANNEL, "linux-64")];
+        let bytes = encoded("digest-n27-62", &consulted);
+        let reader = crate::repodata::universe_from_cache_root(requester.path()).unwrap();
+
+        // Same channel, same subdir, same key -- ONLY the bytes moved.
+        assert_eq!(reader[0].channel_key, consulted[0].channel_key);
+        assert_ne!(reader[0].sha256, consulted[0].sha256);
+        match decode(&bytes, "digest-n27-62", &reader) {
+            Err(Refusal::Universe { recorded, missing }) => {
+                assert_eq!(recorded, 1);
+                assert!(
+                    missing.contains(&consulted[0].sha256),
+                    "the refusal must name the content that moved: {missing}"
+                );
+            }
+            other => panic!("a refreshed document must refuse: {other:?}"),
+        }
+    }
+
+    /// N27-RETREAD-62 GUARD 3 — A RECORD WRITTEN BEFORE THIS FIX IS REFUSED,
+    /// NOT ADOPTED BY ACCIDENT.
+    ///
+    /// `channel_key` is `serde(default)`, so the 14 records the CO and B35
+    /// rounds published decode with an EMPTY key. An empty key must never
+    /// match a reader document (whose key is never empty), and the refusal
+    /// must SAY so -- otherwise the first operator to see it reads it as a
+    /// channel that moved and goes looking for a refresh that never happened.
+    #[test]
+    fn n27_62_a_record_without_a_channel_key_is_refused_and_says_why() {
+        let requester = Scratch::new("n27-62-legacy");
+        plant(requester.path(), N27_62_CHANNEL, "linux-64", N27_62_BODY);
+        let reader = crate::repodata::universe_from_cache_root(requester.path()).unwrap();
+        let mut legacy = as_the_writer_named_it(&reader, N27_62_CHANNEL, "linux-64");
+        legacy.channel_key = String::new();
+        let bytes = encoded("digest-n27-62", &[legacy]);
+
+        match decode(&bytes, "digest-n27-62", &reader) {
+            Err(Refusal::Universe { recorded, missing }) => {
+                assert_eq!(recorded, 1);
+                assert!(
+                    missing.contains("older than N27-RETREAD-62"),
+                    "the refusal must name the reason, not a phantom move: {missing}"
+                );
+            }
+            other => panic!("a keyless record must refuse: {other:?}"),
+        }
     }
 
     #[test]

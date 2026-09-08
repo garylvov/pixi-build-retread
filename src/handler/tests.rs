@@ -10950,6 +10950,10 @@ fn store_world() -> Vec<crate::repodata::RepodataDocument> {
         subdir: "linux-64".to_string(),
         sha256: "feedfacefeedfacefeedfacefeedface".to_string(),
         bytes: 1024,
+        channel_key: crate::repodata::channel_subdir_key(
+            "https://conda.anaconda.org/conda-forge",
+            "linux-64",
+        ),
     }]
 }
 

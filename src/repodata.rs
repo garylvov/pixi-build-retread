@@ -461,9 +461,27 @@ async fn fetch_repodata_bytes(channel_url: &str, subdir: &str) -> Result<Vec<u8>
         .to_vec())
 }
 
-/// Same path scheme both probe.rs and solve_check.rs used before the
-/// unification, so caches written by older versions stay warm.
-fn disk_cache_path(channel_url: &str, subdir: &str) -> PathBuf {
+/// CONDA-OUT-2 / N27-RETREAD-62. The ONE name a `(channel URL, subdir)` pair
+/// has that both halves of the built-output store's adoption rule can compute.
+///
+/// THE DEFECT THIS CLOSES (law 2). `RepodataDocument` had two producers that
+/// spelled `channel` differently and could therefore never compare equal:
+/// [`record_document`] (the writer, which knows the URL because `sparse()` was
+/// called with it) wrote `https://prefix.dev/conda-forge`, while
+/// [`universe_from_cache_root_inner`] (the reader, which has only the file on
+/// disk) wrote `conda_forge#<hex>` reconstructed FROM THE FILENAME. The
+/// built-output store compared whole documents, so no record could ever be
+/// adopted -- by any job, including the one that wrote it. MEASURED on relock
+/// 6063566: `hit=0 miss=14 published=14`, every refusal reading
+/// `repodata_universe mismatch ... is not present under this reader's cache
+/// root` while the SAME process's `conda_universe` row eleven seconds later
+/// named that very document as consulted.
+///
+/// This key is derived from the channel URL and the subdir and from nothing
+/// else -- it is NOT a path. The filename that [`disk_cache_path`] builds
+/// merely CARRIES it as its third `--`-separated field, which is why the
+/// reader can recover it without inventing a URL it does not have.
+pub fn channel_subdir_key(channel_url: &str, subdir: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(channel_url.as_bytes());
     hasher.update(b"|");
@@ -473,6 +491,13 @@ fn disk_cache_path(channel_url: &str, subdir: &str) -> PathBuf {
     for b in &digest[..8] {
         hex.push_str(&format!("{b:02x}"));
     }
+    hex
+}
+
+/// Same path scheme both probe.rs and solve_check.rs used before the
+/// unification, so caches written by older versions stay warm.
+fn disk_cache_path(channel_url: &str, subdir: &str) -> PathBuf {
+    let hex = channel_subdir_key(channel_url, subdir);
     let dir = dirs_cache_root().join("retread-repodata");
     let slug = channel_url
         .trim_end_matches('/')
@@ -605,6 +630,20 @@ pub struct RepodataDocument {
     /// Hex sha256 of the on-disk document.
     pub sha256: String,
     pub bytes: u64,
+    /// CONDA-OUT-2 / N27-RETREAD-62. [`channel_subdir_key`] over the channel
+    /// URL and the subdir: the ONE spelling of "which channel is this" that
+    /// BOTH producers of this type can compute. `channel` above is a human
+    /// label whose two producers disagree by construction -- the writer has
+    /// the URL, the reader has only a filename -- so `channel` must never be
+    /// compared across the two halves, and the built-output store's adoption
+    /// rule compares [`adoption_identity`](RepodataDocument::adoption_identity)
+    /// instead.
+    ///
+    /// `serde(default)` so the field is additive: a record written before this
+    /// fix decodes with an EMPTY key, and an empty key is a refusal
+    /// (`built_output_store::decode`), never a blind adoption.
+    #[serde(default)]
+    pub channel_key: String,
 }
 
 impl RepodataDocument {
@@ -617,6 +656,21 @@ impl RepodataDocument {
     /// row prints.
     pub fn short(&self) -> String {
         self.sha256.chars().take(8).collect()
+    }
+
+    /// CONDA-OUT-2 / N27-RETREAD-62. The tuple two halves of one adoption
+    /// decision may compare: the URL-derived channel key, the subdir, and the
+    /// CONTENT identity of the bytes that were parsed. `channel` is excluded on
+    /// purpose -- it is the one field whose spelling depends on which producer
+    /// built the document, and comparing it is what made every stored record
+    /// unadoptable.
+    pub fn adoption_identity(&self) -> (&str, &str, &str, u64) {
+        (
+            self.channel_key.as_str(),
+            self.subdir.as_str(),
+            self.sha256.as_str(),
+            self.bytes,
+        )
     }
 }
 
@@ -1238,6 +1292,7 @@ async fn record_document(channel_url: &str, subdir: &str, path: PathBuf) {
     };
     let document = RepodataDocument {
         channel: channel_url.to_string(),
+        channel_key: channel_subdir_key(channel_url, subdir),
         subdir: subdir.to_string(),
         sha256,
         bytes,
@@ -1425,6 +1480,13 @@ fn universe_from_cache_root_inner(
             subdir: parts[1].to_string(),
             sha256,
             bytes,
+            // N27-RETREAD-62. The filename's third field IS
+            // `channel_subdir_key(channel_url, subdir)` -- `disk_cache_path`
+            // put it there. Recovering it here is what lets this producer and
+            // `record_document` name one document the same way, WITHOUT this
+            // side inventing a channel URL it does not have. The label above
+            // stays a label.
+            channel_key: parts[2].to_string(),
         });
     }
     documents.sort();
@@ -1597,11 +1659,14 @@ mod tests {
     }
 
     fn doc(channel: &str, subdir: &str, sha: &str, bytes: u64) -> RepodataDocument {
+        // N27-RETREAD-62: the fixture carries the SAME key production computes,
+        // so a fixture can never accidentally be the only thing that compares.
         RepodataDocument {
             channel: channel.to_string(),
             subdir: subdir.to_string(),
             sha256: sha.to_string(),
             bytes,
+            channel_key: channel_subdir_key(channel, subdir),
         }
     }
 
