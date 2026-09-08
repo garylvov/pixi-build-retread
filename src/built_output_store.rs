@@ -100,6 +100,18 @@ pub const SCHEMA: &str = "retread-built-output-store-v3";
 /// artifact, because everything downstream re-validates bytes.
 pub const BUILT_OUTPUT_SCHEMA: &str = "retread-built-output-emission-1";
 
+/// The store's directory name under a persistent root, and the `--store`
+/// spelling `retread store-reap` accepts. Named here, beside the layout it
+/// describes, so the reaper's spec READS it instead of carrying a second copy
+/// (the two-copies-of-a-generation-string defect STORE-REAP-3 measured).
+pub const STORE_DIR: &str = "built-outputs";
+
+/// CONDA-OUT-2. How long an entry may go unreferenced before
+/// `retread store-reap --store built-outputs` selects it. The same 14 days
+/// every other persistent store in this backend uses; a store with no horizon
+/// is a leak, and a horizon spelled differently here would be a second policy.
+pub const BUILT_OUTPUT_STORE_DEFAULT_MAX_AGE_DAYS: u64 = 14;
+
 /// Why a stored record was not usable. Every arm is a MISS at the call site;
 /// the variant exists so the log line names which one.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,6 +128,19 @@ pub enum Refusal {
     /// publish; it catches a truncated-key collision, a hand-moved entry, and
     /// a publisher that addressed and stamped a record from different inputs.
     Inputs { found: String },
+    /// CONDA-OUT-2. The record states which repodata documents the resolution
+    /// it holds actually consulted, and at least one of them is no longer
+    /// present, byte-identical, under this reader's cache root -- so the world
+    /// that answer was true in is not this reader's world. `recorded` is how
+    /// many documents the record named; `missing` is the first one that is not
+    /// here, spelled `<channel>/<subdir>@<sha256>`.
+    ///
+    /// An EMPTY recorded set is this refusal too, and deliberately: a record
+    /// written before this field existed states NOTHING about the world it was
+    /// resolved in, and nothing can never be shown to still hold. Same shape,
+    /// same `serde(default)` and the same reasoning as
+    /// `handler::advertised_identity::AdvertisedIdentityRecord::repodata_universe`.
+    Universe { recorded: usize, missing: String },
 }
 
 impl std::fmt::Display for Refusal {
@@ -133,6 +158,12 @@ impl std::fmt::Display for Refusal {
             }
             Refusal::Inputs { found } => {
                 write!(f, "record input digest `{found}` != the digest of the inputs this lookup was built from")
+            }
+            Refusal::Universe { recorded, missing } => {
+                write!(
+                    f,
+                    "repodata_universe mismatch: of the {recorded} document(s) the stored resolution consulted, `{missing}` is not present under this reader's cache root"
+                )
             }
         }
     }
@@ -170,6 +201,55 @@ pub struct Record {
     /// `serde(default)` so the field is additive within this schema.
     #[serde(default)]
     pub advertised: serde_json::Value,
+    /// CONDA-OUT-2, AUDIT ONLY. `repodata::universe_digest_of` over exactly
+    /// the set in [`consulted_repodata`](Record::consulted_repodata), so an
+    /// operator can compare an entry against a `repodata-universe` row with
+    /// one grep instead of a set diff. It is NOT the acceptance test, and a
+    /// reader never compares it: the set is, for the reasons below.
+    #[serde(default)]
+    pub repodata_universe: String,
+    /// CONDA-OUT-2. **The world this answer was true in**: every repodata
+    /// document the producing resolution actually consulted, as
+    /// `repodata::universe_documents()` recorded them.
+    ///
+    /// THE DEFECT THIS CLOSES (law 2). Until this field the store recorded a
+    /// universe nowhere and read one nowhere: the only `repodata_universe` in a
+    /// stored record sat NESTED inside `advertised`, where nothing at this
+    /// layer looked at it. `restore_advertised_identities` then wrote those
+    /// records into the adopting job's cache dir, and
+    /// `advertised_identity::load_record` refused them for the universe
+    /// mismatch several RPCs later -- so a stale adoption surfaced as "there
+    /// was no record" inside `conda/build_v1`, which is job 5723770's shape.
+    /// The refusal existed; it just arrived after the adoption had already been
+    /// taken and in a place that misnames it.
+    ///
+    /// WHY THIS AND NOT THE DIGEST, MEASURED ON THIS BOX. Every one of the 15
+    /// tip-produced entries in the shared store was written inside one
+    /// 44-minute window carrying `f78473b8878daa23`, and the SAME shared root
+    /// folded to `654cab14d9e1d23b` five hours later. `universe_digest`'s own
+    /// doc boards the reason as p6ad-6-1: the whole-root digest moves when an
+    /// unrelated lane drops an unrelated document in. Folding that digest into
+    /// the key, or demanding it be equal on read, re-addresses or refuses the
+    /// whole store several times a day for changes that cannot touch this
+    /// pack's resolution -- which is C11's "unreachable rather than
+    /// unmisreadable" defect reintroduced with a faster clock.
+    ///
+    /// WHY CONTAINMENT AND NOT EQUALITY. The universe that can move the
+    /// payload is the set the resolution CONSULTED, and that set is known only
+    /// AFTER the resolution -- the reader has not resolved anything when it
+    /// looks up, so it cannot compute an equal digest to compare against. What
+    /// it can decide, before resolving, is whether the world the stored answer
+    /// was true in is still intact inside its own: every recorded
+    /// `(channel, subdir, sha256, bytes)` still present exactly. That refuses
+    /// every genuine channel move and is immune to the unrelated-document
+    /// false positive.
+    ///
+    /// `serde(default)` so the field is additive within this schema, exactly as
+    /// `advertised` was. A record without it decodes to an EMPTY set, and an
+    /// empty set is a refusal: a record that states nothing about its world
+    /// cannot be shown to still hold in this one.
+    #[serde(default)]
+    pub consulted_repodata: Vec<crate::repodata::RepodataDocument>,
 }
 
 /// A record this reader accepted: the payload plus the cold pass's side
@@ -181,13 +261,36 @@ pub struct Accepted {
     pub advertised: serde_json::Value,
 }
 
+/// How one consulted document is spelled in a refusal row: enough to identify
+/// it and to say WHICH of its facts moved, and nothing that is a path.
+fn document_label(document: &crate::repodata::RepodataDocument) -> String {
+    format!(
+        "{}/{}@{}",
+        document.channel, document.subdir, document.sha256
+    )
+}
+
 /// Wrap a payload for publication.
+///
+/// `consulted` is [`Record::consulted_repodata`]: the documents this
+/// resolution read. It is the writer's half of the adoption rule and there is
+/// no publish path that omits it -- a record with an empty set is refused by
+/// every reader, so a caller that could not name its documents publishes an
+/// entry nobody will ever adopt rather than one anybody might adopt blind.
 pub fn encode<T: serde::Serialize, A: serde::Serialize>(
     inputs_digest: &str,
     produced_by: &str,
+    repodata_universe: &str,
+    consulted: &[crate::repodata::RepodataDocument],
     payload: &T,
     advertised: &A,
 ) -> Result<Vec<u8>, serde_json::Error> {
+    let mut consulted_repodata = consulted.to_vec();
+    // SORTED AND DEDUPED at the writer, the same normalisation
+    // `repodata::universe_digest_of` applies, so two publishers of one key
+    // cannot write two orderings of one world.
+    consulted_repodata.sort();
+    consulted_repodata.dedup();
     let record = Record {
         schema: SCHEMA.to_string(),
         emission_schema: BUILT_OUTPUT_SCHEMA.to_string(),
@@ -195,13 +298,22 @@ pub fn encode<T: serde::Serialize, A: serde::Serialize>(
         produced_by: produced_by.to_string(),
         payload: serde_json::to_value(payload)?,
         advertised: serde_json::to_value(advertised)?,
+        repodata_universe: repodata_universe.to_string(),
+        consulted_repodata,
     };
     serde_json::to_vec(&record)
 }
 
 /// Unwrap a stored record, refusing anything whose stamped identity does not
 /// match this reader. A refusal never yields the payload.
-pub fn decode(bytes: &[u8], expected_inputs_digest: &str) -> Result<Accepted, Refusal> {
+/// CONDA-OUT-2: `reader_documents` is the reader's own on-disk snapshot
+/// (`repodata::snapshot_documents_at`). An adoption requires that every
+/// document the stored resolution consulted is still in it, byte-identical.
+pub fn decode(
+    bytes: &[u8],
+    expected_inputs_digest: &str,
+    reader_documents: &[crate::repodata::RepodataDocument],
+) -> Result<Accepted, Refusal> {
     let record: Record = serde_json::from_slice(bytes).map_err(|_| Refusal::Undecodable)?;
     if record.schema != SCHEMA {
         return Err(Refusal::Schema {
@@ -218,6 +330,28 @@ pub fn decode(bytes: &[u8], expected_inputs_digest: &str) -> Result<Accepted, Re
             found: record.inputs_digest,
         });
     }
+    // The universe check is LAST of the four on purpose: it is the only one
+    // that costs a set membership over the reader's snapshot, and the three
+    // cheap identity checks have already thrown out every record that is not
+    // even about these inputs.
+    if record.consulted_repodata.is_empty() {
+        return Err(Refusal::Universe {
+            recorded: 0,
+            missing: "<the record names no consulted document>".to_string(),
+        });
+    }
+    let present: std::collections::BTreeSet<&crate::repodata::RepodataDocument> =
+        reader_documents.iter().collect();
+    if let Some(missing) = record
+        .consulted_repodata
+        .iter()
+        .find(|document| !present.contains(document))
+    {
+        return Err(Refusal::Universe {
+            recorded: record.consulted_repodata.len(),
+            missing: document_label(missing),
+        });
+    }
     Ok(Accepted {
         payload: record.payload,
         advertised: record.advertised,
@@ -228,7 +362,18 @@ pub fn decode(bytes: &[u8], expected_inputs_digest: &str) -> Result<Accepted, Re
 const PAYLOAD: &str = "outputs.json";
 
 /// The completeness marker. Written last; its absence means "miss".
-const MARKER: &str = "COMPLETE";
+///
+/// Its CONTENT is [`SCHEMA`], and CONDA-OUT-2 made that load-bearing: this
+/// store has no generation directory, so the marker's own bytes are where an
+/// entry's generation is written and are what
+/// `retread store-reap --store built-outputs` reads to decide `stale-version`.
+/// Public for the reaper's spec, which must never carry a second copy of it.
+pub const MARKER: &str = "COMPLETE";
+
+/// Where the reaper moves a selected entry. Named here, beside the layout,
+/// because [`BuiltOutputStore::get`] must never walk into it and the reaper
+/// must never walk it as an entry.
+pub const QUARANTINE: &str = "quarantine";
 
 /// A store root the operator opted into. Absent = today's behaviour exactly.
 #[derive(Debug, Clone)]
@@ -290,6 +435,66 @@ impl BuiltOutputStore {
             Ok(bytes) => (Lookup::Hit, Some(bytes)),
             Err(_) => (Lookup::Incomplete, None),
         }
+    }
+
+    /// CONDA-OUT-2. Record that a lock REFERENCED this entry, by touching the
+    /// `.used` sidecar the reaper ages from.
+    ///
+    /// Without this the reaper ages every entry from its PUBLISH time, so the
+    /// entry a relock adopts every night is evicted on its fourteenth day for
+    /// being unreferenced -- which is exactly false. It is the same sidecar,
+    /// written by the same formula (`source_build::use_stamp_path`), that the
+    /// canonical-git-snapshot and hermetic-environment stores stamp on their
+    /// own hit arms; a second formula here is how two stores' sidecars
+    /// silently diverge.
+    ///
+    /// Best effort and silent on failure: a read-only or full store must cost
+    /// a stamp, never a lock.
+    pub fn stamp_used(&self, key: &str) {
+        if let Some(stamp) = crate::source_build::use_stamp_path(&self.entry(key)) {
+            let _ = std::fs::write(stamp, b"");
+        }
+    }
+
+    /// CONDA-OUT-2. Move a REFUSED entry aside so the cold compute that
+    /// replaces it can publish at the same address.
+    ///
+    /// THE HOLE THIS CLOSES. [`Self::publish`] returns `Ok(false)` over any
+    /// entry that carries the marker, so before this an entry this binary
+    /// refuses -- a stale universe, a stale emission schema -- occupied its
+    /// address FOREVER: every later run refused it and no later run could
+    /// replace it. A refusal without a repair is not a safety property, it is
+    /// a permanently cold address, and on a shared store it is permanent for
+    /// everyone.
+    ///
+    /// The entry is RENAMED into [`QUARANTINE`], never deleted: another
+    /// process, on another binary or another snapshot, may still be able to
+    /// adopt what this one refused, and a rename leaves that recoverable while
+    /// a delete does not. `retread store-reap` is what empties the quarantine.
+    ///
+    /// Returns whether an entry was moved. Best effort: a failed rename simply
+    /// leaves the refusal standing, which is today's behaviour.
+    pub fn quarantine_refused(&self, key: &str) -> bool {
+        let entry = self.entry(key);
+        if !entry.is_dir() {
+            return false;
+        }
+        let quarantine_root = self.root.join(QUARANTINE);
+        if std::fs::create_dir_all(&quarantine_root).is_err() {
+            return false;
+        }
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default();
+        let target = quarantine_root.join(format!("{key}-{stamp}-{}", std::process::id()));
+        if std::fs::rename(&entry, &target).is_err() {
+            return false;
+        }
+        if let Some(sidecar) = crate::source_build::use_stamp_path(&entry) {
+            let _ = std::fs::remove_file(sidecar);
+        }
+        true
     }
 
     /// How long a publisher waits for a rival that already renamed its entry
@@ -426,6 +631,40 @@ mod tests {
         BuiltOutputStore::from_config(Some(dir)).expect("configured root yields a store")
     }
 
+    /// CONDA-OUT-2 fixtures. One repodata document, named the way the registry
+    /// names them.
+    fn document(channel: &str, sha256: &str) -> crate::repodata::RepodataDocument {
+        crate::repodata::RepodataDocument {
+            channel: channel.to_string(),
+            subdir: "linux-64".to_string(),
+            sha256: sha256.to_string(),
+            bytes: 4096,
+        }
+    }
+
+    /// The world a fixture resolution consulted.
+    fn consulted_world() -> Vec<crate::repodata::RepodataDocument> {
+        vec![
+            document("https://conda.anaconda.org/conda-forge", "aa11"),
+            document("https://conda.anaconda.org/nvidia", "bb22"),
+        ]
+    }
+
+    fn encoded(
+        inputs_digest: &str,
+        consulted: &[crate::repodata::RepodataDocument],
+    ) -> Vec<u8> {
+        encode(
+            inputs_digest,
+            "1.2.3+deadbeef",
+            &crate::repodata::universe_digest_of(consulted),
+            consulted,
+            &serde_json::json!({"outputs": []}),
+            &serde_json::json!([{"name": "pack", "build": "py311_hdeadbeef_loose_5"}]),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn unset_config_and_unset_env_means_no_store() {
         // The default must be "the feature does not exist", so a workspace
@@ -554,7 +793,7 @@ mod tests {
             .expect("the legacy fixture must deserialize the way the pre-C11 reader did");
 
         assert_eq!(
-            decode(&bytes, "any-digest"),
+            decode(&bytes, "any-digest", &consulted_world()),
             Err(Refusal::Undecodable),
             "a pre-v3 entry must be refused"
         );
@@ -562,17 +801,12 @@ mod tests {
 
     #[test]
     fn a_record_from_another_schema_or_emission_or_input_set_is_refused() {
-        let good = encode(
-            "digest-a",
-            "1.2.3+deadbeef",
-            &serde_json::json!({"outputs": []}),
-            &serde_json::json!([{"name": "pack", "build": "py311_hdeadbeef_loose_5"}]),
-        )
-        .unwrap();
+        let world = consulted_world();
+        let good = encoded("digest-a", &world);
 
         // Positive control first: the honest round trip must work, or every
         // refusal below is trivially satisfiable.
-        let accepted = decode(&good, "digest-a").unwrap();
+        let accepted = decode(&good, "digest-a", &world).unwrap();
         assert_eq!(
             accepted.payload,
             serde_json::json!({"outputs": []}),
@@ -594,7 +828,7 @@ mod tests {
 
         // (d) an older WIRE schema.
         assert_eq!(
-            decode(&tamper("schema", "retread-built-output-store-v2"), "digest-a"),
+            decode(&tamper("schema", "retread-built-output-store-v2"), "digest-a", &world),
             Err(Refusal::Schema {
                 found: "retread-built-output-store-v2".to_string()
             }),
@@ -604,7 +838,8 @@ mod tests {
         assert_eq!(
             decode(
                 &tamper("emission_schema", "retread-built-output-emission-0"),
-                "digest-a"
+                "digest-a",
+                &world
             ),
             Err(Refusal::Emission {
                 found: "retread-built-output-emission-0".to_string()
@@ -614,7 +849,7 @@ mod tests {
         // that landed at this address without standing for these inputs --
         // the truncated-key collision the git hash never covered.
         assert_eq!(
-            decode(&good, "digest-b"),
+            decode(&good, "digest-b", &world),
             Err(Refusal::Inputs {
                 found: "digest-a".to_string()
             }),
@@ -625,7 +860,7 @@ mod tests {
             tamper("schema", "retread-built-output-store-v2"),
             tamper("emission_schema", "retread-built-output-emission-0"),
         ] {
-            assert!(decode(&bytes, "digest-a").is_err());
+            assert!(decode(&bytes, "digest-a", &world).is_err());
         }
     }
 
@@ -633,9 +868,12 @@ mod tests {
     fn the_producing_binary_is_recorded_but_never_gates_acceptance() {
         // The git hash left the KEY; it must still be readable off an entry,
         // and it must not be able to refuse one -- that was the whole trade.
+        let world = consulted_world();
         let bytes = encode(
             "digest-a",
             "9.9.9+cafebabe",
+            &crate::repodata::universe_digest_of(&world),
+            &world,
             &serde_json::json!({"outputs": []}),
             &serde_json::json!([]),
         )
@@ -643,8 +881,210 @@ mod tests {
         let record: Record = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(record.produced_by, "9.9.9+cafebabe");
         assert!(
-            decode(&bytes, "digest-a").is_ok(),
+            decode(&bytes, "digest-a", &world).is_ok(),
             "a record from another binary must still be adoptable"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // CONDA-OUT-2. The repodata-universe rule, and the repair that makes a
+    // refusal survivable. Every arm below is RED on c0ccc0d, whose `decode`
+    // took no world at all and whose `publish` could never replace a marked
+    // entry.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn a_record_whose_consulted_documents_are_all_still_here_is_adopted() {
+        // The POSITIVE CONTROL for the whole rule, and the one that keeps the
+        // three refusals below from being satisfiable by refusing everything:
+        // the reader's world may be STRICTLY LARGER than the record's -- an
+        // unrelated lane dropping an unrelated document in must NOT refuse
+        // anything, which is the false positive p6ad-6-1 boards against the
+        // whole-root digest and the entire reason this is containment.
+        let world = consulted_world();
+        let mut reader = world.clone();
+        reader.push(document("https://conda.anaconda.org/some-other-lane", "cc33"));
+        let bytes = encoded("digest-a", &world);
+        let accepted = decode(&bytes, "digest-a", &reader)
+            .expect("a superset world must still adopt");
+        assert_eq!(accepted.payload, serde_json::json!({"outputs": []}));
+    }
+
+    #[test]
+    fn a_record_is_refused_when_a_document_it_consulted_moved_or_left() {
+        let world = consulted_world();
+        let bytes = encoded("digest-a", &world);
+
+        // (a) the document is GONE from the reader's root.
+        let mut short = world.clone();
+        short.pop();
+        match decode(&bytes, "digest-a", &short) {
+            Err(Refusal::Universe { recorded, missing }) => {
+                assert_eq!(recorded, 2);
+                assert_eq!(missing, "https://conda.anaconda.org/nvidia/linux-64@bb22");
+            }
+            other => panic!("an absent consulted document must refuse: {other:?}"),
+        }
+
+        // (b) the document is STILL THERE under the same name and its BYTES
+        // MOVED. This is the real hazard -- a channel refresh in place -- and
+        // it is invisible to any check that compares names.
+        let moved: Vec<_> = world
+            .iter()
+            .map(|document| {
+                let mut document = document.clone();
+                if document.channel.ends_with("conda-forge") {
+                    document.sha256 = "ffff".to_string();
+                }
+                document
+            })
+            .collect();
+        assert!(
+            matches!(
+                decode(&bytes, "digest-a", &moved),
+                Err(Refusal::Universe { .. })
+            ),
+            "a refreshed document must refuse the answer resolved against the old one"
+        );
+
+        // (c) the reader could not list its root at all: EMPTY reader world.
+        // The failure direction is a miss, never an adoption on no evidence.
+        assert!(matches!(
+            decode(&bytes, "digest-a", &[]),
+            Err(Refusal::Universe { .. })
+        ));
+
+        // And no refusal ever yields the payload.
+        assert!(decode(&bytes, "digest-a", &short).is_err());
+    }
+
+    #[test]
+    fn a_record_that_names_no_consulted_document_is_refused() {
+        // Every one of the 15 tip-produced entries in the shared store on
+        // 2026-09-07 is this record: valid schema, valid emission, valid input
+        // digest, and NOTHING said about the world it was resolved in. A
+        // reader that adopts it is adopting on an unstated claim.
+        let world = consulted_world();
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&encoded("digest-a", &world)).unwrap();
+        record
+            .as_object_mut()
+            .unwrap()
+            .remove("consulted_repodata");
+        let bytes = serde_json::to_vec(&record).unwrap();
+
+        // NON-VACUITY: the bytes really are a record this reader would
+        // otherwise take -- only the world claim is gone.
+        let decoded: Record = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(decoded.schema, SCHEMA);
+        assert_eq!(decoded.inputs_digest, "digest-a");
+
+        assert_eq!(
+            decode(&bytes, "digest-a", &world),
+            Err(Refusal::Universe {
+                recorded: 0,
+                missing: "<the record names no consulted document>".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn the_consulted_set_is_normalised_by_the_writer() {
+        // Two publishers of one key must not write two orderings of one world,
+        // or byte-comparing two entries for the same key becomes meaningless.
+        let world = consulted_world();
+        let mut reversed = world.clone();
+        reversed.reverse();
+        reversed.push(reversed[0].clone());
+        assert_eq!(
+            encoded("digest-a", &world),
+            encoded("digest-a", &reversed),
+            "the writer must sort and dedup the consulted set"
+        );
+    }
+
+    #[test]
+    fn a_refused_entry_can_be_replaced_and_only_through_the_quarantine() {
+        // THE HOLE. `publish` refuses to overwrite a marked entry, so without
+        // `quarantine_refused` the FIRST record this binary refuses owns its
+        // address for ever and that key is permanently cold for every job
+        // sharing the store. Mutation arm for this guard: delete the
+        // `quarantine_refused` call in `handler::conda_outputs` and the second
+        // publish below goes back to `false` with the stale bytes still served.
+        let dir = Scratch::new("repair");
+        let store = store(dir.path());
+        assert!(store.publish("k1", b"stale").unwrap());
+        assert!(
+            !store.publish("k1", b"fresh").unwrap(),
+            "the pre-existing no-overwrite rule must still hold"
+        );
+
+        assert!(store.quarantine_refused("k1"), "the entry must move aside");
+        assert_eq!(
+            store.get("k1").0,
+            Lookup::Miss,
+            "a quarantined entry is a miss, not a hit and not incomplete"
+        );
+        assert!(store.publish("k1", b"fresh").unwrap());
+        assert_eq!(store.get("k1").1.as_deref(), Some(&b"fresh"[..]));
+
+        // RECOVERABLE, never deleted: another binary may still be able to
+        // adopt what this one refused.
+        let quarantined: Vec<String> = std::fs::read_dir(dir.path().join(QUARANTINE))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(quarantined.len(), 1, "{quarantined:?}");
+        assert!(quarantined[0].starts_with("k1-"), "{quarantined:?}");
+        assert_eq!(
+            std::fs::read(dir.path().join(QUARANTINE).join(&quarantined[0]).join(PAYLOAD))
+                .unwrap(),
+            b"stale".to_vec(),
+            "the refused bytes must survive the move"
+        );
+
+        // Nothing to move is not an error.
+        assert!(!store.quarantine_refused("never-published"));
+    }
+
+    #[test]
+    fn an_adoption_stamps_the_sidecar_the_reaper_ages_from() {
+        // Without this the reaper ages an entry from its PUBLISH, so the entry
+        // a nightly relock adopts every night is evicted on its fourteenth day
+        // for being "unreferenced" -- which is exactly false. Same sidecar and
+        // same formula as the git-snapshot and hermetic-environment stores.
+        let dir = Scratch::new("stamp");
+        let store = store(dir.path());
+        assert!(store.publish("k1", b"payload").unwrap());
+        let stamp = crate::source_build::use_stamp_path(&dir.path().join("k1"))
+            .expect("the shared formula must name a stamp for this entry");
+        assert!(!stamp.exists(), "nothing stamps before an adoption");
+        assert_eq!(store.get("k1").0, Lookup::Hit);
+        store.stamp_used("k1");
+        assert!(
+            stamp.is_file(),
+            "an adoption must leave the `.used` sidecar the reaper reads"
+        );
+        // A DOTFILE, so the reaper's `read_dir_names` can never walk it as an
+        // entry of the flat store.
+        assert!(
+            stamp.file_name().unwrap().to_string_lossy().starts_with('.'),
+            "the stamp must be a dotfile beside the entry"
+        );
+    }
+
+    #[test]
+    fn the_marker_carries_the_generation_the_reaper_reads() {
+        // The flat store has no generation directory, so `store-reap
+        // --store built-outputs` reads each entry's generation out of its
+        // marker. That is only true while the marker's CONTENT is `SCHEMA`.
+        let dir = Scratch::new("generation");
+        let store = store(dir.path());
+        assert!(store.publish("k1", b"payload").unwrap());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("k1").join(MARKER)).unwrap(),
+            SCHEMA,
+            "the reaper's `stale-version` rule reads this byte-for-byte"
         );
     }
 

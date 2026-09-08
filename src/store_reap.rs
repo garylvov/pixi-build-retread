@@ -6,7 +6,11 @@
 //! `<root>/hermetic-build-envs/<version>/env-<sha256>/complete.json`; and
 //! SDIST-META-2 took it to SIX with the prepared-sdist-metadata store,
 //! `<root>/sdist-metadata/v1/sdm-<sha256>/complete.json` -- the same shape, so
-//! all three are reaped by ONE walk, `source_build::reap_marker_store`.
+//! all three are reaped by ONE walk, `source_build::reap_marker_store`;
+//! CONDA-OUT-2 took it to SEVEN with the built-output store, the FIRST FLAT
+//! one -- `<root>/built-outputs/<key>/COMPLETE`, no generation directory, the
+//! generation in the marker's own content -- reaped by that SAME walk under
+//! a spec that says so.
 //!
 //! # Why this verb exists (STORE-REAP-1-1, law 2)
 //!
@@ -61,6 +65,13 @@ pub enum Store {
     /// cleanup template runs is the only thing that ever looks at the store as
     /// a whole.
     SdistMetadata,
+    /// CONDA-OUT-2. The first FLAT marker store the verb reaps: it has no
+    /// generation directory, so each entry's generation is its own marker's
+    /// content. APPENDED, never inserted, on the same rule as the three before
+    /// it. MERGE-CO: SDIST-META-2 and CONDA-OUT-2 each appended what its own
+    /// branch called "the sixth store"; both are here, so this is the SEVENTH
+    /// and the two appends did not displace one another.
+    BuiltOutputs,
 }
 
 impl Store {
@@ -73,6 +84,7 @@ impl Store {
             Store::BuildRequirements => "build-requirements",
             Store::HermeticEnvironments => "hermetic-envs",
             Store::SdistMetadata => crate::sdist_metadata::CACHE_NAMESPACE,
+            Store::BuiltOutputs => crate::built_output_store::STORE_DIR,
         }
     }
 
@@ -85,13 +97,18 @@ impl Store {
     /// rows that this landing has no reason to move.
     /// SDIST-META-2 appends the sixth on the same rule L3-1b-3B and L3-1b-4
     /// appended the fourth and fifth by: APPEND, NEVER REORDER.
-    pub const ALL: [Store; 6] = [
+    /// CONDA-OUT-2 appends the SEVENTH by the same rule. MERGE-CO: the two
+    /// branches each appended a "sixth" element at this exact position, and
+    /// the resolution is BOTH, in landing order (sdist-metadata landed first,
+    /// as B32), never one of them.
+    pub const ALL: [Store; 7] = [
         Store::BuiltWheels,
         Store::GitSnapshots,
         Store::Shadow,
         Store::BuildRequirements,
         Store::HermeticEnvironments,
         Store::SdistMetadata,
+        Store::BuiltOutputs,
     ];
 
     fn parse(value: &str) -> Option<Vec<Store>> {
@@ -119,6 +136,9 @@ impl Store {
                 crate::hermetic_build::HERMETIC_ENVIRONMENT_STORE_DEFAULT_MAX_AGE_DAYS
             }
             Store::SdistMetadata => crate::sdist_metadata::DEFAULT_MAX_AGE_DAYS,
+            Store::BuiltOutputs => {
+                crate::built_output_store::BUILT_OUTPUT_STORE_DEFAULT_MAX_AGE_DAYS
+            }
         }
     }
 }
@@ -180,7 +200,8 @@ pub fn parse_args(args: &[String]) -> anyhow::Result<Args> {
                     anyhow::anyhow!(
                         "store-reap: --store {value}: expected one of \
                          built-wheels, git-snapshots, shadow, \
-                         build-requirements, hermetic-envs, sdist-metadata, all"
+                         build-requirements, hermetic-envs, sdist-metadata, \
+                         built-outputs, all"
                     )
                 })?);
             }
@@ -405,6 +426,28 @@ fn reap_one(
         Store::SdistMetadata => {
             let report = crate::source_build::reap_marker_store(
                 &crate::source_build::SDIST_METADATA_STORE_SPEC,
+                root,
+                max_age,
+                mode,
+            )?;
+            outcome.scanned = report.scanned;
+            outcome.selected = report.evicted;
+            outcome.stale_version = report.evicted_stale_version;
+            outcome.kept = report.kept;
+            outcome.skipped_locked = report.skipped_locked;
+            outcome.versions_walked = report.versions_walked;
+            outcome.skipped_concurrent = report.skipped_concurrent;
+            report.entries
+        }
+        // CONDA-OUT-2. THE SAME WALK AGAIN, on the store's FLAT shape:
+        // `<root>/built-outputs/<key>/COMPLETE`, no generation directory, the
+        // generation in the marker. It reports `versions_walked` as the number
+        // of DISTINCT marker generations found -- on the shared root that was
+        // MEASURED at 3 (v1, v2, v3) across 218 entries the day this landed,
+        // and every v1 and v2 of them was unreachable by any reaper until now.
+        Store::BuiltOutputs => {
+            let report = crate::source_build::reap_marker_store(
+                &crate::source_build::BUILT_OUTPUT_STORE_SPEC,
                 root,
                 max_age,
                 mode,
@@ -1321,6 +1364,139 @@ mod tests {
                 .join("sdm-half")
                 .is_dir(),
             "a directory with no completion marker is not an entry"
+        );
+    }
+
+    /// One FLAT built-output entry: `<root>/built-outputs/<key>/COMPLETE`,
+    /// whose CONTENT is the generation. `stamped` writes the `.used` sidecar
+    /// the reaper prefers over the marker mtime.
+    fn built_output_entry(
+        root: &Path,
+        key: &str,
+        generation: &str,
+        marker_ago: u64,
+        stamped: Option<u64>,
+    ) -> PathBuf {
+        let entry = root
+            .join(crate::built_output_store::STORE_DIR)
+            .join(key);
+        std::fs::create_dir_all(&entry).expect("entry");
+        std::fs::write(entry.join("outputs.json"), vec![b'p'; 32]).expect("payload");
+        let marker_path = entry.join(crate::built_output_store::MARKER);
+        std::fs::write(&marker_path, generation).expect("marker");
+        set_mtime(&marker_path, age(marker_ago));
+        if let Some(ago) = stamped {
+            let stamp =
+                crate::source_build::use_stamp_path(&entry).expect("the shared stamp formula");
+            std::fs::write(&stamp, b"").expect("stamp");
+            set_mtime(&stamp, age(ago));
+        }
+        entry
+    }
+
+    /// CONDA-OUT-2. THE SEVENTH STORE (MERGE-CO: the sixth on its own branch,
+    /// the seventh now that SDIST-META-2's store landed first as B32), and
+    /// the first FLAT one: no generation directory, the generation in each
+    /// entry's own marker.
+    ///
+    /// The arms that can each fail on their own: reached by name and through
+    /// `--store all` (a store the fan-out misses is a reaper with no reader);
+    /// the generation is read from the MARKER, so an entry whose marker says
+    /// `v1` is `stale-version` while its `v3` neighbour of the same age is
+    /// `unreferenced`; a FRESH `.used` sidecar keeps an entry whose marker is
+    /// 30 days old, which is the whole reason the adoption path stamps;
+    /// `versions_walked` counts DISTINCT marker generations, not directories;
+    /// and a dry run creates nothing.
+    #[test]
+    fn the_built_output_store_is_flat_and_takes_its_generation_from_the_marker() {
+        assert_eq!(
+            Store::parse("built-outputs"),
+            Some(vec![Store::BuiltOutputs]),
+            "the spelling an operator and the census both type"
+        );
+        assert!(
+            Store::ALL.contains(&Store::BuiltOutputs),
+            "`--store all` must fan out to the built-output store"
+        );
+        for previous in [
+            Store::BuiltWheels,
+            Store::GitSnapshots,
+            Store::Shadow,
+            Store::BuildRequirements,
+            Store::HermeticEnvironments,
+            Store::SdistMetadata,
+        ] {
+            assert!(
+                Store::ALL.contains(&previous),
+                "appending the seventh store displaced {}",
+                previous.as_str()
+            );
+        }
+
+        let root = scratch("built-outputs");
+        let current = crate::built_output_store::SCHEMA;
+        // Over-age, current generation.
+        built_output_entry(&root, "aaaa", current, 30, None);
+        // Over-age, a RETIRED generation: the shared root holds 218 entries
+        // whose markers read v1, v2 and v3, and until this spec existed
+        // nothing could reach the v1s and v2s at all.
+        built_output_entry(&root, "bbbb", "retread-built-output-store-v1", 30, None);
+        // Marker 30 days old and REFERENCED yesterday: kept, and this is the
+        // arm the `.used` stamp on the adoption path exists for.
+        built_output_entry(&root, "cccc", current, 30, Some(1));
+        // Young.
+        built_output_entry(&root, "dddd", current, 1, None);
+        // A half-published entry: a directory with no marker is not an entry.
+        std::fs::create_dir_all(
+            root.join(crate::built_output_store::STORE_DIR).join("eeee"),
+        )
+        .expect("half-published");
+        let before = tree(&root);
+
+        let dry = dry_run(&root, Store::BuiltOutputs);
+        assert_eq!(
+            (
+                dry.scanned,
+                dry.selected,
+                dry.stale_version,
+                dry.kept,
+                dry.versions_walked
+            ),
+            (4, 2, 1, 2, 2),
+            "four entries scanned, the two over-age ones selected, one of them \
+             for its retired generation, and TWO distinct generations walked"
+        );
+        assert_eq!(tree(&root), before, "a dry run creates nothing");
+
+        // Non-vacuity for the dry run's zero: the same fixture, applied,
+        // through the fan-out the census actually calls.
+        let mut selected_by_all = 0;
+        for store in Store::ALL {
+            selected_by_all += reap_one(&root, store, 14, ReapMode::Apply, true)
+                .unwrap_or_else(|error| panic!("{} reap: {error:#}", store.as_str()))
+                .selected;
+        }
+        assert_eq!(
+            selected_by_all, 2,
+            "`all` must reach the built-output entries and nothing else here"
+        );
+        let store_dir = root.join(crate::built_output_store::STORE_DIR);
+        assert!(
+            store_dir.join(crate::built_output_store::QUARANTINE).is_dir(),
+            "an eviction RENAMES into quarantine; it never deletes"
+        );
+        assert!(
+            store_dir.join("cccc").is_dir(),
+            "a freshly REFERENCED entry survives an old marker"
+        );
+        assert!(store_dir.join("dddd").is_dir(), "the young entry is untouched");
+        assert!(
+            !store_dir.join("aaaa").exists() && !store_dir.join("bbbb").exists(),
+            "both over-age entries left their addresses"
+        );
+        assert!(
+            store_dir.join("eeee").is_dir(),
+            "a directory with no marker is not an entry and must not be moved"
         );
     }
 }

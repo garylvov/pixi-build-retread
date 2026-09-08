@@ -1207,10 +1207,33 @@ pub(crate) fn reap_built_wheel_store_once() {
 /// ever needs a DIFFERENT shape it gets its own reaper, exactly as
 /// [`reap_built_wheel_store`] and [`reap_canonical_git_snapshot_store`] have
 /// their own — those two differ in shape and stay separate and untouched.
+/// WHERE a marker store writes an entry's GENERATION.
+///
+/// CONDA-OUT-2 added the second arm. Every store this walk knew until then put
+/// the generation in the path; the built-output store has no generation
+/// directory at all and writes [`crate::built_output_store::SCHEMA`] as the
+/// CONTENT of each entry's marker. That is a difference of one `read_to_string`
+/// in one place, so it is an arm of this walk and not a third reaper: giving it
+/// one would have meant a third copy of the try-lock, the `.used` rule, the
+/// re-read under the entry lock and the quarantine rename, which is the shape
+/// L3-1b-4 restored this struct to avoid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MarkerStoreGenerations {
+    /// `<root>/<dir>/<version>/<identity>/<marker>` -- the generation is a
+    /// path level, and every one of them is walked.
+    PathSegment,
+    /// `<root>/<dir>/<identity>/<marker>` -- FLAT. The generation is the
+    /// marker file's own content, read per entry, and `versions_walked`
+    /// reports how many DISTINCT generations the walk actually found.
+    MarkerContent,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MarkerStoreSpec {
     /// The store directory under the persistent root.
     pub(crate) dir: &'static str,
+    /// Where this store writes an entry's generation.
+    pub(crate) generations: MarkerStoreGenerations,
     /// The `<row> reap` / `<row> evicted` stem, so an operator greps one word.
     pub(crate) row: &'static str,
     /// The store-wide reap try-lock: a DOTFILE beside the generations, so
@@ -1227,6 +1250,7 @@ pub(crate) struct MarkerStoreSpec {
 /// L3-1b-3B's store, spelled as a spec.
 pub(crate) const BUILD_REQUIREMENTS_STORE_SPEC: MarkerStoreSpec = MarkerStoreSpec {
     dir: BUILD_REQUIREMENTS_STORE_DIR,
+    generations: MarkerStoreGenerations::PathSegment,
     row: BUILD_REQUIREMENTS_STORE_ROW,
     reap_lock: BUILD_REQUIREMENTS_STORE_REAP_LOCK,
     version: BUILD_REQUIREMENTS_CACHE_VERSION,
@@ -1239,12 +1263,12 @@ pub(crate) const BUILD_REQUIREMENTS_STORE_SPEC: MarkerStoreSpec = MarkerStoreSpe
 /// entries it was written for (STORE-REAP-3).
 pub(crate) const HERMETIC_ENVIRONMENT_STORE_SPEC: MarkerStoreSpec = MarkerStoreSpec {
     dir: crate::hermetic_build::CACHE_NAMESPACE,
+    generations: MarkerStoreGenerations::PathSegment,
     row: "hermetic_environment_store",
     reap_lock: ".hermetic-build-envs.reap.lock",
     version: crate::hermetic_build::CACHE_VERSION,
     marker: crate::hermetic_build::COMPLETION_MARKER,
 };
-
 
 /// SDIST-META-2's store. Like the hermetic spec above, every field is READ
 /// FROM `sdist_metadata` rather than re-spelled here: the writer (the
@@ -1255,13 +1279,36 @@ pub(crate) const HERMETIC_ENVIRONMENT_STORE_SPEC: MarkerStoreSpec = MarkerStoreS
 ///
 /// It is the SIXTH instantiation of one walk, not a sixth reaper: the shape is
 /// `<root>/sdist-metadata/v1/<sdm-sha256>/complete.json`, identical to the
-/// build-requirements and hermetic stores to the segment.
+/// build-requirements and hermetic stores to the segment. MERGE-CO: its
+/// `generations` is stated EXPLICITLY now that CONDA-OUT-2 has made the field
+/// exist — `PathSegment`, the shape SDIST-META-2 wrote it in, which is what
+/// the two specs above already say.
 pub(crate) const SDIST_METADATA_STORE_SPEC: MarkerStoreSpec = MarkerStoreSpec {
     dir: crate::sdist_metadata::CACHE_NAMESPACE,
+    generations: MarkerStoreGenerations::PathSegment,
     row: crate::sdist_metadata::STORE_ROW,
     reap_lock: crate::sdist_metadata::STORE_REAP_LOCK,
     version: crate::sdist_metadata::CACHE_VERSION,
     marker: crate::sdist_metadata::COMPLETION_MARKER,
+};
+
+/// CONDA-OUT-2's store, and the FIRST flat one this walk has ever reaped.
+///
+/// Every field is read from `built_output_store`, for the reason
+/// [`HERMETIC_ENVIRONMENT_STORE_SPEC`] states: a second copy of a generation
+/// string is how a reaper starts walking past the entries it was written for
+/// (STORE-REAP-3). `version` is the wire SCHEMA, which is what the marker
+/// carries, so a `v3 -> v4` bump makes every v3 entry `stale-version` on the
+/// next census rather than orphaning it -- which is the state the shared root
+/// is in today: MEASURED 2026-09-07, 218 entries whose markers read v1, v2 and
+/// v3, and until this spec existed NOTHING could reach the v1s and v2s.
+pub(crate) const BUILT_OUTPUT_STORE_SPEC: MarkerStoreSpec = MarkerStoreSpec {
+    dir: crate::built_output_store::STORE_DIR,
+    generations: MarkerStoreGenerations::MarkerContent,
+    row: "built_output_store",
+    reap_lock: ".built-outputs.reap.lock",
+    version: crate::built_output_store::SCHEMA,
+    marker: crate::built_output_store::MARKER,
 };
 
 const BUILD_REQUIREMENTS_STORE_DIR: &str = "build-requirements";
@@ -1496,21 +1543,32 @@ pub(crate) fn reap_marker_store(
     };
     let quarantine_root = store_dir.join(MARKER_STORE_QUARANTINE);
     let now = std::time::SystemTime::now();
-    for version in read_dir_names(&store_dir)? {
-        if version == MARKER_STORE_QUARANTINE {
-            continue;
+    // THE GENERATIONS TO WALK, as (label, directory-holding-entries) pairs.
+    // A path-segment store contributes one pair per generation directory; a
+    // flat store contributes exactly one pair, the store directory itself,
+    // whose entries carry their generation in their markers.
+    let generations: Vec<(String, PathBuf)> = match spec.generations {
+        MarkerStoreGenerations::PathSegment => read_dir_names(&store_dir)?
+            .into_iter()
+            .filter(|name| name != MARKER_STORE_QUARANTINE)
+            .map(|name| {
+                let dir = store_dir.join(&name);
+                (name, dir)
+            })
+            .filter(|(_, dir)| dir.is_dir())
+            .collect(),
+        MarkerStoreGenerations::MarkerContent => vec![(String::new(), store_dir.clone())],
+    };
+    let mut generations_seen: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    for (path_version, versioned) in generations {
+        if matches!(spec.generations, MarkerStoreGenerations::PathSegment) {
+            report.versions_walked += 1;
         }
-        let versioned = store_dir.join(&version);
-        if !versioned.is_dir() {
-            continue;
-        }
-        report.versions_walked += 1;
-        let reason = if version == spec.version {
-            REAP_REASON_UNREFERENCED
-        } else {
-            REAP_REASON_STALE_VERSION
-        };
         for identity in read_dir_names(&versioned)? {
+            if identity == MARKER_STORE_QUARANTINE {
+                continue;
+            }
             let entry_dir = versioned.join(&identity);
             if !entry_dir.is_dir() {
                 continue;
@@ -1522,6 +1580,25 @@ pub(crate) fn reap_marker_store(
                 continue;
             }
             report.scanned += 1;
+            // THE ENTRY'S GENERATION, from wherever this store writes it. An
+            // unreadable or empty marker reads as a generation that is not the
+            // current one, i.e. `stale-version` -- never as the current one,
+            // because a reaper that guesses "current" on unreadable evidence
+            // is a reaper that keeps a leak forever.
+            let version = match spec.generations {
+                MarkerStoreGenerations::PathSegment => path_version.clone(),
+                MarkerStoreGenerations::MarkerContent => {
+                    std::fs::read_to_string(entry_dir.join(spec.marker))
+                        .map(|content| content.trim().to_string())
+                        .unwrap_or_default()
+                }
+            };
+            generations_seen.insert(version.clone());
+            let reason = if version == spec.version {
+                REAP_REASON_UNREFERENCED
+            } else {
+                REAP_REASON_STALE_VERSION
+            };
             let Some(age) = marker_store_entry_age(spec, &entry_dir, now) else {
                 report.kept += 1;
                 continue;
@@ -1562,7 +1639,14 @@ pub(crate) fn reap_marker_store(
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            let label = format!("{version}-{identity}");
+            // A flat store's entries have no path generation, so their label
+            // is the identity alone -- a leading `-` in a quarantine directory
+            // name is not a fact about the entry.
+            let label = if path_version.is_empty() {
+                identity.clone()
+            } else {
+                format!("{path_version}-{identity}")
+            };
             let quarantine =
                 quarantine_root.join(format!("{label}-{stamp_unix}-{}", std::process::id()));
             // THE DRY RUN STOPS HERE, one statement before the first write.
@@ -1645,6 +1729,14 @@ pub(crate) fn reap_marker_store(
                 spec.row,
             );
         }
+    }
+    // A flat store has no generation DIRECTORIES to count, so it reports how
+    // many distinct generations its markers actually named. One row format for
+    // every store: the field means "how many generations this walk covered"
+    // either way, and a census that printed 1 for a root holding three would
+    // be the number that hides the leak.
+    if matches!(spec.generations, MarkerStoreGenerations::MarkerContent) {
+        report.versions_walked = generations_seen.len() as u64;
     }
     tracing::info!(
         store = %store_dir.display(),

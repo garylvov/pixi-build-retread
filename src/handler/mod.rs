@@ -5432,11 +5432,23 @@ impl Handler {
         // are cheaper and strictly fresher; a hit here is what a FRESH
         // workspace gets instead of a cold multi-env solve. Loud either way:
         // a miss that should have hit is the thing an operator needs to see.
+        //
+        // CONDA-OUT-2: whether this lookup REFUSED a complete entry, carried
+        // to the publish below. A refused entry keeps its address until
+        // something replaces it, and `publish` will not overwrite a marked
+        // entry -- so without this the first record this binary refuses makes
+        // that key permanently cold for every job that shares the store.
+        let mut built_output_store_refused = false;
         if let (Some(store), Some(store_key)) =
             (built_output_store.as_ref(), built_output_store_key.as_ref())
         {
             let key = &store_key.key;
             let (lookup, payload) = store.get(key);
+            // CONDA-OUT-2: the reader's own world, listed ONCE for this
+            // lookup and only when a store is configured -- an unconfigured
+            // pack pays nothing, and the fold goes through the blocking pool
+            // because it is an NFS read of every document in the cache root.
+            let reader_documents = crate::repodata::prime_snapshot_documents().await;
             // C11: the stored bytes are a RECORD, not a bare payload. Decoding
             // is the acceptance decision -- the wire schema, the emission
             // schema and the full input digest must all match this reader, and
@@ -5445,7 +5457,11 @@ impl Handler {
             let mut refusal: Option<crate::built_output_store::Refusal> = None;
             let mut adopted_advertised: Vec<AdvertisedIdentityRecord> = Vec::new();
             let cached = payload.as_deref().and_then(|bytes| {
-                match crate::built_output_store::decode(bytes, &store_key.inputs_digest) {
+                match crate::built_output_store::decode(
+                    bytes,
+                    &store_key.inputs_digest,
+                    &reader_documents,
+                ) {
                     Ok(accepted) => {
                         match serde_json::from_value::<CondaOutputsResult>(accepted.payload) {
                             Ok(result) => {
@@ -5480,6 +5496,10 @@ impl Handler {
                         outputs = cached.outputs.len(),
                         "bench: built_output_store hit -- adopting a previously computed conda/outputs result (no resolve, no probes)",
                     );
+                    // CONDA-OUT-2: an adoption is a REFERENCE. Stamp it, or
+                    // the reaper ages this entry from its publish and evicts
+                    // the one the nightly relock adopts every time.
+                    store.stamp_used(key);
                     crate::status::tty(
                         "reusing a previously-computed solve for this source package from the shared built-output store.",
                     );
@@ -5566,6 +5586,32 @@ impl Handler {
                             .unwrap_or_else(|| "unknown".to_string()),
                         "bench: built_output_store record refused -- treating as a miss and recomputing",
                     );
+                    // CONDA-OUT-2. The universe arm gets a row of its own, on
+                    // STDOUT and in the harness's `###` grammar, because it is
+                    // the one refusal an operator has to be able to find in a
+                    // lock log without a backend log beside it: it is the
+                    // difference between "the store is cold" and "the world
+                    // moved under the store".
+                    if let Some(crate::built_output_store::Refusal::Universe {
+                        recorded,
+                        missing,
+                    }) = refusal.as_ref()
+                    {
+                        println!(
+                            "### built-outputs REFUSED key={key} reason=repodata_universe mismatch stored={missing} job={}",
+                            std::env::var("SLURM_JOB_ID")
+                                .unwrap_or_else(|_| "none".to_string()),
+                        );
+                        tracing::warn!(
+                            key = %key,
+                            recorded_documents = *recorded,
+                            missing = %missing,
+                            reader_documents = reader_documents.len(),
+                            reader_universe = %crate::repodata::universe_digest_of(&reader_documents),
+                            "bench: built_output_store REFUSED -- the stored resolution consulted a repodata document this reader does not have",
+                        );
+                    }
+                    built_output_store_refused = true;
                 }
                 (lookup, _) => {
                     tracing::info!(
@@ -6564,9 +6610,33 @@ impl Handler {
                 (built_output_store.as_ref(), built_output_store_key.as_ref())
             {
                 let key = &store_key.key;
+                // CONDA-OUT-2. The world this answer was computed in, taken
+                // AFTER the resolution, which is the only time it is known:
+                // `universe_documents` is the registry of documents this
+                // process actually consulted, and it is empty until something
+                // has consulted one.
+                let consulted = crate::repodata::universe_documents();
+                if consulted.is_empty() {
+                    tracing::warn!(
+                        key = %key,
+                        "bench: built_output_store publishing a record that names NO consulted repodata document; no reader will ever adopt it",
+                    );
+                }
+                // A record this binary refused occupies its address until
+                // something moves it aside, and `publish` never overwrites a
+                // marked entry. Move it now, with a replacement in hand.
+                if built_output_store_refused && store.quarantine_refused(key) {
+                    tracing::info!(
+                        key = %key,
+                        root = %store.root().display(),
+                        "bench: built_output_store quarantined the refused entry so this cold result can take its address",
+                    );
+                }
                 match crate::built_output_store::encode(
                     &store_key.inputs_digest,
                     backend_build_identity(),
+                    &crate::repodata::universe_digest_of(&consulted),
+                    &consulted,
                     &result,
                     &published_advertised_identities,
                 ) {

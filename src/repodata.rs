@@ -588,7 +588,16 @@ pub fn frozen() -> bool {
 }
 
 /// One repodata document, identified by the bytes that were actually parsed.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+///
+/// CONDA-OUT-2 made this SERIALIZABLE. The built-output store records the set
+/// of documents the resolution it stores actually consulted, and its reader
+/// checks that set is still intact before adopting the answer; a second,
+/// hand-written copy of these four fields in that module would be a second
+/// spelling of "which document is this", i.e. exactly the divergence
+/// `universe_digest_of` folds over.
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct RepodataDocument {
     /// Channel URL with no trailing slash, exactly as `sparse()` was called.
     pub channel: String,
@@ -1314,6 +1323,49 @@ pub fn universe_summary_line(documents: &[RepodataDocument]) -> String {
 /// prints.
 pub fn universe_from_cache_root(cache_root: &std::path::Path) -> Result<Vec<RepodataDocument>> {
     universe_from_cache_root_inner(cache_root, document_identity_uncached)
+}
+
+/// CONDA-OUT-2. The documents on disk under THIS process's cache root, folded
+/// through the same per-document memo [`snapshot_digest_memoized_at`] uses, so
+/// asking for the list costs nothing a caller that already asked for the digest
+/// has not paid.
+///
+/// An unreadable cache root yields an EMPTY list, not an error. The one caller
+/// is the built-output store's adoption check, which asks "is every document
+/// this stored answer consulted still exactly here?" — and an empty list makes
+/// every recorded document missing, i.e. a MISS. The failure direction is a
+/// cold compute, never an adoption on unread evidence.
+pub fn snapshot_documents_at(cache_root: &std::path::Path) -> Vec<RepodataDocument> {
+    match universe_from_cache_root_inner(cache_root, document_identity_blocking) {
+        Ok(documents) => documents,
+        Err(error) => {
+            tracing::warn!(
+                cache_root = %cache_root.display(),
+                error = %format!("{error:#}"),
+                "repodata: the universe snapshot could not be listed; every stored consulted-document set will read as absent",
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// [`snapshot_documents_at`] for this process's own root, ON THE BLOCKING POOL.
+///
+/// Same reason [`prime_universe_digest`] exists: the fold is an NFS read of
+/// every document in the root, and the built-output store's lookup runs on a
+/// tokio worker inside the backend fan-out.
+pub async fn prime_snapshot_documents() -> Vec<RepodataDocument> {
+    let root = dirs_cache_root();
+    match tokio::task::spawn_blocking(move || snapshot_documents_at(&root)).await {
+        Ok(documents) => documents,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "repodata: the universe snapshot listing task failed; every stored consulted-document set will read as absent",
+            );
+            Vec::new()
+        }
+    }
 }
 
 /// p6ad-4: the walk, parameterised by which identity function reads each

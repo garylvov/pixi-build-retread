@@ -10939,6 +10939,20 @@ fn built_output_store_key_is_workspace_path_and_mtime_free() {
     }
 }
 
+/// CONDA-OUT-2 fixture. The world a built-output record claims its resolution
+/// consulted, and the world the reader is handed back -- one document, stated
+/// once, so the guards below vary the thing they are about and nothing else.
+/// Production takes the writer's half from `repodata::universe_documents` and
+/// the reader's from `repodata::snapshot_documents_at`; both are that type.
+fn store_world() -> Vec<crate::repodata::RepodataDocument> {
+    vec![crate::repodata::RepodataDocument {
+        channel: "https://conda.anaconda.org/conda-forge".to_string(),
+        subdir: "linux-64".to_string(),
+        sha256: "feedfacefeedfacefeedfacefeedface".to_string(),
+        bytes: 1024,
+    }]
+}
+
 #[tokio::test]
 async fn built_output_store_hit_serves_the_same_result_a_cold_compute_produced() {
     use pixi_build_types::procedures::conda_outputs::CondaOutputsResult;
@@ -10967,6 +10981,8 @@ async fn built_output_store_hit_serves_the_same_result_a_cold_compute_produced()
     let payload = crate::built_output_store::encode(
         &key_a.inputs_digest,
         backend_build_identity(),
+        &crate::repodata::universe_digest_of(&store_world()),
+        &store_world(),
         &result,
         &Vec::<AdvertisedIdentityRecord>::new(),
     )
@@ -10989,7 +11005,7 @@ async fn built_output_store_hit_serves_the_same_result_a_cold_compute_produced()
         crate::built_output_store::Lookup::Hit,
         "a fresh workspace with identical content must hit the shared store"
     );
-    let accepted = crate::built_output_store::decode(&bytes.unwrap(), &key_b.inputs_digest)
+    let accepted = crate::built_output_store::decode(&bytes.unwrap(), &key_b.inputs_digest, &store_world())
         .expect("a record this backend wrote must be accepted by this backend");
     let adopted: CondaOutputsResult = serde_json::from_value(accepted.payload).unwrap();
     assert_eq!(adopted.outputs.len(), result.outputs.len());
@@ -10997,6 +11013,8 @@ async fn built_output_store_hit_serves_the_same_result_a_cold_compute_produced()
         crate::built_output_store::encode(
             &key_b.inputs_digest,
             backend_build_identity(),
+            &crate::repodata::universe_digest_of(&store_world()),
+            &store_world(),
             &adopted,
             &Vec::<AdvertisedIdentityRecord>::new(),
         )
@@ -11187,12 +11205,14 @@ fn c11_an_emission_schema_bump_is_a_miss() {
     let published = crate::built_output_store::encode(
         &before.inputs_digest,
         backend_build_identity(),
+        &crate::repodata::universe_digest_of(&store_world()),
+        &store_world(),
         &serde_json::json!({"outputs": []}),
         &serde_json::json!([]),
     )
     .unwrap();
     assert!(
-        crate::built_output_store::decode(&published, &after.inputs_digest).is_err(),
+        crate::built_output_store::decode(&published, &after.inputs_digest, &store_world()).is_err(),
         "a pre-bump record must be refused at a post-bump lookup"
     );
 
@@ -11250,11 +11270,13 @@ async fn c11_an_adopted_output_restores_the_cold_passs_advertised_identity() {
     let bytes = crate::built_output_store::encode(
         "digest",
         backend_build_identity(),
+        &crate::repodata::universe_digest_of(&store_world()),
+        &store_world(),
         &serde_json::json!({"outputs": []}),
         &vec![record.clone()],
     )
     .unwrap();
-    let accepted = crate::built_output_store::decode(&bytes, "digest").unwrap();
+    let accepted = crate::built_output_store::decode(&bytes, "digest", &store_world()).unwrap();
     let carried: Vec<AdvertisedIdentityRecord> =
         serde_json::from_value(accepted.advertised).unwrap();
     assert_eq!(carried, vec![record.clone()], "the record must survive the store");
