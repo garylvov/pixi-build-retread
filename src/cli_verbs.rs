@@ -43,6 +43,7 @@ pub const KNOWN_VERBS: &[&str] = &[
     "fast",
     "preflight",
     "repodata-universe",
+    "sharded-universe",
     "migrate-overrides",
     "store-reap",
     "sdist-meta-key",
@@ -150,6 +151,7 @@ mod tests {
     #[test]
     fn n27_65_known_verbs_carries_the_dispatched_names() {
         for verb in [
+            "sharded-universe",
             "path-source-manifest",
             "path-source-refresh",
             "sdist-meta-key",
