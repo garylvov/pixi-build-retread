@@ -248,9 +248,9 @@ pub struct StoreOutcome {
     /// STORE-REAP-3. How many on-disk LAYOUTS of this store the walk
     /// enumerated. Only the shadow store has ever had more than one (L3-1 moved
     /// the target identity out of the path and left the old directories where
-    /// they were), so the other four stores report 0 here — the same way the
+    /// they were), so the other stores report 0 here — the same way the
     /// shadow store reports 0 for `versions_walked`, because it has no
-    /// generation segment. ONE row format for all five stores; a field that
+    /// generation segment. ONE row format for EVERY store; a field that
     /// does not apply reads 0 rather than being absent, so a parser never has
     /// to know which store it is looking at.
     pub layouts_walked: u64,
@@ -863,19 +863,56 @@ mod tests {
         assert_eq!(empty.stores, Store::ALL.to_vec());
         assert!(empty.roots.is_empty() && !empty.bytes && empty.max_age_days.is_none());
 
-        // SDIST-META-2. `all` is SIX, and each of the six is reachable by name.
-        // A hard 6 on BOTH counts rather than `Store::ALL.len()` on both sides,
-        // which would be an identity and would pass on a list that lost a
-        // store. The two hard numbers must be edited together; the first run of
-        // this landing's mutation matrix caught exactly that, with BASE red on
-        // the second one alone.
-        assert_eq!(Store::ALL.len(), 6, "all six stores are in the fan-out");
+        // CONDA-OUT-3. THE FAN-OUT IS EVERY VARIANT OF THE REGISTRY, and this
+        // guard now derives that from the enum instead of from a hard count.
+        // L3-1b-4 wrote a hard 5 on both counts deliberately -- `Store::ALL
+        // .len()` on both sides is an identity that would pass on a list that
+        // LOST a store -- but a hard number rots the day a store is APPENDED,
+        // which is exactly what CONDA-OUT-2's sixth store (`built-outputs`)
+        // did to it at gate 6051584 (left 6, right 5). SDIST-META-2 had
+        // meanwhile edited the same two numbers to 6 on its own branch, so
+        // MERGE-CO arrived at a THIRD spelling of the same rot -- which is the
+        // argument for this shape rather than a bigger number. Both properties
+        // are kept here without a number: the `match` below is exhaustive with
+        // no `_` arm, so an EIGHTH variant cannot be added to the enum without
+        // the compiler stopping HERE, and the comparison against `Store::ALL`
+        // is not an identity -- one side is the hand-written const list, the
+        // other the enumerated variants -- so a variant dropped from `ALL`
+        // while it still exists on the enum is still a red. The enum is the
+        // ONE authority; nothing counts stores.
+        let every_variant: Vec<Store> = [
+            Store::BuiltWheels,
+            Store::GitSnapshots,
+            Store::Shadow,
+            Store::BuildRequirements,
+            Store::HermeticEnvironments,
+            Store::SdistMetadata,
+            Store::BuiltOutputs,
+        ]
+        .into_iter()
+        .inspect(|store| match store {
+            // EXHAUSTIVE ON PURPOSE. Do not add a `_` arm: this match is the
+            // compile-time half of the guard.
+            Store::BuiltWheels
+            | Store::GitSnapshots
+            | Store::Shadow
+            | Store::BuildRequirements
+            | Store::HermeticEnvironments
+            | Store::SdistMetadata
+            | Store::BuiltOutputs => {}
+        })
+        .collect();
+        assert_eq!(
+            Store::ALL.to_vec(),
+            every_variant,
+            "EVERY variant of the registry is in the fan-out, in declaration order"
+        );
         assert_eq!(
             parse_args(&["--store".into(), "all".into()])
                 .expect("all")
-                .stores
-                .len(),
-            6,
+                .stores,
+            every_variant,
+            "`--store all` fans out to the whole registry, never to a frozen subset",
         );
         for store in Store::ALL {
             assert_eq!(
