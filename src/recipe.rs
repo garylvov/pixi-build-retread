@@ -1537,6 +1537,7 @@ mod tests {
             blueprint: Default::default(),
             blueprint_sync: Default::default(),
             git_sources: std::collections::BTreeMap::new(),
+            subpackages: std::collections::BTreeMap::new(),
             python: None,
             pin_version: false,
             deps_from: Default::default(),
