@@ -17233,12 +17233,48 @@ fn build_auto_imports_naming_authority(
         }
     }
     if let Some(manifest) = manifest {
+        // A DIRECT-SOURCE declaration (`{ path = … }`, `{ git = … }`,
+        // `{ url = … }`) is not a registry fact and must never become a bare
+        // registry root. B-cert-4 measured the cost of conflating the two:
+        // `imprint`'s aarch64-only `[feature.jetson.pypi-dependencies]` carries
+        // `unitree_sdk2py = { path = "third_party/unitree_sdk2_python" }`, the
+        // spec map renders that as `"*"` (indistinguishable from a genuine
+        // unconstrained registry dep), the authority determined
+        // `unitree-sdk2py`, and a linux-64 pack that merely IMPORTS the module
+        // got a bare root uv answered with "was not found in the package
+        // registry" -- `attributed-resolve-backoff`/`upstream-absence`, and
+        // under `retread-auto-imports-strict` an INSTALL-time refusal of
+        // `newton-gpu`. The declaration always said the index does not publish
+        // it; only the flattening lost that.
+        //
+        // Skipping restores the honest verdict: the module is neither mapped
+        // nor determined, so screen (h) of `auto_imports_injection_verdict`
+        // records it as an `auto_imports_lead:` for manifest work. A lead is
+        // not a dropped root, so strict has nothing to refuse.
+        let direct_sources = manifest.direct_source_pypi_names_anywhere();
+        let mut skipped: Vec<String> = Vec::new();
         for (name, specs) in manifest.declared_pypi_specs_anywhere() {
+            let canonical = canonical_conda_name(&name);
+            if direct_sources.contains(&name) {
+                skipped.push(canonical);
+                continue;
+            }
             determined.push(DeterminedDistribution {
-                name: canonical_conda_name(&name),
+                name: canonical,
                 version: auto_imports_declared_exact_version(&specs),
                 origin: NamingOrigin::DeclaredDep,
             });
+        }
+        if !skipped.is_empty() {
+            tracing::info!(
+                skipped = skipped.len(),
+                names = %skipped.join(","),
+                "auto_imports_naming: DIRECT-SOURCE declarations are not registry facts -- \
+                 these names are declared only as `path`/`git`/`url` sources somewhere in the \
+                 workspace, so they do NOT determine an injectable root. An import of one is \
+                 recorded as a lead for manifest work, never handed to uv as a bare root the \
+                 index cannot publish.",
+            );
         }
     }
     crate::auto_imports::NamingAuthority::from_determined(determined)

@@ -214,6 +214,11 @@ pub struct WorkspaceManifest {
     /// because the workspace owns their source without declaring a
     /// registry version constraint.
     pub pypi_dependencies: BTreeMap<String, String>,
+    /// The subset of the sibling `pypi_dependencies` keys whose declaration
+    /// was a DIRECT SOURCE (`url`/`path`/`git`). See
+    /// `parse_direct_source_pypi_names`: the spec map cannot carry this fact
+    /// because it renders all three shapes as `"*"`.
+    pub pypi_direct_sources: BTreeSet<String>,
     /// Per-environment definitions from `[environments]`.
     pub environments: BTreeMap<String, EnvironmentDef>,
     /// Per-feature blocks from `[feature.X.*]`.
@@ -289,6 +294,11 @@ pub struct FeatureDef {
     /// and direct-source semantics as
     /// [`WorkspaceManifest::pypi_dependencies`].
     pub pypi_dependencies: BTreeMap<String, String>,
+    /// The subset of the sibling `pypi_dependencies` keys whose declaration
+    /// was a DIRECT SOURCE (`url`/`path`/`git`). See
+    /// `parse_direct_source_pypi_names`: the spec map cannot carry this fact
+    /// because it renders all three shapes as `"*"`.
+    pub pypi_direct_sources: BTreeSet<String>,
     /// v0.37.0+ (D1): `[feature.X.system-requirements]`. Same shape as
     /// the top-level table; unioned per active env with feature-wins
     /// precedence by `effective_system_requirements`.
@@ -305,6 +315,11 @@ pub struct TargetDependencyDef {
     pub path_dependencies: BTreeMap<String, String>,
     pub source_dependencies: BTreeMap<String, String>,
     pub pypi_dependencies: BTreeMap<String, String>,
+    /// The subset of the sibling `pypi_dependencies` keys whose declaration
+    /// was a DIRECT SOURCE (`url`/`path`/`git`). See
+    /// `parse_direct_source_pypi_names`: the spec map cannot carry this fact
+    /// because it renders all three shapes as `"*"`.
+    pub pypi_direct_sources: BTreeSet<String>,
 }
 
 impl WorkspaceManifest {
@@ -410,6 +425,7 @@ impl WorkspaceManifest {
         out.target_dependencies = parse_target_dependencies(parsed);
 
         out.pypi_dependencies = parse_pypi_dependencies(parsed);
+        out.pypi_direct_sources = parse_direct_source_pypi_names(parsed);
 
         // v0.37.0+ (D1): top-level [system-requirements]. Scalar values
         // (`cuda = "12"`) stored verbatim; table form
@@ -479,6 +495,7 @@ impl WorkspaceManifest {
                     }
                     def.target_dependencies = parse_target_dependencies(fvalue);
                     def.pypi_dependencies = parse_pypi_dependencies(fvalue);
+                    def.pypi_direct_sources = parse_direct_source_pypi_names(fvalue);
                     // v0.37.0+ (D1): per-feature system-requirements.
                     if let Some(sysreqs) = fmap
                         .get("system-requirements")
@@ -1385,6 +1402,40 @@ impl WorkspaceManifest {
         out
     }
 
+    /// Every declared pypi name, anywhere in this manifest, whose declaration
+    /// is a DIRECT SOURCE (`url`/`path`/`git`) at EVERY site that declares it.
+    ///
+    /// The union mirrors [`Self::declared_pypi_specs_anywhere`] site for site,
+    /// so a caller can subtract one from the other. A name declared as a direct
+    /// source in one feature and as a registry spec in another is NOT in this
+    /// set: some site of this workspace does expect the index to publish it,
+    /// and refusing to name it would lose a real root.
+    pub fn direct_source_pypi_names_anywhere(&self) -> BTreeSet<String> {
+        let mut direct: BTreeSet<String> = BTreeSet::new();
+        let mut registry: BTreeSet<String> = BTreeSet::new();
+        let mut absorb = |specs: &BTreeMap<String, String>, sources: &BTreeSet<String>| {
+            for name in specs.keys() {
+                if sources.contains(name) {
+                    direct.insert(name.clone());
+                } else {
+                    registry.insert(name.clone());
+                }
+            }
+        };
+        absorb(&self.pypi_dependencies, &self.pypi_direct_sources);
+        for (_, target) in &self.target_dependencies {
+            absorb(&target.pypi_dependencies, &target.pypi_direct_sources);
+        }
+        for feature in self.features.values() {
+            absorb(&feature.pypi_dependencies, &feature.pypi_direct_sources);
+            for (_, target) in &feature.target_dependencies {
+                absorb(&target.pypi_dependencies, &target.pypi_direct_sources);
+            }
+        }
+        direct.retain(|name| !registry.contains(name));
+        direct
+    }
+
     pub fn effective_pypi_dependencies_for_resolved_env(
         &self,
         env_name: &str,
@@ -1871,6 +1922,7 @@ fn parse_target_dependencies(root: &toml::Value) -> Vec<(String, TargetDependenc
             }
         }
         target.pypi_dependencies = parse_pypi_dependencies(target_value);
+        target.pypi_direct_sources = parse_direct_source_pypi_names(target_value);
         if !target.dependencies.is_empty()
             || !target.path_dependencies.is_empty()
             || !target.source_dependencies.is_empty()
@@ -3138,6 +3190,47 @@ fn parse_pypi_dependencies(container: &toml::Value) -> BTreeMap<String, String> 
         .collect()
 }
 
+/// The declared pypi names whose declaration is a DIRECT SOURCE -- a
+/// `{ url = … }`, `{ path = … }` or `{ git = … }` table.
+///
+/// WHY THIS EXISTS SEPARATELY FROM [`parse_pypi_dependencies`]. That function
+/// collapses all three of those shapes to the spec string `"*"`, which is
+/// byte-identical to what a genuine registry declaration `pkg = "*"` yields.
+/// Every consumer downstream therefore sees a name with no constraint and no
+/// way to tell "the registry publishes this, unconstrained" from "the registry
+/// does NOT publish this; the workspace owns its source". Lane C's naming
+/// authority read the second as the first and emitted a BARE REGISTRY ROOT for
+/// a distribution that exists on no index -- the `unitree-sdk2py` refusal
+/// (B-cert-4, `newton-gpu`): the workspace declares
+/// `unitree_sdk2py = { path = "third_party/unitree_sdk2_python" }` under an
+/// aarch64-only feature, and a linux-64 pack that merely IMPORTS the module got
+/// `unitree-sdk2py` injected as a root uv can never resolve.
+///
+/// The set is additive: `parse_pypi_dependencies` is unchanged and every one of
+/// its callers keeps the `"*"` it already reads.
+fn parse_direct_source_pypi_names(container: &toml::Value) -> BTreeSet<String> {
+    let Some(deps) = container
+        .get("pypi-dependencies")
+        .or_else(|| container.get("pypi_dependencies"))
+        .and_then(|v| v.as_table())
+    else {
+        return BTreeSet::new();
+    };
+    deps.iter()
+        .filter_map(|(raw_name, value)| {
+            let name = crate::relax::canonical_conda_name(raw_name);
+            if name.is_empty() {
+                return None;
+            }
+            let detail = value.as_table()?;
+            (detail.contains_key("url")
+                || detail.contains_key("path")
+                || detail.contains_key("git"))
+            .then_some(name)
+        })
+        .collect()
+}
+
 /// Parse the index-bearing fields from a `[pypi-options]` table nested
 /// under `container` (the manifest root or a `[feature.X]` value).
 fn parse_pypi_options(container: &toml::Value) -> PypiOptions {
@@ -4278,6 +4371,83 @@ default = { features = [] }
              constraint from undeclared: {declared:?}"
         );
         assert!(!declared.contains_key("absent"));
+    }
+
+    /// UNITREE-1 GUARD (a) — a direct-source declaration is distinguishable
+    /// from an unconstrained registry one.
+    ///
+    /// RED before the fix: `direct_source_pypi_names_anywhere` did not exist
+    /// and `declared_pypi_specs_anywhere` renders BOTH shapes as `"*"`, so
+    /// nothing downstream could tell them apart. The fixture is the shape
+    /// `imprint`'s own `pixi.toml` carries: an aarch64-only `jetson` feature
+    /// declaring `unitree_sdk2py` as a vendored PATH, which B-cert-4 turned
+    /// into a bare linux-64 registry root uv could never resolve.
+    #[test]
+    fn a_direct_source_declaration_is_not_a_registry_declaration() {
+        let ws = ws_toml(
+            r#"
+[pypi-dependencies]
+pillow = "==10.4.0"
+anything = "*"
+
+[feature.jetson.pypi-dependencies]
+imprint = { path = ".", editable = true }
+unitree_sdk2py = { path = "third_party/unitree_sdk2_python", editable = true }
+torch = { url = "https://example.invalid/torch-2.5.0-cp310-cp310-linux_aarch64.whl" }
+
+[feature.gpu.pypi-dependencies]
+rsl-rl = { git = "https://github.com/leggedrobotics/rsl_rl.git", rev = "v1.0.2" }
+
+[environments]
+default = { features = [] }
+"#,
+        );
+        let direct = ws.direct_source_pypi_names_anywhere();
+        assert!(
+            direct.contains("unitree-sdk2py"),
+            "the path declaration that produced B-cert-4's refusal must be named: {direct:?}"
+        );
+        assert!(direct.contains("imprint"), "{direct:?}");
+        assert!(direct.contains("torch"), "a url source is a direct source: {direct:?}");
+        assert!(direct.contains("rsl-rl"), "a git source is a direct source: {direct:?}");
+        // THE NEGATIVE, and it is the whole point: `anything = "*"` reaches
+        // `declared_pypi_specs_anywhere` as the SAME `"*"` the path shapes do.
+        // A fix that simply refused every `"*"` would pass the assertions
+        // above and silently stop injecting every unconstrained registry dep.
+        assert!(
+            !direct.contains("anything"),
+            "an unconstrained REGISTRY dep renders as `*` too and must stay injectable: {direct:?}"
+        );
+        assert!(!direct.contains("pillow"), "{direct:?}");
+        assert_eq!(
+            ws.declared_pypi_specs_anywhere().get("anything").map(Vec::as_slice),
+            ws.declared_pypi_specs_anywhere().get("unitree-sdk2py").map(Vec::as_slice),
+            "the spec map really is blind to the difference -- that is the defect being fixed"
+        );
+    }
+
+    /// UNITREE-1 GUARD (b) — a name declared BOTH ways keeps its registry
+    /// standing. Some site of the workspace does expect the index to publish
+    /// it, so refusing to name it would lose a real root.
+    #[test]
+    fn a_name_declared_as_both_a_source_and_a_registry_spec_stays_a_registry_name() {
+        let ws = ws_toml(
+            r#"
+[feature.dev.pypi-dependencies]
+protomotions = { path = "./third_party/ProtoMotions", editable = true }
+
+[feature.release.pypi-dependencies]
+protomotions = ">=1.2"
+
+[environments]
+default = { features = [] }
+"#,
+        );
+        let direct = ws.direct_source_pypi_names_anywhere();
+        assert!(
+            !direct.contains("protomotions"),
+            "one registry declaration anywhere outranks the source declarations: {direct:?}"
+        );
     }
 
     #[test]

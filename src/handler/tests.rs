@@ -12086,6 +12086,152 @@ fn p6t_b_import_isaacsim_names_the_locked_record_not_a_kit_sdk_wheel_from_the_st
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// UNITREE-1 — THE B-cert-4 REFUSAL, REPRODUCED AND FIXED AT ITS ROOT.
+///
+/// B-cert-4 (`c31-p2-cert` 5841111) recorded, on `newton-gpu`, with
+/// `retread-auto-imports-strict` in force by the flip's compiled-in default:
+///
+/// ```text
+/// auto_imports_suppressed_roots=1 auto_imports_suppressed_all=false:
+///   env=robojudo-pack roots=[unitree-sdk2py] reason=attributed-resolve-backoff:
+///   uv named `unitree-sdk2py` -- Because unitree-sdk2py was not found in the
+///   package registry … upstream-absence
+/// ```
+///
+/// Nothing about that root was ever a registry fact. `robojudo-pack` imports
+/// `unitree_sdk2py` (module-scope, in `robojudo/environment/unitree_env.py`),
+/// and the ONLY thing in the whole request that could name the module was the
+/// workspace manifest's aarch64-only
+/// `[feature.jetson.pypi-dependencies] unitree_sdk2py = { path = … }` — a
+/// VENDORED SOURCE declaration, flattened to the spec string `"*"` by
+/// `parse_pypi_dependencies` and thereby made indistinguishable from a real
+/// unconstrained registry dep. The authority determined it; screen (f) of
+/// `auto_imports_injection_verdict` injected a bare `unitree-sdk2py`; uv looked
+/// on the index; nothing was there; strict refused the INSTALL.
+///
+/// RED on `c0ccc0d`: `is_determined("unitree-sdk2py")` is true and the verdict
+/// is `Ok("unitree-sdk2py")` — the exact root uv rejected.
+#[test]
+fn unitree_1_a_vendored_path_declaration_never_becomes_a_bare_registry_root() {
+    let dir = p6t_tmpdir("unitree-path-decl");
+    std::fs::write(
+        dir.join("pixi.toml"),
+        r#"
+[workspace]
+name = "imprint"
+channels = ["conda-forge"]
+platforms = ["linux-64", "linux-aarch64"]
+
+[pypi-dependencies]
+mujoco-python-viewer = "==0.1.4"
+
+[feature.jetson.pypi-dependencies]
+unitree_sdk2py = { path = "third_party/unitree_sdk2_python", editable = true }
+
+[environments]
+newton-gpu = { features = [] }
+jetson = { features = ["jetson"], no-default-feature = true }
+"#,
+    )
+    .unwrap();
+    let manifest = crate::workspace::WorkspaceManifest::load(&dir)
+        .expect("the fixture manifest must parse, or this guard proves nothing");
+    let facts = WorkspaceCondaFacts::default();
+    let naming =
+        build_auto_imports_naming_authority(None, Some(&manifest), &facts, &recovery_target());
+
+    // (1) The vendored source no longer determines a distribution.
+    assert!(
+        !naming.is_determined("unitree-sdk2py"),
+        "a `path =` declaration is not a claim that any index publishes the name"
+    );
+    // (2) NON-VACUITY: the same manifest's ordinary registry dep still does,
+    // so the fix is not "the authority stopped reading the manifest".
+    assert!(
+        naming.is_determined("mujoco-python-viewer"),
+        "a registry declaration must still name and pin a root"
+    );
+    // (3) The verdict for the import that refused: a LEAD for manifest work,
+    // never a root. `indexed=false` because no wheel in any store ships it.
+    let siblings: BTreeSet<String> = BTreeSet::new();
+    let conda: BTreeSet<String> = BTreeSet::new();
+    let req = p6t_req("unitree_sdk2py", "unitree-sdk2py", false);
+    assert_eq!(
+        auto_imports_injection_verdict(&req, &siblings, &conda, &naming),
+        Err(AUTO_IMPORTS_LEAD_REASON),
+        "the import is real and its distribution is on no index: that is a lead, not a root"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// UNITREE-1 — THE RED CONTROL. The same verdict function, handed the
+/// authority the OLD derivation built, still emits the refusing root.
+///
+/// A guard that cannot fail is a defect: this one pins that the fix lives in
+/// the DERIVATION (`build_auto_imports_naming_authority`) and not in some
+/// incidental screen of `auto_imports_injection_verdict` that would have
+/// refused `unitree-sdk2py` anyway.
+#[test]
+fn unitree_1_the_old_derivation_still_reproduces_the_exact_refusing_root() {
+    use crate::auto_imports::{DeterminedDistribution, NamingAuthority, NamingOrigin};
+
+    let old = NamingAuthority::from_determined([DeterminedDistribution {
+        name: "unitree-sdk2py".to_string(),
+        version: None,
+        origin: NamingOrigin::DeclaredDep,
+    }]);
+    let siblings: BTreeSet<String> = BTreeSet::new();
+    let conda: BTreeSet<String> = BTreeSet::new();
+    let req = p6t_req("unitree_sdk2py", "unitree-sdk2py", false);
+    assert_eq!(
+        auto_imports_injection_verdict(&req, &siblings, &conda, &old),
+        Ok("unitree-sdk2py".to_string()),
+        "this IS B-cert-4's injected root; if this ever stops being reachable the guard \
+         above has stopped guarding anything"
+    );
+}
+
+/// UNITREE-1 — THE NEGATIVE. A genuinely missing import that IS a request
+/// fact still becomes a root, so strict still has something to refuse.
+///
+/// The fix must not be a blanket amnesty: only the direct-source shape loses
+/// its standing.
+#[test]
+fn unitree_1_a_registry_declaration_with_no_constraint_is_still_injected() {
+    let dir = p6t_tmpdir("unitree-registry-star");
+    std::fs::write(
+        dir.join("pixi.toml"),
+        r#"
+[workspace]
+name = "imprint"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[feature.gpu.pypi-dependencies]
+some-absent-dist = "*"
+
+[environments]
+default = { features = ["gpu"] }
+"#,
+    )
+    .unwrap();
+    let manifest = crate::workspace::WorkspaceManifest::load(&dir).unwrap();
+    let facts = WorkspaceCondaFacts::default();
+    let naming =
+        build_auto_imports_naming_authority(None, Some(&manifest), &facts, &recovery_target());
+    assert!(naming.is_determined("some-absent-dist"));
+    let siblings: BTreeSet<String> = BTreeSet::new();
+    let conda: BTreeSet<String> = BTreeSet::new();
+    let req = p6t_req("some_absent_dist", "some-absent-dist", false);
+    assert_eq!(
+        auto_imports_injection_verdict(&req, &siblings, &conda, &naming),
+        Ok("some-absent-dist".to_string()),
+        "an unconstrained REGISTRY declaration renders as `*` exactly like a path source; \
+         it must keep injecting, or the fix has silently disarmed auto-detection"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// p6t GUARD (c) — `suppressed_all` is LOUD.
 ///
 /// Job 5748915 emitted `suppressed_all=true` twice and produced a 27/27 lock.
