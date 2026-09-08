@@ -120,6 +120,26 @@ async fn async_main() -> anyhow::Result<()> {
         return run_repodata_universe(&argv[2..]);
     }
 
+    // `retread sharded-universe [--repodata-dir <dir>]` -- fingerprint the
+    // SHARDED repodata indexes the pixi SOLVER read (N27-RETREAD-81).
+    //
+    // WHY THIS IS A VERB AND NOT A BACKEND ROW. The backend never sees these
+    // documents: pixi's frontend fetches the sharded index through
+    // `rattler_repodata_gateway`, solves against it, and only then spawns us.
+    // There is no moment inside this process at which the sharded index has
+    // been read, so a `tracing` row in `repodata.rs` would be a row about a
+    // file this process never opened. The honest producer runs AFTER the lock,
+    // from the harness, over the directory the solve actually used -- exactly
+    // the shape `repodata-universe` already has.
+    //
+    // AND IT IS A SECOND UNIVERSE, NOT A WIDER ONE. `repodata_universe=` keeps
+    // covering precisely the classic documents it always covered, because the
+    // built-output store's adoption rule is keyed on that number and widening
+    // it would make every published record unadoptable in one commit.
+    if matches!(argv.get(1).map(String::as_str), Some("sharded-universe")) {
+        return run_sharded_universe(&argv[2..]);
+    }
+
     if matches!(argv.get(1).map(String::as_str), Some("migrate-overrides")) {
         return run_migrate_overrides(&argv[2..]);
     }
@@ -882,6 +902,67 @@ fn run_repodata_universe(args: &[String]) -> anyhow::Result<()> {
     println!(
         "{}",
         pixi_build_retread::repodata::universe_summary_line(&documents)
+    );
+    Ok(())
+}
+
+/// `retread sharded-universe [--repodata-dir <dir>]`.
+///
+/// N27-RETREAD-81. Fingerprints the SHARDED repodata indexes under a pixi
+/// `repodata/` directory -- the documents the SOLVER read, and the only place
+/// `run_exports` ever comes from.
+///
+/// `--repodata-dir` defaults to `$PIXI_CACHE_DIR/repodata`, which is what
+/// `fasttmp` points the job's pixi at, so running the verb with the relock's
+/// own environment reads the relock's own indexes.
+///
+/// THE PER-INDEX ROWS GO TO STDOUT, NOT STDERR, and that is a deliberate
+/// difference from `repodata-universe`. That verb's per-document lines are
+/// diagnostics beside one summary line; these rows ARE the evidence a
+/// comparator reads back, and evidence a harness has to merge two streams to
+/// find is evidence that goes missing.
+///
+/// AN EMPTY DIRECTORY IS NOT AN ERROR HERE, which is the other difference.
+/// `repodata-universe` bails on an empty snapshot because a classic universe
+/// with no documents means the backend consulted nothing and any digest printed
+/// for it would be a fact nobody has. The sharded case is not symmetric: a lock
+/// solved entirely from pixi's own `.solv`/`pkgs` caches legitimately touches
+/// no shard index, and refusing there would turn a real state into a failed
+/// job. It prints `indexes=0` instead, which a comparator reads as a universe
+/// and an operator reads as loud.
+fn run_sharded_universe(args: &[String]) -> anyhow::Result<()> {
+    let mut repodata_dir: Option<PathBuf> = None;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--repodata-dir" => {
+                repodata_dir = Some(PathBuf::from(it.next().ok_or_else(|| {
+                    anyhow::anyhow!("retread sharded-universe: --repodata-dir needs a path")
+                })?));
+            }
+            other => anyhow::bail!("retread sharded-universe: unknown arg {other}"),
+        }
+    }
+    let repodata_dir = match repodata_dir {
+        Some(dir) => dir,
+        None => std::env::var_os("PIXI_CACHE_DIR")
+            .map(|root| PathBuf::from(root).join("repodata"))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "retread sharded-universe: pass --repodata-dir <dir> or set PIXI_CACHE_DIR"
+                )
+            })?,
+    };
+    let indexes = pixi_build_retread::sharded_repodata::indexes_from_dir(&repodata_dir);
+    for index in &indexes {
+        println!(
+            "{}",
+            pixi_build_retread::sharded_repodata::sharded_index_row(index)
+        );
+    }
+    println!(
+        "{}",
+        pixi_build_retread::sharded_repodata::sharded_universe_line(&indexes)
     );
     Ok(())
 }
