@@ -173,9 +173,37 @@ async fn async_main() -> anyhow::Result<()> {
     // about to scope, standing outside that build, so reading the current
     // process's environment would be the wrong answer as well as the wrong
     // shape.
+    //
+    // SDM-PYTAG-1 (N27-RETREAD-24) MADE `python_tag` MEASURABLE. It was the one
+    // key field with no producer: declared on argv and then carried, which
+    // MERGE-B32 ran over the canonical 27-environment workspace as a single
+    // `cp310`. That lock resolves FOUR interpreters (cp312 x16, cp311 x7,
+    // cp310 x5, cp38 x1), so the carried value was wrong for 22 of 27 and would
+    // have admitted cp312-built metadata under a cp310 key. `--python-tag` is
+    // still accepted for a single-environment caller; `--python-tag-from-lock
+    // <pixi.lock> --env <name>` derives it, and passing BOTH is refused as a
+    // ROW plus `CARRIED_TAG_EXIT` so a wrapper can tell a stale call site from
+    // a typo.
     if matches!(argv.get(1).map(String::as_str), Some("sdist-meta-key")) {
-        let args = pixi_build_retread::sdist_metadata::parse_args(&argv[2..])?;
-        let code = pixi_build_retread::sdist_metadata::run(&args)?;
+        let code = pixi_build_retread::sdist_metadata::key_main(&argv[2..])?;
+        std::process::exit(code);
+    }
+
+    // `retread sdist-meta-python-tags (--lock <pixi.lock> [--subdir <s>]
+    //      [--env <name>] | --prefix <dir> --env <name>)`
+    //
+    // THE PRODUCER of the fifth key field, printing one
+    // `### SDIST_META_KEY env=<name> python_tag=<cpXY> source=<lock|interpreter>`
+    // row per environment plus a `TOTAL … distinct_tags=<n>` summary. The
+    // harvester and the seeder both read those rows instead of carrying a
+    // literal; `distinct_tags` is what tells a single-overlay seeder that one
+    // key cannot serve every environment (N27-RETREAD-25's wiring).
+    if matches!(
+        argv.get(1).map(String::as_str),
+        Some("sdist-meta-python-tags")
+    ) {
+        let args = pixi_build_retread::sdist_metadata::parse_tag_args(&argv[2..])?;
+        let code = pixi_build_retread::sdist_metadata::run_tags(&args)?;
         std::process::exit(code);
     }
 

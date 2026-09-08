@@ -4119,6 +4119,37 @@ packages:
         );
     }
 
+    /// SDM-PYTAG-1. THE INTERPRETER IS FOUND BY STEM, NEVER BY SUBSTRING.
+    /// Every one of these lives beside `python` in a real environment's package
+    /// list, and a `contains("python-3.")` scan of the canonical lock returns
+    /// one of them for several environments — which is how a lock that resolves
+    /// 3.11.0 gets read as `python-3.0.4` and keyed under `cp30`.
+    #[test]
+    fn only_the_python_package_itself_yields_an_interpreter_version() {
+        let base = "https://prefix.dev/conda-forge/linux-64/";
+        assert_eq!(
+            python_version_from_conda_url(&format!("{base}python-3.12.14-h5f976f7_3_cpython.conda")),
+            Some("3.12.14")
+        );
+        assert_eq!(
+            python_version_from_conda_url(&format!("{base}python-3.8.0-h357f687_5.tar.bz2")),
+            Some("3.8.0")
+        );
+        for decoy in [
+            "python_abi-3.12-8_cp312.conda",
+            "python-dotenv-1.0.1-pyhd8ed1ab_0.conda",
+            "msgpack-python-1.1.0-py312h68727a3_0.conda",
+            "pythonqt-3.4.2-h1234567_0.conda",
+            "libpython-static-3.11.0-h1_0.conda",
+        ] {
+            assert_eq!(
+                python_version_from_conda_url(&format!("{base}{decoy}")),
+                None,
+                "`{decoy}` is not the interpreter"
+            );
+        }
+    }
+
     fn ws_toml(text: &str) -> WorkspaceManifest {
         WorkspaceManifest::from_toml_source(text).unwrap()
     }
@@ -7999,11 +8030,18 @@ channels = ["conda-forge", "robostack-humble"]
 // ---------------------------------------------------------------------------
 
 /// One entry under `environments.<env>.packages.<platform>` in `pixi.lock`.
-/// Conda rows deserialize with `pypi: None` and are ignored.
+/// A row carries EITHER `pypi:` or `conda:`; the PyPI read below ignores the
+/// conda half and [`locked_python_versions_by_env`] ignores the PyPI half.
+///
+/// `conda` was added by SDM-PYTAG-1 rather than a second lock reader being
+/// written beside this one: the file's layout has ONE parser here, which is the
+/// same argument `retread sdist-meta-key` makes for `revision.http`.
 #[derive(Debug, Deserialize)]
 struct PixiLockEnvEntry {
     #[serde(default)]
     pypi: Option<String>,
+    #[serde(default)]
+    conda: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -8086,14 +8124,7 @@ pub fn locked_pypi_versions_for_envs(
             (PypiKey::from_pypi(name).into_string(), version.as_str()),
         );
     }
-    // Platform keys that mean `subdir`: the v7 indirection plus the v6 literal.
-    let platform_keys: BTreeSet<&str> = lock
-        .platforms
-        .iter()
-        .filter(|platform| platform.subdir == subdir)
-        .map(|platform| platform.name.as_str())
-        .chain(std::iter::once(subdir))
-        .collect();
+    let platform_keys = pixi_lock_platform_keys(&lock, subdir);
 
     let mut intersected: Option<BTreeMap<String, String>> = None;
     for env in envs {
@@ -8119,4 +8150,95 @@ pub fn locked_pypi_versions_for_envs(
         }
     }
     intersected.unwrap_or_default()
+}
+
+/// Platform keys that mean `subdir`: the v7 `platforms:` indirection plus the
+/// v6 literal, which keys `environments.<env>.packages` by the subdir itself.
+/// ONE derivation, read by both lock consumers below.
+fn pixi_lock_platform_keys<'a>(lock: &'a PixiLockFile, subdir: &'a str) -> BTreeSet<&'a str> {
+    lock.platforms
+        .iter()
+        .filter(|platform| platform.subdir == subdir)
+        .map(|platform| platform.name.as_str())
+        .chain(std::iter::once(subdir))
+        .collect()
+}
+
+/// The CPython version string out of a locked conda artefact URL, or `None`
+/// when the URL is not the `python` package at all.
+///
+/// THE MATCH IS ON THE FILE NAME'S STEM AND THEN ON DIGITS, in that order, and
+/// both halves are load-bearing. `python_abi-3.11-2_cp311.conda`,
+/// `python-dotenv-1.0.1-...` and `msgpack-python-...` all live in the same
+/// environment's package list; a substring search for `python-3.` finds
+/// whichever of them sorts first and calls it the interpreter. So: the LAST
+/// path segment must begin `python-`, and what follows must begin with a digit.
+///
+/// Returns the version verbatim as locked -- `3.12.14`, `3.8.0` -- because the
+/// tag rule that consumes it ([`crate::sdist_metadata::python_tag_from_version`])
+/// is the ONE place the `major.minor -> cpXY` collapse happens.
+pub fn python_version_from_conda_url(url: &str) -> Option<&str> {
+    let file = url.rsplit('/').next()?;
+    let rest = file.strip_prefix("python-")?;
+    if !rest.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    // `3.12.14-h5f976f7_3_cpython.conda` -> `3.12.14`; `3.8.0-h357f687_5.tar.bz2`
+    // -> `3.8.0`. The build string always follows a `-`, and a version never
+    // contains one.
+    let version = rest.split('-').next()?;
+    if version.is_empty() { None } else { Some(version) }
+}
+
+/// EVERY environment in `pixi.lock`, each with the CPython version it resolved
+/// to on `subdir` -- or `None` when that environment locks no `python` package
+/// at all.
+///
+/// WHY EVERY ENVIRONMENT AND NOT JUST THE RESOLVED ONES (law 9). An environment
+/// whose interpreter cannot be read is the exact case that a single carried
+/// `python_tag` hides: it looks identical to an environment that agrees with
+/// the carried value. Returning `None` for it, by name, is what lets the caller
+/// refuse loudly instead of defaulting.
+///
+/// Errors only when the lock itself will not parse. A missing `python` is data,
+/// not a parse failure.
+pub fn locked_python_versions_by_env(
+    text: &str,
+    subdir: &str,
+) -> Result<BTreeMap<String, Option<String>>> {
+    let lock: PixiLockFile =
+        serde_yaml::from_str(text).context("parsing pixi.lock for per-environment interpreters")?;
+    let platform_keys = pixi_lock_platform_keys(&lock, subdir);
+    let mut out: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for (env, locked_env) in &lock.environments {
+        let mut found: Option<String> = None;
+        for (key, entries) in &locked_env.packages {
+            if !platform_keys.contains(key.as_str()) {
+                continue;
+            }
+            for entry in entries {
+                let Some(url) = &entry.conda else { continue };
+                let Some(version) = python_version_from_conda_url(url) else {
+                    continue;
+                };
+                match &found {
+                    // TWO `python` PACKAGES IN ONE ENVIRONMENT IS NOT A PICK,
+                    // IT IS A CONTRADICTION. A lock cannot install two, so this
+                    // is a lock we do not understand, and guessing between them
+                    // is how a wrong key gets derived quietly.
+                    Some(first) if first.as_str() != version => {
+                        bail!(
+                            "pixi.lock environment `{env}` locks two different `python` \
+                             packages on {subdir} ({first} and {version}); the interpreter \
+                             this environment builds under cannot be read"
+                        );
+                    }
+                    Some(_) => {}
+                    None => found = Some(version.to_owned()),
+                }
+            }
+        }
+        out.insert(env.clone(), found);
+    }
+    Ok(out)
 }

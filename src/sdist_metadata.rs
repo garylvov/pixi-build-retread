@@ -467,6 +467,364 @@ pub fn entry_dir(store_root: &Path, key: &str) -> PathBuf {
     generation_dir(store_root).join(key)
 }
 
+// ── `python_tag`, THE ONE KEY FIELD THAT HAD NO PRODUCER (SDM-PYTAG-1) ──────
+//
+// N27-RETREAD-24. Four of [`KeyInputs`]'s five fields are MEASURED at the point
+// of use: `source_digest` out of the entry's own `revision.http`, `uv_version`
+// as the pixi binary's sha256, `backend` read back out of the arm's lock log,
+// `pythonhashseed` from the harness pin. The fifth, `python_tag`, was DECLARED
+// on argv and then CARRIED: MERGE-B32's proof ran the store against the
+// canonical 27-environment workspace with one `cp310` on the command line,
+// inherited verbatim from SDIST-META-3 arm 1's row.
+//
+// THE MEASUREMENT THAT SAYS WHY THAT IS NOT SURVIVABLE, taken from the retained
+// canonical lock `mergeB32/artifacts/pixi.lock.MDA-6054364.cert`: the 27
+// environments resolve FOUR distinct interpreters —
+//
+//   cp312  16 envs (default, cpu, gpu, test, test-gpu, tensorboard-tools,
+//                   newton-gpu, isaaclab-gpu-latest, ros2-{humble,jazzy}-{cpu,gpu},
+//                   pm-newton-gpu 3.12.14, …)
+//   cp311   7 envs (groot-sonic-gpu, holosoma, pace, pm-isaaclab,
+//                   unitree-rl-lab-gpu, uwlab-gpu, viral-gpu; flashsac-gpu 3.11.16)
+//   cp310   5 envs (hover-gpu, jetson 3.10.20, pm-mujoco, robogen, sage)
+//   cp38    1 env  (unitree-rl-gym, python 3.8.0)
+//
+// — so a carried `cp310` is WRONG FOR 22 OF 27. On the read side that is a miss
+// (the recomputed key does not equal the entry's directory name, and the seeder
+// skips with a row); on the WRITE side it is worse, because an entry produced
+// by a cp312 environment is admitted under a cp310 key and a later cp310 arm
+// gets served metadata built by a different interpreter, which is precisely the
+// cross-job collision the fifth field exists to prevent.
+//
+// So the tag is DERIVED HERE, per environment, from the environment's own
+// resolved interpreter, and printed as a row a shell half can read:
+//
+//     ### SDIST_META_KEY env=<name> python_tag=<cpXY> source=<lock|interpreter>
+//
+// Two sources, both measurements and neither an execution: the lock's own
+// `python-<version>-<build>` conda artefact (`source=lock`, the shape the
+// relock templates have in hand before an environment exists), and an installed
+// environment's `lib/python<major>.<minor>` directory (`source=interpreter`,
+// for a caller holding a prefix rather than a lock). Running the interpreter
+// was rejected: the seeder derives keys for an environment it is standing
+// OUTSIDE of, which is the same argument [`ArmFacts`] makes.
+
+/// The row stem every consumer greps for. One word, so `grep SDIST_META_KEY`
+/// over an arm's wall finds every environment's tag and nothing else.
+pub const TAG_ROW_STEM: &str = "### SDIST_META_KEY";
+
+/// The subdir the tags are read on when a caller names none. The store's
+/// readers are the merge relock templates and every one of them locks
+/// `linux-64`; a caller on another platform passes `--subdir`.
+pub const DEFAULT_SUBDIR: &str = "linux-64";
+
+/// The exit code for "this caller is still on the carried-value path". DISTINCT
+/// from a usage error and from [`REVISION_REFUSED_EXIT`] so a wrapper can tell
+/// a stale call site from a bad file.
+pub const CARRIED_TAG_EXIT: i32 = 4;
+
+/// Where a tag was measured. Printed, because "cp312" alone does not say
+/// whether anything was actually read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagSource {
+    /// The `python` conda artefact locked for this environment.
+    Lock,
+    /// An installed prefix's `lib/python<major>.<minor>` directory.
+    Interpreter,
+}
+
+impl TagSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TagSource::Lock => "lock",
+            TagSource::Interpreter => "interpreter",
+        }
+    }
+}
+
+/// One environment's measured tag, and the row it prints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvPythonTag {
+    pub env: String,
+    /// The version verbatim as measured — `3.12.14`, `3.8.0`. Kept beside the
+    /// tag because the tag is lossy and the row is the audit record.
+    pub python_version: String,
+    pub python_tag: String,
+    pub source: TagSource,
+}
+
+impl EnvPythonTag {
+    /// THE ROW. `python_version` rides on the end rather than in the middle so
+    /// that a consumer's `sed -n 's/.*python_tag=\([^ ]*\).*/\1/p` is stable if
+    /// more fields are ever appended.
+    pub fn row(&self) -> String {
+        format!(
+            "{TAG_ROW_STEM} env={} python_tag={} source={} python_version={}",
+            self.env,
+            self.python_tag,
+            self.source.as_str(),
+            self.python_version,
+        )
+    }
+}
+
+/// `3.12.14` -> `cp312`, `3.8.0` -> `cp38`. THE ONE PLACE the major/minor
+/// collapse happens, so the harvester and the seeder cannot spell it two ways.
+///
+/// Refuses anything it cannot read rather than returning a plausible default:
+/// an empty or guessed tag COLLAPSES two interpreters onto one key, which
+/// [`KeyInputs::validate`] refuses for exactly the same reason.
+pub fn python_tag_from_version(version: &str) -> anyhow::Result<String> {
+    let mut parts = version.trim().split('.');
+    let major = parts.next().unwrap_or("");
+    let minor = parts.next().unwrap_or("");
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if !digits(major) || !digits(minor) {
+        anyhow::bail!(
+            "sdist-meta python tag: `{version}` is not a <major>.<minor>[.<patch>] CPython \
+             version; a guessed tag collapses two interpreters onto one entry key"
+        );
+    }
+    Ok(format!("cp{major}{minor}"))
+}
+
+/// Every environment in `lock_text`, each with the tag of the interpreter IT
+/// resolved — never one value carried across all of them.
+///
+/// An environment that locks no `python` is returned as an `Err` naming it,
+/// because for THIS caller it is not data: a key field that cannot be measured
+/// is the state SDM-PYTAG-1 exists to stop being papered over.
+pub fn env_python_tags_from_lock(
+    lock_text: &str,
+    subdir: &str,
+) -> anyhow::Result<Vec<EnvPythonTag>> {
+    let by_env = crate::workspace::locked_python_versions_by_env(lock_text, subdir)?;
+    if by_env.is_empty() {
+        anyhow::bail!(
+            "sdist-meta python tag: the lock declares no environments on {subdir}; there is \
+             nothing to derive a per-environment tag from"
+        );
+    }
+    let mut untagged: Vec<&str> = Vec::new();
+    let mut out = Vec::with_capacity(by_env.len());
+    for (env, version) in &by_env {
+        let Some(version) = version else {
+            untagged.push(env.as_str());
+            continue;
+        };
+        out.push(EnvPythonTag {
+            env: env.clone(),
+            python_tag: python_tag_from_version(version)?,
+            python_version: version.clone(),
+            source: TagSource::Lock,
+        });
+    }
+    if !untagged.is_empty() {
+        anyhow::bail!(
+            "sdist-meta python tag: {} environment(s) lock no `python` on {subdir} and their \
+             key field cannot be measured: {}",
+            untagged.len(),
+            untagged.join(", ")
+        );
+    }
+    Ok(out)
+}
+
+/// The tag of an INSTALLED environment, read from `<prefix>/lib/python<M>.<m>`.
+///
+/// The directory is read, not the interpreter run: the caller derives keys for
+/// an environment it is standing outside of, and an execution here would also
+/// make the verb refuse on a prefix that exists but cannot be entered.
+pub fn env_python_tag_from_prefix(env: &str, prefix: &Path) -> anyhow::Result<EnvPythonTag> {
+    let lib = prefix.join("lib");
+    let entries = std::fs::read_dir(&lib)
+        .map_err(|e| anyhow::anyhow!("sdist-meta python tag: cannot read {}: {e}", lib.display()))?;
+    let mut found: Option<String> = None;
+    for entry in entries {
+        let entry = entry.map_err(|e| {
+            anyhow::anyhow!("sdist-meta python tag: cannot read {}: {e}", lib.display())
+        })?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(version) = name.strip_prefix("python") else {
+            continue;
+        };
+        if !version.starts_with(|c: char| c.is_ascii_digit()) {
+            continue;
+        }
+        // `python3.12` and `python3.12t` (free-threaded) are two interpreters,
+        // and the trailing marker is part of neither this rule nor the tag —
+        // refuse rather than silently fold them together.
+        if python_tag_from_version(version).is_err() {
+            continue;
+        }
+        match &found {
+            Some(first) if first.as_str() != version => anyhow::bail!(
+                "sdist-meta python tag: {} holds two interpreters ({first} and {version}); the \
+                 interpreter this environment builds under cannot be read",
+                lib.display()
+            ),
+            Some(_) => {}
+            None => found = Some(version.to_owned()),
+        }
+    }
+    let Some(version) = found else {
+        anyhow::bail!(
+            "sdist-meta python tag: no `lib/python<major>.<minor>` under {}; this prefix's key \
+             field cannot be measured",
+            prefix.display()
+        )
+    };
+    Ok(EnvPythonTag {
+        env: env.to_owned(),
+        python_tag: python_tag_from_version(&version)?,
+        python_version: version,
+        source: TagSource::Interpreter,
+    })
+}
+
+/// The distinct tags in a set of rows, in first-seen order.
+pub fn distinct_tags(tags: &[EnvPythonTag]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for tag in tags {
+        if !out.iter().any(|seen| seen == &tag.python_tag) {
+            out.push(tag.python_tag.clone());
+        }
+    }
+    out
+}
+
+// ── `retread sdist-meta-python-tags` ────────────────────────────────────────
+
+/// What the tag verb was asked. Exactly one source; there is no precedence rule
+/// between a lock and a prefix because a precedence rule is how the wrong one
+/// wins silently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TagArgs {
+    Lock {
+        lock: PathBuf,
+        subdir: String,
+        /// Restrict to one environment. `None` prints every one, which is what
+        /// a relock template wants: it locks all of them in one pixi call.
+        env: Option<String>,
+    },
+    Prefix {
+        env: String,
+        prefix: PathBuf,
+    },
+}
+
+pub fn parse_tag_args(args: &[String]) -> anyhow::Result<TagArgs> {
+    let mut lock: Option<PathBuf> = None;
+    let mut prefix: Option<PathBuf> = None;
+    let mut env: Option<String> = None;
+    let mut subdir: Option<String> = None;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        let mut value = || -> anyhow::Result<String> {
+            it.next()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("sdist-meta-python-tags: {arg} requires a value"))
+        };
+        match arg.as_str() {
+            "--lock" => lock = Some(PathBuf::from(value()?)),
+            "--prefix" => prefix = Some(PathBuf::from(value()?)),
+            "--env" => env = Some(value()?),
+            "--subdir" => subdir = Some(value()?),
+            // THE CARRIED-VALUE PATH, REFUSED BY NAME. A caller that reaches
+            // the producer while still holding a literal tag has not been
+            // converted, it has been double-wired, and accepting the flag here
+            // would let the carried value win over the measured one.
+            "--python-tag" => anyhow::bail!(
+                "sdist-meta-python-tags: --python-tag is the carried value this verb exists to \
+                 replace; it derives the tag per environment and takes no literal"
+            ),
+            other => anyhow::bail!(
+                "sdist-meta-python-tags: unknown arg {other}; expected (--lock <pixi.lock> \
+                 [--subdir <s>] [--env <name>] | --prefix <dir> --env <name>)"
+            ),
+        }
+    }
+    match (lock, prefix) {
+        (Some(_), Some(_)) => anyhow::bail!(
+            "sdist-meta-python-tags: --lock and --prefix are exclusive; they are two \
+             measurements of the same field and a precedence rule between them is how the \
+             wrong one wins silently"
+        ),
+        (None, None) => anyhow::bail!(
+            "sdist-meta-python-tags: one of --lock <pixi.lock> or --prefix <dir> is required"
+        ),
+        (Some(lock), None) => Ok(TagArgs::Lock {
+            lock,
+            subdir: subdir.unwrap_or_else(|| DEFAULT_SUBDIR.to_string()),
+            env,
+        }),
+        (None, Some(prefix)) => {
+            if subdir.is_some() {
+                anyhow::bail!(
+                    "sdist-meta-python-tags: --subdir belongs to --lock; an installed prefix \
+                     is already one platform"
+                );
+            }
+            let env = env.ok_or_else(|| {
+                anyhow::anyhow!("sdist-meta-python-tags: --prefix requires --env <name>")
+            })?;
+            Ok(TagArgs::Prefix { env, prefix })
+        }
+    }
+}
+
+/// Resolve the rows a [`TagArgs`] asks for.
+pub fn tag_rows(args: &TagArgs) -> anyhow::Result<Vec<EnvPythonTag>> {
+    match args {
+        TagArgs::Lock { lock, subdir, env } => {
+            let text = std::fs::read_to_string(lock).map_err(|e| {
+                anyhow::anyhow!("sdist-meta-python-tags: cannot read {}: {e}", lock.display())
+            })?;
+            let all = env_python_tags_from_lock(&text, subdir)?;
+            let Some(env) = env else { return Ok(all) };
+            let picked: Vec<EnvPythonTag> =
+                all.iter().filter(|t| &t.env == env).cloned().collect();
+            if picked.is_empty() {
+                anyhow::bail!(
+                    "sdist-meta-python-tags: {} has no environment `{env}` on {subdir}; it has: {}",
+                    lock.display(),
+                    all.iter()
+                        .map(|t| t.env.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            Ok(picked)
+        }
+        TagArgs::Prefix { env, prefix } => Ok(vec![env_python_tag_from_prefix(env, prefix)?]),
+    }
+}
+
+pub fn run_tags(args: &TagArgs) -> anyhow::Result<i32> {
+    let rows = tag_rows(args)?;
+    for row in &rows {
+        println!("{}", row.row());
+    }
+    let distinct = distinct_tags(&rows);
+    let source = rows
+        .first()
+        .map(|r| r.source.as_str())
+        .unwrap_or("none");
+    // THE SUMMARY IS THE ROW THAT MATTERS TO THE SEEDER. `distinct_tags=1` is
+    // the only shape a single overlay can be seeded for under one key; anything
+    // higher and the consumer must key per environment or refuse. It is printed
+    // rather than enforced here because this verb is the PRODUCER — the policy
+    // belongs to the call site (N27-RETREAD-25).
+    println!(
+        "{TAG_ROW_STEM} TOTAL envs={} distinct_tags={} tags={} source={source}",
+        rows.len(),
+        distinct.len(),
+        distinct.join(","),
+    );
+    Ok(0)
+}
+
 // ── `retread sdist-meta-key` ────────────────────────────────────────────────
 
 /// The refusal exit code for a `revision.http` this verb cannot read. It is
@@ -486,10 +844,46 @@ pub struct ArmFacts {
     pub pythonhashseed: String,
 }
 
+/// A caller that passed BOTH a literal `--python-tag` and the per-environment
+/// derivation. Its own type so [`key_main`] can turn it into a ROW and
+/// [`CARRIED_TAG_EXIT`], rather than one more anonymous usage error: this is
+/// the defect SDM-PYTAG-1 is about, and a wrapper needs to be able to tell it
+/// apart from a typo.
+#[derive(Debug)]
+pub struct CarriedTagRefusal(pub String);
+
+impl std::fmt::Display for CarriedTagRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CarriedTagRefusal {}
+
+/// Where `sdist-meta-key` gets its `python_tag`. Not an `Option<String>` plus a
+/// second `Option<PathBuf>`: two optionals admit the both-set state as a value,
+/// and the whole point here is that the both-set state has no meaning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PythonTagChoice {
+    /// The literal a caller declared. Still accepted — a single-environment
+    /// caller measures its own tag and passes it — but no longer the only way.
+    Literal(String),
+    /// Derived from the named environment's own locked interpreter.
+    FromLock {
+        lock: PathBuf,
+        subdir: String,
+        env: String,
+    },
+}
+
 /// What the verb was asked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Args {
-    pub facts: ArmFacts,
+    pub uv_version: String,
+    /// SDM-PYTAG-1: a CHOICE, not a string. See [`PythonTagChoice`].
+    pub python_tag: PythonTagChoice,
+    pub backend: String,
+    pub pythonhashseed: String,
     /// The `revision.http` to key on. `None` is `--probe`: resolve and print
     /// the store paths WITHOUT a key. The seeder needs exactly that — one call
     /// to learn where the store is before it has any entry in hand — and
@@ -501,6 +895,39 @@ pub struct Args {
     pub store_root: Option<PathBuf>,
 }
 
+impl Args {
+    /// The four facts, with `python_tag` MEASURED if it was not declared.
+    ///
+    /// Returns the [`EnvPythonTag`] alongside so the caller can print the same
+    /// row the producer verb prints — one row shape, one reader.
+    pub fn resolve_facts(&self) -> anyhow::Result<(ArmFacts, Option<EnvPythonTag>)> {
+        let (python_tag, measured) = match &self.python_tag {
+            PythonTagChoice::Literal(tag) => (tag.clone(), None),
+            PythonTagChoice::FromLock { lock, subdir, env } => {
+                let args = TagArgs::Lock {
+                    lock: lock.clone(),
+                    subdir: subdir.clone(),
+                    env: Some(env.clone()),
+                };
+                let rows = tag_rows(&args)?;
+                let row = rows.into_iter().next().ok_or_else(|| {
+                    anyhow::anyhow!("sdist-meta-key: no tag row for environment `{env}`")
+                })?;
+                (row.python_tag.clone(), Some(row))
+            }
+        };
+        Ok((
+            ArmFacts {
+                uv_version: self.uv_version.clone(),
+                python_tag,
+                backend: self.backend.clone(),
+                pythonhashseed: self.pythonhashseed.clone(),
+            },
+            measured,
+        ))
+    }
+}
+
 pub fn parse_args(args: &[String]) -> anyhow::Result<Args> {
     let mut uv_version: Option<String> = None;
     let mut python_tag: Option<String> = None;
@@ -509,6 +936,9 @@ pub fn parse_args(args: &[String]) -> anyhow::Result<Args> {
     let mut store_root: Option<PathBuf> = None;
     let mut revision_http: Option<PathBuf> = None;
     let mut probe = false;
+    let mut tag_lock: Option<PathBuf> = None;
+    let mut tag_env: Option<String> = None;
+    let mut tag_subdir: Option<String> = None;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         let mut value = || -> anyhow::Result<String> {
@@ -521,12 +951,16 @@ pub fn parse_args(args: &[String]) -> anyhow::Result<Args> {
             "--probe" => probe = true,
             "--uv-version" => uv_version = Some(value()?),
             "--python-tag" => python_tag = Some(value()?),
+            "--python-tag-from-lock" => tag_lock = Some(PathBuf::from(value()?)),
+            "--env" => tag_env = Some(value()?),
+            "--subdir" => tag_subdir = Some(value()?),
             "--backend" => backend = Some(value()?),
             "--pythonhashseed" => pythonhashseed = Some(value()?),
             "--store-root" => store_root = Some(PathBuf::from(value()?)),
             other => anyhow::bail!(
                 "sdist-meta-key: unknown arg {other}; expected (--revision-http <file> | --probe) \
-                 --uv-version --python-tag --backend --pythonhashseed [--store-root]"
+                 --uv-version (--python-tag <cpXY> | --python-tag-from-lock <pixi.lock> --env \
+                 <name> [--subdir <s>]) --backend --pythonhashseed [--store-root]"
             ),
         }
     }
@@ -534,12 +968,47 @@ pub fn parse_args(args: &[String]) -> anyhow::Result<Args> {
     // passing it is a caller that has not been taught the new rule, and a silent
     // acceptance would key it on something it did not intend.
     let missing = |name: &str| anyhow::anyhow!("sdist-meta-key: --{name} is required");
-    let facts = ArmFacts {
-        uv_version: uv_version.ok_or_else(|| missing("uv-version"))?,
-        python_tag: python_tag.ok_or_else(|| missing("python-tag"))?,
-        backend: backend.ok_or_else(|| missing("backend"))?,
-        pythonhashseed: pythonhashseed.ok_or_else(|| missing("pythonhashseed"))?,
+    // SDM-PYTAG-1. THE BOTH-SET STATE IS THE DEFECT, SO IT IS THE REFUSAL.
+    //
+    // MERGE-B32 ran the store over the canonical 27-environment workspace with
+    // ONE `cp310` on argv, carried from a single-environment arm's row; four
+    // distinct interpreters are locked there, so 22 environments would have
+    // been keyed under an interpreter they do not use. A caller holding both a
+    // literal and a lock is that caller mid-conversion, and letting either win
+    // is how the carried value survives the fix.
+    let tag_choice = match (python_tag, tag_lock) {
+        (Some(_), Some(lock)) => {
+            return Err(CarriedTagRefusal(format!(
+                "sdist-meta-key: --python-tag (a carried literal) and --python-tag-from-lock {} \
+                 (the measured value) were both given; they are two answers for one key field \
+                 and this verb will not pick between them",
+                lock.display()
+            ))
+            .into());
+        }
+        (Some(tag), None) => {
+            if tag_env.is_some() || tag_subdir.is_some() {
+                anyhow::bail!(
+                    "sdist-meta-key: --env/--subdir belong to --python-tag-from-lock; with a \
+                     literal --python-tag they name an environment nothing is read from"
+                );
+            }
+            PythonTagChoice::Literal(tag)
+        }
+        (None, Some(lock)) => PythonTagChoice::FromLock {
+            lock,
+            subdir: tag_subdir.unwrap_or_else(|| DEFAULT_SUBDIR.to_string()),
+            env: tag_env.ok_or_else(|| {
+                anyhow::anyhow!("sdist-meta-key: --python-tag-from-lock requires --env <name>")
+            })?,
+        },
+        (None, None) => {
+            return Err(missing("python-tag (or --python-tag-from-lock <pixi.lock> --env <name>)"));
+        }
     };
+    let uv_version = uv_version.ok_or_else(|| missing("uv-version"))?;
+    let backend = backend.ok_or_else(|| missing("backend"))?;
+    let pythonhashseed = pythonhashseed.ok_or_else(|| missing("pythonhashseed"))?;
     match (probe, revision_http.is_some()) {
         (true, true) => anyhow::bail!(
             "sdist-meta-key: --probe and --revision-http are exclusive; --probe resolves the \
@@ -551,10 +1020,34 @@ pub fn parse_args(args: &[String]) -> anyhow::Result<Args> {
         _ => {}
     }
     Ok(Args {
-        facts,
+        uv_version,
+        python_tag: tag_choice,
+        backend,
+        pythonhashseed,
         revision_http,
         store_root,
     })
+}
+
+/// Parse and run `sdist-meta-key`, TURNING THE CARRIED-VALUE REFUSAL INTO A ROW
+/// AND [`CARRIED_TAG_EXIT`] rather than an anonymous usage error.
+///
+/// The seeder reads rows; a refusal that only reaches stderr with the same exit
+/// code as a typo is a refusal it cannot act on differently (law 9).
+pub fn key_main(argv: &[String]) -> anyhow::Result<i32> {
+    match parse_args(argv) {
+        Ok(args) => run(&args),
+        Err(err) => {
+            if let Some(refusal) = err.downcast_ref::<CarriedTagRefusal>() {
+                println!(
+                    "### SDIST-META KEY refused=carried-python-tag version={CACHE_VERSION}"
+                );
+                eprintln!("{refusal}");
+                return Ok(CARRIED_TAG_EXIT);
+            }
+            Err(err)
+        }
+    }
 }
 
 /// Print the key and the paths derived from it, plus every field READ OUT OF
@@ -565,6 +1058,13 @@ pub fn parse_args(args: &[String]) -> anyhow::Result<Args> {
 /// and the one that actually bit (SDIST-META-2, `admitted=0`).
 pub fn run(args: &Args) -> anyhow::Result<i32> {
     let root = store_root_with(args.store_root.as_deref(), &|k| std::env::var(k).ok());
+    // MEASURE FIRST, INCLUDING ON `--probe`. A caller whose lock cannot yield
+    // the environment's tag must find that out on the one probe call it makes
+    // before it has any entry in hand, not on entry number one.
+    let (facts, measured) = args.resolve_facts()?;
+    if let Some(row) = &measured {
+        println!("{}", row.row());
+    }
     let Some(path) = args.revision_http.as_deref() else {
         println!(
             "### SDIST-META KEY probe=1 version={CACHE_VERSION} store={} entry=<probe>",
@@ -586,10 +1086,10 @@ pub fn run(args: &Args) -> anyhow::Result<i32> {
     let digest = source_digest(&pointer.source);
     let inputs = KeyInputs {
         source_digest: digest.clone(),
-        uv_version: args.facts.uv_version.clone(),
-        python_tag: args.facts.python_tag.clone(),
-        backend: args.facts.backend.clone(),
-        pythonhashseed: args.facts.pythonhashseed.clone(),
+        uv_version: facts.uv_version.clone(),
+        python_tag: facts.python_tag.clone(),
+        backend: facts.backend.clone(),
+        pythonhashseed: facts.pythonhashseed.clone(),
     };
     inputs.validate()?;
     let key = entry_key(&inputs);
@@ -937,7 +1437,14 @@ mod tests {
         let args = parse_args(&full).expect("full argv parses");
         assert_eq!(args.store_root, Some(PathBuf::from("/named")));
         assert_eq!(args.revision_http, Some(PathBuf::from("/r.http")));
-        assert_eq!(args.facts.python_tag, "cp310");
+        assert_eq!(
+            args.python_tag,
+            PythonTagChoice::Literal("cp310".to_string())
+        );
+        assert_eq!(
+            args.resolve_facts().expect("a literal needs no lock").0.python_tag,
+            "cp310"
+        );
 
         let probe: Vec<String> = base
             .iter()
@@ -980,6 +1487,245 @@ mod tests {
         assert!(
             parse_args(&retired).is_err(),
             "--sdist-sha256 must be REFUSED, not silently ignored"
+        );
+    }
+
+    // ── SDM-PYTAG-1: the fifth key field, measured per environment ──────────
+
+    /// A scratch directory, the same shape `store_reap`'s tests use. No
+    /// `tempfile` dependency is added for four tests.
+    fn scratch(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "retread-sdm-pytag-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch");
+        dir
+    }
+
+    /// TWO ENVIRONMENTS ON TWO INTERPRETERS, which is the canonical
+    /// workspace's shape in miniature: `mergeB32/artifacts/pixi.lock.MDA-6054364.cert`
+    /// locks cp312, cp311, cp310 and cp38 across its 27 environments.
+    ///
+    /// `legacy` also carries `python-dotenv`, and `gpu` carries `python_abi`,
+    /// because both are packages a substring search for `python-3.` or
+    /// `python` finds first in a real lock.
+    fn two_env_lock() -> &'static str {
+        "version: 6\n\
+         environments:\n\
+        \x20 gpu:\n\
+        \x20   channels:\n\
+        \x20   - url: https://conda.anaconda.org/conda-forge/\n\
+        \x20   packages:\n\
+        \x20     linux-64:\n\
+        \x20     - conda: https://prefix.dev/conda-forge/linux-64/python_abi-3.12-8_cp312.conda\n\
+        \x20     - conda: https://prefix.dev/conda-forge/linux-64/python-3.12.0-hab00c5b_0_cpython.conda\n\
+        \x20     - pypi: https://files.pythonhosted.org/packages/aa/torch-2.7.0-cp312-cp312-linux_x86_64.whl\n\
+        \x20 legacy:\n\
+        \x20   packages:\n\
+        \x20     linux-64:\n\
+        \x20     - conda: https://prefix.dev/conda-forge/linux-64/python-dotenv-1.0.1-pyhd8ed1ab_0.conda\n\
+        \x20     - conda: https://prefix.dev/conda-forge/linux-64/python-3.8.0-h357f687_5.tar.bz2\n\
+         packages: []\n"
+    }
+
+    #[test]
+    fn the_tag_is_the_major_minor_and_a_version_it_cannot_read_is_refused() {
+        assert_eq!(python_tag_from_version("3.12.14").unwrap(), "cp312");
+        assert_eq!(python_tag_from_version("3.8.0").unwrap(), "cp38");
+        assert_eq!(python_tag_from_version("3.10").unwrap(), "cp310");
+        for bad in ["", "3", "3.", "3.x", "cp312", "3.12t"] {
+            assert!(
+                python_tag_from_version(bad).is_err(),
+                "`{bad}` must refuse rather than guess a tag"
+            );
+        }
+    }
+
+    #[test]
+    fn two_environments_on_two_pythons_derive_two_different_tags() {
+        let rows = env_python_tags_from_lock(two_env_lock(), "linux-64")
+            .expect("the fixture lock parses");
+        assert_eq!(rows.len(), 2, "every environment gets a row: {rows:?}");
+        let gpu = rows.iter().find(|r| r.env == "gpu").expect("gpu row");
+        let legacy = rows.iter().find(|r| r.env == "legacy").expect("legacy row");
+        assert_eq!(gpu.python_tag, "cp312");
+        assert_eq!(legacy.python_tag, "cp38");
+        assert_ne!(
+            gpu.python_tag, legacy.python_tag,
+            "two interpreters must not collapse onto one tag"
+        );
+        assert_eq!(distinct_tags(&rows).len(), 2);
+        assert_eq!(
+            gpu.row(),
+            "### SDIST_META_KEY env=gpu python_tag=cp312 source=lock python_version=3.12.0"
+        );
+        assert_eq!(gpu.source, TagSource::Lock);
+    }
+
+    /// THE POINT OF THE WHOLE LANE. Same artefact, same uv, same backend, same
+    /// seed; only the environment differs — and the key must differ, because
+    /// serving one environment's metadata to the other is exactly the
+    /// cross-interpreter collision the fifth field exists to prevent.
+    #[test]
+    fn the_per_environment_tags_move_the_entry_key() {
+        let rows = env_python_tags_from_lock(two_env_lock(), "linux-64").unwrap();
+        let key_for = |tag: &str| {
+            entry_key(&KeyInputs {
+                source_digest: "d".repeat(64),
+                uv_version: "0.9.5".to_string(),
+                python_tag: tag.to_string(),
+                backend: "setuptools==84.0.0".to_string(),
+                pythonhashseed: "0".to_string(),
+            })
+        };
+        let keys: Vec<String> = rows.iter().map(|r| key_for(&r.python_tag)).collect();
+        assert_ne!(
+            keys[0], keys[1],
+            "two environments on two interpreters must not share one entry key"
+        );
+        // And the CARRIED value is neither of them for at least one of the two,
+        // which is the state MERGE-B32 ran: one `cp310` for 27 environments.
+        let carried = key_for("cp310");
+        assert!(
+            keys.iter().all(|k| k != &carried),
+            "the carried cp310 key must match no environment in this lock"
+        );
+    }
+
+    #[test]
+    fn an_environment_that_locks_no_python_is_refused_by_name() {
+        let lock = "environments:\n\
+                   \x20 headless:\n\
+                   \x20   packages:\n\
+                   \x20     linux-64:\n\
+                   \x20     - conda: https://prefix.dev/conda-forge/linux-64/python_abi-3.12-8_cp312.conda\n\
+                    packages: []\n";
+        let error = env_python_tags_from_lock(lock, "linux-64")
+            .expect_err("an unmeasurable key field must refuse");
+        assert!(error.to_string().contains("headless"), "{error}");
+    }
+
+    #[test]
+    fn an_environment_the_lock_does_not_have_is_refused_with_the_list() {
+        let dir = scratch("lock");
+        let lock = dir.join("pixi.lock");
+        std::fs::write(&lock, two_env_lock()).unwrap();
+        let error = tag_rows(&TagArgs::Lock {
+            lock,
+            subdir: "linux-64".to_string(),
+            env: Some("nope".to_string()),
+        })
+        .expect_err("an unknown environment must refuse");
+        let text = error.to_string();
+        assert!(text.contains("nope"), "{text}");
+        assert!(text.contains("gpu"), "the refusal must name what IS there: {text}");
+    }
+
+    /// THE CARRIED-VALUE PATH, REFUSED WITH ITS OWN EXIT CODE AND ITS OWN ROW.
+    #[test]
+    fn a_literal_tag_beside_the_lock_is_refused_as_the_carried_value() {
+        let argv: Vec<String> = [
+            "--probe",
+            "--uv-version",
+            "0.9.5",
+            "--python-tag",
+            "cp310",
+            "--python-tag-from-lock",
+            "/nowhere/pixi.lock",
+            "--env",
+            "gpu",
+            "--backend",
+            "setuptools==84.0.0",
+            "--pythonhashseed",
+            "0",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let error = parse_args(&argv).expect_err("both tag sources must refuse");
+        assert!(
+            error.downcast_ref::<CarriedTagRefusal>().is_some(),
+            "the carried-value refusal must be its own type, not an anonymous \
+             usage error: {error}"
+        );
+        // …and it reaches the caller as a code a wrapper can branch on, never
+        // as the same 1 a typo produces.
+        assert_eq!(key_main(&argv).expect("the refusal is a code, not an Err"), CARRIED_TAG_EXIT);
+        assert_ne!(CARRIED_TAG_EXIT, REVISION_REFUSED_EXIT);
+    }
+
+    #[test]
+    fn the_producer_verb_takes_no_literal_tag_at_all() {
+        let argv: Vec<String> = ["--lock", "/p.lock", "--python-tag", "cp310"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let error = parse_tag_args(&argv).expect_err("the producer must take no literal");
+        assert!(error.to_string().contains("carried value"), "{error}");
+
+        assert!(
+            parse_tag_args(&["--lock".to_string(), "/p.lock".to_string(), "--prefix".to_string(), "/p".to_string()])
+                .is_err(),
+            "a lock and a prefix are two measurements and must not both be given"
+        );
+        assert!(
+            parse_tag_args(&["--prefix".to_string(), "/p".to_string()]).is_err(),
+            "--prefix without --env names nothing"
+        );
+    }
+
+    #[test]
+    fn a_lock_derived_tag_reaches_the_key_and_prints_its_row() {
+        let dir = scratch("lock");
+        let lock = dir.join("pixi.lock");
+        std::fs::write(&lock, two_env_lock()).unwrap();
+        let argv: Vec<String> = [
+            "--probe",
+            "--uv-version",
+            "0.9.5",
+            "--python-tag-from-lock",
+            lock.to_str().unwrap(),
+            "--env",
+            "legacy",
+            "--backend",
+            "setuptools==84.0.0",
+            "--pythonhashseed",
+            "0",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let args = parse_args(&argv).expect("the derived form parses");
+        let (facts, measured) = args.resolve_facts().expect("the lock yields the tag");
+        assert_eq!(facts.python_tag, "cp38");
+        let measured = measured.expect("a derived tag carries its row");
+        assert_eq!(measured.env, "legacy");
+        assert_eq!(measured.source, TagSource::Lock);
+    }
+
+    #[test]
+    fn an_installed_prefix_is_read_from_its_lib_directory_and_never_run() {
+        let dir = scratch("prefix");
+        std::fs::create_dir_all(dir.join("lib/python3.11/site-packages")).unwrap();
+        std::fs::create_dir_all(dir.join("lib/pythonqt")).unwrap();
+        let row = env_python_tag_from_prefix("gpu", &dir).expect("one interpreter");
+        assert_eq!(row.python_tag, "cp311");
+        assert_eq!(row.source, TagSource::Interpreter);
+        assert_eq!(
+            row.row(),
+            "### SDIST_META_KEY env=gpu python_tag=cp311 source=interpreter python_version=3.11"
+        );
+
+        let empty = scratch("empty");
+        std::fs::create_dir_all(empty.join("lib")).unwrap();
+        assert!(
+            env_python_tag_from_prefix("gpu", &empty).is_err(),
+            "a prefix whose key field cannot be measured must refuse"
         );
     }
 }
