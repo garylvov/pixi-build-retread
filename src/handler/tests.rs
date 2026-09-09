@@ -11157,7 +11157,7 @@ fn c11_the_store_key_carries_no_backend_git_hash() {
 /// the current one, so the bump alone retires them; nothing has to be moved by
 /// hand.
 ///
-/// BOTH NEGATIVE LITERALS ARE ASSERTED, and the second is the one that is easy
+/// ALL FOUR NEGATIVE LITERALS ARE ASSERTED, and the second is the one that is easy
 /// to get wrong: `emission-2` is what MERGE-B44's `e30b23f` already claims for
 /// DIFFERENT semantics on a different lineage, so taking it here would be two
 /// live commits asserting "same behaviour" about different behaviour -- the
@@ -11168,7 +11168,7 @@ fn c11_the_store_key_carries_no_backend_git_hash() {
 fn capwins5_the_emission_identity_moves_off_both_claimed_encodings() {
     let identity = backend_behaviour_identity();
     assert!(
-        identity.contains("retread-built-output-emission-4"),
+        identity.contains("retread-built-output-emission-5"),
         "the fact-constrained emission must have its own schema; got {identity}",
     );
     assert!(
@@ -11187,20 +11187,31 @@ fn capwins5_the_emission_identity_moves_off_both_claimed_encodings() {
     // the unsatisfiable `protobuf>=6.33.5` cap (`grep -l '>=6.33.5'` over the
     // store was 0 before that run and 1 after). That key is one of the 14 this
     // campaign consults, so any candidate still claiming emission-3 ADOPTS it.
-    // Moving to emission-4 is what makes it MISS by identity.
+    // Moving off emission-3 is what makes it MISS by identity.
     assert!(
         !identity.contains("retread-built-output-emission-3"),
         "…and must not be the encoding relock 6112256 poisoned with a >=6.33.5 cap \
          (record bd674558336827b3efd62ec1377a9520); got {identity}",
     );
+    // REPICK-1. The FOURTH negative is this re-pick's own: `d51e284` shipped
+    // emission-4, and B44's constrains-from-the-locked-set changes what
+    // `conda/outputs` emits for unchanged inputs on top of it, so a record
+    // written by an emission-4 binary is a DIFFERENT behaviour under the same
+    // name and must miss rather than be adopted.
+    assert!(
+        !identity.contains("retread-built-output-emission-4"),
+        "…and must not still be the encoding the d51e284 tip carried before the \
+         constrains basis moved; got {identity}",
+    );
     assert_eq!(
         crate::built_output_store::BUILT_OUTPUT_SCHEMA,
-        "retread-built-output-emission-4",
+        "retread-built-output-emission-5",
     );
     assert!(
-        crate::lock::EMIT_EPOCH >= 55,
-        "EMIT_EPOCH must clear 52 (695f108), 53 (e30b23f) and 54 (96ff3dd, whose \
-         emission-3 records are poisoned); got {}",
+        crate::lock::EMIT_EPOCH >= 56,
+        "EMIT_EPOCH must clear 52 (695f108), 53 (e30b23f's own lineage), 54 (96ff3dd, \
+         whose emission-3 records are poisoned) and 55 (d51e284, the pre-constrains \
+         basis); got {}",
         crate::lock::EMIT_EPOCH,
     );
 }

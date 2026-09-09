@@ -865,7 +865,7 @@ pub const SCHEMA: u32 = 20;
 /// campaign consults, so 55/emission-4 is what makes it MISS by identity
 /// rather than be adopted.
 ///
-/// Epoch 53 (N27-RETREAD-130): a pack's `constrains` are derived against the
+/// Epoch 56 (N27-RETREAD-130): a pack's `constrains` are derived against the
 /// consuming environments' LOCKED conda set -- the versions the workspace's
 /// committed `pixi.lock` already pinned -- whenever a base lock is present,
 /// falling back to the day's solved universe only for a name that lock does
@@ -877,8 +877,8 @@ pub const SCHEMA: u32 = 20;
 /// was not a fixed point of its own binary. Identical manifests under a kept
 /// lock now emit a different (pinned) `constrains` list, so every affected
 /// pack must cold-derive once. Drop mode -- no `pixi.lock` on disk -- emits
-/// exactly the pre-53 bytes.
-pub const EMIT_EPOCH: u32 = 53;
+/// exactly the pre-56 bytes.
+pub const EMIT_EPOCH: u32 = 56;
 
 fn parse_stored_glibc(value: Option<&str>) -> Option<Option<(u32, u32)>> {
     match value {

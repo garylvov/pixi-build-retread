@@ -107,15 +107,15 @@ pub const SCHEMA: &str = "retread-built-output-store-v3";
 /// cap no consuming environment can satisfy, and that key is one of the 14 this
 /// campaign consults, so a candidate still claiming emission-3 would adopt it.
 ///
-/// Generation 2 (N27-RETREAD-130): a pack's emitted `constrains:` are derived
+/// Generation 5 (N27-RETREAD-130): a pack's emitted `constrains:` are derived
 /// against the consuming environments' LOCKED conda set when a base lock is
 /// present, instead of against the day's solved universe. Identical manifest
 /// inputs therefore emit a different `conda/outputs` constraints list under a
-/// kept lock, so every entry written by generation 1 must be recomputed once.
+/// kept lock, so every entry written by generation 4 must be recomputed once.
 /// The key ALSO moves (the constrains basis is a key component), so this bump
 /// is the belt to that braces: it makes the invalidation visible as a named
 /// constant in review rather than as an emergent property of a hash.
-pub const BUILT_OUTPUT_SCHEMA: &str = "retread-built-output-emission-2";
+pub const BUILT_OUTPUT_SCHEMA: &str = "retread-built-output-emission-5";
 
 /// The store's directory name under a persistent root, and the `--store`
 /// spelling `retread store-reap` accepts. Named here, beside the layout it
