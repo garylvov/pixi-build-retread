@@ -106,8 +106,16 @@ pub const SCHEMA: &str = "retread-built-output-store-v3";
 /// `bd674558336827b3efd62ec1377a9520` at emission-3 with a `protobuf>=6.33.5`
 /// cap no consuming environment can satisfy, and that key is one of the 14 this
 /// campaign consults, so a candidate still claiming emission-3 would adopt it.
-pub const BUILT_OUTPUT_SCHEMA: &str = "retread-built-output-emission-4";
-
+///
+/// Generation 2 (N27-RETREAD-130): a pack's emitted `constrains:` are derived
+/// against the consuming environments' LOCKED conda set when a base lock is
+/// present, instead of against the day's solved universe. Identical manifest
+/// inputs therefore emit a different `conda/outputs` constraints list under a
+/// kept lock, so every entry written by generation 1 must be recomputed once.
+/// The key ALSO moves (the constrains basis is a key component), so this bump
+/// is the belt to that braces: it makes the invalidation visible as a named
+/// constant in review rather than as an emergent property of a hash.
+pub const BUILT_OUTPUT_SCHEMA: &str = "retread-built-output-emission-2";
 
 /// The store's directory name under a persistent root, and the `--store`
 /// spelling `retread store-reap` accepts. Named here, beside the layout it
@@ -259,6 +267,29 @@ pub struct Record {
     /// cannot be shown to still hold in this one.
     #[serde(default)]
     pub consulted_repodata: Vec<crate::repodata::RepodataDocument>,
+    /// N27-RETREAD-130, AUDIT ONLY. Which basis decided this payload's
+    /// `constrains:` -- `"locked"` (the consuming environments' committed
+    /// `pixi.lock`) or `"universe"` (the day's solve).
+    ///
+    /// WHY IT IS NOT COMPARED HERE, and this is CONDA-OUT-2's rule applied
+    /// rather than an exception to it. The basis DOES change the payload, so
+    /// it must be part of the adoption identity -- and it already is, in the
+    /// only slot that can carry it correctly: it is a component of the key
+    /// material, so `inputs_digest` folds it and the existing digest check
+    /// above refuses a locked-basis record at a universe-basis lookup with no
+    /// new refusal reason and no new comparison. Restating it as a second,
+    /// independently-compared field would be two producers of one fact -- the
+    /// defect N27-RETREAD-62 measured when `channel` was compared twice and no
+    /// record could be adopted by anybody, including its own writer.
+    ///
+    /// So this field buys what `produced_by` buys: an operator can `grep` an
+    /// adopted entry and see which basis wrote it, in one read, without
+    /// re-deriving the key. `serde(default)` so it is additive, exactly as
+    /// `advertised` and `repodata_universe` were; a generation-1 record
+    /// decodes with an empty string, which is honest -- it was written before
+    /// the question existed.
+    #[serde(default)]
+    pub constrains_source: String,
 }
 
 /// A record this reader accepted: the payload plus the cold pass's side
@@ -296,11 +327,13 @@ fn document_label(document: &crate::repodata::RepodataDocument) -> String {
 /// no publish path that omits it -- a record with an empty set is refused by
 /// every reader, so a caller that could not name its documents publishes an
 /// entry nobody will ever adopt rather than one anybody might adopt blind.
+#[allow(clippy::too_many_arguments)]
 pub fn encode<T: serde::Serialize, A: serde::Serialize>(
     inputs_digest: &str,
     produced_by: &str,
     repodata_universe: &str,
     consulted: &[crate::repodata::RepodataDocument],
+    constrains_source: &str,
     payload: &T,
     advertised: &A,
 ) -> Result<Vec<u8>, serde_json::Error> {
@@ -319,6 +352,7 @@ pub fn encode<T: serde::Serialize, A: serde::Serialize>(
         advertised: serde_json::to_value(advertised)?,
         repodata_universe: repodata_universe.to_string(),
         consulted_repodata,
+        constrains_source: constrains_source.to_string(),
     };
     serde_json::to_vec(&record)
 }
@@ -696,6 +730,7 @@ mod tests {
             "1.2.3+deadbeef",
             &crate::repodata::universe_digest_of(consulted),
             consulted,
+            "universe",
             &serde_json::json!({"outputs": []}),
             &serde_json::json!([{"name": "pack", "build": "py311_hdeadbeef_loose_5"}]),
         )
@@ -911,6 +946,7 @@ mod tests {
             "9.9.9+cafebabe",
             &crate::repodata::universe_digest_of(&world),
             &world,
+            "locked",
             &serde_json::json!({"outputs": []}),
             &serde_json::json!([]),
         )

@@ -6132,6 +6132,7 @@ mod tests {
             BTreeSet::new(),
             &NameMap::new(),
             "regression-pack",
+            &BTreeMap::new(),
         )
     }
 

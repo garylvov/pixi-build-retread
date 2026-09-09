@@ -864,7 +864,21 @@ pub const SCHEMA: u32 = 20;
 /// the unsatisfiable `protobuf>=6.33.5` cap, and it is one of the 14 keys this
 /// campaign consults, so 55/emission-4 is what makes it MISS by identity
 /// rather than be adopted.
-pub const EMIT_EPOCH: u32 = 55;
+///
+/// Epoch 53 (N27-RETREAD-130): a pack's `constrains` are derived against the
+/// consuming environments' LOCKED conda set -- the versions the workspace's
+/// committed `pixi.lock` already pinned -- whenever a base lock is present,
+/// falling back to the day's solved universe only for a name that lock does
+/// not carry. Until now that list was the ONE thing in a lock derived against
+/// the live conda universe while every conda row beside it was pinned by
+/// url+sha256, so a repodata roll (measured: 6 generations of each of 14
+/// store keys inside ~24 h) legitimately refused the stored record, recomputed
+/// it, and moved the constraints with no edit anywhere -- the certified lock
+/// was not a fixed point of its own binary. Identical manifests under a kept
+/// lock now emit a different (pinned) `constrains` list, so every affected
+/// pack must cold-derive once. Drop mode -- no `pixi.lock` on disk -- emits
+/// exactly the pre-53 bytes.
+pub const EMIT_EPOCH: u32 = 53;
 
 fn parse_stored_glibc(value: Option<&str>) -> Option<Option<(u32, u32)>> {
     match value {

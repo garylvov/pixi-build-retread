@@ -720,6 +720,20 @@ fn built_output_store_key_material(
     // [`resolution_policy_fingerprint`].
     let resolution_policy = resolution_policy_fingerprint(effective);
 
+    // N27-RETREAD-130. THE CONSTRAINS BASIS. The stored payload's `constrains`
+    // list is now a function of the consuming environments' LOCKED conda set
+    // whenever a base lock is present, so without this a keep-mode record
+    // would sit at exactly the address a drop-mode lookup computes -- and a
+    // record derived from lock A would be adopted by a run holding lock B.
+    let (constrains_basis, basis_scope) =
+        constrains_basis_fingerprint(workspace_dir, source_dir, target);
+    if basis_scope != "locked" {
+        tracing::debug!(
+            reason = basis_scope,
+            "bench: built_output_store key -- constrains basis is the day's universe, not a base lock",
+        );
+    }
+
     vec![
         crate::built_output_store::SCHEMA.to_string(),
         backend_behaviour_identity(),
@@ -728,7 +742,72 @@ fn built_output_store_key_material(
         workspace_manifest_digest,
         source_manifest_digest,
         resolution_policy,
+        constrains_basis,
     ]
+}
+
+/// The basis this pack's emitted `constrains:` will be derived against, as a
+/// key component, plus the reason token for the row.
+///
+/// CONDA-OUT-2 REFUSED to fold `repodata_universe` into this key and the
+/// refusal was right: that digest moves several times a day for documents
+/// which cannot touch a pack's resolution, so folding it re-addresses the
+/// whole store daily -- "a store that re-addresses daily is the same
+/// worthlessness as a store that is deleted daily". THIS COMPONENT IS THE
+/// OPPOSITE KIND OF FACT and that is the entire argument for folding it: it
+/// is the base lock's own conda selections for exactly this pack's consuming
+/// environments, so it moves only when the lock moves -- which is only when
+/// an edit has changed the answer. A keep relock with no edit computes the
+/// same component and HITS; that is the fixed point N27-RETREAD-130 exists to
+/// buy, and a key that moved on a roll would not have bought it.
+///
+/// Every abstention returns a DISTINCT universe token rather than one shared
+/// `"universe"`, so a workspace that cannot be read never shares an address
+/// with a workspace whose lock simply is not there yet.
+fn constrains_basis_fingerprint(
+    workspace_dir: Option<&std::path::Path>,
+    source_dir: &std::path::Path,
+    target: &ResolutionTarget,
+) -> (String, &'static str) {
+    let Some(workspace_dir) = workspace_dir else {
+        return (
+            "constrains:universe:no-workspace".to_string(),
+            "no-workspace",
+        );
+    };
+    let Some(manifest) = crate::workspace::WorkspaceManifest::load(workspace_dir) else {
+        return (
+            "constrains:universe:manifest-unparsed".to_string(),
+            "manifest-unparsed",
+        );
+    };
+    let Some(envs) =
+        workspace_precise_consuming_envs(&manifest, workspace_dir, source_dir, target)
+    else {
+        return (
+            "constrains:universe:ambiguous-ownership".to_string(),
+            "ambiguous-ownership",
+        );
+    };
+    let envs: BTreeSet<String> = envs.into_iter().collect();
+    let locked = crate::workspace::locked_conda_versions_by_env(
+        workspace_dir,
+        &envs,
+        target.conda_subdir(),
+    );
+    if locked.is_empty() {
+        return (
+            "constrains:universe:no-base-lock".to_string(),
+            "no-base-lock",
+        );
+    }
+    (
+        format!(
+            "constrains:locked:{}",
+            crate::workspace::locked_conda_set_digest(&locked)
+        ),
+        "locked",
+    )
 }
 
 /// The address of a built-output entry, plus the digest that entry must carry.
@@ -741,6 +820,12 @@ fn built_output_store_key_material(
 pub(crate) struct BuiltOutputStoreKey {
     pub key: String,
     pub inputs_digest: String,
+    /// N27-RETREAD-130. `"locked"` or `"universe"`, READ BACK OUT of the
+    /// constrains-basis key component rather than passed alongside it, so
+    /// there is exactly ONE producer of the fact and a guard that perturbs
+    /// the component through `built_output_store_key_from_material` moves
+    /// this too. Stamped into the published record for audit.
+    pub constrains_source: String,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -779,9 +864,20 @@ fn built_output_store_key_from_material(material: &[String]) -> BuiltOutputStore
     }
     let digest = hasher.finalize();
     let inputs_digest: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    // ONE READER of the ONE component that carries the basis. A perturbed
+    // component that no longer parses falls back to `universe`, which is the
+    // conservative answer: it names no lock.
+    let constrains_source = material
+        .iter()
+        .find_map(|part| part.strip_prefix("constrains:"))
+        .and_then(|rest| rest.split(':').next())
+        .filter(|token| *token == "locked")
+        .unwrap_or("universe")
+        .to_string();
     BuiltOutputStoreKey {
         key: inputs_digest[..32].to_string(),
         inputs_digest,
+        constrains_source,
     }
 }
 
@@ -6727,6 +6823,7 @@ impl Handler {
                     backend_build_identity(),
                     &crate::repodata::universe_digest_of(&consulted),
                     &consulted,
+                    &store_key.constrains_source,
                     &result,
                     &published_advertised_identities,
                 ) {
@@ -9555,6 +9652,54 @@ struct WorkspaceCondaFacts {
     env_exact_specs: BTreeMap<String, Vec<String>>,
     /// Stable digest of `env_exact_specs`, for persisted heal-fact validity.
     fingerprint: String,
+    /// N27-RETREAD-130. WHICH BASIS decided `common_selected_versions`, and
+    /// how much of it the basis could not supply. Read by the `### CONSTRAINS`
+    /// row and by the guards; carried on the facts rather than printed inside
+    /// the derivation so a test can assert the number a row would show.
+    constrains_basis: ConstrainsBasis,
+}
+
+/// The basis a pack's emitted `constrains:` were derived against, and its
+/// coverage. See [`facts_from_solved_records`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ConstrainsBasis {
+    /// `"locked"` when the environments' own committed `pixi.lock` supplied
+    /// the versions, `"universe"` when the day's solve did.
+    source: ConstrainsSource,
+    /// Distinct canonical conda names in the fact boundary.
+    names: usize,
+    /// Of those, the ones the base lock did NOT carry and which therefore fell
+    /// back to the day's universe -- a genuinely new transitive. Always 0
+    /// under `ConstrainsSource::Universe`, where every name came from there.
+    universe_only: usize,
+}
+
+/// Where the versions in the workspace conda fact boundary came from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum ConstrainsSource {
+    /// No base lock reached this resolution (the harness's `drop` mode, a
+    /// cold first pass, or a lock that does not carry every consuming
+    /// environment). Today's behaviour, unchanged.
+    #[default]
+    Universe,
+    /// The environments' committed `pixi.lock` pinned the versions.
+    Locked,
+}
+
+impl ConstrainsSource {
+    /// Stable row token.
+    fn as_str(self) -> &'static str {
+        match self {
+            ConstrainsSource::Universe => "universe",
+            ConstrainsSource::Locked => "locked",
+        }
+    }
+}
+
+impl std::fmt::Display for ConstrainsSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// Workspace-solved evidence for one conda provider across every precise
@@ -10508,12 +10653,33 @@ fn workspace_ownership_planning_dependencies(
         .collect()
 }
 
+/// N27-RETREAD-130. `locked_by_env` is the environments' own committed conda
+/// selections ([`crate::workspace::locked_conda_versions_by_env`]). When it
+/// covers every solved environment it DECIDES the version of every name it
+/// carries, and the day's solved record decides only the names it does not --
+/// so the fact boundary, and therefore the pack's emitted `constrains:`,
+/// become a function of the LOCK instead of a function of the day.
+///
+/// THE LOCK SUPPLIES NAMES AND VERSIONS BOTH. Supplying only versions would
+/// leave the name SET a function of the day, and a name that enters or leaves
+/// the cross-environment intersection because the day's solve moved is
+/// precisely the `+networkx >=3.0,==3.3` shape measured on the store (same
+/// binary, same `inputs_digest`, one added constraint). The day's solve
+/// contributes only the names the base lock does not carry -- a genuinely new
+/// transitive, which nothing pinned can answer for -- and each one is counted
+/// and printed rather than folded in silently.
+///
+/// An EMPTY `locked_by_env` reproduces the pre-130 derivation exactly, byte
+/// for byte, and that is the harness's `drop` mode arriving as the only signal
+/// the backend ever had for it: no `pixi.lock` on disk when the resolution
+/// ran.
 fn facts_from_solved_records(
     env_records: BTreeMap<String, Vec<rattler_conda_types::RepoDataRecord>>,
     env_conda_deps: BTreeMap<String, BTreeMap<String, String>>,
     owned_pypi: BTreeSet<String>,
     name_map: &NameMap,
     bundle_name: &str,
+    locked_by_env: &BTreeMap<String, BTreeMap<String, String>>,
 ) -> WorkspaceCondaFacts {
     use sha2::{Digest, Sha256};
 
@@ -10538,19 +10704,72 @@ fn facts_from_solved_records(
         .map(|name| canonical_conda_name(&name))
         .filter(|name| name != &bundle_name)
         .collect();
-    let per_env_versions: BTreeMap<String, BTreeMap<String, String>> = env_records
-        .iter()
-        .map(|(env, records)| {
-            let versions = records
+    // N27-RETREAD-130. THE BASIS IS ALL-OR-NOTHING ACROSS THE ENVIRONMENTS.
+    // `common_selected_versions` is an INTERSECTION over them, so deriving one
+    // environment from the lock and its neighbour from the day would produce a
+    // boundary that is a function of neither -- and would move on a roll
+    // anyway, which is the whole defect.
+    let locked_covers_all = !locked_by_env.is_empty()
+        && env_records
+            .keys()
+            .all(|env| locked_by_env.contains_key(env));
+    let constrains_source = if locked_covers_all {
+        ConstrainsSource::Locked
+    } else {
+        ConstrainsSource::Universe
+    };
+    let mut universe_only_names: BTreeSet<String> = BTreeSet::new();
+    let mut per_env_versions: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    for (env, records) in &env_records {
+        let locked = if locked_covers_all {
+            locked_by_env.get(env)
+        } else {
+            None
+        };
+        // THE LOCK SUPPLIES THE NAMES AS WELL AS THE VERSIONS, and that is
+        // what makes this a fixed point rather than a partial one. Had it
+        // supplied only versions, the name SET would still be the day's --
+        // and a name that entered or left the intersection because the day's
+        // solve moved is exactly the `+networkx >=3.0,==3.3` shape this
+        // closes. The locked set IS the environment's installed set; a
+        // workspace conda provider it installs is a provider whether or not
+        // this pack's own probe solve happened to reach it.
+        let mut versions: BTreeMap<String, String> = match locked {
+            Some(locked) => locked
                 .iter()
-                .filter_map(|record| {
-                    let name = canonical_conda_name(record.package_record.name.as_normalized());
-                    (name != bundle_name).then(|| (name, record.package_record.version.to_string()))
-                })
-                .collect();
-            (env.clone(), versions)
-        })
-        .collect();
+                .filter(|(name, _)| *name != &bundle_name)
+                .map(|(name, version)| (name.clone(), version.clone()))
+                .collect(),
+            None => BTreeMap::new(),
+        };
+        for record in records {
+            let name = canonical_conda_name(record.package_record.name.as_normalized());
+            if name == bundle_name {
+                continue;
+            }
+            if locked.is_some() {
+                // A genuinely new transitive: the base lock predates it, so
+                // there is nothing pinned to derive it from and the day is
+                // the only authority there is. Counted and printed, never
+                // silent.
+                if versions.contains_key(&name) {
+                    continue;
+                }
+                universe_only_names.insert(name.clone());
+            }
+            versions.insert(name, record.package_record.version.to_string());
+        }
+        per_env_versions.insert(env.clone(), versions);
+    }
+    let constrains_basis = ConstrainsBasis {
+        source: constrains_source,
+        names: per_env_versions
+            .values()
+            .flat_map(BTreeMap::keys)
+            .collect::<BTreeSet<_>>()
+            .len(),
+        universe_only: universe_only_names.len(),
+    };
     let selected_conda_packages = per_env_versions
         .iter()
         .map(|(env, versions)| (env.clone(), versions.keys().cloned().collect()))
@@ -10657,6 +10876,7 @@ fn facts_from_solved_records(
         selected_conda_packages,
         env_exact_specs,
         fingerprint: format!("{:x}", hasher.finalize()),
+        constrains_basis,
     }
 }
 
@@ -11095,7 +11315,54 @@ fn p6n_learned_moves(
 /// Solve each precise consuming environment independently. Destructive
 /// behavior is enabled only when the workspace can map this source package to
 /// concrete active environments and every environment solve succeeds.
+#[allow(clippy::too_many_arguments)]
 async fn solve_workspace_conda_facts(
+    manifest: &crate::workspace::WorkspaceManifest,
+    workspace_dir: &Path,
+    source_dir: &Path,
+    target: &ResolutionTarget,
+    conda_channels: &[ChannelUrl],
+    name_map: &NameMap,
+    bundle_name: &str,
+    bundle_conda_contribution: &BTreeMap<String, String>,
+) -> WorkspaceCondaFacts {
+    let facts = solve_workspace_conda_facts_inner(
+        manifest,
+        workspace_dir,
+        source_dir,
+        target,
+        conda_channels,
+        name_map,
+        bundle_name,
+        bundle_conda_contribution,
+    )
+    .await;
+    // N27-RETREAD-130. THE ROW, ON EVERY EXIT INCLUDING THE ABSTENTIONS.
+    //
+    // STDERR, NEVER STDOUT: `rpc.rs` owns stdout as the JSON-RPC channel, and
+    // a `println!` from a handler interleaves a `###` row into the protocol
+    // stream and corrupts the very lock it is reporting on. This is the same
+    // channel `### built-outputs REFUSED` uses, and the harness already tees
+    // backend stderr into `<arm>.backend.log`.
+    //
+    // It prints in BOTH modes on purpose. `source=universe` on a drop relock
+    // is not noise: it is the control that says the locked path was not
+    // silently taken, and `source=locked universe_only=0` on a keep relock is
+    // the row that says the emitted constraints could not have moved with the
+    // day. A mode that printed nothing would leave "which basis ran" as an
+    // inference from wall-clock and job id, which is how p6ac cost a night.
+    eprintln!(
+        "### CONSTRAINS source={} pack={} names={} universe_only={}",
+        facts.constrains_basis.source,
+        bundle_name,
+        facts.constrains_basis.names,
+        facts.constrains_basis.universe_only,
+    );
+    facts
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn solve_workspace_conda_facts_inner(
     manifest: &crate::workspace::WorkspaceManifest,
     workspace_dir: &Path,
     source_dir: &Path,
@@ -11199,12 +11466,23 @@ async fn solve_workspace_conda_facts(
             }
         }
     }
+    // N27-RETREAD-130. The base lock's own conda selections for exactly the
+    // environments whose solves produced these facts. EMPTY under the
+    // harness's `drop` mode (no `pixi.lock` on disk), on a cold first pass,
+    // and whenever the lock does not carry one of these environments -- and
+    // an empty map reproduces the pre-130 derivation exactly.
+    let locked_by_env = crate::workspace::locked_conda_versions_by_env(
+        workspace_dir,
+        &env_records.keys().cloned().collect::<BTreeSet<String>>(),
+        &target.conda_subdir,
+    );
     facts_from_solved_records(
         env_records,
         env_conda_deps,
         owned_pypi,
         name_map,
         bundle_name,
+        &locked_by_env,
     )
 }
 
@@ -13192,6 +13470,7 @@ gpu = { features = ["gpu"], no-default-feature = true }
             BTreeSet::new(),
             &name_map(&[("torch", "pytorch")]),
             "sage-isaac-pack",
+            &BTreeMap::new(),
         );
         let constraints = workspace_fact_constraints(
             &facts,
@@ -13236,6 +13515,7 @@ gpu = { features = ["gpu"], no-default-feature = true }
             BTreeSet::new(),
             &name_map(&[("transformers", "transformers")]),
             "protomotions-deps-pack",
+            &BTreeMap::new(),
         );
         // The declared/learned split the fix rests on.
         assert!(
@@ -13295,6 +13575,7 @@ gpu = { features = ["gpu"], no-default-feature = true }
             BTreeSet::new(),
             &name_map(&[("torch", "pytorch")]),
             "sage-isaac-pack",
+            &BTreeMap::new(),
         );
 
         assert!(
@@ -13356,6 +13637,7 @@ gpu = { features = ["gpu"], no-default-feature = true }
             BTreeSet::new(),
             &name_map(&[("torch", "pytorch")]),
             "sage-isaac-pack",
+            &BTreeMap::new(),
         );
 
         assert!(!facts.common_conda_versions.contains_key("pytorch"));
@@ -13448,6 +13730,7 @@ gpu = { features = ["gpu"], no-default-feature = true }
             BTreeSet::new(),
             &NameMap::default(),
             "isaaclab-2.3x-pack",
+            &BTreeMap::new(),
         );
 
         assert_eq!(
@@ -13488,6 +13771,7 @@ gpu = { features = ["gpu"], no-default-feature = true }
             BTreeSet::new(),
             &NameMap::default(),
             "demo-pack",
+            &BTreeMap::new(),
         );
 
         assert!(
@@ -13510,6 +13794,7 @@ gpu = { features = ["gpu"], no-default-feature = true }
             BTreeSet::new(),
             &NameMap::default(),
             "demo-pack",
+            &BTreeMap::new(),
         );
 
         assert!(
@@ -13570,6 +13855,7 @@ gpu = { features = ["gpu"], no-default-feature = true }
                 ),
             ]),
             "demo-pack",
+            &BTreeMap::new(),
         );
 
         assert_eq!(facts.common_pypi["numpy"].version, "2.1.0");
@@ -13864,6 +14150,7 @@ gpu = { features = ["gpu"], no-default-feature = true }
             BTreeSet::new(),
             &name_map(&[]),
             "isaaclab-viral-pack",
+            &BTreeMap::new(),
         );
         assert_eq!(
             free.common_selected_versions.get("protobuf").map(String::as_str),
@@ -13889,6 +14176,7 @@ gpu = { features = ["gpu"], no-default-feature = true }
             BTreeSet::new(),
             &name_map(&[]),
             "isaaclab-viral-pack",
+            &BTreeMap::new(),
         );
 
         let closure_names: BTreeSet<String> =
@@ -14036,6 +14324,216 @@ gpu = { features = ["gpu"], no-default-feature = true }
         );
         assert_eq!(set.provenance["torch"].source, "workspace-solved");
         assert_eq!(set.provenance["protobuf"].conda_version, "5.29.3");
+    }
+
+    // ------------------------------------------------------------------
+    // N27-RETREAD-130. THE CONSTRAINS BASIS.
+    // ------------------------------------------------------------------
+
+    /// One environment's base-lock conda selections, as
+    /// `crate::workspace::locked_conda_versions_by_env` returns them.
+    fn locked(env: &str, pins: &[(&str, &str)]) -> BTreeMap<String, BTreeMap<String, String>> {
+        BTreeMap::from([(
+            env.to_string(),
+            pins.iter()
+                .map(|(name, version)| ((*name).to_string(), (*version).to_string()))
+                .collect(),
+        )])
+    }
+
+    /// THE FIXED POINT. Same pack, same base lock, TWO DIFFERENT DAYS --
+    /// one where the universe moved two versions and dropped a third
+    /// package in -- must produce the SAME fact boundary, because the
+    /// boundary is derived from the lock and the lock did not move.
+    ///
+    /// This is the defect N27-RETREAD-128 measured, in miniature: the
+    /// backend re-derived a pack's `constrains` against a rolled repodata
+    /// and the certified lock changed with no edit anywhere. Both halves of
+    /// the measured shape are here -- an ADDED name (`filelock`, absent from
+    /// the first day's solve) and a MOVED version (`networkx` 3.2 -> 3.3,
+    /// which is what an emitted `==3.3` clause reads).
+    #[test]
+    fn n130_the_same_lock_gives_the_same_constrains_basis_on_two_universes() {
+        let base_lock = locked(
+            "pace",
+            &[
+                ("networkx", "3.2"),
+                ("sympy", "1.13.2"),
+                ("filelock", "3.15.4"),
+            ],
+        );
+        let env_conda_deps = BTreeMap::from([("pace".to_string(), BTreeMap::new())]);
+
+        // Day one.
+        let monday = facts_from_solved_records(
+            BTreeMap::from([(
+                "pace".to_string(),
+                vec![
+                    repo_record("networkx", "3.2", &[]),
+                    repo_record("sympy", "1.13.2", &[]),
+                ],
+            )]),
+            env_conda_deps.clone(),
+            BTreeSet::new(),
+            &NameMap::default(),
+            "isaaclab-2.3x-pack",
+            &base_lock,
+        );
+
+        // Day two: conda-forge rolled. Two versions moved and one package
+        // the first solve never reached is now in the candidate set.
+        let tuesday = facts_from_solved_records(
+            BTreeMap::from([(
+                "pace".to_string(),
+                vec![
+                    repo_record("networkx", "3.3", &[]),
+                    repo_record("sympy", "1.13.3", &[]),
+                    repo_record("filelock", "3.16.0", &[]),
+                ],
+            )]),
+            env_conda_deps,
+            BTreeSet::new(),
+            &NameMap::default(),
+            "isaaclab-2.3x-pack",
+            &base_lock,
+        );
+
+        assert_eq!(
+            monday.common_selected_versions, tuesday.common_selected_versions,
+            "a moved universe must not move the fact boundary the constrains are cut from",
+        );
+        assert_eq!(
+            monday.common_selected_versions.get("networkx").map(String::as_str),
+            Some("3.2"),
+            "the LOCKED version decides, not the day's: {:?}",
+            monday.common_selected_versions,
+        );
+        assert_eq!(
+            tuesday.common_selected_versions.get("filelock").map(String::as_str),
+            Some("3.15.4"),
+            "a name the lock carries is pinned by the lock even when the day moved it",
+        );
+        assert_eq!(monday.constrains_basis.source, super::ConstrainsSource::Locked);
+        assert_eq!(tuesday.constrains_basis.source, super::ConstrainsSource::Locked);
+        assert_eq!(
+            (monday.constrains_basis.names, monday.constrains_basis.universe_only),
+            (3, 0),
+        );
+        assert_eq!(
+            (tuesday.constrains_basis.names, tuesday.constrains_basis.universe_only),
+            (3, 0),
+            "nothing fell back: every name the day named is one the lock carries",
+        );
+    }
+
+    /// DROP MODE IS UNTOUCHED. With no base lock -- the harness's `drop`
+    /// relock, and every cold first pass -- the boundary is EXACTLY the
+    /// day's solved records, which is the pre-130 derivation. Without this
+    /// the epoch bump would be hiding a second, unmeasured change.
+    #[test]
+    fn n130_with_no_base_lock_the_boundary_is_exactly_the_days_solve() {
+        let facts = facts_from_solved_records(
+            BTreeMap::from([(
+                "pace".to_string(),
+                vec![
+                    repo_record("networkx", "3.3", &[]),
+                    repo_record("sympy", "1.13.3", &[]),
+                ],
+            )]),
+            BTreeMap::from([("pace".to_string(), BTreeMap::new())]),
+            BTreeSet::new(),
+            &NameMap::default(),
+            "isaaclab-2.3x-pack",
+            &BTreeMap::new(),
+        );
+        assert_eq!(
+            facts.common_selected_versions,
+            BTreeMap::from([
+                ("networkx".to_string(), "3.3".to_string()),
+                ("sympy".to_string(), "1.13.3".to_string()),
+            ]),
+        );
+        assert_eq!(facts.constrains_basis.source, super::ConstrainsSource::Universe);
+        assert_eq!(
+            facts.constrains_basis.universe_only, 0,
+            "under the universe basis every name came from there, so `universe_only` \
+             counts nothing and must not be read as coverage",
+        );
+    }
+
+    /// A LOCK THAT DOES NOT COVER EVERY SOLVED ENVIRONMENT IS NOT A BASIS.
+    /// The boundary is an intersection ACROSS environments, so deriving one
+    /// from the lock and its neighbour from the day produces a boundary that
+    /// is a function of neither -- and still moves on a roll.
+    #[test]
+    fn n130_a_lock_missing_one_environment_falls_back_whole() {
+        let facts = facts_from_solved_records(
+            BTreeMap::from([
+                (
+                    "pace".to_string(),
+                    vec![repo_record("networkx", "3.3", &[])],
+                ),
+                (
+                    "uwlab-gpu".to_string(),
+                    vec![repo_record("networkx", "3.3", &[])],
+                ),
+            ]),
+            BTreeMap::from([
+                ("pace".to_string(), BTreeMap::new()),
+                ("uwlab-gpu".to_string(), BTreeMap::new()),
+            ]),
+            BTreeSet::new(),
+            &NameMap::default(),
+            "isaaclab-2.3x-pack",
+            &locked("pace", &[("networkx", "3.2")]),
+        );
+        assert_eq!(facts.constrains_basis.source, super::ConstrainsSource::Universe);
+        assert_eq!(
+            facts.common_selected_versions.get("networkx").map(String::as_str),
+            Some("3.3"),
+            "a partial lock must not pin anything",
+        );
+    }
+
+    /// A GENUINELY NEW TRANSITIVE FALLS BACK, AND IS COUNTED.
+    /// The base lock predates the name, so nothing pinned can answer for it
+    /// and the day is the only authority there is. The row must say so:
+    /// `universe_only=1` is the difference between "this boundary is a
+    /// function of the lock" and "this boundary is a function of the lock
+    /// except for one name nobody mentioned".
+    #[test]
+    fn n130_a_name_the_lock_does_not_carry_falls_back_and_is_counted() {
+        let facts = facts_from_solved_records(
+            BTreeMap::from([(
+                "pm-newton-gpu".to_string(),
+                vec![
+                    repo_record("networkx", "3.3", &[]),
+                    repo_record("warp-lang", "1.12.0", &[]),
+                ],
+            )]),
+            BTreeMap::from([("pm-newton-gpu".to_string(), BTreeMap::new())]),
+            BTreeSet::new(),
+            &NameMap::default(),
+            "pm-newton-pack",
+            &locked("pm-newton-gpu", &[("networkx", "3.2")]),
+        );
+        assert_eq!(facts.constrains_basis.source, super::ConstrainsSource::Locked);
+        assert_eq!(
+            facts.constrains_basis.universe_only, 1,
+            "the one name the lock does not carry must be counted: {:?}",
+            facts.constrains_basis,
+        );
+        assert_eq!(facts.constrains_basis.names, 2);
+        assert_eq!(
+            facts.common_selected_versions.get("warp-lang").map(String::as_str),
+            Some("1.12.0"),
+            "the new transitive still enters the boundary; it is only not PINNED",
+        );
+        assert_eq!(
+            facts.common_selected_versions.get("networkx").map(String::as_str),
+            Some("3.2"),
+            "and the names the lock does carry are still pinned by it",
+        );
     }
 }
 

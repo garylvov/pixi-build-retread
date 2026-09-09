@@ -8263,3 +8263,281 @@ pub fn locked_python_versions_by_env(text: &str, subdir: &str) -> Result<LockedP
     }
     Ok(out)
 }
+
+/// The canonical conda package name and the version out of a locked conda
+/// artefact URL, or `None` when the last path segment is not a conda artefact
+/// at all.
+///
+/// THE SPLIT IS FROM THE RIGHT AND THAT IS THE WHOLE CORRECTNESS ARGUMENT. A
+/// conda file name is `<name>-<version>-<build>.<ext>`; a package NAME may
+/// contain `-` (`pytorch-cuda`, `msgpack-python`, `python-dotenv`) while a
+/// version and a build string never may, because `-` is the field separator
+/// conda itself uses. Splitting from the LEFT calls `pytorch-cuda-12.4-...`
+/// the package `pytorch` at version `cuda`, which is not a wrong version so
+/// much as a wrong package -- and it would be a SILENT wrong package, because
+/// `pytorch` is a real name that the fact map has an entry for.
+///
+/// Sibling of [`python_version_from_conda_url`], which answers the narrower
+/// question for the interpreter alone and keeps its own name-prefix guard.
+pub fn conda_name_version_from_url(url: &str) -> Option<(String, &str)> {
+    let file = url.rsplit('/').next()?;
+    let stem = file
+        .strip_suffix(".conda")
+        .or_else(|| file.strip_suffix(".tar.bz2"))?;
+    let mut fields = stem.rsplitn(3, '-');
+    let _build = fields.next()?;
+    let version = fields.next()?;
+    let name = fields.next()?;
+    if name.is_empty() || version.is_empty() {
+        return None;
+    }
+    Some((crate::relax::canonical_conda_name(name), version))
+}
+
+/// The conda packages the workspace's committed `pixi.lock` already selected
+/// for each of `envs` on `subdir`: canonical name -> locked version, keyed by
+/// environment.
+///
+/// WHY THIS EXISTS (N27-RETREAD-130). A source pack's emitted `constrains:`
+/// are decided against the workspace conda facts, and those facts are today a
+/// function of a LIVE solve -- so when conda-forge's repodata rolls under a
+/// kept lock, the facts move, the constraints move, and the certified lock
+/// stops being a fixed point of its own binary with no edit anywhere. Every
+/// other conda row beside those constraints is pinned by url+sha256. This is
+/// the pinned basis the constraints were missing: the environment's own LOCKED
+/// set, which moves only when the lock moves.
+///
+/// Returns an EMPTY map -- "cannot know, do not act" -- when the lock is
+/// missing, unparseable, or does not carry one of `envs`. That is the DROP
+/// mode of `tools/base_lock_mode.sh` reaching the backend as the only signal
+/// it ever had: the presence of `pixi.lock` on disk when the resolution runs.
+/// The caller must treat an empty map as "derive as before", never as "this
+/// environment locks nothing".
+///
+/// An environment that is present in the lock but locks nothing on `subdir`
+/// (the `jetson`/`linux-aarch64` shape [`locked_python_versions_by_env`]
+/// measured) yields an EMPTY inner map, which is a real answer and not an
+/// abstention: nothing of that environment's is on this platform.
+pub fn locked_conda_versions_by_env(
+    workspace_root: &Path,
+    envs: &BTreeSet<String>,
+    subdir: &str,
+) -> BTreeMap<String, BTreeMap<String, String>> {
+    if envs.is_empty() {
+        return BTreeMap::new();
+    }
+    let path = workspace_root.join("pixi.lock");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return BTreeMap::new();
+    };
+    let lock: PixiLockFile = match serde_yaml::from_str(&text) {
+        Ok(lock) => lock,
+        Err(err) => {
+            tracing::debug!(
+                path = %path.display(),
+                error = %err,
+                "pixi.lock unparseable; no locked conda facts",
+            );
+            return BTreeMap::new();
+        }
+    };
+    let platform_keys = pixi_lock_platform_keys(&lock, subdir);
+    let mut by_env: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    for env in envs {
+        let Some(locked_env) = lock.environments.get(env) else {
+            // A consumer the lock has never solved: refuse to guess, for the
+            // whole map. A partial basis is worse than none -- it would derive
+            // some environments from the lock and some from the day, and the
+            // emitted constraint is an INTERSECTION across them.
+            return BTreeMap::new();
+        };
+        let mut versions: BTreeMap<String, String> = BTreeMap::new();
+        for (key, entries) in &locked_env.packages {
+            if !platform_keys.contains(key.as_str()) {
+                continue;
+            }
+            for entry in entries {
+                let Some(url) = &entry.conda else { continue };
+                if let Some((name, version)) = conda_name_version_from_url(url) {
+                    versions.insert(name, version.to_owned());
+                }
+            }
+        }
+        by_env.insert(env.clone(), versions);
+    }
+    by_env
+}
+
+/// Content digest of a [`locked_conda_versions_by_env`] map, for the shared
+/// built-output store key.
+///
+/// CONDA-OUT-2 REFUSED to fold `repodata_universe` into that key, and the
+/// reason was measured: the whole-root universe digest moves several times a
+/// day for documents that cannot touch a pack's resolution, so a key folding
+/// it re-addresses the store daily. This digest is the opposite kind of fact
+/// and that is why it may be folded: it moves ONLY when the base lock moves,
+/// which is exactly when the answer it decides has legitimately changed. A
+/// keep relock with no edit computes the same digest and hits; an edited
+/// manifest re-locks, moves the digest, and misses -- which is correct.
+pub fn locked_conda_set_digest(locked: &BTreeMap<String, BTreeMap<String, String>>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"retread-locked-conda-set-v1\0");
+    for (env, versions) in locked {
+        hasher.update(env.as_bytes());
+        hasher.update([0xffu8]);
+        for (name, version) in versions {
+            hasher.update(name.as_bytes());
+            hasher.update([0u8]);
+            hasher.update(version.as_bytes());
+            hasher.update([0u8]);
+        }
+        hasher.update([0xfeu8]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+#[cfg(test)]
+mod locked_conda_set_tests {
+    use super::{conda_name_version_from_url, locked_conda_set_digest, locked_conda_versions_by_env};
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::path::PathBuf;
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "retread-n130-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// N27-RETREAD-130. THE NAME/VERSION SPLIT IS FROM THE RIGHT, and the
+    /// hyphenated names are the whole reason. `pytorch-cuda-12.4-hc786d27_7`
+    /// split from the LEFT reads as the package `pytorch` at version `cuda`
+    /// -- and `pytorch` is a real name the fact boundary has an entry for, so
+    /// the error would be a SILENT wrong pin rather than a parse failure.
+    #[test]
+    fn n130_conda_urls_split_name_and_version_from_the_right() {
+        let cases: &[(&str, Option<(&str, &str)>)] = &[
+            (
+                "https://conda.anaconda.org/pytorch/linux-64/pytorch-cuda-12.4-hc786d27_7.tar.bz2",
+                Some(("pytorch-cuda", "12.4")),
+            ),
+            (
+                "https://conda.anaconda.org/pytorch/linux-64/pytorch-2.5.1-py3.10_cuda12.4_cudnn9.1.0_0.tar.bz2",
+                Some(("pytorch", "2.5.1")),
+            ),
+            (
+                "https://conda.anaconda.org/conda-forge/noarch/networkx-3.3-pyhd8ed1ab_1.conda",
+                Some(("networkx", "3.3")),
+            ),
+            (
+                "https://conda.anaconda.org/conda-forge/linux-64/python_abi-3.11-8_cp311.conda",
+                Some(("python-abi", "3.11")),
+            ),
+            // A wheel is not a conda artefact, and neither is a bare name.
+            ("https://example.com/torch-2.7.0.whl", None),
+            ("https://example.com/linux-64/pytorch.conda", None),
+        ];
+        for (url, want) in cases {
+            let got = conda_name_version_from_url(url);
+            let got = got.as_ref().map(|(name, version)| (name.as_str(), *version));
+            assert_eq!(got, *want, "parsing `{url}`");
+        }
+    }
+
+    /// N27-RETREAD-130. The per-environment conda read: the v7 `platforms:`
+    /// indirection, names+versions straight off the artefact URLs, and the
+    /// fail-closed WHOLE-map refusal when the lock has never solved one of
+    /// the consumers.
+    #[test]
+    fn n130_locked_conda_versions_are_read_per_environment_and_fail_closed() {
+        let root = temp_root("lockconda");
+        std::fs::write(
+            root.join("pixi.lock"),
+            r#"
+version: 7
+platforms:
+- name: p1
+  subdir: linux-64
+- name: p5
+  subdir: linux-aarch64
+environments:
+  pace:
+    packages:
+      p1:
+      - conda: https://example.com/linux-64/networkx-3.2-pyhd8ed1ab_0.conda
+      - conda: https://example.com/linux-64/pytorch-cuda-12.4-hc786d27_7.tar.bz2
+      - pypi: https://example.com/torch-2.7.0.whl
+      p5:
+      - conda: https://example.com/linux-aarch64/networkx-9.9-pyhd8ed1ab_0.conda
+  jetson:
+    packages:
+      p5:
+      - conda: https://example.com/linux-aarch64/networkx-3.9-pyhd8ed1ab_0.conda
+packages:
+- conda: https://example.com/linux-64/networkx-3.2-pyhd8ed1ab_0.conda
+"#,
+        )
+        .unwrap();
+
+        let one =
+            locked_conda_versions_by_env(&root, &BTreeSet::from(["pace".to_string()]), "linux-64");
+        assert_eq!(
+            one,
+            BTreeMap::from([(
+                "pace".to_string(),
+                BTreeMap::from([
+                    ("networkx".to_string(), "3.2".to_string()),
+                    ("pytorch-cuda".to_string(), "12.4".to_string()),
+                ]),
+            )]),
+            "the linux-aarch64 rows must not leak in through the platform indirection",
+        );
+
+        // An environment present in the lock that locks NOTHING on this
+        // subdir is an EMPTY inner map -- a real answer -- and not an
+        // abstention. (`jetson` is the shape `LockedPythons` measured.)
+        let both = locked_conda_versions_by_env(
+            &root,
+            &BTreeSet::from(["pace".to_string(), "jetson".to_string()]),
+            "linux-64",
+        );
+        assert_eq!(both.len(), 2);
+        assert!(both["jetson"].is_empty());
+
+        // A consumer the lock has never solved refuses the WHOLE map: a
+        // partial basis derives some environments from the lock and some
+        // from the day, and the boundary is an intersection across them.
+        assert!(
+            locked_conda_versions_by_env(
+                &root,
+                &BTreeSet::from(["pace".to_string(), "never-locked".to_string()]),
+                "linux-64",
+            )
+            .is_empty(),
+        );
+
+        // No lock at all is the harness's `drop` mode reaching the backend.
+        let empty = temp_root("lockconda-none");
+        assert!(
+            locked_conda_versions_by_env(&empty, &BTreeSet::from(["pace".to_string()]), "linux-64")
+                .is_empty(),
+        );
+
+        // The digest is a function of the map and of nothing else.
+        assert_eq!(
+            locked_conda_set_digest(&one),
+            locked_conda_set_digest(&one.clone()),
+        );
+        assert_ne!(locked_conda_set_digest(&one), locked_conda_set_digest(&both));
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(empty);
+    }
+}

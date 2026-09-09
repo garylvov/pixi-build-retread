@@ -10995,6 +10995,7 @@ async fn built_output_store_hit_serves_the_same_result_a_cold_compute_produced()
         backend_build_identity(),
         &crate::repodata::universe_digest_of(&store_world()),
         &store_world(),
+        "universe",
         &result,
         &Vec::<AdvertisedIdentityRecord>::new(),
     )
@@ -11027,6 +11028,7 @@ async fn built_output_store_hit_serves_the_same_result_a_cold_compute_produced()
             backend_build_identity(),
             &crate::repodata::universe_digest_of(&store_world()),
             &store_world(),
+            "universe",
             &adopted,
             &Vec::<AdvertisedIdentityRecord>::new(),
         )
@@ -11286,6 +11288,7 @@ fn c11_an_emission_schema_bump_is_a_miss() {
         backend_build_identity(),
         &crate::repodata::universe_digest_of(&store_world()),
         &store_world(),
+        "universe",
         &serde_json::json!({"outputs": []}),
         &serde_json::json!([]),
     )
@@ -11351,6 +11354,7 @@ async fn c11_an_adopted_output_restores_the_cold_passs_advertised_identity() {
         backend_build_identity(),
         &crate::repodata::universe_digest_of(&store_world()),
         &store_world(),
+        "universe",
         &serde_json::json!({"outputs": []}),
         &vec![record.clone()],
     )
