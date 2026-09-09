@@ -853,7 +853,18 @@ pub const SCHEMA: u32 = 20;
 /// prevent: a record published by one would be adopted by the other under an
 /// identity asserting "same behaviour". Verified before writing this, not
 /// quoted: `git show e30b23f:src/lock.rs` prints `= 53;`.
-pub const EMIT_EPOCH: u32 = 54;
+///
+/// 55 (N27-RETREAD-145, CAPWINS-6): the AUTO-BUNDLE admission is now resolved
+/// under the same workspace conda facts as the joint-solve restore, so a pack
+/// whose crossing wheel arrived through that door -- which is the door relock
+/// `6112256` measured, 2 `auto-bundled … googleapis-common-protos` rows and 0
+/// `PYPI ROUTE RESTORED` ones, the exact reverse of `6106911` -- emits
+/// different bytes than it did at 54. 54's own emission-3 records are also
+/// POISONED: `6112256` published `bd674558336827b3efd62ec1377a9520` carrying
+/// the unsatisfiable `protobuf>=6.33.5` cap, and it is one of the 14 keys this
+/// campaign consults, so 55/emission-4 is what makes it MISS by identity
+/// rather than be adopted.
+pub const EMIT_EPOCH: u32 = 55;
 
 fn parse_stored_glibc(value: Option<&str>) -> Option<Option<(u32, u32)>> {
     match value {

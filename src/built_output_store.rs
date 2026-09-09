@@ -101,7 +101,12 @@ pub const SCHEMA: &str = "retread-built-output-store-v3";
 /// emission-3 (N27-RETREAD-142): the joint-solve route restore re-resolves.
 /// emission-2 is skipped for the same reason `EMIT_EPOCH` skips 53 -- MERGE-B44's
 /// `e30b23f` already claims it for different semantics.
-pub const BUILT_OUTPUT_SCHEMA: &str = "retread-built-output-emission-3";
+/// emission-4 (N27-RETREAD-145): the AUTO-BUNDLE admission is fact-constrained
+/// too, AND emission-3 is retired by poisoning -- relock 6112256 published
+/// `bd674558336827b3efd62ec1377a9520` at emission-3 with a `protobuf>=6.33.5`
+/// cap no consuming environment can satisfy, and that key is one of the 14 this
+/// campaign consults, so a candidate still claiming emission-3 would adopt it.
+pub const BUILT_OUTPUT_SCHEMA: &str = "retread-built-output-emission-4";
 
 
 /// The store's directory name under a persistent root, and the `--store`

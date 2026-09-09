@@ -274,6 +274,7 @@ pub(crate) fn route_restore_unsatisfiable_message(
     base: &VersionSpecifiers,
     excluded: &[Version],
     crossing: &FactCrossing,
+    site: FactConstrainedSite,
 ) -> String {
     let tried = excluded
         .iter()
@@ -287,13 +288,16 @@ pub(crate) fn route_restore_unsatisfiable_message(
         base
     };
     format!(
-        "joint-solve route restore for `{dep}` in bundle `{bundle}` has no release compatible \
-         with the workspace conda fact `{}=={}`: within `{base}` every candidate this restore \
+        "{site} for `{dep}` in bundle `{bundle}` has no release compatible \
+         with the workspace conda fact `{}=={}`: within `{base}` every candidate this admission \
          reached requires `{}`, which excludes that version. Versions tried and refused: {tried}. \
-         Re-injecting one of them would carry its bound into this pack's conda `constrains` as a \
+         Admitting one of them would carry its bound into this pack's conda `constrains` as a \
          cap no consuming environment can satisfy, so the bundle refuses instead \
-         (N27-RETREAD-142).",
-        crossing.fact_name, crossing.fact_version, crossing.requirement,
+         (N27-RETREAD-142, N27-RETREAD-145).",
+        crossing.fact_name,
+        crossing.fact_version,
+        crossing.requirement,
+        site = site.label(),
     )
 }
 
@@ -317,6 +321,185 @@ pub(crate) fn specifiers_excluding(
     VersionSpecifiers::from_str(&joined).with_context(|| {
         format!("building re-resolve specifiers `{joined}` while restoring `{dep}`")
     })
+}
+
+/// WHICH ADMISSION PATH a wheel took into the pack's closure.
+///
+/// N27-RETREAD-142 fixed ONE of the two, and the production RED then came back
+/// through the other. `MERGE-B44prime-4`'s relock `6112256` is the measurement:
+/// in `6106911`'s backend log `PYPI ROUTE RESTORED dep=googleapis-common-protos`
+/// occurs 2 times and `auto-bundled into isaaclab-2-3x-pack …
+/// googleapis-common-protos` 0 times; in `6112256`'s it is 0 and 2. The SAME
+/// dep, the SAME emitted cap `protobuf>=6.33.5`, the SAME unsatisfiable
+/// `constrains` against the SAME workspace fact `protobuf==5.29.3` -- by a
+/// different door, chosen by the store/route-cache state of the hour. A fix
+/// that guards one door is therefore not a fix; both admissions are now
+/// resolved under the same workspace conda facts, and this enum exists so the
+/// refusal can still say WHICH door refused (N27-RETREAD-145).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FactConstrainedSite {
+    /// `jointly_unroute_unsolvable`: a rejected conda route restored to PyPI.
+    JointRouteRestore,
+    /// `auto_bundle_transitives`: a transitive dep fetched into the bundle
+    /// because no validated conda candidate satisfies it.
+    AutoBundleAdmission,
+}
+
+impl FactConstrainedSite {
+    /// The phrase the refusal opens with, so a reader knows which admission
+    /// path to look at without diffing two log regions.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::JointRouteRestore => "joint-solve route restore",
+            Self::AutoBundleAdmission => "auto-bundle PyPI admission",
+        }
+    }
+}
+
+/// The per-pass row the AUTO-BUNDLE admission writes.
+///
+/// One row per fixed-point pass that admitted at least one wheel, on stderr
+/// (`rpc.rs` owns stdout). `names` is how many workspace conda facts were in
+/// force for the pass -- `names=0` is the honest statement that the pass had
+/// nothing to check against -- and `backtracked` lists every dep whose
+/// selection MOVED, as `<dep> <from> <to>` triples separated by `, `.
+///
+/// `backtracked=none` prints too, and deliberately, for the reason
+/// [`pypi_route_reresolved_row`] gives: a row that appears only when something
+/// moved cannot distinguish "this pass was checked and needed nothing" from
+/// "this pass was never checked", and the second is the defect this whole
+/// series is about.
+pub(crate) fn pypi_closure_fact_constrained_row(
+    names: usize,
+    backtracked: &[(String, String, String)],
+) -> String {
+    let moved = if backtracked.is_empty() {
+        "none".to_string()
+    } else {
+        backtracked
+            .iter()
+            .map(|(dep, from, to)| format!("{dep} {from} {to}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!("### PYPI CLOSURE FACT-CONSTRAINED names={names} backtracked={moved}")
+}
+
+/// Fetch one PyPI candidate UNDER the workspace conda facts, backtracking
+/// until the selection's `Requires-Dist` admits every fact, or refusing.
+///
+/// THIS IS THE ONE ACTUATOR BOTH ADMISSION PATHS SHARE. It is a whole-body
+/// extraction of the loop CAPWINS-5 wrote at the restore site -- the backtrack
+/// is still "exclude the refused version and re-issue", because
+/// `bfs_fetch_pypi_from_chain` returns the highest release satisfying the
+/// specifiers it is handed, so a `!=` clause IS asking for the next one down.
+///
+/// Returns the wheel and, when the facts were actually consulted, the
+/// `(from, to)` pair: `from` is the version the UNCONSTRAINED fetch would have
+/// taken and `to` is the version the facts admit. `from == to` is returned,
+/// not swallowed, so each call site can print "checked, needed nothing".
+/// `None` means the re-resolve was deliberately opted out of.
+#[allow(clippy::too_many_arguments)]
+async fn fetch_under_workspace_facts<X, XF>(
+    request: PypiFetchRequest,
+    indexes: Vec<String>,
+    failure_context: String,
+    facts: &BTreeMap<String, Version>,
+    marker_env: &MarkerEnvironment,
+    bundle_label: &str,
+    site: FactConstrainedSite,
+    enabled: bool,
+    fetch_pypi: &X,
+) -> Result<(ResolvedWheel, Option<(String, String)>)>
+where
+    X: Fn(PypiFetchRequest, Vec<String>, String) -> XF,
+    XF: Future<Output = Result<ResolvedWheel>>,
+{
+    let dep = request.pypi_name.clone();
+    let base = request.specifiers.clone();
+    let mut excluded: Vec<Version> = Vec::new();
+    let mut from_version: Option<String> = None;
+    let mut refused_by: Option<FactCrossing> = None;
+    loop {
+        let mut attempt = request.clone();
+        attempt.specifiers = specifiers_excluding(&base, &excluded, &dep)?;
+        if !excluded.is_empty() {
+            // A backtrack must not be steered by the pre-routing preference:
+            // that preference IS the selection just refused, and a soft
+            // `preferred_version` pointing at it would make every retry
+            // re-propose it.
+            attempt.preferred_version = None;
+        }
+        let wheel = match fetch_pypi(attempt, indexes.clone(), failure_context.clone()).await {
+            Ok(wheel) => wheel,
+            Err(error) => {
+                // An index that cannot serve the ORIGINAL request is the
+                // pre-existing failure and keeps its own message. An index
+                // that runs out only after this re-resolve excluded versions
+                // is the -142/-145 refusal, and it must name what it refused
+                // for.
+                let Some(crossing) = refused_by else {
+                    return Err(error);
+                };
+                return Err(anyhow!(route_restore_unsatisfiable_message(
+                    &dep,
+                    bundle_label,
+                    &base,
+                    &excluded,
+                    &crossing,
+                    site,
+                )));
+            }
+        };
+        if from_version.is_none() {
+            from_version = Some(wheel.metadata.version.clone());
+        }
+        if !enabled {
+            return Ok((wheel, None));
+        }
+        let crossings =
+            fact_versions_excluded_by_requires_dist(&wheel.metadata.requires_dist, facts, marker_env);
+        let Some(crossing) = crossings.into_iter().next() else {
+            let from = from_version
+                .clone()
+                .unwrap_or_else(|| wheel.metadata.version.clone());
+            let to = wheel.metadata.version.clone();
+            return Ok((wheel, Some((from, to))));
+        };
+        let refused = Version::from_str(&wheel.metadata.version).with_context(|| {
+            format!(
+                "parsing candidate wheel version `{}` while re-resolving `{dep}`",
+                wheel.metadata.version
+            )
+        })?;
+        if excluded.contains(&refused) {
+            // The index answered with a version this request had already
+            // excluded. That is not a backtrack that can terminate, so it
+            // refuses here rather than spinning.
+            return Err(anyhow!(route_restore_unsatisfiable_message(
+                &dep,
+                bundle_label,
+                &base,
+                &excluded,
+                &crossing,
+                site,
+            )));
+        }
+        excluded.push(refused);
+        refused_by = Some(crossing);
+        if excluded.len() > ROUTE_RESTORE_RERESOLVE_MAX_BACKTRACKS {
+            return Err(anyhow!(route_restore_unsatisfiable_message(
+                &dep,
+                bundle_label,
+                &base,
+                &excluded,
+                refused_by
+                    .as_ref()
+                    .expect("a backtrack is recorded before the bound is tested"),
+                site,
+            )));
+        }
+    }
 }
 
 /// Per-group state needed to hand a rejected conda route back to the outer uv
@@ -2567,9 +2750,40 @@ where
         // Per item, the index fallback chain is walked serially. The shared
         // BFS fetcher supplies the wheel -> sdist-build fallback. Exhausting
         // the chain is an error because conda routing was already refused.
-        let fetched: Vec<Result<(String, String, ResolvedWheel)>> = {
+        // EVERY WHEEL ADMITTED INTO THE PACK CLOSURE IS RESOLVED UNDER THE
+        // WORKSPACE'S CONDA FACTS (N27-RETREAD-145), not only the ones the
+        // joint-solve restore admits.
+        //
+        // WHY THIS SITE AND NOT A UV CLOSURE CONSTRAINT. The obvious reading of
+        // the production RED is that `protobuf` sits in `auto_dropped` -- it is
+        // workspace-owned, the conda provider holds `5.29.3` -- so the pack's uv
+        // closure resolve never sees it as a requirement to satisfy and freely
+        // picks a `googleapis-common-protos` that needs `>=6.33.5`. MEASURED in
+        // relock `6112256`'s 88 MB backend log, that is NOT what happened: no
+        // closure resolve admitted this dep at all. The two rows, adjacent, are
+        // `pypi: fetching simple index url=https://pypi.org/simple/
+        // googleapis-common-protos/` and `auto_bundle: auto-bundled into
+        // isaaclab-2-3x-pack dep=googleapis-common-protos version=~=1.52` -- the
+        // LOOSE arm of this very loop, fetching under a bare `~=1.52` from a
+        // parent wheel's `Requires-Dist`, and `bfs_fetch_pypi_from_chain`
+        // returning the highest release that satisfies it (1.75.3 today).
+        // Constraining a uv closure would therefore have fixed nothing. The
+        // fact has to reach THIS fetch, which is where the selection is made.
+        //
+        // The actuator is the same one the restore uses, extracted whole
+        // (`fetch_under_workspace_facts`): backtrack by exclusion until the
+        // selection's `Requires-Dist` admits every fact, and when the index
+        // runs out REFUSE loudly naming dep, requirement and fact rather than
+        // emitting a `constrains` bound no consuming environment can satisfy.
+        let fact_versions = restore_fact_versions(bundle);
+        let admission_reresolve = uv_reresolve.mode.is_enabled();
+        let bundle_label = bundle.conda_name.clone();
+        let fetched: Vec<Result<(String, String, ResolvedWheel, Option<(String, String)>)>> = {
             use futures::stream::{self, StreamExt};
             let indexes_ref = indexes;
+            let fact_versions = &fact_versions;
+            let marker_env_ref = &marker_env;
+            let bundle_label = bundle_label.as_str();
             stream::iter(to_fetch)
                 .map(
                     |(name, version, conda_name, specifiers, preferred_ver)| async move {
@@ -2583,25 +2797,52 @@ where
                         let failure_context = format!(
                             "auto-bundle: no PyPI index could resolve `{name}{specifiers}` after conda routing was refused"
                         );
-                        fetch_pypi(request, indexes_ref.to_vec(), failure_context)
+                        fetch_under_workspace_facts(
+                            request,
+                            indexes_ref.to_vec(),
+                            failure_context,
+                            fact_versions,
+                            marker_env_ref,
+                            bundle_label,
+                            FactConstrainedSite::AutoBundleAdmission,
+                            admission_reresolve,
+                            fetch_pypi,
+                        )
                         .await
-                        .map(|wheel| (name, version, wheel))
+                        .map(|(wheel, moved)| (name, version, wheel, moved))
                     },
                 )
                 .buffered(8)
                 .collect()
                 .await
         };
+        let mut admitted_any = false;
+        let mut backtracked: Vec<(String, String, String)> = Vec::new();
         for result in fetched {
-            let (name, version, wheel) = result?;
+            let (name, version, wheel, moved) = result?;
+            if let Some((from, to)) = moved {
+                if from != to {
+                    backtracked.push((name.clone(), from, to));
+                }
+            }
             tracing::info!(
                 dep = %name,
                 version = %version,
+                selected = %wheel.metadata.version,
                 "auto-bundled into {}",
                 bundle.conda_name,
             );
             bundle.extras.push(wheel);
+            admitted_any = true;
             added_any = true;
+        }
+        if admitted_any {
+            // STDERR, NEVER STDOUT: `rpc.rs` owns stdout as the JSON-RPC
+            // channel, exactly as the RERESOLVED row above.
+            eprintln!(
+                "{}",
+                pypi_closure_fact_constrained_row(fact_versions.len(), &backtracked)
+            );
         }
 
         // Scan metadata from every wheel fetched this round before finalizing
@@ -3586,98 +3827,29 @@ where
             let marker_env = &marker_env;
             let bundle_label = bundle_label.as_str();
             async move {
+                // ONE ACTUATOR, TWO DOORS (N27-RETREAD-145). The backtracking
+                // loop that used to live inline here is now
+                // `fetch_under_workspace_facts`, called identically by the
+                // AUTO-BUNDLE admission. Nothing about this path's decision
+                // moved -- the extraction is a whole-body move -- but the
+                // other door is no longer unguarded.
                 let dep = request.pypi_name.clone();
-                let base = request.specifiers.clone();
-                let mut excluded: Vec<Version> = Vec::new();
-                let mut from_version: Option<String> = None;
-                let mut refused_by: Option<FactCrossing> = None;
-                loop {
-                    let mut attempt = request.clone();
-                    attempt.specifiers = specifiers_excluding(&base, &excluded, &dep)?;
-                    if !excluded.is_empty() {
-                        // A backtrack must not be steered by the pre-routing
-                        // preference: that preference IS the selection just
-                        // refused, and a soft `preferred_version` pointing at
-                        // it would make every retry re-propose it.
-                        attempt.preferred_version = None;
-                    }
-                    let wheel = match fetch_pypi(attempt, indexes.to_vec(), failure_context.clone())
-                        .await
-                    {
-                        Ok(wheel) => wheel,
-                        Err(error) => {
-                            // An index that cannot serve the ORIGINAL request
-                            // is the pre-existing failure and keeps its own
-                            // message. An index that runs out only after this
-                            // re-resolve excluded versions is the -142
-                            // refusal, and it must name what it refused for.
-                            let Some(crossing) = refused_by else {
-                                return Err(error);
-                            };
-                            return Err(anyhow!(route_restore_unsatisfiable_message(
-                                &dep,
-                                bundle_label,
-                                &base,
-                                &excluded,
-                                &crossing,
-                            )));
-                        }
-                    };
-                    if from_version.is_none() {
-                        from_version = Some(wheel.metadata.version.clone());
-                    }
-                    if !reresolve {
-                        return Ok((wheel, None));
-                    }
-                    let crossings = fact_versions_excluded_by_requires_dist(
-                        &wheel.metadata.requires_dist,
-                        fact_versions,
-                        marker_env,
-                    );
-                    let Some(crossing) = crossings.into_iter().next() else {
-                        let from = from_version
-                            .clone()
-                            .unwrap_or_else(|| wheel.metadata.version.clone());
-                        let row = pypi_route_reresolved_row(
-                            &dep,
-                            &from,
-                            &wheel.metadata.version,
-                            fact_versions.len(),
-                        );
-                        return Ok((wheel, Some(row)));
-                    };
-                    let refused = Version::from_str(&wheel.metadata.version).with_context(|| {
-                        format!(
-                            "parsing restored wheel version `{}` while re-resolving `{dep}`",
-                            wheel.metadata.version
-                        )
-                    })?;
-                    if excluded.contains(&refused) {
-                        // The index answered with a version this request had
-                        // already excluded. That is not a backtrack that can
-                        // terminate, so it refuses here rather than spinning.
-                        return Err(anyhow!(route_restore_unsatisfiable_message(
-                            &dep,
-                            bundle_label,
-                            &base,
-                            &excluded,
-                            &crossing,
-                        )));
-                    }
-                    excluded.push(refused);
-                    refused_by = Some(crossing);
-                    if excluded.len() > ROUTE_RESTORE_RERESOLVE_MAX_BACKTRACKS {
-                        return Err(anyhow!(route_restore_unsatisfiable_message(
-                            &dep,
-                            bundle_label,
-                            &base,
-                            &excluded,
-                            refused_by
-                                .as_ref()
-                                .expect("a backtrack is recorded before the bound is tested"),
-                        )));
-                    }
-                }
+                let (wheel, moved) = fetch_under_workspace_facts(
+                    request,
+                    indexes.to_vec(),
+                    failure_context,
+                    fact_versions,
+                    marker_env,
+                    bundle_label,
+                    FactConstrainedSite::JointRouteRestore,
+                    reresolve,
+                    fetch_pypi,
+                )
+                .await?;
+                let row = moved.map(|(from, to)| {
+                    pypi_route_reresolved_row(&dep, &from, &to, fact_versions.len())
+                });
+                Ok((wheel, row))
             }
         },
     )
@@ -5151,6 +5323,380 @@ mod tests {
         );
     }
 
+
+    // ---- CAPWINS-6 / N27-RETREAD-145: the AUTO-BUNDLE door.
+
+    /// A pack whose parent wheel declares the dep the way production does.
+    ///
+    /// MEASURED, not invented: relock `6112256`'s backend log prints
+    /// `auto_bundle: auto-bundled into isaaclab-2-3x-pack
+    /// dep=googleapis-common-protos version=~=1.52` -- a LOOSE requirement from
+    /// a parent wheel's `Requires-Dist`, which is why this fixture uses
+    /// `~=1.52` and not an exact pin.
+    ///
+    /// `auto_dropped` carries `protobuf` for the same reason production does:
+    /// the name is workspace-owned (the conda provider holds it), so it is in
+    /// the auto-bundle skip set and can never be fetched. That is precisely
+    /// what makes the fact the ONLY thing standing between the closure and an
+    /// unsatisfiable cap -- and, until this commit, nothing applied it here.
+    fn bundle_with_loose_googleapis_dep(fact_version: Option<&str>) -> Bundle {
+        let mut bundle = test_bundle(&["googleapis-common-protos~=1.52"]);
+        bundle.auto_dropped.insert("protobuf".to_string());
+        if let Some(fact_version) = fact_version {
+            bundle.workspace_conda_provider_facts.insert(
+                "protobuf".to_string(),
+                super::super::WorkspaceCondaProviderFact {
+                    selected_versions: [fact_version.to_string()].into_iter().collect(),
+                    declared_specs: BTreeSet::new(),
+                    present_in_all_consumers: true,
+                },
+            );
+        }
+        bundle
+    }
+
+    /// Drive the AUTO-BUNDLE admission against the same fixture index shape
+    /// `restore_against_index` uses: the index returns the HIGHEST release
+    /// satisfying the specifiers it is handed, and errors when none does,
+    /// which is what `bfs_fetch_pypi_from_chain` does in production.
+    ///
+    /// The probe refuses every conda route (`satisfiable: Some(false)`), which
+    /// is the state that sends a loose candidate down the PyPI path at all.
+    async fn auto_bundle_against_index(
+        bundle: &mut Bundle,
+        releases: Vec<(String, Vec<String>)>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Result<AutoBundleOutcome> {
+        let fetch = move |request: PypiFetchRequest,
+                          _indexes: Vec<String>,
+                          failure_context: String| {
+            let releases = releases.clone();
+            let calls = Arc::clone(&calls);
+            async move {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut best: Option<(Version, Vec<String>)> = None;
+                for (raw, requires) in &releases {
+                    let version = Version::from_str(raw).expect("fixture version parses");
+                    if !request.specifiers.contains(&version) {
+                        continue;
+                    }
+                    let better = match &best {
+                        None => true,
+                        Some((chosen, _)) => &version > chosen,
+                    };
+                    if better {
+                        best = Some((version, requires.clone()));
+                    }
+                }
+                let Some((version, requires_dist)) = best else {
+                    return Err(anyhow!("{failure_context}"));
+                };
+                let requires: Vec<&str> = requires_dist.iter().map(String::as_str).collect();
+                Ok(test_wheel(
+                    &request.bundle_name,
+                    &request.pypi_name,
+                    &version.to_string(),
+                    &requires,
+                ))
+            }
+        };
+        let refuse_every_conda_route = |pairs: Vec<(String, String)>| async move {
+            pairs
+                .into_iter()
+                .map(|(package, spec)| crate::probe::ProbeResult {
+                    package,
+                    spec,
+                    channels_consulted: vec!["conda-forge/linux-64".to_string()],
+                    satisfiable: Some(false),
+                    matching_candidates: 0,
+                })
+                .collect()
+        };
+        let target = crate::pypi::WheelTarget::for_subdir("3.11", "linux-64");
+        auto_bundle_transitives_with(
+            bundle,
+            &[crate::workspace::DEFAULT_PYPI_INDEX.to_string()],
+            &target,
+            &test_config(),
+            None,
+            None,
+            None,
+            &refuse_every_conda_route,
+            &reject_every_mutable_route,
+            &fetch,
+            &["conda-forge/linux-64".to_string()],
+            &UvReresolveContext {
+                mode: UvReresolveMode::default(),
+                uv_backed: false,
+                keep_pypi: BTreeSet::new(),
+            },
+        )
+        .await
+    }
+
+    fn bundled_version(bundle: &Bundle, pypi_name: &str) -> Option<String> {
+        bundle
+            .all_wheels()
+            .find(|wheel| {
+                PypiKey::from_pypi(&wheel.pypi_name) == PypiKey::from_pypi(pypi_name)
+                    || PypiKey::from_pypi(&wheel.metadata.name) == PypiKey::from_pypi(pypi_name)
+            })
+            .map(|wheel| wheel.metadata.version.clone())
+    }
+
+    /// GUARD (a), N27-RETREAD-145. THE AUTO-BUNDLE ADMISSION BACKTRACKS.
+    ///
+    /// This is relock `6112256` reduced to its two facts. That run took the
+    /// AUTO-BUNDLE door -- `auto-bundled … googleapis-common-protos` twice,
+    /// `PYPI ROUTE RESTORED … googleapis-common-protos` zero times, the exact
+    /// reverse of `6106911` -- so N27-RETREAD-142's re-resolve was never
+    /// consulted and 1.75.3 walked into the pack's `constrains` as
+    /// `protobuf>=6.33.5` against the workspace fact `protobuf==5.29.3`.
+    ///
+    /// The CONTROL arm is not decoration: it proves the fixture really offers
+    /// the crossing release first, so the guard's assertion is not an artefact
+    /// of fixture ordering.
+    #[tokio::test]
+    async fn capwins6_an_auto_bundled_wheel_backtracks_to_a_release_the_fact_admits() {
+        let releases = googleapis_releases(&[
+            ("1.75.3", "protobuf<8.0.0,>=6.33.5"),
+            ("1.75.0", "protobuf<8.0.0,>=4.25.8"),
+        ]);
+
+        // CONTROL: no workspace conda fact, so nothing constrains the
+        // admission and the index's newest release is taken. This is 96ff3dd's
+        // answer, and it is the production RED.
+        let mut control = bundle_with_loose_googleapis_dep(None);
+        let control_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        auto_bundle_against_index(&mut control, releases.clone(), Arc::clone(&control_calls))
+            .await
+            .expect("the control admission succeeds");
+        assert_eq!(
+            bundled_version(&control, "googleapis-common-protos").as_deref(),
+            Some("1.75.3"),
+            "the fixture must really offer the crossing release first",
+        );
+        assert_eq!(control_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // THE GUARD: the same index, with the fact the workspace really holds.
+        let mut bundle = bundle_with_loose_googleapis_dep(Some("5.29.3"));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        auto_bundle_against_index(&mut bundle, releases, Arc::clone(&calls))
+            .await
+            .expect("a compatible release exists one below, so the admission succeeds");
+        assert_eq!(
+            bundled_version(&bundle, "googleapis-common-protos").as_deref(),
+            Some("1.75.0"),
+            "the auto-bundle admission must resolve under the workspace conda facts",
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "exactly one backtrack: the crossing release, then the one below it",
+        );
+
+        // NO UNSATISFIABLE `constrains` CAN BE EMITTED, asserted as the
+        // CONDITION that produces one rather than as a string search of
+        // another module's output -- the same shape CAPWINS-5's guard (a) uses.
+        let facts = restore_fact_versions(&bundle);
+        assert_eq!(facts.len(), 1, "one fact is in force");
+        let env = crate::relax::marker_env_for("linux-64", "3.11").unwrap();
+        let surviving = bundle
+            .all_wheels()
+            .find(|wheel| {
+                PypiKey::from_pypi(&wheel.metadata.name)
+                    == PypiKey::from_pypi("googleapis-common-protos")
+            })
+            .expect("the admitted wheel is in the bundle");
+        assert!(
+            fact_versions_excluded_by_requires_dist(
+                &surviving.metadata.requires_dist,
+                &facts,
+                &env,
+            )
+            .is_empty(),
+            "the surviving wheel must give the cap-omission decision nothing to fire on; \
+             requires_dist = {:?}",
+            surviving.metadata.requires_dist,
+        );
+        assert_eq!(
+            pypi_closure_fact_constrained_row(
+                facts.len(),
+                &[(
+                    "googleapis-common-protos".to_string(),
+                    "1.75.3".to_string(),
+                    "1.75.0".to_string(),
+                )],
+            ),
+            "### PYPI CLOSURE FACT-CONSTRAINED names=1 backtracked=googleapis-common-protos \
+             1.75.3 1.75.0",
+        );
+    }
+
+    /// GUARD (c), N27-RETREAD-145. NO ADMISSIBLE RELEASE IS A LOUD REFUSAL.
+    ///
+    /// The index offers only the crossing release. 96ff3dd bundles it and lets
+    /// the emission publish a `constrains` bound no consuming environment can
+    /// satisfy -- which is exactly what killed `6112256` two layers later, in
+    /// the `pm-isaaclab` solve, instead of here where the evidence is. The fix
+    /// refuses at the admission, naming dep, requirement and fact, and leaves
+    /// the bundle UNMUTATED: `bundle.extras.push` runs only after `result?`,
+    /// so nothing is admitted and every caller above turns this `Err` into a
+    /// non-zero exit.
+    #[tokio::test]
+    async fn capwins6_an_auto_bundle_with_no_admissible_release_refuses_loudly() {
+        let releases = googleapis_releases(&[("1.75.3", "protobuf<8.0.0,>=6.33.5")]);
+        let mut bundle = bundle_with_loose_googleapis_dep(Some("5.29.3"));
+        let before = bundle.all_wheels().count();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let error = auto_bundle_against_index(&mut bundle, releases, Arc::clone(&calls))
+            .await
+            .expect_err("no release admits the fact, so the admission must refuse");
+        let message = format!("{error:#}");
+        for needle in [
+            "auto-bundle PyPI admission",
+            "googleapis-common-protos",
+            "protobuf==5.29.3",
+            "protobuf<8.0.0,>=6.33.5",
+            "1.75.3",
+            "N27-RETREAD-145",
+        ] {
+            assert!(
+                message.contains(needle),
+                "the refusal must name `{needle}`; got {message}",
+            );
+        }
+        assert_eq!(
+            bundle.all_wheels().count(),
+            before,
+            "a refused admission must not leave a wheel behind",
+        );
+    }
+
+    /// GUARD (d), N27-RETREAD-145. AN ORDINARY PACK IS BYTE-FOR-BYTE
+    /// UNCHANGED, AND COSTS NO EXTRA FETCH.
+    ///
+    /// Nearly every auto-bundled wheel already admits every fact. This is the
+    /// non-regression arm that pins "the fix moves emitted bytes only where a
+    /// requirement really crossed a fact": the selection must not move, and
+    /// exactly ONE index round-trip may happen, so the whole daily lock does
+    /// not silently buy a second fetch per dep. Both arms -- fact present and
+    /// fact absent -- must agree, which is what "no crossing" means.
+    #[tokio::test]
+    async fn capwins6_an_ordinary_admission_keeps_its_version_and_its_one_fetch() {
+        let releases = googleapis_releases(&[("1.75.0", "protobuf<8.0.0,>=4.25.8")]);
+
+        let mut constrained = bundle_with_loose_googleapis_dep(Some("5.29.3"));
+        let constrained_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        auto_bundle_against_index(
+            &mut constrained,
+            releases.clone(),
+            Arc::clone(&constrained_calls),
+        )
+        .await
+        .expect("the only release admits the fact");
+
+        let mut unconstrained = bundle_with_loose_googleapis_dep(None);
+        let unconstrained_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        auto_bundle_against_index(
+            &mut unconstrained,
+            releases,
+            Arc::clone(&unconstrained_calls),
+        )
+        .await
+        .expect("the control admission succeeds too");
+
+        assert_eq!(
+            bundled_version(&constrained, "googleapis-common-protos"),
+            bundled_version(&unconstrained, "googleapis-common-protos"),
+            "with no crossing the fact-constrained admission and the old one must agree",
+        );
+        assert_eq!(
+            bundled_version(&constrained, "googleapis-common-protos").as_deref(),
+            Some("1.75.0"),
+        );
+        assert_eq!(
+            constrained_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the ordinary path costs exactly one fetch, as before the fix",
+        );
+        assert_eq!(
+            unconstrained_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+        );
+        // The pass still SAYS it was checked. A row that appeared only on a
+        // change could not tell "checked, needed nothing" from "never
+        // checked", and the second is the whole defect.
+        assert_eq!(
+            pypi_closure_fact_constrained_row(1, &[]),
+            "### PYPI CLOSURE FACT-CONSTRAINED names=1 backtracked=none",
+        );
+    }
+
+    /// The refusal must say WHICH door refused, because the two doors are why
+    /// N27-RETREAD-142 read as fixed and came back: `6106911` took the restore
+    /// (2 rows) and `6112256` took the auto-bundle (2 rows), same dep, same
+    /// cap, same RED.
+    #[test]
+    fn capwins6_the_refusal_names_the_admission_path_it_refused_on() {
+        let crossing = FactCrossing {
+            fact_name: "protobuf".to_string(),
+            fact_version: "5.29.3".to_string(),
+            requirement: "protobuf<8.0.0,>=6.33.5".to_string(),
+        };
+        let base = VersionSpecifiers::from_str("~=1.52").unwrap();
+        let excluded = [Version::from_str("1.75.3").unwrap()];
+        let restore = route_restore_unsatisfiable_message(
+            "googleapis-common-protos",
+            "isaaclab-2-3x-pack",
+            &base,
+            &excluded,
+            &crossing,
+            FactConstrainedSite::JointRouteRestore,
+        );
+        let admission = route_restore_unsatisfiable_message(
+            "googleapis-common-protos",
+            "isaaclab-2-3x-pack",
+            &base,
+            &excluded,
+            &crossing,
+            FactConstrainedSite::AutoBundleAdmission,
+        );
+        assert!(restore.starts_with("joint-solve route restore for"), "{restore}");
+        assert!(
+            admission.starts_with("auto-bundle PyPI admission for"),
+            "{admission}",
+        );
+        assert_ne!(restore, admission, "the two doors must be distinguishable");
+        // N27-RETREAD-142's own needles survive the generalisation, which is
+        // what keeps CAPWINS-5's refusal guard a real guard and not a rewrite.
+        for needle in ["protobuf==5.29.3", "protobuf<8.0.0,>=6.33.5", "1.75.3", "N27-RETREAD-142"] {
+            assert!(restore.contains(needle), "{restore}");
+            assert!(admission.contains(needle), "{admission}");
+        }
+    }
+
+    /// The per-pass row is the reader for a decision that otherwise leaves no
+    /// trace (law 2). Its two shapes are pinned because a merge lane greps for
+    /// them by string.
+    #[test]
+    fn capwins6_the_per_pass_row_reports_both_shapes() {
+        assert_eq!(
+            pypi_closure_fact_constrained_row(0, &[]),
+            "### PYPI CLOSURE FACT-CONSTRAINED names=0 backtracked=none",
+        );
+        assert_eq!(
+            pypi_closure_fact_constrained_row(
+                3,
+                &[
+                    ("googleapis-common-protos".to_string(), "1.75.3".to_string(), "1.75.0".to_string()),
+                    ("wandb".to_string(), "0.30.0".to_string(), "0.29.0".to_string()),
+                ],
+            ),
+            "### PYPI CLOSURE FACT-CONSTRAINED names=3 backtracked=googleapis-common-protos \
+             1.75.3 1.75.0, wandb 0.30.0 0.29.0",
+        );
+    }
     #[test]
     fn dependency_conflict_names_workspace_scope_and_remediation() {
         let context = JointRouteDiagnosticContext {

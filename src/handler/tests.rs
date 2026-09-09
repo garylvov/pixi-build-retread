@@ -11162,8 +11162,8 @@ fn c11_the_store_key_carries_no_backend_git_hash() {
 fn capwins5_the_emission_identity_moves_off_both_claimed_encodings() {
     let identity = backend_behaviour_identity();
     assert!(
-        identity.contains("retread-built-output-emission-3"),
-        "the re-resolving emission must have its own schema; got {identity}",
+        identity.contains("retread-built-output-emission-4"),
+        "the fact-constrained emission must have its own schema; got {identity}",
     );
     assert!(
         !identity.contains("retread-built-output-emission-1"),
@@ -11175,13 +11175,26 @@ fn capwins5_the_emission_identity_moves_off_both_claimed_encodings() {
         "…and must not be the encoding MERGE-B44's e30b23f already claims for different \
          semantics; got {identity}",
     );
+    // CAPWINS-6 / N27-RETREAD-145. THE THIRD NEGATIVE IS A MEASURED POISONING,
+    // not a precaution. Relock `6112256` published
+    // `bd674558336827b3efd62ec1377a9520/outputs.json` at emission-3 carrying
+    // the unsatisfiable `protobuf>=6.33.5` cap (`grep -l '>=6.33.5'` over the
+    // store was 0 before that run and 1 after). That key is one of the 14 this
+    // campaign consults, so any candidate still claiming emission-3 ADOPTS it.
+    // Moving to emission-4 is what makes it MISS by identity.
+    assert!(
+        !identity.contains("retread-built-output-emission-3"),
+        "…and must not be the encoding relock 6112256 poisoned with a >=6.33.5 cap \
+         (record bd674558336827b3efd62ec1377a9520); got {identity}",
+    );
     assert_eq!(
         crate::built_output_store::BUILT_OUTPUT_SCHEMA,
-        "retread-built-output-emission-3",
+        "retread-built-output-emission-4",
     );
     assert!(
-        crate::lock::EMIT_EPOCH >= 54,
-        "EMIT_EPOCH must clear both 52 (695f108) and 53 (e30b23f); got {}",
+        crate::lock::EMIT_EPOCH >= 55,
+        "EMIT_EPOCH must clear 52 (695f108), 53 (e30b23f) and 54 (96ff3dd, whose \
+         emission-3 records are poisoned); got {}",
         crate::lock::EMIT_EPOCH,
     );
 }
