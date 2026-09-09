@@ -98,7 +98,11 @@ pub const SCHEMA: &str = "retread-built-output-store-v3";
 /// invalidates the store regardless; the record carries the producing git hash
 /// for post-hoc audit; and a stale hit is a stale RESOLUTION, never a wrong
 /// artifact, because everything downstream re-validates bytes.
-pub const BUILT_OUTPUT_SCHEMA: &str = "retread-built-output-emission-1";
+/// emission-3 (N27-RETREAD-142): the joint-solve route restore re-resolves.
+/// emission-2 is skipped for the same reason `EMIT_EPOCH` skips 53 -- MERGE-B44's
+/// `e30b23f` already claims it for different semantics.
+pub const BUILT_OUTPUT_SCHEMA: &str = "retread-built-output-emission-3";
+
 
 /// The store's directory name under a persistent root, and the `--store`
 /// spelling `retread store-reap` accepts. Named here, beside the layout it

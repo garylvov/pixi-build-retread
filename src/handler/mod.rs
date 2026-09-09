@@ -8564,8 +8564,16 @@ async fn resolve_all(
         })
         .collect::<BTreeMap<_, _>>();
 
-    let uv_reresolve_env = std::env::var_os("RETREAD_UV_RERESOLVE");
-    let uv_reresolve_mode = UvReresolveMode::from_env_value(uv_reresolve_env.as_deref());
+    // N27-RETREAD-142. THE ENV READ THAT USED TO BE HERE IS DELETED.
+    //
+    // `std::env::var_os("RETREAD_UV_RERESOLVE")` was the ONLY production
+    // reader of `UvReresolveMode`, and the variable it read occurs zero times
+    // in the relock sbatch, in the backend shim, and in the 33.8 MB backend
+    // log of the run that produced the unsatisfiable `protobuf` cap. So the
+    // re-resolving actuator existed and no production path could reach it.
+    // The switch is a declared input on the request now, and its ABSENT state
+    // re-resolves.
+    let uv_reresolve_mode = UvReresolveMode::from_manifest_flag(config.route_restore_reresolve);
     let mut uv_retry_keep_by_group: BTreeMap<String, BTreeSet<PypiKey>> = BTreeMap::new();
 
     while let Some((group_name, group_entries)) = groups.pop_first() {
@@ -12094,9 +12102,9 @@ async fn uv_group_closure(
         async move { context.solve(routes).await }
     };
     // Ownership planning is deliberately mode-independent: it replaces the
-    // three unconditional pre-P4 drop implementations and preserves their
-    // default-off behavior. RETREAD_UV_RERESOLVE gates only the rejected-route
-    // handoff that bypasses the legacy reconstruct/fetch path.
+    // three unconditional pre-P4 drop implementations. The re-resolve mode
+    // (`retread-route-restore-reresolve`, N27-RETREAD-142) reaches only the
+    // rejected-route handoff and the restore that follows it, never this.
     let mut ownership_req = req.clone();
     ownership_req.dependencies =
         workspace_ownership_planning_dependencies(&req.dependencies, &deps_from_root_names);

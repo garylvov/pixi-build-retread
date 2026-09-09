@@ -28,6 +28,25 @@ pub(crate) const AUTO_IMPORTS_STRICT_KEY: &str = "retread-auto-imports-strict";
 /// Legacy env override for experimental probe fan-out, and its manifest key.
 pub(crate) const PARALLEL_PROBES_ENV: &str = "RETREAD_PARALLEL_PROBES";
 pub(crate) const PARALLEL_PROBES_KEY: &str = "retread-parallel-probes";
+/// N27-RETREAD-142. The route-restore re-resolve, and the ONE way to turn it
+/// off.
+///
+/// There is no env var here on purpose. The capability this key reaches used
+/// to be default-OFF behind `RETREAD_UV_RERESOLVE`, a variable that occurs
+/// zero times in the relock sbatch, the backend shim and the 33.8 MB backend
+/// log of the landing relock that produced the defect — a built capability
+/// with no production call site, reached (when reached at all) through the
+/// ambient environment. Both halves of that are defects in their own right,
+/// so the env read is DELETED and this manifest key replaces it.
+///
+/// `None` (the key absent) is ON: a route the joint solve rejects is
+/// re-resolved under the closure's current workspace conda facts before its
+/// wheel goes back into the bundle. `false` is a DELIBERATE OPT-OUT and says
+/// so on stderr — see `handler::auto_bundle::UvReresolveMode::from_manifest_flag`
+/// — because the legacy behaviour it restores re-injects a wheel at its
+/// pre-routing version and emits a `constrains` cap contradicting a fact the
+/// pack's own uv lock had just honoured.
+pub(crate) const ROUTE_RESTORE_RERESOLVE_KEY: &str = "retread-route-restore-reresolve";
 
 fn deserialize_name_map<'de, D>(deserializer: D) -> std::result::Result<NameMap, D::Error>
 where
@@ -219,6 +238,27 @@ pub struct RetreadConfig {
         alias = "auto-imports-strict"
     )]
     pub auto_imports_strict: Option<bool>,
+
+    /// N27-RETREAD-142: re-resolve a PyPI route the final joint conda solve
+    /// rejects, instead of re-injecting its pre-routing wheel.
+    ///
+    /// `None` (the key absent) is ON. This is the only default in this struct
+    /// that is on when absent, and the reason is that the off state is not a
+    /// neutral one: it re-injects `googleapis-common-protos 1.75.3`
+    /// (`protobuf<8.0.0,>=6.33.5`) into a closure whose uv lock had just
+    /// resolved `protobuf 5.29.3`, and the emission then carries that bound
+    /// into the pack's conda `constrains` as a cap no consumer can satisfy.
+    ///
+    /// ```toml
+    /// [build.config]
+    /// retread-route-restore-reresolve = false
+    /// ```
+    #[serde(
+        default,
+        rename = "retread-route-restore-reresolve",
+        alias = "route-restore-reresolve"
+    )]
+    pub route_restore_reresolve: Option<bool>,
 
     /// C13: force the FULL `git status --untracked-files=all` walk on every
     /// canonical Git snapshot check, instead of verifying the seal a publish

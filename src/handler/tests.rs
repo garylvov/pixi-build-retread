@@ -734,6 +734,7 @@ fn pythons_for_rejects_bare_major_variant() {
         pack_manifest_path: None,
         auto_imports: None,
         auto_imports_strict: None,
+        route_restore_reresolve: None,
         verify_snapshots: None,
         git_snapshot_store: None,
         git_snapshot_store_max_age_days: None,
@@ -805,6 +806,7 @@ fn pythons_for_accepts_dotted_variant() {
         pack_manifest_path: None,
         auto_imports: None,
         auto_imports_strict: None,
+        route_restore_reresolve: None,
         verify_snapshots: None,
         git_snapshot_store: None,
         git_snapshot_store_max_age_days: None,
@@ -876,6 +878,7 @@ fn pythons_for_filters_bare_major_keeps_dotted() {
         pack_manifest_path: None,
         auto_imports: None,
         auto_imports_strict: None,
+        route_restore_reresolve: None,
         verify_snapshots: None,
         git_snapshot_store: None,
         git_snapshot_store_max_age_days: None,
@@ -3666,6 +3669,7 @@ fn cfg() -> RetreadConfig {
         pack_manifest_path: None,
         auto_imports: None,
         auto_imports_strict: None,
+        route_restore_reresolve: None,
         verify_snapshots: None,
         git_snapshot_store: None,
         git_snapshot_store_max_age_days: None,
@@ -11126,6 +11130,60 @@ fn c11_the_store_key_carries_no_backend_git_hash() {
     assert!(key.inputs_digest.starts_with(&key.key));
 
     let _ = std::fs::remove_dir_all(ws);
+}
+
+/// N27-RETREAD-142: THE EMISSION IDENTITY MOVES, SO THE THREE LIVE
+/// WRONG-OMISSION RECORDS MISS.
+///
+/// This commit changes what `conda/outputs` EMITS for unchanged inputs -- a
+/// restored route now comes back at a version the workspace conda facts admit,
+/// so both the bundled wheel and the `constrains` list derived from its
+/// `Requires-Dist` move. `built_output_store::BUILT_OUTPUT_SCHEMA`'s own rule
+/// says any such commit must bump it, and `backend_behaviour_identity()` is
+/// what hashes it into every store address.
+///
+/// THE THREE RECORDS THIS IS FOR, measured on the shared root before the
+/// commit: `c9eb4978259fda861d7ba94cc1a34b83`, `b643fc5995ab6429622706991a49e1f1`
+/// and `0573d1fed2ddb70919dbadab3100582b` are live, `COMPLETE`, and stamped
+/// `"emission_schema":"retread-built-output-emission-1"` -- the SAME constant
+/// 695f108 carries, which is why a candidate on that lineage adopts them and
+/// inherits the wrong omission. `decode` refuses a record whose schema is not
+/// the current one, so the bump alone retires them; nothing has to be moved by
+/// hand.
+///
+/// BOTH NEGATIVE LITERALS ARE ASSERTED, and the second is the one that is easy
+/// to get wrong: `emission-2` is what MERGE-B44's `e30b23f` already claims for
+/// DIFFERENT semantics on a different lineage, so taking it here would be two
+/// live commits asserting "same behaviour" about different behaviour -- the
+/// exact hazard the constant exists to prevent. CAPWINS-4's withdrawn
+/// `f6f5e76` made that mistake; this guard is why it cannot be made silently
+/// again.
+#[test]
+fn capwins5_the_emission_identity_moves_off_both_claimed_encodings() {
+    let identity = backend_behaviour_identity();
+    assert!(
+        identity.contains("retread-built-output-emission-3"),
+        "the re-resolving emission must have its own schema; got {identity}",
+    );
+    assert!(
+        !identity.contains("retread-built-output-emission-1"),
+        "…and must not still be the encoding the three wrong-omission records carry; \
+         got {identity}",
+    );
+    assert!(
+        !identity.contains("retread-built-output-emission-2"),
+        "…and must not be the encoding MERGE-B44's e30b23f already claims for different \
+         semantics; got {identity}",
+    );
+    assert_eq!(
+        crate::built_output_store::BUILT_OUTPUT_SCHEMA,
+        "retread-built-output-emission-3",
+    );
+    assert!(
+        crate::lock::EMIT_EPOCH >= 54,
+        "EMIT_EPOCH must clear both 52 (695f108) and 53 (e30b23f); got {}",
+        crate::lock::EMIT_EPOCH,
+    );
 }
 
 /// Guard (b): ANY input digest component moves the address.

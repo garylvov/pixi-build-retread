@@ -1544,6 +1544,7 @@ mod tests {
             pack_manifest_path: None,
             auto_imports: None,
             auto_imports_strict: None,
+            route_restore_reresolve: None,
             verify_snapshots: None,
             git_snapshot_store: None,
             git_snapshot_store_max_age_days: None,

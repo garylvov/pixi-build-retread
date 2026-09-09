@@ -838,7 +838,22 @@ pub const SCHEMA: u32 = 20;
 /// manifests now emit `conda/outputs` metadata with a non-empty `constraints`
 /// list and a lock carrying `conda_run_constraints`, so every affected pack
 /// must cold-derive once.
-pub const EMIT_EPOCH: u32 = 52;
+/// Epoch 54: a PyPI route the final joint conda solve rejects is RE-RESOLVED
+/// under the workspace conda facts before its wheel returns to the bundle,
+/// instead of being re-injected at its pre-routing version. Identical
+/// manifests therefore emit a different bundled wheel (and a different
+/// `constrains` list derived from its `Requires-Dist`) wherever a restored
+/// route crossed a fact -- `googleapis-common-protos` moves off 1.75.3 for
+/// `isaaclab-2.3x-pack` -- so every affected pack must re-derive.
+///
+/// 53 IS SKIPPED DELIBERATELY. MERGE-B44's `e30b23f` already stamps
+/// `EMIT_EPOCH = 53` with `retread-built-output-emission-2` for DIFFERENT
+/// emitted-bytes semantics on a different lineage, and two live commits
+/// claiming one encoding is precisely the hazard this constant exists to
+/// prevent: a record published by one would be adopted by the other under an
+/// identity asserting "same behaviour". Verified before writing this, not
+/// quoted: `git show e30b23f:src/lock.rs` prints `= 53;`.
+pub const EMIT_EPOCH: u32 = 54;
 
 fn parse_stored_glibc(value: Option<&str>) -> Option<Option<(u32, u32)>> {
     match value {
