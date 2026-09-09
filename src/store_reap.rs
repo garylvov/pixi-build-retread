@@ -72,6 +72,11 @@ pub enum Store {
     /// branch called "the sixth store"; both are here, so this is the SEVENTH
     /// and the two appends did not displace one another.
     BuiltOutputs,
+    /// METAGEN-1: the derived path-source metadata store. Its writer and its
+    /// reader are the SAME code — the path-source derivation inside the
+    /// backend's `initialize` — one lock apart, and this verb is what ages it.
+    /// APPENDED, never inserted, on the rule the six before it were.
+    PathSourceMetadata,
 }
 
 impl Store {
@@ -85,6 +90,7 @@ impl Store {
             Store::HermeticEnvironments => "hermetic-envs",
             Store::SdistMetadata => crate::sdist_metadata::CACHE_NAMESPACE,
             Store::BuiltOutputs => crate::built_output_store::STORE_DIR,
+            Store::PathSourceMetadata => crate::derived_editable_metadata::CACHE_NAMESPACE,
         }
     }
 
@@ -101,7 +107,8 @@ impl Store {
     /// branches each appended a "sixth" element at this exact position, and
     /// the resolution is BOTH, in landing order (sdist-metadata landed first,
     /// as B32), never one of them.
-    pub const ALL: [Store; 7] = [
+    /// METAGEN-1 appends the EIGHTH by the same rule: APPEND, NEVER REORDER.
+    pub const ALL: [Store; 8] = [
         Store::BuiltWheels,
         Store::GitSnapshots,
         Store::Shadow,
@@ -109,6 +116,7 @@ impl Store {
         Store::HermeticEnvironments,
         Store::SdistMetadata,
         Store::BuiltOutputs,
+        Store::PathSourceMetadata,
     ];
 
     fn parse(value: &str) -> Option<Vec<Store>> {
@@ -139,6 +147,7 @@ impl Store {
             Store::BuiltOutputs => {
                 crate::built_output_store::BUILT_OUTPUT_STORE_DEFAULT_MAX_AGE_DAYS
             }
+            Store::PathSourceMetadata => crate::derived_editable_metadata::DEFAULT_MAX_AGE_DAYS,
         }
     }
 }
@@ -201,7 +210,7 @@ pub fn parse_args(args: &[String]) -> anyhow::Result<Args> {
                         "store-reap: --store {value}: expected one of \
                          built-wheels, git-snapshots, shadow, \
                          build-requirements, hermetic-envs, sdist-metadata, \
-                         built-outputs, all"
+                         built-outputs, path-source-metadata, all"
                     )
                 })?);
             }
@@ -445,6 +454,25 @@ fn reap_one(
         // of DISTINCT marker generations found -- on the shared root that was
         // MEASURED at 3 (v1, v2, v3) across 218 entries the day this landed,
         // and every v1 and v2 of them was unreachable by any reaper until now.
+        // METAGEN-1. THE SAME WALK AGAIN -- an eighth spec, not an eighth
+        // reaper, on the same `<root>/<dir>/<version>/<key>/complete.json`
+        // shape the build-requirements, hermetic and sdist-metadata stores use.
+        Store::PathSourceMetadata => {
+            let report = crate::source_build::reap_marker_store(
+                &crate::source_build::PATH_SOURCE_METADATA_STORE_SPEC,
+                root,
+                max_age,
+                mode,
+            )?;
+            outcome.scanned = report.scanned;
+            outcome.selected = report.evicted;
+            outcome.stale_version = report.evicted_stale_version;
+            outcome.kept = report.kept;
+            outcome.skipped_locked = report.skipped_locked;
+            outcome.versions_walked = report.versions_walked;
+            outcome.skipped_concurrent = report.skipped_concurrent;
+            report.entries
+        }
         Store::BuiltOutputs => {
             let report = crate::source_build::reap_marker_store(
                 &crate::source_build::BUILT_OUTPUT_STORE_SPEC,
@@ -888,6 +916,7 @@ mod tests {
             Store::HermeticEnvironments,
             Store::SdistMetadata,
             Store::BuiltOutputs,
+            Store::PathSourceMetadata,
         ]
         .into_iter()
         .inspect(|store| match store {
@@ -899,7 +928,8 @@ mod tests {
             | Store::BuildRequirements
             | Store::HermeticEnvironments
             | Store::SdistMetadata
-            | Store::BuiltOutputs => {}
+            | Store::BuiltOutputs
+            | Store::PathSourceMetadata => {}
         })
         .collect();
         assert_eq!(
@@ -1282,6 +1312,65 @@ mod tests {
             root.join("hermetic-build-envs/v8/env-half").is_dir(),
             "a directory with no completion marker is not an entry"
         );
+    }
+
+    /// METAGEN-1's store, registered exactly the way the seven before it were,
+    /// and asserted through the module's own constants rather than by
+    /// re-spelling the segments — so a generation bump moves the fixture with
+    /// the walk instead of leaving this green over a store nothing addresses.
+    ///
+    /// It is a separate store and not a corner of the sdist-metadata one for a
+    /// structural reason: that key's first field is a fold of the sdist's URL
+    /// and ETag out of a `revision.http`, and a LOCAL PATH TREE has no URL, no
+    /// ETag and no `revision.http`.
+    #[test]
+    fn the_path_source_metadata_store_is_reached_by_name_and_by_store_all() {
+        use crate::derived_editable_metadata as dem;
+
+        assert_eq!(
+            Store::parse(dem::CACHE_NAMESPACE),
+            Some(vec![Store::PathSourceMetadata]),
+            "the spelling the census and an operator both type"
+        );
+        assert!(
+            Store::ALL.contains(&Store::PathSourceMetadata),
+            "`--store all` must fan out to the path-source-metadata store, \
+             which is the ONLY thing `tools/store_reap_census.sh` ever calls"
+        );
+        for previous in [
+            Store::BuiltWheels,
+            Store::GitSnapshots,
+            Store::Shadow,
+            Store::BuildRequirements,
+            Store::HermeticEnvironments,
+            Store::SdistMetadata,
+            Store::BuiltOutputs,
+        ] {
+            assert!(
+                Store::ALL.contains(&previous),
+                "appending the eighth store displaced {}",
+                previous.as_str()
+            );
+        }
+        assert_eq!(
+            resolved_max_age_days(Store::PathSourceMetadata, None),
+            dem::DEFAULT_MAX_AGE_DAYS,
+            "the horizon is the store's own constant, not a copy of 14 here"
+        );
+
+        // AND THE WALK REACHES A REAL ENTRY. A registration that parses but
+        // scans nothing is the same defect one level down.
+        let root = scratch("pathsourcemeta");
+        marker_store_entry(
+            &root,
+            dem::CACHE_NAMESPACE,
+            dem::CACHE_VERSION,
+            "psm-cur",
+            dem::COMPLETION_MARKER,
+            30,
+        );
+        let dry = dry_run(&root, Store::PathSourceMetadata);
+        assert_eq!(dry.scanned, 1, "the walk must see the entry: {dry:?}");
     }
 
     /// SDIST-META-2's half of the verb, and the CENSUS the store's harness

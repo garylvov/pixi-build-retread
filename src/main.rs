@@ -526,6 +526,8 @@ fn run_path_source_manifest(args: &[String]) -> anyhow::Result<()> {
     let mut out: Option<PathBuf> = None;
     let mut records_dir = psm::RECORDS_DIR_DEFAULT.to_string();
     let mut shims = true;
+    let mut derive_editable = true;
+    let mut generated_records = true;
     let mut check = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -555,6 +557,17 @@ fn run_path_source_manifest(args: &[String]) -> anyhow::Result<()> {
             // the canonical bytes, so a lock driver can bisect the transform
             // itself without editing anything.
             "--no-pack-shims" => shims = false,
+            // METAGEN-1's opt-out, the CLI half of
+            // `retread-derive-editable-metadata = false`. With it, a source
+            // that states its dependencies NOWHERE derives none instead of
+            // building them -- which is what the pre-METAGEN-1 verb did, and
+            // what the byte-identity guard drives.
+            "--no-derive-editable-metadata" => derive_editable = false,
+            // METAGEN-1. The record half: with this, the verb derives the
+            // metadata but writes NO record into the pack. It exists so the
+            // staged-first workflow has a real control -- a run that shows
+            // what WOULD be written without writing it.
+            "--no-generated-records" => generated_records = false,
             "--check" => check = true,
             other => anyhow::bail!("path-source-manifest: unknown arg {other}"),
         }
@@ -572,13 +585,35 @@ fn run_path_source_manifest(args: &[String]) -> anyhow::Result<()> {
              pass --no-pack-shims to copy the canonical manifest through)"
         );
     }
-    let (text, rewrites, outcomes, derived) = psm::effective_manifest_text(
+    // METAGEN-1. The verb builds the same last-resort reader the backend does,
+    // from the same constructor, so the two producers of one capability cannot
+    // drift -- the defect SHIM-AUTO-3's comment in `path_source_metadata`
+    // records having already happened once here.
+    let deriver = pixi_build_retread::derived_editable_metadata::ConfiguredDeriver::from_config(
+        Some(derive_editable),
+        None,
+        &|key| std::env::var(key).ok(),
+        std::env::temp_dir().join(format!("retread-metagen-{}", std::process::id())),
+    );
+    let dynamic = deriver
+        .as_ref()
+        .map(|d| d as &dyn psm::DynamicDependencySource);
+    let (text, rewrites, outcomes, derived, metadata_rows) = psm::effective_manifest_text(
         &packs,
         &workspace,
         &records_dir,
         &manifest_text,
         shims,
+        dynamic,
+        generated_records,
     )?;
+    // THE DERIVED-METADATA ROWS, before the records that carry them. One per
+    // source whose dependencies had to be BUILT because the tree states them
+    // nowhere; a run that prints none is a run in which every source stated its
+    // own facts, which is the fast and common case.
+    for row in &metadata_rows {
+        println!("{row}");
+    }
     // WHERE EACH RECORD CAME FROM, before anything that uses it. Nothing under
     // `<pack>/path-sources/` has to exist: the record is derived from the
     // manifest entry and the tree's own metadata, and a file that IS there can

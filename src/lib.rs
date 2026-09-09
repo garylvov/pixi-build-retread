@@ -14,6 +14,7 @@ pub mod constraint;
 pub mod coresident_pins;
 pub mod courier;
 pub mod deps_from;
+pub mod derived_editable_metadata;
 pub mod emit_pypi;
 pub mod fasttmp;
 pub mod glibc;

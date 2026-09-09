@@ -143,6 +143,23 @@ pub struct PathSourceEntry {
     /// preference.
     #[serde(default)]
     pub packages_include: Vec<String>,
+
+    /// METAGEN-1. The bounded content hash of the real tree AS IT WAS when this
+    /// record's `dependencies` were DERIVED by an isolated PEP 517 metadata
+    /// build ([`crate::derived_editable_metadata::source_hash`]).
+    ///
+    /// It is present only on a record the derivation generated, and it is what
+    /// makes the record self-checking. Every other field of a record is a claim
+    /// a reader can re-read from the tree and cross-check; `dependencies` for a
+    /// tree that states them NOWHERE is the one field with no cheap reader, so
+    /// the hash stands in for one: if the tree's hash today differs from the
+    /// hash the record was built at, the record is STALE and the run rederives
+    /// it rather than locking a dependency list for a tree that has moved.
+    ///
+    /// `None` — every record written before this existed, and every
+    /// hand-written one — behaves exactly as it always did.
+    #[serde(default)]
+    pub source_hash: Option<String>,
 }
 
 impl PathSourceEntry {
@@ -448,6 +465,11 @@ pub fn record_from_tree(
     Ok(PathSourceEntry {
         path: current.path.clone(),
         version,
+        // METAGEN-1: a refresh FROM THE TREE carries the record's hash
+        // forward. `path-source-refresh --write` re-states the tree's facts; it
+        // does not run an isolated build, so it has no new hash to state and
+        // dropping the old one would make a derived record look hand-written.
+        source_hash: current.source_hash.clone(),
         requires_python: facts
             .requires_python
             .as_ref()
@@ -532,6 +554,19 @@ pub fn render_record(project: &str, entry: &PathSourceEntry) -> String {
             toml_array(&entry.packages_include)
         ));
     }
+    if let Some(hash) = entry.source_hash.as_deref() {
+        out.push_str(&format!(
+            "\n# METAGEN-1. `dependencies` above was DERIVED by an isolated PEP 517\n\
+             # metadata build of the tree at `path`, because that tree states them\n\
+             # NOWHERE a reader can see -- no [project] table, no *.egg-info/PKG-INFO.\n\
+             # This is the bounded content hash of that tree at the moment of the\n\
+             # build; if the tree's hash today differs, this record is STALE and the\n\
+             # next run rederives it. Editing the tree's setup.py, pyproject.toml,\n\
+             # setup.cfg, MANIFEST.in or anything under config/ moves it.\n\
+             source-hash = {}\n",
+            toml_string(hash)
+        ));
+    }
     out
 }
 
@@ -604,7 +639,27 @@ pub fn materialize_declared_path_sources(
     let manifest_file = workspace_root.join("pixi.toml");
     let manifest_text = std::fs::read_to_string(&manifest_file)
         .with_context(|| format!("reading {}", manifest_file.display()))?;
-    let backend = backend_records(&pack_dir, workspace_root, records_dir, &manifest_text)?;
+    // METAGEN-1. The last-resort dependency reader, or `None` when
+    // `retread-derive-editable-metadata = false`. Built here and not inside the
+    // derivation so the switch has exactly ONE reader in production.
+    let deriver = crate::derived_editable_metadata::ConfiguredDeriver::from_config(
+        config.derive_editable_metadata,
+        config.path_source_metadata_store.as_deref(),
+        &|key| std::env::var(key).ok(),
+        std::env::temp_dir().join(format!("retread-metagen-{}", std::process::id())),
+    );
+    let dynamic = deriver
+        .as_ref()
+        .map(|d| d as &dyn DynamicDependencySource);
+    let generated_records = config.path_source_generated_records.unwrap_or(true);
+    let backend = backend_records(&pack_dir, workspace_root, records_dir, &manifest_text, dynamic, generated_records)?;
+    // THE ROWS. One per source whose dependencies had to be built because the
+    // tree states them nowhere. A row is printed for a BUILD, never for a tree
+    // that stated its own facts, so a silent run is the run where nothing was
+    // derived -- which is the common case and the fast one.
+    for row in &backend.metadata_rows {
+        tracing::info!("{}", row);
+    }
     if backend.records.is_empty() {
         bail!(
             "retread-path-source-metadata = true but {} declares no \
@@ -666,6 +721,9 @@ pub struct BackendRecords {
     /// Sources derived beside this pack whose shim the manifest points
     /// elsewhere — another pack's backend owns them.
     pub elsewhere: Vec<String>,
+    /// METAGEN-1's `### EDITABLE METADATA DERIVED` rows, carried out so
+    /// `initialize` can log them where a verb would print them.
+    pub metadata_rows: Vec<String>,
 }
 
 impl BackendRecords {
@@ -696,15 +754,18 @@ pub fn backend_records(
     workspace_root: &Path,
     records_dir: &str,
     manifest_text: &str,
+    dynamic: Option<&dyn DynamicDependencySource>,
+    generated_records: bool,
 ) -> Result<BackendRecords> {
     let canonical_root = workspace_root
         .canonicalize()
         .with_context(|| format!("canonicalizing {}", workspace_root.display()))?;
     let packs = [pack_dir.to_path_buf()];
-    let derivation = derive_records(&packs, workspace_root, records_dir, manifest_text)?;
+    let derivation = derive_records(&packs, workspace_root, records_dir, manifest_text, dynamic, generated_records)?;
     let mut records = Vec::new();
     let mut confirmed = 0usize;
     let mut elsewhere = derivation.elsewhere;
+    let metadata_rows = derivation.metadata_rows;
     for record in derivation.records {
         let shim_rel = pathdiff_from_root(&canonical_root, &record.shim)?;
         if declares_path(manifest_text, &shim_rel) {
@@ -724,6 +785,7 @@ pub fn backend_records(
         records,
         confirmed,
         elsewhere,
+        metadata_rows,
     })
 }
 
@@ -1481,6 +1543,28 @@ fn pack_builds_project(pack_dir: &Path, project: &str) -> Result<bool> {
 pub struct Derivation {
     pub records: Vec<DerivedRecord>,
     pub elsewhere: Vec<String>,
+    /// METAGEN-1. One `### EDITABLE METADATA DERIVED` row per source whose
+    /// dependencies had to be BUILT because the tree states them nowhere.
+    ///
+    /// It is carried out rather than printed here for the reason `elsewhere`
+    /// is: the derivation has two callers with different output channels (a
+    /// verb writing to stdout, a backend writing to `tracing`), and a row that
+    /// only one of them can emit is a producer half the system cannot read.
+    pub metadata_rows: Vec<String>,
+}
+
+/// METAGEN-1's seam into the derivation: the LAST-RESORT reader of a path
+/// source's dependencies, consulted only when the tree states them nowhere.
+///
+/// `None` at the call site is the `retread-derive-editable-metadata = false`
+/// arm and reproduces the behaviour before this existed exactly — which is
+/// what makes the opt-out a thing a guard can drive rather than a claim.
+pub trait DynamicDependencySource {
+    /// Derive the tree's core metadata. A failure here must REACH THE CALLER:
+    /// falling back to the frontend's prefix-parented PEP 517 build is the
+    /// 1295.6 s this whole capability removes, and taking it silently would
+    /// hide the failure that needs fixing.
+    fn derive(&self, tree: &Path) -> Result<crate::derived_editable_metadata::Derived>;
 }
 
 /// A manifest entry that already points at a generated shim: recover the real
@@ -1554,6 +1638,8 @@ pub fn derive_records(
     workspace_root: &Path,
     records_dir: &str,
     manifest_text: &str,
+    dynamic: Option<&dyn DynamicDependencySource>,
+    config_allows_generated_records: bool,
 ) -> Result<Derivation> {
     let canonical_root = workspace_root
         .canonicalize()
@@ -1624,6 +1710,8 @@ pub fn derive_records(
 
     let mut derived = Vec::new();
     let mut elsewhere = Vec::new();
+    let mut metadata_rows: Vec<String> = Vec::new();
+    let mut derived_records_to_write: Vec<(PathBuf, String)> = Vec::new();
     for (project, (declared_path, scopes, mut pack_candidates)) in candidates {
         if pack_candidates.len() > 1 {
             let mut builders = Vec::new();
@@ -1689,23 +1777,162 @@ pub fn derive_records(
         };
 
         let tree = canonical_root.join(&real_path);
-        let facts = tree_facts(&tree)
+        let mut facts = tree_facts(&tree)
             .with_context(|| format!("reading the facts `{project}`'s tree states at {}", tree.display()))?;
+
+        // METAGEN-1. The tree states its dependencies in exactly one of three
+        // ways, and only the third costs anything.
+        //
+        //  1. a static `[project].dependencies` -- `imprint`, `unitree_sdk2py`.
+        //     `tree_facts` never looked here, so a static editable's list was
+        //     invisible to the derivation as well; read it, and never build.
+        //  2. an `*.egg-info/PKG-INFO` -- what `tree_facts` already reads.
+        //  3. NOWHERE. `pace_sim2real` declares `install_requires` as a python
+        //     LIST built from a module-level name, which no text reader can
+        //     honestly parse, so before this the derivation emitted
+        //     `dependencies = []` SILENTLY and dropped `psutil` and `cmaes`.
+        //     Ask the tree's own build backend, in an isolated environment.
+        if facts.dependencies.is_none()
+            && let Some(stated) =
+                crate::derived_editable_metadata::static_dependencies(&tree).with_context(|| {
+                    format!("reading `{project}`'s own [project] table at {}", tree.display())
+                })?
+        {
+            facts.dependencies = Some((stated, tree.join("pyproject.toml")));
+        }
+        // THE GENERATED RECORD IS THE RECORD OF TRUTH; THE STORE IS THE CACHE.
+        // A record already on disk whose `source-hash` matches the tree's hash
+        // TODAY states the derived dependencies, so nothing is built at all --
+        // not even a store lookup. A record whose hash has MOVED is stale and
+        // the run rederives it (auto) and rewrites it. A record with no
+        // `source-hash` at all -- every hand-written one -- is left to the
+        // confirm-or-refuse path below, exactly as before.
+        let record_file = pack.join(records_dir).join(format!("{project}.toml"));
+        let mut recorded: Option<PathSourceEntry> = None;
+        let mut record_stale = false;
+        if facts.dependencies.is_none() && record_file.is_file() {
+            let text = std::fs::read_to_string(&record_file)
+                .with_context(|| format!("reading {}", record_file.display()))?;
+            let on_disk: PathSourceEntry = toml::from_str(&text)
+                .with_context(|| format!("parsing {} as a path-source record", record_file.display()))?;
+            if let Some(recorded_hash) = on_disk.source_hash.as_deref() {
+                let current = crate::derived_editable_metadata::source_hash(&tree)
+                    .with_context(|| {
+                        format!("hashing `{project}`'s tree at {} to check {} for staleness", tree.display(), record_file.display())
+                    })?;
+                if recorded_hash == current {
+                    facts.dependencies =
+                        Some((on_disk.dependencies.clone(), record_file.clone()));
+                    if facts.requires_python.is_none() {
+                        facts.requires_python = on_disk.requires_python.clone().map(|value| TreeFact {
+                            value,
+                            source: record_file.clone(),
+                        });
+                    }
+                    recorded = Some(on_disk);
+                } else {
+                    record_stale = true;
+                }
+            }
+        }
+        if facts.dependencies.is_none()
+            && let Some(source) = dynamic
+        {
+            if !config_allows_generated_records {
+                bail!(
+                    "`{project}`'s tree at {} states its dependencies nowhere, and \
+                     {} declares `{}` = false -- so no generated record may be \
+                     written here. Either allow the generated record, or produce \
+                     it once by hand:\n  pixi-build-retread path-source-refresh \
+                     --pack {} --workspace {} --project {project} --write\n\
+                     Refusing rather than locking `dependencies = []`, which is \
+                     the silent drop this capability exists to remove.",
+                    tree.display(),
+                    pack.display(),
+                    crate::derived_editable_metadata::GENERATED_RECORDS_KEY,
+                    pack.display(),
+                    workspace_root.display()
+                );
+            }
+            let derived = source.derive(&tree).with_context(|| {
+                format!(
+                    "`{project}` states its dependencies nowhere -- not in a \
+                     [project] table, not in an *.egg-info/PKG-INFO, not in a \
+                     generated record -- so they were derived from {}",
+                    tree.display()
+                )
+            })?;
+            metadata_rows.push(format!(
+                "{} record={} reason={}",
+                derived.row(&real_path),
+                record_file.display(),
+                if record_stale { "stale-record" } else { "no-record" }
+            ));
+            derived_records_to_write.push((record_file.clone(), derived.source_hash.clone()));
+            facts.dependencies = Some((derived.metadata.requires_dist.clone(), tree.clone()));
+            // The same build states these two as well, and a tree that states
+            // neither anywhere else would otherwise lose them.
+            if facts.requires_python.is_none()
+                && let Some(value) = derived.metadata.requires_python.clone()
+            {
+                facts.requires_python = Some(TreeFact {
+                    value,
+                    source: tree.clone(),
+                });
+            }
+            if facts.version.is_none()
+                && let Some(value) = derived.metadata.version.clone()
+            {
+                facts.version = Some(TreeFact {
+                    value,
+                    source: tree.clone(),
+                });
+            }
+        }
+
         let seed = PathSourceEntry {
             path: real_path.clone(),
             ..PathSourceEntry::default()
         };
-        let entry = record_from_tree(&project, &seed, &facts).with_context(|| {
+        let mut entry = record_from_tree(&project, &seed, &facts).with_context(|| {
             format!(
                 "deriving the path-source record for `{project}` from {}",
                 tree.display()
             )
         })?;
+        // Carry the hash forward from whichever half supplied the dependencies:
+        // the record we just read back and accepted, or the build we just ran.
+        if let Some(recorded) = recorded.as_ref() {
+            entry.source_hash = recorded.source_hash.clone();
+            entry.packages_include = recorded.packages_include.clone();
+        }
 
         // A record file on disk may CONFIRM and may never be required.
-        let file = pack.join(records_dir).join(format!("{project}.toml"));
+        let file = record_file;
         let mut confirmed = false;
-        if file.is_file() {
+        // THE GENERATED WRITE. When this run DERIVED the dependencies, the
+        // record on disk is absent or stale by construction, so it is written
+        // rather than confirmed -- the file is the record of truth and a
+        // derivation nobody wrote down is a fact the next run has to pay for
+        // again. It goes through `write_under_pack`, so a records directory
+        // outside the pack is a refusal and not a stray write.
+        if let Some((_, hash)) = derived_records_to_write
+            .iter()
+            .find(|(target, _)| target == &file)
+        {
+            entry.source_hash = Some(hash.clone());
+            let text = render_record(&project, &entry);
+            // The containment check runs on the DIRECTORY first, so a records
+            // directory outside the pack is refused before it is created.
+            let Some(parent) = file.parent() else {
+                bail!("{}: a record file with no parent directory", file.display());
+            };
+            write_under_pack(&pack, parent, None)?;
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+            write_under_pack(&pack, &file, Some(text.as_str()))?;
+            metadata_rows.push(format!("### EDITABLE METADATA RECORD written={}", file.display()));
+        } else if file.is_file() {
             let text = std::fs::read_to_string(&file)
                 .with_context(|| format!("reading {}", file.display()))?;
             let on_disk: PathSourceEntry = toml::from_str(&text)
@@ -1715,6 +1942,10 @@ pub fn derive_records(
             // reader states, so a record is allowed to be the only statement
             // of it and carrying it forward is not a disagreement.
             want.packages_include = on_disk.packages_include.clone();
+            // Nor is a `source-hash` on a record whose dependencies this run
+            // read from a different producer: the hash describes how the record
+            // was made, not what the tree says today.
+            want.source_hash = on_disk.source_hash.clone();
             if on_disk != want {
                 bail!(
                     "{} disagrees with the tree it describes. The record says\n  \
@@ -1745,6 +1976,7 @@ pub fn derive_records(
     Ok(Derivation {
         records: derived,
         elsewhere,
+        metadata_rows,
     })
 }
 /// The canonical manifest, transformed. `text` is what gets locked.
@@ -1756,6 +1988,8 @@ pub struct EffectiveManifest {
     /// caller can print where each one came from: a derivation nobody can read
     /// back is the same defect as a record nobody wrote.
     pub derived: Vec<DerivedRecord>,
+    /// METAGEN-1's `### EDITABLE METADATA DERIVED` rows, in project order.
+    pub metadata_rows: Vec<String>,
 }
 
 impl EffectiveManifest {
@@ -1799,6 +2033,8 @@ pub fn plan_effective_manifest(
     workspace_root: &Path,
     records_dir: &str,
     manifest_text: &str,
+    dynamic: Option<&dyn DynamicDependencySource>,
+    generated_records: bool,
 ) -> Result<EffectiveManifest> {
     if packs.is_empty() {
         bail!("no pack directory was given: there is nothing to generate shims from");
@@ -1819,7 +2055,7 @@ pub fn plan_effective_manifest(
         }
     }
 
-    let derivation = derive_records(packs, workspace_root, records_dir, manifest_text)?;
+    let derivation = derive_records(packs, workspace_root, records_dir, manifest_text, dynamic, generated_records)?;
     // The verb is given EVERY pack, so a source it declined to claim was
     // declared at the shim of a pack nobody named. Repointing nothing and
     // saying nothing is the silent miss; refusing names both halves.
@@ -1833,6 +2069,7 @@ pub fn plan_effective_manifest(
         );
     }
     let derived = derivation.records;
+    let metadata_rows = derivation.metadata_rows;
 
     // A named pack that stands in for nothing is a gate with no producer: the
     // argument list and the manifest disagree and one of them is stale.
@@ -1884,6 +2121,7 @@ pub fn plan_effective_manifest(
         text,
         rewrites,
         derived,
+        metadata_rows,
     })
 }
 
@@ -1899,8 +2137,10 @@ pub fn generate_effective_manifest(
     workspace_root: &Path,
     records_dir: &str,
     manifest_text: &str,
+    dynamic: Option<&dyn DynamicDependencySource>,
+    generated_records: bool,
 ) -> Result<(EffectiveManifest, Vec<PathSourceOutcome>)> {
-    let effective = plan_effective_manifest(packs, workspace_root, records_dir, manifest_text)?;
+    let effective = plan_effective_manifest(packs, workspace_root, records_dir, manifest_text, dynamic, generated_records)?;
     let mut outcomes = Vec::new();
     for pack_dir in packs {
         // THE DERIVED RECORDS, not the files on disk. Reloading from disk here
@@ -1936,11 +2176,14 @@ pub fn effective_manifest_text(
     records_dir: &str,
     manifest_text: &str,
     shims: bool,
+    dynamic: Option<&dyn DynamicDependencySource>,
+    generated_records: bool,
 ) -> Result<(
     String,
     Vec<ShimRewrite>,
     Vec<PathSourceOutcome>,
     Vec<DerivedRecord>,
+    Vec<String>,
 )> {
     if !shims {
         return Ok((
@@ -1948,15 +2191,17 @@ pub fn effective_manifest_text(
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         ));
     }
     let (effective, outcomes) =
-        generate_effective_manifest(packs, workspace_root, records_dir, manifest_text)?;
+        generate_effective_manifest(packs, workspace_root, records_dir, manifest_text, dynamic, generated_records)?;
     Ok((
         effective.text,
         effective.rewrites,
         outcomes,
         effective.derived,
+        effective.metadata_rows,
     ))
 }
 
@@ -2116,6 +2361,7 @@ mod tests {
             requires_python: Some(">=3.10".to_string()),
             dependencies: vec!["psutil".to_string(), "cmaes".to_string()],
             packages_include: Vec::new(),
+            source_hash: None,
         }
     }
 
@@ -2561,6 +2807,8 @@ mod tests {
             &bare,
             RECORDS_DIR_DEFAULT,
             &manifest_text,
+            None,
+            true,
         )
         .unwrap();
         assert_eq!(derived.records.len(), 1);
@@ -2591,6 +2839,8 @@ mod tests {
             &bare,
             RECORDS_DIR_DEFAULT,
             &manifest_text,
+            None,
+            true,
         )
         .unwrap();
         assert_eq!(confirmed.confirmed, 1);
@@ -2675,6 +2925,7 @@ mod tests {
             requires_python: Some(">=3.8".to_string()),
             dependencies: Vec::new(),
             packages_include: Vec::new(),
+            source_hash: None,
         };
         std::fs::write(
             root.join(other_shim).join("pyproject.toml"),
@@ -2692,6 +2943,8 @@ mod tests {
             &root,
             RECORDS_DIR_DEFAULT,
             &manifest_text,
+            None,
+            true,
         )
         .unwrap();
         assert_eq!(mine.records.len(), 1, "{:?}", mine.records);
@@ -2839,6 +3092,7 @@ mod effective_manifest_tests {
             requires_python: Some(">=3.10".to_string()),
             dependencies: vec!["psutil".to_string(), "cmaes".to_string()],
             packages_include: Vec::new(),
+            source_hash: None,
         }
     }
 
@@ -2849,6 +3103,7 @@ mod effective_manifest_tests {
             requires_python: Some(">=3.8".to_string()),
             dependencies: Vec::new(),
             packages_include: Vec::new(),
+            source_hash: None,
         }
     }
 
@@ -2956,7 +3211,7 @@ mod effective_manifest_tests {
     #[test]
     fn the_effective_manifest_is_the_p6mb_hand_edit_byte_for_byte() {
         let (root, packs) = fixture("p6mb");
-        let planned = plan_effective_manifest(&packs, &root, RECORDS_DIR_DEFAULT, CANONICAL)
+        let planned = plan_effective_manifest(&packs, &root, RECORDS_DIR_DEFAULT, CANONICAL, None, true)
             .expect("the transform must plan against the canonical manifest");
 
         let (deleted, added) = diff_lines(CANONICAL, &planned.text);
@@ -2995,7 +3250,7 @@ mod effective_manifest_tests {
     fn the_shims_are_materialised_against_the_generated_manifest() {
         let (root, packs) = fixture("materialise");
         let (effective, outcomes) =
-            generate_effective_manifest(&packs, &root, RECORDS_DIR_DEFAULT, CANONICAL).unwrap();
+            generate_effective_manifest(&packs, &root, RECORDS_DIR_DEFAULT, CANONICAL, None, true).unwrap();
         assert_eq!(outcomes.len(), 2, "{outcomes:?}");
         for outcome in &outcomes {
             let shim = outcome.shim().join("pyproject.toml");
@@ -3008,7 +3263,7 @@ mod effective_manifest_tests {
         }
         // Re-running is a no-op in both halves: same bytes, nothing written.
         let (again, outcomes2) =
-            generate_effective_manifest(&packs, &root, RECORDS_DIR_DEFAULT, CANONICAL).unwrap();
+            generate_effective_manifest(&packs, &root, RECORDS_DIR_DEFAULT, CANONICAL, None, true).unwrap();
         assert_eq!(again.text, effective.text);
         assert!(outcomes2.iter().all(|o| matches!(o, PathSourceOutcome::Unchanged { .. })));
 
@@ -3016,7 +3271,7 @@ mod effective_manifest_tests {
         // the effective manifest is a fixed point, which is what lets a lock
         // driver regenerate it unconditionally.
         let twice =
-            plan_effective_manifest(&packs, &root, RECORDS_DIR_DEFAULT, &effective.text).unwrap();
+            plan_effective_manifest(&packs, &root, RECORDS_DIR_DEFAULT, &effective.text, None, true).unwrap();
         assert_eq!(twice.text, effective.text);
         assert!(twice.rewrites.iter().all(|r| r.already && r.lines == 0));
         assert!(twice.rows().iter().all(|r| r.contains("reason=already-declared")));
@@ -3028,8 +3283,8 @@ mod effective_manifest_tests {
     #[test]
     fn the_opt_out_reproduces_the_canonical_manifest() {
         let (root, packs) = fixture("optout");
-        let (text, rewrites, outcomes, derived) =
-            effective_manifest_text(&packs, &root, RECORDS_DIR_DEFAULT, CANONICAL, false).unwrap();
+        let (text, rewrites, outcomes, derived, _rows) =
+            effective_manifest_text(&packs, &root, RECORDS_DIR_DEFAULT, CANONICAL, false, None, true).unwrap();
         assert_eq!(text, CANONICAL);
         assert!(rewrites.is_empty());
         assert!(outcomes.is_empty());
@@ -3043,8 +3298,8 @@ mod effective_manifest_tests {
         }
         // The ON path through the SAME entry point does move the four lines,
         // so this guard can fail in both directions.
-        let (on, rewrites, _, derived) =
-            effective_manifest_text(&packs, &root, RECORDS_DIR_DEFAULT, CANONICAL, true).unwrap();
+        let (on, rewrites, _, derived, _rows) =
+            effective_manifest_text(&packs, &root, RECORDS_DIR_DEFAULT, CANONICAL, true, None, true).unwrap();
         assert_ne!(on, CANONICAL);
         assert_eq!(rewrites.len(), 2);
         assert_eq!(derived.len(), 2);
@@ -3063,7 +3318,7 @@ mod effective_manifest_tests {
     fn a_pack_that_cannot_do_the_job_is_refused_and_never_falls_back() {
         let (root, mut packs) = fixture("missing");
         packs.push(root.join("pypi-packs/there-is-no-such-pack"));
-        let error = plan_effective_manifest(&packs, &root, RECORDS_DIR_DEFAULT, CANONICAL)
+        let error = plan_effective_manifest(&packs, &root, RECORDS_DIR_DEFAULT, CANONICAL, None, true)
             .expect_err("a missing pack directory must refuse");
         let text = format!("{error:#}");
         assert!(text.contains("there-is-no-such-pack"), "{text}");
@@ -3073,7 +3328,7 @@ mod effective_manifest_tests {
         // a gate with no producer.
         let orphan = bare_pack(&root, "pypi-packs/orphan-pack", "nothing-at-all");
         let error =
-            plan_effective_manifest(&[orphan.clone()], &root, RECORDS_DIR_DEFAULT, CANONICAL)
+            plan_effective_manifest(&[orphan.clone()], &root, RECORDS_DIR_DEFAULT, CANONICAL, None, true)
                 .expect_err("a pack that stands in for nothing must refuse");
         let text = format!("{error:#}");
         assert!(text.contains("orphan-pack"), "{text}");
@@ -3105,7 +3360,7 @@ mod effective_manifest_tests {
         std::fs::write(root.join("pixi.toml"), escaped).unwrap();
         real_tree(&root, PACE_REL, "pace-sim2real", &pace_entry());
         let isaac = bare_pack(&root, ISAAC_PACK, "pace-sim2real");
-        let error = plan_effective_manifest(&[isaac], &root, RECORDS_DIR_DEFAULT, escaped)
+        let error = plan_effective_manifest(&[isaac], &root, RECORDS_DIR_DEFAULT, escaped, None, true)
             .expect_err("a path the rewriter cannot find must refuse");
         let text = format!("{error:#}");
         assert!(text.contains("pace-sim2real"), "{text}");
@@ -3128,7 +3383,7 @@ mod effective_manifest_tests {
              \"protomotions\" = { version = \"==1.0.0\" }\n",
         )
         .unwrap();
-        let error = plan_effective_manifest(&packs, &root, RECORDS_DIR_DEFAULT, CANONICAL)
+        let error = plan_effective_manifest(&packs, &root, RECORDS_DIR_DEFAULT, CANONICAL, None, true)
             .expect_err("two packs building one project must refuse");
         let text = format!("{error:#}");
         assert!(text.contains("isaaclab-2.3x-pack"), "{text}");
@@ -3149,7 +3404,7 @@ mod effective_manifest_tests {
              \"something-else\" = { version = \"==1.0.0\" }\n",
         )
         .unwrap();
-        let error = plan_effective_manifest(&packs, &root, RECORDS_DIR_DEFAULT, CANONICAL)
+        let error = plan_effective_manifest(&packs, &root, RECORDS_DIR_DEFAULT, CANONICAL, None, true)
             .expect_err("no pack building the project must refuse too");
         assert!(format!("{error:#}").contains("Exactly one pack must"));
     }
@@ -3169,7 +3424,7 @@ mod effective_manifest_tests {
     #[test]
     fn a_source_beside_no_named_pack_and_the_workspace_itself_are_not_shimmed() {
         let (root, packs) = fixture("scope");
-        let planned = plan_effective_manifest(&packs, &root, RECORDS_DIR_DEFAULT, CANONICAL)
+        let planned = plan_effective_manifest(&packs, &root, RECORDS_DIR_DEFAULT, CANONICAL, None, true)
             .expect("the transform must plan from a manifest with unrelated sources in it");
         let projects: Vec<&str> = planned
             .derived
@@ -3200,7 +3455,7 @@ mod effective_manifest_tests {
                 pack_dir.display()
             );
         }
-        let planned = plan_effective_manifest(&packs, &root, RECORDS_DIR_DEFAULT, CANONICAL)
+        let planned = plan_effective_manifest(&packs, &root, RECORDS_DIR_DEFAULT, CANONICAL, None, true)
             .expect("the derivation must work with no record file anywhere");
 
         assert_eq!(planned.derived.len(), 2);
@@ -3235,7 +3490,7 @@ mod effective_manifest_tests {
         // The derived text is the same text the record files produce, so the
         // two producers cannot drift.
         let (root2, packs2) = fixture_with_records("confirm");
-        let confirmed = plan_effective_manifest(&packs2, &root2, RECORDS_DIR_DEFAULT, CANONICAL)
+        let confirmed = plan_effective_manifest(&packs2, &root2, RECORDS_DIR_DEFAULT, CANONICAL, None, true)
             .expect("a record that agrees must confirm, not refuse");
         assert_eq!(confirmed.text, planned.text);
         assert!(confirmed.derived.iter().all(|d| d.confirmed));
@@ -3266,7 +3521,7 @@ mod effective_manifest_tests {
             render_record("protomotions", &lying),
         )
         .unwrap();
-        let error = plan_effective_manifest(&packs, &root, RECORDS_DIR_DEFAULT, CANONICAL)
+        let error = plan_effective_manifest(&packs, &root, RECORDS_DIR_DEFAULT, CANONICAL, None, true)
             .expect_err("a record disagreeing with its tree must refuse");
         let text = format!("{error:#}");
         assert!(text.contains("protomotions.toml"), "{text}");
@@ -3299,7 +3554,7 @@ mod effective_manifest_tests {
         let isaac = bare_pack(&root, ISAAC_PACK, "pace-sim2real");
         let pm = bare_pack(&root, PM_PACK, "protomotions");
 
-        let planned = plan_effective_manifest(&[isaac, pm], &root, RECORDS_DIR_DEFAULT, REAL)
+        let planned = plan_effective_manifest(&[isaac, pm], &root, RECORDS_DIR_DEFAULT, REAL, None, true)
             .expect("the real manifest must derive its own records");
 
         assert_eq!(planned.derived.len(), 2, "repointed=2");
@@ -3354,7 +3609,7 @@ mod effective_manifest_tests {
 
         // --- the VERB, exactly as the lock driver runs it -------------------
         let (effective, outcomes) =
-            generate_effective_manifest(&packs, &root, RECORDS_DIR_DEFAULT, REAL)
+            generate_effective_manifest(&packs, &root, RECORDS_DIR_DEFAULT, REAL, None, true)
                 .expect("the verb must derive its own records");
         assert_eq!(effective.text.len(), 45_393, "the measured effective size");
         assert_eq!(effective.derived.len(), 2, "repointed=2");
@@ -3391,7 +3646,7 @@ mod effective_manifest_tests {
         let manifest_text = std::fs::read_to_string(root.join("pixi.toml")).unwrap();
         let mut rows = Vec::new();
         for pack in &packs {
-            let backend = backend_records(pack, &root, RECORDS_DIR_DEFAULT, &manifest_text)
+            let backend = backend_records(pack, &root, RECORDS_DIR_DEFAULT, &manifest_text, None, true)
                 .expect("the backend must derive its own pack's records");
             assert_eq!(backend.records.len(), 1, "{pack:?}: {:?}", backend.records);
             assert_eq!(backend.confirmed, 0, "no file confirmed anything");
@@ -3460,5 +3715,701 @@ mod effective_manifest_tests {
             }
         }
         n
+    }
+}
+
+/// METAGEN-1's guards. Every one of them FAILS at 0be408a, because at 0be408a
+/// the derivation had no last-resort dependency reader at all.
+#[cfg(test)]
+mod metagen_tests {
+    use super::*;
+    use crate::derived_editable_metadata as dem;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const PACE_REL: &str = "third_party/pace-sim2real/source/pace_sim2real";
+    const ISAAC_PACK: &str = "pypi-packs/isaaclab-2.3x-pack";
+
+    /// The canonical manifest, cut down to the one entry these guards need.
+    const MANIFEST: &str = r#"[workspace]
+channels = ["conda-forge"]
+
+[feature.pace.dependencies]
+"isaaclab-2.3x-pack" = { path = "pypi-packs/isaaclab-2.3x-pack" }
+
+[feature.pace.pypi-dependencies]
+pace_sim2real = { path = "third_party/pace-sim2real/source/pace_sim2real", editable = true }
+"#;
+
+    /// `pace_sim2real`'s `setup.py`, TRANSCRIBED from
+    /// `imprint-data/third_party/pace-sim2real/source/pace_sim2real/setup.py`.
+    /// The load-bearing part is `install_requires=INSTALL_REQUIRES`: a python
+    /// LIST reached through a module-level name, which is exactly what
+    /// `scan_setup_kwarg` (a quoted-SCALAR reader) structurally cannot read.
+    const PACE_SETUP_PY: &str = r#"import os
+import toml
+
+from setuptools import setup
+
+EXTENSION_PATH = os.path.dirname(os.path.realpath(__file__))
+EXTENSION_TOML_DATA = toml.load(os.path.join(EXTENSION_PATH, "config", "extension.toml"))
+
+INSTALL_REQUIRES = [
+    "psutil",
+    "cmaes",
+]
+
+setup(
+    name="pace_sim2real",
+    packages=["pace_sim2real"],
+    author=EXTENSION_TOML_DATA["package"]["author"],
+    version=EXTENSION_TOML_DATA["package"]["version"],
+    install_requires=INSTALL_REQUIRES,
+    license="Apache-2.0",
+    python_requires=">=3.10",
+    zip_safe=False,
+)
+"#;
+
+    /// The tree's `pyproject.toml`: FOUR LINES, `[build-system]` only, NO
+    /// `[project]` table. This is the file verbatim as it stands in
+    /// `imprint-data`, and its emptiness is the whole defect.
+    const PACE_PYPROJECT: &str = r#"[build-system]
+requires = ["setuptools", "wheel", "toml"]
+build-backend = "setuptools.build_meta"
+"#;
+
+    const PACE_EXTENSION_TOML: &str = r#"[package]
+version = "0.1.2"
+author = "Filip Bjelonic"
+maintainer = "Filip Bjelonic"
+description = "PACE software for sim-to-real transfer of legged robots"
+repository = "https://github.com/leggedrobotics/pace-sim2real"
+"#;
+
+    /// What the tree's OWN backend produces — the live
+    /// `pace_sim2real.egg-info/PKG-INFO`, transcribed, `Dynamic:` lines and
+    /// all. The isolated build's output has this shape, so this is what the
+    /// fake builder returns.
+    const PACE_CORE_METADATA: &str = r#"Metadata-Version: 2.4
+Name: pace_sim2real
+Version: 0.1.2
+Summary: PACE software for sim-to-real transfer of legged robots
+Home-page: https://github.com/leggedrobotics/pace-sim2real
+Author: Filip Bjelonic
+Maintainer: Filip Bjelonic
+License: Apache-2.0
+Keywords: isaaclab,sim2real,reinforcement-learning,robotics,pace
+Requires-Python: >=3.10
+Requires-Dist: psutil
+Requires-Dist: cmaes
+Dynamic: author
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
+
+body
+"#;
+
+    /// The three `[project]` values PACEMETA-1 STAGED by hand into
+    /// `pacemeta1-work/staged/.../pyproject.toml`. The derived shim must carry
+    /// exactly these, which is what "byte-identical modulo `Dynamic:` lines"
+    /// means for the fields uv reads.
+    const STAGED_VERSION: &str = "0.1.2";
+    const STAGED_REQUIRES_PYTHON: &str = ">=3.10";
+    const STAGED_DEPENDENCIES: [&str; 2] = ["psutil", "cmaes"];
+
+    fn test_dir(label: &str) -> PathBuf {
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "retread-metagen-{label}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A pack directory with no record in it — production's actual shape.
+    fn bare_pack(root: &Path, rel: &str, builds: &str) -> PathBuf {
+        let dir = root.join(rel);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("pixi.toml"),
+            format!(
+                "[package]\n\n[package.build.config.retread-wheels]\n\
+                 \"{builds}\" = {{ version = \"==1.0.0\" }}\n"
+            ),
+        )
+        .unwrap();
+        dir
+    }
+
+    /// THE FIXTURE THAT MATTERS: `pace_sim2real` with **no `*.egg-info`**.
+    /// A `git clean`, a fresh submodule clone, or a `cp -al` of a pristine tree
+    /// is exactly this shape, and it is the shape in which the derivation used
+    /// to emit `dependencies = []` silently.
+    fn fixture(label: &str) -> (PathBuf, Vec<PathBuf>) {
+        let root = test_dir(label);
+        std::fs::write(root.join("pixi.toml"), MANIFEST).unwrap();
+        let tree = root.join(PACE_REL);
+        std::fs::create_dir_all(tree.join("pace_sim2real")).unwrap();
+        std::fs::write(tree.join("pace_sim2real").join("__init__.py"), "").unwrap();
+        std::fs::write(tree.join("pyproject.toml"), PACE_PYPROJECT).unwrap();
+        std::fs::write(tree.join("setup.py"), PACE_SETUP_PY).unwrap();
+        std::fs::create_dir_all(tree.join("config")).unwrap();
+        std::fs::write(
+            tree.join("config").join("extension.toml"),
+            PACE_EXTENSION_TOML,
+        )
+        .unwrap();
+        let pack = bare_pack(&root, ISAAC_PACK, "pace-sim2real");
+        (root, vec![pack])
+    }
+
+    /// A builder that counts its calls and returns the tree's real metadata
+    /// from an interpreter path OUTSIDE every environment prefix.
+    ///
+    /// It is a seam and not a mock of convenience: `cargo test` has no network
+    /// and cannot `pip install setuptools`, and a capability whose only guard
+    /// needs a network is a capability with no guard. What the real builder
+    /// adds on top of this is exercised by the isolation run, and the ONE
+    /// property that must hold for both — the interpreter is not
+    /// prefix-parented — is asserted on this path too, by `derive_for_tree`.
+    struct Counting {
+        calls: AtomicUsize,
+        interpreter: PathBuf,
+    }
+
+    impl Counting {
+        fn outside() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                interpreter: PathBuf::from("/usr/bin/python3"),
+            }
+        }
+        /// MUTATION (i): the prefix-parented build restored.
+        fn inside_prefix() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                interpreter: PathBuf::from(
+                    "/oscar/data/stellex/glvov/imprint-data/.pixi/envs/pace/bin/python3.11",
+                ),
+            }
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl dem::MetadataBuilder for Counting {
+        fn build(&self, _tree: &Path) -> anyhow::Result<dem::BuildProduct> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(dem::BuildProduct {
+                metadata: PACE_CORE_METADATA.to_string(),
+                interpreter: self.interpreter.clone(),
+            })
+        }
+    }
+
+    /// The derivation's seam, wired to a `Counting` builder and a store root.
+    struct Source<'a> {
+        options: dem::DeriveOptions,
+        builder: &'a Counting,
+    }
+
+    impl DynamicDependencySource for Source<'_> {
+        fn derive(&self, tree: &Path) -> anyhow::Result<dem::Derived> {
+            dem::derive_for_tree(tree, &self.options, "cp311", self.builder)
+        }
+    }
+
+    /// GUARD (a). The derived metadata IS PACEMETA-1's staged pyproject, the
+    /// store goes miss -> built -> hit, and no build is prefix-parented.
+    ///
+    /// FAILS at 0be408a: with no last-resort reader, `record_from_tree` fell
+    /// back to the seed's empty vector and `dependencies` was `[]`.
+    #[test]
+    fn metagen1_the_derived_shim_carries_pacemetas_staged_fields_and_the_store_goes_miss_built_hit()
+    {
+        let (root, packs) = fixture("staged-fields");
+        let store = test_dir("staged-fields-store");
+        let builder = Counting::outside();
+        let source = Source {
+            options: dem::DeriveOptions {
+                enabled: true,
+                store_root: Some(store.clone()),
+            },
+            builder: &builder,
+        };
+
+        // FIRST CALL: nothing in the store, so the build runs and publishes.
+        let first = derive_records(
+            &packs,
+            &root,
+            RECORDS_DIR_DEFAULT,
+            MANIFEST,
+            Some(&source as &dyn DynamicDependencySource),
+            true,
+        )
+        .expect("the derivation must succeed on a tree with no egg-info");
+        assert_eq!(first.records.len(), 1, "{:?}", first.records);
+        let entry = &first.records[0].record.entry;
+
+        // THE FIELDS PACEMETA-1 STAGED BY HAND, derived instead.
+        assert_eq!(entry.version, STAGED_VERSION);
+        assert_eq!(entry.requires_python.as_deref(), Some(STAGED_REQUIRES_PYTHON));
+        assert_eq!(
+            entry.dependencies,
+            STAGED_DEPENDENCIES
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+            "the two dependencies PACEMETA-1 transcribed by hand must be DERIVED"
+        );
+
+        // The rendered shim carries them as a real static `[project]` table,
+        // which is what makes pixi's frontend print `Found static pyproject.toml`.
+        let shim = render_shim_pyproject("pace-sim2real", entry, "../../../third_party");
+        assert!(shim.contains("dependencies = [\"psutil\", \"cmaes\"]"), "{shim}");
+        assert!(shim.contains("version = \"0.1.2\""), "{shim}");
+        assert!(shim.contains("requires-python = \">=3.10\""), "{shim}");
+        // And NOT one `Dynamic:` line: those are core-metadata headers, not
+        // pyproject keys, which is the whole "modulo Dynamic lines" clause.
+        assert!(!shim.contains("Dynamic:"), "{shim}");
+
+        // THE ROWS: the derivation, then the RECORD it generated.
+        assert_eq!(first.metadata_rows.len(), 2, "{:?}", first.metadata_rows);
+        let row = &first.metadata_rows[0];
+        assert!(row.starts_with("### EDITABLE METADATA DERIVED path="), "{row}");
+        assert!(row.contains(&format!("path={PACE_REL} ")), "{row}");
+        assert!(row.contains(" store=built "), "{row}");
+        assert!(row.contains(" build_env=isolated "), "{row}");
+        assert!(row.contains("source_hash="), "{row}");
+        assert!(row.contains(" reason=no-record"), "{row}");
+        // THE RECORD PATH IS IN THE ROW, and the record is on disk in the pack.
+        let record = packs[0].join(RECORDS_DIR_DEFAULT).join("pace-sim2real.toml");
+        assert!(row.contains(&format!("record={}", record.display())), "{row}");
+        assert_eq!(
+            first.metadata_rows[1],
+            format!("### EDITABLE METADATA RECORD written={}", record.display())
+        );
+        assert!(record.is_file(), "the generated record must be written");
+        let record_text = std::fs::read_to_string(&record).unwrap();
+        assert!(record_text.contains("dependencies = [\"psutil\", \"cmaes\"]"), "{record_text}");
+        assert!(record_text.contains("source-hash = \""), "{record_text}");
+        assert_eq!(builder.calls(), 1, "exactly one build for one tree");
+
+        // AND THE RECORD IS NOW THE RECORD OF TRUTH. A second run whose tree
+        // hash still matches the record reads the record and does not build, does
+        // not consult the store, and prints NO row -- the store is the cache, the
+        // file is the truth.
+        let recorded_run = derive_records(
+            &packs,
+            &root,
+            RECORDS_DIR_DEFAULT,
+            MANIFEST,
+            Some(&source as &dyn DynamicDependencySource),
+            true,
+        )
+        .unwrap();
+        assert_eq!(builder.calls(), 1, "a matching record must not build");
+        assert!(
+            recorded_run.metadata_rows.is_empty(),
+            "a run served by the record prints no derivation row: {:?}",
+            recorded_run.metadata_rows
+        );
+        assert_eq!(recorded_run.records[0].record.entry.dependencies, entry.dependencies);
+        assert!(recorded_run.records[0].confirmed, "the record CONFIRMS the derivation");
+
+        // NOW REMOVE THE RECORD. The tree is unchanged, so the STORE serves the
+        // metadata and the builder is still not called: `store=hit`.
+        std::fs::remove_file(&record).unwrap();
+
+        // NO PREFIX-PARENTED BUILD. The interpreter the build reported must not
+        // be under `.pixi/envs`, and the assertion is the module's own.
+        dem::assert_isolated_interpreter(Path::new("/usr/bin/python3")).unwrap();
+        assert!(
+            dem::assert_isolated_interpreter(Path::new(
+                "/w/.pixi/envs/pace/bin/python3.11"
+            ))
+            .is_err(),
+            "a prefix-parented interpreter must be REFUSED"
+        );
+
+        let second = derive_records(
+            &packs,
+            &root,
+            RECORDS_DIR_DEFAULT,
+            MANIFEST,
+            Some(&source as &dyn DynamicDependencySource),
+            true,
+        )
+        .unwrap();
+        assert_eq!(builder.calls(), 1, "the second call must HIT the store");
+        assert!(second.metadata_rows[0].contains(" store=hit "), "{:?}", second.metadata_rows);
+        assert_eq!(second.records[0].record.entry.dependencies, entry.dependencies);
+
+        // The hit rewrote the record, so remove it again for the MISS arm.
+        assert!(record.is_file(), "a store hit still writes the record");
+        std::fs::remove_file(&record).unwrap();
+
+        // MISS: the same tree with no store root builds and keeps nothing.
+        let no_store = Source {
+            options: dem::DeriveOptions {
+                enabled: true,
+                store_root: None,
+            },
+            builder: &builder,
+        };
+        let third = derive_records(
+            &packs,
+            &root,
+            RECORDS_DIR_DEFAULT,
+            MANIFEST,
+            Some(&no_store as &dyn DynamicDependencySource),
+            true,
+        )
+        .unwrap();
+        assert!(third.metadata_rows[0].contains(" store=miss "), "{:?}", third.metadata_rows);
+        assert_eq!(builder.calls(), 2);
+    }
+
+    /// GUARD (b). An edit to the vendored `setup.py` moves the source hash, so
+    /// the entry is REBUILT rather than served stale.
+    ///
+    /// This is the guard a git tree hash could not pass: both live trees are
+    /// submodules, so `HEAD^{tree}` would be unchanged by an uncommitted edit.
+    #[test]
+    fn metagen1_an_edit_to_the_vendored_setup_py_moves_the_hash_and_rebuilds() {
+        let (root, packs) = fixture("setup-edit");
+        let store = test_dir("setup-edit-store");
+        let builder = Counting::outside();
+        let source = Source {
+            options: dem::DeriveOptions {
+                enabled: true,
+                store_root: Some(store.clone()),
+            },
+            builder: &builder,
+        };
+        let tree = root.join(PACE_REL);
+
+        let before = dem::source_hash(&tree).unwrap();
+        derive_records(&packs, &root, RECORDS_DIR_DEFAULT, MANIFEST, Some(&source as &dyn DynamicDependencySource), true).unwrap();
+        assert_eq!(builder.calls(), 1);
+        // A second identical call HITS -- the control for the edit below.
+        derive_records(&packs, &root, RECORDS_DIR_DEFAULT, MANIFEST, Some(&source as &dyn DynamicDependencySource), true).unwrap();
+        assert_eq!(builder.calls(), 1, "unchanged tree must hit");
+
+        // THE EDIT: one more dependency in the same literal list.
+        std::fs::write(
+            tree.join("setup.py"),
+            PACE_SETUP_PY.replace("\"cmaes\",", "\"cmaes\",\n    \"numpy\","),
+        )
+        .unwrap();
+        let after = dem::source_hash(&tree).unwrap();
+        assert_ne!(before, after, "editing setup.py MUST move the source hash");
+
+        let rebuilt = derive_records(&packs, &root, RECORDS_DIR_DEFAULT, MANIFEST, Some(&source as &dyn DynamicDependencySource), true).unwrap();
+        assert_eq!(builder.calls(), 2, "the edited tree must be REBUILT");
+        // AND THE ROW SAYS WHY. A stale record and an absent one are different
+        // events and the operator needs to tell them apart.
+        assert!(
+            rebuilt.metadata_rows[0].contains(" reason=stale-record"),
+            "{:?}",
+            rebuilt.metadata_rows
+        );
+        // The record on disk now carries the NEW hash, not the old one.
+        let record = packs[0].join(RECORDS_DIR_DEFAULT).join("pace-sim2real.toml");
+        let text = std::fs::read_to_string(&record).unwrap();
+        assert!(text.contains(&format!("source-hash = \"{after}\"")), "{text}");
+        assert!(!text.contains(&before), "the stale hash must be gone: {text}");
+
+        // A pack declared CLEAN-ONLY refuses instead of writing, and the refusal
+        // names the verb that produces the record by hand.
+        std::fs::remove_file(&record).unwrap();
+        let error = derive_records(
+            &packs,
+            &root,
+            RECORDS_DIR_DEFAULT,
+            MANIFEST,
+            Some(&source as &dyn DynamicDependencySource),
+            false,
+        )
+        .expect_err("a clean-only pack must refuse rather than write");
+        let text = format!("{error:#}");
+        assert!(text.contains(dem::GENERATED_RECORDS_KEY), "{text}");
+        assert!(text.contains("path-source-refresh"), "{text}");
+        assert!(text.contains("--write"), "{text}");
+        assert!(!record.exists(), "a refusal must leave no record behind");
+
+        // The same holds for `config/extension.toml`, which is where the
+        // version actually comes from.
+        let before_ext = dem::source_hash(&tree).unwrap();
+        std::fs::write(
+            tree.join("config").join("extension.toml"),
+            PACE_EXTENSION_TOML.replace("0.1.2", "0.1.3"),
+        )
+        .unwrap();
+        assert_ne!(before_ext, dem::source_hash(&tree).unwrap());
+
+        // And creating a file the bounded set NAMES moves it, because absence
+        // is hashed as well as presence.
+        let before_cfg = dem::source_hash(&tree).unwrap();
+        std::fs::write(tree.join("setup.cfg"), "[metadata]\n").unwrap();
+        assert_ne!(before_cfg, dem::source_hash(&tree).unwrap());
+    }
+
+    /// GUARD (c). A STATIC editable is untouched: no build, no row, and its own
+    /// `[project].dependencies` are what get locked.
+    ///
+    /// FAILS at 0be408a for a reason worth stating plainly: `tree_facts` never
+    /// read a `[project]` table at all, so a static editable with no egg-info
+    /// ALSO derived `dependencies = []` there.
+    #[test]
+    fn metagen1_a_static_editable_is_never_built_and_prints_no_row() {
+        let (root, packs) = fixture("static");
+        let tree = root.join(PACE_REL);
+        // Give the tree the static table `imprint` and `unitree_sdk2py` have.
+        std::fs::write(
+            tree.join("pyproject.toml"),
+            format!(
+                "{PACE_PYPROJECT}\n[project]\nname = \"pace_sim2real\"\n\
+                 version = \"0.1.2\"\nrequires-python = \">=3.10\"\n\
+                 dependencies = [\"psutil\", \"cmaes\"]\n"
+            ),
+        )
+        .unwrap();
+        let builder = Counting::outside();
+        let source = Source {
+            options: dem::DeriveOptions {
+                enabled: true,
+                store_root: None,
+            },
+            builder: &builder,
+        };
+        let derivation = derive_records(
+            &packs,
+            &root,
+            RECORDS_DIR_DEFAULT,
+            MANIFEST,
+            Some(&source as &dyn DynamicDependencySource),
+            true,
+        )
+        .unwrap();
+        assert_eq!(builder.calls(), 0, "a static editable must NEVER be built");
+        assert!(
+            derivation.metadata_rows.is_empty(),
+            "no row for a tree that states its own facts: {:?}",
+            derivation.metadata_rows
+        );
+        assert_eq!(
+            derivation.records[0].record.entry.dependencies,
+            vec!["psutil".to_string(), "cmaes".to_string()],
+            "the static table is what gets locked"
+        );
+
+        // And `dynamic = [\"dependencies\"]` is NOT a statement: it is the case
+        // this capability exists for, so it falls through to the build.
+        std::fs::write(
+            tree.join("pyproject.toml"),
+            format!(
+                "{PACE_PYPROJECT}\n[project]\nname = \"pace_sim2real\"\n\
+                 version = \"0.1.2\"\ndynamic = [\"dependencies\"]\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(dem::static_dependencies(&tree).unwrap(), None);
+        derive_records(&packs, &root, RECORDS_DIR_DEFAULT, MANIFEST, Some(&source as &dyn DynamicDependencySource), true).unwrap();
+        assert_eq!(builder.calls(), 1, "dynamic dependencies must be built");
+    }
+
+    /// GUARD (d). THE OPT-OUT IS THE OLD BEHAVIOUR, EXACTLY.
+    ///
+    /// `retread-derive-editable-metadata = false` hands the derivation `None`,
+    /// and on a tree with no egg-info and no `[project]` table it then produces
+    /// what 0be408a produced: an EMPTY dependency list and no row. This guard
+    /// PASSES at 0be408a and must keep passing, which is what makes it a
+    /// byte-identity claim rather than an assertion about a new feature.
+    #[test]
+    fn metagen1_the_switch_off_reproduces_the_pre_metagen_behaviour() {
+        let (root, packs) = fixture("off");
+        let derivation =
+            derive_records(&packs, &root, RECORDS_DIR_DEFAULT, MANIFEST, None, true).unwrap();
+        assert!(derivation.metadata_rows.is_empty());
+        assert!(
+            derivation.records[0].record.entry.dependencies.is_empty(),
+            "with the switch off, the SILENT DROP is what happens -- and that is \
+             precisely why the default is on"
+        );
+        // The constructor is the ONE reader of the switch, and `false` must
+        // yield no reader at all rather than a disabled one.
+        assert!(
+            dem::ConfiguredDeriver::from_config(
+                Some(false),
+                None,
+                &|_| None,
+                std::env::temp_dir()
+            )
+            .is_none()
+        );
+        // `None` (the key absent) is ON -- the opposite of the two path-source
+        // keys, for the reason `config.rs` states.
+        assert!(
+            dem::ConfiguredDeriver::from_config(None, None, &|_| None, std::env::temp_dir())
+                .is_some()
+        );
+    }
+
+    /// MUTATION (i)'s target, stated as its own guard: a builder that reports a
+    /// prefix-parented interpreter is REFUSED by `derive_for_tree`, not
+    /// accepted with a row that lies about `build_env=isolated`.
+    #[test]
+    fn metagen1_a_prefix_parented_build_is_refused_and_never_stored() {
+        let (root, _packs) = fixture("prefix");
+        let store = test_dir("prefix-store");
+        let builder = Counting::inside_prefix();
+        let options = dem::DeriveOptions {
+            enabled: true,
+            store_root: Some(store.clone()),
+        };
+        let error = dem::derive_for_tree(&root.join(PACE_REL), &options, "cp311", &builder)
+            .expect_err("a prefix-parented build must be REFUSED");
+        let text = format!("{error:#}");
+        assert!(text.contains(".pixi/envs"), "{text}");
+        assert!(text.contains("1295.6"), "the refusal must name the cost: {text}");
+        // AND NOTHING WAS PUBLISHED. A refused build that left an entry behind
+        // would serve the refusal's own bad metadata to the next lock.
+        let hash = dem::source_hash(&root.join(PACE_REL)).unwrap();
+        let key = dem::entry_key(&hash, "cp311");
+        assert!(dem::read_entry(&store, &key).unwrap().is_none());
+    }
+
+    /// The bounded hash is BOUNDED, and the bound REFUSES rather than
+    /// truncating. A silent prefix-hash would reuse metadata for a tree that
+    /// changed, which is the same class of defect as the empty dependency list.
+    #[test]
+    fn metagen1_the_hash_bound_refuses_instead_of_hashing_a_prefix() {
+        let (root, _packs) = fixture("bound");
+        let tree = root.join(PACE_REL);
+        let config = tree.join("config");
+        for n in 0..=dem::HASHED_DIR_MAX_FILES {
+            std::fs::write(config.join(format!("f{n}.toml")), "x").unwrap();
+        }
+        let error = dem::source_hash(&tree).expect_err("over the bound must refuse");
+        let text = format!("{error:#}");
+        assert!(text.contains("over the"), "{text}");
+        assert!(text.contains("partial key"), "{text}");
+    }
+
+    /// The store's ENTRY SHAPE. Its registration with the one reaper is
+    /// guarded in `store_reap`'s own tests, beside the six that came before it.
+    #[test]
+    fn metagen1_the_store_entry_is_the_shape_every_marker_store_uses() {
+        let root = test_dir("store-shape");
+        let key = dem::entry_key("abc", "cp311");
+        assert!(key.starts_with(dem::KEY_PREFIX));
+        dem::publish_entry(&root, &key, PACE_CORE_METADATA, "{}\n").unwrap();
+        assert_eq!(
+            dem::entry_dir(&root, &key),
+            root.join(dem::CACHE_NAMESPACE)
+                .join(dem::CACHE_VERSION)
+                .join(&key)
+        );
+        assert_eq!(
+            dem::read_entry(&root, &key).unwrap().as_deref(),
+            Some(PACE_CORE_METADATA)
+        );
+        // Only the two permitted names exist in the entry.
+        let mut names: Vec<String> = std::fs::read_dir(dem::entry_dir(&root, &key))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        let mut permitted: Vec<String> =
+            dem::PERMITTED_ENTRY_NAMES.iter().map(|s| s.to_string()).collect();
+        permitted.sort();
+        assert_eq!(names, permitted);
+        // A missing marker reads as ABSENT, never as truncated metadata.
+        std::fs::remove_file(dem::entry_dir(&root, &key).join(dem::COMPLETION_MARKER)).unwrap();
+        assert!(dem::read_entry(&root, &key).unwrap().is_none());
+    }
+
+    /// The core-metadata reader, and the `build-system` readers that keep the
+    /// build env LIGHT: pace declares three requirements, not a conda prefix.
+    #[test]
+    fn metagen1_the_readers_read_what_the_tree_declares() {
+        let (root, _packs) = fixture("readers");
+        let tree = root.join(PACE_REL);
+        assert_eq!(
+            dem::build_requires(&tree).unwrap(),
+            vec![
+                "setuptools".to_string(),
+                "wheel".to_string(),
+                "toml".to_string()
+            ],
+            "the tree's OWN build-system.requires, which is why the env is light"
+        );
+        assert_eq!(dem::build_backend(&tree).unwrap(), "setuptools.build_meta");
+
+        let parsed = dem::parse_core_metadata(PACE_CORE_METADATA);
+        assert_eq!(parsed.name.as_deref(), Some("pace_sim2real"));
+        assert_eq!(parsed.version.as_deref(), Some("0.1.2"));
+        assert_eq!(parsed.requires_python.as_deref(), Some(">=3.10"));
+        assert_eq!(parsed.requires_dist, vec!["psutil", "cmaes"]);
+        // Headers end at the first blank line: the body must not be scanned.
+        assert!(!parsed.requires_dist.iter().any(|d| d == "body"));
+
+        // A tree with no pyproject.toml at all -- ProtoMotions' shape before
+        // PACEMETA-1 staged one -- gets the PEP 518 defaults and is still
+        // buildable, rather than refusing for want of a file PEP 518 says is
+        // optional.
+        let pm = root.join("third_party/ProtoMotions");
+        std::fs::create_dir_all(&pm).unwrap();
+        std::fs::write(pm.join("setup.py"), "from setuptools import setup\nsetup()\n").unwrap();
+        assert_eq!(
+            dem::build_requires(&pm).unwrap(),
+            vec!["setuptools>=64".to_string(), "wheel".to_string()]
+        );
+        assert_eq!(
+            dem::build_backend(&pm).unwrap(),
+            "setuptools.build_meta:__legacy__"
+        );
+        assert_eq!(dem::static_dependencies(&pm).unwrap(), None);
+    }
+
+    /// The interpreter selection: the first candidate that exists wins, an
+    /// absent one is skipped, and a prefix-parented one that EXISTS is a
+    /// refusal rather than a skip -- because silently walking past it is how a
+    /// fallback gets reinvented.
+    #[test]
+    fn metagen1_interpreter_selection_refuses_a_prefix_and_skips_an_absent_one() {
+        let root = test_dir("interp");
+        let absent = root.join("no-such-python");
+        let good = root.join("bin").join("python3");
+        std::fs::create_dir_all(good.parent().unwrap()).unwrap();
+        std::fs::write(&good, "#!/bin/sh\n").unwrap();
+        assert_eq!(
+            dem::select_interpreter(&[absent.clone(), good.clone()]).unwrap(),
+            good
+        );
+
+        let prefixed = root.join(".pixi").join("envs").join("pace").join("python3");
+        std::fs::create_dir_all(prefixed.parent().unwrap()).unwrap();
+        std::fs::write(&prefixed, "#!/bin/sh\n").unwrap();
+        let error = dem::select_interpreter(&[prefixed, good]).expect_err("must refuse");
+        assert!(format!("{error:#}").contains(".pixi/envs"));
+
+        // Nothing at all is a refusal that names what it looked for.
+        let error = dem::select_interpreter(&[absent]).expect_err("must refuse");
+        assert!(format!("{error:#}").contains("no usable interpreter"));
+
+        // And the PATH reader produces candidates in PATH order.
+        let candidates = dem::path_interpreter_candidates(Some("/a:/b"));
+        assert_eq!(candidates[0], PathBuf::from("/a/python3.13"));
+        assert_eq!(candidates[dem::INTERPRETER_NAMES.len() - 1], PathBuf::from("/a/python"));
+        assert_eq!(candidates[dem::INTERPRETER_NAMES.len()], PathBuf::from("/b/python3.13"));
+        assert!(dem::path_interpreter_candidates(None).is_empty());
     }
 }

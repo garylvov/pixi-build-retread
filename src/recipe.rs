@@ -1562,6 +1562,9 @@ mod tests {
             hermetic_environment_store_max_age_days: None,
             path_source_metadata: None,
             path_source_records: None,
+            derive_editable_metadata: None,
+            path_source_metadata_store: None,
+            path_source_generated_records: None,
             parallel_probes: None,
         }
     }

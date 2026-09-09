@@ -701,6 +701,82 @@ pub struct RetreadConfig {
     )]
     pub path_source_records: Option<String>,
 
+    /// Let retread DERIVE a dynamic path source's `dependencies` itself, by
+    /// running that tree's own PEP 517 `prepare_metadata_for_build_wheel` in an
+    /// ISOLATED build environment, when the tree states them nowhere.
+    ///
+    /// `None` (the key absent) is **ON**, and that is the opposite of the two
+    /// keys above on purpose. Those two turn a whole capability on; this one
+    /// governs a LAST-RESORT reader inside a capability that is already on, and
+    /// its `false` arm is the arm that silently drops a dependency: with no
+    /// `*.egg-info/PKG-INFO` in the tree,
+    /// [`crate::path_source_metadata::record_from_tree`] falls back to an empty
+    /// vector and the generated shim is rendered `dependencies = []` with no
+    /// row and no refusal. Defaulting to ON cannot change a lock that was
+    /// already correct: the derivation only ever runs for a tree that states
+    /// nothing, so every source carrying a `[project]` table or a `PKG-INFO` is
+    /// untouched and prints no row at all.
+    ///
+    /// Setting it `false` restores exactly the pre-METAGEN-1 behaviour — no
+    /// build, no store, no row.
+    ///
+    /// ```toml
+    /// [build.config]
+    /// retread-path-source-metadata = true
+    /// # optional; true if omitted
+    /// retread-derive-editable-metadata = true
+    /// ```
+    ///
+    /// See [`crate::derived_editable_metadata`] for the isolation refusal, the
+    /// bounded content hash and the store.
+    #[serde(
+        default,
+        rename = "retread-derive-editable-metadata",
+        alias = "derive-editable-metadata"
+    )]
+    pub derive_editable_metadata: Option<bool>,
+
+    /// Where [`crate::derived_editable_metadata`]'s entries live. Defaults to
+    /// [`crate::courier::persistent_store_root`], like every other store; named
+    /// here so a pack can point it at a shared root the way
+    /// `retread-hermetic-environment-store` does.
+    ///
+    /// ```toml
+    /// [build.config]
+    /// retread-path-source-metadata-store = "/oscar/.../cache/retread"
+    /// ```
+    #[serde(
+        default,
+        rename = "retread-path-source-metadata-store",
+        alias = "path-source-metadata-store"
+    )]
+    pub path_source_metadata_store: Option<std::path::PathBuf>,
+
+    /// May retread WRITE a generated path-source record into THIS pack
+    /// directory? `None` (the key absent) is **true**.
+    ///
+    /// Set it `false` for a pack that must stay clean of generated files. The
+    /// derivation then REFUSES for any source whose dependencies it would have
+    /// had to derive, naming
+    /// `path-source-refresh --pack … --workspace … --project … --write` as the
+    /// way to produce the record once by hand. It refuses rather than carrying
+    /// on, because carrying on means locking `dependencies = []` — the silent
+    /// drop [`crate::derived_editable_metadata`] exists to remove.
+    ///
+    /// It affects the RECORD only. The generated shim under `<pack>/sources/`
+    /// is governed by `retread-path-source-metadata` and is unchanged.
+    ///
+    /// ```toml
+    /// [build.config]
+    /// retread-path-source-generated-records = false
+    /// ```
+    #[serde(
+        default,
+        rename = "retread-path-source-generated-records",
+        alias = "path-source-generated-records"
+    )]
+    pub path_source_generated_records: Option<bool>,
+
     /// PyPI -> conda name mapping overrides on top of the built-in identity
     /// mapping. Use for the common drift cases (`opencv-python-headless` ->
     /// `py-opencv`, etc.).
@@ -2666,6 +2742,54 @@ mod tests {
         assert_eq!(cfg.retread_wheels.len(), 1);
         assert_eq!(cfg.relax, RelaxPolicy::Patch);
         assert_eq!(cfg.build_number, 7);
+    }
+
+    /// METAGEN-1's key, through serde, before it ships — the contract
+    /// `parses_bundle_field_on_entry` states: `deny_unknown_fields` means a
+    /// binary built before this field existed REJECTS a manifest carrying it,
+    /// so the parse side is pinned here rather than discovered in an upgrade
+    /// window.
+    #[test]
+    fn parses_the_derive_editable_metadata_key_and_its_default_is_on() {
+        let prefixed: RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-wheels": {},
+            "retread-derive-editable-metadata": false,
+            "retread-path-source-metadata-store": "/tmp/psm",
+        }))
+        .unwrap();
+        assert_eq!(prefixed.derive_editable_metadata, Some(false));
+        assert_eq!(
+            prefixed.path_source_metadata_store.as_deref(),
+            Some(std::path::Path::new("/tmp/psm"))
+        );
+
+        // The unprefixed alias, on the rule every other key here follows.
+        let aliased: RetreadConfig = serde_json::from_value(serde_json::json!({
+            "retread-wheels": {},
+            "derive-editable-metadata": true,
+        }))
+        .unwrap();
+        assert_eq!(aliased.derive_editable_metadata, Some(true));
+
+        // ABSENT is the case that matters most: the key is `None`, and `None`
+        // resolves to ON. This is the opposite of `retread-path-source-metadata`
+        // and it is deliberate — the OFF arm is the one that silently drops a
+        // dependency, so it must be typed to be chosen.
+        let absent: RetreadConfig =
+            serde_json::from_value(serde_json::json!({ "retread-wheels": {} })).unwrap();
+        assert_eq!(absent.derive_editable_metadata, None);
+        assert!(
+            crate::derived_editable_metadata::DeriveOptions::from_config(
+                absent.derive_editable_metadata,
+                None
+            )
+            .enabled,
+            "the key absent must resolve to ON"
+        );
+        assert!(
+            !crate::derived_editable_metadata::DeriveOptions::from_config(Some(false), None)
+                .enabled
+        );
     }
 
     #[test]

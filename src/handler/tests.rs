@@ -752,6 +752,9 @@ fn pythons_for_rejects_bare_major_variant() {
         hermetic_environment_store_max_age_days: None,
         path_source_metadata: None,
         path_source_records: None,
+        derive_editable_metadata: None,
+        path_source_metadata_store: None,
+        path_source_generated_records: None,
         parallel_probes: None,
     };
     let result = pythons_for(&cfg, Some(&variants));
@@ -826,6 +829,9 @@ fn pythons_for_accepts_dotted_variant() {
         hermetic_environment_store_max_age_days: None,
         path_source_metadata: None,
         path_source_records: None,
+        derive_editable_metadata: None,
+        path_source_metadata_store: None,
+        path_source_generated_records: None,
         parallel_probes: None,
     };
     let result = pythons_for(&cfg, Some(&variants));
@@ -900,6 +906,9 @@ fn pythons_for_filters_bare_major_keeps_dotted() {
         hermetic_environment_store_max_age_days: None,
         path_source_metadata: None,
         path_source_records: None,
+        derive_editable_metadata: None,
+        path_source_metadata_store: None,
+        path_source_generated_records: None,
         parallel_probes: None,
     };
     let result = pythons_for(&cfg, Some(&variants));
@@ -3842,6 +3851,9 @@ fn cfg() -> RetreadConfig {
         hermetic_environment_store_max_age_days: None,
         path_source_metadata: None,
         path_source_records: None,
+        derive_editable_metadata: None,
+        path_source_metadata_store: None,
+        path_source_generated_records: None,
         parallel_probes: None,
     }
 }

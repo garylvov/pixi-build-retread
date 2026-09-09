@@ -1311,6 +1311,29 @@ pub(crate) const BUILT_OUTPUT_STORE_SPEC: MarkerStoreSpec = MarkerStoreSpec {
     marker: crate::built_output_store::MARKER,
 };
 
+/// METAGEN-1's store, and the SEVENTH instantiation of this one walk.
+///
+/// Every field is READ FROM `derived_editable_metadata` rather than re-spelled
+/// here, for the reason [`HERMETIC_ENVIRONMENT_STORE_SPEC`] states: a second
+/// copy of a generation string is how a reaper starts walking past the entries
+/// it was written for (STORE-REAP-3).
+///
+/// It is NOT the sdist-metadata store, and that is a design decision with a
+/// measured reason. That store's key begins with a fold of the sdist's URL and
+/// ETag out of a cache shard's `revision.http`; a LOCAL PATH TREE has no URL,
+/// no ETag and no `revision.http`, and its `PERMITTED_ENTRY_NAMES` admits only
+/// uv's own `Metadata23` bytes beside that file. Two key rules wearing one
+/// name is exactly the defect SDIST-META-3's header describes, so this is a
+/// seventh SPEC and not a seventh reaper.
+pub(crate) const PATH_SOURCE_METADATA_STORE_SPEC: MarkerStoreSpec = MarkerStoreSpec {
+    dir: crate::derived_editable_metadata::CACHE_NAMESPACE,
+    generations: MarkerStoreGenerations::PathSegment,
+    row: crate::derived_editable_metadata::STORE_ROW,
+    reap_lock: crate::derived_editable_metadata::STORE_REAP_LOCK,
+    version: crate::derived_editable_metadata::CACHE_VERSION,
+    marker: crate::derived_editable_metadata::COMPLETION_MARKER,
+};
+
 const BUILD_REQUIREMENTS_STORE_DIR: &str = "build-requirements";
 
 /// The `<prefix> reap` / `<prefix> evicted` row stem, so an operator greps one
