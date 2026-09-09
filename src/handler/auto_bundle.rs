@@ -195,14 +195,24 @@ pub(crate) fn fact_versions_excluded_by_requires_dist(
 }
 
 /// The workspace conda facts this restore re-resolves against: exactly those
-/// with ONE selected version that parses as PEP 440.
+/// with ONE selected version whose PyPI spelling is the SAME string.
 ///
 /// Two selections mean the consuming environments disagree and there is no
 /// single version to test a requirement against; zero means there is no fact.
-/// A conda version that is not PEP 440 (`2026c`, `26.05`) cannot be compared
-/// with a PyPI specifier at all. All three fail CLOSED -- the name simply does
-/// not constrain the restore -- which is the same polarity
-/// `uv_closure::learned_fact_constraints` already uses on the same evidence.
+/// Both fail CLOSED -- the name simply does not constrain the restore.
+///
+/// THE THIRD LEG IS THE ONE MY OWN GUARD CAUGHT ME ON, so it is written out
+/// rather than assumed. "Unparseable as PEP 440" is NOT the filter that
+/// excludes conda calendar spellings: `Version::from_str("2026c")` SUCCEEDS,
+/// because PEP 440 reads a trailing `c` as a release-candidate marker and
+/// normalizes it to `2026rc0` -- a version tzdata never published, which as a
+/// restore constraint could backtrack or REFUSE against a fact that does not
+/// exist. The filter is therefore the one
+/// `uv_closure::learned_fact_constraints` already applies to this same
+/// evidence, inherited verbatim rather than re-invented: only a spelling that
+/// survives PEP 440 normalization UNCHANGED is a fact about the PyPI side. A
+/// workspace that really pinned a pre-release spells it the PyPI way
+/// (`2.1.0rc1`) and is kept.
 pub(crate) fn restore_fact_versions(bundle: &Bundle) -> BTreeMap<String, Version> {
     bundle
         .workspace_conda_provider_facts
@@ -212,7 +222,19 @@ pub(crate) fn restore_fact_versions(bundle: &Bundle) -> BTreeMap<String, Version
                 return None;
             }
             let raw = fact.selected_versions.iter().next()?;
-            Some((name.clone(), Version::from_str(raw).ok()?))
+            let parsed = Version::from_str(raw).ok()?;
+            if parsed.to_string() != *raw {
+                tracing::debug!(
+                    conda_package = %name,
+                    conda_version = %raw,
+                    pep440 = %parsed,
+                    "route-restore fact skipped: its PEP 440 translation is a different \
+                     version than conda spelling (version-scheme mismatch), so it cannot \
+                     be asserted about a PyPI requirement",
+                );
+                return None;
+            }
+            Some((name.clone(), parsed))
         })
         .collect()
 }
@@ -5058,10 +5080,21 @@ mod tests {
         );
     }
 
-    /// Two selected versions or a conda version PEP 440 cannot read are both
-    /// "no single answer", and both must leave the restore unconstrained
-    /// rather than guessing. Same polarity as
-    /// `uv_closure::learned_fact_constraints` on the same evidence.
+    /// Two selected versions, and a conda spelling PEP 440 reads as a DIFFERENT
+    /// version, are both "no single answer about PyPI", and both must leave the
+    /// restore unconstrained rather than guessing.
+    ///
+    /// THIS GUARD CAUGHT A REAL DEFECT IN MY FIRST WRITING OF
+    /// `restore_fact_versions`, which is why the tzdata leg is not decorative.
+    /// I had filtered on "parses as PEP 440", believing conda `2026c` would
+    /// fail to parse. It PARSES -- PEP 440 reads the trailing `c` as a
+    /// release-candidate marker and normalizes it to `2026rc0` -- so the
+    /// restore would have been constrained by a version tzdata never published,
+    /// and could have backtracked or REFUSED against a fact that does not
+    /// exist. Gate 6108932 printed
+    /// `left: ["packaging", "tzdata"]  right: ["packaging"]`, and the fix is
+    /// `uv_closure::learned_fact_constraints` own round-trip test, inherited
+    /// rather than re-invented.
     #[test]
     fn capwins5_a_fact_without_one_pep440_version_constrains_nothing() {
         let mut bundle = test_bundle(&[]);
