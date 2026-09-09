@@ -2703,6 +2703,75 @@ where
         .await
 }
 
+
+/// The row a joint-solve route restore writes so the decision has a reader.
+///
+/// TRIGGER-1 measured that this decision — the one that turns an upstream
+/// dependency add into a pack that bundles a wheel instead of routing it to
+/// conda, and therefore into a `Requires-Dist` that can cross a learned
+/// workspace conda fact — has exactly two sinks today and BOTH are unreachable
+/// after the fact: a `tracing::warn!` into the backend log, which
+/// N27-RETREAD-133 established the arm gzips and `rm -f`s, and a probe-trace
+/// JSON under the job's ephemeral fast root (`grep -c "probe trace"` = 0 in
+/// MDP-6097871's backend log; 12 in C37 a1, whose destination no longer
+/// exists). Under law 2 that is a writer with no reader.
+///
+/// `crosses` names the workspace conda providers this restored wheel's own
+/// requirements mention, which is the precursor of the cap-vs-fact collision
+/// that surfaces two layers later. An empty `crosses` is still printed: a
+/// route row filtered by the very condition it exists to give early warning of
+/// is not early warning.
+///
+/// SIZING, MEASURED, AND TRIGGER-1'S PROPOSED FILTER IS A NO-OP HERE. It asked
+/// that the row print "only for a restored wheel that ends up `owner=pack`".
+/// Every wheel restored at this site is pushed into `trial.extras`, i.e. is
+/// shipped by this pack, so that filter selects all of them and changes no
+/// volume. The true volume is therefore the restore count itself: 12 for the
+/// pack in MDP-6097871 and 442 across C37 arm a1.
+pub(crate) fn pypi_route_restored_row(
+    pypi_name: &str,
+    conda_name: &str,
+    bundle_name: &str,
+    crosses: &[String],
+) -> String {
+    format!(
+        "### PYPI ROUTE RESTORED dep={pypi_name} conda={conda_name} bundle={bundle_name} \
+         reason=joint-co-solve-rejected crosses={}",
+        if crosses.is_empty() {
+            "none".to_string()
+        } else {
+            crosses.join(",")
+        }
+    )
+}
+
+/// The workspace conda provider names a restored wheel's `Requires-Dist`
+/// mentions. Deliberately a plain name match against the fact boundary: the
+/// row is a pointer for a reader, not a solver. A version-aware answer here
+/// would have to re-decide the cap-versus-fact question on the real
+/// constraint set, which is a different capability and is not on this base --
+/// the row exists to say WHICH names are about to meet that boundary, early
+/// enough to be read, and nothing more.
+pub(crate) fn route_restore_crossings(
+    requires_dist: &[String],
+    fact_names: &BTreeSet<String>,
+) -> Vec<String> {
+    let mut crossings: BTreeSet<String> = BTreeSet::new();
+    for requirement in requires_dist {
+        let name: String = requirement
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
+            .collect();
+        if name.is_empty() {
+            continue;
+        }
+        let key = super::canonical_conda_name(&name);
+        if fact_names.contains(&key) {
+            crossings.insert(key);
+        }
+    }
+    crossings.into_iter().collect()
+}
 async fn jointly_unroute_unsolvable_with_route_precheck<C, CF, W, WF, V, VF, X, XF>(
     bundle: &mut Bundle,
     metadata_routes: &mut ProvisionalMetadataRoutes,
@@ -3239,7 +3308,29 @@ where
         .auto_routed
         .retain(|route| !rejected_keys.contains(&canonical_conda_name(&route.route.conda_name)));
     trial.extras.extend(restored_wheels);
+    let fact_names: BTreeSet<String> = trial.workspace_conda_provider_facts.keys().cloned().collect();
     for (pypi_name, conda_name) in audit_origins {
+        // THE DECISION GETS A READER (TRIGGER-1, law 2). The WARN below is
+        // deleted with the arm's backend log and the probe trace lands under a
+        // fast root the job removes, so this restore -- the step that turns an
+        // upstream dependency add into a bundled wheel whose Requires-Dist can
+        // cross a learned conda fact -- was, until now, unrecoverable after the
+        // fact. STDERR, NEVER STDOUT: `rpc.rs` owns stdout as the JSON-RPC
+        // channel and a `###` row on it corrupts the very lock it reports on.
+        let crosses = trial
+            .all_wheels()
+            .find(|wheel| {
+                PypiKey::from_pypi(&wheel.pypi_name) == PypiKey::from_pypi(&pypi_name)
+                    || PypiKey::from_pypi(&wheel.metadata.name) == PypiKey::from_pypi(&pypi_name)
+            })
+            .map(|wheel| {
+                route_restore_crossings(&wheel.metadata.requires_dist, &fact_names)
+            })
+            .unwrap_or_default();
+        eprintln!(
+            "{}",
+            pypi_route_restored_row(&pypi_name, &conda_name, &trial.conda_name.to_string(), &crosses)
+        );
         let conda_key = canonical_conda_name(&conda_name);
         let spec = rejected_specs.get(&conda_key).cloned().unwrap_or_default();
         trial.probe_decisions.push(crate::audit::ProbeDecision {

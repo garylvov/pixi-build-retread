@@ -14011,3 +14011,69 @@ fn capture_debug_logs<T>(body: impl FnOnce() -> T) -> (T, String) {
     let text = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
     (value, text)
 }
+
+// ---- TRIGGER-1: the joint-solve route restore gets a reader.
+
+#[test]
+fn trigger1_the_route_restore_row_names_the_dep_conda_bundle_and_what_it_crosses() {
+    // The decision this row records is the one TRIGGER-1 traced from an
+    // upstream `wandb` 0.29.0 -> 0.30.0 bump to a dead relock: the joint
+    // co-solve rejects a conda route, the wheel is bundled instead, and its
+    // Requires-Dist then crosses a learned conda fact two layers later. Its
+    // only sinks were a WARN in a backend log the arm gzips and deletes
+    // (N27-RETREAD-133) and a probe trace under a fast root the job removes.
+    assert_eq!(
+        super::auto_bundle::pypi_route_restored_row(
+            "googleapis-common-protos",
+            "googleapis-common-protos",
+            "isaaclab-2-3x-pack",
+            &["protobuf".to_string()],
+        ),
+        "### PYPI ROUTE RESTORED dep=googleapis-common-protos \
+         conda=googleapis-common-protos bundle=isaaclab-2-3x-pack \
+         reason=joint-co-solve-rejected crosses=protobuf",
+    );
+    // An empty crossing set still prints. A route row filtered by the very
+    // condition it exists to warn about early is not early warning.
+    assert_eq!(
+        super::auto_bundle::pypi_route_restored_row("jedi", "jedi", "isaaclab-2-3x-pack", &[]),
+        "### PYPI ROUTE RESTORED dep=jedi conda=jedi bundle=isaaclab-2-3x-pack \
+         reason=joint-co-solve-rejected crosses=none",
+    );
+}
+
+#[test]
+fn trigger1_route_restore_crossings_are_exactly_the_workspace_fact_boundary() {
+    let facts = BTreeSet::from(["protobuf".to_string(), "numpy".to_string()]);
+    // C37's wheel verbatim, plus neighbours that cross nothing.
+    let crossings = super::auto_bundle::route_restore_crossings(
+        &[
+            "protobuf<8.0.0,>=6.33.5".to_string(),
+            "grpcio>=1.60".to_string(),
+            "numpy>=1.26; python_version >= \"3.11\"".to_string(),
+        ],
+        &facts,
+    );
+    assert_eq!(crossings, vec!["numpy".to_string(), "protobuf".to_string()]);
+    // A wheel that touches no workspace-provided name crosses nothing, and a
+    // bare requirement with no specifier still resolves to its name.
+    assert!(
+        super::auto_bundle::route_restore_crossings(
+            &["jedi".to_string(), "parso>=0.8".to_string()],
+            &facts,
+        )
+        .is_empty()
+    );
+    assert_eq!(
+        super::auto_bundle::route_restore_crossings(&["protobuf".to_string()], &facts),
+        vec!["protobuf".to_string()],
+    );
+    // Underscore/hyphen spellings land on one canonical key, not two.
+    assert_eq!(
+        super::auto_bundle::route_restore_crossings(
+            &["Protobuf==5.29.3".to_string()],
+            &BTreeSet::from(["protobuf".to_string()]),
+        ),
+        vec!["protobuf".to_string()],
+    );
+}
