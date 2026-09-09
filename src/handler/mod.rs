@@ -10411,20 +10411,43 @@ impl CondaCoSolveContext {
         ];
         let key =
             verdict_cache_validity_key(&channels, &self.python, subdir, &policy_fields, effective);
-        let path = crate::route_probe_cache::cache_path(
-            cache_dir,
-            self.bundle.as_str(),
-            &self.python,
-            subdir,
-        );
+        // N27-RETREAD-160. `retread-route-probe-store = "<root>"` moves this
+        // handle's file off the job-scoped `cache_dir` and onto a shared,
+        // durable root, at an address that names neither the bundle nor the
+        // job. The key absent is the pre-existing per-bundle, per-job path,
+        // unchanged — including that it prints no `###` row.
+        let (path, mode) = match crate::route_probe_cache::resolve_store_root(
+            effective.route_probe_store.as_deref(),
+        )
+        .as_deref()
+        {
+            Some(store_root) => (
+                crate::route_probe_cache::shared_cache_path(store_root, &key, &self.python, subdir),
+                crate::route_probe_cache::StoreMode::Shared,
+            ),
+            None => (
+                crate::route_probe_cache::cache_path(
+                    cache_dir,
+                    self.bundle.as_str(),
+                    &self.python,
+                    subdir,
+                ),
+                crate::route_probe_cache::StoreMode::PerJob,
+            ),
+        };
         tracing::debug!(
-            path = %path.display(), key = %key,
+            path = %path.display(), key = %key, mode = mode.as_str(),
             repodata_universe = %crate::repodata::universe_digest(),
             "route probe cache: opened",
         );
-        self.verdict_cache = Some(Arc::new(crate::route_probe_cache::RouteProbeCache::open(
-            path, key,
-        )));
+        self.verdict_cache = Some(Arc::new(
+            crate::route_probe_cache::RouteProbeCache::open_labelled(
+                path,
+                key,
+                self.bundle.as_str().to_string(),
+                mode,
+            ),
+        ));
         self
     }
 

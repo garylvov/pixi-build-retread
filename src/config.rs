@@ -199,6 +199,52 @@ pub struct RetreadConfig {
     )]
     pub built_output_store: Option<std::path::PathBuf>,
 
+    /// N27-RETREAD-160. Root of a SHARED, DURABLE store of conda route-probe
+    /// VERDICTS, so a probe one bundle already answered is not re-executed by
+    /// the next bundle, nor by the next job.
+    ///
+    /// Unset (the default) means the store does not exist and behaviour is
+    /// byte-for-byte what it was before the key was added: one verdict file
+    /// per (bundle, python minor, subdir) under the handler's `cache_dir`,
+    /// which `fasttmp` redirects into a JOB-SCOPED namespace — so every
+    /// canonical relock starts with an empty probe store and pays every probe
+    /// again. Measured on relock 6115467: eight probing packs, 1951.35 s of
+    /// summed probe span against a 734 s union, and the whole
+    /// `isaaclab-2.3x-pack` build's 730 s decomposes to a 408.48 s route-probe
+    /// re-entry loop.
+    ///
+    /// ```toml
+    /// [build.config]
+    /// retread-route-probe-store = "/shared/cache/retread"
+    /// ```
+    ///
+    /// WHY THIS IS SOUND BY CONSTRUCTION and not a bet:
+    /// `route_probe_cache::probe_digest(stage, universe, specs)` puts neither
+    /// the bundle nor the job in the entry address, so a cross-pack hit is a
+    /// question two packs literally asked identically — 49 of 166 measured
+    /// (bundle, digest) pairs, 29.5 %. `route_probe_cache::EntryStamp` carries
+    /// the closure INSIDE each record and `RouteProbeCache::lookup` refuses
+    /// anything whose stamp is not the reader's, so a wrong-closure verdict is
+    /// refused rather than adopted, exactly as
+    /// `built_output_store::decode` refuses a wrong-input record. The file's
+    /// own `validity_key` (channels, python, subdir, channel priority, system
+    /// requirements, virtual packages, workspace deps, workspace PyPI
+    /// providers, resolution policy) is the FILENAME under this root, so two
+    /// policy universes address different files instead of discarding each
+    /// other's.
+    ///
+    /// TRADE, stated plainly, and it is smaller than the built-output store's:
+    /// an entry freezes a co-solve VERDICT, not a resolution. The universe it
+    /// was decided in is in its address AND in its stamp, so a rolled universe
+    /// is a new address — a miss and a republish, never a stale answer.
+    #[serde(
+        default,
+        rename = "retread-route-probe-store",
+        alias = "route-probe-store",
+        alias = "route_probe_store"
+    )]
+    pub route_probe_store: Option<std::path::PathBuf>,
+
     /// Per-dependency overrides, applied after the relax policy. Map of
     /// PyPI name -> conda match-spec (e.g. `"*"`, `">=2.7"`).
     #[serde(default, rename = "retread-overrides", alias = "overrides")]

@@ -341,11 +341,18 @@ async fn async_main() -> anyhow::Result<()> {
     );
 
     let handler = handler::Handler::new();
-    rpc::serve(move |method, params| {
+    let served = rpc::serve(move |method, params| {
         let handler = handler.clone();
         async move { handler.dispatch(method, params).await }
     })
-    .await
+    .await;
+    // N27-RETREAD-160. The run-total `### ROUTE PROBE STORE` row. `serve`
+    // returns when the frontend closes stdin, which is the last moment this
+    // process is alive and the first at which every per-bundle handle has
+    // dropped its counters into the totals. A no-op unless the shared store
+    // was configured, so the default regime prints nothing new.
+    pixi_build_retread::route_probe_cache::emit_run_total();
+    served
 }
 
 /// `retread migrate-overrides --workspace <dir> --pack <pack pixi.toml>`:
