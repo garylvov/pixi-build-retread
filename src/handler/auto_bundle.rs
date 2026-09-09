@@ -130,10 +130,63 @@ pub(crate) struct FactCrossing {
     /// The canonical conda name both the fact and the requirement carry.
     pub(crate) fact_name: String,
     /// The version every precise consuming environment selected for it.
+    ///
+    /// When the consumers hold MORE than one version and the requirement
+    /// excludes all of them, this is the lowest of them: a reader needs one
+    /// number in the row, and `holders_total` below says how many there were.
     pub(crate) fact_version: String,
     /// The wheel's own `Requires-Dist` line, verbatim, because the refusal has
     /// to be readable without the wheel in hand.
     pub(crate) requirement: String,
+    /// How many precise consumers hold this name at all. A crossing is only a
+    /// crossing when ZERO of them are admitted, so the row prints
+    /// `consumers_holding=0/<holders_total>` and the denominator is the whole
+    /// evidence the decision was taken on.
+    pub(crate) holders_total: usize,
+}
+
+/// A name whose precise consumers DISAGREE and whose requirement admits some of
+/// them but not all.
+///
+/// This is not a crossing -- one consumer holding an admitted version is the
+/// existence proof the door asks for -- but it is not nothing either, and
+/// before N27-RETREAD-141 it was invisible twice over: the pre-141 single-fact reader
+/// dropped every multi-version fact, so neither the admission nor a row ever
+/// happened. A decision nobody can see is the defect this series is about, so
+/// the split gets its own row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FactConsumerSplit {
+    pub(crate) fact_name: String,
+    pub(crate) requirement: String,
+    pub(crate) holders_admitting: usize,
+    pub(crate) holders_total: usize,
+    /// `env=version` for every holder, in holder order.
+    pub(crate) held: Vec<String>,
+}
+
+/// What one door's fact check did, for the row the call site prints.
+///
+/// `from == to` is returned, not swallowed: a row that appears only when the
+/// answer changed cannot tell a reader "this fetch was checked and needed
+/// nothing" apart from "this fetch was never checked", and the second is the
+/// defect. `holders_total` is how many precise consumers held the name the
+/// decision turned on, so `consumers_holding=0/<n>` can be printed without the
+/// call site re-deriving the evidence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FactCheck {
+    pub(crate) from: String,
+    pub(crate) to: String,
+    pub(crate) holders_total: usize,
+}
+
+/// What one candidate wheel's `Requires-Dist` does to the consumers' holdings.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FactVerdict {
+    /// Names NO consumer's held version satisfies. These decide.
+    pub(crate) crossings: Vec<FactCrossing>,
+    /// Names some but not all consumers satisfy. These are reported, never
+    /// backtracked on.
+    pub(crate) splits: Vec<FactConsumerSplit>,
 }
 
 /// The workspace conda facts a candidate wheel's `Requires-Dist` EXCLUDES.
@@ -153,16 +206,41 @@ pub(crate) struct FactCrossing {
 /// A requirement with no version clause, a URL requirement, and an
 /// unparseable line are all skipped: none of them can EXCLUDE a version.
 ///
-/// A fact is considered only when it carries exactly ONE selected version that
-/// parses as PEP 440 -- see [`restore_fact_versions`] -- so the function fails
-/// closed on the two states where "the fact" is not a single answer.
-pub(crate) fn fact_versions_excluded_by_requires_dist(
+/// A name is considered only where [`admission_fact_holdings`] produced at
+/// least one holder whose version survives the PEP 440 round trip, so a name
+/// with no usable evidence still fails closed. It is NO LONGER restricted to
+/// names with exactly one selected version (N27-RETREAD-141): a name whose
+/// consumers disagree is a real question with a real answer, and the answer is
+/// "crossing only if every one of them is excluded".
+/// KEPT AS A TEST-ONLY VIEW, DELIBERATELY. It is one line of delegation to
+/// [`fact_verdict_for_requires_dist`], so it cannot drift from the production
+/// predicate, and it lets every guard written before N27-RETREAD-141 keep its
+/// call shape instead of being rewritten in the same commit that changes what
+/// it is testing.
+#[cfg(test)]
+fn fact_versions_excluded_by_requires_dist(
     requires_dist: &[String],
-    facts: &BTreeMap<String, Version>,
+    holdings: &BTreeMap<String, BTreeMap<String, Version>>,
     env: &MarkerEnvironment,
 ) -> Vec<FactCrossing> {
+    fact_verdict_for_requires_dist(requires_dist, holdings, env).crossings
+}
+
+/// The full per-consumer verdict: see [`fact_versions_excluded_by_requires_dist`]
+/// for the shared rules and [`admission_fact_holdings`] for the evidence.
+///
+/// THE PREDICATE IS AN EXISTENCE TEST OVER THE CONSUMERS AND THAT IS THE WHOLE
+/// CHANGE (N27-RETREAD-141). A requirement is a crossing only when it excludes
+/// EVERY holder's version. One holder it admits is the proof that the pack can
+/// ship this wheel and still have an environment that imports, so the door has
+/// no business backtracking -- it reports the split instead.
+pub(crate) fn fact_verdict_for_requires_dist(
+    requires_dist: &[String],
+    holdings: &BTreeMap<String, BTreeMap<String, Version>>,
+    env: &MarkerEnvironment,
+) -> FactVerdict {
     let mut seen: BTreeSet<String> = BTreeSet::new();
-    let mut crossings: Vec<FactCrossing> = Vec::new();
+    let mut verdict = FactVerdict::default();
     for raw in requires_dist {
         let Ok(requirement) = crate::pep508_lenient::parse_requirement_lenient(raw) else {
             continue;
@@ -171,72 +249,154 @@ pub(crate) fn fact_versions_excluded_by_requires_dist(
             continue;
         }
         let key = canonical_conda_name(requirement.name.as_ref());
-        let Some(fact_version) = facts.get(&key) else {
+        let Some(held) = holdings.get(&key) else {
             continue;
         };
+        if held.is_empty() {
+            continue;
+        }
         let Some(uv_pep508::VersionOrUrl::VersionSpecifier(specifiers)) =
             requirement.version_or_url.as_ref()
         else {
             continue;
         };
-        if specifiers.contains(fact_version) {
+        let admitting = held
+            .values()
+            .filter(|version| specifiers.contains(version))
+            .count();
+        if admitting == held.len() {
             continue;
         }
         if !seen.insert(key.clone()) {
             continue;
         }
-        crossings.push(FactCrossing {
+        if admitting > 0 {
+            verdict.splits.push(FactConsumerSplit {
+                fact_name: key,
+                requirement: raw.clone(),
+                holders_admitting: admitting,
+                holders_total: held.len(),
+                held: held
+                    .iter()
+                    .map(|(holder, version)| format!("{holder}={version}"))
+                    .collect(),
+            });
+            continue;
+        }
+        // Every holder is excluded. The row needs ONE number and the lowest is
+        // the least arbitrary choice: it is the version a reader checking "is
+        // there really nothing here the requirement admits?" reaches first.
+        let fact_version = held
+            .values()
+            .min()
+            .map(Version::to_string)
+            .unwrap_or_default();
+        verdict.crossings.push(FactCrossing {
             fact_name: key,
-            fact_version: fact_version.to_string(),
+            fact_version,
             requirement: raw.clone(),
+            holders_total: held.len(),
         });
     }
-    crossings
+    verdict
 }
 
-/// The workspace conda facts this restore re-resolves against: exactly those
-/// with ONE selected version whose PyPI spelling is the SAME string.
+
+/// The ONE version-scheme filter every fact reader applies, extracted so they
+/// cannot drift.
 ///
-/// Two selections mean the consuming environments disagree and there is no
-/// single version to test a requirement against; zero means there is no fact.
-/// Both fail CLOSED -- the name simply does not constrain the restore.
+/// "Unparseable as PEP 440" is NOT the filter that excludes conda calendar
+/// spellings: `Version::from_str("2026c")` SUCCEEDS, because PEP 440 reads the
+/// trailing `c` as a release-candidate marker and normalizes it to `2026rc0` --
+/// a version tzdata never published, which as a door constraint could backtrack
+/// or refuse against a fact that does not exist. The filter is therefore the one
+/// `uv_closure::learned_fact_constraints` already applies to this same evidence,
+/// inherited rather than re-invented: only a spelling that survives PEP 440
+/// normalization UNCHANGED is a fact about the PyPI side. A workspace that
+/// really pinned a pre-release spells it the PyPI way (`2.1.0rc1`) and is kept.
+fn fact_pep440(name: &str, raw: &str) -> Option<Version> {
+    let parsed = Version::from_str(raw).ok()?;
+    if parsed.to_string() != *raw {
+        tracing::debug!(
+            conda_package = %name,
+            conda_version = %raw,
+            pep440 = %parsed,
+            "route-restore fact skipped: its PEP 440 translation is a different \
+             version than conda spelling (version-scheme mismatch), so it cannot \
+             be asserted about a PyPI requirement",
+        );
+        return None;
+    }
+    Some(parsed)
+}
+
+/// The label a holding carries when it came from the workspace fact rather
+/// than from a named environment's locked set.
+pub(crate) const WORKSPACE_FACT_HOLDER: &str = "workspace-fact";
+
+/// What each precise consuming environment HOLDS for a conda name:
+/// name -> holder -> version.
 ///
-/// THE THIRD LEG IS THE ONE MY OWN GUARD CAUGHT ME ON, so it is written out
-/// rather than assumed. "Unparseable as PEP 440" is NOT the filter that
-/// excludes conda calendar spellings: `Version::from_str("2026c")` SUCCEEDS,
-/// because PEP 440 reads a trailing `c` as a release-candidate marker and
-/// normalizes it to `2026rc0` -- a version tzdata never published, which as a
-/// restore constraint could backtrack or REFUSE against a fact that does not
-/// exist. The filter is therefore the one
-/// `uv_closure::learned_fact_constraints` already applies to this same
-/// evidence, inherited verbatim rather than re-invented: only a spelling that
-/// survives PEP 440 normalization UNCHANGED is a fact about the PyPI side. A
-/// workspace that really pinned a pre-release spells it the PyPI way
-/// (`2.1.0rc1`) and is kept.
-pub(crate) fn restore_fact_versions(bundle: &Bundle) -> BTreeMap<String, Version> {
-    bundle
-        .workspace_conda_provider_facts
-        .iter()
-        .filter_map(|(name, fact)| {
-            if fact.selected_versions.len() != 1 {
-                return None;
-            }
-            let raw = fact.selected_versions.iter().next()?;
-            let parsed = Version::from_str(raw).ok()?;
-            if parsed.to_string() != *raw {
-                tracing::debug!(
-                    conda_package = %name,
-                    conda_version = %raw,
-                    pep440 = %parsed,
-                    "route-restore fact skipped: its PEP 440 translation is a different \
-                     version than conda spelling (version-scheme mismatch), so it cannot \
-                     be asserted about a PyPI requirement",
-                );
-                return None;
-            }
-            Some((name.clone(), parsed))
-        })
-        .collect()
+/// WHY THIS REPLACES THE SINGLE FACT AT THE DOOR (N27-RETREAD-141). The door's
+/// question is "can this wheel's requirement be satisfied by what the consuming
+/// environments actually have?", and that is an EXISTENCE question over the
+/// consumers -- not a question about one number. The pre-141 single-fact reader
+/// answers it with one number and fails two ways at once. (a) When the
+/// consumers DISAGREE it returns nothing at all, so a requirement that excludes
+/// EVERY one of their versions is silently admitted. (b) When the base lock is
+/// present the fact and the held version are the same object -- N27-RETREAD-130
+/// already seeds `per_env_versions` from the lock -- but when it is ABSENT the
+/// fact is the day's float, produced by a solve that filters this very pack
+/// out, so it is the version the environment would hold IF THE PACK DID NOT
+/// EXIST. Measured on relock `6115467` (`--base-lock drop`): the fact was
+/// `numpy==2.4.6` while every consuming environment's emitted lock holds
+/// `numpy 1.26.4` under the pack's own `constrains`.
+///
+/// THE PRECEDENCE IS EVIDENCE-FIRST AND IT IS NOT A MERGE. When the base lock
+/// carries a name for at least one consumer, the LOCKED versions are the whole
+/// answer for that name and the float is dropped: the lock is what the
+/// environment holds WITH the pack installed, the float is a counterfactual,
+/// and unioning a counterfactual into an existence proof would only ever
+/// weaken the predicate. When the lock carries nothing for a name -- the
+/// `--base-lock drop` shape, and a cold first pass -- the float stands as the
+/// only evidence there is, and the door decides exactly as it did before, which
+/// is why this change moves no row of a drop-mode relock.
+///
+/// Holders are keyed so a reader can see WHICH consumer holds what: an
+/// environment name when the lock supplied it, `workspace-fact` otherwise.
+pub(crate) fn admission_fact_holdings(
+    bundle: &Bundle,
+) -> BTreeMap<String, BTreeMap<String, Version>> {
+    let mut holdings: BTreeMap<String, BTreeMap<String, Version>> = BTreeMap::new();
+    for (env, versions) in &bundle.workspace_locked_conda {
+        for (name, raw) in versions {
+            let Some(parsed) = fact_pep440(name, raw) else {
+                continue;
+            };
+            holdings
+                .entry(name.clone())
+                .or_default()
+                .insert(env.clone(), parsed);
+        }
+    }
+    for (name, fact) in &bundle.workspace_conda_provider_facts {
+        if holdings.contains_key(name) {
+            // The lock already answered for this name; the float is a
+            // counterfactual and does not get a vote beside it.
+            continue;
+        }
+        let mut entry: BTreeMap<String, Version> = BTreeMap::new();
+        for raw in &fact.selected_versions {
+            let Some(parsed) = fact_pep440(name, raw) else {
+                continue;
+            };
+            entry.insert(format!("{WORKSPACE_FACT_HOLDER}:{raw}"), parsed);
+        }
+        if !entry.is_empty() {
+            holdings.insert(name.clone(), entry);
+        }
+    }
+    holdings
 }
 
 /// The row a re-resolved route restore writes.
@@ -249,7 +409,7 @@ pub(crate) fn restore_fact_versions(bundle: &Bundle) -> BTreeMap<String, Version
 /// restore was never checked", and the second is the defect.
 ///
 /// `constraints` is how many workspace conda facts were in force for this
-/// re-resolve, i.e. the size of [`restore_fact_versions`]. A row reading
+/// re-resolve, i.e. the number of names [`admission_fact_holdings`] carries. A row reading
 /// `constraints=0` is the honest statement that the restore had nothing to
 /// check against.
 pub(crate) fn pypi_route_reresolved_row(
@@ -415,10 +575,40 @@ pub(crate) fn pypi_admission_fact_crossing_unresolved_row(
 ) -> String {
     format!(
         "{PYPI_ADMISSION_FACT_CROSSING_UNRESOLVED_PREFIX} dep={dep} requirement={} fact={}=={} \
-         door={} policy={EMISSION_CROSSING_POLICY}",
+         consumers_holding=0/{} door={} policy={EMISSION_CROSSING_POLICY}",
         crossing.requirement,
         crossing.fact_name,
         crossing.fact_version,
+        crossing.holders_total,
+        site.door(),
+    )
+}
+
+/// The prefix of the row a CONSUMER-SPLIT writes.
+pub(crate) const PYPI_ADMISSION_CONSUMER_SPLIT_PREFIX: &str =
+    "### PYPI ADMISSION CONSUMER-SPLIT";
+
+/// The row a name whose precise consumers DISAGREE writes when the candidate
+/// wheel's requirement admits some of them and not others.
+///
+/// It is deliberately NOT a crossing row: nothing backtracks, nothing refuses,
+/// and the wheel is admitted. It exists because before N27-RETREAD-141 this
+/// case produced no decision AND no row -- the multi-version fact was dropped
+/// before the predicate ever saw it -- and a split that no operator can see is
+/// how an environment that cannot import gets shipped quietly.
+pub(crate) fn pypi_admission_consumer_split_row(
+    dep: &str,
+    split: &FactConsumerSplit,
+    site: FactConstrainedSite,
+) -> String {
+    format!(
+        "{PYPI_ADMISSION_CONSUMER_SPLIT_PREFIX} dep={dep} fact={} requirement={} \
+         holders={}/{} held={} door={}",
+        split.fact_name,
+        split.requirement,
+        split.holders_admitting,
+        split.holders_total,
+        split.held.join(","),
         site.door(),
     )
 }
@@ -436,16 +626,24 @@ pub(crate) fn pypi_admission_fact_crossing_unresolved_row(
 /// moved cannot distinguish "this pass was checked and needed nothing" from
 /// "this pass was never checked", and the second is the defect this whole
 /// series is about.
+/// Each backtrack entry also carries `consumers_holding=0/<m>`: `m` is how many
+/// precise consumers held the name that FORCED the backtrack, and the numerator
+/// is zero by construction, because under N27-RETREAD-141 a backtrack happens
+/// only when NO consumer's held version is admitted. A reader who sees
+/// `consumers_holding=0/1` on a `--base-lock drop` run knows the denominator is
+/// one workspace float and not one environment's locked set.
 pub(crate) fn pypi_closure_fact_constrained_row(
     names: usize,
-    backtracked: &[(String, String, String)],
+    backtracked: &[(String, String, String, usize)],
 ) -> String {
     let moved = if backtracked.is_empty() {
         "none".to_string()
     } else {
         backtracked
             .iter()
-            .map(|(dep, from, to)| format!("{dep} {from} {to}"))
+            .map(|(dep, from, to, holders)| {
+                format!("{dep} {from} {to} consumers_holding=0/{holders}")
+            })
             .collect::<Vec<_>>()
             .join(", ")
     };
@@ -480,13 +678,13 @@ async fn fetch_under_workspace_facts<X, XF>(
     request: PypiFetchRequest,
     indexes: Vec<String>,
     failure_context: String,
-    facts: &BTreeMap<String, Version>,
+    holdings: &BTreeMap<String, BTreeMap<String, Version>>,
     marker_env: &MarkerEnvironment,
     bundle_label: &str,
     site: FactConstrainedSite,
     enabled: bool,
     fetch_pypi: &X,
-) -> Result<(ResolvedWheel, Option<(String, String)>)>
+) -> Result<(ResolvedWheel, Option<FactCheck>)>
 where
     X: Fn(PypiFetchRequest, Vec<String>, String) -> XF,
     XF: Future<Output = Result<ResolvedWheel>>,
@@ -525,7 +723,14 @@ where
                 "{}",
                 fact_crossing_unresolved_message(&dep, bundle_label, &base, &excluded, &crossing, site),
             );
-            return Ok((wheel, Some((version.clone(), version))));
+            return Ok((
+                wheel,
+                Some(FactCheck {
+                    from: version.clone(),
+                    to: version,
+                    holders_total: crossing.holders_total,
+                }),
+            ));
         }};
     }
     loop {
@@ -559,14 +764,39 @@ where
         if !enabled {
             return Ok((wheel, None));
         }
-        let crossings =
-            fact_versions_excluded_by_requires_dist(&wheel.metadata.requires_dist, facts, marker_env);
-        let Some(crossing) = crossings.into_iter().next() else {
+        let verdict = fact_verdict_for_requires_dist(
+            &wheel.metadata.requires_dist,
+            holdings,
+            marker_env,
+        );
+        let Some(crossing) = verdict.crossings.into_iter().next() else {
+            // A SPLIT IS NOT A CROSSING AND IT IS NOT SILENCE EITHER. The wheel
+            // is admitted -- some consumer holds a version this requirement
+            // admits -- and the disagreement is printed so the operator can see
+            // which environments are on which side. STDERR, NEVER STDOUT.
+            for split in &verdict.splits {
+                eprintln!("{}", pypi_admission_consumer_split_row(&dep, split, site));
+            }
             let from = from_version
                 .clone()
                 .unwrap_or_else(|| wheel.metadata.version.clone());
             let to = wheel.metadata.version.clone();
-            return Ok((wheel, Some((from, to))));
+            // The denominator a backtrack reports is the evidence that FORCED
+            // it -- the refused crossing's holders -- not the accepted wheel's,
+            // which by definition crosses nothing.
+            let holders_total = refused_by
+                .as_ref()
+                .map(|crossing| crossing.holders_total)
+                .or_else(|| verdict.splits.first().map(|split| split.holders_total))
+                .unwrap_or(0);
+            return Ok((
+                wheel,
+                Some(FactCheck {
+                    from,
+                    to,
+                    holders_total,
+                }),
+            ));
         };
         let refused = Version::from_str(&wheel.metadata.version).with_context(|| {
             format!(
@@ -2861,10 +3091,10 @@ where
         // selection's `Requires-Dist` admits every fact, and when the index
         // runs out REFUSE loudly naming dep, requirement and fact rather than
         // emitting a `constrains` bound no consuming environment can satisfy.
-        let fact_versions = restore_fact_versions(bundle);
+        let fact_versions = admission_fact_holdings(bundle);
         let admission_reresolve = uv_reresolve.mode.is_enabled();
         let bundle_label = bundle.conda_name.clone();
-        let fetched: Vec<Result<(String, String, ResolvedWheel, Option<(String, String)>)>> = {
+        let fetched: Vec<Result<(String, String, ResolvedWheel, Option<FactCheck>)>> = {
             use futures::stream::{self, StreamExt};
             let indexes_ref = indexes;
             let fact_versions = &fact_versions;
@@ -2903,12 +3133,17 @@ where
                 .await
         };
         let mut admitted_any = false;
-        let mut backtracked: Vec<(String, String, String)> = Vec::new();
+        let mut backtracked: Vec<(String, String, String, usize)> = Vec::new();
         for result in fetched {
             let (name, version, wheel, moved) = result?;
-            if let Some((from, to)) = moved {
-                if from != to {
-                    backtracked.push((name.clone(), from, to));
+            if let Some(check) = moved {
+                if check.from != check.to {
+                    backtracked.push((
+                        name.clone(),
+                        check.from,
+                        check.to,
+                        check.holders_total,
+                    ));
                 }
             }
             tracing::info!(
@@ -3854,7 +4089,7 @@ where
     // another path's selection from inside this one; -142's proof is that the
     // production wheel arrived through the FETCH.
     let marker_env = marker_env_for(&target.conda_subdir, &target.python_version)?;
-    let fact_versions = restore_fact_versions(bundle);
+    let fact_versions = admission_fact_holdings(bundle);
     let reresolve = uv_reresolve.mode.is_enabled();
     let bundle_label = bundle.conda_name.to_string();
 
@@ -3932,8 +4167,13 @@ where
                     fetch_pypi,
                 )
                 .await?;
-                let row = moved.map(|(from, to)| {
-                    pypi_route_reresolved_row(&dep, &from, &to, fact_versions.len())
+                let row = moved.map(|check| {
+                    pypi_route_reresolved_row(
+                        &dep,
+                        &check.from,
+                        &check.to,
+                        fact_versions.len(),
+                    )
                 });
                 Ok((wheel, row))
             }
@@ -4856,6 +5096,7 @@ mod tests {
             workspace_selected_conda_packages: BTreeMap::new(),
             workspace_declared_pypi: BTreeSet::new(),
             workspace_locked_pypi: BTreeMap::new(),
+            workspace_locked_conda: BTreeMap::new(),
         }
     }
 
@@ -5164,7 +5405,7 @@ mod tests {
             "exactly one backtrack: the crossing release, then the one below it",
         );
 
-        let facts = restore_fact_versions(&bundle);
+        let facts = admission_fact_holdings(&bundle);
         assert_eq!(facts.len(), 1, "one fact is in force");
         let env = crate::relax::marker_env_for("linux-64", "3.11").unwrap();
         let surviving = bundle
@@ -5228,6 +5469,7 @@ mod tests {
             fact_name: "protobuf".to_string(),
             fact_version: "5.29.3".to_string(),
             requirement: "protobuf<8.0.0,>=6.33.5".to_string(),
+            holders_total: 4,
         };
         assert_eq!(
             pypi_admission_fact_crossing_unresolved_row(
@@ -5236,7 +5478,7 @@ mod tests {
                 FactConstrainedSite::JointRouteRestore,
             ),
             "### PYPI ADMISSION FACT-CROSSING UNRESOLVED dep=googleapis-common-protos \
-             requirement=protobuf<8.0.0,>=6.33.5 fact=protobuf==5.29.3 door=restore \
+             requirement=protobuf<8.0.0,>=6.33.5 fact=protobuf==5.29.3 consumers_holding=0/4 door=restore \
              policy=constrains-only:learned-fact-yields-to-cap|declared-pin-kept|\
              undecidable-omitted",
         );
@@ -5305,9 +5547,24 @@ mod tests {
     #[test]
     fn capwins5_only_a_specifier_that_excludes_the_fact_is_a_crossing() {
         let env = crate::relax::marker_env_for("linux-64", "3.11").unwrap();
-        let facts: BTreeMap<String, Version> = [
-            ("protobuf".to_string(), Version::from_str("5.29.3").unwrap()),
-            ("packaging".to_string(), Version::from_str("26.3").unwrap()),
+        // ONE holder per name: the single-consumer shape, which is what a
+        // `--base-lock drop` relock has for every name and therefore what this
+        // guard must keep asserting unchanged (N27-RETREAD-141).
+        let facts: BTreeMap<String, BTreeMap<String, Version>> = [
+            (
+                "protobuf".to_string(),
+                BTreeMap::from([(
+                    "pace".to_string(),
+                    Version::from_str("5.29.3").unwrap(),
+                )]),
+            ),
+            (
+                "packaging".to_string(),
+                BTreeMap::from([(
+                    "pace".to_string(),
+                    Version::from_str("26.3").unwrap(),
+                )]),
+            ),
         ]
         .into_iter()
         .collect();
@@ -5365,12 +5622,21 @@ mod tests {
         );
     }
 
-    /// Two selected versions, and a conda spelling PEP 440 reads as a DIFFERENT
-    /// version, are both "no single answer about PyPI", and both must leave the
-    /// restore unconstrained rather than guessing.
+    /// A conda spelling PEP 440 reads as a DIFFERENT version is "no answer
+    /// about PyPI" and must leave the door unconstrained rather than guessing.
+    ///
+    /// N27-RETREAD-141 SPLIT THIS GUARD'S TWO LEGS APART AND THE ASSERTION
+    /// BELOW SAYS SO. The version-scheme leg (tzdata) is unchanged: it is not a
+    /// fact about PyPI at all. The two-selections leg (protobuf) MOVED and had
+    /// to: "the consumers disagree" is not "there is nothing to check", it is a
+    /// question with a per-consumer answer, and dropping the name meant a
+    /// requirement excluding EVERY one of their versions was admitted in
+    /// silence. protobuf is therefore now carried with both holders, and
+    /// whether it crosses is decided by
+    /// [`fact_verdict_for_requires_dist`], not here.
     ///
     /// THIS GUARD CAUGHT A REAL DEFECT IN MY FIRST WRITING OF
-    /// `restore_fact_versions`, which is why the tzdata leg is not decorative.
+    /// the fact readers, which is why the tzdata leg is not decorative.
     /// I had filtered on "parses as PEP 440", believing conda `2026c` would
     /// fail to parse. It PARSES -- PEP 440 reads the trailing `c` as a
     /// release-candidate marker and normalizes it to `2026rc0` -- so the
@@ -5381,7 +5647,7 @@ mod tests {
     /// `uv_closure::learned_fact_constraints` own round-trip test, inherited
     /// rather than re-invented.
     #[test]
-    fn capwins5_a_fact_without_one_pep440_version_constrains_nothing() {
+    fn fact1_a_version_scheme_mismatch_constrains_nothing_but_a_split_is_carried() {
         let mut bundle = test_bundle(&[]);
         bundle.workspace_conda_provider_facts.insert(
             "protobuf".to_string(),
@@ -5409,12 +5675,18 @@ mod tests {
                 present_in_all_consumers: true,
             },
         );
-        let facts = restore_fact_versions(&bundle);
+        let facts = admission_fact_holdings(&bundle);
         assert_eq!(
             facts.keys().cloned().collect::<Vec<_>>(),
-            vec!["packaging".to_string()],
-            "only a single PEP 440 selection is a constraint",
+            vec!["packaging".to_string(), "protobuf".to_string()],
+            "a version-scheme mismatch is not a fact about PyPI; a split IS",
         );
+        assert_eq!(
+            facts["protobuf"].len(),
+            2,
+            "both holders are carried so the predicate can ask about each",
+        );
+        assert_eq!(facts["packaging"].len(), 1);
     }
 
     /// The backtrack is the whole mechanism, so its one primitive is pinned.
@@ -5611,7 +5883,7 @@ mod tests {
         // NO UNSATISFIABLE `constrains` CAN BE EMITTED, asserted as the
         // CONDITION that produces one rather than as a string search of
         // another module's output -- the same shape CAPWINS-5's guard (a) uses.
-        let facts = restore_fact_versions(&bundle);
+        let facts = admission_fact_holdings(&bundle);
         assert_eq!(facts.len(), 1, "one fact is in force");
         let env = crate::relax::marker_env_for("linux-64", "3.11").unwrap();
         let surviving = bundle
@@ -5639,10 +5911,11 @@ mod tests {
                     "googleapis-common-protos".to_string(),
                     "1.75.3".to_string(),
                     "1.75.0".to_string(),
+                    4,
                 )],
             ),
             "### PYPI CLOSURE FACT-CONSTRAINED names=1 backtracked=googleapis-common-protos \
-             1.75.3 1.75.0",
+              1.75.3 1.75.0 consumers_holding=0/4",
         );
     }
 
@@ -5720,6 +5993,7 @@ mod tests {
             fact_name: "protobuf".to_string(),
             fact_version: "5.29.3".to_string(),
             requirement: "protobuf<8.0.0,>=6.33.5".to_string(),
+            holders_total: 4,
         };
         assert_eq!(
             pypi_admission_fact_crossing_unresolved_row(
@@ -5728,7 +6002,7 @@ mod tests {
                 FactConstrainedSite::AutoBundleAdmission,
             ),
             "### PYPI ADMISSION FACT-CROSSING UNRESOLVED dep=googleapis-common-protos \
-             requirement=protobuf<8.0.0,>=6.33.5 fact=protobuf==5.29.3 door=auto-bundle \
+             requirement=protobuf<8.0.0,>=6.33.5 fact=protobuf==5.29.3 consumers_holding=0/4 door=auto-bundle \
              policy=constrains-only:learned-fact-yields-to-cap|declared-pin-kept|\
              undecidable-omitted",
         );
@@ -5768,6 +6042,7 @@ mod tests {
             fact_name: "sympy".to_string(),
             fact_version: "1.14.0".to_string(),
             requirement: "sympy (==1.13.1) ; python_version >= \"3.9\"".to_string(),
+            holders_total: 1,
         };
         let admission = pypi_admission_fact_crossing_unresolved_row(
             "torch",
@@ -5783,7 +6058,7 @@ mod tests {
             admission,
             "### PYPI ADMISSION FACT-CROSSING UNRESOLVED dep=torch \
              requirement=sympy (==1.13.1) ; python_version >= \"3.9\" fact=sympy==1.14.0 \
-             door=auto-bundle policy=constrains-only:learned-fact-yields-to-cap|\
+             consumers_holding=0/1 door=auto-bundle policy=constrains-only:learned-fact-yields-to-cap|\
              declared-pin-kept|undecidable-omitted",
         );
         assert_eq!(
@@ -5867,6 +6142,7 @@ mod tests {
             fact_name: "protobuf".to_string(),
             fact_version: "5.29.3".to_string(),
             requirement: "protobuf<8.0.0,>=6.33.5".to_string(),
+            holders_total: 4,
         };
         let base = VersionSpecifiers::from_str("~=1.52").unwrap();
         let excluded = [Version::from_str("1.75.3").unwrap()];
@@ -5913,12 +6189,12 @@ mod tests {
             pypi_closure_fact_constrained_row(
                 3,
                 &[
-                    ("googleapis-common-protos".to_string(), "1.75.3".to_string(), "1.75.0".to_string()),
-                    ("wandb".to_string(), "0.30.0".to_string(), "0.29.0".to_string()),
+                    ("googleapis-common-protos".to_string(), "1.75.3".to_string(), "1.75.0".to_string(), 4),
+                    ("wandb".to_string(), "0.30.0".to_string(), "0.29.0".to_string(), 2),
                 ],
             ),
             "### PYPI CLOSURE FACT-CONSTRAINED names=3 backtracked=googleapis-common-protos \
-             1.75.3 1.75.0, wandb 0.30.0 0.29.0",
+              1.75.3 1.75.0 consumers_holding=0/4, wandb 0.30.0 0.29.0 consumers_holding=0/2",
         );
     }
     #[test]
@@ -10223,5 +10499,208 @@ pillow = ">=10,<13"
                  auditable against the lock: {rows}",
             );
         }
+    }
+
+    /// The evidence a door decides on, built for one name across named
+    /// consuming environments. `locked` is what each environment HOLDS.
+    fn fact1_bundle(
+        fact: &[(&str, &[&str])],
+        locked: &[(&str, &[(&str, &str)])],
+    ) -> Bundle {
+        let mut bundle = test_bundle(&[]);
+        for (name, versions) in fact {
+            bundle.workspace_conda_provider_facts.insert(
+                (*name).to_string(),
+                super::super::WorkspaceCondaProviderFact {
+                    selected_versions: versions.iter().map(|v| (*v).to_string()).collect(),
+                    declared_specs: BTreeSet::new(),
+                    present_in_all_consumers: true,
+                },
+            );
+        }
+        for (env, versions) in locked {
+            bundle.workspace_locked_conda.insert(
+                (*env).to_string(),
+                versions
+                    .iter()
+                    .map(|(name, version)| ((*name).to_string(), (*version).to_string()))
+                    .collect(),
+            );
+        }
+        bundle
+    }
+
+    /// GUARD (a), N27-RETREAD-141. THE MEASURED dex-retargeting SHAPE.
+    ///
+    /// Relock `6115467` printed, six times,
+    /// `dep=dex-retargeting requirement=numpy <2.0.0,>=1.21.0 fact=numpy==2.4.6`
+    /// -- and its own emitted lock holds `numpy 1.26.4` in BOTH consuming
+    /// environments (`groot-sonic-gpu`, `viral-gpu`), because the pack emitted
+    /// `constrains: numpy >=1.26.0,<1.27` under the cap. The fact was the
+    /// version those environments would hold IF THE PACK DID NOT EXIST: the
+    /// solve that produces it filters the pack out. A requirement every
+    /// consumer's HELD version satisfies is not a crossing, so no backtrack and
+    /// no row.
+    #[test]
+    fn fact1_a_requirement_every_consumer_holds_a_version_for_is_not_a_crossing() {
+        let bundle = fact1_bundle(
+            &[("numpy", &["2.4.6"])],
+            &[
+                ("groot-sonic-gpu", &[("numpy", "1.26.4")]),
+                ("viral-gpu", &[("numpy", "1.26.4")]),
+            ],
+        );
+        let holdings = admission_fact_holdings(&bundle);
+        assert_eq!(
+            holdings["numpy"].keys().cloned().collect::<Vec<_>>(),
+            vec!["groot-sonic-gpu".to_string(), "viral-gpu".to_string()],
+            "the lock answers for this name, so the float does not get a vote",
+        );
+        let env = crate::relax::marker_env_for("linux-64", "3.11").unwrap();
+        let verdict = fact_verdict_for_requires_dist(
+            &["numpy<2.0.0,>=1.21.0".to_string()],
+            &holdings,
+            &env,
+        );
+        assert!(
+            verdict.crossings.is_empty(),
+            "every consumer holds 1.26.4, which the requirement admits: {:?}",
+            verdict.crossings,
+        );
+        assert!(
+            verdict.splits.is_empty(),
+            "the consumers agree, so there is no split to report: {:?}",
+            verdict.splits,
+        );
+    }
+
+    /// GUARD (b), N27-RETREAD-141. THE MEASURED googleapis-common-protos SHAPE,
+    /// WHICH MUST NOT MOVE.
+    ///
+    /// All four precise consumers of `isaaclab-2.3x-pack` (`pace`,
+    /// `pm-isaaclab`, `unitree-rl-lab-gpu`, `uwlab-gpu`) hold `protobuf 5.29.3`
+    /// in relock `6115467`'s emitted lock, and `protobuf<8.0.0,>=6.33.5`
+    /// admits none of them. That is a TRUE crossing and the backtrack
+    /// `1.75.3 -> 1.75.0` this run printed four times stays.
+    #[test]
+    fn fact1_a_requirement_no_consumer_holds_a_version_for_is_still_a_crossing() {
+        let held: &[(&str, &str)] = &[("protobuf", "5.29.3")];
+        let bundle = fact1_bundle(
+            &[("protobuf", &["5.29.3"])],
+            &[
+                ("pace", held),
+                ("pm-isaaclab", held),
+                ("unitree-rl-lab-gpu", held),
+                ("uwlab-gpu", held),
+            ],
+        );
+        let holdings = admission_fact_holdings(&bundle);
+        let env = crate::relax::marker_env_for("linux-64", "3.11").unwrap();
+        let verdict = fact_verdict_for_requires_dist(
+            &["protobuf<8.0.0,>=6.33.5".to_string()],
+            &holdings,
+            &env,
+        );
+        assert_eq!(verdict.crossings.len(), 1, "the crossing must survive");
+        let crossing = &verdict.crossings[0];
+        assert_eq!(crossing.fact_name, "protobuf");
+        assert_eq!(crossing.holders_total, 4, "four consumers, none admitted");
+        assert!(verdict.splits.is_empty());
+        assert_eq!(
+            pypi_admission_fact_crossing_unresolved_row(
+                "googleapis-common-protos",
+                crossing,
+                FactConstrainedSite::AutoBundleAdmission,
+            ),
+            "### PYPI ADMISSION FACT-CROSSING UNRESOLVED dep=googleapis-common-protos \
+             requirement=protobuf<8.0.0,>=6.33.5 fact=protobuf==5.29.3 consumers_holding=0/4 \
+             door=auto-bundle policy=constrains-only:learned-fact-yields-to-cap|\
+             declared-pin-kept|undecidable-omitted",
+        );
+    }
+
+    /// GUARD (c), N27-RETREAD-141. A SPLIT IS NOT A CROSSING, AND IT IS NOT
+    /// SILENCE.
+    ///
+    /// One consumer holding a version the requirement admits is the existence
+    /// proof the door asks for, so nothing backtracks. Before this commit the
+    /// name was dropped by `selected_versions.len() != 1` before the predicate
+    /// ever saw it, so the split produced no decision AND no row.
+    #[test]
+    fn fact1_a_split_admits_the_wheel_and_prints_its_own_row() {
+        let bundle = fact1_bundle(
+            &[("numpy", &["2.4.6"])],
+            &[
+                ("viral-gpu", &[("numpy", "1.26.4")]),
+                ("newton-gpu", &[("numpy", "2.4.6")]),
+            ],
+        );
+        let holdings = admission_fact_holdings(&bundle);
+        let env = crate::relax::marker_env_for("linux-64", "3.11").unwrap();
+        let verdict = fact_verdict_for_requires_dist(
+            &["numpy<2.0.0,>=1.21.0".to_string()],
+            &holdings,
+            &env,
+        );
+        assert!(
+            verdict.crossings.is_empty(),
+            "one consumer holds an admitted version, so this is not a crossing: {:?}",
+            verdict.crossings,
+        );
+        assert_eq!(verdict.splits.len(), 1);
+        let split = &verdict.splits[0];
+        assert_eq!((split.holders_admitting, split.holders_total), (1, 2));
+        assert_eq!(
+            pypi_admission_consumer_split_row(
+                "dex-retargeting",
+                split,
+                FactConstrainedSite::AutoBundleAdmission,
+            ),
+            "### PYPI ADMISSION CONSUMER-SPLIT dep=dex-retargeting fact=numpy \
+             requirement=numpy<2.0.0,>=1.21.0 holders=1/2 \
+             held=newton-gpu=2.4.6,viral-gpu=1.26.4 door=auto-bundle",
+        );
+    }
+
+    /// GUARD (d), N27-RETREAD-141. THE ORDINARY CASE DOES NOT MOVE.
+    ///
+    /// With no base lock -- the `--base-lock drop` shape relock `6115467` ran,
+    /// where `workspace_locked_conda` is EMPTY -- the door falls back to the
+    /// workspace fact and decides exactly as it did before this commit: one
+    /// holder, admitted, no crossing, no split, and `backtracked=none`
+    /// byte-identical. `EMIT_EPOCH` therefore does not move: no emitted byte of
+    /// an unchanged case changes.
+    #[test]
+    fn fact1_with_no_lock_the_float_still_decides_and_the_ordinary_case_is_unchanged() {
+        let bundle = fact1_bundle(&[("packaging", &["23.0"])], &[]);
+        let holdings = admission_fact_holdings(&bundle);
+        assert_eq!(
+            holdings["packaging"].keys().cloned().collect::<Vec<_>>(),
+            vec!["workspace-fact:23.0".to_string()],
+            "with no lock the float is the only evidence there is",
+        );
+        let env = crate::relax::marker_env_for("linux-64", "3.11").unwrap();
+        let admits = fact_verdict_for_requires_dist(
+            &["packaging>=20".to_string()],
+            &holdings,
+            &env,
+        );
+        assert!(admits.crossings.is_empty() && admits.splits.is_empty());
+        let excludes = fact_verdict_for_requires_dist(
+            &["packaging>=24.0".to_string()],
+            &holdings,
+            &env,
+        );
+        assert_eq!(excludes.crossings.len(), 1, "the wheel/packaging row of 6115467");
+        assert_eq!(excludes.crossings[0].holders_total, 1);
+        assert_eq!(
+            pypi_closure_fact_constrained_row(holdings.len(), &[]),
+            "### PYPI CLOSURE FACT-CONSTRAINED names=1 backtracked=none",
+        );
+        assert_eq!(
+            crate::lock::EMIT_EPOCH,
+            56,
+            "no emitted byte of an unchanged case moved, so the epoch does not",
+        );
     }
 }

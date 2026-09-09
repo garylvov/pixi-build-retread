@@ -4576,6 +4576,27 @@ struct Bundle {
     /// means "cannot know" -- never "unconstrained". Read ONLY by
     /// `check_declared_pypi_bounds`.
     workspace_locked_pypi: BTreeMap<String, String>,
+    /// Precise consuming environment -> canonical conda name -> the version
+    /// that environment's committed `pixi.lock` HOLDS
+    /// ([`crate::workspace::locked_conda_versions_by_env`]).
+    ///
+    /// WHY THIS IS KEPT PER ENVIRONMENT AND NOT INTERSECTED (N27-RETREAD-141).
+    /// `facts_from_solved_records` folds the same reader into the fact boundary
+    /// under an ALL-OR-NOTHING rule, and correctly: the emitted `constrains:`
+    /// are an INTERSECTION across the consumers, so deriving one environment
+    /// from the lock and its neighbour from the day would produce a boundary
+    /// that is a function of neither. The DOOR asks a different question --
+    /// "is there a consuming environment whose held version this requirement
+    /// admits?" -- and that is an EXISTENCE question, where one environment
+    /// answering is the whole proof. So the door gets the map unreduced and
+    /// unconditioned, and decides per name.
+    ///
+    /// EMPTY means "cannot know", never "holds nothing": no `pixi.lock` on
+    /// disk (the harness's `--base-lock drop` mode, and a cold first pass), an
+    /// unparseable lock, or a consumer the lock never solved. On an empty map
+    /// the door falls back to the workspace fact and decides exactly as it did
+    /// before this field existed.
+    workspace_locked_conda: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 /// Evidence that a wheel this bundle emits has the same canonical name as a
@@ -9123,6 +9144,24 @@ async fn resolve_all(
         // activation instead is the failure mode this closes.
         bundle.workspace_locked_pypi = match workspace_dir {
             Some(root) => crate::workspace::locked_pypi_versions_for_envs(
+                root,
+                &workspace_facts
+                    .env_exact_specs
+                    .keys()
+                    .cloned()
+                    .collect::<BTreeSet<_>>(),
+                &target.conda_subdir,
+            ),
+            None => BTreeMap::new(),
+        };
+        // N27-RETREAD-141. The SAME environments' locked CONDA selections, for
+        // the admission doors. This is the evidence that tells a real crossing
+        // from a counterfactual one: the fact these doors used to decide
+        // against is produced by a solve that filters this pack OUT, so it is
+        // the version the environment would hold if the pack did not exist,
+        // while the lock is what it holds WITH the pack installed.
+        bundle.workspace_locked_conda = match workspace_dir {
+            Some(root) => crate::workspace::locked_conda_versions_by_env(
                 root,
                 &workspace_facts
                     .env_exact_specs
@@ -16208,6 +16247,7 @@ async fn resolve_bundle(
             workspace_selected_conda_packages: Default::default(),
             workspace_declared_pypi: Default::default(),
             workspace_locked_pypi: Default::default(),
+            workspace_locked_conda: Default::default(),
         });
     }
 
@@ -16825,6 +16865,7 @@ async fn resolve_bundle(
         workspace_selected_conda_packages: Default::default(),
         workspace_declared_pypi: Default::default(),
         workspace_locked_pypi: Default::default(),
+        workspace_locked_conda: Default::default(),
     };
 
     Ok(bfs_bundle)
@@ -31955,6 +31996,7 @@ mod emit_wheel_upstream_url_tests {
             workspace_selected_conda_packages: Default::default(),
             workspace_declared_pypi: Default::default(),
             workspace_locked_pypi: Default::default(),
+            workspace_locked_conda: Default::default(),
         };
 
         // Reproduce the exact mapping from build_one that populates EmitWheel.
@@ -32084,6 +32126,7 @@ mod emit_wheel_upstream_url_tests {
             workspace_selected_conda_packages: Default::default(),
             workspace_declared_pypi: Default::default(),
             workspace_locked_pypi: Default::default(),
+            workspace_locked_conda: Default::default(),
         };
 
         let emit_wheels: Vec<crate::emit_pypi::EmitWheel> = bundle

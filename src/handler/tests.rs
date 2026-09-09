@@ -932,6 +932,7 @@ fn courier_pure_python_bundle_is_platform_specific_not_noarch() {
         workspace_selected_conda_packages: Default::default(),
         workspace_declared_pypi: Default::default(),
         workspace_locked_pypi: Default::default(),
+        workspace_locked_conda: Default::default(),
     };
 
     let courier_cfg = RetreadConfig {
@@ -1018,6 +1019,7 @@ fn produce_output_emits_auto_routed_conda_run_deps() {
         workspace_selected_conda_packages: Default::default(),
         workspace_declared_pypi: Default::default(),
         workspace_locked_pypi: Default::default(),
+        workspace_locked_conda: Default::default(),
     };
     let out = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
     let deps: Vec<(String, String)> = out
@@ -3261,6 +3263,7 @@ fn produce_output_softens_deps_from_floor_pin_to_floor_spec() {
         workspace_selected_conda_packages: Default::default(),
         workspace_declared_pypi: Default::default(),
         workspace_locked_pypi: Default::default(),
+        workspace_locked_conda: Default::default(),
     };
     let out = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
     let deps: Vec<(String, String)> = out
@@ -3324,6 +3327,7 @@ fn produce_output_preserves_deps_from_bare_and_range_specs() {
         workspace_selected_conda_packages: Default::default(),
         workspace_declared_pypi: Default::default(),
         workspace_locked_pypi: Default::default(),
+        workspace_locked_conda: Default::default(),
     };
 
     let out = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
@@ -3895,6 +3899,7 @@ fn solo_bundle(name: &str, requires: Vec<&str>) -> Bundle {
         workspace_selected_conda_packages: Default::default(),
         workspace_declared_pypi: Default::default(),
         workspace_locked_pypi: Default::default(),
+        workspace_locked_conda: Default::default(),
     }
 }
 
@@ -4777,6 +4782,7 @@ fn vendored_sub_packages_dropped_from_run_deps() {
         workspace_selected_conda_packages: Default::default(),
         workspace_declared_pypi: Default::default(),
         workspace_locked_pypi: Default::default(),
+        workspace_locked_conda: Default::default(),
     };
 
     let output =
@@ -4938,6 +4944,7 @@ fn bundle_field_groups_entries_into_one_output() {
         workspace_selected_conda_packages: Default::default(),
         workspace_declared_pypi: Default::default(),
         workspace_locked_pypi: Default::default(),
+        workspace_locked_conda: Default::default(),
     };
 
     let output =
@@ -5043,6 +5050,7 @@ fn relaxed_pure_python_primary_pins_python_to_workspace_variant() {
         workspace_selected_conda_packages: Default::default(),
         workspace_declared_pypi: Default::default(),
         workspace_locked_pypi: Default::default(),
+        workspace_locked_conda: Default::default(),
     };
 
     let output =
