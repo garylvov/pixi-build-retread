@@ -261,14 +261,16 @@ pub(crate) fn pypi_route_reresolved_row(
     format!("### PYPI ROUTE RERESOLVED dep={dep} from={from} to={to} constraints={constraints}")
 }
 
-/// What the bundle says when NO release of a restored route is compatible with
+/// What the bundle says when NO release admitted by a door is compatible with
 /// the workspace conda facts.
 ///
 /// It names the dep, the cap and the fact, because those three are what the
-/// reader needs to decide which side is wrong, and because the alternative --
-/// emitting the pack with the cap in its `constrains` -- ships code that
-/// cannot run in the environments the pack is for.
-pub(crate) fn route_restore_unsatisfiable_message(
+/// reader needs to decide which side is wrong. It NO LONGER says the bundle
+/// refuses: relock `6113841` proved that a pinned candidate set of one turns
+/// this into a hard failure on a `constrains` edge the emission policy handles
+/// without halting, so the door admits and defers and this text is the prose
+/// half of [`pypi_admission_fact_crossing_unresolved_row`].
+pub(crate) fn fact_crossing_unresolved_message(
     dep: &str,
     bundle: &str,
     base: &VersionSpecifiers,
@@ -291,9 +293,10 @@ pub(crate) fn route_restore_unsatisfiable_message(
         "{site} for `{dep}` in bundle `{bundle}` has no release compatible \
          with the workspace conda fact `{}=={}`: within `{base}` every candidate this admission \
          reached requires `{}`, which excludes that version. Versions tried and refused: {tried}. \
-         Admitting one of them would carry its bound into this pack's conda `constrains` as a \
-         cap no consuming environment can satisfy, so the bundle refuses instead \
-         (N27-RETREAD-142, N27-RETREAD-145).",
+         There is nothing left to backtrack to, so this door admits the pinned wheel and defers \
+         to the pack's `constrains` emission policy, which decides the bound and does not halt \
+         the lock ({EMISSION_CROSSING_POLICY}) (N27-RETREAD-142, N27-RETREAD-145, \
+         N27-RETREAD-146).",
         crossing.fact_name,
         crossing.fact_version,
         crossing.requirement,
@@ -354,6 +357,70 @@ impl FactConstrainedSite {
             Self::AutoBundleAdmission => "auto-bundle PyPI admission",
         }
     }
+
+    /// The `door=` field of [`pypi_admission_fact_crossing_unresolved_row`].
+    ///
+    /// One token, not the prose [`Self::label`] renders, because this half is
+    /// what a gate criterion greps.
+    pub(crate) fn door(self) -> &'static str {
+        match self {
+            Self::JointRouteRestore => "restore",
+            Self::AutoBundleAdmission => "auto-bundle",
+        }
+    }
+}
+
+/// What the `constrains` emission does with a crossing this door could not
+/// resolve -- one token, because the row it rides in is machine-read.
+///
+/// It is not a promise this module makes; it is a NAME for the policy that
+/// already lives in `handler::mod`'s `RelaxDecision::Conflict` arm, whose
+/// `constrains_only` branch has exactly two exits and neither halts: a LEARNED
+/// workspace conda fact yields and the wheel's cap is emitted (the WARN says
+/// "the bundled wheel's cap wins"), a DECLARED manifest pin keeps today's
+/// behaviour, and an entry that stays undecidable is dropped under the WARN
+/// "omitting the bound. The workspace conda provider is unbounded for this
+/// name." That last branch's own comment states the rule this door broke:
+/// "An undecidable one must NOT turn a pack that built before into a hard
+/// failure -- that would be a regression introduced by the carry itself."
+pub(crate) const EMISSION_CROSSING_POLICY: &str =
+    "constrains-only:learned-fact-yields-to-cap|declared-pin-kept|undecidable-omitted";
+
+/// The row a door writes when it admitted a wheel it could NOT resolve under
+/// the workspace conda facts.
+///
+/// N27-RETREAD-145 gave both doors a backtracking actuator and, when the
+/// backtrack ran out, a refusal that halted the lock. Relock `6113841`
+/// measured what that costs: `torch` is pinned `==2.5.1+cu124`, a candidate
+/// set of ONE whose `Requires-Dist` carries `sympy (==1.13.1)` against the
+/// workspace conda fact `sympy==1.14.0`, so there is nothing to backtrack TO
+/// and the whole lock died at 216 s on a `constrains` edge that the emission
+/// policy had been handling for weeks -- B42's `sage-isaac-pack` record
+/// (`6bf4ea3cfb45bc81c48a8e4a09cc3f99`) emits `sympy` as a BARE name and the
+/// environments built and ran.
+///
+/// A door that cannot decide therefore does NOT decide: it admits the pinned
+/// wheel and defers to emission, which is total for `constrains` entries. What
+/// it must not do is go quiet -- a crossing nobody can see is the defect this
+/// whole series is about -- so the crossing is printed here, on stderr, in the
+/// grammar the other `###` rows use, and reaches the backend log, the gate
+/// criteria and the operator.
+pub(crate) const PYPI_ADMISSION_FACT_CROSSING_UNRESOLVED_PREFIX: &str =
+    "### PYPI ADMISSION FACT-CROSSING UNRESOLVED";
+
+pub(crate) fn pypi_admission_fact_crossing_unresolved_row(
+    dep: &str,
+    crossing: &FactCrossing,
+    site: FactConstrainedSite,
+) -> String {
+    format!(
+        "{PYPI_ADMISSION_FACT_CROSSING_UNRESOLVED_PREFIX} dep={dep} requirement={} fact={}=={} \
+         door={} policy={EMISSION_CROSSING_POLICY}",
+        crossing.requirement,
+        crossing.fact_name,
+        crossing.fact_version,
+        site.door(),
+    )
 }
 
 /// The per-pass row the AUTO-BUNDLE admission writes.
@@ -386,7 +453,16 @@ pub(crate) fn pypi_closure_fact_constrained_row(
 }
 
 /// Fetch one PyPI candidate UNDER the workspace conda facts, backtracking
-/// until the selection's `Requires-Dist` admits every fact, or refusing.
+/// until the selection's `Requires-Dist` admits every fact -- or, when NO
+/// candidate does, admitting the pinned wheel and printing the crossing.
+///
+/// THE TWO OUTCOMES ARE NOT SYMMETRIC AND THAT IS THE POINT (N27-RETREAD-146).
+/// When an admissible release EXISTS the door decides: it backtracks to it,
+/// and the protobuf case (1.75.3 -> 1.75.0) is unchanged. When none exists the
+/// door has no decision to make -- `torch==2.5.1+cu124` is a candidate set of
+/// ONE -- so it defers to the `constrains` emission policy that governed this
+/// case before either door existed, and says so loudly rather than halting a
+/// lock that the emission would have completed.
 ///
 /// THIS IS THE ONE ACTUATOR BOTH ADMISSION PATHS SHARE. It is a whole-body
 /// extraction of the loop CAPWINS-5 wrote at the restore site -- the backtrack
@@ -419,7 +495,39 @@ where
     let base = request.specifiers.clone();
     let mut excluded: Vec<Version> = Vec::new();
     let mut from_version: Option<String> = None;
+    let mut first_wheel: Option<ResolvedWheel> = None;
     let mut refused_by: Option<FactCrossing> = None;
+    // A door that has run out of candidates ADMITS and DEFERS (N27-RETREAD-146).
+    // It hands back the wheel the UNCONSTRAINED fetch took -- the pinned
+    // selection, the one every pre-145 lock admitted silently -- and prints the
+    // crossing so it reaches the log, the gate criteria and the operator.
+    // Refusing here instead would be a NEW hard failure on a `constrains` edge
+    // whose emission policy is total: see [`EMISSION_CROSSING_POLICY`].
+    macro_rules! admit_and_defer {
+        ($crossing:expr) => {{
+            let crossing: FactCrossing = $crossing;
+            let wheel = first_wheel
+                .clone()
+                .expect("a crossing is only recorded after the first fetch succeeded");
+            let version = from_version
+                .clone()
+                .unwrap_or_else(|| wheel.metadata.version.clone());
+            // STDERR, NEVER STDOUT: `rpc.rs` owns stdout as the JSON-RPC
+            // channel, exactly as every other `###` row in this module.
+            eprintln!(
+                "{}",
+                pypi_admission_fact_crossing_unresolved_row(&dep, &crossing, site)
+            );
+            tracing::warn!(
+                dep = %dep,
+                bundle = %bundle_label,
+                door = %site.door(),
+                "{}",
+                fact_crossing_unresolved_message(&dep, bundle_label, &base, &excluded, &crossing, site),
+            );
+            return Ok((wheel, Some((version.clone(), version))));
+        }};
+    }
     loop {
         let mut attempt = request.clone();
         attempt.specifiers = specifiers_excluding(&base, &excluded, &dep)?;
@@ -441,18 +549,12 @@ where
                 let Some(crossing) = refused_by else {
                     return Err(error);
                 };
-                return Err(anyhow!(route_restore_unsatisfiable_message(
-                    &dep,
-                    bundle_label,
-                    &base,
-                    &excluded,
-                    &crossing,
-                    site,
-                )));
+                admit_and_defer!(crossing);
             }
         };
         if from_version.is_none() {
             from_version = Some(wheel.metadata.version.clone());
+            first_wheel = Some(wheel.clone());
         }
         if !enabled {
             return Ok((wheel, None));
@@ -475,29 +577,13 @@ where
         if excluded.contains(&refused) {
             // The index answered with a version this request had already
             // excluded. That is not a backtrack that can terminate, so it
-            // refuses here rather than spinning.
-            return Err(anyhow!(route_restore_unsatisfiable_message(
-                &dep,
-                bundle_label,
-                &base,
-                &excluded,
-                &crossing,
-                site,
-            )));
+            // stops here rather than spinning.
+            admit_and_defer!(crossing);
         }
         excluded.push(refused);
-        refused_by = Some(crossing);
+        refused_by = Some(crossing.clone());
         if excluded.len() > ROUTE_RESTORE_RERESOLVE_MAX_BACKTRACKS {
-            return Err(anyhow!(route_restore_unsatisfiable_message(
-                &dep,
-                bundle_label,
-                &base,
-                &excluded,
-                refused_by
-                    .as_ref()
-                    .expect("a backtrack is recorded before the bound is tested"),
-                site,
-            )));
+            admit_and_defer!(crossing);
         }
     }
 }
@@ -5105,49 +5191,75 @@ mod tests {
         );
     }
 
-    /// GUARD (b), N27-RETREAD-142. NO COMPATIBLE RELEASE IS A REFUSAL, NOT AN
-    /// UNSATISFIABLE CAP.
+    /// GUARD (b), N27-RETREAD-142, AS AMENDED BY N27-RETREAD-146. NO
+    /// COMPATIBLE RELEASE IS A LOUD DEFERRAL, NOT A HALT.
     ///
-    /// The index offers only the crossing release. The old code re-injected
-    /// it and let the emission publish a `constrains` bound no consuming
-    /// environment could satisfy; the fix refuses, naming the dep, the cap and
-    /// the fact, and the bundle is left UNMUTATED -- which is what "no output
-    /// record written" means at this layer, since `*bundle = trial` is the
-    /// last statement of the success path and every caller above turns this
-    /// `Err` into a non-zero exit (`collect_conflicts` re-raises anything that
-    /// is not a typed `Conflict`).
+    /// The index offers only the crossing release. -142 made this a refusal
+    /// that killed the lock; relock `6113841` then died on `torch`, a pinned
+    /// candidate set of ONE, on a `constrains` edge whose emission policy had
+    /// been handling exactly this for weeks. So the restore now ADMITS the
+    /// pinned wheel -- the pre-142 selection, byte for byte -- and prints the
+    /// crossing. The `-142` needles stay in the prose, because the message is
+    /// still the thing a reader needs to decide which side is wrong.
     #[tokio::test]
-    async fn capwins5_a_restore_with_no_admissible_release_refuses_loudly() {
+    async fn capwins5_a_restore_with_no_admissible_release_admits_and_defers_loudly() {
         let releases = googleapis_releases(&[("1.75.3", "protobuf<8.0.0,>=6.33.5")]);
         let mut bundle = bundle_with_protobuf_fact(Some("5.29.3"));
         let before = bundle.all_wheels().count();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let error = restore_against_index(&mut bundle, releases, Arc::clone(&calls))
+        restore_against_index(&mut bundle, releases, Arc::clone(&calls))
             .await
-            .expect_err("no release admits the fact, so the bundle must refuse");
-        let message = format!("{error:#}");
+            .expect("an unresolvable crossing must NOT halt the lock");
+        assert_eq!(
+            bundled_version(&bundle, "googleapis-common-protos").as_deref(),
+            Some("1.75.3"),
+            "the pinned wheel is admitted and emission decides the bound",
+        );
+        assert_eq!(
+            bundle.all_wheels().count(),
+            before + 1,
+            "the restore admits exactly the one wheel it could not re-resolve",
+        );
+
+        // THE CROSSING REACHES THE LOG. Pinned by bytes, because a merge lane
+        // and a gate criterion both grep for this row by string.
+        let crossing = FactCrossing {
+            fact_name: "protobuf".to_string(),
+            fact_version: "5.29.3".to_string(),
+            requirement: "protobuf<8.0.0,>=6.33.5".to_string(),
+        };
+        assert_eq!(
+            pypi_admission_fact_crossing_unresolved_row(
+                "googleapis-common-protos",
+                &crossing,
+                FactConstrainedSite::JointRouteRestore,
+            ),
+            "### PYPI ADMISSION FACT-CROSSING UNRESOLVED dep=googleapis-common-protos \
+             requirement=protobuf<8.0.0,>=6.33.5 fact=protobuf==5.29.3 door=restore \
+             policy=constrains-only:learned-fact-yields-to-cap|declared-pin-kept|\
+             undecidable-omitted",
+        );
+        let message = fact_crossing_unresolved_message(
+            "googleapis-common-protos",
+            "isaaclab-2-3x-pack",
+            &VersionSpecifiers::from_str("~=1.52").unwrap(),
+            &[Version::from_str("1.75.3").unwrap()],
+            &crossing,
+            FactConstrainedSite::JointRouteRestore,
+        );
         for needle in [
             "googleapis-common-protos",
             "protobuf==5.29.3",
             "protobuf<8.0.0,>=6.33.5",
             "1.75.3",
             "N27-RETREAD-142",
+            "N27-RETREAD-146",
         ] {
             assert!(
                 message.contains(needle),
-                "the refusal must name `{needle}`; got {message}",
+                "the crossing message must name `{needle}`; got {message}",
             );
         }
-        assert_eq!(
-            bundle.all_wheels().count(),
-            before,
-            "a refused restore must not leave a wheel behind",
-        );
-        assert_eq!(
-            bundle.auto_routed.len(),
-            1,
-            "a refused restore must not mutate the routing either",
-        );
     }
 
     /// GUARD (c), N27-RETREAD-142. AN ALREADY-COMPATIBLE RESTORE IS UNCHANGED
@@ -5533,26 +5645,100 @@ mod tests {
         );
     }
 
-    /// GUARD (c), N27-RETREAD-145. NO ADMISSIBLE RELEASE IS A LOUD REFUSAL.
+    /// GUARD (c), N27-RETREAD-145, AS AMENDED BY N27-RETREAD-146. NO
+    /// ADMISSIBLE RELEASE IS A LOUD DEFERRAL AT THIS DOOR TOO.
     ///
-    /// The index offers only the crossing release. 96ff3dd bundles it and lets
-    /// the emission publish a `constrains` bound no consuming environment can
-    /// satisfy -- which is exactly what killed `6112256` two layers later, in
-    /// the `pm-isaaclab` solve, instead of here where the evidence is. The fix
-    /// refuses at the admission, naming dep, requirement and fact, and leaves
-    /// the bundle UNMUTATED: `bundle.extras.push` runs only after `result?`,
-    /// so nothing is admitted and every caller above turns this `Err` into a
-    /// non-zero exit.
+    /// This is relock `6113841` in miniature, with the dep the fixtures
+    /// already carry. `torch` is pinned `==2.5.1+cu124`: ONE candidate, whose
+    /// `Requires-Dist` says `sympy (==1.13.1)` against the workspace fact
+    /// `sympy==1.14.0`. -145 refused and the whole lock died at 216 s. B42's
+    /// `sage-isaac-pack` record, the last green, emits `sympy` as a BARE name
+    /// and those environments ran. So the door admits and prints; emission
+    /// decides the bound.
     #[tokio::test]
-    async fn capwins6_an_auto_bundle_with_no_admissible_release_refuses_loudly() {
+    async fn capwins6_an_auto_bundle_with_no_admissible_release_admits_and_defers_loudly() {
         let releases = googleapis_releases(&[("1.75.3", "protobuf<8.0.0,>=6.33.5")]);
         let mut bundle = bundle_with_loose_googleapis_dep(Some("5.29.3"));
         let before = bundle.all_wheels().count();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let error = auto_bundle_against_index(&mut bundle, releases, Arc::clone(&calls))
+        auto_bundle_against_index(&mut bundle, releases, Arc::clone(&calls))
             .await
-            .expect_err("no release admits the fact, so the admission must refuse");
-        let message = format!("{error:#}");
+            .expect("an unresolvable crossing must NOT halt the lock");
+        assert_eq!(
+            bundled_version(&bundle, "googleapis-common-protos").as_deref(),
+            Some("1.75.3"),
+            "the pinned wheel is admitted and emission decides the bound",
+        );
+        assert_eq!(
+            bundle.all_wheels().count(),
+            before + 1,
+            "the admission admits exactly the one wheel it could not re-resolve",
+        );
+
+        // THE IDENTITY THAT MAKES THE DEFERRAL SAFE, ASSERTED AND NOT ARGUED.
+        // Emission is a function of the admitted wheels and the workspace
+        // facts. The facts do not move here, so "the emitted `constrains` are
+        // what 9ca588f emitted" reduces to "the admitted wheel is what
+        // 9ca588f admitted" -- and 9ca588f's behaviour on this path is
+        // exactly the fact-free arm, because before N27-RETREAD-145 no fact
+        // reached this fetch at all.
+        let mut unconstrained = bundle_with_loose_googleapis_dep(None);
+        let unconstrained_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        auto_bundle_against_index(
+            &mut unconstrained,
+            googleapis_releases(&[("1.75.3", "protobuf<8.0.0,>=6.33.5")]),
+            Arc::clone(&unconstrained_calls),
+        )
+        .await
+        .expect("the pre-145 admission succeeds");
+        let admitted = |b: &Bundle| {
+            b.all_wheels()
+                .find(|wheel| {
+                    PypiKey::from_pypi(&wheel.metadata.name)
+                        == PypiKey::from_pypi("googleapis-common-protos")
+                })
+                .map(|wheel| (wheel.metadata.version.clone(), wheel.metadata.requires_dist.clone()))
+                .expect("the admitted wheel is in the bundle")
+        };
+        assert_eq!(
+            admitted(&bundle),
+            admitted(&unconstrained),
+            "a crossing this door cannot resolve must admit BYTE-FOR-BYTE what the pre-145 \
+             door admitted, so emission sees exactly the inputs it saw in the last green",
+        );
+        // The deferral costs exactly ONE extra probe -- the backtrack that
+        // found the index empty -- and nothing else. Pinned, because a door
+        // that quietly re-walked the index would be a different fix.
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            unconstrained_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+        );
+
+        let crossing = FactCrossing {
+            fact_name: "protobuf".to_string(),
+            fact_version: "5.29.3".to_string(),
+            requirement: "protobuf<8.0.0,>=6.33.5".to_string(),
+        };
+        assert_eq!(
+            pypi_admission_fact_crossing_unresolved_row(
+                "googleapis-common-protos",
+                &crossing,
+                FactConstrainedSite::AutoBundleAdmission,
+            ),
+            "### PYPI ADMISSION FACT-CROSSING UNRESOLVED dep=googleapis-common-protos \
+             requirement=protobuf<8.0.0,>=6.33.5 fact=protobuf==5.29.3 door=auto-bundle \
+             policy=constrains-only:learned-fact-yields-to-cap|declared-pin-kept|\
+             undecidable-omitted",
+        );
+        let message = fact_crossing_unresolved_message(
+            "googleapis-common-protos",
+            "isaaclab-2-3x-pack",
+            &VersionSpecifiers::from_str("~=1.52").unwrap(),
+            &[Version::from_str("1.75.3").unwrap()],
+            &crossing,
+            FactConstrainedSite::AutoBundleAdmission,
+        );
         for needle in [
             "auto-bundle PyPI admission",
             "googleapis-common-protos",
@@ -5560,16 +5746,53 @@ mod tests {
             "protobuf<8.0.0,>=6.33.5",
             "1.75.3",
             "N27-RETREAD-145",
+            "N27-RETREAD-146",
         ] {
             assert!(
                 message.contains(needle),
-                "the refusal must name `{needle}`; got {message}",
+                "the crossing message must name `{needle}`; got {message}",
             );
         }
+    }
+
+    /// N27-RETREAD-146. THE TWO DOORS DIFFER ONLY IN `door=`.
+    ///
+    /// The row is a gate criterion's grep target, so its `door=` field must be
+    /// a stable single token and the two doors must be distinguishable by it
+    /// alone -- the failure -145 was built for is a fix that guards one door
+    /// while the production RED comes back through the other.
+    #[test]
+    fn capwins7_the_unresolved_row_names_the_door_and_the_emission_policy() {
+        let crossing = FactCrossing {
+            fact_name: "sympy".to_string(),
+            fact_version: "1.14.0".to_string(),
+            requirement: "sympy (==1.13.1) ; python_version >= \"3.9\"".to_string(),
+        };
+        let admission = pypi_admission_fact_crossing_unresolved_row(
+            "torch",
+            &crossing,
+            FactConstrainedSite::AutoBundleAdmission,
+        );
+        let restore = pypi_admission_fact_crossing_unresolved_row(
+            "torch",
+            &crossing,
+            FactConstrainedSite::JointRouteRestore,
+        );
         assert_eq!(
-            bundle.all_wheels().count(),
-            before,
-            "a refused admission must not leave a wheel behind",
+            admission,
+            "### PYPI ADMISSION FACT-CROSSING UNRESOLVED dep=torch \
+             requirement=sympy (==1.13.1) ; python_version >= \"3.9\" fact=sympy==1.14.0 \
+             door=auto-bundle policy=constrains-only:learned-fact-yields-to-cap|\
+             declared-pin-kept|undecidable-omitted",
+        );
+        assert_eq!(
+            restore,
+            admission.replace("door=auto-bundle", "door=restore"),
+            "the two rows must differ in `door=` and nothing else",
+        );
+        assert!(
+            admission.contains(EMISSION_CROSSING_POLICY),
+            "the row must state what emission will do; got {admission}",
         );
     }
 
@@ -5633,12 +5856,12 @@ mod tests {
         );
     }
 
-    /// The refusal must say WHICH door refused, because the two doors are why
+    /// The crossing message must say WHICH door hit it, because the two doors are why
     /// N27-RETREAD-142 read as fixed and came back: `6106911` took the restore
     /// (2 rows) and `6112256` took the auto-bundle (2 rows), same dep, same
     /// cap, same RED.
     #[test]
-    fn capwins6_the_refusal_names_the_admission_path_it_refused_on() {
+    fn capwins6_the_crossing_message_names_the_admission_path_it_fired_on() {
         let crossing = FactCrossing {
             fact_name: "protobuf".to_string(),
             fact_version: "5.29.3".to_string(),
@@ -5646,7 +5869,7 @@ mod tests {
         };
         let base = VersionSpecifiers::from_str("~=1.52").unwrap();
         let excluded = [Version::from_str("1.75.3").unwrap()];
-        let restore = route_restore_unsatisfiable_message(
+        let restore = fact_crossing_unresolved_message(
             "googleapis-common-protos",
             "isaaclab-2-3x-pack",
             &base,
@@ -5654,7 +5877,7 @@ mod tests {
             &crossing,
             FactConstrainedSite::JointRouteRestore,
         );
-        let admission = route_restore_unsatisfiable_message(
+        let admission = fact_crossing_unresolved_message(
             "googleapis-common-protos",
             "isaaclab-2-3x-pack",
             &base,
