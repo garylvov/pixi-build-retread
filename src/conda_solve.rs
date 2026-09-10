@@ -437,6 +437,10 @@ impl SharedSparseSolveData {
         }
 
         let pairs = self.pairs().await;
+        // UNIVERSE-1 / N27-RETREAD-204: the other SOLVE entry point. Same
+        // reasoning as `load_selected_records_sparse`'s registration, and the
+        // same reason it is not in the shared inner walk.
+        record_reachable_roots(&requested_roots);
         let (records, consulted) = match load(pairs, requested_roots.clone()).await {
             Ok(loaded) => loaded,
             // Gateway errors and spawn-blocking panics both take this path.
@@ -811,6 +815,15 @@ async fn load_selected_records_sparse(
     // -- they're skipped here and simply unmatchable in the subset,
     // identical to how an absent package behaved in the full set.
     let root_names = exact_root_names(parsed_specs);
+    // UNIVERSE-1 / N27-RETREAD-204. The writer's half of the candidate-set
+    // adoption rule, registered at the SOLVE entry points and deliberately NOT
+    // inside `load_selected_records_sparse_from_pairs`. See
+    // [`record_reachable_roots`] for why: the store's READER re-walks a stored
+    // record's roots through that same inner function, and registering there
+    // would fold a refused record's roots into the NEXT publish's stamped set --
+    // a superset, which is strictly more refusals, i.e. this lane's own defect
+    // reintroduced by its own reader.
+    record_reachable_roots(&root_names);
     match load_selected_records_sparse_from_pairs(pairs, root_names).await {
         Ok(loaded) => loaded,
         Err(consulted) => (Vec::new(), consulted),
@@ -823,11 +836,6 @@ async fn load_selected_records_sparse_from_pairs(
 ) -> SparseLoadResult {
     use rattler_repodata_gateway::sparse::{PackageFormatSelection, SparseRepoData};
     let consulted: Vec<String> = pairs.iter().map(|(label, _)| label.clone()).collect();
-    // UNIVERSE-1 / N27-RETREAD-204. The writer's half of the candidate-set
-    // adoption rule, registered HERE because this is the one place in the
-    // process that walks a closure -- a second registration site would be a
-    // second producer of "which roots did this resolution reach from".
-    record_reachable_roots(&root_names);
     let roots = root_names.len();
     let t = std::time::Instant::now();
     let per_repo = match tokio::task::spawn_blocking(move || {
@@ -894,8 +902,19 @@ pub(crate) const CANDIDATE_UNIVERSE_SCHEMA: &str = "retread-conda-universe-v3";
 /// What a resolution actually depends on is the transitive closure
 /// `load_records_recursive` walks from its root names. So the record must name
 /// its roots, and the reader must be able to re-walk them: this registry is the
-/// writer's half, filled by [`load_selected_records_sparse_from_pairs`], which
-/// is the ONE place in the process that walks a closure.
+/// writer's half.
+///
+/// FILLED AT THE TWO SOLVE ENTRY POINTS ([`load_selected_records_sparse`] and
+/// `SharedSparseSolveData::snapshot_for_with_loader`), AND NOT INSIDE THE SHARED
+/// INNER WALK, which is where it is tempting to put it because that walk is the
+/// one place a closure is loaded. The reason is the store's own READER: it
+/// re-walks a STORED record's roots through that same inner function to recompute
+/// a v3 digest, and a registration there would fold a refused record's roots into
+/// the next publish's stamped set. A superset of roots reaches a superset of
+/// candidates, which is strictly MORE refusals -- this lane's own defect,
+/// reintroduced by this lane's own reader. Two call sites naming themselves as
+/// solves is the honest shape; one call site that cannot tell a solve from an
+/// adoption check is not.
 ///
 /// A `BTreeSet<String>` and not `PackageName`, because the set is serialised
 /// into the record and read back by a reader that only has strings.

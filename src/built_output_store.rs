@@ -2023,4 +2023,50 @@ mod tests {
         );
         assert_eq!(record.candidate_universe, "cafebabecafebabe");
     }
+
+    /// UNIVERSE-1 GUARD (f) -- THE READER'S OWN RE-WALK MUST NOT WIDEN THE ROOTS
+    /// THE NEXT PUBLISH STAMPS.
+    ///
+    /// THE DEFECT THIS LANE ALMOST SHIPPED. The candidate-set digest is folded
+    /// over the closure from a root set, so a WIDER root set reaches MORE
+    /// candidates and refuses on more rolls. The store's reader re-walks a stored
+    /// record's roots to recompute a v3 digest, and that walk goes through the
+    /// same `load_selected_records_sparse_from_pairs` a solve does. Registering
+    /// the roots inside that shared function -- which is where the first draft of
+    /// this lane put it, because it is the one place a closure is loaded -- folds
+    /// a REFUSED record's roots into the next publish's stamped set. One relock
+    /// consults this store fourteen times, so pack 7 would publish a digest over
+    /// pack 1's roots as well as its own, and every later reader of pack 7 would
+    /// refuse on a roll that touched only something pack 1 could reach. That is
+    /// N27-RETREAD-204 reintroduced by its own fix.
+    ///
+    /// So the registration lives at the two SOLVE entry points, and this guard is
+    /// what says so: a reader-side `candidate_universe` call over a document must
+    /// leave `reachable_roots()` exactly as it found it.
+    ///
+    /// NON-VACUITY: the digest it computes is asserted non-empty, so a walk that
+    /// silently did nothing cannot pass this.
+    #[test]
+    fn u1_f_a_reader_side_rewalk_does_not_widen_the_registered_roots() {
+        let dir = Scratch::new("u1-f");
+        let (_reader, _writer, sparse) = u1_world(dir.path(), &u1_base());
+        let before = crate::conda_solve::reachable_roots();
+        let digest = u1_digest(&sparse);
+        assert!(
+            !digest.is_empty(),
+            "the walk must actually have run, or this guard is empty"
+        );
+        let after = crate::conda_solve::reachable_roots();
+        assert_eq!(
+            before, after,
+            "a reader recomputing a stored record's v3 must not register that \
+             record's roots as this process's own -- a wider root set is a wider \
+             candidate set, i.e. more refusals"
+        );
+        assert!(
+            !after.iter().any(|name| name == "pack-root"),
+            "and `pack-root` in particular must not be there: it is the FIXTURE \
+             record's root, not any root this process resolved"
+        );
+    }
 }
