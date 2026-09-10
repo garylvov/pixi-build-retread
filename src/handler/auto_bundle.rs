@@ -7050,6 +7050,182 @@ mod tests {
         assert_eq!(bundle.auto_routed[0].route.conda_version, "12.9.4");
     }
 
+    /// N27-RETREAD-221 (READER-221). THE READER THE CALL SITE DID NOT HAVE.
+    ///
+    /// Every other guard in this file drives
+    /// `reconcile_kept_routes_with_workspace_facts` directly, which is why
+    /// FACTS-2's mutant m3 -- delete the production call -- came back GREEN on
+    /// all five (`### MUT3 CALL-SITE COVERAGE red=0 of 5`, job 6202272). This
+    /// one drives `run_workspace_conda_fact_admission_doors`, the statement
+    /// group `resolve_all` actually executes, so the same mutation now reds.
+    ///
+    /// THE EXPECTED ROW IS PRODUCTION'S OWN BYTES, NOT A RESTATEMENT OF THE
+    /// FORMAT STRING. Job `6211599` (MERGE-STACK-3 R1, the first keep that
+    /// LOCKED where job 6197128 had died in 638 s) printed four distinct
+    /// reconciliations in its backend log; the first, at line 51662, reads
+    ///
+    /// ```text
+    /// ### ROUTE FACT RECONCILED pack=robojudo-pack name=cuda-bindings route=12.9.4 fact=12.9.7 envs=newton-gpu
+    /// ```
+    ///
+    /// and the second, at line 153338, `pack=isaac-pack-latest ...
+    /// envs=isaaclab-gpu-latest`. Production's `robojudo-pack` row names ONE
+    /// env because only `newton-gpu` consumed that pack; this fixture is the
+    /// two-consumer shape, so its `envs` field carries both env names that R1
+    /// printed, comma-joined in `BTreeMap` order. Everything up to `envs=` is
+    /// therefore asserted byte-for-byte against R1, and the envs field is
+    /// asserted to name both of R1's consumers.
+    ///
+    /// THE ROW IS ON STDERR (`rpc.rs` owns stdout), so it is read the way the
+    /// rest of this crate reads its own `###` rows: the test re-executes the
+    /// test binary against itself with `--exact`, exactly as
+    /// `route_probe_cache`'s two-process guard does, and greps the child's
+    /// fd 2. A parent that could not find the marker fails, so a child that
+    /// silently did nothing cannot pass.
+    #[test]
+    fn the_production_admission_door_prints_r1s_reconciled_row_and_emits_the_adopted_version() {
+        // R1's own bytes, job 6211599, backend log line 51662, through `envs=`.
+        const R1_ROW: &str = "### ROUTE FACT RECONCILED pack=robojudo-pack \
+                              name=cuda-bindings route=12.9.4 fact=12.9.7 envs=";
+        const EMITTED_MARKER: &str = "### READER-221 CHILD EMITTED ";
+
+        if let Ok(arm) = std::env::var("N27_221_ADMISSION_DOOR_CHILD") {
+            let config = test_config();
+            let target = crate::pypi::WheelTarget::for_subdir("3.12", "linux-64");
+            let mut bundle =
+                cuda_bindings_route_fact_bundle("12.9.4", "12.9.7", vec![cuda_major_table_input()]);
+            match arm.as_str() {
+                // The cuda-bindings shape on a LOCKED basis: the door adopts.
+                "locked" => {
+                    assert!(
+                        bundle
+                            .constrains_basis
+                            .held_version_is_from_lock("cuda-bindings"),
+                        "the fixture's premise is a LOCK-held fact",
+                    );
+                    super::super::run_workspace_conda_fact_admission_doors(
+                        &mut bundle,
+                        &config,
+                        &config.name_map,
+                        &BTreeSet::new(),
+                        &BTreeSet::new(),
+                    )
+                    .expect("the production door must adopt the locked fact, not refuse");
+                    assert_eq!(
+                        bundle.auto_routed[0].route.conda_version, "12.9.7",
+                        "the route must carry the LOCK's version after the door",
+                    );
+                    let routes =
+                        super::super::emitted_bundle_route_specs(&bundle, &config, &target)
+                            .expect("the reconciled pair must emit");
+                    let emitted: Vec<String> = routes
+                        .iter()
+                        .filter(|route| route.conda_name.as_spec() == "cuda-bindings")
+                        .map(|route| route.spec.clone())
+                        .collect();
+                    assert_eq!(emitted.len(), 1, "one emitted route for the name: {emitted:?}");
+                    let band =
+                        VersionSpecifiers::from_str(emitted[0].trim()).expect("emitted band parses");
+                    let adopted = uv_pep508::uv_pep440::Version::from_str("12.9.7").unwrap();
+                    let route_version = uv_pep508::uv_pep440::Version::from_str("12.9.4").unwrap();
+                    assert!(
+                        band.contains(&adopted),
+                        "the emitted bound must admit R1's adopted version: {emitted:?}",
+                    );
+                    assert!(
+                        band.contains(&route_version),
+                        "12.9.4 and 12.9.7 share the minor band an ABI anchor widens to, so \
+                         this holds too and the guard above is not the whole claim: {emitted:?}",
+                    );
+                    eprintln!("{EMITTED_MARKER}{}", emitted[0].trim());
+                }
+                // CAPWINS-9 (N27-RETREAD-198) through the SAME door: with the
+                // basis stripped the held version is the day's float, and a
+                // float may not decide an emitted bound -- so the identical
+                // pair refuses, naming the basis.
+                "float" => {
+                    bundle.constrains_basis = Default::default();
+                    let error = super::super::run_workspace_conda_fact_admission_doors(
+                        &mut bundle,
+                        &config,
+                        &config.name_map,
+                        &BTreeSet::new(),
+                        &BTreeSet::new(),
+                    )
+                    .expect_err("a float basis may not decide the route's bound");
+                    let message = format!("{error:#}");
+                    for needle in ["cuda-bindings", "==12.9.4", "==12.9.7", "universe"] {
+                        assert!(message.contains(needle), "missing `{needle}`:\n{message}");
+                    }
+                    assert_eq!(
+                        bundle.auto_routed[0].route.conda_version, "12.9.4",
+                        "the refusing path must not rewrite the route",
+                    );
+                }
+                other => panic!("unknown child arm `{other}`"),
+            }
+            return;
+        }
+
+        let exe = std::env::current_exe().expect("test binary");
+        let run = |arm: &str| -> (bool, String) {
+            let output = std::process::Command::new(&exe)
+                .args([
+                    "--exact",
+                    "handler::auto_bundle::tests::\
+                     the_production_admission_door_prints_r1s_reconciled_row_and_emits_the_adopted_version",
+                    "--nocapture",
+                ])
+                .env("N27_221_ADMISSION_DOOR_CHILD", arm)
+                .stdout(std::process::Stdio::null())
+                .output()
+                .expect("re-exec the test binary");
+            (
+                output.status.success(),
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            )
+        };
+
+        let (ok, stderr) = run("locked");
+        assert!(ok, "the locked-basis child must pass:\n{stderr}");
+        assert!(
+            stderr.contains(R1_ROW),
+            "the production door must print R1's row verbatim through `envs=`:\n{stderr}",
+        );
+        // Both of R1's consuming environments, comma-joined: the two-consumer
+        // shape this fixture is, rather than production's one-env slice of it.
+        assert!(
+            stderr.contains(&format!("{R1_ROW}isaaclab-gpu-latest,newton-gpu")),
+            "the row's envs field must name both of R1's consumers:\n{stderr}",
+        );
+        assert!(
+            !stderr.contains("### ROUTE FACT CONFLICT"),
+            "R1 printed zero conflict rows for this shape; so must the door:\n{stderr}",
+        );
+        let emitted = stderr
+            .lines()
+            .find_map(|line| line.strip_prefix(EMITTED_MARKER))
+            .expect("the child must report the emitted bound it asserted");
+        assert!(
+            emitted.contains("12.9"),
+            "the emitted bound reached the parent: {emitted}",
+        );
+
+        let (ok, stderr) = run("float");
+        assert!(ok, "the float-basis child must pass:\n{stderr}");
+        assert!(
+            !stderr.contains(&format!("{R1_ROW}isaaclab-gpu-latest,newton-gpu")),
+            "a float basis must not print a RECONCILED row:\n{stderr}",
+        );
+        assert!(
+            stderr.contains(
+                "### ROUTE FACT CONFLICT pack=robojudo-pack name=cuda-bindings route=12.9.4 \
+                 fact=12.9.7 envs=isaaclab-gpu-latest,newton-gpu basis=universe"
+            ),
+            "the float refusal must name the basis in its row:\n{stderr}",
+        );
+    }
+
     /// THE MUTATION THAT KEEPS THE GUARD HONEST. A door that reconciled
     /// whenever a fact existed would rewrite every route in the workspace. It
     /// fires only when the route's OWN emitted band excludes the fact: a route

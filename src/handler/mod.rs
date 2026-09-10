@@ -9175,6 +9175,56 @@ fn resolve_workspace_target_for_source(
 /// Extras expansion is BFS with cycle detection (by PEP 503 normalized
 /// name) scoped per-bundle, so two different user entries can independently
 /// pull in the same sub-package.
+/// N27-RETREAD-221. THE WORKSPACE-CONDA-FACT ADMISSION DOOR AS ONE NAMED
+/// STATEMENT GROUP, so that the production call to its fourth arm has a
+/// reader.
+///
+/// FACTS-2 mutated the production call to
+/// `reconcile_kept_routes_with_workspace_facts` away and ALL FIVE of its
+/// guards stayed green -- `### MUT3 CALL-SITE COVERAGE red=0 of 5`, job
+/// 6202272 -- because every guard drove the door method DIRECTLY and none of
+/// them read the one statement in the `conda/outputs` resolve that calls it.
+/// By the reader/writer law that call site was a writer with no reader, and a
+/// green implying coverage that does not exist is worse than a red.
+///
+/// `resolve_all` is `async`, takes a download dir and a channel list, and
+/// reaches the network, so it cannot itself be a unit's subject. This seam is
+/// the smallest thing that IS the production flow: the three arms of
+/// `apply_workspace_conda_fact_ownership` followed, in the same order and the
+/// same statement group, by the fourth. Nothing is added and nothing is
+/// reordered -- the group moved behind a name. Removing the anchored line
+/// below now reds a guard.
+fn run_workspace_conda_fact_admission_doors(
+    bundle: &mut Bundle,
+    effective: &RetreadConfig,
+    fact_name_map: &NameMap,
+    uv_retry_keep: &BTreeSet<PypiKey>,
+    protected_workspace_fact_names: &BTreeSet<String>,
+) -> Result<()> {
+    // Conda-facts-first: workspace-solved provider evidence owns a wheel
+    // dependency unless the pack carries explicit PyPI-side intent. An
+    // all-consumer provider needs no emitted route; a partial provider
+    // replaces a matching stale uv route with the workspace conjunction.
+    // Both flow through `auto_dropped` before auto-bundle scans and joint
+    // route validation.
+    bundle.apply_workspace_conda_fact_ownership(
+        effective,
+        fact_name_map,
+        uv_retry_keep,
+        protected_workspace_fact_names,
+    );
+    // N27-RETREAD-221. THE FOURTH ARM, at the same door and in the same
+    // statement group as the three that precede it. A route the three arms
+    // KEPT, on a conda name the workspace facts also hold at a different
+    // version, is reconciled to the fact (the fact is the base lock's own
+    // version; the route's exactness is a probe artefact) or refused HERE
+    // with a `### ROUTE FACT CONFLICT` row -- never carried into a solve
+    // that dies on it hundreds of seconds later.
+    // FACTS-2-DOOR-CALL (MUTATION ANCHOR)
+    bundle.reconcile_kept_routes_with_workspace_facts(effective)?;
+    Ok(())
+}
+
 async fn resolve_all(
     config: &RetreadConfig,
     target: &ResolutionTarget,
@@ -9702,27 +9752,17 @@ async fn resolve_all(
             // dep that was probed across the whole group.
             bundle.probe_decisions.extend(sub.probe_decisions);
         }
-        // Conda-facts-first: workspace-solved provider evidence owns a wheel
-        // dependency unless the pack carries explicit PyPI-side intent. An
-        // all-consumer provider needs no emitted route; a partial provider
-        // replaces a matching stale uv route with the workspace conjunction.
-        // Both flow through `auto_dropped` before auto-bundle scans and joint
-        // route validation.
-        bundle.apply_workspace_conda_fact_ownership(
+        // N27-RETREAD-221. The four arms of the workspace-conda-fact admission
+        // door, as ONE named statement group so that a unit can drive exactly
+        // what production drives. See
+        // `run_workspace_conda_fact_admission_doors`.
+        run_workspace_conda_fact_admission_doors(
+            &mut bundle,
             &effective,
             &config.name_map,
             &uv_retry_keep,
             &protected_workspace_fact_names,
-        );
-        // N27-RETREAD-221. THE FOURTH ARM, at the same door and in the same
-        // statement group as the three that precede it. A route the three arms
-        // KEPT, on a conda name the workspace facts also hold at a different
-        // version, is reconciled to the fact (the fact is the base lock's own
-        // version; the route's exactness is a probe artefact) or refused HERE
-        // with a `### ROUTE FACT CONFLICT` row -- never carried into a solve
-        // that dies on it hundreds of seconds later.
-        // FACTS-2-DOOR-CALL (MUTATION ANCHOR)
-        bundle.reconcile_kept_routes_with_workspace_facts(&effective)?;
+        )?;
         // Auto-bundle scans the whole merged bundle's Requires-Dist, so
         // it naturally handles transitives pulled by any wheel in the
         // group. Every explicit non-URL entry index joins the candidate
