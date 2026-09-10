@@ -333,6 +333,70 @@ pub struct Record {
     /// the question existed.
     #[serde(default)]
     pub constrains_source: String,
+    /// UNIVERSE-1 / N27-RETREAD-204. Every exact root name the producing
+    /// resolution walked a closure from, as
+    /// [`conda_solve::reachable_roots`](crate::conda_solve::reachable_roots)
+    /// unioned them.
+    ///
+    /// THE DEFECT THIS CLOSES. `consulted_repodata` above names WHOLE
+    /// DOCUMENTS, and a document is a whole channel index -- conda-forge's
+    /// linux-64 index measured 639,918,240 B and rolls inside the 30-minute
+    /// `REPODATA_TTL`. So the containment rule refuses a record whenever ANY of
+    /// ~30,000 packages moved, including every package the stored resolution
+    /// could not reach: DEVPATH-2's record was 89 minutes old, refused, and
+    /// QUARANTINED. Containment is SOUND and far too STRICT.
+    ///
+    /// The reader cannot guess these roots -- the cold pass's route probes
+    /// decide them -- so the record states them, exactly as it states its
+    /// documents, and the reader re-walks them. `serde(default)` so the field is
+    /// additive within `SCHEMA`: an empty set means "written before v3", which
+    /// falls back to v2 containment rather than adopting blind.
+    #[serde(default)]
+    pub reachable_roots: Vec<String>,
+    /// UNIVERSE-1 / N27-RETREAD-204. The v3 digest
+    /// ([`conda_solve::CANDIDATE_UNIVERSE_SCHEMA`](crate::conda_solve::CANDIDATE_UNIVERSE_SCHEMA))
+    /// of the candidate set reachable from [`reachable_roots`](Record::reachable_roots)
+    /// at publish time: per candidate its name, subdir, version, build,
+    /// build_number, archive sha256, file name, `depends` and `constrains`.
+    ///
+    /// This one IS compared, unlike [`repodata_universe`](Record::repodata_universe),
+    /// and the difference is that a reader CAN recompute it before resolving:
+    /// the roots come out of the record, the walk is
+    /// `SparseRepoData::load_records_recursive`, and the digest is folded by the
+    /// same function the writer used. A roll that adds or removes a candidate
+    /// for a reachable name moves it; a roll that touches only unreachable
+    /// packages does not.
+    ///
+    /// `serde(default)` -- empty means "no v3 was recorded", which is a v2
+    /// fallback and never an adoption.
+    #[serde(default)]
+    pub candidate_universe: String,
+}
+
+/// Which of the two universe rules admitted a record.
+///
+/// The variant is printed, not just logged: an operator reading
+/// `### STORE UNIVERSE ... match=v2` is reading "this record predates v3 and was
+/// bridged once", and a fleet that never leaves `match=v2` is a writer that
+/// stopped stamping v3 -- law 2's reader/writer pair, made visible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UniverseMatch {
+    /// The reader re-walked the record's roots and folded the same candidate
+    /// digest. The unrelated-document roll cannot refuse this.
+    V3,
+    /// No comparable v3 on one of the two sides, but every consulted document
+    /// is still present byte-identical -- CONDA-OUT-2's original rule, kept as
+    /// the bridge that makes every record written before tonight adoptable once.
+    V2,
+}
+
+impl std::fmt::Display for UniverseMatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UniverseMatch::V3 => write!(f, "v3"),
+            UniverseMatch::V2 => write!(f, "v2"),
+        }
+    }
 }
 
 /// A record this reader accepted: the payload plus the cold pass's side
@@ -377,6 +441,8 @@ pub fn encode<T: serde::Serialize, A: serde::Serialize>(
     repodata_universe: &str,
     consulted: &[crate::repodata::RepodataDocument],
     constrains_source: &str,
+    reachable_roots: &[String],
+    candidate_universe: &str,
     payload: &T,
     advertised: &A,
 ) -> Result<Vec<u8>, serde_json::Error> {
@@ -396,27 +462,29 @@ pub fn encode<T: serde::Serialize, A: serde::Serialize>(
         repodata_universe: repodata_universe.to_string(),
         consulted_repodata,
         constrains_source: constrains_source.to_string(),
+        // UNIVERSE-1: sorted and deduped at the writer for the same reason the
+        // documents are -- two publishers of one key must not write two
+        // orderings of one root set, or the digests they fold diverge.
+        reachable_roots: {
+            let mut roots = reachable_roots.to_vec();
+            roots.sort();
+            roots.dedup();
+            roots
+        },
+        candidate_universe: candidate_universe.to_string(),
     };
     serde_json::to_vec(&record)
 }
 
-/// Unwrap a stored record, refusing anything whose stamped identity does not
-/// match this reader. A refusal never yields the payload.
-/// CONDA-OUT-2: `reader_documents` is the reader's own on-disk snapshot
-/// (`repodata::snapshot_documents_at`). An adoption requires that every
-/// document the stored resolution consulted is still in it, byte-identical.
+/// The three CHEAP identity checks: wire schema, emission semantics, and the
+/// full input digest. A record that passes them is about these inputs; whether
+/// its WORLD still holds is [`universe_verdict`]'s question.
 ///
-/// N27-RETREAD-62: "still in it" is decided on
-/// [`RepodataDocument::adoption_identity`](crate::repodata::RepodataDocument::adoption_identity)
-/// -- the URL-derived channel key, the subdir and the content hash -- and
-/// NEVER on the whole document, because `channel` is a human label whose two
-/// producers spell it differently by construction. Comparing it made every
-/// stored record unadoptable by every reader, including the one that wrote it.
-pub fn decode(
-    bytes: &[u8],
-    expected_inputs_digest: &str,
-    reader_documents: &[crate::repodata::RepodataDocument],
-) -> Result<Accepted, Refusal> {
+/// UNIVERSE-1 split this out of [`decode`] because the universe half now needs
+/// something the reader can only compute AFTER reading the record — the roots to
+/// re-walk — so the decision cannot be one function any more. It is two, and
+/// this one is the half that costs nothing.
+pub fn parse(bytes: &[u8], expected_inputs_digest: &str) -> Result<Record, Refusal> {
     let record: Record = serde_json::from_slice(bytes).map_err(|_| Refusal::Undecodable)?;
     if record.schema != SCHEMA {
         return Err(Refusal::Schema {
@@ -432,6 +500,56 @@ pub fn decode(
         return Err(Refusal::Inputs {
             found: record.inputs_digest,
         });
+    }
+    Ok(record)
+}
+
+/// Is the world this answer was true in still intact inside the reader's?
+///
+/// TWO RULES, TRIED IN THIS ORDER, AND THE ORDER IS THE WHOLE OF UNIVERSE-1.
+///
+/// **v3 — the candidate set (N27-RETREAD-204).** When the record stamped a
+/// `candidate_universe` and the reader recomputed one for the record's OWN roots
+/// (`reader_candidate_universe`), equality of the two digests is the adoption
+/// test. It is exact, not containment: the reader walked the same roots through
+/// the same fold, so it can compare an equal thing — which is precisely what
+/// CONDA-OUT-2 said a reader could not do, and it was right about the
+/// alternative it had. Its "the reader has not resolved anything" argument
+/// applies to the RESOLUTION, not to the candidate set: the set needs the roots
+/// and a sparse walk, both of which are available before any solve.
+///
+/// **v2 — document containment.** The bridge. A record written before v3 existed
+/// carries no `candidate_universe`, and a reader that could not walk a universe
+/// at all recomputes none; either way the decision falls back to CONDA-OUT-2's
+/// rule unchanged, so every one of the records already in the shared store stays
+/// adoptable exactly as adoptable as it is today. Nothing became MORE adoptable
+/// by this arm — it is byte-for-byte the old test.
+///
+/// WHY v3 FIRST AND NOT v2 FIRST. v2 passing IMPLIES v3 passing (identical
+/// documents produce an identical walk from identical roots), so the two orders
+/// admit exactly the same records and differ only in what they cost and in what
+/// they print. v3 is stated first because it is the RULE and v2 is the bridge,
+/// and the caller is free to skip computing a v3 when v2 already passed — see
+/// `handler::conda_outputs`, which does exactly that so the warm path that
+/// measurably adopts today (job 6167146: hit=14 miss=0, not one repodata row)
+/// pays nothing new.
+///
+/// The refusal is UNCHANGED in shape and still names the first document that
+/// moved, because that is the diagnosis an operator needs: when v3 disagrees the
+/// record's world genuinely rolled under it in a way that could reach its own
+/// resolution.
+pub fn universe_verdict(
+    record: &Record,
+    reader_documents: &[crate::repodata::RepodataDocument],
+    reader_candidate_universe: Option<&str>,
+) -> Result<UniverseMatch, Refusal> {
+    if let (false, Some(reader)) = (
+        record.candidate_universe.is_empty(),
+        reader_candidate_universe,
+    ) {
+        if record.candidate_universe == reader {
+            return Ok(UniverseMatch::V3);
+        }
     }
     // The universe check is LAST of the four on purpose: it is the only one
     // that costs a set membership over the reader's snapshot, and the three
@@ -465,10 +583,46 @@ pub fn decode(
             missing: document_label(missing),
         });
     }
-    Ok(Accepted {
+    Ok(UniverseMatch::V2)
+}
+
+/// Take the payload and the cold pass's side effects out of an admitted record.
+/// Separate from [`universe_verdict`] so no caller can reach a payload without
+/// having asked for a verdict first.
+pub fn accept(record: Record) -> Accepted {
+    Accepted {
         payload: record.payload,
         advertised: record.advertised,
-    })
+    }
+}
+
+/// Unwrap a stored record, refusing anything whose stamped identity does not
+/// match this reader. A refusal never yields the payload.
+/// CONDA-OUT-2: `reader_documents` is the reader's own on-disk snapshot
+/// (`repodata::snapshot_documents_at`). An adoption requires that every
+/// document the stored resolution consulted is still in it, byte-identical.
+///
+/// N27-RETREAD-62: "still in it" is decided on
+/// [`RepodataDocument::adoption_identity`](crate::repodata::RepodataDocument::adoption_identity)
+/// -- the URL-derived channel key, the subdir and the content hash -- and
+/// NEVER on the whole document, because `channel` is a human label whose two
+/// producers spell it differently by construction. Comparing it made every
+/// stored record unadoptable by every reader, including the one that wrote it.
+///
+/// UNIVERSE-1: this is the v2-ONLY composition — it passes no reader candidate
+/// universe, so it decides on document containment exactly as it always did. It
+/// is what every caller that has no universe to walk should use, and it is the
+/// shape all of CONDA-OUT-2's and N27-RETREAD-62's guards keep asserting
+/// against. The production consult calls [`parse`] + [`universe_verdict`] +
+/// [`accept`] instead, because only it can compute a v3.
+pub fn decode(
+    bytes: &[u8],
+    expected_inputs_digest: &str,
+    reader_documents: &[crate::repodata::RepodataDocument],
+) -> Result<Accepted, Refusal> {
+    let record = parse(bytes, expected_inputs_digest)?;
+    universe_verdict(&record, reader_documents, None)?;
+    Ok(accept(record))
 }
 
 /// The payload filename inside an entry.
@@ -774,6 +928,8 @@ mod tests {
             &crate::repodata::universe_digest_of(consulted),
             consulted,
             "universe",
+            &[],
+            "",
             &serde_json::json!({"outputs": []}),
             &serde_json::json!([{"name": "pack", "build": "py311_hdeadbeef_loose_5"}]),
         )
@@ -990,6 +1146,8 @@ mod tests {
             &crate::repodata::universe_digest_of(&world),
             &world,
             "locked",
+            &[],
+            "",
             &serde_json::json!({"outputs": []}),
             &serde_json::json!([]),
         )
@@ -1572,5 +1730,297 @@ mod tests {
             "a complete entry is never overwritten"
         );
         assert_eq!(store.get("k1").1.as_deref(), Some(&b"first"[..]));
+    }
+
+    // ------------------------------------------------------------------
+    // UNIVERSE-1 / N27-RETREAD-204: adoption is decided on the CANDIDATE SET
+    // the stored resolution could reach, not on whole document bytes.
+    // ------------------------------------------------------------------
+
+    const U1_CHANNEL: &str = "https://prefix.dev/conda-forge";
+    const U1_SUBDIR: &str = "linux-64";
+
+    fn u1_sha(c: char) -> String {
+        std::iter::repeat(c).take(64).collect()
+    }
+
+    /// One repodata document, with the three packages the guards below move one
+    /// of. `pack-root` is the reachable ROOT, `libreach` is reachable through
+    /// its `depends`, and `unrelated` sits in the same document reachable from
+    /// nothing -- which is the whole point: a document is a WHOLE channel index,
+    /// and conda-forge/linux-64 measured 639,918,240 B of ~30,000 packages, of
+    /// which one pack's resolution reaches a few hundred.
+    fn u1_document(libreach_sha: &str, unrelated_version: &str, extra_candidate: &str) -> String {
+        let root_sha = u1_sha('1');
+        let unrelated_sha = u1_sha('3');
+        format!(
+            r#"{{"info":{{"subdir":"linux-64"}},"packages":{{
+"pack-root-1.0-h0.tar.bz2":{{"name":"pack-root","version":"1.0","build":"h0","build_number":0,"subdir":"linux-64","depends":["libreach >=1.0"],"sha256":"{root_sha}","size":1}},
+"libreach-1.0-h0.tar.bz2":{{"name":"libreach","version":"1.0","build":"h0","build_number":0,"subdir":"linux-64","depends":[],"sha256":"{libreach_sha}","size":1}},
+"unrelated-{unrelated_version}-h0.tar.bz2":{{"name":"unrelated","version":"{unrelated_version}","build":"h0","build_number":0,"subdir":"linux-64","depends":[],"sha256":"{unrelated_sha}","size":1}}{extra_candidate}
+}}}}"#
+        )
+    }
+
+    /// The document every guard starts from.
+    fn u1_base() -> String {
+        u1_document(&u1_sha('2'), "1.0", "")
+    }
+
+    fn u1_block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("guard runtime")
+            .block_on(future)
+    }
+
+    /// Write one document into `dir` under BOTH the reader's
+    /// `retread-repodata` cache-root name and a plain path the sparse loader can
+    /// mmap, and return `(reader documents, the WRITER's spelling of that same
+    /// document, the sparse path)`.
+    ///
+    /// Both halves come off the SAME bytes, exactly as they do in production:
+    /// `plant` + `universe_from_cache_root` is the reader's real producer, and
+    /// `as_the_writer_named_it` is the writer's.
+    fn u1_world(
+        dir: &Path,
+        body: &str,
+    ) -> (
+        Vec<crate::repodata::RepodataDocument>,
+        crate::repodata::RepodataDocument,
+        PathBuf,
+    ) {
+        plant(dir, U1_CHANNEL, U1_SUBDIR, body.as_bytes());
+        let reader = crate::repodata::universe_from_cache_root(dir).unwrap();
+        let writer = as_the_writer_named_it(&reader, U1_CHANNEL, U1_SUBDIR);
+        let sparse = dir.join("sparse-repodata.json");
+        std::fs::write(&sparse, body.as_bytes()).expect("sparse fixture");
+        (reader, writer, sparse)
+    }
+
+    /// A v3 record: the roots the resolution walked, and the digest of the
+    /// candidate set it could reach.
+    fn u1_record(
+        consulted: &[crate::repodata::RepodataDocument],
+        roots: &[&str],
+        candidate_universe: &str,
+    ) -> Vec<u8> {
+        encode(
+            "digest-u1",
+            "1.2.3+deadbeef",
+            &crate::repodata::universe_digest_of(consulted),
+            consulted,
+            "universe",
+            &roots.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
+            candidate_universe,
+            &serde_json::json!({"outputs": []}),
+            &serde_json::json!([]),
+        )
+        .unwrap()
+    }
+
+    /// The REAL walk and the REAL fold, over the fixture document.
+    fn u1_digest(sparse: &Path) -> String {
+        u1_block_on(crate::conda_solve::candidate_universe_over_document(
+            U1_CHANNEL,
+            U1_SUBDIR,
+            sparse,
+            &["pack-root"],
+        ))
+        .expect("the fixture document must yield a candidate universe")
+    }
+
+    /// UNIVERSE-1 GUARD (a) -- A BYTE MOVED ON AN UNREACHABLE PACKAGE, AND THE
+    /// RECORD IS ADOPTED.
+    ///
+    /// THE DEFECT, MEASURED. The store's rule was containment of WHOLE
+    /// documents, and conda-forge/linux-64 is one document of 639,918,240 B that
+    /// rolls inside the 30-minute `REPODATA_TTL`. DEVPATH-2's record was 89
+    /// minutes old when a reader refused it and QUARANTINED it -- renamed
+    /// production's record away -- because the index had rolled, not because
+    /// anything that record's own resolution could reach had changed. The price
+    /// is a full cold `conda/outputs`: 389 s for one pack in job 6182399.
+    ///
+    /// This guard IS that shape. `unrelated` moves 1.0 -> 1.1, so the document's
+    /// sha256 moves and v2 containment must refuse -- asserted, non-vacuously --
+    /// while the candidate set reachable from `pack-root` is identical, so v3
+    /// matches and the record is adopted.
+    #[test]
+    fn u1_a_a_roll_on_an_unreachable_package_still_adopts() {
+        let publisher = Scratch::new("u1-a-pub");
+        let requester = Scratch::new("u1-a-req");
+        let (_pub_reader, writer, pub_sparse) = u1_world(publisher.path(), &u1_base());
+        let (reader, _reader_writer, req_sparse) =
+            u1_world(requester.path(), &u1_document(&u1_sha('2'), "1.1", ""));
+
+        // NON-VACUITY 1: the document genuinely rolled, so the v2 rule this
+        // guard exists to replace really does refuse here.
+        assert_ne!(
+            reader[0].sha256, writer.sha256,
+            "the fixture must actually roll the document, or this guard is empty"
+        );
+        let bytes = u1_record(&[writer.clone()], &["pack-root"], &u1_digest(&pub_sparse));
+        let record = parse(&bytes, "digest-u1").unwrap();
+        assert!(
+            matches!(
+                universe_verdict(&record, &reader, None),
+                Err(Refusal::Universe { .. })
+            ),
+            "v2 containment MUST refuse this reader -- that is the defect"
+        );
+
+        // NON-VACUITY 2: and the candidate set really is unchanged.
+        let reader_v3 = u1_digest(&req_sparse);
+        assert_eq!(
+            reader_v3, record.candidate_universe,
+            "an unreachable package cannot move the reachable candidate set"
+        );
+        assert_eq!(
+            universe_verdict(&record, &reader, Some(&reader_v3)),
+            Ok(UniverseMatch::V3),
+            "the record must be adopted on the candidate set"
+        );
+    }
+
+    /// UNIVERSE-1 GUARD (b) -- A NEW CANDIDATE FOR A REACHABLE NAME REFUSES.
+    ///
+    /// The soundness half, and the risk the brief for this lane names: a roll
+    /// that adds a NEWER version of a package the resolution reached may change
+    /// what the solve would pick, so the stored answer may be stale. The digest
+    /// is therefore over the CANDIDATE SET for the reachable names and not over
+    /// the records the old solve chose -- `libreach 1.1` appears, nothing else
+    /// moves, and the record must refuse even though every record the old solve
+    /// chose is still present byte-identical.
+    #[test]
+    fn u1_b_a_new_candidate_for_a_reachable_name_refuses() {
+        let publisher = Scratch::new("u1-b-pub");
+        let requester = Scratch::new("u1-b-req");
+        let (_pub_reader, writer, pub_sparse) = u1_world(publisher.path(), &u1_base());
+        let added = format!(
+            r#",
+"libreach-1.1-h0.tar.bz2":{{"name":"libreach","version":"1.1","build":"h0","build_number":0,"subdir":"linux-64","depends":[],"sha256":"{}","size":1}}"#,
+            u1_sha('4')
+        );
+        let (reader, _w, req_sparse) =
+            u1_world(requester.path(), &u1_document(&u1_sha('2'), "1.0", &added));
+
+        let bytes = u1_record(&[writer.clone()], &["pack-root"], &u1_digest(&pub_sparse));
+        let record = parse(&bytes, "digest-u1").unwrap();
+        let reader_v3 = u1_digest(&req_sparse);
+        assert_ne!(
+            reader_v3, record.candidate_universe,
+            "a new candidate for a REACHABLE name must move the digest"
+        );
+        match universe_verdict(&record, &reader, Some(&reader_v3)) {
+            Err(Refusal::Universe { recorded, missing }) => {
+                assert_eq!(recorded, 1);
+                assert!(
+                    missing.contains(&writer.sha256),
+                    "the refusal must still name the document that moved: {missing}"
+                );
+            }
+            other => panic!("a new reachable candidate must refuse: {other:?}"),
+        }
+    }
+
+    /// UNIVERSE-1 GUARD (c) -- THE CHOSEN RECORD'S OWN sha256 MOVED: REFUSE.
+    ///
+    /// The narrowest hole a `(name, version, build)` digest would leave open: an
+    /// artifact REPLACED at an unchanged version and build. Nothing about the
+    /// candidate LIST changes, only the bytes the resolution resolved against --
+    /// so `sha256` is in the fold, and this guard is what says so.
+    #[test]
+    fn u1_c_a_replaced_artifact_at_the_same_version_refuses() {
+        let publisher = Scratch::new("u1-c-pub");
+        let requester = Scratch::new("u1-c-req");
+        let (_pub_reader, writer, pub_sparse) = u1_world(publisher.path(), &u1_base());
+        let (reader, _w, req_sparse) =
+            u1_world(requester.path(), &u1_document(&u1_sha('9'), "1.0", ""));
+
+        let bytes = u1_record(&[writer.clone()], &["pack-root"], &u1_digest(&pub_sparse));
+        let record = parse(&bytes, "digest-u1").unwrap();
+        let reader_v3 = u1_digest(&req_sparse);
+        assert_ne!(
+            reader_v3, record.candidate_universe,
+            "a replaced artifact at one version+build must still move the digest"
+        );
+        assert!(
+            matches!(
+                universe_verdict(&record, &reader, Some(&reader_v3)),
+                Err(Refusal::Universe { .. })
+            ),
+            "a replaced reachable artifact must refuse"
+        );
+    }
+
+    /// UNIVERSE-1 GUARD (d) -- A RECORD WRITTEN BEFORE v3 IS STILL ADOPTED, BY
+    /// v2, AND THE ARM SAYS SO.
+    ///
+    /// The bridge. 307 entries sit in the shared store and not one carries a
+    /// candidate universe; if v3 refused them this fix would have cost more than
+    /// the defect on its first night. So a record with an empty
+    /// `candidate_universe` falls back to CONDA-OUT-2's containment rule
+    /// UNCHANGED -- and the verdict is `V2`, not `V3`, so
+    /// `handler::conda_outputs` names the arm in its row and a fleet stuck on the
+    /// bridge is one grep away.
+    #[test]
+    fn u1_d_a_v2_only_record_is_adopted_by_the_bridge() {
+        let dir = Scratch::new("u1-d");
+        let (reader, writer, _sparse) = u1_world(dir.path(), &u1_base());
+        let bytes = u1_record(&[writer.clone()], &[], "");
+        let record = parse(&bytes, "digest-u1").unwrap();
+        assert!(
+            record.candidate_universe.is_empty() && record.reachable_roots.is_empty(),
+            "the fixture must be a record from before v3"
+        );
+        assert_eq!(
+            universe_verdict(&record, &reader, None),
+            Ok(UniverseMatch::V2),
+            "a pre-v3 record in an intact world must still adopt, through the bridge"
+        );
+        assert_eq!(
+            universe_verdict(&record, &reader, Some("a-digest-that-matches-nothing")),
+            Ok(UniverseMatch::V2),
+            "and a reader that DID compute a v3 must not refuse it for lacking one"
+        );
+        // And the bridge is not a hole: the same pre-v3 record in a MOVED world
+        // still refuses, exactly as it did before tonight.
+        let moved = Scratch::new("u1-d-moved");
+        let (moved_reader, _w, _s) = u1_world(moved.path(), &u1_document(&u1_sha('2'), "1.1", ""));
+        assert!(
+            matches!(
+                universe_verdict(&record, &moved_reader, None),
+                Err(Refusal::Universe { .. })
+            ),
+            "the bridge must be CONDA-OUT-2's rule unchanged, not a waiver"
+        );
+    }
+
+    /// UNIVERSE-1 -- THE WRITER STAMPS WHAT THE READER READS.
+    ///
+    /// Law 2 in one assertion: `encode` must put the roots and the digest where
+    /// `parse` finds them, sorted and deduped, or the two halves of an adoption
+    /// are talking past each other.
+    #[test]
+    fn u1_the_record_carries_the_roots_sorted_and_deduped() {
+        let dir = Scratch::new("u1-roundtrip");
+        let (_reader, writer, _sparse) = u1_world(dir.path(), &u1_base());
+        let bytes = u1_record(
+            &[writer],
+            &["zlib", "pack-root", "zlib", "libreach"],
+            "cafebabecafebabe",
+        );
+        let record = parse(&bytes, "digest-u1").unwrap();
+        assert_eq!(
+            record.reachable_roots,
+            vec![
+                "libreach".to_string(),
+                "pack-root".to_string(),
+                "zlib".to_string()
+            ],
+            "two publishers of one key must not write two orderings of one root set"
+        );
+        assert_eq!(record.candidate_universe, "cafebabecafebabe");
     }
 }

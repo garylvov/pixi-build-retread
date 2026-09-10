@@ -5779,40 +5779,102 @@ impl Handler {
             // schema and the full input digest must all match this reader, and
             // anything else is a miss with a named reason. This is what makes
             // it safe for the key to have stopped folding the git hash.
+            // UNIVERSE-1 / N27-RETREAD-204. The decision is now TWO calls and
+            // not one, because the v3 arm needs something only the record can
+            // supply -- the roots the stored resolution walked from -- and then
+            // an `await` to re-walk them. So this is written out rather than
+            // folded into an `and_then` closure: a closure cannot await.
+            //
+            // THE ORDER IS THE COST CONTROL, and it is the same argument
+            // ORDER-1's `snapshot_documents_after_universe` makes. v2
+            // containment passing IMPLIES v3 passing (identical documents, same
+            // roots, same fold), so trying v2 FIRST admits exactly the records
+            // v3-first would and costs nothing: the warm reader that measurably
+            // adopts today (job 6167146: hit=14, miss=0, zero repodata rows in
+            // the whole backend log) never walks a candidate set at all. The v3
+            // walk happens only where v2 REFUSED -- which today costs a full
+            // cold closure (measured 389 s for one pack in job 6182399), so a
+            // sparse walk there is unambiguously cheaper than the alternative.
             let mut refusal: Option<crate::built_output_store::Refusal> = None;
             let mut adopted_advertised: Vec<AdvertisedIdentityRecord> = Vec::new();
-            let cached = payload.as_deref().and_then(|bytes| {
-                match crate::built_output_store::decode(
-                    bytes,
-                    &store_key.inputs_digest,
-                    &reader_documents,
-                ) {
-                    Ok(accepted) => {
-                        match serde_json::from_value::<CondaOutputsResult>(accepted.payload) {
-                            Ok(result) => {
-                                // The cold pass's side effects travel with the
-                                // payload; an adoption that skipped them would
-                                // be a hit that a later RPC refuses.
-                                adopted_advertised = serde_json::from_value::<
-                                    Vec<AdvertisedIdentityRecord>,
-                                >(
-                                    accepted.advertised
-                                )
-                                .unwrap_or_default();
-                                Some(result)
+            let mut cached: Option<CondaOutputsResult> = None;
+            let mut universe_match: Option<crate::built_output_store::UniverseMatch> = None;
+            let mut reader_candidate_universe: Option<String> = None;
+            if let Some(bytes) = payload.as_deref() {
+                match crate::built_output_store::parse(bytes, &store_key.inputs_digest) {
+                    Ok(record) => {
+                        let mut verdict = crate::built_output_store::universe_verdict(
+                            &record,
+                            &reader_documents,
+                            None,
+                        );
+                        if verdict.is_err() && !record.candidate_universe.is_empty() {
+                            reader_candidate_universe = crate::conda_solve::candidate_universe(
+                                &params.channels,
+                                cache_target.conda_subdir(),
+                                &record.reachable_roots,
+                            )
+                            .await;
+                            verdict = crate::built_output_store::universe_verdict(
+                                &record,
+                                &reader_documents,
+                                reader_candidate_universe.as_deref(),
+                            );
+                        }
+                        // STDERR, never STDOUT -- see the `### STORE CONSULT`
+                        // row above and `rpc::tests::no_println_reaches_the_json_rpc_channel`.
+                        eprintln!(
+                            "### STORE UNIVERSE v3={} v2={} record_v3={} record_v2={} roots={} match={}",
+                            reader_candidate_universe.as_deref().unwrap_or("not-computed"),
+                            crate::repodata::universe_digest_of(&reader_documents),
+                            if record.candidate_universe.is_empty() {
+                                "none"
+                            } else {
+                                record.candidate_universe.as_str()
+                            },
+                            if record.repodata_universe.is_empty() {
+                                "none"
+                            } else {
+                                record.repodata_universe.as_str()
+                            },
+                            record.reachable_roots.len(),
+                            match &verdict {
+                                Ok(matched) => matched.to_string(),
+                                Err(_) => "none".to_string(),
+                            },
+                        );
+                        match verdict {
+                            Ok(matched) => {
+                                universe_match = Some(matched);
+                                let accepted = crate::built_output_store::accept(record);
+                                match serde_json::from_value::<CondaOutputsResult>(
+                                    accepted.payload,
+                                ) {
+                                    Ok(result) => {
+                                        // The cold pass's side effects travel with the
+                                        // payload; an adoption that skipped them would
+                                        // be a hit that a later RPC refuses.
+                                        adopted_advertised = serde_json::from_value::<
+                                            Vec<AdvertisedIdentityRecord>,
+                                        >(
+                                            accepted.advertised
+                                        )
+                                        .unwrap_or_default();
+                                        cached = Some(result);
+                                    }
+                                    Err(_) => {
+                                        refusal = Some(
+                                            crate::built_output_store::Refusal::Undecodable,
+                                        );
+                                    }
+                                }
                             }
-                            Err(_) => {
-                                refusal = Some(crate::built_output_store::Refusal::Undecodable);
-                                None
-                            }
+                            Err(why) => refusal = Some(why),
                         }
                     }
-                    Err(why) => {
-                        refusal = Some(why);
-                        None
-                    }
+                    Err(why) => refusal = Some(why),
                 }
-            });
+            }
             match (&lookup, &cached) {
                 (crate::built_output_store::Lookup::Hit, Some(cached)) => {
                     tracing::info!(
@@ -5825,6 +5887,36 @@ impl Handler {
                     // the reaper ages this entry from its publish and evicts
                     // the one the nightly relock adopts every time.
                     store.stamp_used(key);
+                    // UNIVERSE-1 / N27-RETREAD-204. A record adopted through
+                    // the v2 BRIDGE carries no `candidate_universe`, and this
+                    // process CANNOT stamp one for it. Saying so here rather
+                    // than leaving it implied, because the brief for this lane
+                    // asked for the opposite and the opposite is unsound:
+                    //
+                    // the digest is over the candidate set reachable from THIS
+                    // pack's question, and a hit returns BEFORE any closure is
+                    // walked, so the only roots this process holds are the ones
+                    // some OTHER pack's cold compute left in the registry. A
+                    // relock consults this store fourteen times; stamping pack
+                    // 7's record with pack 1's roots would write a digest of a
+                    // different question and make every later reader adopt on a
+                    // world it never consulted -- N27-RETREAD-62's defect with
+                    // the sign flipped, and this time it would adopt rather than
+                    // refuse. There is exactly one producer of a pack's root set
+                    // and it is that pack's cold compute, which publishes a v3
+                    // record at the bottom of this function.
+                    //
+                    // So the bridge is per-RECORD, not per-run: a record written
+                    // before v3 is adopted by v2 for the rest of its fourteen
+                    // days and gains v3 when a cold recompute replaces it. The
+                    // row says which arm admitted it, so a fleet stuck on `v2`
+                    // is visible in one grep.
+                    if universe_match == Some(crate::built_output_store::UniverseMatch::V2) {
+                        tracing::info!(
+                            key = %key,
+                            "bench: built_output_store adopted through the v2 document-containment bridge -- this record predates the candidate-set rule (N27-RETREAD-204)",
+                        );
+                    }
                     crate::status::tty(
                         "reusing a previously-computed solve for this source package from the shared built-output store.",
                     );
@@ -6976,12 +7068,40 @@ impl Handler {
                         "bench: built_output_store quarantined the refused entry so this cold result can take its address",
                     );
                 }
+                // UNIVERSE-1 / N27-RETREAD-204. The CANDIDATE-SET half of the
+                // world, also taken after the resolution and for the same
+                // reason: `reachable_roots` is the registry of every exact root
+                // name this process walked a closure from, and it is empty until
+                // a closure has been walked. The digest is folded by the same
+                // `candidate_universe` the READER calls, over the same roots, so
+                // the two halves of an adoption cannot compute it two ways --
+                // the divergence N27-RETREAD-62 measured when one fact had two
+                // spellings. The pairs are already mmapped in this process by
+                // the resolution that just finished, so this walk is a memory
+                // walk and not a fetch.
+                let reachable_roots = crate::conda_solve::reachable_roots();
+                let candidate_universe = crate::conda_solve::candidate_universe(
+                    &params.channels,
+                    cache_target.conda_subdir(),
+                    &reachable_roots,
+                )
+                .await
+                .unwrap_or_default();
+                if candidate_universe.is_empty() {
+                    tracing::warn!(
+                        key = %key,
+                        roots = reachable_roots.len(),
+                        "bench: built_output_store publishing a record with NO candidate universe; every reader will fall back to whole-document containment (N27-RETREAD-204)",
+                    );
+                }
                 match crate::built_output_store::encode(
                     &store_key.inputs_digest,
                     backend_build_identity(),
                     &crate::repodata::universe_digest_of(&consulted),
                     &consulted,
                     &store_key.constrains_source,
+                    &reachable_roots,
+                    &candidate_universe,
                     &result,
                     &published_advertised_identities,
                 ) {

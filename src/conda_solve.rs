@@ -823,6 +823,11 @@ async fn load_selected_records_sparse_from_pairs(
 ) -> SparseLoadResult {
     use rattler_repodata_gateway::sparse::{PackageFormatSelection, SparseRepoData};
     let consulted: Vec<String> = pairs.iter().map(|(label, _)| label.clone()).collect();
+    // UNIVERSE-1 / N27-RETREAD-204. The writer's half of the candidate-set
+    // adoption rule, registered HERE because this is the one place in the
+    // process that walks a closure -- a second registration site would be a
+    // second producer of "which roots did this resolution reach from".
+    record_reachable_roots(&root_names);
     let roots = root_names.len();
     let t = std::time::Instant::now();
     let per_repo = match tokio::task::spawn_blocking(move || {
@@ -864,6 +869,201 @@ async fn load_selected_records_sparse_from_pairs(
     Ok((records, consulted))
 }
 
+
+/// UNIVERSE-1 / N27-RETREAD-204. Wire tag of the CANDIDATE-SET fingerprint the
+/// built-output store adopts on. Bumped when the folding rule changes meaning;
+/// a record carrying a different tag describes a different rule and must not be
+/// compared with this one.
+///
+/// It is deliberately a SIBLING of [`crate::repodata::UNIVERSE_SCHEMA`]
+/// (`retread-conda-universe-v2`) and not a replacement: v2 folds whole
+/// documents, v3 folds the records a resolution could reach, and the store
+/// carries both so a record written before v3 existed stays adoptable.
+pub(crate) const CANDIDATE_UNIVERSE_SCHEMA: &str = "retread-conda-universe-v3";
+
+/// Every exact root name any sparse walk in this process seeded from, unioned.
+///
+/// THE DEFECT THIS EXISTS FOR (N27-RETREAD-204). The built-output store adopts
+/// a record only when every repodata DOCUMENT the stored resolution consulted
+/// is still present byte-identical. A document is the whole channel index:
+/// conda-forge/linux-64 measured 639,918,240 B and rolls within the 30-minute
+/// `REPODATA_TTL`, so ANY upload to ANY of its ~30,000 packages refuses a
+/// record whose own resolution could not have reached that package. DEVPATH-2's
+/// 89-minute-old record was refused and quarantined for exactly that.
+///
+/// What a resolution actually depends on is the transitive closure
+/// `load_records_recursive` walks from its root names. So the record must name
+/// its roots, and the reader must be able to re-walk them: this registry is the
+/// writer's half, filled by [`load_selected_records_sparse_from_pairs`], which
+/// is the ONE place in the process that walks a closure.
+///
+/// A `BTreeSet<String>` and not `PackageName`, because the set is serialised
+/// into the record and read back by a reader that only has strings.
+static REACHABLE_ROOTS: std::sync::OnceLock<std::sync::Mutex<BTreeSet<String>>> =
+    std::sync::OnceLock::new();
+
+fn reachable_roots_registry() -> &'static std::sync::Mutex<BTreeSet<String>> {
+    REACHABLE_ROOTS.get_or_init(|| std::sync::Mutex::new(BTreeSet::new()))
+}
+
+/// Union `names` into the process's reachable-root registry.
+fn record_reachable_roots(names: &[PackageName]) {
+    let mut registry = reachable_roots_registry().lock().unwrap();
+    for name in names {
+        registry.insert(name.as_normalized().to_string());
+    }
+}
+
+/// Every root name this process has walked from, sorted and deduped.
+///
+/// Sorted here and not by the caller, for the same reason
+/// [`crate::repodata::universe_digest_of`] sorts its own input: two publishers
+/// of one key must not write two orderings of one set.
+pub(crate) fn reachable_roots() -> Vec<String> {
+    reachable_roots_registry()
+        .lock()
+        .unwrap()
+        .iter()
+        .cloned()
+        .collect()
+}
+
+/// Fold a CANDIDATE SET into one digest: every field of every reachable record
+/// that a resolvo verdict can turn on, in a canonical order.
+///
+/// WHY THESE FIELDS AND NOT THE BRIEF'S `(version, build, sha256)`. A
+/// conda-forge repodata PATCH rewrites `depends`/`constrains` for an artifact
+/// that already exists — the archive's `sha256` does not move, and the
+/// `run_exports flap` SHARD-DIGEST-1 measured is exactly that shape. A digest
+/// over `(version, build, sha256)` alone would adopt a record whose emitted
+/// pins a patch has since invalidated. `sha256` is kept as well, because it is
+/// the one field that catches a REPLACED artifact at an unchanged version+build.
+///
+/// `channel` is excluded, and that is N27-RETREAD-62's rule applied here: it is
+/// a human label whose two producers spell it differently by construction.
+/// `subdir` and `file_name` carry the same information with one spelling.
+fn candidate_universe_digest_of(records: &[RepoDataRecord]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut lines: Vec<String> = records
+        .iter()
+        .map(|record| {
+            let package = &record.package_record;
+            let sha = package
+                .sha256
+                .as_ref()
+                .map(|hash| hash.iter().map(|b| format!("{b:02x}")).collect::<String>())
+                .unwrap_or_default();
+            format!(
+                "{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}",
+                package.name.as_normalized(),
+                package.subdir,
+                package.version.as_str(),
+                package.build,
+                package.build_number,
+                sha,
+                record.file_name,
+                package.depends.join("\u{2}"),
+                package.constrains.join("\u{2}"),
+            )
+        })
+        .collect();
+    lines.sort();
+    lines.dedup();
+    let mut hasher = Sha256::new();
+    hasher.update(CANDIDATE_UNIVERSE_SCHEMA.as_bytes());
+    hasher.update([0u8]);
+    for line in &lines {
+        hasher.update(line.as_bytes());
+        hasher.update([0u8]);
+    }
+    let digest = hasher.finalize();
+    digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
+}
+
+/// The v3 digest of the candidate set reachable from `roots` in
+/// `channels x [target_subdir, noarch]`.
+///
+/// The WRITER and the READER both go through this one function with the same
+/// roots, so the two halves of an adoption cannot compute the digest two ways —
+/// the divergence N27-RETREAD-62 measured when `channel` had two spellings.
+/// `None` means no repodata could be walked at all (empty fan-out, or a failed
+/// load): a reader that cannot see a universe must fall back to v2 containment,
+/// never adopt.
+pub(crate) async fn candidate_universe(
+    channels: &[ChannelUrl],
+    target_subdir: &str,
+    roots: &[String],
+) -> Option<String> {
+    if roots.is_empty() {
+        return None;
+    }
+    let root_names: Vec<PackageName> = roots
+        .iter()
+        .filter_map(|raw| PackageName::try_from(raw.as_str()).ok())
+        .collect();
+    if root_names.is_empty() {
+        return None;
+    }
+    let pairs: Arc<[SparsePair]> = crate::repodata::sparse_pairs(channels, target_subdir)
+        .await
+        .into();
+    candidate_universe_from_pairs(pairs, &root_names).await
+}
+
+/// [`candidate_universe`] with the fan-out INJECTED, so a guard can drive the
+/// real walk and the real fold over an in-memory repodata document with no
+/// filesystem and no network -- the same shape ORDER-1's
+/// `snapshot_documents_after_universe_with` uses for the same reason.
+pub(crate) async fn candidate_universe_from_pairs(
+    pairs: Arc<[SparsePair]>,
+    root_names: &[PackageName],
+) -> Option<String> {
+    if pairs.is_empty() || root_names.is_empty() {
+        return None;
+    }
+    match load_selected_records_sparse_from_pairs(pairs, root_names.to_vec()).await {
+        Ok((records, _consulted)) if !records.is_empty() => {
+            Some(candidate_universe_digest_of(&records))
+        }
+        _ => None,
+    }
+}
+
+/// UNIVERSE-1's guard door: the REAL walk and the REAL fold over one repodata
+/// document held in memory.
+///
+/// It exists so the built-output store's adoption guards can move ONE package's
+/// bytes in a document and read the consequence for the candidate digest,
+/// without a network, a cache root, or a `SparsePair` type they cannot name.
+/// The fixture is the document; everything downstream of it is production code.
+/// `document` is a path so the mmapped `from_file` constructor production uses is
+/// the one under test.
+#[cfg(test)]
+pub(crate) async fn candidate_universe_over_document(
+    channel_url: &str,
+    subdir: &str,
+    document: &std::path::Path,
+    roots: &[&str],
+) -> Option<String> {
+    use rattler_conda_types::{Channel, ChannelConfig};
+    let cfg = ChannelConfig::default_with_root_dir(std::env::temp_dir());
+    let channel = Channel::from_str(channel_url, &cfg).expect("fixture channel URL must parse");
+    let handle = std::sync::Arc::new(
+        rattler_repodata_gateway::sparse::SparseRepoData::from_file(
+            channel,
+            subdir.to_string(),
+            document,
+            None,
+        )
+        .expect("fixture repodata must parse"),
+    );
+    let pairs: Arc<[SparsePair]> = vec![(format!("{channel_url}/{subdir}"), handle)].into();
+    let root_names: Vec<PackageName> = roots
+        .iter()
+        .map(|raw| PackageName::try_from(*raw).expect("fixture root name must parse"))
+        .collect();
+    candidate_universe_from_pairs(pairs, &root_names).await
+}
 /// The sysroot chosen independently of the compiler solve.
 ///
 /// Keep both representations: the parsed glibc pair drives wheel tags and
