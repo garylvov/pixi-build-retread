@@ -928,6 +928,7 @@ fn courier_pure_python_bundle_is_platform_specific_not_noarch() {
         uv_dependency_graph: Default::default(),
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
+        constrains_basis: Default::default(),
         workspace_selected_conda_packages: Default::default(),
         workspace_declared_pypi: Default::default(),
         workspace_locked_pypi: Default::default(),
@@ -1013,6 +1014,7 @@ fn produce_output_emits_auto_routed_conda_run_deps() {
         uv_dependency_graph: Default::default(),
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
+        constrains_basis: Default::default(),
         workspace_selected_conda_packages: Default::default(),
         workspace_declared_pypi: Default::default(),
         workspace_locked_pypi: Default::default(),
@@ -1676,7 +1678,7 @@ fn hub_constrains_entry(output: &super::CondaOutput) -> Option<String> {
 }
 
 #[test]
-fn a_learned_conda_fact_yields_to_a_cap_only_while_the_held_version_can_satisfy_it() {
+fn a_learned_conda_fact_yields_to_a_cap_unless_a_lock_holds_a_version_the_cap_excludes() {
     // D1 turn 13, SUPERSEDED IN ONE DIRECTION BY CAPWINS-8, and said plainly
     // rather than quietly rewritten. t13 MEASURED, on the v10 viral-gpu backend
     // log, the carry firing and being thrown away, VERBATIM --
@@ -1696,26 +1698,57 @@ fn a_learned_conda_fact_yields_to_a_cap_only_while_the_held_version_can_satisfy_
     // grant, and relock 6150106 proved what it is instead: the whole lock dies
     // two layers away, on `eigenpy` rather than `huggingface_hub`, naming
     // neither the capping wheel nor the fact's provenance. The ADMISSION door
-    // had already decided this exact crossing was to be tolerated. So the
-    // ceiling direction is now OMITTED with the `### CONSTRAINS BOUND-UNRESOLVED`
-    // row (half one below), and t13's ruling stands untouched wherever the cap
-    // stays satisfiable (half two).
+    // had already decided this exact crossing was to be tolerated.
+    //
+    // AND THEN CAPWINS-9 (N27-RETREAD-198) FOUND THAT ff3795d APPLIED THAT
+    // SUPERSESSION TO THE WRONG HALF OF t13's OWN FIXTURE, WHICH IS WHY THIS
+    // TEST IS SHAPED IN THREE PARTS AND RENAMED AGAIN. Read t13's own words: the
+    // `==1.28.0` "is NOT in pixi.toml. It is what the sibling envs' last solve
+    // resolved to -- a LEARNED float." A float is not a held version. Nothing
+    // in that log says any environment's committed lock pinned 1.28.0, so
+    // "the consuming environments' HELD version cannot satisfy the cap" was
+    // never a true sentence about this fixture, and ff3795d asserted the
+    // omission here anyway. Relock 6177375 then paid for it in production: 47
+    // bounds omitted on floats, `huggingface-hub >=0.34.0,<1.0` against a float
+    // of 1.30.0 among them -- THIS crossing, at a rolled number.
+    //
+    // So the three parts are exactly the three states, and each one names what
+    // decides it:
+    //   HALF ZERO -- t13's measured shape, a FLOAT: the cap is EMITTED. This is
+    //     D1 turn 13's ORIGINAL ruling, restored where turn 13 measured it.
+    //   HALF ONE  -- the same numbers with a LOCKED basis: OMITTED with the
+    //     `### CONSTRAINS BOUND-UNRESOLVED` row. This is CAPWINS-8's
+    //     supersession, valid in the one shape that supports it.
+    //   HALF TWO  -- a cap the version can satisfy: EMITTED, provenance
+    //     irrelevant, untouched by either change.
     let bundle = hub_cap_bundle_with_conflicting_workspace_fact(BTreeSet::new());
 
     let (output, logs) = capture_debug_logs(|| {
         produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap()
     });
 
-    assert_eq!(
-        hub_constrains_entry(&output),
-        None,
-        "the held 1.28.0 cannot satisfy the wheel's `<1.0`, so the bound is not \
-         emittable and the crossing follows the admission door's verdict: {:?}",
-        output.run_dependencies.constraints
+    let float_entry = hub_constrains_entry(&output).unwrap_or_else(|| {
+        panic!(
+            "RED AT ff3795d. 1.28.0 is a LEARNED FLOAT by t13's own measurement, not a \
+             version any lock holds, so it is no evidence that a consuming environment \
+             cannot satisfy `<1.0`: the cap is emitted and the conda solve decides, \
+             which is D1 turn 13's ruling: {:?}",
+            output.run_dependencies.constraints
+        )
+    });
+    assert!(
+        float_entry.contains(">=0.34.0") && float_entry.contains("<1.0"),
+        "and the emitted bound is the wheel's own cap, unweakened by the float: \
+         {float_entry}"
     );
     assert!(
-        logs.contains("held=1.28.0") && logs.contains("HELD version cannot"),
-        "the omission must name the held version it could not satisfy: {logs}"
+        logs.contains("float=1.28.0")
+            && logs.contains(&format!("reason={}", super::CONSTRAINS_BOUND_KEPT_REASON)),
+        "the decline must still reach an actor: {logs}"
+    );
+    assert!(
+        !logs.contains("HELD version cannot"),
+        "nothing HELD 1.28.0, so the omission row must not claim otherwise: {logs}"
     );
     assert!(
         output
@@ -1724,6 +1757,33 @@ fn a_learned_conda_fact_yields_to_a_cap_only_while_the_held_version_can_satisfy_
             .iter()
             .all(|d| d.name.replace('-', "_") != "huggingface_hub"),
         "the pack still must not claim a name the workspace provider owns"
+    );
+
+    // HALF ONE: THE SAME FIXTURE, THE SAME NUMBERS, AND THE ONLY THING THAT
+    // MOVES IS WHERE 1.28.0 CAME FROM. Under a `source=locked` basis it IS the
+    // consuming environments' own pinned version, the cap really is
+    // unsatisfiable there, and CAPWINS-8's omission is the right verdict --
+    // stated on this fixture so the two halves sit side by side and neither can
+    // be read as the general rule.
+    let mut locked = hub_cap_bundle_with_conflicting_workspace_fact(BTreeSet::new());
+    locked.constrains_basis = super::ConstrainsBasis {
+        source: super::ConstrainsSource::Locked,
+        names: 1,
+        universe_only_names: BTreeSet::new(),
+    };
+    let (locked_output, locked_logs) = capture_debug_logs(|| {
+        produce_output(&locked, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap()
+    });
+    assert_eq!(
+        hub_constrains_entry(&locked_output),
+        None,
+        "a version the LOCK holds and the cap excludes is an unsatisfiable constraint, \
+         not a re-pick request, and emission follows the admission door: {:?}",
+        locked_output.run_dependencies.constraints
+    );
+    assert!(
+        locked_logs.contains("held=1.28.0") && locked_logs.contains("HELD version cannot"),
+        "the omission must name the held version it could not satisfy: {locked_logs}"
     );
 
     // HALF TWO: t13's ruling, on a cap the held version CAN satisfy. Only the
@@ -3156,6 +3216,7 @@ fn produce_output_softens_deps_from_floor_pin_to_floor_spec() {
         uv_dependency_graph: Default::default(),
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
+        constrains_basis: Default::default(),
         workspace_selected_conda_packages: Default::default(),
         workspace_declared_pypi: Default::default(),
         workspace_locked_pypi: Default::default(),
@@ -3218,6 +3279,7 @@ fn produce_output_preserves_deps_from_bare_and_range_specs() {
         uv_dependency_graph: Default::default(),
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
+        constrains_basis: Default::default(),
         workspace_selected_conda_packages: Default::default(),
         workspace_declared_pypi: Default::default(),
         workspace_locked_pypi: Default::default(),
@@ -3788,6 +3850,7 @@ fn solo_bundle(name: &str, requires: Vec<&str>) -> Bundle {
         uv_dependency_graph: Default::default(),
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
+        constrains_basis: Default::default(),
         workspace_selected_conda_packages: Default::default(),
         workspace_declared_pypi: Default::default(),
         workspace_locked_pypi: Default::default(),
@@ -4669,6 +4732,7 @@ fn vendored_sub_packages_dropped_from_run_deps() {
         uv_dependency_graph: Default::default(),
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
+        constrains_basis: Default::default(),
         workspace_selected_conda_packages: Default::default(),
         workspace_declared_pypi: Default::default(),
         workspace_locked_pypi: Default::default(),
@@ -4829,6 +4893,7 @@ fn bundle_field_groups_entries_into_one_output() {
         uv_dependency_graph: Default::default(),
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
+        constrains_basis: Default::default(),
         workspace_selected_conda_packages: Default::default(),
         workspace_declared_pypi: Default::default(),
         workspace_locked_pypi: Default::default(),
@@ -4933,6 +4998,7 @@ fn relaxed_pure_python_primary_pins_python_to_workspace_variant() {
         uv_dependency_graph: Default::default(),
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
+        constrains_basis: Default::default(),
         workspace_selected_conda_packages: Default::default(),
         workspace_declared_pypi: Default::default(),
         workspace_locked_pypi: Default::default(),
@@ -11210,7 +11276,7 @@ fn c11_the_store_key_carries_no_backend_git_hash() {
 fn capwins5_the_emission_identity_moves_off_both_claimed_encodings() {
     let identity = backend_behaviour_identity();
     assert!(
-        identity.contains("retread-built-output-emission-6"),
+        identity.contains("retread-built-output-emission-7"),
         "the fact-constrained emission must have its own schema; got {identity}",
     );
     assert!(
@@ -11261,16 +11327,32 @@ fn capwins5_the_emission_identity_moves_off_both_claimed_encodings() {
          6152478 carry, two of whose packs emit a psutil bound this epoch omits; \
          got {identity}",
     );
+    // CAPWINS-9 / N27-RETREAD-198. THE SIXTH NEGATIVE, AND IT IS ARITHMETIC ON
+    // THE IDENTITY ITSELF RATHER THAN AN ARGUMENT ABOUT IT. This identity is
+    // `CARGO_PKG_VERSION + BUILT_OUTPUT_SCHEMA + REQUIRED_UV` and NOTHING else
+    // -- no git hash, no `EMIT_EPOCH` -- so `ff3795d` and this commit compute
+    // the SAME address unless this string moves. Drop-mode relock `6177375`
+    // published 14 emission-6 records (store `entries` 293 -> 307), and every
+    // one was emitted by the binary that omitted 47 bounds on universe FLOATS:
+    // its 77 `### CONSTRAINS source=` rows are all `source=universe`. Those
+    // records carry constrains lists missing caps this commit restores, so
+    // adopting one is adopting the defect.
+    assert!(
+        !identity.contains("retread-built-output-emission-6"),
+        "…and must not still be the encoding the 14 records relock 6177375 published \
+         carry, whose 47 omitted bounds all rested on a universe float; got {identity}",
+    );
     assert_eq!(
         crate::built_output_store::BUILT_OUTPUT_SCHEMA,
-        "retread-built-output-emission-6",
+        "retread-built-output-emission-7",
     );
     assert!(
-        crate::lock::EMIT_EPOCH >= 57,
+        crate::lock::EMIT_EPOCH >= 58,
         "EMIT_EPOCH must clear 52 (695f108), 53 (e30b23f's own lineage), 54 (96ff3dd, \
          whose emission-3 records are poisoned), 55 (d51e284, the pre-constrains \
-         basis) and 56 (0be408a, whose emission-5 records carry the unsatisfiable \
-         psutil bound); got {}",
+         basis), 56 (0be408a, whose emission-5 records carry the unsatisfiable \
+         psutil bound) and 57 (ff3795d, whose emission-6 records omit 47 bounds on \
+         universe floats); got {}",
         crate::lock::EMIT_EPOCH,
     );
 }
@@ -14272,13 +14354,24 @@ fn eigenpy_cap_bundle(held: Option<&str>, declared_specs: BTreeSet<String>) -> s
             .workspace_conda_versions
             .insert(key.clone(), held.to_string());
         bundle.workspace_conda_provider_facts.insert(
-            key,
+            key.clone(),
             super::WorkspaceCondaProviderFact {
                 selected_versions: BTreeSet::from([held.to_string()]),
                 declared_specs,
                 present_in_all_consumers: true,
             },
         );
+        // CAPWINS-9 (N27-RETREAD-198). 6150106 IS A KEEP-MODE RELOCK, so its
+        // fact IS a held version and the fixture has to say so. `held=Some(..)`
+        // in this fixture means "the consuming environment's committed lock
+        // supplies this number", which is what makes the crossing evidence
+        // about an environment rather than about the day. `held=None` needs no
+        // basis: with no fact at all the ladder is never entered.
+        bundle.constrains_basis = super::ConstrainsBasis {
+            source: super::ConstrainsSource::Locked,
+            names: 1,
+            universe_only_names: BTreeSet::new(),
+        };
     }
     bundle
 }
@@ -14321,6 +14414,17 @@ fn capwins8_a_bound_the_held_conda_version_cannot_satisfy_is_omitted_not_emitted
         "the omission must reach an actor, naming the held version and the policy \
          it is following (doctrine: failure is loud and reaches an actor): {logs}",
     );
+    // CAPWINS-9 GUARD (b): UNCHANGED BY N27-RETREAD-198, AND THE REASON IS
+    // NAMED. 6150106 is a KEEP-mode relock, so `source=locked` and 3.12.0 is
+    // what `isaaclab-gpu-latest`'s own committed lock holds -- the one shape in
+    // which "the consuming environments' HELD version cannot satisfy this" is a
+    // true sentence. The two rows are mutually exclusive by construction and
+    // this asserts it: a crossing that is omitted must not ALSO be reported as
+    // kept.
+    assert!(
+        !logs.contains(super::CONSTRAINS_BOUND_KEPT_REASON),
+        "a LOCKED holder licenses the omission, so the kept row must not fire: {logs}",
+    );
     // The pack still does not CLAIM a name the workspace provider owns; the
     // omission is of the bound, not of the cession.
     assert!(
@@ -14340,10 +14444,20 @@ fn capwins8_a_bound_the_held_conda_version_satisfies_is_still_emitted() {
     // 3.12.0, which is what four of the seven environments in relock 6150106's
     // base lock actually held. The cap is emittable, so it is emitted, exactly
     // as at 0be408a. This is the half of D1 turn 13's ruling that survives.
+    //
+    // CAPWINS-9 GUARD (c): also unchanged by N27-RETREAD-198, and for a
+    // different reason from guard (b) -- here the bound excludes NOTHING, so
+    // neither door has anything to decide and neither row may fire.
     let bundle = eigenpy_cap_bundle(Some("3.13.0"), BTreeSet::new());
 
-    let output =
-        produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
+    let (output, logs) = capture_debug_logs(|| {
+        produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap()
+    });
+    assert!(
+        !logs.contains(super::CONSTRAINS_BOUND_KEPT_REASON)
+            && !logs.contains("HELD version cannot"),
+        "a bound nothing excludes reaches neither the omission nor the kept row: {logs}",
+    );
 
     let entry = eigenpy_constrains_entry(&output).unwrap_or_else(|| {
         panic!(
@@ -14392,7 +14506,7 @@ fn capwins8_a_declared_pin_keeps_todays_behaviour() {
 }
 
 #[test]
-fn capwins8_drop_mode_has_a_float_fact_too_so_the_predicate_reaches_it() {
+fn capwins9_drop_modes_float_reaches_the_predicate_and_the_bound_is_kept_not_omitted() {
     // GUARD (d), AND THE BRIEF'S PREMISE FOR IT IS MEASURABLY WRONG, WHICH IS
     // WHY THIS TEST IS SHAPED THE WAY IT IS RATHER THAN THE WAY IT WAS ASKED
     // FOR. The ask was "drop mode (no held version) -> unchanged". Drop mode
@@ -14409,6 +14523,31 @@ fn capwins8_drop_mode_has_a_float_fact_too_so_the_predicate_reaches_it() {
     //
     // So drop mode is NOT unchanged by this fix, and pretending otherwise would
     // hide the one measurement that decides the EMIT_EPOCH bump.
+    //
+    // ---------------------------------------------------------------------
+    // CAPWINS-9 (N27-RETREAD-198) INVERTS HALF TWO, AND THE RENAME SAYS SO
+    // RATHER THAN QUIETLY REWRITING IT. CAPWINS-8 got the FIRST half of this
+    // right -- drop mode does have a float fact, it does carry a `==` clause,
+    // and it does reach this ladder -- and then drew the wrong conclusion from
+    // it. A float is not a held version. `locked_conda_versions_by_env` returns
+    // the EMPTY map in drop mode, so the number is the workspace-wide CAP-FREE
+    // selection for the day, and it is systematically HIGHER than what any
+    // consuming environment holds precisely because the cap under discussion is
+    // what holds those environments down.
+    //
+    // MEASURED ON THE FIRST PRODUCTION RUN OF ff3795d, relock `6177375` (drop,
+    // COMPLETED 0:0): 47 `### CONSTRAINS BOUND-UNRESOLVED` rows over FOUR names,
+    // in a log whose 77 `### CONSTRAINS source=` rows are ALL
+    // `source=universe universe_only=0`. `packaging <24` was dropped against a
+    // float of 26.3 while every consuming environment holds 23.2 and satisfies
+    // the cap -- CAPWINS-8's own row2 quotes that pair verbatim as a case its
+    // predicate would LEAVE ALONE, and in the certification shape it did not.
+    // A certified lock whose packs ship without the caps their wheels declare
+    // is 38de1a5's symptom class: weaker constrains, runtime hazard.
+    //
+    // So half two now asserts the OPPOSITE of what it asserted at ff3795d, on
+    // the same fixture at the same numbers, and this is CAPWINS-9's guard (a):
+    // the bound is EMITTED and the case prints `### CONSTRAINS BOUND-KEPT`.
 
     // HALF ONE: with no fact of ANY kind there is nothing for the predicate to
     // read and the wheel's cap is the only bound. This is the genuinely
@@ -14428,10 +14567,48 @@ fn capwins8_drop_mode_has_a_float_fact_too_so_the_predicate_reaches_it() {
         "a bundle with no fact at all must be untouched by this change: {entry}",
     );
 
-    // HALF TWO: 6152478's psutil row, in drop mode, at its measured numbers. A
-    // float the bound excludes is a held version like any other and the bound
-    // is omitted -- so a DROP-MODE relock's emitted bytes move, and the epoch
-    // must bump.
+    // HALF TWO: 6152478's / 6177375's psutil row, in drop mode, at its measured
+    // numbers, and the fixture builds NO basis at all -- which is the point.
+    // `ConstrainsBasis::default()` is `source=universe` with no universe-only
+    // names, exactly what `facts_from_solved_records` derives when
+    // `locked_by_env` is empty, so this fixture IS the drop shape rather than a
+    // model of it.
+    let psutil = drop_mode_psutil_float_bundle();
+    let (output, logs) = capture_debug_logs(|| {
+        produce_output(&psutil, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap()
+    });
+    let entry = output
+        .run_dependencies
+        .constraints
+        .iter()
+        .map(format_constraint_spec)
+        .find(|line| line.split(' ').next() == Some("psutil"))
+        .unwrap_or_else(|| {
+            panic!(
+                "RED AT ff3795d, WHICH IS THE WHOLE POINT: 7.2.2 is the day's cap-free \
+                 FLOAT and no lock holds it, so it is not evidence that any consuming \
+                 environment cannot satisfy >=5.9.0,<6.0.0. The bound must be EMITTED \
+                 and each environment's own solve must decide, which is what every \
+                 relock did before N27-RETREAD-146: {:?}",
+                output.run_dependencies.constraints
+            )
+        });
+    assert!(
+        entry.contains(">=5.9.0") && entry.contains("<6.0.0"),
+        "and the emitted bound is the wheel's own cap, unweakened: {entry}",
+    );
+    assert!(
+        !logs.contains("HELD version cannot"),
+        "nothing HELD this version, so the omission row must not claim otherwise: {logs}",
+    );
+}
+
+/// The 6152478 / 6177375 `psutil` crossing IN DROP MODE, at its measured
+/// numbers, and the fixture builds NO basis at all -- which is the point.
+/// `ConstrainsBasis::default()` is `source=universe` with no universe-only
+/// names, exactly what `facts_from_solved_records` derives when `locked_by_env`
+/// is empty, so this fixture IS the drop shape rather than a model of it.
+fn drop_mode_psutil_float_bundle() -> super::Bundle {
     let mut psutil = solo_bundle("isaaclab-2.3x-pack", vec!["psutil>=5.9.0,<6.0.0"]);
     psutil.primary.original_requires_dist = vec!["psutil>=5.9.0,<6.0.0".to_string()];
     let key = canonical_conda_name("psutil");
@@ -14448,24 +14625,117 @@ fn capwins8_drop_mode_has_a_float_fact_too_so_the_predicate_reaches_it() {
             present_in_all_consumers: true,
         },
     );
-    let (output, logs) = capture_debug_logs(|| {
+    psutil
+}
+
+/// CAPWINS-9 (N27-RETREAD-198) GUARD: THE DECLINE STAYS VISIBLE IN THE LOG.
+///
+/// Deliberately a SEPARATE test from the emission guard above, on the same
+/// fixture, because the two things can fail independently and the gate's
+/// mutation arms prove it: deleting the row between its markers must redden
+/// THIS test and leave the emission guard green, while removing the provenance
+/// check reddens both. Fused into one test, "the bound is emitted" and "the
+/// operator can see why" would be one arm and neither mutant would be
+/// distinguishable from the other.
+///
+/// Trading a silent wrong omission for a silent right emission would leave a
+/// reader of a drop-mode log unable to see that the branch was reached at all,
+/// which is how this defect survived a whole campaign in the certification
+/// shape: 6152478 COMPLETED clean while carrying it.
+#[test]
+fn capwins9_the_declined_omission_reaches_an_actor_with_the_float_and_the_reason() {
+    let psutil = drop_mode_psutil_float_bundle();
+    let (_output, logs) = capture_debug_logs(|| {
         produce_output(&psutil, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap()
     });
     assert!(
-        output
-            .run_dependencies
-            .constraints
-            .iter()
-            .map(format_constraint_spec)
-            .all(|line| line.split(' ').next() != Some("psutil")),
-        "7.2.2 cannot satisfy >=5.9.0,<6.0.0, so the second crossing in relock \
-         6152478's own drop-mode log is omitted as well: {:?}",
-        output.run_dependencies.constraints,
+        logs.contains("float=7.2.2"),
+        "the kept row must name the float it declined to treat as held: {logs}",
     );
     assert!(
-        logs.contains("held=7.2.2"),
-        "the drop-mode omission gets the same row: {logs}",
+        logs.contains(&format!("reason={}", super::CONSTRAINS_BOUND_KEPT_REASON)),
+        "…and the reason it declined, in the row's own token: {logs}",
     );
+    assert!(
+        logs.contains("basis=universe"),
+        "…and the basis, so a reader can tell a drop relock from a name the lock \
+         does not carry: {logs}",
+    );
+}
+
+/// CAPWINS-9 (N27-RETREAD-198) GUARD: THE PROVENANCE QUESTION IS PER-NAME, NOT
+/// PER-RUN, and `universe_only_names` is why the basis keeps names instead of a
+/// count.
+///
+/// A `source=locked` basis still floats every name the base lock does not carry
+/// -- `facts_from_solved_records` inserts the day's version for a genuinely new
+/// transitive and counts it -- so asking only `source == Locked` would license
+/// an omission on exactly the float this change exists to refuse. Relock
+/// `6177375` cannot show this leg (all 77 of its rows are `universe_only=0`), so
+/// it is pinned here on `n130_a_name_the_lock_does_not_carry_falls_back_and_is_
+/// counted`'s own fixture numbers: `networkx` pinned by the lock at 3.2,
+/// `warp-lang` floated in at 1.12.0.
+#[test]
+fn capwins9_a_locked_basis_still_floats_the_names_the_lock_does_not_carry() {
+    let basis = super::ConstrainsBasis {
+        source: super::ConstrainsSource::Locked,
+        names: 2,
+        universe_only_names: BTreeSet::from(["warp-lang".to_string()]),
+    };
+    assert!(
+        basis.held_version_is_from_lock("networkx"),
+        "a name the lock pins IS held, and its crossing is evidence about an environment",
+    );
+    assert!(
+        !basis.held_version_is_from_lock("warp-lang"),
+        "a name the lock does not carry is the day's float even under a locked basis, \
+         so it may not license an omission",
+    );
+    assert_eq!(basis.universe_only(), 1, "and the row's count is derived from the names");
+
+    let universe = super::ConstrainsBasis::default();
+    assert_eq!(universe.source, super::ConstrainsSource::Universe);
+    assert!(
+        !universe.held_version_is_from_lock("packaging"),
+        "the DEFAULT basis must be the safe one: an unset provenance emits the cap and \
+         lets the consuming solve decide, never omits on a number nothing holds",
+    );
+    assert_eq!(universe.universe_only(), 0);
+}
+
+/// CAPWINS-9 (N27-RETREAD-198) GUARD: the kept row's grammar, asserted as a
+/// pure function so the shape is pinned without capturing a stream.
+///
+/// `float=` and not `held=`: the versions are the workspace-wide cap-free
+/// selection for the day, and calling them "held" is the mistake being fixed.
+#[test]
+fn capwins9_the_kept_row_names_dep_bound_float_and_reason() {
+    use std::str::FromStr;
+    assert_eq!(
+        super::constrains_bound_kept_row(
+            "packaging",
+            ">=20.0,<24",
+            &[uv_pep508::uv_pep440::Version::from_str("26.3").unwrap()],
+        ),
+        "### CONSTRAINS BOUND-KEPT dep=packaging bound=>=20.0,<24 float=26.3 \
+         reason=no-locked-holder",
+    );
+    // The four names relock 6177375 dropped bounds for, spelled at its own
+    // measured floats so the row a re-run must print is written down here.
+    for (dep, bound, float) in [
+        ("packaging", ">=20.9,<24", "26.3"),
+        ("huggingface-hub", ">=0.34.0,<1.0", "1.30.0"),
+        ("psutil", ">=5.9.0,<6.0.0", "7.2.2"),
+        ("numpy", ">=1.23.5,==1.26.0,~=1.26.0,<2", "2.4.6"),
+    ] {
+        let row = super::constrains_bound_kept_row(
+            dep,
+            bound,
+            &[uv_pep508::uv_pep440::Version::from_str(float).unwrap()],
+        );
+        assert!(row.starts_with(super::CONSTRAINS_BOUND_KEPT_PREFIX));
+        assert!(row.contains(&format!("dep={dep} bound={bound} float={float} ")));
+    }
 }
 
 #[test]

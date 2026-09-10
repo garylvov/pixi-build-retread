@@ -115,7 +115,29 @@ pub const SCHEMA: &str = "retread-built-output-store-v3";
 /// The key ALSO moves (the constrains basis is a key component), so this bump
 /// is the belt to that braces: it makes the invalidation visible as a named
 /// constant in review rather than as an emergent property of a hash.
-pub const BUILT_OUTPUT_SCHEMA: &str = "retread-built-output-emission-6";
+///
+/// Generation 6 (N27-RETREAD-146, CAPWINS-8): a `constrains` bound the
+/// consuming environments' HELD conda version cannot satisfy is OMITTED rather
+/// than emitted. `ff3795d` bumped the constant and did not write this line;
+/// it is written here rather than left as a gap, because the next reader
+/// deciding a bump reads THIS block.
+///
+/// Generation 7 (N27-RETREAD-198, CAPWINS-9): generation 6's omission is
+/// narrowed to the case it can justify -- a held version the LOCK supplies.
+/// Under `ConstrainsSource::Universe` (the harness's `drop` mode, every cold
+/// pass) and for any name a base lock does not carry, the learned version is
+/// the day's cap-free FLOAT, and generation 6 dropped caps on it: relock
+/// `6177375`, whose 77 `### CONSTRAINS source=` rows are ALL `source=universe`,
+/// omitted 47 bounds over `packaging`/`huggingface-hub`/`psutil`/`numpy`,
+/// including `packaging <24` on a float of 26.3 while the consuming
+/// environments hold 23.2 and satisfy it. THE BUMP IS FORCED AND IT IS
+/// ARITHMETIC, not caution: `backend_behaviour_identity()` folds
+/// `CARGO_PKG_VERSION`, this constant and `REQUIRED_UV` and NOTHING ELSE -- no
+/// git hash, no `EMIT_EPOCH` -- so without moving this string the 14
+/// emission-6 records `6177375` published, each carrying the wrongly OMITTED
+/// bounds, sit at exactly the address this binary computes and would be adopted
+/// under an identity asserting "same behaviour".
+pub const BUILT_OUTPUT_SCHEMA: &str = "retread-built-output-emission-7";
 
 /// The store's directory name under a persistent root, and the `--store`
 /// spelling `retread store-reap` accepts. Named here, beside the layout it

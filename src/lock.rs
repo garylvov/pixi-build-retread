@@ -909,7 +909,30 @@ pub const SCHEMA: u32 = 20;
 /// a bundle with no workspace fact at all never enters the ladder. Of the ~110
 /// distinct dep/bundle/bound/fact tuples that reached this arm in `6150106`,
 /// exactly TWO names move: `eigenpy` and `psutil`.
-pub const EMIT_EPOCH: u32 = 57;
+///
+/// Epoch 58 (N27-RETREAD-198, CAPWINS-9): epoch 57's omission runs ONLY when
+/// the held version's provenance is the LOCK. With `ConstrainsSource::Universe`
+/// -- the harness's `drop` mode and every cold pass -- or for a name the base
+/// lock does not carry, the learned version is the workspace-wide cap-FREE
+/// float, the bound is EMITTED exactly as it was before epoch 57, and the case
+/// prints `### CONSTRAINS BOUND-KEPT dep= bound= float= reason=no-locked-holder`
+/// so declining stays visible.
+///
+/// THIS MOVES BYTES BACK, WHICH IS WHY IT IS AN EPOCH AND NOT A REFACTOR, AND
+/// THE MEASUREMENT IS DROP-MODE relock `6177375` (COMPLETED 0:0, wall 1641 s,
+/// cert `6bb604822ea133d28573bb5322dcc179`), the canonical certification shape:
+/// its 117 MB backend log carries 47 `### CONSTRAINS BOUND-UNRESOLVED` rows over
+/// FOUR names -- `packaging` x24 (`>=20.9,<24`, `<24`, `>=20.0,<24`,
+/// `>20.0,>=20.9,<24`; float 26.3), `huggingface-hub` x11 (`>=0.34.0,<1.0`;
+/// float 1.30.0), `psutil` x10 (`>=5.9.0,<6.0.0`; float 7.2.2), `numpy` x2
+/// (float 2.4.6) -- and ALL 77 of its `### CONSTRAINS source=` rows read
+/// `source=universe universe_only=0`, so not one of the 47 omissions rested on
+/// a version anything held. Epoch 58 restores every one of those bounds, so the
+/// packs that publish carry the caps their wheels declare again. Epoch 57's own
+/// `eigenpy` case is UNTOUCHED: keep-mode `6150106` derives `source=locked`, the
+/// held `eigenpy==3.12.0` is the consuming environment's own locked version, and
+/// the bound is still omitted with its `BOUND-UNRESOLVED` row.
+pub const EMIT_EPOCH: u32 = 58;
 
 fn parse_stored_glibc(value: Option<&str>) -> Option<Option<(u32, u32)>> {
     match value {

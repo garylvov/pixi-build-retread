@@ -4543,6 +4543,22 @@ struct Bundle {
     /// differ across consumers, together with the direct workspace specs that
     /// constrain them.
     workspace_conda_provider_facts: BTreeMap<String, WorkspaceCondaProviderFact>,
+    /// CAPWINS-9 (N27-RETREAD-198). WHERE THE VERSIONS IN THE TWO MAPS ABOVE
+    /// CAME FROM, carried to the emission site because the emission site is
+    /// where the question gets asked.
+    ///
+    /// `ConstrainsSource` was decided in [`facts_from_solved_records`] and
+    /// printed by the `### CONSTRAINS source=` row from the very first slice
+    /// (N27-RETREAD-130), but it stopped at `WorkspaceCondaFacts` and never
+    /// reached the `Bundle` -- so `produce_output_with_conflicts` could tell
+    /// what a fact SAID and not whether anything actually held it. That gap is
+    /// the whole of N27-RETREAD-198: a float read as a held version.
+    ///
+    /// Default is `ConstrainsSource::Universe` with no universe-only names,
+    /// which is the fail-SAFE direction here: an unset basis emits the cap and
+    /// lets the consuming solve decide, exactly as every relock before ff3795d
+    /// did. It never licenses an omission it cannot justify.
+    constrains_basis: ConstrainsBasis,
     /// Selected canonical conda package names, retained separately for each
     /// exact consuming environment. This is evidence only in this slice;
     /// emission does not yet make ownership or drop decisions from it.
@@ -9093,6 +9109,11 @@ async fn resolve_all(
         }
         bundle.workspace_conda_versions = workspace_facts.common_selected_versions.clone();
         bundle.workspace_conda_provider_facts = workspace_facts.provider_facts.clone();
+        // CAPWINS-9 (N27-RETREAD-198). The basis travels WITH the facts it
+        // decided, in the same handoff and the same statement group, so a
+        // future slice cannot copy the versions and leave their provenance
+        // behind -- which is exactly how ff3795d shipped.
+        bundle.constrains_basis = workspace_facts.constrains_basis.clone();
         bundle.workspace_selected_conda_packages = workspace_facts.selected_conda_packages.clone();
         bundle.workspace_declared_pypi = workspace_facts.declared_pypi.clone();
         // The locked PyPI selections of the very envs whose conda solves
@@ -9669,9 +9690,50 @@ struct ConstrainsBasis {
     /// Distinct canonical conda names in the fact boundary.
     names: usize,
     /// Of those, the ones the base lock did NOT carry and which therefore fell
-    /// back to the day's universe -- a genuinely new transitive. Always 0
+    /// back to the day's universe -- a genuinely new transitive. Always EMPTY
     /// under `ConstrainsSource::Universe`, where every name came from there.
-    universe_only: usize,
+    ///
+    /// CAPWINS-9 (N27-RETREAD-198) KEEPS THE NAMES AND NOT JUST THE COUNT, and
+    /// the count is now derived from them so there is one source of truth. The
+    /// emission door asks a PER-NAME question -- "is the held version I am
+    /// about to call unsatisfiable one the lock pinned?" -- and a bare
+    /// `universe_only=1` cannot answer it. A basis that is `Locked` overall
+    /// still floats every name in this set.
+    universe_only_names: BTreeSet<String>,
+}
+
+impl ConstrainsBasis {
+    /// The row's `universe_only=` number: how many names in the boundary the
+    /// base lock did not carry.
+    fn universe_only(&self) -> usize {
+        self.universe_only_names.len()
+    }
+
+    /// CAPWINS-9 (N27-RETREAD-198). WHETHER THE HELD VERSION FOR ONE NAME
+    /// CAME FROM THE CONSUMING ENVIRONMENTS' LOCK, OR FROM THE DAY'S FLOAT.
+    ///
+    /// This is the whole predicate CAPWINS-8's omission branch was missing.
+    /// CAPWINS-8 omits a `constrains` bound the HELD version cannot satisfy,
+    /// on the argument that emitting it makes the lock fatal on a crossing the
+    /// admission door deliberately admitted. That argument holds only while
+    /// "held" means held: under `ConstrainsSource::Universe` there is no lock
+    /// at all, `locked_conda_versions_by_env` returns the empty map (FACT-1),
+    /// and every fact is the workspace-wide cap-FREE float for the day --
+    /// which is systematically HIGHER than what any consuming environment
+    /// holds, precisely because the cap the pack is about to emit is what
+    /// holds those environments down. Relock 6177375 measured the cost: 47
+    /// `### CONSTRAINS BOUND-UNRESOLVED` rows over four names in a run whose
+    /// 77 `### CONSTRAINS source=` rows are ALL `source=universe`, dropping
+    /// `packaging <24` because the float is 26.3 while every consuming env
+    /// holds 23.2 and satisfies it. A certified lock whose packs ship without
+    /// the caps they should carry is 38de1a5's symptom class again.
+    ///
+    /// So the omission is licensed only by a LOCKED holder. With a float, the
+    /// pre-CAPWINS-8 behaviour stands: the cap is emitted and the conda solve
+    /// decides, as it did for the whole campaign before ff3795d.
+    fn held_version_is_from_lock(&self, conda_key: &str) -> bool {
+        self.source == ConstrainsSource::Locked && !self.universe_only_names.contains(conda_key)
+    }
 }
 
 /// Where the versions in the workspace conda fact boundary came from.
@@ -9810,6 +9872,36 @@ pub(crate) fn constrains_bound_unresolved_row(
     format!(
         "{CONSTRAINS_BOUND_UNRESOLVED_PREFIX} dep={dep} bound={bound} held={} policy={CONSTRAINS_BOUND_UNRESOLVED_POLICY}",
         held.join(",")
+    )
+}
+
+/// STDERR row prefix for a `constrains` bound the emission door KEEPS even
+/// though the learned fact's version cannot satisfy it, because that version is
+/// the day's universe float and no lock holds it.
+///
+/// CAPWINS-9 (N27-RETREAD-198). The case has to stay VISIBLE or the fix trades
+/// one silent behaviour for another: a reader of a drop-mode relock's log must
+/// be able to see that the omission branch was reached and declined, and on
+/// what grounds. STDERR and never stdout, for the same reason as its sibling:
+/// `rpc.rs` owns stdout as the JSON-RPC channel.
+pub(crate) const CONSTRAINS_BOUND_KEPT_PREFIX: &str = "### CONSTRAINS BOUND-KEPT";
+
+/// The one reason token the kept row carries. There is exactly one way to reach
+/// it, so there is exactly one token: nothing in the lock holds the version the
+/// bound excludes, so the exclusion is not evidence about any environment.
+pub(crate) const CONSTRAINS_BOUND_KEPT_REASON: &str = "no-locked-holder";
+
+/// Grammar of the kept row. A pure function so a guard can assert the grammar
+/// without capturing a stream.
+///
+/// The versions are spelled `float=` and not `held=` ON PURPOSE: they are the
+/// workspace-wide cap-free selection for the day, and calling them "held" is
+/// the mistake this whole change corrects.
+pub(crate) fn constrains_bound_kept_row(dep: &str, bound: &str, float: &[Version]) -> String {
+    let float: Vec<String> = float.iter().map(ToString::to_string).collect();
+    format!(
+        "{CONSTRAINS_BOUND_KEPT_PREFIX} dep={dep} bound={bound} float={} reason={CONSTRAINS_BOUND_KEPT_REASON}",
+        float.join(",")
     )
 }
 
@@ -10823,7 +10915,7 @@ fn facts_from_solved_records(
             .flat_map(BTreeMap::keys)
             .collect::<BTreeSet<_>>()
             .len(),
-        universe_only: universe_only_names.len(),
+        universe_only_names,
     };
     let selected_conda_packages = per_env_versions
         .iter()
@@ -11411,7 +11503,7 @@ async fn solve_workspace_conda_facts(
         facts.constrains_basis.source,
         bundle_name,
         facts.constrains_basis.names,
-        facts.constrains_basis.universe_only,
+        facts.constrains_basis.universe_only(),
     );
     facts
 }
@@ -14471,11 +14563,11 @@ gpu = { features = ["gpu"], no-default-feature = true }
         assert_eq!(monday.constrains_basis.source, super::ConstrainsSource::Locked);
         assert_eq!(tuesday.constrains_basis.source, super::ConstrainsSource::Locked);
         assert_eq!(
-            (monday.constrains_basis.names, monday.constrains_basis.universe_only),
+            (monday.constrains_basis.names, monday.constrains_basis.universe_only()),
             (3, 0),
         );
         assert_eq!(
-            (tuesday.constrains_basis.names, tuesday.constrains_basis.universe_only),
+            (tuesday.constrains_basis.names, tuesday.constrains_basis.universe_only()),
             (3, 0),
             "nothing fell back: every name the day named is one the lock carries",
         );
@@ -14510,7 +14602,7 @@ gpu = { features = ["gpu"], no-default-feature = true }
         );
         assert_eq!(facts.constrains_basis.source, super::ConstrainsSource::Universe);
         assert_eq!(
-            facts.constrains_basis.universe_only, 0,
+            facts.constrains_basis.universe_only(), 0,
             "under the universe basis every name came from there, so `universe_only` \
              counts nothing and must not be read as coverage",
         );
@@ -14574,11 +14666,21 @@ gpu = { features = ["gpu"], no-default-feature = true }
         );
         assert_eq!(facts.constrains_basis.source, super::ConstrainsSource::Locked);
         assert_eq!(
-            facts.constrains_basis.universe_only, 1,
+            facts.constrains_basis.universe_only(), 1,
             "the one name the lock does not carry must be counted: {:?}",
             facts.constrains_basis,
         );
         assert_eq!(facts.constrains_basis.names, 2);
+        // CAPWINS-9 (N27-RETREAD-198). THE NAME, NOT ONLY THE COUNT. The
+        // emission door asks its question one name at a time, so a basis that
+        // knew only "one name floated" would license an omission on exactly the
+        // float this change refuses.
+        assert_eq!(
+            facts.constrains_basis.universe_only_names,
+            BTreeSet::from(["warp-lang".to_string()]),
+        );
+        assert!(facts.constrains_basis.held_version_is_from_lock("networkx"));
+        assert!(!facts.constrains_basis.held_version_is_from_lock("warp-lang"));
         assert_eq!(
             facts.common_selected_versions.get("warp-lang").map(String::as_str),
             Some("1.12.0"),
@@ -15962,6 +16064,7 @@ async fn resolve_bundle(
             uv_dependency_graph: Default::default(),
             workspace_conda_versions: Default::default(),
             workspace_conda_provider_facts: Default::default(),
+            constrains_basis: Default::default(),
             workspace_selected_conda_packages: Default::default(),
             workspace_declared_pypi: Default::default(),
             workspace_locked_pypi: Default::default(),
@@ -16578,6 +16681,7 @@ async fn resolve_bundle(
         uv_dependency_graph: Default::default(),
         workspace_conda_versions: Default::default(),
         workspace_conda_provider_facts: Default::default(),
+        constrains_basis: Default::default(),
         workspace_selected_conda_packages: Default::default(),
         workspace_declared_pypi: Default::default(),
         workspace_locked_pypi: Default::default(),
@@ -22866,11 +22970,71 @@ fn produce_output_with_conflicts(
                                 // the wheel's learned cap, so it keeps today's
                                 // behaviour, and an unbounded `specifiers`
                                 // excludes nothing and is emitted unchanged.
-                                let held_excluded = if native_conda_override.is_none() {
+                                //
+                                // CAPWINS-9 (N27-RETREAD-198) ADDS THE ONE LEG
+                                // THIS BRANCH WAS MISSING: the omission is
+                                // licensed by a LOCKED holder and by nothing
+                                // else. `held=` above is read off a
+                                // `WorkspaceCondaFact`'s `==` clause, and in
+                                // drop mode -- and for any name the base lock
+                                // does not carry -- that clause is the day's
+                                // cap-FREE universe float, not a version any
+                                // consuming environment holds. Relock 6177375:
+                                // 77 `### CONSTRAINS source=` rows, ALL
+                                // `source=universe`, and 47 bounds omitted on
+                                // floats (`packaging` 26.3 against a `<24` cap
+                                // every consuming env satisfies at 23.2). The
+                                // door's verdict argument does not reach that
+                                // case at all: with no lock there is no
+                                // "consuming environments' HELD version" to be
+                                // unable to satisfy anything, so the bound is
+                                // EMITTED and the conda solve decides, which is
+                                // what happened for the whole campaign before
+                                // ff3795d. The case still prints, as
+                                // `BOUND-KEPT`, so declining is visible.
+                                let float_excluded = if native_conda_override.is_none() {
                                     held_fact_versions_excluded_by_bound(&constraints, &specifiers)
                                 } else {
                                     Vec::new()
                                 };
+                                let held_from_lock = bundle
+                                    .constrains_basis
+                                    .held_version_is_from_lock(conda_name.key().as_str());
+                                if !float_excluded.is_empty() && !held_from_lock {
+                                    // CAPWINS-9 ROW BEGIN -- delimited so the
+                                    // gate's mutation arm can remove EXACTLY the
+                                    // row and nothing else (law 3).
+                                    eprintln!(
+                                        "{}",
+                                        constrains_bound_kept_row(
+                                            conda_name.key().as_str(),
+                                            &rendered,
+                                            &float_excluded,
+                                        )
+                                    );
+                                    tracing::warn!(
+                                        dep = %conda_name,
+                                        bundle = %bundle.conda_name,
+                                        bound = %rendered,
+                                        float = %float_excluded
+                                            .iter()
+                                            .map(ToString::to_string)
+                                            .collect::<Vec<_>>()
+                                            .join(","),
+                                        basis = %bundle.constrains_basis.source,
+                                        reason = %CONSTRAINS_BOUND_KEPT_REASON,
+                                        "the bundled wheel's cap excludes the learned workspace \
+                                         conda version, but that version is the day's cap-free \
+                                         universe FLOAT and no lock holds it, so it is not \
+                                         evidence that any consuming environment cannot satisfy \
+                                         the bound. EMITTING the bound and letting each \
+                                         consuming environment's own solve decide, which is the \
+                                         behaviour every relock had before N27-RETREAD-146.",
+                                    );
+                                    // CAPWINS-9 ROW END
+                                }
+                                let held_excluded =
+                                    if held_from_lock { float_excluded } else { Vec::new() };
                                 if !held_excluded.is_empty() {
                                     // CAPWINS-8 ROW BEGIN -- the two observables
                                     // of the omission, delimited so the gate's
@@ -31343,6 +31507,7 @@ mod emit_wheel_upstream_url_tests {
             uv_dependency_graph: Default::default(),
             workspace_conda_versions: Default::default(),
             workspace_conda_provider_facts: Default::default(),
+            constrains_basis: Default::default(),
             workspace_selected_conda_packages: Default::default(),
             workspace_declared_pypi: Default::default(),
             workspace_locked_pypi: Default::default(),
@@ -31471,6 +31636,7 @@ mod emit_wheel_upstream_url_tests {
             uv_dependency_graph: Default::default(),
             workspace_conda_versions: Default::default(),
             workspace_conda_provider_facts: Default::default(),
+            constrains_basis: Default::default(),
             workspace_selected_conda_packages: Default::default(),
             workspace_declared_pypi: Default::default(),
             workspace_locked_pypi: Default::default(),

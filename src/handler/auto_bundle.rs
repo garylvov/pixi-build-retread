@@ -4852,6 +4852,7 @@ mod tests {
             uv_dependency_graph: Default::default(),
             workspace_conda_versions: BTreeMap::new(),
             workspace_conda_provider_facts: BTreeMap::new(),
+            constrains_basis: Default::default(),
             workspace_selected_conda_packages: BTreeMap::new(),
             workspace_declared_pypi: BTreeSet::new(),
             workspace_locked_pypi: BTreeMap::new(),
