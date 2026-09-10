@@ -21488,6 +21488,92 @@ fn spec_floor(specifiers: &VersionSpecifiers) -> Option<Version> {
         .max()
 }
 
+/// The `reason` every WIDENED-PIN admission carries -- in the warning, in the
+/// recorded relaxation's `source`, and in the row. N27-RETREAD-205.
+pub(crate) const CEDED_WIDENED_PIN_REASON: &str = "widened-pin";
+
+/// The substring the install side matches to recognise a WIDENED-PIN admission
+/// the BUILD already made and recorded in this lock.
+///
+/// Writer: [`record_ceded_relaxation`]'s `source`. Reader:
+/// `installer::widened_pin_admission`. One constant, so the pair cannot drift.
+pub(crate) fn ceded_widened_pin_marker() -> String {
+    format!("reason={CEDED_WIDENED_PIN_REASON}; declared pypi provider wins")
+}
+
+/// The loud row a WIDENED-PIN admission writes.
+///
+/// STDERR, NEVER STDOUT: `rpc.rs` owns stdout as the JSON-RPC channel and a
+/// `###` row on it corrupts the very lock it reports on (N27-RETREAD-180).
+pub(crate) fn ceded_bound_widened_pin_row(
+    dep: &str,
+    upstream: &str,
+    band: &str,
+    locked: &str,
+) -> String {
+    format!(
+        "### CEDED BOUND WIDENED-PIN dep={dep} upstream={upstream} band={band} \
+         locked={locked} policy=admitted"
+    )
+}
+
+/// Did RETREAD manufacture `specifiers`, by widening an EXACT pin the wheel's
+/// author wrote?
+///
+/// `metadata.requires_dist` is the POST-phase-D line; `original_requires_dist`
+/// is what upstream shipped. Upstream states `pillow==11.3.0`; phase D rewrites
+/// it to `pillow>=11.3,<11.4` ([`crate::wheel_rewrite::widen_exact_to_pep508`]
+/// at the Patch tier). That band is RETREAD'S OWN INVENTION -- nobody asserted
+/// it -- and the same run already projects the pin out of the emitted bound as
+/// non-contractual (`retread-constrains-discipline`). So it may not also be a
+/// lock-fatal contract at the MAJOR boundary.
+///
+/// PROVEN, never guessed: the band must be EXACTLY what `widen_exact_to_pep508`
+/// produces from that pin at one of its tiers. A range the author wrote by hand
+/// (`>=11.3,<12`) matches no tier and is not a widened pin.
+///
+/// Returns the upstream pin text (`==11.3.0`) so every caller can quote it.
+fn widened_exact_pin_upstream(
+    original_requires_dist: &[String],
+    name: &str,
+    specifiers: &VersionSpecifiers,
+    marker_env: &uv_pep508::MarkerEnvironment,
+) -> Option<String> {
+    for raw in original_requires_dist {
+        let Ok(requirement): Result<uv_pep508::Requirement, _> =
+            crate::pep508_lenient::parse_requirement_lenient(raw)
+        else {
+            continue;
+        };
+        if canonical_conda_name(requirement.name.as_ref()) != name {
+            continue;
+        }
+        if !requirement.marker.evaluate(marker_env, &[]) {
+            continue;
+        }
+        let Some(uv_pep508::VersionOrUrl::VersionSpecifier(upstream)) =
+            requirement.version_or_url.as_ref()
+        else {
+            continue;
+        };
+        let clauses: Vec<_> = upstream.iter().collect();
+        if clauses.len() != 1 || *clauses[0].operator() != Operator::Equal {
+            continue;
+        }
+        for policy in [RelaxPolicy::Patch, RelaxPolicy::Minor, RelaxPolicy::Major] {
+            let Some(widened) =
+                crate::wheel_rewrite::widen_exact_to_pep508(clauses[0].version(), policy)
+            else {
+                continue;
+            };
+            if VersionSpecifiers::from_str(&widened).ok().as_ref() == Some(specifiers) {
+                return Some(upstream.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Classify a ceded name's bundled bound against the version the consuming env
 /// actually provides.
 fn classify_ceded_bound(
@@ -21570,6 +21656,60 @@ fn conda_version_satisfying(
     None
 }
 
+/// Accept a ceded name's env-provided version over a bundled wheel's bound:
+/// warn, record the relaxation through the seam every other emission
+/// relaxation uses, and advertise the relaxed band in place of the bound.
+///
+/// One function for BOTH non-fatal arms (`within-major`/`calver` and
+/// `widened-pin`), so the warning, the record and the advertised bound can
+/// never say three different things about the same decision.
+#[allow(clippy::too_many_arguments)]
+fn record_ceded_relaxation(
+    ownership: &mut CededOwnership,
+    bundle: &Bundle,
+    wheel: &ResolvedWheel,
+    name: &str,
+    locked: &str,
+    raw: &str,
+    specifiers: &VersionSpecifiers,
+    relaxed: String,
+    reason: &str,
+) {
+    tracing::warn!(
+        bundle = %bundle.conda_name,
+        "declared-pypi ownership: accepting {name}=={locked} over bundled wheel \
+         {wheel_file} requirement {raw}; relaxed to {relaxed} \
+         (reason={reason}; declared pypi provider wins)",
+        wheel_file = wheel.metadata.filename,
+    );
+    let decision = crate::relax_decision::RelaxationDecision {
+        origin_id: ConstraintOriginId::from_parts("declared-pypi-owner", [name, locked, raw]),
+        kind: crate::relax_decision::RelaxationKind::ExactPinWidened,
+        original: specifiers.to_string(),
+        relaxed: relaxed.clone(),
+        original_clause: specifiers.to_string(),
+        relaxed_clause: Some(relaxed.clone()),
+        source: format!(
+            "wheel `{}` Requires-Dist `{raw}` vs declared-pypi owner \
+             {name}=={locked} (reason={reason}; declared pypi provider wins)",
+            wheel.metadata.filename,
+        ),
+        tier: RelaxPolicy::Major,
+    };
+    ownership
+        .records
+        .extend(auto_bundle::wheel_metadata_relaxations(
+            &crate::relax::PypiKey::from_pypi(name),
+            &[],
+            vec![decision],
+            &bundle.conda_name,
+            format!(" for bundle '{}'", bundle.conda_name),
+        ));
+    // Widest relaxation wins when two wheels disagree: the env installs
+    // exactly one copy either way.
+    ownership.relaxed.insert(name.to_string(), relaxed);
+}
+
 /// Resolve every contradiction between a bundled wheel's requirement and the
 /// version the consuming workspace has ALREADY locked for a name the pack is
 /// ceding to pixi's pypi phase.
@@ -21584,10 +21724,16 @@ fn conda_version_satisfying(
 ///   and WARN once. Refusing here would make every ordinary float/pin
 ///   disagreement a hard stop, and the pack's exact pin is an incidental
 ///   snapshot of what its builder resolved against, not an ABI fact.
-/// * **across a major boundary** (`huggingface_hub 1.28` against a bundled
-///   `<1.0`) -- no relaxation is defensible. Conda must become the single owner
-///   of the name; when it cannot, REFUSE, naming all three sides (the declared
-///   pypi root, the bundled wheel, and conda).
+/// * **across a major boundary, on a band retread WIDENED out of the author's
+///   EXACT pin** (`pillow==11.3.0` phase-D-widened to `>=11.3,<11.4`, env
+///   supplies 12.3.0) -- N27-RETREAD-205: the bound is retread's own, the same
+///   run already projects the pin out of the emitted contract, so this takes
+///   the within-major path with a loud `### CEDED BOUND WIDENED-PIN` row.
+/// * **across a major boundary on a REAL upstream range** (`huggingface_hub
+///   1.28` against an author-written `<1.0`) -- no relaxation is defensible.
+///   Conda must become the single owner of the name; when it cannot, REFUSE,
+///   naming all three sides (the declared pypi root, the bundled wheel, and
+///   conda).
 ///
 /// Silent when the workspace lock has no entry for the name: the cold first
 /// pass has no lock yet, and "cannot know" is not "unconstrained" -- on that
@@ -21643,44 +21789,70 @@ fn resolve_ceded_pypi_bounds(
             match classify_ceded_bound(specifiers, &locked_version) {
                 CededBoundVerdict::Satisfied => continue,
                 CededBoundVerdict::WithinMajor { relaxed, reason } => {
-                    tracing::warn!(
-                        bundle = %bundle.conda_name,
-                        "declared-pypi ownership: accepting {name}=={locked} over bundled wheel \
-                         {wheel_file} requirement {raw}; relaxed to {relaxed} \
-                         (reason={reason}; declared pypi provider wins)",
-                        wheel_file = wheel.metadata.filename,
+                    record_ceded_relaxation(
+                        &mut ownership,
+                        bundle,
+                        wheel,
+                        &name,
+                        locked,
+                        raw,
+                        specifiers,
+                        relaxed,
+                        reason,
                     );
-                    let decision = crate::relax_decision::RelaxationDecision {
-                        origin_id: ConstraintOriginId::from_parts(
-                            "declared-pypi-owner",
-                            [name.as_str(), locked.as_str(), raw.as_str()],
-                        ),
-                        kind: crate::relax_decision::RelaxationKind::ExactPinWidened,
-                        original: specifiers.to_string(),
-                        relaxed: relaxed.clone(),
-                        original_clause: specifiers.to_string(),
-                        relaxed_clause: Some(relaxed.clone()),
-                        source: format!(
-                            "wheel `{}` Requires-Dist `{raw}` vs declared-pypi owner \
-                             {name}=={locked} (reason={reason}; declared pypi provider wins)",
-                            wheel.metadata.filename,
-                        ),
-                        tier: RelaxPolicy::Major,
-                    };
-                    ownership
-                        .records
-                        .extend(auto_bundle::wheel_metadata_relaxations(
-                            &crate::relax::PypiKey::from_pypi(&name),
-                            &[],
-                            vec![decision],
-                            &bundle.conda_name,
-                            format!(" for bundle '{}'", bundle.conda_name),
-                        ));
-                    // Widest relaxation wins when two wheels disagree: the
-                    // env installs exactly one copy either way.
-                    ownership.relaxed.insert(name.clone(), relaxed);
                 }
                 CededBoundVerdict::CrossMajor => {
+                    // N27-RETREAD-205. A band retread WIDENED out of the wheel
+                    // author's exact pin is retread's own invention, not a
+                    // contract the author asserted -- and the SAME run already
+                    // projects that pin out of the emitted bound as
+                    // non-contractual (`retread-constrains-discipline`).
+                    // Treating a violation of it as lock-fatal is two policies
+                    // contradicting each other inside one run: measured on
+                    // `viral-gpu`, where upstream `isaaclab==0.54.2` states
+                    // `pillow==11.3.0`, phase D widens it to `>=11.3,<11.4`,
+                    // and the first keep's own pypi phase supplies 12.3.0 --
+                    // with NO pillow line anywhere in the env's manifest for an
+                    // operator to fix. So the widened band takes the
+                    // WITHIN-MAJOR path and says so loudly. A REAL upstream
+                    // RANGE (`huggingface_hub<1.0`, written by the author)
+                    // matches no widening tier and keeps the refusal below.
+                    if let Some(upstream) = widened_exact_pin_upstream(
+                        &wheel.original_requires_dist,
+                        &name,
+                        specifiers,
+                        marker_env,
+                    ) {
+                        let major = locked_version.release().first().copied().unwrap_or(0);
+                        // The band must contain the version it accepts: a floor
+                        // above the locked version yields to the locked version.
+                        let floor = match spec_floor(specifiers) {
+                            Some(floor) if floor <= locked_version => floor,
+                            _ => locked_version.clone(),
+                        };
+                        let relaxed = format!(">={floor},<{}", major + 1);
+                        eprintln!(
+                            "{}",
+                            ceded_bound_widened_pin_row(
+                                &name,
+                                &upstream,
+                                &specifiers.to_string(),
+                                locked,
+                            )
+                        );
+                        record_ceded_relaxation(
+                            &mut ownership,
+                            bundle,
+                            wheel,
+                            &name,
+                            locked,
+                            raw,
+                            specifiers,
+                            relaxed,
+                            CEDED_WIDENED_PIN_REASON,
+                        );
+                        continue;
+                    }
                     // Conda first, refusal second (F11 turn 5). No within-major
                     // relaxation is defensible here, but if a workspace conda
                     // provider offers the name at a version the bundled bound

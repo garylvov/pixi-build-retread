@@ -10667,6 +10667,267 @@ fn a_calver_ceded_bound_builds_and_records_the_calver_relaxation() {
     );
 }
 
+// -----------------------------------------------------------------
+// N27-RETREAD-205 -- a band retread widened out of an EXACT pin is not a hard
+// range, so it can never be a lock-fatal MAJOR-boundary refusal.
+//
+// Measured on `viral-gpu` (KEEPWALK-1, jobs 6186134 / 6187025 / 6187418):
+// upstream `isaaclab==0.54.2` states `Requires-Dist pillow==11.3.0`; phase D's
+// `widen_exact_to_pep508` rewrites it to `pillow>=11.3,<11.4` at the Patch
+// tier; the first keep's own pypi phase then supplies `pillow 12.3.0` through
+// torchvision, and `resolve_ceded_pypi_bounds` refused the whole relock across
+// a MAJOR boundary -- while the SAME run projected that very pin out of the
+// emitted bound as non-contractual (`retread-constrains-discipline`), and no
+// feature `viral-gpu` uses declares `pillow` at all, so the refusal's "fix the
+// manifest" pointed at nothing.
+// -----------------------------------------------------------------
+
+/// The pillow shape of the `viral-gpu` refusal, as a bundle.
+///
+/// `upstream` is what the wheel author wrote; `post_d` is the line phase D left
+/// in the shipped METADATA (what `resolve_ceded_pypi_bounds` actually reads).
+/// `torchvision` is the declared workspace pypi root that makes the name ceded,
+/// exactly as the measured manifest does.
+fn ceded_pillow_bundle(upstream: &str, post_d: &str, locked: &str) -> Bundle {
+    let mut bundle = solo_bundle("isaaclab-viral-pack", vec![post_d]);
+    bundle.primary.metadata.requires_dist = vec![post_d.to_string()];
+    bundle.primary.original_requires_dist = vec![upstream.to_string()];
+    bundle
+        .workspace_declared_pypi
+        .insert(canonical_conda_name("torchvision"));
+    bundle
+        .uv_dependency_graph
+        .edges
+        .insert(crate::uv_closure::UvDependencyEdge {
+            parent: "torchvision".to_string(),
+            child: "pillow".to_string(),
+        });
+    bundle
+        .workspace_locked_pypi
+        .insert("pillow".to_string(), locked.to_string());
+    bundle
+}
+
+/// GUARD (a). The pillow shape BUILDS, records `reason=widened-pin`, and
+/// advertises a band that admits the version it accepted.
+///
+/// RED on 6acd7f9: `produce_output_pending_relaxations` returns the
+/// `across a MAJOR boundary` bail.
+#[test]
+fn a_widened_exact_pin_is_not_a_cross_major_contract() {
+    let bundle = ceded_pillow_bundle("pillow==11.3.0", "pillow>=11.3,<11.4", "12.3.0");
+    let (output, relaxations) = produce_output_pending_relaxations(
+        &bundle,
+        &cfg(),
+        Platform::Linux64,
+        "3.11",
+        &[],
+        None,
+        None,
+    )
+    .expect(
+        "a band retread widened out of the author's exact pin is retread's own, \
+         not a contract that may refuse a relock across a MAJOR boundary",
+    );
+
+    let depends: Vec<String> = output
+        .run_dependencies
+        .depends
+        .iter()
+        .map(|d| d.name.clone())
+        .collect();
+    assert!(
+        !depends.iter().any(|name| name == "pillow"),
+        "the widened-pin admission must not hand the name to conda: {depends:?}",
+    );
+    let rendered: Vec<String> = relaxations.iter().map(|r| format!("{r}")).collect();
+    assert!(
+        rendered
+            .iter()
+            .any(|r| r.contains("pillow") && r.contains("reason=widened-pin")),
+        "the relaxation record must name the widened-pin rule: {rendered:?}",
+    );
+
+    // The recorded band must ADMIT the version it accepted -- a record whose
+    // own band excludes 12.3.0 would let the INSTALL refuse what this build
+    // accepted, because `installer::widened_pin_admission` matches on exactly
+    // that band. floor 11.3 (the widened band's own floor, <= 12.3.0) and the
+    // ceiling of the locked version's major.
+    let record = rendered
+        .iter()
+        .find(|r| r.contains("pillow") && r.contains("reason=widened-pin"))
+        .expect("a pillow widened-pin relaxation record");
+    assert!(
+        record.contains(">=11.3,<13"),
+        "the recorded band must admit the accepted version 12.3.0: {record}",
+    );
+    assert!(
+        record.contains(&ceded_widened_pin_marker()),
+        "the record must carry the marker the install side reads: {record}",
+    );
+
+    // The bound the pack ADVERTISES is the relaxed one, never the manufactured
+    // `<11.4` band it just accepted a violation of.
+    let constrains: Vec<String> = output
+        .run_dependencies
+        .constraints
+        .iter()
+        .map(format_constraint_spec)
+        .collect();
+    assert!(
+        !constrains.iter().any(|line| line.contains("11.4")),
+        "the manufactured `<11.4` ceiling must not be advertised: {constrains:?}",
+    );
+}
+
+/// GUARD (b). A REAL upstream RANGE keeps the cross-major refusal.
+///
+/// `>=11.3,<12` is a bound the wheel author WROTE; it matches no
+/// `widen_exact_to_pep508` tier, so nothing about (a) reaches it. GREEN on
+/// 6acd7f9 and after -- the mutant "admit every band" turns it red.
+#[test]
+fn a_real_upstream_range_still_refuses_across_a_major_boundary() {
+    let bundle = ceded_pillow_bundle("pillow>=11.3,<12", "pillow>=11.3,<12", "12.3.0");
+    let err = produce_output_pending_relaxations(
+        &bundle,
+        &cfg(),
+        Platform::Linux64,
+        "3.11",
+        &[],
+        None,
+        None,
+    )
+    .expect_err("an author-written range crossing a MAJOR boundary must still refuse");
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("across a MAJOR boundary") && rendered.contains("pillow"),
+        "the refusal must be the unchanged cross-major one: {rendered}",
+    );
+}
+
+/// GUARD (b2). The `huggingface_hub 1.28` vs bundled `<1.0` case in the
+/// function's own doc comment -- an author-written upper cap, no exact pin
+/// anywhere -- is untouched.
+#[test]
+fn a_bare_upper_cap_still_refuses_across_a_major_boundary() {
+    let mut bundle = solo_bundle("hub-pack", vec!["huggingface-hub<1.0"]);
+    bundle.primary.metadata.requires_dist = vec!["huggingface-hub<1.0".to_string()];
+    bundle.primary.original_requires_dist = vec!["huggingface-hub<1.0".to_string()];
+    bundle
+        .workspace_declared_pypi
+        .insert(canonical_conda_name("transformers"));
+    bundle
+        .uv_dependency_graph
+        .edges
+        .insert(crate::uv_closure::UvDependencyEdge {
+            parent: "transformers".to_string(),
+            child: "huggingface-hub".to_string(),
+        });
+    bundle
+        .workspace_locked_pypi
+        .insert("huggingface-hub".to_string(), "1.28.0".to_string());
+    let err = produce_output_pending_relaxations(
+        &bundle,
+        &cfg(),
+        Platform::Linux64,
+        "3.11",
+        &[],
+        None,
+        None,
+    )
+    .expect_err("an author-written upper cap crossing a MAJOR boundary must still refuse");
+    assert!(
+        format!("{err:#}").contains("across a MAJOR boundary"),
+        "{err:#}",
+    );
+}
+
+/// GUARD (c). A WITHIN-MAJOR disagreement over a real range is unchanged: it
+/// took the accept-and-record path before this fix and still does, under
+/// `reason=within-major` and NOT under `reason=widened-pin`.
+#[test]
+fn a_within_major_real_range_keeps_its_within_major_reason() {
+    let bundle = ceded_pillow_bundle("pillow>=11.0,<11.5", "pillow>=11.0,<11.5", "11.9.0");
+    let (_output, relaxations) = produce_output_pending_relaxations(
+        &bundle,
+        &cfg(),
+        Platform::Linux64,
+        "3.11",
+        &[],
+        None,
+        None,
+    )
+    .expect("a within-major disagreement builds, as it always did");
+    let rendered: Vec<String> = relaxations.iter().map(|r| format!("{r}")).collect();
+    assert!(
+        rendered
+            .iter()
+            .any(|r| r.contains("pillow") && r.contains("reason=within-major")),
+        "a real range's within-major relaxation must keep its own reason: {rendered:?}",
+    );
+    assert!(
+        !rendered.iter().any(|r| r.contains("reason=widened-pin")),
+        "the widened-pin arm must not steal the within-major case: {rendered:?}",
+    );
+}
+
+/// The PROVENANCE predicate itself, in isolation -- the mechanism the whole
+/// ruling rests on. A band is a widened pin only when it is EXACTLY what
+/// `widen_exact_to_pep508` produces from an upstream exact pin at one of its
+/// tiers; every other shape is the author's own.
+#[test]
+fn widened_pin_provenance_is_proven_from_the_upstream_line_never_guessed() {
+    let marker_env = crate::relax::default_marker_env("3.11").unwrap();
+    let probe = |upstream: &str, band: &str| {
+        widened_exact_pin_upstream(
+            &[upstream.to_string()],
+            "pillow",
+            &VersionSpecifiers::from_str(band).unwrap(),
+            &marker_env,
+        )
+    };
+    // The measured shape: Patch tier of the default policy.
+    assert_eq!(
+        probe("pillow==11.3.0", ">=11.3,<11.4"),
+        Some("==11.3.0".to_string()),
+    );
+    // Minor and Major tiers of the same pin are equally retread's own.
+    assert_eq!(
+        probe("pillow==11.3.0", ">=11.3,<12"),
+        Some("==11.3.0".to_string()),
+    );
+    // A band that is NOT any tier's output over that pin is not provenance.
+    assert_eq!(probe("pillow==11.3.0", ">=11.3,<11.9"), None);
+    assert_eq!(probe("pillow==11.3.0", ">=11.0,<12"), None);
+    // An author-written RANGE upstream is never a widened pin, however much
+    // the band looks like one.
+    assert_eq!(probe("pillow>=11.3,<12", ">=11.3,<11.4"), None);
+    assert_eq!(probe("pillow<1.0", ">=11.3,<11.4"), None);
+    // A different name never matches.
+    assert_eq!(probe("numpy==11.3.0", ">=11.3,<11.4"), None);
+    // No upstream line at all (a path that records none) keeps the refusal.
+    assert_eq!(
+        widened_exact_pin_upstream(
+            &[],
+            "pillow",
+            &VersionSpecifiers::from_str(">=11.3,<11.4").unwrap(),
+            &marker_env,
+        ),
+        None,
+    );
+}
+
+/// The loud row is a fixed shape a log reader can grep for, and it is the ONE
+/// place its text is built.
+#[test]
+fn the_widened_pin_row_names_dep_upstream_band_locked_and_the_policy() {
+    assert_eq!(
+        ceded_bound_widened_pin_row("pillow", "==11.3.0", ">=11.3,<11.4", "12.3.0"),
+        "### CEDED BOUND WIDENED-PIN dep=pillow upstream===11.3.0 band=>=11.3,<11.4 \
+         locked=12.3.0 policy=admitted",
+    );
+}
+
 /// Shared shape for the Lane C injected-constraint tests: a pack whose
 /// closure auto-routed `pillow` to conda at the version the solve happened to
 /// pick. `injected` marks it as a Lane C injection; `declared` is what the

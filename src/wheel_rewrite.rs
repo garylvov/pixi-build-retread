@@ -827,7 +827,7 @@ fn strip_upper_bounds_pep508(specs: &[&uv_pep508::uv_pep440::VersionSpecifier]) 
     kept
 }
 
-fn widen_exact_to_pep508(v: &Version, policy: RelaxPolicy) -> Option<String> {
+pub(crate) fn widen_exact_to_pep508(v: &Version, policy: RelaxPolicy) -> Option<String> {
     let r = v.release();
     if r.is_empty() || !crate::relax::exact_version_can_widen(v) {
         return None;

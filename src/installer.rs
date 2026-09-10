@@ -889,6 +889,30 @@ fn not_courier_owned_pypi(lock: &RetreadLock, prefix: &Path) -> BTreeSet<String>
     owned
 }
 
+/// The BUILD's own record that it admitted `name` at the env's locked version
+/// over a band it had WIDENED out of the wheel author's exact pin.
+///
+/// Writer: `handler::record_ceded_relaxation` under
+/// [`crate::handler::CEDED_WIDENED_PIN_REASON`], which rides into this lock as
+/// `relaxations[]`. Reader: [`check_env_pypi_bounds`]. The recorded band must
+/// itself admit the locked version, so a stale record for a different version
+/// cannot launder a refusal away.
+fn widened_pin_admission<'a>(
+    lock: &'a RetreadLock,
+    name: &str,
+    locked_version: &uv_pep508::uv_pep440::Version,
+) -> Option<&'a crate::relaxation_record::RelaxationRecord> {
+    let marker = crate::handler::ceded_widened_pin_marker();
+    lock.relaxations.iter().find(|record| {
+        normalize_dist_name(&record.package) == name
+            && record.kind == crate::relaxation_record::RelaxationRecordKind::ExactPinWidened
+            && record.source.contains(&marker)
+            && uv_pep508::uv_pep440::VersionSpecifiers::from_str(&record.resulting_spec)
+                .map(|specs| specs.contains(locked_version))
+                .unwrap_or(false)
+    })
+}
+
 /// Refuse an install whose bundled wheels contradict the version the env's own
 /// `pixi.lock` installs for a name this install is ceding.
 ///
@@ -944,6 +968,25 @@ fn check_env_pypi_bounds(lock: &RetreadLock, owned: &BTreeMap<String, String>) -
                      wheel {wheel_file} requirement {raw} (reason={reason}; declared \
                      pypi provider wins)",
                     wheel_file = wheel.filename,
+                );
+                continue;
+            }
+            // SAME POLICY AS BUILD (N27-RETREAD-205). A band retread widened
+            // out of the wheel author's EXACT pin is retread's own invention,
+            // not a contract the author asserted. Provenance is not knowable
+            // from the specifiers alone -- the lock records only the POST-D
+            // line -- so the BUILD writes its admission into this lock's
+            // `relaxations[]` and this is its reader. Without it the build
+            // would accept `pillow 12.3.0` and the install would refuse it.
+            if let Some(record) = widened_pin_admission(lock, &name, &locked_version) {
+                eprintln!(
+                    "retread install: accepting env-pypi owner {name}=={locked} over bundled \
+                     wheel {wheel_file} requirement {raw} (reason={reason}; the bundled bound \
+                     is a retread-widened exact pin, not an author-written range; the build \
+                     recorded {relaxed} for this name)",
+                    wheel_file = wheel.filename,
+                    reason = crate::handler::CEDED_WIDENED_PIN_REASON,
+                    relaxed = record.resulting_spec,
                 );
                 continue;
             }
@@ -4577,6 +4620,94 @@ packages:
 
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(bare);
+    }
+
+    /// N27-RETREAD-205, INSTALL SIDE. The install must never refuse what the
+    /// build accepted.
+    ///
+    /// The build admits `pillow 12.3.0` over the band it WIDENED out of
+    /// `pillow==11.3.0`, but provenance is not knowable from the lock's
+    /// POST-phase-D `requires_dist` alone -- so the build writes the admission
+    /// into `relaxations[]` and this reader is the other half of that pair.
+    /// Without the reader the pack builds and then cannot install.
+    #[test]
+    fn a_widened_pin_the_build_admitted_is_not_refused_at_install() {
+        let mut lock = make_lock(vec![], vec![], BTreeMap::new());
+        let mut pack = lock_wheel("viral-pack", "1.0.0");
+        // What the shipped METADATA carries: the WIDENED band, not the pin.
+        pack.requires_dist = vec!["pillow>=11.3,<11.4".into()];
+        lock.wheels = vec![pack];
+        let owned = BTreeMap::from([("pillow".to_string(), "12.3.0".to_string())]);
+
+        // Without the build's record, the install refuses -- the band crosses
+        // a major boundary and nothing in the lock says otherwise.
+        let err = format!(
+            "{:#}",
+            check_env_pypi_bounds(&lock, &owned)
+                .expect_err("with no recorded admission the cross-major refusal stands"),
+        );
+        assert!(err.contains("MAJOR boundary"), "{err}");
+
+        // WITH the build's own record -- same marker, band admitting 12.3.0 --
+        // the install accepts, because the build did.
+        let record = |package: &str, resulting: &str, source: String| {
+            crate::relaxation_record::RelaxationRecord {
+                package: package.to_string(),
+                original_spec: ">=11.3,<11.4".to_string(),
+                resulting_spec: resulting.to_string(),
+                tier: crate::config::RelaxPolicy::Major,
+                kind: crate::relaxation_record::RelaxationRecordKind::ExactPinWidened,
+                source,
+                involved_wheels: vec![],
+                scope: crate::relaxation_record::RelaxationScope {
+                    environments: vec![],
+                    targets: vec![],
+                    platform: "linux-64".to_string(),
+                    python: "3.11".to_string(),
+                },
+            }
+        };
+        let marker = crate::handler::ceded_widened_pin_marker();
+        let mut admitted = lock.clone();
+        admitted.relaxations = vec![record(
+            "pillow",
+            ">=11.3,<13",
+            format!("wheel `x.whl` Requires-Dist `pillow>=11.3,<11.4` ({marker})"),
+        )];
+        check_env_pypi_bounds(&admitted, &owned)
+            .expect("the install must accept the admission the build recorded");
+
+        // A record for a DIFFERENT name does not launder the refusal away.
+        let mut wrong_name = lock.clone();
+        wrong_name.relaxations = vec![record(
+            "numpy",
+            ">=11.3,<13",
+            format!("wheel `x.whl` ({marker})"),
+        )];
+        check_env_pypi_bounds(&wrong_name, &owned)
+            .expect_err("a record for another name is not this name's admission");
+
+        // Nor does a record whose OWN band excludes the locked version: the
+        // build never admitted 12.3.0 under `>=11.3,<12`.
+        let mut stale_band = lock.clone();
+        stale_band.relaxations = vec![record(
+            "pillow",
+            ">=11.3,<12",
+            format!("wheel `x.whl` ({marker})"),
+        )];
+        check_env_pypi_bounds(&stale_band, &owned)
+            .expect_err("a band that excludes the locked version admits nothing");
+
+        // Nor does an ordinary relaxation record that never went through the
+        // ceded widened-pin arm -- the marker is what makes it an admission.
+        let mut unmarked = lock.clone();
+        unmarked.relaxations = vec![record(
+            "pillow",
+            ">=11.3,<13",
+            "some other relaxation entirely".to_string(),
+        )];
+        check_env_pypi_bounds(&unmarked, &owned)
+            .expect_err("only the ceded widened-pin arm's own record is an admission");
     }
 
     /// F23. A conda package that ships UPSTREAM'S wheel RECORD verbatim while
