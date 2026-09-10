@@ -1365,6 +1365,12 @@ fn a_declared_owned_name_locked_outside_a_bundled_wheels_bound_refuses_at_build(
 /// build proceeds, and the bundled dist is still ceded so replay never
 /// materializes it. Only when conda cannot satisfy the bound is the
 /// disagreement unresolvable (arm 1b of the guard above, unchanged).
+///
+/// N27-RETREAD-207 narrowed "unresolvable" to author-written RANGES: an exact
+/// pin conda cannot satisfy is now admitted (arm (b) below), because the pin is
+/// an incidental snapshot and not a contract. The CONDA-FIRST ordering this test
+/// pins is what -207 must not disturb, and gate 6190728 measured it going red
+/// when a first cut put the pin arm above the conda arm.
 #[test]
 fn a_cross_major_contested_name_conda_can_satisfy_becomes_a_conda_depends_edge() {
     let contested_bundle = || {
@@ -1429,13 +1435,47 @@ fn a_cross_major_contested_name_conda_can_satisfy_becomes_a_conda_depends_edge()
         "the contested bundled wheel must stay out of the install replay",
     );
 
-    // (b) conda does NOT have a satisfying version -> today's loud refusal.
+    // (b) conda does NOT have a satisfying version, and the bundled bound is an
+    // EXACT PIN -> N27-RETREAD-207 RETIRES THE REFUSAL FOR PINS. This arm
+    // asserted a `bail!` until CEDE-2; the pin is an incidental snapshot of what
+    // the pack's builder resolved against (operator ruling 2026-08-19), so it is
+    // admitted with an EXACT-PIN record instead. What survives here is the
+    // ORDERING: arm (a) above still wins whenever conda CAN satisfy the pin,
+    // because that resolution violates nothing.
     let mut bundle = contested_bundle();
     bundle
         .workspace_conda_versions
         .insert("trimesh".to_string(), "5.0.0".to_string());
+    let (_output, relaxations) = produce_output_pending_relaxations(
+        &bundle,
+        &cfg(),
+        Platform::Linux64,
+        "3.11",
+        &[],
+        None,
+        None,
+    )
+    .expect("a raw exact pin conda cannot satisfy is admitted, not lock-fatal (-207)");
+    let rendered: Vec<String> = relaxations.iter().map(|r| format!("{r}")).collect();
+    assert!(
+        rendered
+            .iter()
+            .any(|r| r.contains("trimesh") && r.contains("reason=exact-pin")),
+        "the admission must be recorded under the exact-pin reason: {rendered:?}",
+    );
+
+    // (c) conda does NOT have a satisfying version and the bundled bound is an
+    // author-written RANGE -> the unresolvable refusal is UNCHANGED, and it
+    // still names every side. This is the arm that keeps F11 turn 5's message
+    // under test now that (b) no longer refuses.
+    let mut bundle = contested_bundle();
+    bundle.primary.original_requires_dist = vec!["trimesh>=4.11.1,<5".to_string()];
+    bundle.primary.metadata.requires_dist = vec!["trimesh>=4.11.1,<5".to_string()];
+    bundle
+        .workspace_conda_versions
+        .insert("trimesh".to_string(), "5.0.0".to_string());
     let err = produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None)
-        .expect_err("conda cannot satisfy the bundled pin, so the refusal stands");
+        .expect_err("conda cannot satisfy an author-written range, so the refusal stands");
     let message = format!("{err:#}");
     for needle in [
         "declared-pypi owner",
@@ -10750,7 +10790,7 @@ fn a_widened_exact_pin_is_not_a_cross_major_contract() {
 
     // The recorded band must ADMIT the version it accepted -- a record whose
     // own band excludes 12.3.0 would let the INSTALL refuse what this build
-    // accepted, because `installer::widened_pin_admission` matches on exactly
+    // accepted, because `installer::ceded_pin_admission` matches on exactly
     // that band. floor 11.3 (the widened band's own floor, <= 12.3.0) and the
     // ceiling of the locked version's major.
     let record = rendered
@@ -10925,6 +10965,215 @@ fn the_widened_pin_row_names_dep_upstream_band_locked_and_the_policy() {
         ceded_bound_widened_pin_row("pillow", "==11.3.0", ">=11.3,<11.4", "12.3.0"),
         "### CEDED BOUND WIDENED-PIN dep=pillow upstream===11.3.0 band=>=11.3,<11.4 \
          locked=12.3.0 policy=admitted",
+    );
+}
+
+// -----------------------------------------------------------------
+// N27-RETREAD-207 -- a RAW upstream exact pin is the same incidental snapshot
+// as a widened one; only an author-written RANGE is contractual here.
+//
+// Measured on `viral-gpu` (MERGE-B44-4 R1b, job 6190259): with -205 in the
+// binary the widened `isaaclab` crossing was ADMITTED in production
+// (`### CEDED BOUND WIDENED-PIN dep=pillow upstream===11.3.0 band=>=11.3, <11.4
+// locked=12.3.0 policy=admitted` x2) and the solve walked straight into a
+// SECOND crossing behind it:
+// `isaacsim_kernel-5.1.0.0-cp311-none-manylinux_2_35_x86_64.whl` requiring the
+// RAW `Pillow==11.3.0`.
+//
+// WHY THAT ONE WAS NEVER WIDENED, measured rather than assumed: phase D runs in
+// `materialize_and_rewrite`, the DECLARED-root path (it is what writes the
+// `.injected.autodata.relaxed` infixes). `isaacsim_kernel` is resolved as a
+// BFS/auto-bundle TRANSITIVE, and that path fetches the wheel as-is -- its own
+// construction site says so and sets `original_requires_dist` equal to
+// `metadata.requires_dist`. In 6190259's 78 MB backend log the name appears
+// under exactly two filenames, both raw upstream, with zero `.relaxed` forms.
+// It is not the binary-vs-`py3-none-any` shape and not the `Pillow`
+// capitalisation: `canonical_conda_name` folds `Pillow` to `pillow` and the
+// bail's own text proves the name matched.
+//
+// AND THE SAME RUN PROJECTS THAT WHEEL'S OWN RAW PINS OUT OF THE EMITTED BOUND
+// as non-contractual -- `retread-constrains-discipline ... dropped ==2.4.4
+// (wheel `isaacsim-kernel==5.1.0.0` Requires-Dist `aiohappyeyeballs==2.4.4`)`
+// -- which is CEDE-1's self-contradiction argument with the widening taken out
+// of it. Operator ruling 2026-08-19 already calls a pack's exact pin "an
+// incidental snapshot of what its builder resolved against, not an ABI fact",
+// with no clause about who manufactured the band.
+// -----------------------------------------------------------------
+
+/// GUARD (a). THE `isaacsim_kernel` SHAPE: a RAW `==` pin phase D never
+/// touched, locked 12.3.0, and NO `.relaxed` provenance anywhere -- builds,
+/// records `reason=exact-pin`, and advertises a band admitting what it took.
+///
+/// RED on 0785fe8: `widened_exact_pin_upstream` finds no widening to prove, so
+/// the `CrossMajor` bail stands. This is the whole lane in one test.
+#[test]
+fn a_raw_upstream_exact_pin_is_not_a_cross_major_contract() {
+    // Author capitalisation preserved on BOTH lines: this wheel's metadata was
+    // never rewritten, which is exactly the state under test.
+    let bundle = ceded_pillow_bundle("Pillow==11.3.0", "Pillow==11.3.0", "12.3.0");
+    let (output, relaxations) = produce_output_pending_relaxations(
+        &bundle,
+        &cfg(),
+        Platform::Linux64,
+        "3.11",
+        &[],
+        None,
+        None,
+    )
+    .expect(
+        "a raw upstream exact pin is the same incidental snapshot as a widened one \
+         and may not refuse a relock across a MAJOR boundary",
+    );
+
+    let depends: Vec<String> = output
+        .run_dependencies
+        .depends
+        .iter()
+        .map(|d| d.name.clone())
+        .collect();
+    assert!(
+        !depends.iter().any(|name| name == "pillow"),
+        "the exact-pin admission must not hand the name to conda: {depends:?}",
+    );
+    let rendered: Vec<String> = relaxations.iter().map(|r| format!("{r}")).collect();
+    let record = rendered
+        .iter()
+        .find(|r| r.contains("pillow") && r.contains("reason=exact-pin"))
+        .expect("a pillow exact-pin relaxation record");
+    // The band must ADMIT the version it accepted, or the INSTALL reader
+    // (`installer::ceded_pin_admission`) refuses what this build took.
+    assert!(
+        record.contains(">=11.3.0,<13"),
+        "the recorded band must admit the accepted version 12.3.0: {record}",
+    );
+    assert!(
+        record.contains(&ceded_exact_pin_marker()),
+        "the record must carry the marker the install side reads: {record}",
+    );
+    // The pin itself is never advertised as the pack's contract.
+    let constrains: Vec<String> = output
+        .run_dependencies
+        .constraints
+        .iter()
+        .map(format_constraint_spec)
+        .collect();
+    assert!(
+        !constrains.iter().any(|line| line.contains("==11.3.0")),
+        "the incidental pin must not be advertised as a bound: {constrains:?}",
+    );
+}
+
+/// GUARD (b). CEDE-1's WIDENED shape is UNCHANGED by this lane: it still takes
+/// the widened arm, under `reason=widened-pin` and never `reason=exact-pin`.
+///
+/// The two origins are mutually exclusive by construction -- a widened band is
+/// never a single `==` clause -- and this asserts the ordering never lets the
+/// new arm steal the old one's case.
+#[test]
+fn the_widened_shape_keeps_its_own_reason_and_never_the_exact_pin_one() {
+    let bundle = ceded_pillow_bundle("pillow==11.3.0", "pillow>=11.3,<11.4", "12.3.0");
+    let (_output, relaxations) = produce_output_pending_relaxations(
+        &bundle,
+        &cfg(),
+        Platform::Linux64,
+        "3.11",
+        &[],
+        None,
+        None,
+    )
+    .expect("CEDE-1's widened admission is unchanged");
+    let rendered: Vec<String> = relaxations.iter().map(|r| format!("{r}")).collect();
+    assert!(
+        rendered
+            .iter()
+            .any(|r| r.contains("pillow") && r.contains("reason=widened-pin")),
+        "the widened shape must keep reason=widened-pin: {rendered:?}",
+    );
+    assert!(
+        !rendered.iter().any(|r| r.contains("reason=exact-pin")),
+        "the raw arm must not steal the widened case: {rendered:?}",
+    );
+}
+
+/// GUARD (c). An author-written RANGE still refuses across a MAJOR boundary,
+/// with the raw-pin arm in the tree.
+///
+/// `>=11.3,<12` is byte-identical to `widen_exact_to_pep508(11.3.0, Minor)`,
+/// and here the upstream line is that same RANGE -- so neither arm may fire.
+/// The mutant "admit every bound" turns this red.
+#[test]
+fn an_author_written_range_still_refuses_with_the_raw_pin_arm_present() {
+    let bundle = ceded_pillow_bundle("pillow>=11.3,<12", "pillow>=11.3,<12", "12.3.0");
+    let err = produce_output_pending_relaxations(
+        &bundle,
+        &cfg(),
+        Platform::Linux64,
+        "3.11",
+        &[],
+        None,
+        None,
+    )
+    .expect_err("an author-written range crossing a MAJOR boundary must still refuse");
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("across a MAJOR boundary") && rendered.contains("pillow"),
+        "the refusal must be the unchanged cross-major one: {rendered}",
+    );
+}
+
+/// GUARD (d). `~=11.3` is a RANGE (`>=11.3,<12`), not an exact pin, and keeps
+/// the refusal.
+///
+/// The compatible-release operator is the shape most likely to be mistaken for
+/// a pin: it is written with an `=` and names one version. It is not one.
+#[test]
+fn a_compatible_release_range_refuses_across_a_major_boundary() {
+    let bundle = ceded_pillow_bundle("pillow~=11.3", "pillow~=11.3", "12.3.0");
+    let err = produce_output_pending_relaxations(
+        &bundle,
+        &cfg(),
+        Platform::Linux64,
+        "3.11",
+        &[],
+        None,
+        None,
+    )
+    .expect_err("`~=` is a range the author wrote and must still refuse");
+    assert!(
+        format!("{err:#}").contains("across a MAJOR boundary"),
+        "{err:#}",
+    );
+}
+
+/// GUARD (e). The predicate in isolation: EXACTLY ONE `==` clause and nothing
+/// else. Every other shape is a range or a deliberate author act.
+#[test]
+fn raw_exact_pin_admits_only_a_single_equals_clause() {
+    let probe = |spec: &str| raw_exact_pin(&VersionSpecifiers::from_str(spec).unwrap());
+    assert_eq!(probe("==11.3.0"), Some("==11.3.0".to_string()));
+    assert_eq!(probe("==11.3"), Some("==11.3".to_string()));
+    // Ranges, in every spelling the ecosystem writes them.
+    assert_eq!(probe(">=11.3,<12"), None);
+    assert_eq!(probe("~=11.3"), None);
+    assert_eq!(probe("<12"), None);
+    assert_eq!(probe(">=11.3"), None);
+    assert_eq!(probe("!=11.3.0"), None);
+    assert_eq!(probe("==11.3.*"), None);
+    // Arbitrary equality is a deliberate author act, not an incidental
+    // snapshot: it keeps the refusal.
+    assert_eq!(probe("===11.3.0"), None);
+    // Two clauses are a range however narrow.
+    assert_eq!(probe(">=11.3.0,<=11.3.0"), None);
+}
+
+/// The RAW row is a fixed shape a log reader can grep for, distinct from the
+/// widened one (no `band=`, because for a raw pin the bound IS the upstream
+/// line), and this is the ONE place its text is built.
+#[test]
+fn the_exact_pin_row_names_dep_upstream_locked_and_the_policy() {
+    assert_eq!(
+        ceded_bound_exact_pin_row("pillow", "==11.3.0", "12.3.0"),
+        "### CEDED BOUND EXACT-PIN dep=pillow upstream===11.3.0 locked=12.3.0 policy=admitted",
     );
 }
 

@@ -21492,13 +21492,35 @@ fn spec_floor(specifiers: &VersionSpecifiers) -> Option<Version> {
 /// recorded relaxation's `source`, and in the row. N27-RETREAD-205.
 pub(crate) const CEDED_WIDENED_PIN_REASON: &str = "widened-pin";
 
-/// The substring the install side matches to recognise a WIDENED-PIN admission
-/// the BUILD already made and recorded in this lock.
+/// The `reason` every RAW EXACT-PIN admission carries. N27-RETREAD-207.
+///
+/// The sibling of [`CEDED_WIDENED_PIN_REASON`] for the pin phase D never
+/// touched: a wheel resolved as a BFS/auto-bundle transitive is fetched as-is
+/// (`auto_bundle`: "no phase-D rewrite of its own"), so its author's
+/// `Pillow==11.3.0` reaches the ceded check verbatim. Operator ruling
+/// 2026-08-19 already calls such a pin "an incidental snapshot of what its
+/// builder resolved against, not an ABI fact" -- widening it is not what makes
+/// it incidental, so a raw pin is admitted on the same terms.
+pub(crate) const CEDED_EXACT_PIN_REASON: &str = "exact-pin";
+
+/// The substring the install side matches to recognise an admission the BUILD
+/// already made and recorded in this lock, for one `reason`.
 ///
 /// Writer: [`record_ceded_relaxation`]'s `source`. Reader:
-/// `installer::widened_pin_admission`. One constant, so the pair cannot drift.
+/// `installer::ceded_pin_admission`. One function, so the pair cannot drift
+/// for either reason.
+pub(crate) fn ceded_pin_marker(reason: &str) -> String {
+    format!("reason={reason}; declared pypi provider wins")
+}
+
+/// The WIDENED-PIN marker. See [`ceded_pin_marker`].
 pub(crate) fn ceded_widened_pin_marker() -> String {
-    format!("reason={CEDED_WIDENED_PIN_REASON}; declared pypi provider wins")
+    ceded_pin_marker(CEDED_WIDENED_PIN_REASON)
+}
+
+/// The RAW EXACT-PIN marker. See [`ceded_pin_marker`].
+pub(crate) fn ceded_exact_pin_marker() -> String {
+    ceded_pin_marker(CEDED_EXACT_PIN_REASON)
 }
 
 /// The loud row a WIDENED-PIN admission writes.
@@ -21515,6 +21537,43 @@ pub(crate) fn ceded_bound_widened_pin_row(
         "### CEDED BOUND WIDENED-PIN dep={dep} upstream={upstream} band={band} \
          locked={locked} policy=admitted"
     )
+}
+
+/// The loud row a RAW EXACT-PIN admission writes. N27-RETREAD-207.
+///
+/// No `band=` field: for a raw pin the bound IS the upstream line, so a band
+/// would only repeat it. Same stderr rule as
+/// [`ceded_bound_widened_pin_row`].
+pub(crate) fn ceded_bound_exact_pin_row(dep: &str, upstream: &str, locked: &str) -> String {
+    format!(
+        "### CEDED BOUND EXACT-PIN dep={dep} upstream={upstream} \
+         locked={locked} policy=admitted"
+    )
+}
+
+/// Is `specifiers` itself an author-written EXACT pin (`==x.y.z`), untouched by
+/// phase D? N27-RETREAD-207.
+///
+/// The pin reaches the ceded check verbatim whenever the wheel carrying it was
+/// resolved as a BFS/auto-bundle transitive, because that path fetches the
+/// wheel as-is and never rewrites its `Requires-Dist` -- measured on
+/// `isaacsim_kernel-5.1.0.0-cp311-none-manylinux_2_35_x86_64.whl`, whose
+/// `Pillow==11.3.0` refused a keep the widened sibling
+/// (`isaaclab-0.54.2-…injected.autodata.relaxed.whl`, `pillow>=11.3,<11.4`)
+/// had just been admitted through.
+///
+/// EXACTLY ONE `==` CLAUSE AND NOTHING ELSE. `~=`, `!=`, `<`, `>=a,<b` and the
+/// arbitrary-equality `===` are all author-written RANGES or deliberate
+/// author acts, and every one of them keeps the `CrossMajor` refusal --
+/// which is CEDE-1's guard (b) doctrine, unchanged.
+fn raw_exact_pin(specifiers: &VersionSpecifiers) -> Option<String> {
+    let clauses: Vec<_> = specifiers.iter().collect();
+    // RAW-EXACT-PIN-CLAUSE-TEST (MUTATION ANCHOR)
+    if clauses.len() != 1 || *clauses[0].operator() != Operator::Equal {
+        return None;
+    }
+    // RAW-EXACT-PIN-ADMIT (MUTATION ANCHOR)
+    Some(specifiers.to_string())
 }
 
 /// Did RETREAD manufacture `specifiers`, by widening an EXACT pin the wheel's
@@ -21710,6 +21769,41 @@ fn record_ceded_relaxation(
     ownership.relaxed.insert(name.to_string(), relaxed);
 }
 
+/// Admit a ceded name's locked version over an EXACT PIN the pack's builder
+/// happened to resolve against -- widened by retread (N27-RETREAD-205) or raw
+/// from the author (N27-RETREAD-207).
+///
+/// ONE function for BOTH origins, so the band, the record and the row can never
+/// disagree about the same decision; the caller supplies the already-built
+/// `row` and the `reason`, which are the only two things that differ.
+#[allow(clippy::too_many_arguments)]
+fn admit_ceded_exact_pin(
+    ownership: &mut CededOwnership,
+    bundle: &Bundle,
+    wheel: &ResolvedWheel,
+    name: &str,
+    locked: &str,
+    locked_version: &Version,
+    raw: &str,
+    specifiers: &VersionSpecifiers,
+    row: &str,
+    reason: &'static str,
+) {
+    let major = locked_version.release().first().copied().unwrap_or(0);
+    // The band must contain the version it accepts: a floor above the locked
+    // version yields to the locked version.
+    let floor = match spec_floor(specifiers) {
+        Some(floor) if floor <= *locked_version => floor,
+        _ => locked_version.clone(),
+    };
+    let relaxed = format!(">={floor},<{}", major + 1);
+    // STDERR, NEVER STDOUT (N27-RETREAD-180).
+    eprintln!("{row}");
+    record_ceded_relaxation(
+        ownership, bundle, wheel, name, locked, raw, specifiers, relaxed, reason,
+    );
+}
+
 /// Resolve every contradiction between a bundled wheel's requirement and the
 /// version the consuming workspace has ALREADY locked for a name the pack is
 /// ceding to pixi's pypi phase.
@@ -21729,11 +21823,19 @@ fn record_ceded_relaxation(
 ///   supplies 12.3.0) -- N27-RETREAD-205: the bound is retread's own, the same
 ///   run already projects the pin out of the emitted contract, so this takes
 ///   the within-major path with a loud `### CEDED BOUND WIDENED-PIN` row.
+/// * **across a major boundary on a RAW author exact pin** (`isaacsim_kernel`'s
+///   `Pillow==11.3.0`, which phase D never touched because the wheel was a
+///   BFS/auto-bundle transitive) -- N27-RETREAD-207: same ruling, same
+///   within-major path, under `### CEDED BOUND EXACT-PIN`. It is tried LAST,
+///   after the conda-owner arm below, so a pin conda CAN satisfy still becomes a
+///   conda `depends` edge and this arm fires only where the tree used to
+///   `bail!`.
 /// * **across a major boundary on a REAL upstream range** (`huggingface_hub
 ///   1.28` against an author-written `<1.0`) -- no relaxation is defensible.
 ///   Conda must become the single owner of the name; when it cannot, REFUSE,
 ///   naming all three sides (the declared pypi root, the bundled wheel, and
-///   conda).
+///   conda). After -207 this is the ONLY shape that still refuses: a range, not
+///   a pin.
 ///
 /// Silent when the workspace lock has no entry for the name: the cold first
 /// pass has no lock yet, and "cannot know" is not "unconstrained" -- on that
@@ -21823,32 +21925,21 @@ fn resolve_ceded_pypi_bounds(
                         specifiers,
                         marker_env,
                     ) {
-                        let major = locked_version.release().first().copied().unwrap_or(0);
-                        // The band must contain the version it accepts: a floor
-                        // above the locked version yields to the locked version.
-                        let floor = match spec_floor(specifiers) {
-                            Some(floor) if floor <= locked_version => floor,
-                            _ => locked_version.clone(),
-                        };
-                        let relaxed = format!(">={floor},<{}", major + 1);
-                        eprintln!(
-                            "{}",
-                            ceded_bound_widened_pin_row(
-                                &name,
-                                &upstream,
-                                &specifiers.to_string(),
-                                locked,
-                            )
-                        );
-                        record_ceded_relaxation(
+                        admit_ceded_exact_pin(
                             &mut ownership,
                             bundle,
                             wheel,
                             &name,
                             locked,
+                            &locked_version,
                             raw,
                             specifiers,
-                            relaxed,
+                            &ceded_bound_widened_pin_row(
+                                &name,
+                                &upstream,
+                                &specifiers.to_string(),
+                                locked,
+                            ),
                             CEDED_WIDENED_PIN_REASON,
                         );
                         continue;
@@ -21873,6 +21964,47 @@ fn resolve_ceded_pypi_bounds(
                             wheel_file = wheel.metadata.filename,
                         );
                         ownership.conda_owned.insert(name.clone(), conda_version);
+                        continue;
+                    }
+                    // N27-RETREAD-207. LAST, AND THAT POSITION IS THE RULING'S
+                    // OTHER HALF. The widening is not what makes a pin
+                    // incidental -- the 2026-08-19 ruling already calls a pack's
+                    // exact pin "an incidental snapshot of what its builder
+                    // resolved against, not an ABI fact", with no clause about
+                    // who manufactured the band -- so a RAW `==x.y.z` phase D
+                    // never touched is admitted on the same terms. Measured on
+                    // `viral-gpu` (6190259): a wheel resolved as a
+                    // BFS/auto-bundle transitive is fetched as-is, so the SAME
+                    // pillow pin arrives WIDENED from the declared root
+                    // `isaaclab` (admitted above) and RAW from the transitive
+                    // `isaacsim_kernel`, which then refused the relock; and the
+                    // same run projects that wheel's own raw pins out of the
+                    // emitted bound as non-contractual
+                    // (`retread-constrains-discipline`).
+                    //
+                    // BUT IT GOES BELOW THE CONDA ARM, NOT BESIDE THE WIDENED
+                    // ONE, AND THAT WAS MEASURED THE HARD WAY (gate 6190728, a
+                    // real red): a raw pin conda CAN satisfy must still become a
+                    // conda `depends` edge, because that resolution VIOLATES
+                    // NOTHING while a relaxation admits a version the bound
+                    // excludes. Placing this arm first re-ceded `trimesh==4.11.1`
+                    // to pixi's pypi phase and turned F11 turn 5's guard
+                    // (`a_cross_major_contested_name_conda_can_satisfy_becomes_a_conda_depends_edge`)
+                    // red. Here it fires ONLY where the tree used to `bail!`,
+                    // which is exactly what this change claims to be.
+                    if let Some(upstream) = raw_exact_pin(specifiers) {
+                        admit_ceded_exact_pin(
+                            &mut ownership,
+                            bundle,
+                            wheel,
+                            &name,
+                            locked,
+                            &locked_version,
+                            raw,
+                            specifiers,
+                            &ceded_bound_exact_pin_row(&name, &upstream, locked),
+                            CEDED_EXACT_PIN_REASON,
+                        );
                         continue;
                     }
                     bail!(

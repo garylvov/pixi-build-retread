@@ -890,27 +890,45 @@ fn not_courier_owned_pypi(lock: &RetreadLock, prefix: &Path) -> BTreeSet<String>
 }
 
 /// The BUILD's own record that it admitted `name` at the env's locked version
-/// over a band it had WIDENED out of the wheel author's exact pin.
+/// over an EXACT PIN -- one retread WIDENED out of the author's pin
+/// ([`crate::handler::CEDED_WIDENED_PIN_REASON`], N27-RETREAD-205), or the RAW
+/// author pin phase D never touched
+/// ([`crate::handler::CEDED_EXACT_PIN_REASON`], N27-RETREAD-207).
 ///
-/// Writer: `handler::record_ceded_relaxation` under
-/// [`crate::handler::CEDED_WIDENED_PIN_REASON`], which rides into this lock as
-/// `relaxations[]`. Reader: [`check_env_pypi_bounds`]. The recorded band must
-/// itself admit the locked version, so a stale record for a different version
-/// cannot launder a refusal away.
-fn widened_pin_admission<'a>(
+/// Writer: `handler::record_ceded_relaxation` under one of those two reasons,
+/// which rides into this lock as `relaxations[]`. Reader:
+/// [`check_env_pypi_bounds`]. The recorded band must itself admit the locked
+/// version, so a stale record for a different version cannot launder a refusal
+/// away. Returns the reason too, so the accepting line names WHICH origin the
+/// build recorded rather than guessing.
+fn ceded_pin_admission<'a>(
     lock: &'a RetreadLock,
     name: &str,
     locked_version: &uv_pep508::uv_pep440::Version,
-) -> Option<&'a crate::relaxation_record::RelaxationRecord> {
-    let marker = crate::handler::ceded_widened_pin_marker();
-    lock.relaxations.iter().find(|record| {
-        normalize_dist_name(&record.package) == name
-            && record.kind == crate::relaxation_record::RelaxationRecordKind::ExactPinWidened
-            && record.source.contains(&marker)
-            && uv_pep508::uv_pep440::VersionSpecifiers::from_str(&record.resulting_spec)
-                .map(|specs| specs.contains(locked_version))
-                .unwrap_or(false)
-    })
+) -> Option<(&'a crate::relaxation_record::RelaxationRecord, &'static str)> {
+    for (reason, marker) in [
+        (
+            crate::handler::CEDED_WIDENED_PIN_REASON,
+            crate::handler::ceded_widened_pin_marker(),
+        ),
+        (
+            crate::handler::CEDED_EXACT_PIN_REASON,
+            crate::handler::ceded_exact_pin_marker(),
+        ),
+    ] {
+        let found = lock.relaxations.iter().find(|record| {
+            normalize_dist_name(&record.package) == name
+                && record.kind == crate::relaxation_record::RelaxationRecordKind::ExactPinWidened
+                && record.source.contains(&marker)
+                && uv_pep508::uv_pep440::VersionSpecifiers::from_str(&record.resulting_spec)
+                    .map(|specs| specs.contains(locked_version))
+                    .unwrap_or(false)
+        });
+        if let Some(record) = found {
+            return Some((record, reason));
+        }
+    }
+    None
 }
 
 /// Refuse an install whose bundled wheels contradict the version the env's own
@@ -971,21 +989,23 @@ fn check_env_pypi_bounds(lock: &RetreadLock, owned: &BTreeMap<String, String>) -
                 );
                 continue;
             }
-            // SAME POLICY AS BUILD (N27-RETREAD-205). A band retread widened
-            // out of the wheel author's EXACT pin is retread's own invention,
-            // not a contract the author asserted. Provenance is not knowable
-            // from the specifiers alone -- the lock records only the POST-D
-            // line -- so the BUILD writes its admission into this lock's
-            // `relaxations[]` and this is its reader. Without it the build
-            // would accept `pillow 12.3.0` and the install would refuse it.
-            if let Some(record) = widened_pin_admission(lock, &name, &locked_version) {
+            // SAME POLICY AS BUILD (N27-RETREAD-205 and -207). An EXACT PIN --
+            // whether retread widened it out of the author's line, or the
+            // author wrote it and phase D never ran on that wheel (a
+            // BFS/auto-bundle transitive is fetched as-is) -- is an incidental
+            // snapshot of what the pack's builder resolved against, not a
+            // contract. Provenance is not knowable from the specifiers alone --
+            // the lock records only the POST-D line -- so the BUILD writes its
+            // admission into this lock's `relaxations[]` and this is its
+            // reader. Without it the build would accept `pillow 12.3.0` and the
+            // install would refuse it.
+            if let Some((record, reason)) = ceded_pin_admission(lock, &name, &locked_version) {
                 eprintln!(
                     "retread install: accepting env-pypi owner {name}=={locked} over bundled \
                      wheel {wheel_file} requirement {raw} (reason={reason}; the bundled bound \
-                     is a retread-widened exact pin, not an author-written range; the build \
+                     is an exact pin, not an author-written range; the build \
                      recorded {relaxed} for this name)",
                     wheel_file = wheel.filename,
-                    reason = crate::handler::CEDED_WIDENED_PIN_REASON,
                     relaxed = record.resulting_spec,
                 );
                 continue;
@@ -4708,6 +4728,90 @@ packages:
         )];
         check_env_pypi_bounds(&unmarked, &owned)
             .expect_err("only the ceded widened-pin arm's own record is an admission");
+    }
+
+    /// N27-RETREAD-207, INSTALL SIDE. The install must never refuse what the
+    /// build accepted -- for the RAW pin too.
+    ///
+    /// The shipped METADATA carries the author's `Pillow==11.3.0` verbatim,
+    /// because the wheel was a BFS/auto-bundle transitive and phase D never ran
+    /// on it. Nothing in the lock's POST-D `requires_dist` distinguishes that
+    /// from a range, so the BUILD's `relaxations[]` record under
+    /// `CEDED_EXACT_PIN_REASON` is the only thing that can, and this reader is
+    /// the other half of the pair.
+    #[test]
+    fn a_raw_exact_pin_the_build_admitted_is_not_refused_at_install() {
+        let mut lock = make_lock(vec![], vec![], BTreeMap::new());
+        let mut pack = lock_wheel("isaacsim-kernel", "5.1.0.0");
+        // The author's capitalisation, un-rewritten: the state under test.
+        pack.requires_dist = vec!["Pillow==11.3.0".into()];
+        lock.wheels = vec![pack];
+        let owned = BTreeMap::from([("pillow".to_string(), "12.3.0".to_string())]);
+
+        // With no recorded admission the cross-major refusal stands.
+        let err = format!(
+            "{:#}",
+            check_env_pypi_bounds(&lock, &owned)
+                .expect_err("with no recorded admission the cross-major refusal stands"),
+        );
+        assert!(err.contains("MAJOR boundary"), "{err}");
+
+        let record = |package: &str, resulting: &str, source: String| {
+            crate::relaxation_record::RelaxationRecord {
+                package: package.to_string(),
+                original_spec: "==11.3.0".to_string(),
+                resulting_spec: resulting.to_string(),
+                tier: crate::config::RelaxPolicy::Major,
+                kind: crate::relaxation_record::RelaxationRecordKind::ExactPinWidened,
+                source,
+                involved_wheels: vec![],
+                scope: crate::relaxation_record::RelaxationScope {
+                    environments: vec![],
+                    targets: vec![],
+                    platform: "linux-64".to_string(),
+                    python: "3.11".to_string(),
+                },
+            }
+        };
+        let exact = crate::handler::ceded_exact_pin_marker();
+        let mut admitted = lock.clone();
+        admitted.relaxations = vec![record(
+            "pillow",
+            ">=11.3.0,<13",
+            format!(
+                "wheel `isaacsim_kernel-5.1.0.0-cp311-none-manylinux_2_35_x86_64.whl` ({exact})"
+            ),
+        )];
+        check_env_pypi_bounds(&admitted, &owned)
+            .expect("the install must accept the raw-pin admission the build recorded");
+
+        // The two markers are DISTINCT strings and neither is a substring of
+        // the other, so a widened record cannot stand in for a raw one or the
+        // reverse -- but either one, on this name and band, is an admission.
+        let widened = crate::handler::ceded_widened_pin_marker();
+        assert!(!widened.contains(&exact) && !exact.contains(&widened));
+        let mut by_widened = lock.clone();
+        by_widened.relaxations = vec![record(
+            "pillow",
+            ">=11.3.0,<13",
+            format!("wheel `x.whl` ({widened})"),
+        )];
+        check_env_pypi_bounds(&by_widened, &owned)
+            .expect("a widened admission on this name and band is still an admission");
+
+        // The three ways a record must NOT launder a refusal away, for the raw
+        // reason exactly as for the widened one: wrong name, band excluding the
+        // locked version, marker absent.
+        for bad in [
+            record("numpy", ">=11.3.0,<13", format!("wheel `x.whl` ({exact})")),
+            record("pillow", ">=11.3,<12", format!("wheel `x.whl` ({exact})")),
+            record("pillow", ">=11.3.0,<13", "no marker at all".to_string()),
+        ] {
+            let mut bad_lock = lock.clone();
+            bad_lock.relaxations = vec![bad];
+            check_env_pypi_bounds(&bad_lock, &owned)
+                .expect_err("only this name's own marked, admitting record is an admission");
+        }
     }
 
     /// F23. A conda package that ships UPSTREAM'S wheel RECORD verbatim while
