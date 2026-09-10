@@ -10699,7 +10699,7 @@ pillow = ">=10,<13"
         );
         assert_eq!(
             crate::lock::EMIT_EPOCH,
-            58,
+            59,
             "no emitted byte of an unchanged case moved, so the epoch does not",
         );
     }
