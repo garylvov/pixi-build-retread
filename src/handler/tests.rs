@@ -15759,3 +15759,273 @@ fn n215_drop_mode_emits_the_same_bytes() {
         assert!(!bundle.auto_dropped.contains(&name));
     }
 }
+
+// ---------------------------------------------------------------------------
+// N27-RETREAD-190: a pack whose wheel set is ENTIRELY DERIVED must initialize.
+//
+// THE DEFECT THESE FOUR ARMS EXIST FOR. `Handler::initialize` refused
+// `[build.config].wheels must list at least one wheel` from a site ~215 lines
+// ABOVE the `[retread-subpackages]` expansion, so an empty `[retread-wheels]`
+// plus one rule -- the end state `crate::subpackages`'s module doc says the
+// capability exists to reach, and the shape the operator's "the pack manifest
+// points at its requirements file and retread derives the rest" directive asks
+// for -- never got a rule read. Found by HOTFIX-180's own transport guard
+// (relock-shaped gate 6169659), not by reading.
+//
+// WHY THESE ARMS CAN FAIL, which is the only property that makes them guards:
+// arm `a` (derived only) and arm `d` (declared + derived) each drive a real
+// enumeration over a real git checkout through the real `dispatch` boundary and
+// assert the ARITY of both halves, so moving the emptiness check back above the
+// expansion turns arm `a` red at its `initialize must succeed` assertion, and
+// deleting or hard-coding either count turns arm `d` red. Arm `b` is the
+// regression half -- it asserts the LOUD REFUSAL is still there, verbatim, for
+// the one pack shape that genuinely has no wheels -- and it is the one arm that
+// is green both before and after the fix, deliberately: it exists to catch a
+// "fix" that simply drops the refusal.
+
+/// A committed git tree whose `source/` level holds four children: `alpha` and
+/// `beta` carry the two files `SUBPACKAGE_BUILD_FILES` accepts, `gamma` carries
+/// one and is EXCLUDED by every rule below, `docs` carries none and is SKIPPED.
+/// So `found=3 included=2 excluded=gamma skipped=docs` and a derived count of 2
+/// is a number the tree really produces, not a constant.
+///
+/// Containment (N27-RETREAD-181): everything this writes lives under one
+/// `temp_dir()` directory named with pid + nanos, so it can neither collide
+/// with a sibling arm nor reach the live worktree.
+fn wheel_set_guard_fixture(tag: &str) -> (PathBuf, PathBuf, PathBuf, String) {
+    let tmp = std::env::temp_dir().join(format!(
+        "retread-wheelset-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    let tree = tmp.join("tree");
+    let cache = tmp.join("cache");
+    std::fs::create_dir_all(&cache).unwrap();
+    for (dir, build_file) in [
+        ("alpha", Some("pyproject.toml")),
+        ("beta", Some("setup.py")),
+        ("gamma", Some("pyproject.toml")),
+        ("docs", None),
+    ] {
+        let d = tree.join("source").join(dir);
+        std::fs::create_dir_all(&d).unwrap();
+        match build_file {
+            Some(name) => std::fs::write(d.join(name), b"# fixture\n").unwrap(),
+            None => std::fs::write(d.join("README.md"), b"not a distribution\n").unwrap(),
+        }
+    }
+    // Inline identity: the gate redirects HOME at a private tree, so there is
+    // no global git user to inherit and a bare `git commit` would refuse.
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&tree)
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr),
+        );
+        String::from_utf8(out.stdout).expect("git stdout is utf-8")
+    };
+    let init = std::process::Command::new("git")
+        .args(["init", "-q", "--initial-branch=main"])
+        .current_dir(&tree)
+        .output()
+        .expect("git init");
+    assert!(
+        init.status.success(),
+        "git init failed: {}",
+        String::from_utf8_lossy(&init.stderr),
+    );
+    git(&["add", "-A"]);
+    git(&[
+        "-c",
+        "user.email=guard@retread.invalid",
+        "-c",
+        "user.name=retread guard",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-q",
+        "-m",
+        "wheel-set fixture tree",
+    ]);
+    let rev = git(&["rev-parse", "HEAD"]).trim().to_string();
+    assert_eq!(rev.len(), 40, "expected a full sha, got {rev:?}");
+    (tmp, tree, cache, rev)
+}
+
+/// Capture INFO-level tracing for the duration of `body`.
+///
+/// The `### PACK WHEEL SET` row is written twice on purpose -- `eprintln!` for
+/// the operator's `<arm>.backend.log` (stderr; NEVER stdout, which
+/// `crate::rpc::serve` owns as the JSON-RPC channel) and `tracing::info!` for
+/// every in-process reader. This is the in-process reader.
+fn capture_info_logs<T>(body: impl FnOnce() -> T) -> (T, String) {
+    let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::INFO)
+        .with_writer({
+            let logs = std::sync::Arc::clone(&logs);
+            move || SharedLogWriter(std::sync::Arc::clone(&logs))
+        })
+        .finish();
+    let value = tracing::subscriber::with_default(subscriber, body);
+    let text = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    (value, text)
+}
+
+/// Drive ONE real `initialize` through the same `dispatch` boundary the RPC
+/// loop uses, with no workspace directory (so no workspace-scoped side effect
+/// runs) and a private cache directory for the rule's checkout.
+fn initialize_with_config(
+    tmp: &Path,
+    cache: &Path,
+    configuration: serde_json::Value,
+) -> (Result<Value, RpcError>, String) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("the guard needs a current-thread runtime so the subscriber stays in scope");
+    let params = serde_json::json!({
+        "manifestPath": tmp.join("pixi.toml"),
+        "sourceDirectory": tmp,
+        "cacheDirectory": cache,
+        "configuration": configuration,
+    });
+    capture_info_logs(|| {
+        runtime.block_on(async { Handler::new().dispatch("initialize".to_string(), params).await })
+    })
+}
+
+/// The `### PACK WHEEL SET` row, or a panic naming what was logged instead.
+fn wheel_set_row(logs: &str) -> String {
+    logs.lines()
+        .find(|line| line.contains("### PACK WHEEL SET"))
+        .unwrap_or_else(|| panic!("no `### PACK WHEEL SET` row was logged\n--- logs ---\n{logs}"))
+        .to_string()
+}
+
+/// Arm (a). RED before the fix, at `initialize must succeed`.
+#[test]
+fn a_pack_whose_wheels_are_entirely_derived_initializes() {
+    let (tmp, tree, cache, rev) = wheel_set_guard_fixture("derived");
+    let (result, logs) = initialize_with_config(
+        &tmp,
+        &cache,
+        serde_json::json!({
+            // The whole point: the pack declares NO wheel by hand.
+            "retread-wheels": {},
+            "retread-git-sources": {
+                "fixture": { "url": tree.to_string_lossy(), "rev": rev }
+            },
+            "retread-subpackages": {
+                "fixture": {
+                    "from": "fixture",
+                    "glob": "source/*",
+                    "expect": 2,
+                    "exclude": ["gamma"]
+                }
+            }
+        }),
+    );
+    result.expect(
+        "initialize must succeed for a pack whose wheel set is entirely derived: the \
+         emptiness refusal has to run AFTER the subpackage expansion (N27-RETREAD-190)",
+    );
+    let row = wheel_set_row(&logs);
+    assert!(
+        row.contains("declared=0") && row.contains("derived=2") && row.contains("total=2"),
+        "a two-subpackage rule and no typed entry is declared=0 derived=2 total=2; got: {row}"
+    );
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
+/// Arm (b). GREEN before AND after: the regression half.
+#[test]
+fn a_pack_with_neither_a_wheel_nor_a_rule_is_still_refused() {
+    let (tmp, _tree, cache, _rev) = wheel_set_guard_fixture("neither");
+    let (result, _logs) = initialize_with_config(
+        &tmp,
+        &cache,
+        serde_json::json!({ "retread-wheels": {} }),
+    );
+    let error = result.expect_err(
+        "a pack with no typed wheel and no rule that could derive one has no wheel set \
+         at all and must still refuse loudly at initialize",
+    );
+    assert_eq!(
+        error.message, "[build.config].wheels must list at least one wheel",
+        "the refusal's wording is what an operator reads and what other readers match; \
+         moving where it runs must not change it",
+    );
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
+/// Arm (c). RED before the fix: the row did not exist.
+#[test]
+fn a_pack_with_only_typed_wheels_is_unchanged_and_counts_zero_derived() {
+    let (tmp, _tree, cache, _rev) = wheel_set_guard_fixture("typed");
+    let (result, logs) = initialize_with_config(
+        &tmp,
+        &cache,
+        serde_json::json!({
+            // Two typed entries, no rule. Nothing resolves at initialize, so
+            // this stays offline.
+            "retread-wheels": {
+                "tomli": { "version": "==2.0.1" },
+                "packaging": { "version": "==24.0" }
+            }
+        }),
+    );
+    result.expect("a hand-typed pack must initialize exactly as it did before");
+    let row = wheel_set_row(&logs);
+    assert!(
+        row.contains("declared=2") && row.contains("derived=0") && row.contains("total=2"),
+        "two typed entries and no rule is declared=2 derived=0 total=2; got: {row}"
+    );
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
+/// Arm (d). RED before the fix, and the arm that makes both counts
+/// falsifiable: a hard-coded or swapped pair cannot satisfy 1 + 2 = 3.
+#[test]
+fn a_half_converted_pack_counts_declared_and_derived_separately() {
+    let (tmp, tree, cache, rev) = wheel_set_guard_fixture("mixed");
+    let (result, logs) = initialize_with_config(
+        &tmp,
+        &cache,
+        serde_json::json!({
+            "retread-wheels": {
+                // Cannot collide with `alpha`/`beta`, so the derived entries
+                // land beside it -- the shape a half-converted pack has.
+                "tomli": { "version": "==2.0.1" }
+            },
+            "retread-git-sources": {
+                "fixture": { "url": tree.to_string_lossy(), "rev": rev }
+            },
+            "retread-subpackages": {
+                "fixture": {
+                    "from": "fixture",
+                    "glob": "source/*",
+                    "expect": 2,
+                    "exclude": ["gamma"]
+                }
+            }
+        }),
+    );
+    result.expect("one typed entry plus a rule must initialize");
+    let row = wheel_set_row(&logs);
+    assert!(
+        row.contains("declared=1") && row.contains("derived=2") && row.contains("total=3"),
+        "one typed entry plus a two-subpackage rule is declared=1 derived=2 total=3; got: {row}"
+    );
+    std::fs::remove_dir_all(&tmp).ok();
+}

@@ -5156,11 +5156,21 @@ impl Handler {
         config.hermetic =
             crate::config::effective_hermetic_builds(config.hermetic, hermetic_env.as_deref());
 
-        if config.retread_wheels.is_empty() {
-            return Err(RpcError::invalid_params(
-                "[build.config].wheels must list at least one wheel",
-            ));
-        }
+        // N27-RETREAD-190: the emptiness refusal for this pack's wheel set does
+        // NOT live here, and moving it was the fix. It used to stand on this
+        // line -- ~215 lines ABOVE the `[retread-subpackages]` expansion below
+        // -- so a pack whose wheel set is ENTIRELY derived (an empty
+        // `[retread-wheels]` plus one rule, which is the end state
+        // `crate::subpackages`'s module doc says the capability exists to
+        // reach, and the shape the operator's "the manifest points at the
+        // requirements file and retread derives the rest" directive asks for)
+        // was refused `[build.config].wheels must list at least one wheel`
+        // before a single rule was read. Found by HOTFIX-180's own transport
+        // guard, not by reading. The refusal is UNCHANGED in message and still
+        // loud; it now counts declared + derived entries together, after the
+        // expansion, beside the `### PACK WHEEL SET` row. `declared` is taken
+        // here, before any derivation can touch the table.
+        let declared_wheel_count = config.retread_wheels.len();
 
         // Eagerly normalize + validate each entry now so misconfigurations
         // surface at initialize time rather than mid-build. Normalization
@@ -5370,6 +5380,38 @@ impl Handler {
                 eprintln!("{row}");
                 tracing::info!("{row}");
             }
+        }
+
+        // N27-RETREAD-190: the pack's wheel set is only complete HERE, after the
+        // expansion above -- declared entries plus derived ones. This is the
+        // single place that knows both halves, so it is where the count is
+        // published and where the emptiness refusal belongs.
+        //
+        // STDERR, NEVER STDOUT, for the same reason the subpackage row above
+        // is: `crate::rpc::serve` owns `tokio::io::stdout()` as the JSON-RPC
+        // channel, and `crate::rpc::tests::no_println_reaches_the_json_rpc_channel`
+        // refuses any stdout write under `src/handler/` outright. The real
+        // transport reader for this row is
+        // `tests/jsonrpc_protocol.rs`'s
+        // `a_derived_only_pack_initializes_over_the_real_transport`.
+        let total_wheel_count = config.retread_wheels.len();
+        let derived_wheel_count = total_wheel_count.saturating_sub(declared_wheel_count);
+        let wheel_set_row = format!(
+            "### PACK WHEEL SET declared={declared_wheel_count} \
+             derived={derived_wheel_count} total={total_wheel_count}"
+        );
+        eprintln!("{wheel_set_row}");
+        tracing::info!("{wheel_set_row}");
+
+        // The refusal itself, unchanged in wording (an operator's manifest and
+        // every existing test read this exact string) but now counting the
+        // whole set: a pack with neither a typed entry, nor a rule that derives
+        // one, nor any other source of wheels still refuses loudly at
+        // initialize -- which is the only shape that SHOULD refuse.
+        if config.retread_wheels.is_empty() {
+            return Err(RpcError::invalid_params(
+                "[build.config].wheels must list at least one wheel",
+            ));
         }
 
         let mut state = self.state.write().await;
