@@ -1308,6 +1308,175 @@ mod tests {
         }
     }
 
+    /// The record a cold reader is trying to adopt, published into `store`
+    /// under `key`, naming the one document `body` will become. The writer's
+    /// half is built off a SEPARATE publisher root, exactly as a different job
+    /// on a different machine would have built it.
+    fn publish_record_naming(
+        store: &BuiltOutputStore,
+        key: &str,
+        tag: &str,
+        body: &[u8],
+    ) -> Vec<u8> {
+        let publisher = Scratch::new(tag);
+        plant(publisher.path(), N27_62_CHANNEL, "linux-64", body);
+        let published = crate::repodata::universe_from_cache_root(publisher.path()).unwrap();
+        let consulted = vec![as_the_writer_named_it(&published, N27_62_CHANNEL, "linux-64")];
+        let bytes = encoded("digest-order-1", &consulted);
+        assert!(
+            store.publish(key, &bytes).unwrap(),
+            "the fixture record must land"
+        );
+        bytes
+    }
+
+    /// ORDER-1 GUARD (a) — A VALID RECORD PLUS A COLD READER MUST HIT ON THE
+    /// FIRST CONSULT.
+    ///
+    /// RED ON af021b6 (STACK-3's tip): `handler::conda_outputs` took its reader
+    /// snapshot with `repodata::prime_snapshot_documents()` and nothing in the
+    /// process had fetched a repodata document yet, because the only caller of
+    /// `repodata::sparse_pairs` is `conda_solve::load_selected_records_sparse`
+    /// INSIDE the cold compute this lookup exists to skip. DEVPATH-2's job
+    /// 6185774 measured the gap to the millisecond: lookup at `02:47:09.100`,
+    /// conda-forge/linux-64 on disk at `02:47:11.707`, `reader_documents=0`,
+    /// `Refusal::Universe`, and then a `quarantine_refused` that renamed
+    /// production's record away. This guard asserts BOTH halves in one process:
+    /// the pre-fix reading of the same bytes refuses, and the ordering the fix
+    /// installs adopts.
+    ///
+    /// MUTATION ARM: in `repodata::snapshot_documents_after_universe_with`,
+    /// return `(first, false)` unconditionally — i.e. restore "snapshot, then
+    /// consult" — and this goes red on the `expect` below.
+    #[tokio::test]
+    async fn order1_a_cold_reader_adopts_a_valid_record_on_its_first_consult() {
+        let store_dir = Scratch::new("order1-hit-store");
+        let store = store(store_dir.path());
+        let bytes = publish_record_naming(&store, "order1-hit", "order1-hit-pub", N27_62_BODY);
+
+        // The reader's root is EMPTY: no `retread-repodata` directory at all,
+        // which is what a fresh `$HOME/.cache/rattler/cache` is.
+        let reader_root = Scratch::new("order1-hit-reader");
+
+        // THE af021b6 READING, MEASURED HERE SO THIS GUARD CANNOT PASS
+        // VACUOUSLY: snapshot first, and the record refuses with the exact
+        // counters 6185774 printed.
+        let cold = crate::repodata::snapshot_documents_at(reader_root.path());
+        assert!(cold.is_empty(), "the reader must start cold");
+        match decode(&bytes, "digest-order-1", &cold) {
+            Err(Refusal::Universe { recorded, .. }) => assert_eq!(
+                recorded, 1,
+                "pre-fix: one recorded document, zero reader documents, refusal"
+            ),
+            other => panic!("a cold reader must refuse before the fix: {other:?}"),
+        }
+
+        // THE FIX: the universe is loaded first (here, the injected load plants
+        // the document a real fetch would have written), THEN the snapshot is
+        // taken, THEN the record is judged.
+        let planted = reader_root.path().to_path_buf();
+        let (reader, primed) = crate::repodata::snapshot_documents_after_universe_with(
+            reader_root.path().to_path_buf(),
+            move || async move {
+                plant(&planted, N27_62_CHANNEL, "linux-64", N27_62_BODY);
+            },
+        )
+        .await;
+        assert!(primed, "an empty snapshot must load the universe first");
+        assert_eq!(reader.len(), 1, "the loaded universe must be visible");
+        assert!(
+            matches!(store.get("order1-hit").0, Lookup::Hit),
+            "the record is still where it was published"
+        );
+        let accepted = decode(&bytes, "digest-order-1", &reader)
+            .expect("a first cold consult must HIT once the universe is loaded first");
+        assert_eq!(accepted.payload, serde_json::json!({"outputs": []}));
+    }
+
+    /// ORDER-1 GUARD (b) — A ROLLED UNIVERSE STILL REFUSES.
+    ///
+    /// The fix loads the reader's real world before judging; it must not make
+    /// the RECORD's world true. If conda-forge moved since the record was
+    /// published (DEVPATH-2's second mechanism: the record's `12fcba1590…`
+    /// against the `93da1a8a…` the reader fetched 89 minutes later), the
+    /// refusal is unchanged and still names the content the record stands on.
+    #[tokio::test]
+    async fn order1_a_universe_that_rolled_still_refuses_after_the_load() {
+        let store_dir = Scratch::new("order1-roll-store");
+        let store = store(store_dir.path());
+        let bytes = publish_record_naming(&store, "order1-roll", "order1-roll-pub", N27_62_BODY);
+
+        let reader_root = Scratch::new("order1-roll-reader");
+        let planted = reader_root.path().to_path_buf();
+        // The load brings back DIFFERENT bytes under the same channel, subdir
+        // and URL-derived key -- an index that rolled.
+        let (reader, primed) = crate::repodata::snapshot_documents_after_universe_with(
+            reader_root.path().to_path_buf(),
+            move || async move {
+                plant(
+                    &planted,
+                    N27_62_CHANNEL,
+                    "linux-64",
+                    br#"{"packages":{"n27-62":{"build":"9"}}}"#,
+                );
+            },
+        )
+        .await;
+        assert!(primed, "an empty snapshot must load the universe first");
+        assert_eq!(reader.len(), 1, "the rolled document is on disk");
+        assert!(matches!(store.get("order1-roll").0, Lookup::Hit));
+        match decode(&bytes, "digest-order-1", &reader) {
+            Err(Refusal::Universe { recorded, missing }) => {
+                assert_eq!(recorded, 1);
+                assert!(
+                    missing.contains(&reader[0].channel_key),
+                    "the refusal must still name the document that moved: {missing}"
+                );
+                assert!(
+                    !missing.contains(&reader[0].sha256),
+                    "and it must name the RECORD's content, not the reader's: {missing}"
+                );
+            }
+            other => panic!("a rolled universe must still refuse: {other:?}"),
+        }
+    }
+
+    /// ORDER-1 GUARD (c) — THE WARM READER PATH IS BYTE-UNCHANGED.
+    ///
+    /// A reader whose root already holds documents is the shape that measurably
+    /// adopts today (relock 6167146: `hit=14 miss=0`, zero repodata rows in the
+    /// whole backend log). Loading the universe for it would REFRESH the very
+    /// documents its records name and break the one path that works, so the
+    /// load must not run and the documents handed to `decode` must be exactly
+    /// what the pre-fix producer returned.
+    #[tokio::test]
+    async fn order1_a_warm_reader_neither_loads_nor_changes_its_documents() {
+        let reader_root = Scratch::new("order1-warm-reader");
+        plant(reader_root.path(), N27_62_CHANNEL, "linux-64", N27_62_BODY);
+        let before = crate::repodata::snapshot_documents_at(reader_root.path());
+        assert_eq!(before.len(), 1, "the warm reader starts with its document");
+
+        let loaded = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&loaded);
+        let (reader, primed) = crate::repodata::snapshot_documents_after_universe_with(
+            reader_root.path().to_path_buf(),
+            move || async move {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            },
+        )
+        .await;
+        assert!(!primed, "a warm reader must not load the universe");
+        assert_eq!(
+            loaded.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the load must never be awaited on the warm path"
+        );
+        assert_eq!(
+            reader, before,
+            "the warm path's documents must be byte-identical to the pre-fix producer's"
+        );
+    }
+
     #[test]
     fn a_refused_entry_can_be_replaced_and_only_through_the_quarantine() {
         // THE HOLE. `publish` refuses to overwrite a marked entry, so without

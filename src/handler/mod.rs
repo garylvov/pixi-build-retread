@@ -5727,7 +5727,53 @@ impl Handler {
             // lookup and only when a store is configured -- an unconfigured
             // pack pays nothing, and the fold goes through the blocking pool
             // because it is an NFS read of every document in the cache root.
-            let reader_documents = crate::repodata::prime_snapshot_documents().await;
+            //
+            // ORDER-1: and when there IS a record at this address, the universe
+            // is LOADED BEFORE the snapshot is taken, because this consult is
+            // strictly upstream of every repodata fetch in the process
+            // (`conda_solve::load_selected_records_sparse` is the only caller of
+            // `repodata::sparse_pairs`, and it runs inside the cold compute this
+            // lookup exists to skip). DEVPATH-2's job 6185774 read the root at
+            // `02:47:09.100` and its conda-forge/linux-64 document landed at
+            // `02:47:11.707`: `reader_documents=0`, `Refusal::Universe`, and
+            // then a `quarantine_refused` that RENAMED production's record away.
+            // A first cold consult could not hit however warm the store was.
+            //
+            // The priming is behind `payload.is_some()` and behind an EMPTY
+            // first snapshot (`snapshot_documents_after_universe`), which is
+            // what keeps it free: no record at this key means nothing to judge,
+            // and a non-empty snapshot is the warm reader that measurably
+            // adopts today (job 6167146: hit=14, miss=0, not one repodata row in
+            // the log) and must not be refreshed under its own records' feet.
+            let (reader_documents, consult_order) = if payload.is_some() {
+                let (documents, primed) = crate::repodata::snapshot_documents_after_universe(
+                    &params.channels,
+                    cache_target.conda_subdir(),
+                )
+                .await;
+                (
+                    documents,
+                    if primed {
+                        "after-universe"
+                    } else {
+                        "reader-already-warm"
+                    },
+                )
+            } else {
+                (
+                    crate::repodata::prime_snapshot_documents().await,
+                    "no-record",
+                )
+            };
+            // STDERR, never STDOUT -- `rpc.rs` owns stdout as the JSON-RPC
+            // channel, and `rpc::tests::no_println_reaches_the_json_rpc_channel`
+            // refuses a `println!` anywhere under `src/handler/`. See the longer
+            // note on the `### built-outputs REFUSED` row below.
+            eprintln!(
+                "### STORE CONSULT order={consult_order} reader_documents={} universe={}",
+                reader_documents.len(),
+                crate::repodata::universe_digest_of(&reader_documents),
+            );
             // C11: the stored bytes are a RECORD, not a bare payload. Decoding
             // is the acceptance decision -- the wire schema, the emission
             // schema and the full input digest must all match this reader, and

@@ -1410,7 +1410,13 @@ pub fn snapshot_documents_at(cache_root: &std::path::Path) -> Vec<RepodataDocume
 /// every document in the root, and the built-output store's lookup runs on a
 /// tokio worker inside the backend fan-out.
 pub async fn prime_snapshot_documents() -> Vec<RepodataDocument> {
-    let root = dirs_cache_root();
+    snapshot_documents_on_pool(dirs_cache_root()).await
+}
+
+/// [`snapshot_documents_at`] against an explicit root, on the blocking pool.
+/// The ONE place the listing crosses onto the pool, so `prime_snapshot_documents`
+/// and [`snapshot_documents_after_universe_with`] cannot spawn it two ways.
+async fn snapshot_documents_on_pool(root: PathBuf) -> Vec<RepodataDocument> {
     match tokio::task::spawn_blocking(move || snapshot_documents_at(&root)).await {
         Ok(documents) => documents,
         Err(error) => {
@@ -1421,6 +1427,72 @@ pub async fn prime_snapshot_documents() -> Vec<RepodataDocument> {
             Vec::new()
         }
     }
+}
+
+/// ORDER-1. The reader snapshot the built-output store's adoption rule needs,
+/// with the universe LOADED FIRST when — and only when — the snapshot is empty.
+///
+/// THE DEFECT THIS EXISTS FOR, measured in DEVPATH-2's job 6185774. The store
+/// consult in `handler::conda_outputs` runs strictly UPSTREAM of every repodata
+/// fetch: `conda_solve::load_selected_records_sparse` is the only caller of
+/// [`sparse_pairs`], and it runs inside the cold compute the consult is trying
+/// to avoid. So on a cache root that no earlier process populated, the lookup
+/// at `02:47:09.100` read a root whose conda-forge/linux-64 document landed at
+/// `02:47:11.707` — 2.6 s later — `reader_documents=0`, every recorded document
+/// fails containment, and `built_output_store::decode` returns
+/// `Refusal::Universe`. Worse than a miss: the refusal path then
+/// `quarantine_refused`s the record, so one cold reader RENAMES a record
+/// production adopts. A first cold consult could not hit however warm the store
+/// was.
+///
+/// WHY "ONLY WHEN EMPTY", WHICH IS THE WHOLE OF THE DESIGN. A non-empty
+/// snapshot is a reader that has documents to be judged against, and judging it
+/// is exactly what CONDA-OUT-2 wants; loading the universe first would refresh
+/// documents whose bytes the stored records name, i.e. it would BREAK the warm
+/// path that measurably works (job 6167146: hit=14 miss=0, zero repodata rows
+/// in the whole backend log — that process adopted off an earlier job's
+/// documents without fetching anything). An EMPTY snapshot cannot adopt
+/// anything by construction, so on that branch the load is free of downside:
+/// the alternative is a guaranteed refusal plus a quarantine plus a full cold
+/// closure, and the closure would fetch these very documents seconds later.
+/// That is the "no extra cost" claim, and it is why this is not a cache warmer.
+///
+/// The refusal SEMANTICS are untouched. A universe that genuinely rolled still
+/// refuses — the load puts the reader's real world on disk, it does not make
+/// the record's world true.
+pub async fn snapshot_documents_after_universe(
+    channels: &[ChannelUrl],
+    target_subdir: &str,
+) -> (Vec<RepodataDocument>, bool) {
+    let channels = channels.to_vec();
+    let subdir = target_subdir.to_string();
+    snapshot_documents_after_universe_with(dirs_cache_root(), move || async move {
+        // The same fan-out the closure runs, so a primed consult pays only what
+        // the cold compute behind it would have paid anyway.
+        let _ = sparse_pairs(&channels, &subdir).await;
+    })
+    .await
+}
+
+/// [`snapshot_documents_after_universe`] with the LOAD injected and the root
+/// explicit, so a guard can drive the ordering rule without a network.
+///
+/// Returns `(documents, primed)`; `primed` is true exactly when the first
+/// snapshot was empty and `load_universe` was therefore awaited.
+pub(crate) async fn snapshot_documents_after_universe_with<F, Fut>(
+    cache_root: PathBuf,
+    load_universe: F,
+) -> (Vec<RepodataDocument>, bool)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let first = snapshot_documents_on_pool(cache_root.clone()).await;
+    if !first.is_empty() {
+        return (first, false);
+    }
+    load_universe().await;
+    (snapshot_documents_on_pool(cache_root).await, true)
 }
 
 /// p6ad-4: the walk, parameterised by which identity function reads each
