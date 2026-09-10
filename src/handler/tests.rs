@@ -1676,35 +1676,46 @@ fn hub_constrains_entry(output: &super::CondaOutput) -> Option<String> {
 }
 
 #[test]
-fn a_learned_workspace_conda_fact_cannot_veto_a_bundled_wheels_cap() {
-    // D1 turn 13. MEASURED on the v10 viral-gpu backend log: the carry fires
-    // and is then thrown away, VERBATIM --
+fn a_learned_conda_fact_yields_to_a_cap_only_while_the_held_version_can_satisfy_it() {
+    // D1 turn 13, SUPERSEDED IN ONE DIRECTION BY CAPWINS-8, and said plainly
+    // rather than quietly rewritten. t13 MEASURED, on the v10 viral-gpu backend
+    // log, the carry firing and being thrown away, VERBATIM --
     //   WARN handler: conda constrains entry for a workspace-provided name
     //        could not be decided; omitting the bound ... dep=huggingface_hub
     //        bundle=isaaclab-viral-pack conflict=... `>=0.34.0, <1.0` required
     //        by wheel `transformers==4.57.6`; `==1.28.0` required by workspace
     //        conda fact
-    // The `==1.28.0` is NOT in pixi.toml. It is what the sibling envs' last
-    // solve resolved to -- a LEARNED float. Omitting on that conflict is
-    // circular: the float vetoes the bound that would correct the float, so
-    // 1.28.0 is re-picked every lock and `transformers`' runtime `<1.0` check
-    // raises on import. A learned fact must yield to the wheel's own cap.
+    // -- and ruled that a LEARNED float must not veto the wheel's cap, because
+    // the veto is circular: the float vetoes the bound that would correct it,
+    // 1.28.0 is re-picked every lock, and `transformers`' runtime `<1.0` check
+    // raises on import.
+    //
+    // WHAT CHANGED, AND IT IS NOT THE RULING. t13's fixture is the case where
+    // the held version 1.28.0 CANNOT satisfy the emitted `<1.0` -- so "emit and
+    // let the conda solver re-pick" is not a re-pick request the solver can
+    // grant, and relock 6150106 proved what it is instead: the whole lock dies
+    // two layers away, on `eigenpy` rather than `huggingface_hub`, naming
+    // neither the capping wheel nor the fact's provenance. The ADMISSION door
+    // had already decided this exact crossing was to be tolerated. So the
+    // ceiling direction is now OMITTED with the `### CONSTRAINS BOUND-UNRESOLVED`
+    // row (half one below), and t13's ruling stands untouched wherever the cap
+    // stays satisfiable (half two).
     let bundle = hub_cap_bundle_with_conflicting_workspace_fact(BTreeSet::new());
 
-    let output =
-        produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
-
-    let hub = hub_constrains_entry(&output).unwrap_or_else(|| {
-        panic!(
-            "a LEARNED workspace conda fact must not suppress the bundled wheel's bound; \
-             the constrains entry must still be emitted: {:?}",
-            output.run_dependencies.constraints
-        )
+    let (output, logs) = capture_debug_logs(|| {
+        produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap()
     });
+
+    assert_eq!(
+        hub_constrains_entry(&output),
+        None,
+        "the held 1.28.0 cannot satisfy the wheel's `<1.0`, so the bound is not \
+         emittable and the crossing follows the admission door's verdict: {:?}",
+        output.run_dependencies.constraints
+    );
     assert!(
-        hub.contains(">=0.34.0") && hub.contains("<1.0"),
-        "the emitted bound must be the wheel's own cap, unweakened by the learned \
-         float: {hub}"
+        logs.contains("held=1.28.0") && logs.contains("HELD version cannot"),
+        "the omission must name the held version it could not satisfy: {logs}"
     );
     assert!(
         output
@@ -1713,6 +1724,37 @@ fn a_learned_workspace_conda_fact_cannot_veto_a_bundled_wheels_cap() {
             .iter()
             .all(|d| d.name.replace('-', "_") != "huggingface_hub"),
         "the pack still must not claim a name the workspace provider owns"
+    );
+
+    // HALF TWO: t13's ruling, on a cap the held version CAN satisfy. Only the
+    // number the sibling env floated to moves -- 0.36.0, inside `>=0.34.0,<1.0`
+    // -- and the learned fact still yields to the wheel's own bound.
+    let mut satisfiable = hub_cap_bundle_with_conflicting_workspace_fact(BTreeSet::new());
+    let key = canonical_conda_name("huggingface-hub");
+    satisfiable
+        .workspace_conda_versions
+        .insert(key.clone(), "0.36.0".to_string());
+    satisfiable.workspace_conda_provider_facts.insert(
+        key,
+        super::WorkspaceCondaProviderFact {
+            selected_versions: BTreeSet::from(["0.36.0".to_string()]),
+            declared_specs: BTreeSet::new(),
+            present_in_all_consumers: true,
+        },
+    );
+    let output =
+        produce_output(&satisfiable, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
+    let hub = hub_constrains_entry(&output).unwrap_or_else(|| {
+        panic!(
+            "a LEARNED workspace conda fact must not suppress a bundled wheel's bound \
+             the held version can satisfy: {:?}",
+            output.run_dependencies.constraints
+        )
+    });
+    assert!(
+        hub.contains(">=0.34.0") && hub.contains("<1.0"),
+        "the emitted bound must be the wheel's own cap, unweakened by the learned \
+         float: {hub}"
     );
 }
 
@@ -11168,7 +11210,7 @@ fn c11_the_store_key_carries_no_backend_git_hash() {
 fn capwins5_the_emission_identity_moves_off_both_claimed_encodings() {
     let identity = backend_behaviour_identity();
     assert!(
-        identity.contains("retread-built-output-emission-5"),
+        identity.contains("retread-built-output-emission-6"),
         "the fact-constrained emission must have its own schema; got {identity}",
     );
     assert!(
@@ -11203,15 +11245,32 @@ fn capwins5_the_emission_identity_moves_off_both_claimed_encodings() {
         "…and must not still be the encoding the d51e284 tip carried before the \
          constrains basis moved; got {identity}",
     );
+    // CAPWINS-8 / N27-RETREAD-146. THE FIFTH NEGATIVE, and like the third it is
+    // a MEASURED adoption hazard rather than a precaution. `6150106` (keep) and
+    // `6152478` (drop) between them published 28 emission-5 records -- the store
+    // census went 261 -> 275 -> 289 across the pair, with DISJOINT key sets --
+    // and `6152478`'s own drop-mode log carries `dep=psutil
+    // bound=>=5.9.0,<6.0.0` against a float `psutil==7.2.2` for
+    // `isaaclab-2-3x-pack` and `isaaclab-sonic-pack`, both of which published.
+    // Those two packs' emitted `constrains` lists move at 57, so a record
+    // written by an emission-5 binary is DIFFERENT behaviour under the same
+    // name.
+    assert!(
+        !identity.contains("retread-built-output-emission-5"),
+        "…and must not still be the encoding the 28 records published by 6150106 and \
+         6152478 carry, two of whose packs emit a psutil bound this epoch omits; \
+         got {identity}",
+    );
     assert_eq!(
         crate::built_output_store::BUILT_OUTPUT_SCHEMA,
-        "retread-built-output-emission-5",
+        "retread-built-output-emission-6",
     );
     assert!(
-        crate::lock::EMIT_EPOCH >= 56,
+        crate::lock::EMIT_EPOCH >= 57,
         "EMIT_EPOCH must clear 52 (695f108), 53 (e30b23f's own lineage), 54 (96ff3dd, \
-         whose emission-3 records are poisoned) and 55 (d51e284, the pre-constrains \
-         basis); got {}",
+         whose emission-3 records are poisoned), 55 (d51e284, the pre-constrains \
+         basis) and 56 (0be408a, whose emission-5 records carry the unsatisfiable \
+         psutil bound); got {}",
         crate::lock::EMIT_EPOCH,
     );
 }
@@ -14165,5 +14224,319 @@ fn trigger1_route_restore_crossings_are_exactly_the_workspace_fact_boundary() {
             &BTreeSet::from(["protobuf".to_string()]),
         ),
         vec!["protobuf".to_string()],
+    );
+}
+
+// ---- CAPWINS-8: EMISSION FOLLOWS THE ADMISSION POLICY (N27-RETREAD-146) ----
+//
+// MEASURED, not argued. Relock 6150106 (`--base-lock keep` on 0be408a, the
+// first production run in which N27-RETREAD-130's per-environment fact was
+// live) printed BOTH halves of one crossing:
+//
+//   ### PYPI ADMISSION FACT-CROSSING UNRESOLVED dep=coal
+//       requirement=eigenpy >= 3.13, < 4 fact=eigenpy==3.12.0 door=auto-bundle
+//       policy=constrains-only:learned-fact-yields-to-cap|...
+//
+//   WARN handler: ... the bundled wheel's cap wins. Emitting the bound ...
+//       dep=eigenpy bundle=isaac-pack-latest bound=>=3.13,<4
+//       ... `==3.12.0` required by workspace conda fact `eigenpy==3.12.0`
+//
+// and then died: `failed to solve requirements of environment
+// 'isaaclab-gpu-latest' ... isaac-pack-latest 6.1.11 would constrain eigenpy
+// >=3.13,<4, which conflicts with any installable versions previously
+// reported`. The DOOR admitted the crossing on purpose (refusing there would be
+// a new hard failure on a `constrains` edge whose emission is total); EMISSION
+// then turned the same tolerated crossing into a lock-fatal constraint. Two
+// doors, one crossing, opposite verdicts.
+//
+// The blast radius is measured too, and it is small: of the ~110 distinct
+// dep/bundle/bound/fact tuples that reached this arm in 6150106's log, the held
+// version fails the emitted bound for exactly two names -- `eigenpy` (>=3.13,<4
+// against 3.12.0) and `psutil` (>=5.9.0,<6.0.0 against 7.2.2). Every other row
+// either emits an unbounded `bound=` or emits a bound the held version already
+// satisfies (`packaging >=20.0,<24` against 23.2, `multidict >=6.0.0,<7.0.0`
+// against 6.7.1, `requests ~=2.7,>=2.18.4,<3` against 2.34.2, ...), and this
+// predicate leaves every one of those untouched.
+
+/// The 6150106 shape, built the same way as
+/// `hub_cap_bundle_with_conflicting_workspace_fact`: a bundled wheel capping
+/// `eigenpy >=3.13,<4` while the CONSUMING environment's lock holds `held`.
+fn eigenpy_cap_bundle(held: Option<&str>, declared_specs: BTreeSet<String>) -> super::Bundle {
+    let mut bundle = solo_bundle("isaac-pack-latest", vec!["eigenpy>=3.13,<4"]);
+    bundle.primary.original_requires_dist = vec!["eigenpy>=3.13,<4".to_string()];
+    let key = canonical_conda_name("eigenpy");
+    bundle.auto_dropped.insert(key.clone());
+    bundle.uv_closure_names.insert("eigenpy".into());
+    if let Some(held) = held {
+        bundle
+            .workspace_conda_versions
+            .insert(key.clone(), held.to_string());
+        bundle.workspace_conda_provider_facts.insert(
+            key,
+            super::WorkspaceCondaProviderFact {
+                selected_versions: BTreeSet::from([held.to_string()]),
+                declared_specs,
+                present_in_all_consumers: true,
+            },
+        );
+    }
+    bundle
+}
+
+fn eigenpy_constrains_entry(output: &super::CondaOutput) -> Option<String> {
+    output
+        .run_dependencies
+        .constraints
+        .iter()
+        .map(format_constraint_spec)
+        .find(|line| line.split(' ').next() == Some("eigenpy"))
+}
+
+#[test]
+fn capwins8_a_bound_the_held_conda_version_cannot_satisfy_is_omitted_not_emitted() {
+    // GUARD (a). The exact 6150106 crossing. RED at 0be408a: the cap-wins arm
+    // emitted `eigenpy >=3.13,<4` and the lock died on `isaaclab-gpu-latest`.
+    let bundle = eigenpy_cap_bundle(Some("3.12.0"), BTreeSet::new());
+
+    let (output, logs) = capture_debug_logs(|| {
+        produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap()
+    });
+
+    assert_eq!(
+        eigenpy_constrains_entry(&output),
+        None,
+        "a bound the consuming environments' HELD version cannot satisfy is not a \
+         re-pick request, it is an unsatisfiable constraint: the admission door \
+         already ADMITTED this crossing, so emission must omit it rather than take \
+         the whole lock down: {:?}",
+        output.run_dependencies.constraints,
+    );
+    assert!(
+        logs.contains("HELD version cannot")
+            && logs.contains("held=3.12.0")
+            && logs.contains(&format!(
+                "policy={}",
+                super::CONSTRAINS_BOUND_UNRESOLVED_POLICY
+            )),
+        "the omission must reach an actor, naming the held version and the policy \
+         it is following (doctrine: failure is loud and reaches an actor): {logs}",
+    );
+    // The pack still does not CLAIM a name the workspace provider owns; the
+    // omission is of the bound, not of the cession.
+    assert!(
+        output
+            .run_dependencies
+            .depends
+            .iter()
+            .all(|dependency| dependency.name.as_str() != "eigenpy"),
+        "omitting the bound must not turn the ceded name into a run-dep",
+    );
+}
+
+#[test]
+fn capwins8_a_bound_the_held_conda_version_satisfies_is_still_emitted() {
+    // GUARD (b). Same wheel, same cap, and the only thing that moves is the
+    // number the consuming environment's lock holds -- 3.13.0 instead of
+    // 3.12.0, which is what four of the seven environments in relock 6150106's
+    // base lock actually held. The cap is emittable, so it is emitted, exactly
+    // as at 0be408a. This is the half of D1 turn 13's ruling that survives.
+    let bundle = eigenpy_cap_bundle(Some("3.13.0"), BTreeSet::new());
+
+    let output =
+        produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
+
+    let entry = eigenpy_constrains_entry(&output).unwrap_or_else(|| {
+        panic!(
+            "a cap the held version CAN satisfy must still be emitted -- the conda \
+             solver really can re-pick under it: {:?}",
+            output.run_dependencies.constraints
+        )
+    });
+    assert!(
+        entry.contains(">=3.13") && entry.contains("<4"),
+        "the emitted bound must be the wheel's own cap, unweakened: {entry}",
+    );
+}
+
+#[test]
+fn capwins8_a_declared_pin_keeps_todays_behaviour() {
+    // GUARD (c). ORIGIN STILL DECIDES, one rung above this predicate. When the
+    // 3.12.0 is a DECLARED manifest pin rather than a learned selection, the
+    // learned-fact-yields ladder is never entered at all: the carry keeps its
+    // policy-decided behaviour, which is "omit the undecidable bound with the
+    // `could not be decided` WARN". Stated plainly because the two omissions
+    // look alike from outside: the bound is absent EITHER way here, and what
+    // this guard pins is WHICH row explains it -- a declared pin must NOT be
+    // reported as an admitted crossing, because nothing was admitted.
+    let bundle = eigenpy_cap_bundle(Some("3.12.0"), BTreeSet::from(["==3.12.0".to_string()]));
+
+    let (output, logs) = capture_debug_logs(|| {
+        produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap()
+    });
+
+    assert_eq!(
+        eigenpy_constrains_entry(&output),
+        None,
+        "a DECLARED workspace pin is operator intent and the carry stays omitted: {:?}",
+        output.run_dependencies.constraints,
+    );
+    assert!(
+        logs.contains("could not be decided"),
+        "the declared-pin path keeps its own row: {logs}",
+    );
+    assert!(
+        !logs.contains("held=3.12.0"),
+        "a declared pin was never admitted by any door, so it must not be reported \
+         as an admitted crossing: {logs}",
+    );
+}
+
+#[test]
+fn capwins8_drop_mode_has_a_float_fact_too_so_the_predicate_reaches_it() {
+    // GUARD (d), AND THE BRIEF'S PREMISE FOR IT IS MEASURABLY WRONG, WHICH IS
+    // WHY THIS TEST IS SHAPED THE WAY IT IS RATHER THAN THE WAY IT WAS ASKED
+    // FOR. The ask was "drop mode (no held version) -> unchanged". Drop mode
+    // does not mean no fact: FACT-1 measured that with no `pixi.lock` on disk
+    // `locked_conda_versions_by_env` returns the EMPTY map and every consulted
+    // fact becomes a SINGLETON DAY'S-UNIVERSE FLOAT -- still a
+    // `WorkspaceCondaFact`, still carrying a `==` clause, still reaching this
+    // ladder. Relock 6152478 (`--base-lock drop`, COMPLETED 0:0) proves both
+    // halves in one log: `eigenpy` never crosses at all, because the float is
+    // 3.13.0 and it SATISFIES coal's `>=3.13,<4` -- which is exactly why the
+    // certification shape never saw the defect keep mode died on -- while
+    // `psutil` DOES cross, `bound=>=5.9.0,<6.0.0 fact=psutil==7.2.2`, for
+    // `isaaclab-2-3x-pack` and `isaaclab-sonic-pack`.
+    //
+    // So drop mode is NOT unchanged by this fix, and pretending otherwise would
+    // hide the one measurement that decides the EMIT_EPOCH bump.
+
+    // HALF ONE: with no fact of ANY kind there is nothing for the predicate to
+    // read and the wheel's cap is the only bound. This is the genuinely
+    // unchanged path.
+    let bundle = eigenpy_cap_bundle(None, BTreeSet::new());
+    let output =
+        produce_output(&bundle, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap();
+    let entry = eigenpy_constrains_entry(&output).unwrap_or_else(|| {
+        panic!(
+            "with no workspace fact there is no crossing and no held version; the \
+             wheel's cap is the only bound and it is emitted: {:?}",
+            output.run_dependencies.constraints
+        )
+    });
+    assert!(
+        entry.contains(">=3.13") && entry.contains("<4"),
+        "a bundle with no fact at all must be untouched by this change: {entry}",
+    );
+
+    // HALF TWO: 6152478's psutil row, in drop mode, at its measured numbers. A
+    // float the bound excludes is a held version like any other and the bound
+    // is omitted -- so a DROP-MODE relock's emitted bytes move, and the epoch
+    // must bump.
+    let mut psutil = solo_bundle("isaaclab-2.3x-pack", vec!["psutil>=5.9.0,<6.0.0"]);
+    psutil.primary.original_requires_dist = vec!["psutil>=5.9.0,<6.0.0".to_string()];
+    let key = canonical_conda_name("psutil");
+    psutil.auto_dropped.insert(key.clone());
+    psutil.uv_closure_names.insert("psutil".into());
+    psutil
+        .workspace_conda_versions
+        .insert(key.clone(), "7.2.2".to_string());
+    psutil.workspace_conda_provider_facts.insert(
+        key,
+        super::WorkspaceCondaProviderFact {
+            selected_versions: BTreeSet::from(["7.2.2".to_string()]),
+            declared_specs: BTreeSet::new(),
+            present_in_all_consumers: true,
+        },
+    );
+    let (output, logs) = capture_debug_logs(|| {
+        produce_output(&psutil, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap()
+    });
+    assert!(
+        output
+            .run_dependencies
+            .constraints
+            .iter()
+            .map(format_constraint_spec)
+            .all(|line| line.split(' ').next() != Some("psutil")),
+        "7.2.2 cannot satisfy >=5.9.0,<6.0.0, so the second crossing in relock \
+         6152478's own drop-mode log is omitted as well: {:?}",
+        output.run_dependencies.constraints,
+    );
+    assert!(
+        logs.contains("held=7.2.2"),
+        "the drop-mode omission gets the same row: {logs}",
+    );
+}
+
+#[test]
+fn capwins8_the_predicate_names_only_held_versions_the_bound_excludes() {
+    use std::str::FromStr;
+    let fact = |version: &str| super::Constraint {
+        specifiers: uv_pep508::uv_pep440::VersionSpecifiers::from_str(&format!("=={version}"))
+            .unwrap(),
+        source: "workspace conda fact".to_string(),
+        origin_id: super::ConstraintOriginId::from_parts("workspace-conda-fact", [version]),
+        provenance: super::Provenance::WorkspaceCondaFact("precise-consuming-envs".to_string()),
+    };
+    let bound =
+        |text: &str| uv_pep508::uv_pep440::VersionSpecifiers::from_str(text).unwrap();
+    let held = |version: &str| uv_pep508::uv_pep440::Version::from_str(version).unwrap();
+
+    // The 6150106 crossing: 3.12.0 against >=3.13,<4.
+    assert_eq!(
+        super::held_fact_versions_excluded_by_bound(&[fact("3.12.0")], &bound(">=3.13,<4")),
+        vec![held("3.12.0")],
+    );
+    // The same wheel against the four environments that held 3.13.0.
+    assert!(
+        super::held_fact_versions_excluded_by_bound(&[fact("3.13.0")], &bound(">=3.13,<4"))
+            .is_empty(),
+    );
+    // An UNBOUNDED emission excludes nothing. This is the ~60 `bound=` rows of
+    // 6150106's log, and not one of them may move.
+    assert!(
+        super::held_fact_versions_excluded_by_bound(&[fact("3.12.0")], &bound("")).is_empty(),
+    );
+    // The real satisfied bounds from the same log, name by name.
+    for (version, text) in [
+        ("23.2", ">=20.0,<24"),
+        ("6.7.1", ">=6.0.0,<7.0.0"),
+        ("2.34.2", "~=2.7,>=2.18.4,<3"),
+        ("4.16.0", ">=4.6.0,!=4.7.0"),
+    ] {
+        assert!(
+            super::held_fact_versions_excluded_by_bound(&[fact(version)], &bound(text)).is_empty(),
+            "{version} satisfies {text} and must stay emitted",
+        );
+    }
+    // psutil, the SECOND latent lock-killer in the same log.
+    assert_eq!(
+        super::held_fact_versions_excluded_by_bound(&[fact("7.2.2")], &bound(">=5.9.0,<6.0.0")),
+        vec![held("7.2.2")],
+    );
+    // A fact with no `==` clause holds no version, so it names nothing.
+    let mut ranged = fact("3.12.0");
+    ranged.specifiers = bound(">=3.12");
+    assert!(super::held_fact_versions_excluded_by_bound(&[ranged], &bound(">=3.13,<4")).is_empty());
+    // No fact at all is drop mode.
+    assert!(super::held_fact_versions_excluded_by_bound(&[], &bound(">=3.13,<4")).is_empty());
+}
+
+#[test]
+fn capwins8_the_omission_row_names_dep_bound_held_and_policy() {
+    use std::str::FromStr;
+    assert_eq!(
+        super::constrains_bound_unresolved_row(
+            "eigenpy",
+            ">=3.13,<4",
+            &[uv_pep508::uv_pep440::Version::from_str("3.12.0").unwrap()],
+        ),
+        "### CONSTRAINS BOUND-UNRESOLVED dep=eigenpy bound=>=3.13,<4 held=3.12.0 \
+         policy=admitted",
+    );
+    // The policy token is the ADMISSION door's own verdict, spelled once.
+    assert!(
+        super::constrains_bound_unresolved_row("psutil", ">=5.9.0,<6.0.0", &[])
+            .starts_with(super::CONSTRAINS_BOUND_UNRESOLVED_PREFIX),
     );
 }

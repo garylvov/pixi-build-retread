@@ -878,7 +878,38 @@ pub const SCHEMA: u32 = 20;
 /// lock now emit a different (pinned) `constrains` list, so every affected
 /// pack must cold-derive once. Drop mode -- no `pixi.lock` on disk -- emits
 /// exactly the pre-56 bytes.
-pub const EMIT_EPOCH: u32 = 56;
+///
+/// Epoch 57 (N27-RETREAD-146, CAPWINS-8): a `constrains` bound the consuming
+/// environments' HELD conda version cannot satisfy is now OMITTED with a
+/// `### CONSTRAINS BOUND-UNRESOLVED` row instead of emitted, so emission
+/// follows the verdict the ADMISSION door already reached on the same crossing.
+///
+/// THE BUMP IS A MEASUREMENT AND NOT A PRECAUTION, AND ITS EVIDENCE IS IN THE
+/// CANONICAL DROP SHAPE, NOT ONLY IN KEEP MODE. Keep-mode relock `6150106`
+/// emitted `eigenpy >=3.13,<4` for `isaac-pack-latest` against a held
+/// `eigenpy==3.12.0` and died on environment `isaaclab-gpu-latest`; that case
+/// published no record at all, so on its own it would move no bytes. But
+/// DROP-mode relock `6152478` -- COMPLETED 0:0, the very shape every landing
+/// certifies against -- carries `dep=psutil bundle=isaaclab-2-3x-pack
+/// bound=>=5.9.0,<6.0.0` and `bundle=isaaclab-sonic-pack` likewise, against a
+/// float `psutil==7.2.2`, and those two packs DID publish. Their emitted
+/// `constrains` lists therefore differ at 57 for identical manifest inputs, and
+/// 28 emission-5 records already exist in the shared store (14 from `6150106`,
+/// 14 from `6152478`, disjoint key sets). Without the bump those records would
+/// be ADOPTED by this binary under an identity asserting "same behaviour" --
+/// exactly the hazard 55/emission-4 was minted to prevent -- and the fix would
+/// be silently inert on every warm relock.
+///
+/// Unchanged, and each one measured on `6150106`'s own log rather than assumed:
+/// an UNBOUNDED emission (the ~60 `bound=` rows) excludes nothing; a bound the
+/// held version already satisfies (`packaging >=20.0,<24` against 23.2,
+/// `multidict >=6.0.0,<7.0.0` against 6.7.1, `requests ~=2.7,>=2.18.4,<3`
+/// against 2.34.2, `typing-extensions >=4.6.0,!=4.7.0` against 4.16.0, ...) is
+/// still emitted; a DECLARED manifest pin is still decided one rung above; and
+/// a bundle with no workspace fact at all never enters the ladder. Of the ~110
+/// distinct dep/bundle/bound/fact tuples that reached this arm in `6150106`,
+/// exactly TWO names move: `eigenpy` and `psutil`.
+pub const EMIT_EPOCH: u32 = 57;
 
 fn parse_stored_glibc(value: Option<&str>) -> Option<Option<(u32, u32)>> {
     match value {

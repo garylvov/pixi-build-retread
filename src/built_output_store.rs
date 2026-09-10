@@ -115,7 +115,7 @@ pub const SCHEMA: &str = "retread-built-output-store-v3";
 /// The key ALSO moves (the constrains basis is a key component), so this bump
 /// is the belt to that braces: it makes the invalidation visible as a named
 /// constant in review rather than as an emergent property of a hash.
-pub const BUILT_OUTPUT_SCHEMA: &str = "retread-built-output-emission-5";
+pub const BUILT_OUTPUT_SCHEMA: &str = "retread-built-output-emission-6";
 
 /// The store's directory name under a persistent root, and the `--store`
 /// spelling `retread store-reap` accepts. Named here, beside the layout it

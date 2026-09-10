@@ -9750,18 +9750,7 @@ fn declared_spec_bounds_version(spec: &str) -> bool {
 /// The fact side is read from its own `==` clause, so an override that happens
 /// to admit the learned version is not mistaken for a conflict.
 fn declared_override_excludes_learned_fact(constraints: &[Constraint]) -> bool {
-    let fact_versions: Vec<uv_pep508::uv_pep440::Version> = constraints
-        .iter()
-        .filter(|constraint| matches!(constraint.provenance, Provenance::WorkspaceCondaFact(_)))
-        .flat_map(|constraint| constraint.specifiers.iter())
-        .filter(|specifier| {
-            matches!(
-                specifier.operator(),
-                uv_pep508::uv_pep440::Operator::Equal | uv_pep508::uv_pep440::Operator::ExactEqual
-            )
-        })
-        .map(|specifier| specifier.version().clone())
-        .collect();
+    let fact_versions = learned_fact_held_versions(constraints);
     if fact_versions.is_empty() {
         return false;
     }
@@ -9773,6 +9762,72 @@ fn declared_override_excludes_learned_fact(constraints: &[Constraint]) -> bool {
                 .iter()
                 .any(|version| !constraint.specifiers.contains(version))
         })
+}
+
+/// The versions the workspace conda facts in this emission group actually HOLD.
+///
+/// A `WorkspaceCondaFact` states one version per name -- under N27-RETREAD-130
+/// the version the CONSUMING ENVIRONMENT'S LOCK holds, not the day's universe
+/// float -- and it states it as its own `==` clause. Reading the clause rather
+/// than the whole specifier set is what keeps a fact that merely narrows a
+/// range from being mistaken for a held version.
+fn learned_fact_held_versions(constraints: &[Constraint]) -> Vec<Version> {
+    constraints
+        .iter()
+        .filter(|constraint| matches!(constraint.provenance, Provenance::WorkspaceCondaFact(_)))
+        .flat_map(|constraint| constraint.specifiers.iter())
+        .filter(|specifier| {
+            matches!(
+                specifier.operator(),
+                uv_pep508::uv_pep440::Operator::Equal | uv_pep508::uv_pep440::Operator::ExactEqual
+            )
+        })
+        .map(|specifier| specifier.version().clone())
+        .collect()
+}
+
+/// STDERR row prefix for a `constrains` bound the emission door omits because
+/// the consuming environments' HELD version cannot satisfy it.
+///
+/// STDERR and never stdout: `rpc.rs` owns stdout as the JSON-RPC channel, so a
+/// `###` row on stdout corrupts the very lock it reports on.
+pub(crate) const CONSTRAINS_BOUND_UNRESOLVED_PREFIX: &str = "### CONSTRAINS BOUND-UNRESOLVED";
+
+/// The one policy token the row carries, and it is the ADMISSION door's own
+/// word: [`auto_bundle::pypi_admission_fact_crossing_unresolved_row`] admits a
+/// crossing no consumer can satisfy rather than refusing it, so emission of the
+/// same crossing may not turn it into a lock-fatal constraint.
+pub(crate) const CONSTRAINS_BOUND_UNRESOLVED_POLICY: &str = "admitted";
+
+/// Grammar of the omission row. A pure function so a guard can assert the
+/// grammar without capturing a stream.
+pub(crate) fn constrains_bound_unresolved_row(
+    dep: &str,
+    bound: &str,
+    held: &[Version],
+) -> String {
+    let held: Vec<String> = held.iter().map(ToString::to_string).collect();
+    format!(
+        "{CONSTRAINS_BOUND_UNRESOLVED_PREFIX} dep={dep} bound={bound} held={} policy={CONSTRAINS_BOUND_UNRESOLVED_POLICY}",
+        held.join(",")
+    )
+}
+
+/// The held fact versions the re-decided emission bound would EXCLUDE.
+///
+/// Empty means the bound is emittable: every held version satisfies it (an
+/// unbounded `specifiers` admits everything, which is why the ~100 empty-bound
+/// cap-wins rows in relock 6150106's log are untouched by this predicate).
+/// Non-empty means the bound is provably unsatisfiable in the very environments
+/// the `constrains` entry binds -- knowable HERE, from evidence in hand.
+fn held_fact_versions_excluded_by_bound(
+    constraints: &[Constraint],
+    bound: &VersionSpecifiers,
+) -> Vec<Version> {
+    learned_fact_held_versions(constraints)
+        .into_iter()
+        .filter(|version| !bound.contains(version))
+        .collect()
 }
 
 /// Effective Rule-1 ownership authority shared with Rule 2. Direct conda
@@ -22771,6 +22826,90 @@ fn produce_output_with_conflicts(
                                 let rendered = native_conda_override
                                     .clone()
                                     .unwrap_or_else(|| specifiers.to_string().replace(", ", ","));
+                                // EMISSION FOLLOWS THE ADMISSION POLICY
+                                // (N27-RETREAD-146, CAPWINS-8). The door that
+                                // let this wheel in already decided this exact
+                                // crossing: when no release of the capping
+                                // wheel admits the held fact,
+                                // `auto_bundle::fetch_under_workspace_facts`
+                                // ADMITS the wheel and prints `### PYPI
+                                // ADMISSION FACT-CROSSING UNRESOLVED`, because
+                                // refusing would be a new hard failure on a
+                                // `constrains` edge whose emission policy is
+                                // total. Emitting the same bound here inverts
+                                // that decision two layers later and takes the
+                                // WHOLE lock: relock 6150106 printed `dep=coal
+                                // requirement=eigenpy >= 3.13, < 4
+                                // fact=eigenpy==3.12.0 door=auto-bundle` at the
+                                // door, admitted it, then emitted `eigenpy
+                                // >=3.13,<4` for `isaac-pack-latest` and died
+                                // with `failed to solve requirements of
+                                // environment 'isaaclab-gpu-latest'`.
+                                //
+                                // "Fail loudly rather than ship an environment
+                                // that cannot import" is the right instinct and
+                                // it still governs every bound the held version
+                                // CAN satisfy -- the conda solver really may
+                                // re-pick under those, which is D1 turn 13's
+                                // ruling and is untouched. But a bound the held
+                                // version provably cannot satisfy is not a
+                                // re-pick request, it is an unsatisfiable
+                                // constraint, and its failure surfaces two
+                                // layers away as `would constrain ... conflicts
+                                // with any installable versions` naming neither
+                                // the capping wheel nor the fact's provenance.
+                                // So it is omitted HERE, with the row, and the
+                                // door's verdict stands.
+                                //
+                                // Narrow on purpose: a `native_conda_override`
+                                // is a written-down conda override rather than
+                                // the wheel's learned cap, so it keeps today's
+                                // behaviour, and an unbounded `specifiers`
+                                // excludes nothing and is emitted unchanged.
+                                let held_excluded = if native_conda_override.is_none() {
+                                    held_fact_versions_excluded_by_bound(&constraints, &specifiers)
+                                } else {
+                                    Vec::new()
+                                };
+                                if !held_excluded.is_empty() {
+                                    // CAPWINS-8 ROW BEGIN -- the two observables
+                                    // of the omission, delimited so the gate's
+                                    // mutation arm can remove EXACTLY the row and
+                                    // nothing else (a guard that cannot fail is a
+                                    // defect; law 3).
+                                    eprintln!(
+                                        "{}",
+                                        constrains_bound_unresolved_row(
+                                            conda_name.key().as_str(),
+                                            &rendered,
+                                            &held_excluded,
+                                        )
+                                    );
+                                    tracing::warn!(
+                                        dep = %conda_name,
+                                        bundle = %bundle.conda_name,
+                                        bound = %rendered,
+                                        held = %held_excluded
+                                            .iter()
+                                            .map(ToString::to_string)
+                                            .collect::<Vec<_>>()
+                                            .join(","),
+                                        policy = %CONSTRAINS_BOUND_UNRESOLVED_POLICY,
+                                        conflict = %conflict,
+                                        "conda constrains entry conflicts with a LEARNED \
+                                         workspace conda fact, and the bundled wheel's cap is \
+                                         one the consuming environments' HELD version cannot \
+                                         satisfy. The admission door already ADMITTED this \
+                                         crossing rather than refusing it, so emitting the \
+                                         bound would make the same tolerated crossing fatal to \
+                                         the whole lock. Omitting the bound; the crossing is \
+                                         reported by this row and belongs on the operator pin \
+                                         list. Resolve by pinning one side in the consuming \
+                                         environment or the pack manifest.",
+                                    );
+                                    // CAPWINS-8 ROW END
+                                    continue;
+                                }
                                 tracing::warn!(
                                     dep = %conda_name,
                                     bundle = %bundle.conda_name,
