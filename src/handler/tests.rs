@@ -11815,7 +11815,7 @@ fn c11_the_store_key_carries_no_backend_git_hash() {
 fn capwins5_the_emission_identity_moves_off_both_claimed_encodings() {
     let identity = backend_behaviour_identity();
     assert!(
-        identity.contains("retread-built-output-emission-8"),
+        identity.contains("retread-built-output-emission-9"),
         "the fact-constrained emission must have its own schema; got {identity}",
     );
     assert!(
@@ -11899,10 +11899,10 @@ fn capwins5_the_emission_identity_moves_off_both_claimed_encodings() {
     );
     assert_eq!(
         crate::built_output_store::BUILT_OUTPUT_SCHEMA,
-        "retread-built-output-emission-8",
+        "retread-built-output-emission-9",
     );
     assert!(
-        crate::lock::EMIT_EPOCH >= 59,
+        crate::lock::EMIT_EPOCH >= 60,
         "EMIT_EPOCH must clear 52 (695f108), 53 (e30b23f's own lineage), 54 (96ff3dd, \
          whose emission-3 records are poisoned), 55 (d51e284, the pre-constrains \
          basis), 56 (0be408a, whose emission-5 records carry the unsatisfiable \

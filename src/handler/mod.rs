@@ -5036,6 +5036,286 @@ fn workspace_conda_provider_route(
     })
 }
 
+/// N27-RETREAD-221. The conda version band ONE auto-route emits -- the single
+/// producer, read by the emission loop that writes the `depends`/`constrains`
+/// line and by the admission door that decides whether that band contradicts a
+/// kept workspace conda fact.
+///
+/// `None` means this route emits no band of its own: a `DepsFromRelaxed` route
+/// states its contract through its typed upstream inputs, and there is nothing
+/// for the door to reconcile.
+///
+/// WHY THIS IS A FUNCTION AND NOT TWO COPIES OF FIVE LINES. The door's whole
+/// job is to answer "does the band this route will emit admit the version the
+/// workspace fact holds?". A second copy of the band rule can drift from the
+/// emitted one by an ABI-anchor test or a ceiling, and then the door approves a
+/// band that emission refuses -- which is the shape of the defect this closes,
+/// just moved one file over.
+fn auto_route_emitted_band(auto_route: &BundleAutoRoute, config: &RetreadConfig) -> Option<String> {
+    if matches!(auto_route.provenance, Provenance::DepsFromRelaxed) {
+        return None;
+    }
+    let conda_name = CondaName::new(auto_route.route.conda_name.as_str());
+    let conda_key = conda_name.key();
+    let conda_version = &auto_route.route.conda_version;
+    let manual_override = config.overrides.contains_key(conda_key.as_str())
+        && !config.ledger_overrides.contains(conda_key.as_str());
+    let route_is_abi_anchor = crate::solve::is_abi_anchor(&auto_route.route.pypi_name)
+        || crate::solve::is_abi_anchor(auto_route.route.conda_name.as_str())
+        || crate::solve::is_abi_anchor(conda_key.as_str());
+    if route_is_abi_anchor || manual_override {
+        return Some(format!("=={conda_version}"));
+    }
+    Some(match bounded_range_ceiling(conda_version) {
+        Some(ceiling) => format!(">={conda_version},<{ceiling}"),
+        None => format!("=={conda_version}"),
+    })
+}
+
+/// N27-RETREAD-221. What the admission door decided about ONE kept route that
+/// shares a conda name with a kept workspace conda fact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RouteFactVerdict {
+    /// The route's emitted band already admits the fact's version. Nothing to
+    /// do -- the overwhelming majority of routes.
+    Compatible,
+    /// The route's band excludes the fact, and nothing that GOVERNED uv's
+    /// selection excludes the fact. The route's exact pin is a probe artefact;
+    /// the fact is the locked basis, so the route adopts it.
+    Reconciled { from: String, to: String },
+    /// The route's band excludes the fact AND at least one active input that
+    /// governed uv's selection also excludes it. The fact cannot cover this
+    /// route's consumers, so no reconciliation exists and the crossing is
+    /// refused at the door.
+    Conflict {
+        route_version: String,
+        fact_version: String,
+        blocking_inputs: Vec<String>,
+    },
+}
+
+/// N27-RETREAD-221. Decide one kept route against one kept fact.
+///
+/// THE RULE, AND WHY IT HAS NO THRESHOLD IN IT. A workspace conda fact's
+/// version is the BASE LOCK's version for that conda name (see
+/// `facts_from_solved_records`: the lock supplies the versions, the pack's own
+/// probe supplies the names). A route's `conda_version` is whichever build the
+/// pack's own probe happened to reach on the day. So when the two disagree,
+/// the fact is the locked basis and the route's exactness is an artefact --
+/// UNLESS something that actually governed uv's selection says otherwise, and
+/// `input_requirements` is exactly that set ("Active root/constraint/override/
+/// self-heal inputs that governed uv's selection ... Empty means the selected
+/// PyPI version was only solver output"). An empty input set is therefore
+/// vacuously covered, which is the common case and the one that must not
+/// refuse.
+fn route_fact_verdict(
+    auto_route: &BundleAutoRoute,
+    fact_version: &str,
+    config: &RetreadConfig,
+) -> Result<RouteFactVerdict> {
+    let parsed_fact = uv_pep508::uv_pep440::Version::from_str(fact_version).with_context(|| {
+        format!(
+            "parsing workspace conda fact `{}=={fact_version}` for auto-route `{}`",
+            auto_route.route.conda_name, auto_route.route.pypi_name
+        )
+    })?;
+    let Some(band) = auto_route_emitted_band(auto_route, config) else {
+        return Ok(RouteFactVerdict::Compatible);
+    };
+    let band_specifiers = VersionSpecifiers::from_str(&band).with_context(|| {
+        format!(
+            "parsing generated conda route constraint `{} {band}`",
+            auto_route.route.pypi_name
+        )
+    })?;
+    if band_specifiers.contains(&parsed_fact) {
+        return Ok(RouteFactVerdict::Compatible);
+    }
+    let mut blocking_inputs = Vec::new();
+    // A hand-written `retread-overrides` pin is the operator's own contract,
+    // not a probe artefact, and the fact may not silently displace it. A
+    // ledger override is retread's own repair entry and is not hand-written,
+    // which is the same distinction `produce_output_with_conflicts` draws.
+    let conda_key = CondaName::new(auto_route.route.conda_name.as_str()).key();
+    for name in [
+        canonical_conda_name(&auto_route.route.pypi_name),
+        conda_key.as_str().to_string(),
+    ] {
+        if config.overrides.contains_key(name.as_str())
+            && !config.ledger_overrides.contains(name.as_str())
+        {
+            blocking_inputs.push(format!(
+                "the pack manifest hand-pins `{name}` under `retread-overrides`"
+            ));
+            break;
+        }
+    }
+    for input in &auto_route.route.input_requirements {
+        let trimmed = input.specifiers.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let specifiers = VersionSpecifiers::from_str(trimmed).with_context(|| {
+            format!(
+                "parsing auto-route input `{trimmed}` for `{}`",
+                auto_route.route.pypi_name
+            )
+        })?;
+        if !specifiers.contains(&parsed_fact) {
+            blocking_inputs.push(format!("{trimmed} ({})", input.source));
+        }
+    }
+    // FACTS-2-BLOCKING-INPUTS (MUTATION ANCHOR)
+    if blocking_inputs.is_empty() {
+        return Ok(RouteFactVerdict::Reconciled {
+            from: auto_route.route.conda_version.clone(),
+            to: fact_version.to_string(),
+        });
+    }
+    Ok(RouteFactVerdict::Conflict {
+        route_version: auto_route.route.conda_version.clone(),
+        fact_version: fact_version.to_string(),
+        blocking_inputs,
+    })
+}
+
+impl Bundle {
+    /// N27-RETREAD-221. THE FOURTH ARM OF THE ADMISSION DOOR.
+    ///
+    /// `apply_workspace_conda_fact_ownership` has three arms: an excluded name
+    /// keeps its route untouched, an all-consumer provider DELETES the route,
+    /// and a partial provider ANNOTATES the route with the workspace
+    /// conjunction. A route that comes out of all three still routed, on a
+    /// conda name the workspace facts also hold at a DIFFERENT version, was
+    /// nobody's case -- and both claimants were then carried, unreconciled,
+    /// into a solve that died 638 s later (job 6197128: `cuda-bindings`
+    /// `==12.9.4` from the route against `==12.9.7` from the fact, in
+    /// `robojudo-pack`/`newton-gpu` and `isaac-pack-latest`/
+    /// `isaaclab-gpu-latest`). Under N27-RETREAD-130 this never fired because
+    /// the whole locked set seeded the boundary, `present_in_all_consumers`
+    /// went vacuously true, and arm two deleted the route -- so the old lock
+    /// succeeded while being wrong. N27-RETREAD-215's narrowing keeps both
+    /// claimants, which is correct, and leaves them to be reconciled HERE.
+    ///
+    /// Two outcomes and no third: the route adopts the fact's version, or the
+    /// crossing is refused AT THE DOOR with a `### ROUTE FACT CONFLICT` row.
+    /// Carrying an unreconciled pair forward is not one of them.
+    fn reconcile_kept_routes_with_workspace_facts(&mut self, config: &RetreadConfig) -> Result<()> {
+        if self.workspace_conda_versions.is_empty() {
+            return Ok(());
+        }
+        let mut conflicts: Vec<String> = Vec::new();
+        for index in 0..self.auto_routed.len() {
+            // An annotated route no longer emits its own band: its typed
+            // workspace conjunction replaced it in arm three, so there is
+            // nothing here to reconcile.
+            if self.auto_routed[index].workspace_provider.is_some() {
+                continue;
+            }
+            let conda_key = canonical_conda_name(&self.auto_routed[index].route.conda_name);
+            let Some(fact_version) = self.workspace_conda_versions.get(&conda_key).cloned() else {
+                continue;
+            };
+            let verdict = route_fact_verdict(&self.auto_routed[index], &fact_version, config)?;
+            let envs = self.workspace_envs_holding(&conda_key);
+            match verdict {
+                RouteFactVerdict::Compatible => {}
+                // CAPWINS-9's ruling (N27-RETREAD-198) reaches this door
+                // unchanged: a bound may be decided by the workspace's held
+                // version only when that version comes from the LOCK, never
+                // from the day's float. "The fact is the locked basis" is the
+                // entire reason a route yields to it, so with no lock there is
+                // no basis to prefer, and adopting a float would let a
+                // conda-forge roll move an emitted pin -- which is -130's own
+                // defect wearing this fix's clothes. Under
+                // `ConstrainsSource::Universe` the contradiction is still
+                // REFUSED, and still at the door with a row, which is strictly
+                // earlier and louder than the emission-time death it replaces.
+                RouteFactVerdict::Reconciled { from, to }
+                    if !self
+                        .constrains_basis
+                        .held_version_is_from_lock(&conda_key) =>
+                {
+                    eprintln!(
+                        "### ROUTE FACT CONFLICT pack={} name={} route={from} fact={to} \
+                         envs={envs} basis={}",
+                        self.conda_name,
+                        conda_key,
+                        self.constrains_basis.source.as_str(),
+                    );
+                    conflicts.push(format!(
+                        "`{conda_key}`: the auto-route holds `=={from}` and the workspace conda \
+                         fact holds `=={to}` in {envs}, and the fact's basis is \
+                         `{}` -- a float, not the lock, so it may not decide the route's bound",
+                        self.constrains_basis.source.as_str()
+                    ));
+                }
+                RouteFactVerdict::Reconciled { from, to } => {
+                    // STDERR, never stdout: `rpc.rs` owns stdout as the
+                    // JSON-RPC channel, the same reason `### FACT BOUNDARY`
+                    // prints here. A silent rewrite of an emitted pin is how a
+                    // certificate moves without a row to explain it.
+                    eprintln!(
+                        "### ROUTE FACT RECONCILED pack={} name={} route={from} fact={to} envs={envs}",
+                        self.conda_name, conda_key,
+                    );
+                    self.auto_routed[index].route.conda_version = to;
+                }
+                RouteFactVerdict::Conflict {
+                    route_version,
+                    fact_version,
+                    blocking_inputs,
+                } => {
+                    eprintln!(
+                        "### ROUTE FACT CONFLICT pack={} name={} route={route_version} \
+                         fact={fact_version} envs={envs}",
+                        self.conda_name, conda_key,
+                    );
+                    conflicts.push(format!(
+                        "`{conda_key}`: the auto-route holds `=={route_version}` and the \
+                         workspace conda fact holds `=={fact_version}` in {envs}, and the \
+                         route cannot adopt the fact because {}",
+                        blocking_inputs.join("; ")
+                    ));
+                }
+            }
+        }
+        if conflicts.is_empty() {
+            return Ok(());
+        }
+        Err(anyhow!(
+            "bundle '{}': a kept auto-route contradicts a kept workspace conda fact for the \
+             same conda name, and no reconciliation exists: {}. The workspace conda fact is \
+             the base lock's own version for that name; pin the route to it with \
+             `retread-overrides`, keep the wheel with `keep-pypi`, or drop the name with \
+             `retread-drop-deps` in the pack manifest (see README).",
+            self.conda_name,
+            conflicts.join(" | ")
+        ))
+    }
+
+    /// N27-RETREAD-221. The precise consuming environments whose solve holds
+    /// this conda name, rendered for a `###` row. `(unrecorded)` when the
+    /// per-environment selection map is absent -- which is the abstaining
+    /// fact solve, not an empty answer.
+    fn workspace_envs_holding(&self, conda_key: &str) -> String {
+        if self.workspace_selected_conda_packages.is_empty() {
+            return "(unrecorded)".to_string();
+        }
+        let envs: Vec<&str> = self
+            .workspace_selected_conda_packages
+            .iter()
+            .filter(|(_, names)| names.contains(conda_key))
+            .map(|(env, _)| env.as_str())
+            .collect();
+        if envs.is_empty() {
+            "(none)".to_string()
+        } else {
+            envs.join(",")
+        }
+    }
+}
+
 /// Pull a pack/output label out of raw JSON-RPC params.
 ///
 /// Reads the wire JSON rather than the typed structs because the error being
@@ -9434,6 +9714,15 @@ async fn resolve_all(
             &uv_retry_keep,
             &protected_workspace_fact_names,
         );
+        // N27-RETREAD-221. THE FOURTH ARM, at the same door and in the same
+        // statement group as the three that precede it. A route the three arms
+        // KEPT, on a conda name the workspace facts also hold at a different
+        // version, is reconciled to the fact (the fact is the base lock's own
+        // version; the route's exactness is a probe artefact) or refused HERE
+        // with a `### ROUTE FACT CONFLICT` row -- never carried into a solve
+        // that dies on it hundreds of seconds later.
+        // FACTS-2-DOOR-CALL (MUTATION ANCHOR)
+        bundle.reconcile_kept_routes_with_workspace_facts(&effective)?;
         // Auto-bundle scans the whole merged bundle's Requires-Dist, so
         // it naturally handles transitives pulled by any wheel in the
         // group. Every explicit non-URL entry index joins the candidate
@@ -22785,31 +23074,16 @@ fn produce_output_with_conflicts(
         }
 
         let conda_name = CondaName::new(auto_route.route.conda_name.as_str());
-        let conda_version = &auto_route.route.conda_version;
-        let conda_key = conda_name.key();
 
         // Preserve the existing conda route contract. The selected version is
         // not restored as a hard PyPI `==`: ordinary routes receive the
         // bounded/exact compatibility envelope the emitted conda package has
         // always declared. Deps-from routes rely solely on their typed
-        // upstream inputs below.
-        let manual_override = config.overrides.contains_key(conda_key.as_str())
-            && !config.ledger_overrides.contains(conda_key.as_str());
-        if !matches!(auto_route.provenance, Provenance::DepsFromRelaxed) {
-            let route_is_abi_anchor = crate::solve::is_abi_anchor(&auto_route.route.pypi_name)
-                || crate::solve::is_abi_anchor(auto_route.route.conda_name.as_str())
-                || crate::solve::is_abi_anchor(conda_key.as_str());
-            let (route_spec, provenance) = if route_is_abi_anchor || manual_override {
-                (format!("=={conda_version}"), Provenance::UvConstraint)
-            } else {
-                match bounded_range_ceiling(conda_version) {
-                    Some(ceiling) => (
-                        format!(">={conda_version},<{ceiling}"),
-                        Provenance::UvConstraint,
-                    ),
-                    None => (format!("=={conda_version}"), Provenance::UvConstraint),
-                }
-            };
+        // upstream inputs below. N27-RETREAD-221: the band itself is built by
+        // `auto_route_emitted_band`, which is also what the admission door
+        // asks, so the door can never approve a band this loop then rejects.
+        if let Some(route_spec) = auto_route_emitted_band(auto_route, config) {
+            let provenance = Provenance::UvConstraint;
             let specifiers = VersionSpecifiers::from_str(&route_spec).with_context(|| {
                 format!(
                     "parsing generated conda route constraint `{} {route_spec}`",

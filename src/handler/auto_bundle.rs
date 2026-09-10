@@ -6786,6 +6786,300 @@ mod tests {
         }
     }
 
+    /// N27-RETREAD-221 FIXTURE. The production shape of job 6197128, at unit
+    /// scale, INCLUDING ITS BASIS: two precise consuming environments whose
+    /// BASE LOCK holds `cuda-bindings` at `lock_version`, a pack whose own
+    /// probe solve reached that same conda package at `route_version`, and an
+    /// auto-route onto it at `route_version`. The versions come from the lock
+    /// exactly as `facts_from_solved_records` derives them under
+    /// N27-RETREAD-215, so `constrains_basis.source` is `Locked` -- which is
+    /// the basis the fourth arm requires and the one production had.
+    ///
+    /// The route survives all three existing arms of
+    /// `apply_workspace_conda_fact_ownership` the way the production one did:
+    /// the fact's own PyPI candidate is `cuda-bindings` (identity, no map
+    /// edge), so the all-consumer drop retains routes keyed on THAT PyPI name
+    /// -- and this route's PyPI name is `cuda-python`, the other member of
+    /// `CUDA_MAJOR_TRACKED_PYPI_FAMILIES`. Both names begin `cuda-`, so both
+    /// are ABI anchors and the emitted band is exact, which is why any
+    /// difference at all is fatal.
+    fn cuda_bindings_route_fact_bundle(
+        route_version: &str,
+        lock_version: &str,
+        inputs: Vec<crate::uv_closure::AutoRouteInputRequirement>,
+    ) -> Bundle {
+        let envs = ["isaaclab-gpu-latest", "newton-gpu"];
+        let env_records = envs
+            .iter()
+            .map(|env| {
+                (
+                    (*env).to_string(),
+                    vec![repo_record("cuda-bindings", route_version, &[])],
+                )
+            })
+            .collect();
+        let env_conda_deps = envs
+            .iter()
+            .map(|env| ((*env).to_string(), BTreeMap::new()))
+            .collect();
+        let locked_by_env: BTreeMap<String, BTreeMap<String, String>> = envs
+            .iter()
+            .map(|env| {
+                (
+                    (*env).to_string(),
+                    BTreeMap::from([("cuda-bindings".to_string(), lock_version.to_string())]),
+                )
+            })
+            .collect();
+        let facts = super::super::facts_from_solved_records(
+            env_records,
+            env_conda_deps,
+            BTreeSet::new(),
+            &NameMap::new(),
+            "robojudo-pack",
+            &locked_by_env,
+        );
+        assert_eq!(
+            facts.common_selected_versions.get("cuda-bindings"),
+            Some(&lock_version.to_string()),
+            "the fixture's premise: the LOCK supplies the fact's version",
+        );
+
+        let mut bundle = test_bundle(&[]);
+        bundle.conda_name = "robojudo-pack".to_string();
+        bundle.primary = test_wheel("robojudo", "robojudo", "0.1.0", &[]);
+        bundle.workspace_conda_versions = facts.common_selected_versions.clone();
+        bundle.workspace_selected_conda_packages = facts.selected_conda_packages.clone();
+        bundle.constrains_basis = facts.constrains_basis.clone();
+        bundle.workspace_conda_provider_facts = facts.provider_facts;
+        bundle.auto_routed.push(super::super::BundleAutoRoute {
+            route: crate::uv_closure::AutoRoutedPackage {
+                pypi_name: "cuda-python".to_string(),
+                conda_name: "cuda-bindings".to_string(),
+                pypi_version: route_version.to_string(),
+                conda_version: route_version.to_string(),
+                channel: "https://conda.example.invalid/linux-64".to_string(),
+                input_requirements: inputs,
+                origin: crate::uv_closure::RouteOrigin::Fixpoint,
+            },
+            provenance: Provenance::UvConstraint,
+            workspace_provider: None,
+        });
+        bundle
+    }
+
+    fn cuda_major_table_input() -> crate::uv_closure::AutoRouteInputRequirement {
+        crate::uv_closure::AutoRouteInputRequirement {
+            specifiers: ">=12,<13".to_string(),
+            source: "uv constraint `cuda-bindings>=12,<13` from cuda-major-table \
+                     `consuming-envs` (conda `cuda-version12.*`)"
+                .to_string(),
+            provenance: Provenance::UvConstraint,
+            role: crate::uv_closure::AutoRouteInputRole::Constraint,
+        }
+    }
+
+    /// The unreconciled pair, asserted to be FATAL before the door runs. The
+    /// conflict is keyed on the ROUTE's PyPI name (`cuda-python`) while the
+    /// fact names the conda package (`cuda-bindings`) -- measured, not
+    /// assumed: gate 6199636's panic body reads
+    /// "`cuda-python` requirements are mutually unsatisfiable: ...
+    /// `==12.9.7` required by workspace conda fact `cuda-bindings==12.9.7`".
+    fn assert_route_fact_pair_is_fatal(
+        bundle: &Bundle,
+        config: &RetreadConfig,
+        target: &crate::pypi::WheelTarget,
+        route_version: &str,
+        lock_version: &str,
+    ) {
+        let error = super::super::emitted_bundle_route_specs(bundle, config, target)
+            .expect_err("the unreconciled route/fact pair must reproduce the typed conflict");
+        assert!(
+            error
+                .downcast_ref::<crate::constraint::Conflict>()
+                .is_some(),
+            "pre-door assembly must return the typed conflict: {error:#}"
+        );
+        let message = format!("{error:#}");
+        for needle in [
+            "`cuda-python` requirements are mutually unsatisfiable".to_string(),
+            format!("auto-route `cuda-python=={route_version}`"),
+            format!("workspace conda fact `cuda-bindings=={lock_version}`"),
+        ] {
+            assert!(message.contains(&needle), "missing `{needle}`:\n{message}");
+        }
+    }
+
+    /// THE GUARD. Without the fourth arm both claimants reach emission and the
+    /// group finalizes empty -- which is the 638-second refusal of job
+    /// 6197128. With it, the kept route adopts the kept fact's version and the
+    /// same emission succeeds carrying the LOCK's version, not the probe's.
+    ///
+    /// The second half crosses a MINOR boundary on purpose. An ABI anchor's
+    /// exact rendering is widened to a minor band by
+    /// `widen_exact_abi_anchor_spec_to_minor_band`, so `12.9.4` and `12.9.7`
+    /// both render as `>=12.9,<12.10` and the emitted BYTES cannot tell them
+    /// apart. `12.10.1` can, and does.
+    #[test]
+    fn kept_route_adopts_the_kept_workspace_conda_fact_version() {
+        let config = test_config();
+        let target = crate::pypi::WheelTarget::for_subdir("3.12", "linux-64");
+        let mut bundle =
+            cuda_bindings_route_fact_bundle("12.9.4", "12.9.7", vec![cuda_major_table_input()]);
+
+        assert_route_fact_pair_is_fatal(&bundle, &config, &target, "12.9.4", "12.9.7");
+
+        // The three existing arms KEEP this route -- that is the premise the
+        // fourth arm exists for, and it is asserted, not assumed.
+        bundle.apply_workspace_conda_fact_ownership(
+            &config,
+            &config.name_map,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+        assert_eq!(
+            bundle.auto_routed.len(),
+            1,
+            "the fixture's premise is a route the first three arms keep"
+        );
+
+        bundle
+            .reconcile_kept_routes_with_workspace_facts(&config)
+            .expect("an unblocked route on a LOCKED basis must adopt the fact, not refuse");
+        assert_eq!(bundle.auto_routed[0].route.conda_version, "12.9.7");
+        let routes = super::super::emitted_bundle_route_specs(&bundle, &config, &target)
+            .expect("the reconciled pair must emit");
+        let emitted: Vec<String> = routes
+            .iter()
+            .filter(|route| route.conda_name.as_spec() == "cuda-bindings")
+            .map(|route| route.spec.clone())
+            .collect();
+        assert_eq!(emitted.len(), 1, "one emitted route for the name: {emitted:?}");
+        let band = VersionSpecifiers::from_str(emitted[0].trim()).expect("emitted band parses");
+        let fact = uv_pep508::uv_pep440::Version::from_str("12.9.7").unwrap();
+        assert!(band.contains(&fact), "the emitted band must admit the fact: {emitted:?}");
+
+        // The minor-crossing half, where the emitted bytes MUST move.
+        let mut crossing =
+            cuda_bindings_route_fact_bundle("12.9.4", "12.10.1", vec![cuda_major_table_input()]);
+        assert_route_fact_pair_is_fatal(&crossing, &config, &target, "12.9.4", "12.10.1");
+        crossing.apply_workspace_conda_fact_ownership(
+            &config,
+            &config.name_map,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+        crossing
+            .reconcile_kept_routes_with_workspace_facts(&config)
+            .expect("the minor-crossing pair reconciles too");
+        let crossed = super::super::emitted_bundle_route_specs(&crossing, &config, &target)
+            .expect("the reconciled minor-crossing pair must emit")
+            .iter()
+            .filter(|route| route.conda_name.as_spec() == "cuda-bindings")
+            .map(|route| route.spec.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(crossed.len(), 1, "{crossed:?}");
+        assert!(crossed[0].contains("12.10"), "{crossed:?}");
+        assert!(!crossed[0].contains("12.9"), "{crossed:?}");
+    }
+
+    /// THE OTHER HALF OF THE DOCTRINE. When something that GOVERNED uv's
+    /// selection excludes the fact, no reconciliation exists, and the crossing
+    /// is refused AT THE DOOR -- naming both versions and the blocking input
+    /// -- instead of being carried into a solve that dies on it later.
+    #[test]
+    fn kept_route_whose_governing_input_excludes_the_fact_refuses_at_the_door() {
+        let config = test_config();
+        let blocking = crate::uv_closure::AutoRouteInputRequirement {
+            specifiers: "<12.9.5".to_string(),
+            source: "wheel `robojudo==0.1.0` Requires-Dist `cuda-python<12.9.5`".to_string(),
+            provenance: Provenance::IndexWheelMetadata,
+            role: crate::uv_closure::AutoRouteInputRole::Requirement,
+        };
+        let mut bundle = cuda_bindings_route_fact_bundle(
+            "12.9.4",
+            "12.9.7",
+            vec![cuda_major_table_input(), blocking],
+        );
+        bundle.apply_workspace_conda_fact_ownership(
+            &config,
+            &config.name_map,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+
+        let error = bundle
+            .reconcile_kept_routes_with_workspace_facts(&config)
+            .expect_err("a fact that cannot cover the route's consumers must refuse");
+        let message = format!("{error:#}");
+        for needle in [
+            "robojudo-pack",
+            "cuda-bindings",
+            "==12.9.4",
+            "==12.9.7",
+            "newton-gpu",
+            "isaaclab-gpu-latest",
+            "<12.9.5",
+        ] {
+            assert!(message.contains(needle), "missing `{needle}`:\n{message}");
+        }
+        // The route is NOT silently rewritten on the refusing path.
+        assert_eq!(bundle.auto_routed[0].route.conda_version, "12.9.4");
+    }
+
+    /// CAPWINS-9's RULING REACHES THIS DOOR. With no lock the fact is the
+    /// day's FLOAT, and a float may not decide a route's bound -- adopting one
+    /// would let a conda-forge roll move an emitted pin, which is
+    /// N27-RETREAD-130's own defect in this fix's clothes. The same pair that
+    /// reconciles on a locked basis REFUSES on a universe basis, and the
+    /// refusal names the basis.
+    #[test]
+    fn on_a_float_basis_the_same_pair_refuses_instead_of_adopting() {
+        let config = test_config();
+        let mut bundle =
+            cuda_bindings_route_fact_bundle("12.9.4", "12.9.7", vec![cuda_major_table_input()]);
+        // Strip the lock: the versions stay, the BASIS does not.
+        bundle.constrains_basis = Default::default();
+        let error = bundle
+            .reconcile_kept_routes_with_workspace_facts(&config)
+            .expect_err("a float basis may not decide the route's bound");
+        let message = format!("{error:#}");
+        for needle in ["cuda-bindings", "==12.9.4", "==12.9.7", "universe"] {
+            assert!(message.contains(needle), "missing `{needle}`:\n{message}");
+        }
+        assert_eq!(bundle.auto_routed[0].route.conda_version, "12.9.4");
+    }
+
+    /// THE MUTATION THAT KEEPS THE GUARD HONEST. A door that reconciled
+    /// whenever a fact existed would rewrite every route in the workspace. It
+    /// fires only when the route's OWN emitted band excludes the fact: a route
+    /// already agreeing with the lock is left exactly as it was, and so is a
+    /// non-anchor route whose `>=v,<ceiling` band already admits the fact.
+    #[test]
+    fn a_route_whose_band_already_admits_the_fact_is_untouched() {
+        let config = test_config();
+        let mut bundle =
+            cuda_bindings_route_fact_bundle("12.9.7", "12.9.7", vec![cuda_major_table_input()]);
+        bundle
+            .reconcile_kept_routes_with_workspace_facts(&config)
+            .expect("an agreeing pair is not a conflict");
+        assert_eq!(bundle.auto_routed[0].route.conda_version, "12.9.7");
+
+        let mut banded =
+            cuda_bindings_route_fact_bundle("12.9.4", "12.9.7", vec![cuda_major_table_input()]);
+        banded.auto_routed[0].route.pypi_name = "fsspec".to_string();
+        banded.auto_routed[0].route.conda_name = "fsspec".to_string();
+        banded.auto_routed[0].route.conda_version = "2026.2.0".to_string();
+        banded.workspace_conda_versions =
+            BTreeMap::from([("fsspec".to_string(), "2026.7.0".to_string())]);
+        banded
+            .reconcile_kept_routes_with_workspace_facts(&config)
+            .expect("a band that already admits the fact is not a conflict");
+        assert_eq!(
+            banded.auto_routed[0].route.conda_version, "2026.2.0",
+            "`>=2026.2.0,<2027` already admits 2026.7.0; the route must not be rewritten"
+        );
+    }
     fn assert_workspace_fact_conflict_before_ownership(
         bundle: &Bundle,
         config: &RetreadConfig,
@@ -10697,10 +10991,17 @@ pillow = ">=10,<13"
             pypi_closure_fact_constrained_row(holdings.len(), &[]),
             "### PYPI CLOSURE FACT-CONSTRAINED names=1 backtracked=none",
         );
+        // N27-RETREAD-221 (FACTS-2) moved this pin from 59 to 60, and the
+        // REASON above still holds for THIS case: with no lock the basis is
+        // `universe`, the fourth arm may not adopt a float, and no emitted
+        // byte of the no-lock case moves. The epoch moved for the KEEP half
+        // (see `crate::lock::EMIT_EPOCH`), which this test does not exercise,
+        // so the pin is updated rather than deleted -- a deleted pin is one
+        // fewer reader for the constant.
         assert_eq!(
             crate::lock::EMIT_EPOCH,
-            59,
-            "no emitted byte of an unchanged case moved, so the epoch does not",
+            60,
+            "the no-lock case is unchanged; the epoch moved for the keep half only",
         );
     }
 }

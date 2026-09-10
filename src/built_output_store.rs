@@ -158,7 +158,24 @@ pub const SCHEMA: &str = "retread-built-output-store-v3";
 /// the two binaries -- `locked_covers_all` is false there and nothing is
 /// seeded -- but the store cannot tell the two modes apart at the address, so
 /// the invalidation is whole-generation by construction.
-pub const BUILT_OUTPUT_SCHEMA: &str = "retread-built-output-emission-8";
+/// Generation 9 (N27-RETREAD-221, FACTS-2): a kept auto-route is reconciled
+/// with the kept workspace conda fact for the same conda name -- the route
+/// adopts the fact's version when its own band excludes it, and the crossing
+/// is refused at admission when a governing input means it cannot.
+///
+/// THE BUMP IS FORCED BY THE SAME ARITHMETIC GENERATIONS 7 AND 8 SPELL OUT,
+/// and by the KEEP half only. CAPWINS-9 reaches this door: the fourth arm
+/// adopts a fact only when `constrains_basis.held_version_is_from_lock` is
+/// true, so under `ConstrainsSource::Universe` -- the harness.s `drop` mode
+/// and every cold pass -- no route is rewritten and drop-mode records are
+/// byte-identical between the two binaries. Every KEEP-mode record can move,
+/// and `backend_behaviour_identity()` folds `CARGO_PKG_VERSION`, this string
+/// and `REQUIRED_UV` and nothing else -- not `EMIT_EPOCH`, not a git hash --
+/// so without moving this string those records sit at exactly the address
+/// this binary computes under an identity asserting "same behaviour". The
+/// store cannot tell the two modes apart at the address, so the invalidation
+/// is whole-generation by construction, exactly as generation 8 argues.
+pub const BUILT_OUTPUT_SCHEMA: &str = "retread-built-output-emission-9";
 
 /// The store's directory name under a persistent root, and the `--store`
 /// spelling `retread store-reap` accepts. Named here, beside the layout it

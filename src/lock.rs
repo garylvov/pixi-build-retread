@@ -970,7 +970,23 @@ pub const SCHEMA: u32 = 20;
 /// when conda-forge rolled under a kept lock; the version for every name the
 /// pack reaches still comes from the lock, so a roll still cannot move a
 /// bound. What no longer comes from the lock is the name SET.
-pub const EMIT_EPOCH: u32 = 59;
+///
+/// 60 (N27-RETREAD-221, FACTS-2): a kept auto-route whose emitted band
+/// EXCLUDES the workspace conda fact for the same conda name adopts the
+/// fact's version at admission, or the crossing is refused there. THE BYTES
+/// MOVE, WHICH IS WHY THIS IS AN EPOCH AND NOT A DIAGNOSTIC: the route's
+/// emitted `depends`/`constrains` line carries the fact's version instead of
+/// the pack probe's, and the crossings that previously RELAXED their way past
+/// the contradiction (`decide_for_emission` is not obliged to refuse every
+/// authoritative conflict) emitted a relaxed bound where they now emit the
+/// fact's exact one. The refusing crossings publish nothing either way, so
+/// they are not the reason; the relaxed ones are. KEEP MODE ONLY: CAPWINS-9's
+/// ruling reaches this door as well, so a route adopts a fact only when
+/// `constrains_basis.held_version_is_from_lock` is true, and the no-lock case
+/// emits exactly what it emitted at 59 -- which is what
+/// `fact1_with_no_lock_the_float_still_decides_and_the_ordinary_case_is_unchanged`
+/// pins.
+pub const EMIT_EPOCH: u32 = 60;
 
 fn parse_stored_glibc(value: Option<&str>) -> Option<Option<(u32, u32)>> {
     match value {
