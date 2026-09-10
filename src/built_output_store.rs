@@ -137,7 +137,28 @@ pub const SCHEMA: &str = "retread-built-output-store-v3";
 /// emission-6 records `6177375` published, each carrying the wrongly OMITTED
 /// bounds, sit at exactly the address this binary computes and would be adopted
 /// under an identity asserting "same behaviour".
-pub const BUILT_OUTPUT_SCHEMA: &str = "retread-built-output-emission-7";
+/// Generation 8 (N27-RETREAD-215, FACTS-1): generation 5's locked fact
+/// boundary is narrowed to the INTERSECTION of the base lock's conda set with
+/// the names the pack's own probe solve selected. Generation 5 seeded the
+/// boundary with the lock's whole conda set, which handed a pack ownership of
+/// every package its consuming environment installs -- and ownership DELETES
+/// the pack's route, turning a binding `depends` into an inert `constrains`.
+/// KEEPWALK-2 measured the result as a period-2 oscillation rather than a
+/// fixed point: a keep on `R2`'s cert removes 1300 conda rows over 602 names
+/// in 13 environments (`flashsac-pack` `depends` 75 -> 17, boundary 57 -> 408)
+/// and a keep on that removes them right back.
+///
+/// THE BUMP IS FORCED BY THE SAME ARITHMETIC GENERATION 7 SPELLS OUT:
+/// `backend_behaviour_identity()` folds `CARGO_PKG_VERSION`, this string and
+/// `REQUIRED_UV` and nothing else -- not `EMIT_EPOCH`, not a git hash. Every
+/// generation-7 record published from a KEEP relock carries the collapsed
+/// `depends`/`constrains` lists, and without moving this string those records
+/// sit at exactly the address this binary computes, under an identity
+/// asserting "same behaviour". Drop-mode records are byte-identical between
+/// the two binaries -- `locked_covers_all` is false there and nothing is
+/// seeded -- but the store cannot tell the two modes apart at the address, so
+/// the invalidation is whole-generation by construction.
+pub const BUILT_OUTPUT_SCHEMA: &str = "retread-built-output-emission-8";
 
 /// The store's directory name under a persistent root, and the `--store`
 /// spelling `retread store-reap` accepts. Named here, beside the layout it

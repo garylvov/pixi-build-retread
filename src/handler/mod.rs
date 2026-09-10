@@ -9700,6 +9700,22 @@ struct ConstrainsBasis {
     /// `universe_only=1` cannot answer it. A basis that is `Locked` overall
     /// still floats every name in this set.
     universe_only_names: BTreeSet<String>,
+    /// N27-RETREAD-215. Distinct canonical conda names the BASE LOCK carried
+    /// for the pack's consuming environments, whether or not the pack's own
+    /// probe solve reached them. Zero whenever no lock seeded the boundary
+    /// (`drop` mode, or a lock that does not cover every consuming
+    /// environment), which is what makes `intersect_names` safe to subtract.
+    locked_names: usize,
+    /// N27-RETREAD-215. Of `locked_names`, the ones the pack's own probe solve
+    /// never selected. THESE NEVER SEED THE FACT BOUNDARY AND THEREFORE NEVER
+    /// TRANSFER OWNERSHIP: a name the pack cannot reach is not a route the
+    /// pack has to cede. Before this existed the whole locked set seeded the
+    /// boundary, `present_in_all_consumers` went true for all of it, and
+    /// `Bundle::apply_workspace_conda_fact_ownership` deleted the pack's
+    /// binding `depends` edge for names the pack was the only requirer of --
+    /// measured on `flashsac-pack` as 75 `depends` collapsing to 17 with the
+    /// boundary going 57 -> 408.
+    locked_only_excluded: usize,
 }
 
 impl ConstrainsBasis {
@@ -9707,6 +9723,19 @@ impl ConstrainsBasis {
     /// base lock did not carry.
     fn universe_only(&self) -> usize {
         self.universe_only_names.len()
+    }
+
+    /// N27-RETREAD-215. The row's `probe=` number: names the pack's own probe
+    /// solve selected. This IS the boundary size now, in both modes.
+    fn probe_names(&self) -> usize {
+        self.names
+    }
+
+    /// N27-RETREAD-215. The row's `intersect=` number: names in the base lock
+    /// that the probe solve also reached -- the only names a lock may supply a
+    /// version fact for, and the only ones ownership can transfer.
+    fn intersect_names(&self) -> usize {
+        self.locked_names - self.locked_only_excluded
     }
 
     /// CAPWINS-9 (N27-RETREAD-198). WHETHER THE HELD VERSION FOR ONE NAME
@@ -10866,6 +10895,10 @@ fn facts_from_solved_records(
         ConstrainsSource::Universe
     };
     let mut universe_only_names: BTreeSet<String> = BTreeSet::new();
+    // N27-RETREAD-215. The two halves of the boundary decision, unioned across
+    // the consuming environments so the printed row is per pack.
+    let mut locked_union: BTreeSet<String> = BTreeSet::new();
+    let mut intersect_union: BTreeSet<String> = BTreeSet::new();
     let mut per_env_versions: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
     for (env, records) in &env_records {
         let locked = if locked_covers_all {
@@ -10873,20 +10906,61 @@ fn facts_from_solved_records(
         } else {
             None
         };
-        // THE LOCK SUPPLIES THE NAMES AS WELL AS THE VERSIONS, and that is
-        // what makes this a fixed point rather than a partial one. Had it
-        // supplied only versions, the name SET would still be the day's --
-        // and a name that entered or left the intersection because the day's
-        // solve moved is exactly the `+networkx >=3.0,==3.3` shape this
-        // closes. The locked set IS the environment's installed set; a
-        // workspace conda provider it installs is a provider whether or not
-        // this pack's own probe solve happened to reach it.
+        // N27-RETREAD-215. The names THIS pack's own probe solve selected for
+        // THIS environment. The lock is intersected against it below, so the
+        // name SET is always the pack's own and only the VERSIONS come from
+        // the lock.
+        let probe_names: BTreeSet<String> = records
+            .iter()
+            .map(|record| canonical_conda_name(record.package_record.name.as_normalized()))
+            .filter(|name| name != &bundle_name)
+            .collect();
+        // N27-RETREAD-215. THE LOCK SUPPLIES THE VERSIONS. THE PACK'S OWN
+        // PROBE SOLVE SUPPLIES THE NAMES. The boundary is their INTERSECTION.
+        //
+        // -130 seeded this map with the lock's ENTIRE conda set, on the
+        // reasoning that "a workspace conda provider it installs is a provider
+        // whether or not this pack's own probe solve happened to reach it".
+        // That reasoning is unsound, and the unsoundness is not academic: a
+        // fact is not inert. Every name in the boundary that maps to a PyPI
+        // identity the pack routes goes `present_in_all_consumers` -- vacuously
+        // so when there is ONE consuming environment, which is the shape every
+        // pack here has -- and `apply_workspace_conda_fact_ownership` then
+        // DELETES the pack's route for it. A `depends` is BINDING; the
+        // `constrains` it becomes is INERT unless something else pulls the
+        // name in. So the pack cedes the very edge that put the name in the
+        // base lock in the first place, and the next solve drops it and its
+        // transitive closure. Measured on `flashsac-pack`: boundary 57 -> 408,
+        // `depends` 75 -> 17, `constrains` 2 -> 60, and 1300 conda rows over
+        // 602 names leaving the certificate -- with all 70 lost `depends`
+        // being names the lock carried and the probe never selected.
+        //
+        // -130's OWN GOAL SURVIVES INTACT, and that is why this is a narrowing
+        // and not a revert. The `+networkx >=3.0,==3.3` defect was a VERSION
+        // moving under a kept lock when conda-forge rolled; the version for
+        // every name the pack reaches still comes from the lock here, so a
+        // roll still cannot move an emitted bound. What no longer comes from
+        // the lock is the name SET, which is the half that was transferring
+        // ownership of packages the pack has no route to.
         let mut versions: BTreeMap<String, String> = match locked {
-            Some(locked) => locked
-                .iter()
-                .filter(|(name, _)| *name != &bundle_name)
-                .map(|(name, version)| (name.clone(), version.clone()))
-                .collect(),
+            Some(locked) => {
+                let mut seeded = BTreeMap::new();
+                for (name, version) in locked {
+                    if name == &bundle_name {
+                        continue;
+                    }
+                    locked_union.insert(name.clone());
+                    if !probe_names.contains(name) {
+                        // A `locked_only` name: in the environment's lock, not
+                        // in this pack's probe solve. It is somebody else's
+                        // route. Counted, never seeded, never owned.
+                        continue;
+                    }
+                    intersect_union.insert(name.clone());
+                    seeded.insert(name.clone(), version.clone());
+                }
+                seeded
+            }
             None => BTreeMap::new(),
         };
         for record in records {
@@ -10908,6 +10982,8 @@ fn facts_from_solved_records(
         }
         per_env_versions.insert(env.clone(), versions);
     }
+    let locked_names = locked_union.len();
+    let locked_only_excluded = locked_names - intersect_union.len();
     let constrains_basis = ConstrainsBasis {
         source: constrains_source,
         names: per_env_versions
@@ -10916,6 +10992,8 @@ fn facts_from_solved_records(
             .collect::<BTreeSet<_>>()
             .len(),
         universe_only_names,
+        locked_names,
+        locked_only_excluded,
     };
     let selected_conda_packages = per_env_versions
         .iter()
@@ -11504,6 +11582,21 @@ async fn solve_workspace_conda_facts(
         bundle_name,
         facts.constrains_basis.names,
         facts.constrains_basis.universe_only(),
+    );
+    // N27-RETREAD-215. The boundary decision itself, per pack, per pass, in
+    // BOTH modes. `### CONSTRAINS names=` alone could not distinguish "the
+    // lock seeded 408 names" from "the probe reached 408 names", and that is
+    // exactly the distinction that cost 1300 conda rows: the collapse showed
+    // up in that row as a boundary that GREW. On a drop relock this reads
+    // `locked=0 intersect=0 locked_only_excluded=0`, which is the control
+    // saying no lock seeded anything.
+    eprintln!(
+        "### FACT BOUNDARY pack={} locked={} probe={} intersect={} locked_only_excluded={}",
+        bundle_name,
+        facts.constrains_basis.locked_names,
+        facts.constrains_basis.probe_names(),
+        facts.constrains_basis.intersect_names(),
+        facts.constrains_basis.locked_only_excluded,
     );
     facts
 }
@@ -14545,10 +14638,23 @@ gpu = { features = ["gpu"], no-default-feature = true }
             &base_lock,
         );
 
-        assert_eq!(
-            monday.common_selected_versions, tuesday.common_selected_versions,
-            "a moved universe must not move the fact boundary the constrains are cut from",
-        );
+        // N27-RETREAD-215 REWROTE THIS ASSERTION AND SAYS SO RATHER THAN
+        // DELETING IT. -130 asserted the two maps EQUAL, which is only true
+        // while the lock supplies the NAMES as well as the versions -- and
+        // that is the seeding that transferred ownership of names the pack
+        // cannot reach and cost 1300 conda rows. The name set is now the
+        // pack's own probe reach, so Tuesday's boundary carries `filelock`
+        // and Monday's does not. WHAT -130 EXISTS FOR IS UNCHANGED AND IS
+        // ASSERTED BELOW: every name in BOTH boundaries holds the LOCKED
+        // version on both days, so a repodata roll still cannot move an
+        // emitted bound.
+        for (name, monday_version) in &monday.common_selected_versions {
+            assert_eq!(
+                Some(monday_version),
+                tuesday.common_selected_versions.get(name),
+                "a moved universe must not move the version a shared name is cut against",
+            );
+        }
         assert_eq!(
             monday.common_selected_versions.get("networkx").map(String::as_str),
             Some("3.2"),
@@ -14564,12 +14670,33 @@ gpu = { features = ["gpu"], no-default-feature = true }
         assert_eq!(tuesday.constrains_basis.source, super::ConstrainsSource::Locked);
         assert_eq!(
             (monday.constrains_basis.names, monday.constrains_basis.universe_only()),
-            (3, 0),
+            (2, 0),
+            "the boundary is the pack's own probe reach, and Monday never reached filelock",
         );
         assert_eq!(
             (tuesday.constrains_basis.names, tuesday.constrains_basis.universe_only()),
             (3, 0),
             "nothing fell back: every name the day named is one the lock carries",
+        );
+        // N27-RETREAD-215's row, on the two days, as the `### FACT BOUNDARY`
+        // line prints it.
+        assert_eq!(
+            (
+                monday.constrains_basis.locked_names,
+                monday.constrains_basis.probe_names(),
+                monday.constrains_basis.intersect_names(),
+                monday.constrains_basis.locked_only_excluded,
+            ),
+            (3, 2, 2, 1),
+        );
+        assert_eq!(
+            (
+                tuesday.constrains_basis.locked_names,
+                tuesday.constrains_basis.probe_names(),
+                tuesday.constrains_basis.intersect_names(),
+                tuesday.constrains_basis.locked_only_excluded,
+            ),
+            (3, 3, 3, 0),
         );
     }
 
@@ -14605,6 +14732,19 @@ gpu = { features = ["gpu"], no-default-feature = true }
             facts.constrains_basis.universe_only(), 0,
             "under the universe basis every name came from there, so `universe_only` \
              counts nothing and must not be read as coverage",
+        );
+        // N27-RETREAD-215, guard (d): the `### FACT BOUNDARY` row's drop-mode
+        // control. `locked=0` is the line that says no lock seeded anything,
+        // so an intersection that excluded nothing cannot be confused with a
+        // lock that was never consulted.
+        assert_eq!(
+            (
+                facts.constrains_basis.locked_names,
+                facts.constrains_basis.probe_names(),
+                facts.constrains_basis.intersect_names(),
+                facts.constrains_basis.locked_only_excluded,
+            ),
+            (0, 2, 0, 0),
         );
     }
 

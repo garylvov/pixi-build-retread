@@ -932,7 +932,45 @@ pub const SCHEMA: u32 = 20;
 /// `eigenpy` case is UNTOUCHED: keep-mode `6150106` derives `source=locked`, the
 /// held `eigenpy==3.12.0` is the consuming environment's own locked version, and
 /// the bound is still omitted with its `BOUND-UNRESOLVED` row.
-pub const EMIT_EPOCH: u32 = 58;
+///
+/// Epoch 59 (N27-RETREAD-215, FACTS-1): the locked fact boundary is the
+/// INTERSECTION of the base lock's conda set with the names the pack's own
+/// probe solve selected. Epoch 55/generation 5 (-130) seeded it with the
+/// lock's WHOLE conda set, on the reasoning that a provider the environment
+/// installs is a provider whether or not this pack reached it. It is not: the
+/// boundary decides `present_in_all_consumers`, that flag makes
+/// `apply_workspace_conda_fact_ownership` DELETE the pack's route, and a
+/// deleted `depends` is a binding edge replaced by an inert `constrains`. So
+/// the pack ceded the edge that put the name in the base lock, and the next
+/// solve dropped the name and its closure.
+///
+/// THE MEASUREMENT IS KEEPWALK-2's FOUR ARMS AND IT IS AN OSCILLATION, NOT A
+/// FIXED POINT: `keep(R2)` = R1 removes 1300 conda rows over 602 names in 13
+/// environments; `keep(R1)` = R1b adds 1294 back; R2 vs R1b differ by 23 rows.
+/// Per pack, read off the certs: `flashsac-pack` `depends` 75 -> 17 -> 73 and
+/// `constrains` 2 -> 60 -> 15, `holosoma-pack` 53 -> 7 -> 46, `robogen-pack`
+/// 56 -> 4 -> 56. The `### CONSTRAINS` rows carry the cause -- flashsac's
+/// boundary is `names=57` under `source=universe` and `names=408` under
+/// `source=locked`, and 408 is exactly the consuming environment's entire
+/// locked conda half. All 70 of flashsac's lost `depends` are names the lock
+/// carried and the probe never selected; R1's lock installs and then
+/// ImportErrors at activation (holosoma loses 39 of its 46).
+///
+/// KEEP-MODE BYTES MOVE AND DROP-MODE BYTES DO NOT, which is why this is an
+/// epoch. With no base lock `locked_covers_all` is false, nothing is seeded,
+/// and the derivation is byte-for-byte the pre-130 one -- guarded. Under a
+/// kept lock the emitted `depends` and `constrains` lists both change for the
+/// same manifest inputs, so every generation-7 record published from a keep
+/// relock is stale, and `BUILT_OUTPUT_SCHEMA` moves to emission-8 in this same
+/// commit for the reason generation 5 gives: `backend_behaviour_identity()`
+/// folds that string and NOT this constant.
+///
+/// -130's OWN GOAL IS KEPT, and that is the difference between a narrowing and
+/// a revert. The `+networkx >=3.0,==3.3` defect was an emitted VERSION moving
+/// when conda-forge rolled under a kept lock; the version for every name the
+/// pack reaches still comes from the lock, so a roll still cannot move a
+/// bound. What no longer comes from the lock is the name SET.
+pub const EMIT_EPOCH: u32 = 59;
 
 fn parse_stored_glibc(value: Option<&str>) -> Option<Option<(u32, u32)>> {
     match value {

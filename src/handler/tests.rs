@@ -1810,6 +1810,7 @@ fn a_learned_conda_fact_yields_to_a_cap_unless_a_lock_holds_a_version_the_cap_ex
         source: super::ConstrainsSource::Locked,
         names: 1,
         universe_only_names: BTreeSet::new(),
+        ..Default::default()
     };
     let (locked_output, locked_logs) = capture_debug_logs(|| {
         produce_output(&locked, &cfg(), Platform::Linux64, "3.11", &[], None, None).unwrap()
@@ -11786,7 +11787,7 @@ fn c11_the_store_key_carries_no_backend_git_hash() {
 fn capwins5_the_emission_identity_moves_off_both_claimed_encodings() {
     let identity = backend_behaviour_identity();
     assert!(
-        identity.contains("retread-built-output-emission-7"),
+        identity.contains("retread-built-output-emission-8"),
         "the fact-constrained emission must have its own schema; got {identity}",
     );
     assert!(
@@ -11852,17 +11853,34 @@ fn capwins5_the_emission_identity_moves_off_both_claimed_encodings() {
         "…and must not still be the encoding the 14 records relock 6177375 published \
          carry, whose 47 omitted bounds all rested on a universe float; got {identity}",
     );
+    // FACTS-1 / N27-RETREAD-215. THE SEVENTH NEGATIVE. An emission-7 binary
+    // seeds the locked fact boundary with the consuming environments' ENTIRE
+    // locked conda set, so under a KEPT lock it cedes the pack's own `depends`
+    // edges to names the pack has no route to: KEEPWALK-2's `keep(R2)` arm
+    // removed 1300 conda rows over 602 names in 13 environments and took
+    // `flashsac-pack` from 75 `depends` to 17. Any record published from a
+    // keep relock by such a binary carries those collapsed lists, and the
+    // arithmetic above applies unchanged -- this identity folds
+    // `BUILT_OUTPUT_SCHEMA` and not `EMIT_EPOCH` -- so without this move they
+    // sit at exactly the address the fixed binary computes.
+    assert!(
+        !identity.contains("retread-built-output-emission-7"),
+        "…and must not still be the encoding a binary carries that seeds the fact \
+         boundary with the whole locked set (KEEPWALK-2: 1300 conda rows removed on \
+         the first keep application); got {identity}",
+    );
     assert_eq!(
         crate::built_output_store::BUILT_OUTPUT_SCHEMA,
-        "retread-built-output-emission-7",
+        "retread-built-output-emission-8",
     );
     assert!(
-        crate::lock::EMIT_EPOCH >= 58,
+        crate::lock::EMIT_EPOCH >= 59,
         "EMIT_EPOCH must clear 52 (695f108), 53 (e30b23f's own lineage), 54 (96ff3dd, \
          whose emission-3 records are poisoned), 55 (d51e284, the pre-constrains \
          basis), 56 (0be408a, whose emission-5 records carry the unsatisfiable \
-         psutil bound) and 57 (ff3795d, whose emission-6 records omit 47 bounds on \
-         universe floats); got {}",
+         psutil bound), 57 (ff3795d, whose emission-6 records omit 47 bounds on \
+         universe floats) and 58 (28ad0a0, whose emission-7 keep-mode records carry \
+         the collapsed depends lists); got {}",
         crate::lock::EMIT_EPOCH,
     );
 }
@@ -14881,6 +14899,7 @@ fn eigenpy_cap_bundle(held: Option<&str>, declared_specs: BTreeSet<String>) -> s
             source: super::ConstrainsSource::Locked,
             names: 1,
             universe_only_names: BTreeSet::new(),
+            ..Default::default()
         };
     }
     bundle
@@ -15191,6 +15210,7 @@ fn capwins9_a_locked_basis_still_floats_the_names_the_lock_does_not_carry() {
         source: super::ConstrainsSource::Locked,
         names: 2,
         universe_only_names: BTreeSet::from(["warp-lang".to_string()]),
+        ..Default::default()
     };
     assert!(
         basis.held_version_is_from_lock("networkx"),
@@ -15319,4 +15339,399 @@ fn capwins8_the_omission_row_names_dep_bound_held_and_policy() {
         super::constrains_bound_unresolved_row("psutil", ">=5.9.0,<6.0.0", &[])
             .starts_with(super::CONSTRAINS_BOUND_UNRESOLVED_PREFIX),
     );
+}
+
+// ---------------------------------------------------------------------
+// N27-RETREAD-215 (FACTS-1). A NAME THE BASE LOCK HOLDS BUT THE PACK'S OWN
+// PROBE SOLVE NEVER SELECTED IS NOT THE PACK'S FACT.
+//
+// -130 seeded the locked fact boundary with the consuming environments'
+// ENTIRE locked conda set. `present_in_all_consumers` then went true for
+// every one of those names -- vacuously, because every pack here has exactly
+// ONE precise consumer (`conda facts: derived precise workspace routing
+// inputs bundle=flashsac-pack consuming_envs=1`, identical in all three of
+// KEEPWALK-2's arms) -- and `apply_workspace_conda_fact_ownership` DELETES
+// the pack's route for an all-consumer fact. A `depends` is binding; the
+// `constrains` it becomes is inert. So the pack cedes the edge that put the
+// name in the lock, and the closure that hung off it leaves the certificate.
+//
+// THE FIXTURE IS THE MEASURED SHAPE, NOT AN INVENTED ONE. Every number below
+// is `flashsac-pack`'s own, read from `mergeB44_5`: the probe boundary is
+// `### CONSTRAINS source=universe pack=flashsac-pack names=57`, the locked
+// boundary is `names=408` (exactly the `flashsac-gpu` environment's conda
+// half), and the pack emits 75 `depends` which collapse to 17.
+// ---------------------------------------------------------------------
+
+/// One solved conda record, the shape `facts_from_solved_records` consumes.
+fn n215_record(name: &str, version: &str) -> rattler_conda_types::RepoDataRecord {
+    use rattler_conda_types::{PackageRecord, VersionWithSource};
+    use std::str::FromStr as _;
+    let mut package_record = PackageRecord::new(
+        name.parse().unwrap(),
+        VersionWithSource::from_str(version).unwrap(),
+        "h123456_0".to_string(),
+    );
+    package_record.subdir = "linux-64".to_string();
+    rattler_conda_types::RepoDataRecord {
+        package_record,
+        file_name: format!("{name}-{version}-h123456_0.conda"),
+        url: url::Url::parse(&format!(
+            "https://example.invalid/linux-64/{name}-{version}-h123456_0.conda"
+        ))
+        .unwrap(),
+        channel: Some("https://example.invalid".into()),
+    }
+}
+
+/// Attach one conda route the pack owns, exactly as the uv closure's
+/// auto-route leaves it.
+fn n215_route(bundle: &mut Bundle, name: &str, version: &str) {
+    bundle.auto_routed.push(BundleAutoRoute {
+        route: crate::uv_closure::AutoRoutedPackage {
+            pypi_name: name.to_string(),
+            conda_name: name.to_string(),
+            pypi_version: version.to_string(),
+            conda_version: version.to_string(),
+            channel: "https://conda.example.invalid/linux-64".to_string(),
+            input_requirements: Vec::new(),
+            origin: crate::uv_closure::RouteOrigin::Fixpoint,
+        },
+        provenance: Provenance::PriorSelection,
+        workspace_provider: None,
+    });
+}
+
+/// The names `flashsac-pack` emits as `depends` -- edges the pack itself is
+/// the only requirer of, which is why deleting them drops their closure.
+fn n215_pack_dep_names() -> Vec<String> {
+    (0..75).map(|i| format!("dep-{i:03}")).collect()
+}
+
+/// The names the consuming environment's own probe solve reached: 57, and
+/// disjoint from the pack's own edges, because the probe solves the
+/// environment WITHOUT the pack that is being built.
+fn n215_probe_names() -> Vec<String> {
+    (0..57).map(|i| format!("probe-{i:03}")).collect()
+}
+
+/// The consuming environment's whole locked conda half: the 57 the probe
+/// reaches, the 75 the pack put there, and 276 more the pack has never heard
+/// of. 408 in total, which is the number the `### CONSTRAINS source=locked`
+/// row printed for `flashsac-pack`.
+fn n215_base_lock() -> BTreeMap<String, BTreeMap<String, String>> {
+    let mut versions: BTreeMap<String, String> = BTreeMap::new();
+    for name in n215_probe_names() {
+        versions.insert(name, "1.0.0".to_string());
+    }
+    for name in n215_pack_dep_names() {
+        versions.insert(name, "1.0.0".to_string());
+    }
+    for i in 0..276 {
+        versions.insert(format!("other-{i:03}"), "1.0.0".to_string());
+    }
+    assert_eq!(versions.len(), 408, "the fixture must be flashsac's own shape");
+    BTreeMap::from([("flashsac-gpu".to_string(), versions)])
+}
+
+/// The pack's facts for a keep pass against `n215_base_lock`.
+fn n215_keep_facts() -> WorkspaceCondaFacts {
+    super::facts_from_solved_records(
+        BTreeMap::from([(
+            "flashsac-gpu".to_string(),
+            n215_probe_names()
+                .iter()
+                .map(|name| n215_record(name, "1.0.0"))
+                .collect(),
+        )]),
+        BTreeMap::from([("flashsac-gpu".to_string(), BTreeMap::new())]),
+        BTreeSet::new(),
+        &NameMap::default(),
+        "flashsac-pack",
+        &n215_base_lock(),
+    )
+}
+
+/// GUARD (a). THE flashsac SHAPE. A base lock covering the 57 names the pack
+/// reaches, the 75 it emits, and 276 it has nothing to do with must leave the
+/// pack's 75 `depends` standing.
+///
+/// RED ON 28ad0a0, where the boundary is all 408, every `dep-*` becomes an
+/// all-consumer fact, and `apply_workspace_conda_fact_ownership` empties
+/// `auto_routed` -- the 75 -> 17 collapse in miniature.
+#[test]
+fn n215_locked_only_names_do_not_take_the_packs_route() {
+    let facts = n215_keep_facts();
+
+    assert_eq!(facts.constrains_basis.source, super::ConstrainsSource::Locked);
+    assert_eq!(
+        (
+            facts.constrains_basis.locked_names,
+            facts.constrains_basis.probe_names(),
+            facts.constrains_basis.intersect_names(),
+            facts.constrains_basis.locked_only_excluded,
+        ),
+        (408, 57, 57, 351),
+        "the `### FACT BOUNDARY` row: the lock holds 408, the probe reached 57, \
+         and the 351 the pack cannot reach never seed the boundary",
+    );
+    for name in n215_pack_dep_names() {
+        assert!(
+            !facts.provider_facts.contains_key(&name),
+            "`{name}` is the pack's OWN edge; the lock holding it is a consequence \
+             of that edge, not evidence that somebody else provides it",
+        );
+    }
+
+    let mut bundle = solo_bundle("flashsac-pack", vec![]);
+    for name in n215_pack_dep_names() {
+        n215_route(&mut bundle, &name, "1.0.0");
+    }
+    bundle.workspace_conda_provider_facts = facts.provider_facts.clone();
+    let config = cfg();
+    bundle.apply_workspace_conda_fact_ownership(
+        &config,
+        &config.name_map,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+    );
+
+    // The 57 names the probe DID reach are genuine facts and the pack cedes
+    // them, exactly as -130 intends -- it routes none of them, so nothing of
+    // its own is lost. What may never be ceded is one of its own 75 edges.
+    for name in n215_pack_dep_names() {
+        assert!(
+            !bundle.auto_dropped.contains(&name),
+            "`{name}` is the pack's own route and only the lock's copy of it says \
+             otherwise: {:?}",
+            bundle.auto_dropped,
+        );
+    }
+    assert_eq!(bundle.auto_routed.len(), 75);
+
+    let output =
+        produce_output(&bundle, &config, Platform::Linux64, "3.11", &[], None, None).unwrap();
+    let emitted = output
+        .run_dependencies
+        .depends
+        .iter()
+        .filter(|dependency| dependency.name.as_str() != "python")
+        .count();
+    assert_eq!(
+        emitted, 75,
+        "the keep application must leave the emitted `depends` at 75",
+    );
+}
+
+/// GUARD (b). THE FIXED POINT: `depends(keep(L)) == depends(L)`.
+///
+/// Pass one runs with no base lock and emits a `depends` set; the lock that
+/// pass produces is the environment's installed set, which is the probe's own
+/// names PLUS everything the pack's edges pulled in. Pass two is a keep
+/// against exactly that. -130's own comment claims its seeding "is what makes
+/// this a fixed point"; KEEPWALK-2 measured a period-2 oscillation instead.
+///
+/// RED ON 28ad0a0: pass two's boundary swallows pass one's own edges and the
+/// second `depends` set collapses.
+#[test]
+fn n215_a_keep_against_the_lock_the_pack_produced_is_a_fixed_point() {
+    let build = |locked: &BTreeMap<String, BTreeMap<String, String>>| -> Vec<String> {
+        let facts = super::facts_from_solved_records(
+            BTreeMap::from([(
+                "flashsac-gpu".to_string(),
+                n215_probe_names()
+                    .iter()
+                    .map(|name| n215_record(name, "1.0.0"))
+                    .collect(),
+            )]),
+            BTreeMap::from([("flashsac-gpu".to_string(), BTreeMap::new())]),
+            BTreeSet::new(),
+            &NameMap::default(),
+            "flashsac-pack",
+            locked,
+        );
+        let mut bundle = solo_bundle("flashsac-pack", vec![]);
+        for name in n215_pack_dep_names() {
+            n215_route(&mut bundle, &name, "1.0.0");
+        }
+        bundle.workspace_conda_provider_facts = facts.provider_facts.clone();
+        let config = cfg();
+        bundle.apply_workspace_conda_fact_ownership(
+            &config,
+            &config.name_map,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+        let mut names: Vec<String> = produce_output(
+            &bundle,
+            &config,
+            Platform::Linux64,
+            "3.11",
+            &[],
+            None,
+            None,
+        )
+        .unwrap()
+        .run_dependencies
+        .depends
+        .iter()
+        .map(|dependency| dependency.name.as_str().to_string())
+        .filter(|name| name != "python")
+        .collect();
+        names.sort();
+        names
+    };
+
+    // Pass one: the cold/drop pass, no base lock.
+    let cold = build(&BTreeMap::new());
+    assert_eq!(cold.len(), 75);
+
+    // The lock that pass produced: the environment installs the probe's names
+    // and everything the pack's `depends` pulled in.
+    let mut installed: BTreeMap<String, String> = BTreeMap::new();
+    for name in n215_probe_names() {
+        installed.insert(name, "1.0.0".to_string());
+    }
+    for name in &cold {
+        installed.insert(name.clone(), "1.0.0".to_string());
+    }
+    let produced_lock = BTreeMap::from([("flashsac-gpu".to_string(), installed)]);
+
+    // Pass two: a keep against it.
+    let kept = build(&produced_lock);
+    assert_eq!(
+        kept, cold,
+        "keep(L) must emit the same depends as L: a pack that cedes its own \
+         edges to the lock those edges wrote is an oscillation, not a fixed point",
+    );
+}
+
+/// GUARD (c). A GENUINELY SHARED NAME STILL TRANSFERS OWNERSHIP, WHICH IS
+/// WHAT -130 IS FOR. `pytorch` is in the base lock AND in the pack's own
+/// probe solve, so the consuming environment really does provide it and the
+/// pack's `torch -> pytorch` route is correctly dropped -- at the LOCKED
+/// version, not the day's, so a repodata roll still cannot move it.
+///
+/// This is the control on the narrowing: it must stay green. Mutant (ii)
+/// -- excluding shared names from ownership too -- turns it red.
+#[test]
+fn n215_a_shared_name_still_transfers_ownership_at_the_locked_version() {
+    let facts = super::facts_from_solved_records(
+        BTreeMap::from([(
+            "flashsac-gpu".to_string(),
+            // The day moved pytorch to 2.9.0; the lock still says 2.7.0.
+            vec![n215_record("pytorch", "2.9.0")],
+        )]),
+        BTreeMap::from([("flashsac-gpu".to_string(), BTreeMap::new())]),
+        BTreeSet::new(),
+        &NameMap::default(),
+        "flashsac-pack",
+        &BTreeMap::from([(
+            "flashsac-gpu".to_string(),
+            BTreeMap::from([
+                ("pytorch".to_string(), "2.7.0".to_string()),
+                ("only-in-the-lock".to_string(), "1.0.0".to_string()),
+            ]),
+        )]),
+    );
+    assert_eq!(
+        (
+            facts.constrains_basis.locked_names,
+            facts.constrains_basis.probe_names(),
+            facts.constrains_basis.intersect_names(),
+            facts.constrains_basis.locked_only_excluded,
+        ),
+        (2, 1, 1, 1),
+    );
+    assert_eq!(
+        facts.common_selected_versions.get("pytorch").map(String::as_str),
+        Some("2.7.0"),
+        "-130's whole point: the LOCK decides the version of a name it carries",
+    );
+    assert!(facts.provider_facts.contains_key("pytorch"));
+    assert!(
+        facts.provider_facts["pytorch"].present_in_all_consumers,
+        "one consuming environment that selected it IS every consuming environment",
+    );
+
+    let mut bundle = solo_bundle("flashsac-pack", vec!["torch>=2"]);
+    n215_route(&mut bundle, "torch", "2.7.0");
+    bundle.auto_routed[0].route.conda_name = "pytorch".to_string();
+    bundle.workspace_conda_provider_facts = facts.provider_facts.clone();
+    let mut config = cfg();
+    config.name_map = name_map(&[("torch", "pytorch")]);
+    bundle.apply_workspace_conda_fact_ownership(
+        &config,
+        &config.name_map,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+    );
+    assert!(
+        bundle.auto_dropped.contains("torch"),
+        "a provider the consuming environment genuinely selected still owns the \
+         PyPI identity it maps to: {:?}",
+        bundle.auto_dropped,
+    );
+    assert!(bundle.auto_routed.is_empty());
+}
+
+/// GUARD (d). DROP MODE IS BYTE-FOR-BYTE UNTOUCHED. With no base lock nothing
+/// is seeded, so there is nothing to intersect and the emitted `depends` are
+/// exactly what 28ad0a0 emits. Green on both binaries on purpose: without it
+/// the epoch bump would be covering a second, unmeasured change.
+#[test]
+fn n215_drop_mode_emits_the_same_bytes() {
+    let facts = super::facts_from_solved_records(
+        BTreeMap::from([(
+            "flashsac-gpu".to_string(),
+            n215_probe_names()
+                .iter()
+                .map(|name| n215_record(name, "1.0.0"))
+                .collect(),
+        )]),
+        BTreeMap::from([("flashsac-gpu".to_string(), BTreeMap::new())]),
+        BTreeSet::new(),
+        &NameMap::default(),
+        "flashsac-pack",
+        &BTreeMap::new(),
+    );
+    assert_eq!(
+        facts.constrains_basis.source,
+        super::ConstrainsSource::Universe
+    );
+    assert_eq!(
+        (
+            facts.constrains_basis.locked_names,
+            facts.constrains_basis.probe_names(),
+            facts.constrains_basis.intersect_names(),
+            facts.constrains_basis.locked_only_excluded,
+        ),
+        (0, 57, 0, 0),
+        "`locked=0` is the row that says no lock seeded anything",
+    );
+
+    let mut bundle = solo_bundle("flashsac-pack", vec![]);
+    for name in n215_pack_dep_names() {
+        n215_route(&mut bundle, &name, "1.0.0");
+    }
+    bundle.workspace_conda_provider_facts = facts.provider_facts.clone();
+    let config = cfg();
+    bundle.apply_workspace_conda_fact_ownership(
+        &config,
+        &config.name_map,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+    );
+    let emitted: Vec<String> =
+        produce_output(&bundle, &config, Platform::Linux64, "3.11", &[], None, None)
+            .unwrap()
+            .run_dependencies
+            .depends
+            .iter()
+            .map(|dependency| dependency.name.as_str().to_string())
+            .filter(|name| name != "python")
+            .collect();
+    assert_eq!(emitted.len(), 75);
+    for name in n215_pack_dep_names() {
+        assert!(!bundle.auto_dropped.contains(&name));
+    }
 }
