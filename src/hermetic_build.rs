@@ -29,6 +29,264 @@ pub(crate) const CACHE_VERSION: &str = "v8";
 pub(crate) const COMPLETION_MARKER: &str = "complete.json";
 const MIN_RATTLER_BUILD_VERSION: (u64, u64, u64) = (0, 70, 0);
 
+/// The recipe's package name, hoisted out of [`render_debug_recipe`] because
+/// [`hermetic_store_root_budget_bytes`] has to COUNT it: rattler-build puts this
+/// name inside the build directory it derives both conda prefixes from, so the
+/// recipe's writer and the preflight's reader have to be the same 34 bytes or
+/// the budget drifts from the path it is budgeting for.
+const DEBUG_PACKAGE_NAME: &str = "retread-hermetic-build-environment";
+
+/// N27-RETREAD-173. THE CEILING, MEASURED, WITH THE FILE AND LINE OF THE THING
+/// THAT ENFORCES IT.
+///
+/// `rattler-build debug setup` derives both conda prefixes from ONE build
+/// directory, `<output-dir>/bld/rattler-build_<package>_<epoch>`, and names the
+/// host prefix by TRUNCATING a placeholder template so the whole path is
+/// EXACTLY 255 bytes. Job 6181995 measured that in thirteen cells from a
+/// 40-byte base to a 160-byte one: `len=255` in all thirteen, the placeholder
+/// tail shortening by exactly the bytes the base grew, down to
+/// `host_env_placeh`. Its sibling `build_env` is NOT padded (`len=249` under a
+/// 239-byte build directory), so 255 is not folklore about conda — it is the
+/// number this tool pads to, read off its own output.
+///
+/// PAST THE CEILING IT DOES NOT RETURN AN ERROR, IT PANICS. Job 6182340,
+/// rattler-build 0.70.0, in 17-18 ms, before one package is fetched:
+///
+/// ```text
+/// thread '<unnamed>' panicked at
+///   crates/rattler_build_core/src/types/directories.rs:181:17:
+/// end byte index 18446744073709551605 is out of bounds for string of length 260
+/// Error:   × Thread panicked
+/// ```
+///
+/// `18446744073709551605` is `2^64 - 11`: a `usize` that went to -11 while
+/// slicing the 260-byte template. Solved against that cell's own geometry —
+/// build directory 257 bytes — `255 - 257 - 1 - len("host_env")` is -11
+/// exactly, so the slice length is `255 - build_dir - 1 - 8` and the panic
+/// fires the moment the build directory passes 246 bytes.
+///
+/// AND THEN THE BOUNDARY WAS MEASURED BY ONES RATHER THAN DERIVED, WHICH IS THE
+/// ONLY REASON THIS CONSTANT IS RIGHT: job 6182564 swept the entry length one
+/// byte at a time with BOTH recipes, and the two recipes do NOT share a
+/// boundary.
+///
+/// * The trivial recipe (`make` in build, `zlib` in host) provisions at a
+///   167-byte entry and PANICS at 168, exactly where the arithmetic above says
+///   it must — 167 + 79 = 246.
+/// * The REAL toolchain (gcc/gxx/binutils/sysroot 2.28/make/ninja/patchelf +
+///   python 3.11) provisions at 166 and FAILS AT 167, one byte sooner, and with
+///   a different sentence: `Error: × Failed to resolve dependencies ├─▶ failed
+///   to link patchelf-0.19.1-hee9eb32_1.conda ├─▶ failed to link 'bin/patchelf'
+///   ├─▶ unexpected io operation while replacing placeholders`.
+///
+/// THAT ONE BYTE IS THE WHOLE DIFFERENCE BETWEEN A BUDGET THAT WORKS AND ONE
+/// THAT SHIPS THE DEFECT. The host prefix is padded to 255 and can therefore
+/// never overrun; its sibling `build_env` is NOT padded (`len=249` under a
+/// 239-byte build directory, job 6181995), and conda packages record a
+/// 255-byte prefix placeholder that binary replacement cannot grow — the tool's
+/// own string table carries `target prefix cannot be longer than the
+/// placeholder prefix`. So the BINDING path is `<build-dir>/build_env`, the
+/// trivial recipe simply had no binary to rewrite, and budgeting off the panic
+/// alone would have permitted the one length at which the real toolchain dies.
+/// The budget below is therefore taken against `build_env`.
+const CONDA_PREFIX_BUDGET_BYTES: usize = 255;
+
+/// The build prefix leaf, and the reason the budget is taken here: rattler-build
+/// pads and truncates the HOST prefix but leaves this one at its natural length,
+/// so this is the path that overruns the 255-byte placeholder first. MEASURED
+/// boundary, job 6182564: a 166-byte entry provisions the real toolchain and a
+/// 167-byte one fails replacing placeholders in `bin/patchelf`.
+const RATTLER_BUILD_PREFIX_LEAF: &str = "/build_env";
+
+/// Digits in the unix epoch rattler-build stamps into its build directory name.
+/// Ten until the year 2286, and one byte of slack costs one byte of root.
+const RATTLER_EPOCH_DIGITS: usize = 10;
+
+/// Bytes [`cache_directory`] appends below the store root, counted from the
+/// constants the writer uses rather than from a remembered total.
+fn cache_entry_bytes_below_root() -> usize {
+    1 + CACHE_NAMESPACE.len() + 1 + CACHE_VERSION.len() + "/env-".len() + 64
+}
+
+/// Bytes [`provision_uncached`] and rattler-build together append below one
+/// cache entry before either conda prefix is named: the `--output-dir` this
+/// module passes, then rattler-build's own `bld/rattler-build_<package>_<epoch>`.
+fn rattler_build_dir_bytes_below_entry() -> usize {
+    "/rattler-output".len()
+        + "/bld".len()
+        + "/rattler-build_".len()
+        + DEBUG_PACKAGE_NAME.len()
+        + 1
+        + RATTLER_EPOCH_DIGITS
+}
+
+/// The longest hermetic store root whose entries rattler-build can still name.
+/// Every term is a constant this module also USES, so a rename of the namespace
+/// or the generation moves the budget with it instead of leaving it stale.
+pub(crate) fn hermetic_store_root_budget_bytes() -> usize {
+    CONDA_PREFIX_BUDGET_BYTES
+        .saturating_sub(RATTLER_BUILD_PREFIX_LEAF.len())
+        .saturating_sub(rattler_build_dir_bytes_below_entry())
+        .saturating_sub(cache_entry_bytes_below_root())
+}
+
+/// N27-RETREAD-173. WHY THIS IS A TYPE AND NOT A MESSAGE.
+///
+/// `uv_closure`'s sdist-heal rung treats EVERY error out of a wheel build as
+/// "Pass B drifted this name up onto a wheel-less release", caps the name below
+/// the failing version and re-solves — its own comment says "Genuine sdist-only
+/// packages BUILD, so they never reach here". A hermetic toolchain that cannot
+/// be provisioned makes EVERY sdist unbuildable, so every one of them reaches
+/// there, and a path-length panic was delivered to the operator as `capping
+/// pyperclip<1.8.0 and re-solving` and then as
+/// `isaacsim-core==5.1.0.0 cannot be used ... unsatisfiable`: a filesystem fact
+/// reported as a lockfile fact, with no row naming a number. A string nobody
+/// parses cannot stop that. A type the heal rung asks for can.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HermeticProvisionFailure {
+    /// The store root is longer than rattler-build can name an entry under.
+    RootTooLong {
+        root: String,
+        len: usize,
+        budget: usize,
+    },
+    /// Any other provisioning failure, carrying the one line of the tool's own
+    /// stderr worth putting in a row.
+    Failed { reason: String },
+}
+
+impl std::fmt::Display for HermeticProvisionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RootTooLong { root, len, budget } => write!(
+                f,
+                "### HERMETIC ROOT root={root} len={len} budget={budget} verdict=too-long \
+                 -- rattler-build cannot name the conda prefixes under a hermetic entry this \
+                 deep (N27-RETREAD-173, MEASURED job 6182564: a {}-byte entry provisions the \
+                 real toolchain and a {}-byte one fails replacing placeholders in \
+                 bin/patchelf, and one byte further it panics slicing its own placeholder \
+                 template in 18 ms); shorten the retread-hermetic-environment-store root by \
+                 {} byte(s). This is a PATH LENGTH and not a dependency conflict",
+                CONDA_PREFIX_BUDGET_BYTES
+                    - RATTLER_BUILD_PREFIX_LEAF.len()
+                    - rattler_build_dir_bytes_below_entry(),
+                CONDA_PREFIX_BUDGET_BYTES + 1
+                    - RATTLER_BUILD_PREFIX_LEAF.len()
+                    - rattler_build_dir_bytes_below_entry(),
+                len.saturating_sub(*budget),
+            ),
+            Self::Failed { reason } => {
+                write!(f, "### HERMETIC PROVISION FAILED reason={reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for HermeticProvisionFailure {}
+
+/// The reader half of [`HermeticProvisionFailure`]. `anyhow::Error::downcast_ref`
+/// searches the whole cause chain INCLUDING context values, which is why the
+/// classifier below may attach the verdict as context and this still finds it.
+pub(crate) fn provision_failure(error: &anyhow::Error) -> Option<&HermeticProvisionFailure> {
+    error.downcast_ref::<HermeticProvisionFailure>()
+}
+
+/// The marker [`run_captured_sealed`] puts in front of the tool's OWN first
+/// meaningful stderr line. One writer, one reader
+/// ([`classify_provision_failure`]), and a guard over both — the alternative is
+/// re-guessing rattler-build's formatting at the reader.
+const FIRST_STDERR_LINE_MARKER: &str = "first-stderr-line=";
+
+/// The one line of a failed tool's stderr worth putting in a row.
+///
+/// The FIRST line is never the complaint: job 6182340's capture opens with
+/// `rattler-build 0.70.0`, then `No configuration file loaded`, then a variant
+/// table, and only reaches `panicked at .../directories.rs:181:17` on line 15.
+/// Preference order, each arm chosen against that capture:
+///   1. the first line containing `panicked at` — it carries the file and line;
+///   2. else the first line starting with `Error:`;
+///   3. else the last non-empty line;
+///   4. else a stated absence, never an empty row.
+fn first_meaningful_stderr_line(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| line.contains("panicked at"))
+        .or_else(|| {
+            text.lines()
+                .map(str::trim)
+                .find(|line| line.starts_with("Error:"))
+        })
+        .or_else(|| text.lines().map(str::trim).rev().find(|l| !l.is_empty()))
+        .unwrap_or("<the tool printed nothing on stderr>");
+    line.chars().take(300).collect()
+}
+
+/// N27-RETREAD-173, THE PRODUCT HALF (a). Refuse a store root rattler-build
+/// cannot name an entry under — BY LENGTH, WITH THE NUMBER — before anything is
+/// solved, fetched or spawned.
+pub(crate) fn preflight_store_root() -> Result<()> {
+    preflight_store_root_len(&hermetic_environment_store_root())
+}
+
+/// The testable core. Pure: it takes the root rather than reading the global, so
+/// a guard can drive both verdicts without racing another test's store.
+pub(crate) fn preflight_store_root_len(root: &Path) -> Result<()> {
+    let len = root.as_os_str().len();
+    let budget = hermetic_store_root_budget_bytes();
+    let verdict = if len <= budget { "ok" } else { "too-long" };
+    // STDERR, NEVER STDOUT: `rpc::serve` owns stdout as the JSON-RPC frame
+    // channel for the whole life of the process, and one row in front of the
+    // first response frame killed a build backend (N27-RETREAD-180).
+    eprintln!(
+        "### HERMETIC ROOT root={} len={len} budget={budget} verdict={verdict}",
+        root.display()
+    );
+    if len <= budget {
+        return Ok(());
+    }
+    Err(anyhow::Error::new(HermeticProvisionFailure::RootTooLong {
+        root: root.display().to_string(),
+        len,
+        budget,
+    }))
+}
+
+/// N27-RETREAD-173, THE PRODUCT HALF (b). Every failure leaving [`provision`]
+/// carries a [`HermeticProvisionFailure`] and has ALREADY printed its row, so no
+/// consumer can mistake a toolchain that could not be built for a package that
+/// could not be resolved.
+fn classify_provision_failure(error: anyhow::Error) -> anyhow::Error {
+    if provision_failure(&error).is_some() {
+        // The length refusal printed its own row at the preflight; a second copy
+        // would read as two different verdicts.
+        return error;
+    }
+    let rendered = format!("{error:#}");
+    let reason = rendered
+        .split_once(FIRST_STDERR_LINE_MARKER)
+        .map(|(_, rest)| {
+            rest.split("; stderr: ")
+                .next()
+                .unwrap_or(rest)
+                .trim()
+                .to_string()
+        })
+        .filter(|reason| !reason.is_empty())
+        .unwrap_or_else(|| {
+            rendered
+                .lines()
+                .next()
+                .unwrap_or("the hermetic toolchain could not be provisioned")
+                .trim()
+                .to_string()
+        });
+    let failure = HermeticProvisionFailure::Failed { reason };
+    eprintln!("{failure}");
+    error.context(failure)
+}
+
 // ── L3-1b-4: the hermetic environment cache is PERSISTENT, and the marker
 //    reaper walks it ────────────────────────────────────────────────────────
 
@@ -450,6 +708,26 @@ pub(crate) async fn provision(
     python: &str,
     cuda_version: Option<&str>,
 ) -> Result<HermeticBuildEnvironment> {
+    // N27-RETREAD-173. THE ONE EXIT EVERY HERMETIC FAILURE LEAVES BY, so that
+    // "the toolchain could not be built" can never arrive at a consumer wearing
+    // the clothes of "this package could not be resolved".
+    match provision_inner(target_floor, python, cuda_version).await {
+        Ok(environment) => Ok(environment),
+        Err(error) => Err(classify_provision_failure(error)),
+    }
+}
+
+async fn provision_inner(
+    target_floor: (u32, u32),
+    python: &str,
+    cuda_version: Option<&str>,
+) -> Result<HermeticBuildEnvironment> {
+    // N27-RETREAD-173, AND IT IS THE FIRST STATEMENT ON PURPOSE: past the
+    // measured ceiling `rattler-build debug setup` PANICS slicing its own
+    // placeholder, and a panic 18 ms into a provision that has already cost a
+    // conda solve is the same defect reported later and more expensively.
+    // Nothing below this line is reached by a root that cannot work.
+    preflight_store_root()?;
     let python_minor = crate::pypi::normalized_python_minor(python)?.version();
     let requested_cuda = normalize_cuda_version(cuda_version)?;
     // At most two attempts. The second exists only for the ONE recoverable
@@ -2632,7 +2910,7 @@ fn render_debug_recipe(
     let recipe = DebugRecipe {
         schema_version: 1,
         package: DebugPackage {
-            name: "retread-hermetic-build-environment".to_string(),
+            name: DEBUG_PACKAGE_NAME.to_string(),
             version: "1.0.0".to_string(),
         },
         build: DebugBuild {
@@ -3462,8 +3740,16 @@ async fn run_captured_sealed(command: &mut Command, label: &str) -> Result<std::
     if !output.status.success() {
         let stdout = output_snippet(&output.stdout);
         let stderr = output_snippet(&output.stderr);
+        // N27-RETREAD-173: the tool's OWN complaint, named and first, so
+        // `classify_provision_failure` can put it in a row without re-guessing
+        // rattler-build's formatting. `output_snippet` keeps the LAST 4000 chars
+        // and the banner is at the front, so a reader that took "the first line"
+        // of either field would report the version number as the cause — which
+        // is exactly what COLDMEAS-1 row8's quoted stderr was.
+        let first_line = first_meaningful_stderr_line(&output.stderr);
         bail!(
-            "{label} failed with status {}: stderr: {stderr}; stdout: {stdout}",
+            "{label} failed with status {}: {FIRST_STDERR_LINE_MARKER}{first_line}; \
+             stderr: {stderr}; stdout: {stdout}",
             output.status
         );
     }
@@ -4574,6 +4860,9 @@ Error:   × Failed to resolve dependencies\n\
 
     #[test]
     fn the_hermetic_cache_directory_lives_under_the_store_root_and_keeps_its_segments() {
+        // N27-RETREAD-173: this test writes the process-global store and so does
+        // the length-preflight ordering arm. `cargo test` runs both in parallel.
+        let _serialized = STORE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let root = std::env::temp_dir().join(format!(
             "retread-l31b4-root-{}-{}",
             std::process::id(),
@@ -4913,5 +5202,212 @@ Error:   × Failed to resolve dependencies\n\
         assert!(validate_cached_path(&cache, &link, "test", CachedPathKind::File).is_err());
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── N27-RETREAD-173, THE PRODUCT HALF ───────────────────────────────────
+    //
+    // Every number asserted below was MEASURED, in two isolation jobs, and the
+    // arms are written so that widening the budget or deleting the refusal
+    // cannot leave them green. See `CONDA_PREFIX_BUDGET_BYTES` for the cells.
+
+    /// The store-root test lock. `set_hermetic_environment_store` writes a
+    /// process-global, `cargo test` runs this file's tests in parallel, and two
+    /// tests racing that global is a flake that reads as a real failure. This
+    /// existed as a latent hazard before the arm below needed it.
+    static STORE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The budget is not a magic number: it is the measured entry ceiling minus
+    /// the two path segments this module and rattler-build each contribute, and
+    /// this arm re-derives it from BOTH ends. If a future edit widens the
+    /// ceiling or shortens a segment without a new measurement, the two sides
+    /// disagree here.
+    #[test]
+    fn the_root_budget_is_the_measured_entry_ceiling_minus_the_paths_below_it() {
+        // MEASURED, job 6182564: a 166-byte hermetic entry provisions the real
+        // gcc/python toolchain and a 167-byte one dies replacing placeholders.
+        const MEASURED_ENTRY_CEILING: usize = 166;
+        assert_eq!(
+            CONDA_PREFIX_BUDGET_BYTES
+                - RATTLER_BUILD_PREFIX_LEAF.len()
+                - rattler_build_dir_bytes_below_entry(),
+            MEASURED_ENTRY_CEILING,
+            "the constants no longer reproduce the measured entry ceiling",
+        );
+        assert_eq!(
+            cache_entry_bytes_below_root(),
+            92,
+            "`/hermetic-build-envs` + `/v8` + `/env-` + 64 hex is 92 bytes",
+        );
+        assert_eq!(
+            hermetic_store_root_budget_bytes(),
+            MEASURED_ENTRY_CEILING - cache_entry_bytes_below_root(),
+            "the root budget must be the entry ceiling less what cache_directory adds",
+        );
+        // And the absolute number, so a reader of the ledger row can check it
+        // without re-deriving anything.
+        assert_eq!(hermetic_store_root_budget_bytes(), 74);
+    }
+
+    /// GUARD (b): a root AT the budget is `ok`, and nothing about it refuses.
+    /// The fixture asserts its own length so the arm cannot silently move off
+    /// the boundary it is here to hold.
+    #[test]
+    fn a_root_at_the_budget_passes_the_length_preflight() {
+        let budget = hermetic_store_root_budget_bytes();
+        let root = PathBuf::from(format!("/{}", "r".repeat(budget - 1)));
+        assert_eq!(root.as_os_str().len(), budget, "fixture is off the boundary");
+        preflight_store_root_len(&root).expect("a root at the budget must provision");
+        // 50 bytes -- the length the brief's passing arm uses -- is comfortably
+        // inside it, and this states the fact rather than implying it.
+        let fifty = PathBuf::from(format!("/{}", "r".repeat(49)));
+        assert_eq!(fifty.as_os_str().len(), 50);
+        preflight_store_root_len(&fifty).expect("50 bytes is inside the budget");
+        // THE ABSOLUTE PAIR, and it is here so that WIDENING the budget cannot
+        // leave these arms green: the lengths are literals taken off the
+        // measured boundary, not derived from the constant under test. 74 is the
+        // longest root job 6182564 showed the real toolchain provisioning under;
+        // 75 is one byte past it.
+        let seventy_four = PathBuf::from(format!("/{}", "r".repeat(73)));
+        assert_eq!(seventy_four.as_os_str().len(), 74);
+        preflight_store_root_len(&seventy_four)
+            .expect("74 bytes is the measured ceiling and must provision");
+        let seventy_five = PathBuf::from(format!("/{}", "r".repeat(74)));
+        assert_eq!(seventy_five.as_os_str().len(), 75);
+        let over = preflight_store_root_len(&seventy_five)
+            .expect_err("75 bytes is past the measured ceiling and must refuse");
+        assert!(
+            matches!(
+                provision_failure(&over),
+                Some(HermeticProvisionFailure::RootTooLong { len: 75, .. })
+            ),
+            "{over:#}",
+        );
+    }
+
+    /// GUARD (a): one byte over refuses, by NAME, with the byte count, the
+    /// budget and the deficit -- and the verdict is a typed value, not a
+    /// sentence, because the sdist-heal rung has to be able to ASK.
+    #[test]
+    fn a_root_one_byte_over_the_budget_refuses_with_the_number() {
+        let budget = hermetic_store_root_budget_bytes();
+        let root = PathBuf::from(format!("/{}", "r".repeat(budget)));
+        assert_eq!(root.as_os_str().len(), budget + 1);
+        let error = preflight_store_root_len(&root).expect_err("one byte over must refuse");
+        let failure = provision_failure(&error).expect("the refusal must be typed");
+        assert_eq!(
+            failure,
+            &HermeticProvisionFailure::RootTooLong {
+                root: root.display().to_string(),
+                len: budget + 1,
+                budget,
+            },
+        );
+        let rendered = failure.to_string();
+        for want in [
+            "### HERMETIC ROOT",
+            "verdict=too-long",
+            &format!("len={}", budget + 1),
+            &format!("budget={budget}"),
+            "by 1 byte(s)",
+            "PATH LENGTH and not a dependency conflict",
+        ] {
+            assert!(rendered.contains(want), "the row is missing `{want}`: {rendered}");
+        }
+    }
+
+    /// GUARD (a), THE ORDERING HALF, and the reason it is worth a `tokio::test`
+    /// that touches the global: the refusal is only a fix if it happens BEFORE
+    /// the conda solve. A too-long root therefore has to come back with the
+    /// typed verdict promptly and without reaching the network. Delete
+    /// `preflight_store_root()?` from `provision_inner` and this arm either
+    /// returns a different error or blows the timeout -- both red.
+    #[tokio::test]
+    async fn a_too_long_root_refuses_before_provision_solves_anything() {
+        let _serialized = STORE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let budget = hermetic_store_root_budget_bytes();
+        let root = PathBuf::from(format!("/{}", "r".repeat(budget)));
+        set_hermetic_environment_store(Some(&root));
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            provision((2, 28), "3.11", None),
+        )
+        .await;
+        set_hermetic_environment_store(None);
+        let result = outcome.expect(
+            "a root the toolchain cannot use must refuse immediately; a timeout here means \
+             the preflight no longer runs before the solve",
+        );
+        let error = result.expect_err("a too-long root must not provision");
+        match provision_failure(&error) {
+            Some(HermeticProvisionFailure::RootTooLong { len, budget: b, .. }) => {
+                assert_eq!(*len, budget + 1);
+                assert_eq!(*b, budget);
+            }
+            other => panic!("expected a RootTooLong verdict, got {other:?}: {error:#}"),
+        }
+    }
+
+    /// GUARD (c), THE CAPTURE HALF. A tool that exits non-zero has its OWN
+    /// first meaningful line named in the message, because the first line of
+    /// rattler-build's stderr is its version banner -- COLDMEAS-1 row8 quoted
+    /// `rattler-build 0.70.0` as the cause for exactly that reason.
+    #[tokio::test]
+    async fn a_failing_tool_names_its_own_complaint_and_not_its_version_banner() {
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg(
+            "echo 'rattler-build 0.70.0' >&2; echo 'No configuration file loaded' >&2; \
+             echo 'Error:   x boom, the real cause' >&2; exit 1",
+        );
+        let error = run_captured_sealed(&mut command, "rattler-build debug setup")
+            .await
+            .expect_err("a non-zero tool must fail the call");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains(&format!(
+                "{FIRST_STDERR_LINE_MARKER}Error:   x boom, the real cause;"
+            )),
+            "the marker must carry the tool's own complaint: {rendered}",
+        );
+        // And the classifier turns exactly that into the row.
+        let classified = classify_provision_failure(error);
+        assert_eq!(
+            provision_failure(&classified),
+            Some(&HermeticProvisionFailure::Failed {
+                reason: "Error:   x boom, the real cause".to_string(),
+            }),
+        );
+        assert!(
+            provision_failure(&classified)
+                .unwrap()
+                .to_string()
+                .starts_with("### HERMETIC PROVISION FAILED reason=Error:   x boom"),
+            "{}",
+            provision_failure(&classified).unwrap(),
+        );
+    }
+
+    /// A panic is the failure this defect actually produced, and its line is the
+    /// only part of the capture worth a row -- so `panicked at` outranks
+    /// `Error:`, which in the real capture came four lines LATER and said only
+    /// "Thread panicked".
+    #[test]
+    fn the_reported_stderr_line_is_the_panic_site_not_the_generic_error_line() {
+        let captured = b"rattler-build 0.70.0\nNo configuration file loaded\n\
+Found 1 variants\n\
+thread '<unnamed>' (2689659) panicked at crates/rattler_build_core/src/types/directories.rs:181:17:\n\
+end byte index 18446744073709551605 is out of bounds for string of length 260\n\
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\
+Error:   x Thread panicked\n";
+        assert_eq!(
+            first_meaningful_stderr_line(captured),
+            "thread '<unnamed>' (2689659) panicked at \
+             crates/rattler_build_core/src/types/directories.rs:181:17:",
+        );
+        // No panic, no `Error:` -- the last non-empty line, never an empty row.
+        assert_eq!(first_meaningful_stderr_line(b"a\nb\n\n"), "b");
+        assert_eq!(
+            first_meaningful_stderr_line(b""),
+            "<the tool printed nothing on stderr>",
+        );
     }
 }

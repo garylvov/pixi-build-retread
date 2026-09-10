@@ -2599,6 +2599,45 @@ where
                                 match build(name.clone(), Some(spec)).await {
                                     Ok(w) => new_built.push(w),
                                     Err(be) => {
+                                        // N27-RETREAD-173, AND IT IS THE WHOLE
+                                        // POINT OF THAT ROW. Rung 3 below reads
+                                        // every entry of `build_failures` as
+                                        // "Pass B drifted this name UP onto a
+                                        // wheel-less release" and caps the name
+                                        // — its own comment says "Genuine
+                                        // sdist-only packages BUILD, so they
+                                        // never reach here". A hermetic
+                                        // toolchain that could not be
+                                        // provisioned makes EVERY sdist
+                                        // unbuildable, so every one of them
+                                        // reaches here and the assumption is
+                                        // false. That is how a store root
+                                        // rattler-build panics on became
+                                        // `capping pyperclip<1.8.0 and
+                                        // re-solving` and then an
+                                        // `isaacsim-core==5.1.0.0 ...
+                                        // unsatisfiable` for the operator: a
+                                        // filesystem fact delivered as a
+                                        // lockfile fact. An environmental
+                                        // failure has no retreat to find, so it
+                                        // ends the heal loop by NAME instead of
+                                        // being healed by a cap that cannot
+                                        // work.
+                                        // ---- LENGTH-1 NOCAP BEGIN ----
+                                        let verdict = crate::hermetic_build::provision_failure(
+                                            &be,
+                                        )
+                                        .map(|failure| failure.to_string());
+                                        if let Some(verdict) = verdict {
+                                            return Err(be.context(format!(
+                                                "the hermetic build toolchain could not be \
+                                                 provisioned, so NO sdist in bundle `{bundle}` \
+                                                 can be built and `{name}=={version}` is not a \
+                                                 dependency conflict; refusing to cap it. \
+                                                 {verdict}"
+                                            )));
+                                        }
+                                        // ---- LENGTH-1 NOCAP END ----
                                         build_failures.push((name.clone(), format!("{be:#}")))
                                     }
                                 }
@@ -15610,6 +15649,151 @@ sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
             seen[1].iter().any(|c| c == "mujoco<3.12.0"),
             "the re-solve after the failed build must carry the cap: {seen:?}"
         );
+    }
+
+    /// N27-RETREAD-173, THE ARM THAT WOULD HAVE CAUGHT IT. The sibling above is
+    /// the LEGITIMATE retreat: the sdist genuinely cannot build at that version,
+    /// so capping it below and re-solving is the fix. This one is the same
+    /// failing build with an ENVIRONMENTAL cause -- the hermetic toolchain could
+    /// not be provisioned at all -- and it must NOT be healed, because there is
+    /// no version of `mujoco` at which a store root of the wrong length becomes
+    /// the right length.
+    ///
+    /// WHAT IT LOOKED LIKE IN PRODUCTION (COLDMEAS-1, jobs 6118942 / 6119148 /
+    /// 6120388 / 6136962): a `rattler-build debug setup` that panicked on a path
+    /// length was healed into `capping pyperclip<1.8.0 and re-solving` and
+    /// delivered to the operator as `isaacsim-core==5.1.0.0 cannot be used ...
+    /// unsatisfiable`. Four arms were filed as pack conflicts on that evidence.
+    ///
+    /// Two independent assertions, so a fix that only improves the WORDING is
+    /// still red: the error must name the hermetic row, AND the solver must be
+    /// called exactly once -- no cap, no re-solve.
+    #[tokio::test]
+    async fn a_hermetic_provision_failure_ends_the_heal_instead_of_capping_the_package() {
+        let seen_constraints = Arc::new(Mutex::new(Vec::new()));
+        let solve = {
+            let seen_constraints = Arc::clone(&seen_constraints);
+            move |r: UvClosureRequest| {
+                let seen_constraints = Arc::clone(&seen_constraints);
+                Box::pin(async move {
+                    seen_constraints
+                        .lock()
+                        .unwrap()
+                        .push(r.constraints.constraints.clone());
+                    Err(heal_needed(
+                        &[("mujoco", "3.12.0")],
+                        &[],
+                        "distribution mujoco==3.12.0 can't be installed \
+                         because it has no usable wheels",
+                    ))
+                }) as futures::future::BoxFuture<'static, Result<UvClosure>>
+            }
+        };
+        let probe = |_n: String, _s: String| {
+            Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
+        };
+        let sdist_probe = |_n: String, _s: String| {
+            Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
+        };
+        // Exactly the error `hermetic_build::provision` now returns: retread's
+        // own context on the outside, the typed verdict in the chain.
+        let sdist_build = |_n: String, _r: Option<String>| {
+            Box::pin(async {
+                Err(anyhow::Error::new(
+                    crate::hermetic_build::HermeticProvisionFailure::RootTooLong {
+                        root: "/a/very/long/hermetic/store/root".to_string(),
+                        len: 200,
+                        budget: 74,
+                    },
+                )
+                .context("provisioning the cache-identified hermetic toolchain"))
+            }) as futures::future::BoxFuture<'static, Result<BuiltSdistWheel>>
+        };
+        let error = auto_route_fixpoint_with_sdist_heal(
+            &auto_route_req(),
+            &auto_route_opts(),
+            solve,
+            probe,
+            sdist_probe,
+            Some(sdist_build),
+        )
+        .await
+        .expect_err("a toolchain that cannot be provisioned must not be healed by a cap");
+        let msg = format!("{error:#}");
+        for want in [
+            "### HERMETIC ROOT",
+            "verdict=too-long",
+            "budget=74",
+            "is not a \
+             dependency conflict",
+            "refusing to cap it",
+        ] {
+            assert!(msg.contains(want), "the refusal is missing `{want}`: {msg}");
+        }
+        let seen = seen_constraints.lock().unwrap();
+        assert_eq!(
+            seen.len(),
+            1,
+            "an environmental failure must not provoke a re-solve: {seen:?}",
+        );
+        assert!(
+            !seen[0].iter().any(|c| c.starts_with("mujoco<")),
+            "no cap may be emitted for an environmental failure: {seen:?}",
+        );
+    }
+
+    /// The same refusal for a provision failure that is NOT a length: any
+    /// hermetic failure is environmental, and the row carries rattler's own
+    /// first line rather than a version cap.
+    #[tokio::test]
+    async fn any_hermetic_provision_failure_refuses_to_cap_not_just_the_length_one() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let solve = {
+            let seen = Arc::clone(&seen);
+            move |r: UvClosureRequest| {
+                let seen = Arc::clone(&seen);
+                Box::pin(async move {
+                    seen.lock().unwrap().push(r.constraints.constraints.clone());
+                    Err(heal_needed(
+                        &[("mujoco", "3.12.0")],
+                        &[],
+                        "distribution mujoco==3.12.0 can't be installed \
+                         because it has no usable wheels",
+                    ))
+                }) as futures::future::BoxFuture<'static, Result<UvClosure>>
+            }
+        };
+        let probe = |_n: String, _s: String| {
+            Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
+        };
+        let sdist_probe = |_n: String, _s: String| {
+            Box::pin(async { None }) as futures::future::BoxFuture<'static, Option<RouteProbeHit>>
+        };
+        let sdist_build = |_n: String, _r: Option<String>| {
+            Box::pin(async {
+                Err(anyhow::Error::new(
+                    crate::hermetic_build::HermeticProvisionFailure::Failed {
+                        reason: "Error:   x Thread panicked".to_string(),
+                    },
+                ))
+            }) as futures::future::BoxFuture<'static, Result<BuiltSdistWheel>>
+        };
+        let error = auto_route_fixpoint_with_sdist_heal(
+            &auto_route_req(),
+            &auto_route_opts(),
+            solve,
+            probe,
+            sdist_probe,
+            Some(sdist_build),
+        )
+        .await
+        .expect_err("a provision failure of any kind must not be healed by a cap");
+        let msg = format!("{error:#}");
+        assert!(
+            msg.contains("### HERMETIC PROVISION FAILED reason=Error:   x Thread panicked"),
+            "{msg}",
+        );
+        assert_eq!(seen.lock().unwrap().len(), 1, "no re-solve, no cap");
     }
 
     /// The retreat is BOUNDED: a package that keeps failing to build at a
