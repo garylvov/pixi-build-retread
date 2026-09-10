@@ -138,7 +138,7 @@ impl EntryStamp {
         Self {
             stage: stage.to_string(),
             universe: universe.to_string(),
-            question: normalized_question(specs).join("\u{1f}"),
+            question: normalized_question(specs).join(&QUESTION_SEPARATOR.to_string()),
         }
     }
 }
@@ -269,6 +269,355 @@ pub const QUARANTINE: &str = "quarantine";
 /// How long an entry file may go unreferenced before a reaper may select it.
 /// The same 14 days every other persistent store in this backend uses.
 pub const ROUTE_PROBE_STORE_DEFAULT_MAX_AGE_DAYS: u64 = 14;
+
+/// REAP-2. Name of the reaper's own store-wide try-lock, a dot-sidecar beside
+/// the entry files it scans. NEVER a blocking lock: a process that cannot take
+/// it does not reap, so a live relock is never made to wait on housekeeping.
+/// Same shape and same rule as `source_build`'s `.built-wheels.reap.lock`.
+const ROUTE_PROBE_REAP_LOCK_NAME: &str = ".route-probe-verdicts.reap.lock";
+
+/// The separator [`EntryStamp`] joins the normalized spec set with, named once
+/// so the writer that joins and the reaper that splits cannot drift apart.
+const QUESTION_SEPARATOR: char = '\u{1f}';
+
+/// REAP-2. `<root>/route-probe-verdicts`, the ONE formula for where the shared
+/// store's entry files live. [`shared_cache_path`] and the reaper both go
+/// through it, so a reaper can never walk a directory the writer does not use.
+pub fn store_dir_in(root: &Path) -> PathBuf {
+    root.join(STORE_DIR)
+}
+
+/// REAP-2, AND THIS IS A CORRECTION, NOT AN ADDITION.
+///
+/// THE ONE definition of the advisory lock that guards one verdict file's
+/// read-modify-write. [`RouteProbeCache::persist`] took this path inline
+/// (`self.path.with_extension("lock")`), so a reaper written against this
+/// campaign's OTHER convention — `source_build::artifact_cache_lock_path`'s
+/// dot form `.{file}.lock` — would have try-locked a path no writer ever
+/// touches and reported `skipped_locked=0` over a live publish: a criterion
+/// with no producer, which is the law-2 defect this lane exists to close.
+/// So the writer and the reaper now READ THE SAME FUNCTION.
+///
+/// The shape is `<stem>.lock` beside the entry (`k-py3.12-linux-64.json` ->
+/// `k-py3.12-linux-64.lock`) because that is what the writer has always used
+/// and moving it would orphan every lock a running relock holds. It is not a
+/// dotfile, which is why the reaper's enumeration filters by `.json` rather
+/// than by a leading dot.
+pub fn lock_path_for(entry: &Path) -> PathBuf {
+    entry.with_extension("lock")
+}
+
+/// REAP-2. Is this directory entry's name one of the store's ENTRY files?
+///
+/// The store directory holds four other things and every one of them would be
+/// a bug to reap: the `<stem>.lock` sidecars, the `<stem>.tmp<pid>` files a
+/// concurrent `persist` renames from, the `quarantine` directory, and the
+/// reaper's own dot-lock. Only a published `*.json` is an entry.
+pub fn is_verdict_entry_name(name: &str) -> bool {
+    !name.starts_with('.') && name.ends_with(".json")
+}
+
+/// REAP-2. Can any reader ever ADDRESS this entry again?
+///
+/// The entry's map key is `probe_digest(stage, universe, specs)` and v4 records
+/// the same three inputs in the entry's own [`EntryStamp`]. So recomputing the
+/// digest from the stamp and comparing it to the key is a complete, offline
+/// answer to "is this entry reachable": a record whose stamp does not reproduce
+/// its own address can never be returned to anybody, because
+/// [`RouteProbeCache::lookup`] looks up BY the digest and then refuses anything
+/// whose stamp disagrees. `serde(default)` makes a v3 remnant or a truncated
+/// entry decode to an EMPTY stamp, which cannot reproduce any address, so those
+/// are unreachable too.
+///
+/// **WHAT THIS IS NOT, STATED HERE BECAUSE THE DIFFERENCE DECIDES A ROW.**
+/// It is not "the universe this entry was learned in no longer exists". That
+/// question is NOT decidable from the store: `conda_solve::
+/// reachable_universe_digest` hashes the reachable CANDIDATE SET for one
+/// question, and nothing on disk enumerates the universes that are currently
+/// live — `repodata::snapshot_documents_at` yields document identities, not
+/// universe digests — so answering it would need a re-solve per entry, which a
+/// reaper must never do. What IS decidable, and what the `universe` reason
+/// counts, is an address the universe component can no longer reach.
+pub(crate) fn entry_is_unreachable(key: &str, stamp: &EntryStamp) -> bool {
+    if stamp.stage.is_empty() && stamp.universe.is_empty() && stamp.question.is_empty() {
+        return true;
+    }
+    let specs: Vec<&str> = if stamp.question.is_empty() {
+        Vec::new()
+    } else {
+        stamp.question.split(QUESTION_SEPARATOR).collect()
+    };
+    probe_digest(&stamp.stage, &stamp.universe, specs.iter()) != key
+}
+
+/// REAP-2. Why one entry file was selected. `&'static str` so it is the same
+/// value in the per-entry row, the reason tally and the guard's assertion.
+const REASON_AGE: &str = "age";
+const REASON_UNIVERSE: &str = "universe";
+
+/// REAP-2. What the route-probe reap did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RouteProbeReapReport {
+    pub(crate) scanned: u64,
+    /// Entries RENAMED into `quarantine/` (apply) or that would be (dry run).
+    pub(crate) quarantined: u64,
+    pub(crate) kept: u64,
+    /// Of `quarantined`, how many were selected because the file was older
+    /// than `max_age`.
+    pub(crate) selected_age: u64,
+    /// Of `quarantined`, how many were selected because every entry in the
+    /// file is unaddressable — see [`entry_is_unreachable`].
+    pub(crate) selected_universe: u64,
+    /// A live `persist` held the entry's own advisory lock, so the entry was
+    /// left exactly where it was and COUNTED. The reader half of
+    /// [`lock_path_for`].
+    pub(crate) skipped_locked: u64,
+    /// Another process held the store-wide try-lock and this one backed off
+    /// without scanning anything.
+    pub(crate) skipped_concurrent: bool,
+    pub(crate) entries: Vec<crate::courier::ReapedEntry>,
+}
+
+/// REAP-2, THE REAPER. Quarantine every verdict file that is over-age or that
+/// no reader can address any more.
+///
+/// The three rules C18-1 wrote and every reaper in this backend keeps:
+/// 1. **It never deletes.** A selected entry is RENAMED to
+///    `<store>/quarantine/<name>-<unix>-<pid>`. Reclaiming a quarantine is a
+///    separate, operator-visible act.
+/// 2. **It never blocks anyone.** Both the store-wide lock and the per-entry
+///    [`lock_path_for`] lock are TRY-locks; an entry a live `persist` holds is
+///    skipped and counted, never waited on. Note that `persist` itself takes
+///    that lock BLOCKING, which is correct for a writer and would be a wedge
+///    for housekeeping.
+/// 3. **It re-reads the age with the lock held.** A publish can land between
+///    the scan and the rename, so the mtime is re-stated after the entry lock
+///    is taken and an entry that became fresh in that window is kept.
+///
+/// `max_age` zero DISABLES the age rule (the shape every other reaper in this
+/// backend uses for "off"); the unaddressable rule still runs, because an entry
+/// nobody can reach is not a retention decision.
+pub(crate) fn reap_route_probe_store(
+    root: &Path,
+    max_age: std::time::Duration,
+    mode: crate::courier::ReapMode,
+) -> anyhow::Result<RouteProbeReapReport> {
+    use crate::courier::{ReapLockOutcome, ReapedEntry, take_entry_lock, take_reap_lock};
+    use anyhow::Context as _;
+
+    let mut report = RouteProbeReapReport::default();
+    let store_dir = store_dir_in(root);
+    let max_age_days = max_age.as_secs() / 86_400;
+    if !store_dir.is_dir() {
+        tracing::info!(
+            store = %store_dir.display(),
+            scanned = 0,
+            quarantined = 0,
+            kept = 0,
+            max_age_days,
+            mode = mode.as_str(),
+            reason = "store-absent",
+            "route_probe_store reap",
+        );
+        return Ok(report);
+    }
+    let reap_lock_path = store_dir.join(ROUTE_PROBE_REAP_LOCK_NAME);
+    let _reap_lock = match take_reap_lock(&reap_lock_path, mode)? {
+        ReapLockOutcome::Held(lock) => Some(lock),
+        ReapLockOutcome::Absent => None,
+        ReapLockOutcome::Busy | ReapLockOutcome::Unopenable => {
+            report.skipped_concurrent = true;
+            tracing::info!(
+                store = %store_dir.display(),
+                mode = mode.as_str(),
+                "route_probe_store reap skipped=concurrent",
+            );
+            return Ok(report);
+        }
+    };
+    let quarantine_root = store_dir.join(QUARANTINE);
+    let now = std::time::SystemTime::now();
+    let mut names: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(&store_dir)
+        .with_context(|| format!("reading the route-probe store {}", store_dir.display()))?
+    {
+        let entry = entry
+            .with_context(|| format!("reading an entry of {}", store_dir.display()))?;
+        let Some(name) = entry.file_name().to_str().map(|s| s.to_string()) else {
+            continue;
+        };
+        if !is_verdict_entry_name(&name) {
+            continue;
+        }
+        names.push(name);
+    }
+    names.sort();
+    for name in names {
+        let entry_path = store_dir.join(&name);
+        if !entry_path.is_file() {
+            continue;
+        }
+        report.scanned += 1;
+        let age = entry_age(&entry_path, now);
+        let over_age = !max_age.is_zero() && age.is_some_and(|age| age > max_age);
+        let unreachable = file_is_unaddressable(&entry_path);
+        if !over_age && !unreachable {
+            report.kept += 1;
+            continue;
+        }
+        // Rule 2: the entry's OWN lock, try-only. A held lock is a live
+        // `persist`, which is a use, so the entry stays and is counted.
+        let entry_lock_path = lock_path_for(&entry_path);
+        let _entry_lock = match take_entry_lock(&entry_lock_path, mode) {
+            ReapLockOutcome::Held(lock) => Some(lock),
+            ReapLockOutcome::Absent => None,
+            ReapLockOutcome::Busy => {
+                report.skipped_locked += 1;
+                tracing::info!(
+                    entry = %name,
+                    mode = mode.as_str(),
+                    "route_probe_store skipped=locked",
+                );
+                continue;
+            }
+            // "I cannot look" is not "a writer holds it": the entry is kept and
+            // NOT counted as locked, the distinction `ReapLockOutcome` exists
+            // for.
+            ReapLockOutcome::Unopenable => {
+                report.kept += 1;
+                continue;
+            }
+        };
+        // Rule 3: re-state the decision with the lock held. Only the AGE can
+        // change under us (a publish rewrites the file, which both refreshes
+        // the mtime and replaces its entries), so re-reading the age is
+        // sufficient and re-parsing would be a second full read for nothing.
+        let fresh_age = entry_age(&entry_path, std::time::SystemTime::now());
+        let over_age = !max_age.is_zero() && fresh_age.is_some_and(|age| age > max_age);
+        let unreachable = if over_age {
+            unreachable
+        } else {
+            file_is_unaddressable(&entry_path)
+        };
+        if !over_age && !unreachable {
+            report.kept += 1;
+            continue;
+        }
+        // AGE FIRST: an over-age file is a retention decision whatever its
+        // entries say, and a reader counting reclaimed bytes against a
+        // retention policy must not have them attributed to a defect.
+        let reason = if over_age { REASON_AGE } else { REASON_UNIVERSE };
+        let age_days = fresh_age.map_or(0, |age| age.as_secs() / 86_400);
+        let stamp_unix = now
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let quarantine =
+            quarantine_root.join(format!("{name}-{stamp_unix}-{}", std::process::id()));
+        // THE DRY RUN STOPS HERE, one statement before the first thing that
+        // writes: scanned, aged, re-aged and selected by exactly the rules the
+        // apply path uses, and from here on nothing is created and nothing is
+        // renamed.
+        if mode.is_dry_run() {
+            report.quarantined += 1;
+            if reason == REASON_AGE {
+                report.selected_age += 1;
+            } else {
+                report.selected_universe += 1;
+            }
+            report.entries.push(ReapedEntry {
+                label: name.clone(),
+                path: entry_path.clone(),
+                quarantine: None,
+                age_days,
+                reason,
+            });
+            tracing::info!(
+                entry = %name, age_days, max_age_days, reason,
+                mode = mode.as_str(),
+                "route_probe_store would-evict",
+            );
+            continue;
+        }
+        if let Err(error) = std::fs::create_dir_all(&quarantine_root) {
+            tracing::warn!(
+                store = %store_dir.display(), error = %error,
+                "could not create the route-probe quarantine; nothing evicted",
+            );
+            report.kept += 1;
+            continue;
+        }
+        // Rule 1: RENAME. Never `remove_file`. A reader already holding the
+        // file keeps reading valid bytes; the next one misses and re-probes.
+        if let Err(error) = std::fs::rename(&entry_path, &quarantine) {
+            tracing::warn!(
+                entry = %name, error = %error,
+                "route_probe_store eviction could not rename; entry kept",
+            );
+            report.kept += 1;
+            continue;
+        }
+        report.quarantined += 1;
+        if reason == REASON_AGE {
+            report.selected_age += 1;
+        } else {
+            report.selected_universe += 1;
+        }
+        report.entries.push(ReapedEntry {
+            label: name.clone(),
+            path: entry_path.clone(),
+            quarantine: Some(quarantine.clone()),
+            age_days,
+            reason,
+        });
+        tracing::info!(
+            entry = %name, age_days, max_age_days, reason,
+            quarantine = %quarantine.display(),
+            mode = mode.as_str(),
+            "route_probe_store evicted",
+        );
+    }
+    tracing::info!(
+        store = %store_dir.display(),
+        scanned = report.scanned,
+        quarantined = report.quarantined,
+        selected_age = report.selected_age,
+        selected_universe = report.selected_universe,
+        kept = report.kept,
+        skipped_locked = report.skipped_locked,
+        max_age_days,
+        mode = mode.as_str(),
+        "route_probe_store reap",
+    );
+    Ok(report)
+}
+
+/// How long ago this entry file was last written. `None` when the mtime cannot
+/// be read or lies in the future (clock skew across nodes), which reads as
+/// "not over-age" — a reaper must never evict on a clock it cannot trust.
+fn entry_age(path: &Path, now: std::time::SystemTime) -> Option<std::time::Duration> {
+    let modified = std::fs::metadata(path).and_then(|meta| meta.modified()).ok()?;
+    now.duration_since(modified).ok()
+}
+
+/// Is EVERY entry in this file unaddressable? A file with at least one
+/// reachable entry is live, and an EMPTY or unparseable file is NOT selected
+/// on this rule: "I could not read it" is not "nobody can reach it", and an
+/// unreadable file is left for the age rule to age out.
+fn file_is_unaddressable(path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(file) = serde_json::from_str::<VerdictFile>(&text) else {
+        return false;
+    };
+    if file.entries.is_empty() {
+        return false;
+    }
+    file.entries
+        .iter()
+        .all(|(key, entry)| entry_is_unreachable(key, &entry.stamp))
+}
 
 /// Where a `RouteProbeCache`'s file lives, for the printed row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -704,7 +1053,7 @@ impl RouteProbeCache {
         }
 
         // Held for the read-modify-write below; dropped (unlocking) on return.
-        let lock_path = self.path.with_extension("lock");
+        let lock_path = lock_path_for(&self.path);
         let lock = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -1682,5 +2031,135 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// REAP-2 GUARD. THE WRITER'S LOCK AND THE REAPER'S LOCK ARE ONE PATH.
+    ///
+    /// This is the guard for the correction, and it is written so it FAILS if
+    /// anybody ever re-inlines the writer's lock path or points the reaper at
+    /// this campaign's OTHER convention. Half 1 states the shape as a literal
+    /// (`<stem>.lock`, not `.{file}.lock`) so a silent convention swap cannot
+    /// stay green by both sides moving together; half 2 runs a real publish and
+    /// asserts the file `persist` created is the file `lock_path_for` names.
+    ///
+    /// RED WITHOUT THE FIX: with `persist` still computing its own path, half 2
+    /// passes only by coincidence -- and it is exactly that coincidence the
+    /// reaper cannot rely on, which is why half 1 pins the shape too.
+    #[test]
+    fn reap2_the_writer_and_the_reaper_share_one_lock_path() {
+        let root = shared_root("lockpath");
+        let key = key_for("strict");
+        let path = shared_cache_path(&root, &key, "3.12", "linux-64");
+
+        // Half 1: the SHAPE, as a literal. `<stem>.lock` beside the entry.
+        let named = lock_path_for(&path);
+        assert_eq!(
+            named.file_name().and_then(|n| n.to_str()),
+            Some(format!("{}-py3.12-linux-64.lock", key).as_str()),
+            "the store's lock is <stem>.lock beside the entry, not a dotfile: {}",
+            named.display(),
+        );
+        assert_eq!(
+            named.parent(),
+            path.parent(),
+            "the lock must be a sibling of the entry it guards",
+        );
+        assert!(
+            !named
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with('.')),
+            "a dot-prefixed lock would be invisible to the reaper's `.json` filter",
+        );
+
+        // Half 2: a real publish, and the file it leaves behind.
+        assert!(!named.exists(), "nothing has published yet");
+        let specs = ["numpy==1.26.4".to_string()];
+        let digest = probe_digest("auto_route_joint_solve", "u1", specs.iter());
+        let stamp = EntryStamp::new("auto_route_joint_solve", "u1", specs.iter());
+        {
+            let cache = RouteProbeCache::open_labelled(
+                path.clone(),
+                key.clone(),
+                "pack-a".to_string(),
+                StoreMode::Shared,
+            );
+            cache.record(&digest, &stamp, CachedVerdict::Sat);
+        }
+        assert!(path.is_file(), "the entry must have been published");
+        assert!(
+            named.is_file(),
+            "`persist` must have created the lock the reaper tries: {}",
+            named.display(),
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// REAP-2 GUARD. `entry_is_unreachable` answers "can any reader address
+    /// this entry again" from the record alone, and the three cases are the
+    /// three the store actually produces.
+    ///
+    /// RED IF THE PREDICATE IS INVERTED OR STUBBED: a stub returning `false`
+    /// fails cases 2 and 3, one returning `true` fails case 1.
+    #[test]
+    fn reap2_an_entry_is_unreachable_exactly_when_its_stamp_misses_its_address() {
+        let specs = ["numpy==1.26.4".to_string(), "torch==2.7.0".to_string()];
+        let digest = probe_digest("auto_route_joint_solve", "universe-rev-1", specs.iter());
+        let stamp = EntryStamp::new("auto_route_joint_solve", "universe-rev-1", specs.iter());
+
+        // 1. The normal entry: the stamp reproduces its own address.
+        assert!(
+            !entry_is_unreachable(&digest, &stamp),
+            "a self-consistent entry is reachable and must never be reaped by reason=universe",
+        );
+        // 2. A v3 remnant or a truncated record: `serde(default)` gives it an
+        //    EMPTY stamp, which can reproduce no address at all.
+        assert!(
+            entry_is_unreachable(&digest, &EntryStamp::default()),
+            "an unstamped entry can never be adopted, so nothing can reach it",
+        );
+        // 3. The p6ab shape: an entry sitting at an address its own universe
+        //    does not hash to.
+        let wrong = EntryStamp::new("auto_route_joint_solve", "universe-rev-2", specs.iter());
+        assert!(
+            entry_is_unreachable(&digest, &wrong),
+            "an entry whose universe does not hash to its key is unreachable",
+        );
+        // ... and it IS reachable at its own address, so the predicate is
+        // about the PAIR and not about the stamp in isolation.
+        let wrong_digest = probe_digest("auto_route_joint_solve", "universe-rev-2", specs.iter());
+        assert!(
+            !entry_is_unreachable(&wrong_digest, &wrong),
+            "the predicate must compare the stamp against THIS key, not judge the stamp alone",
+        );
+    }
+
+    /// REAP-2 GUARD. The store's own filter: only a published `*.json` is an
+    /// entry, and every other thing the store directory legitimately holds is
+    /// NOT one. Without this the reaper would quarantine live locks, a
+    /// concurrent publish's temp file, or the quarantine directory itself.
+    #[test]
+    fn reap2_only_a_published_json_is_an_entry() {
+        for name in [
+            "abc-py3.12-linux-64.json",
+            "abc-py3.11-osx-arm64.json",
+        ] {
+            assert!(is_verdict_entry_name(name), "{name} is an entry");
+        }
+        for name in [
+            // the writer's advisory lock
+            "abc-py3.12-linux-64.lock",
+            // a concurrent `persist`'s temp file (`with_extension("tmp<pid>")`)
+            "abc-py3.12-linux-64.tmp12345",
+            // the reaper's own store-wide try-lock
+            ROUTE_PROBE_REAP_LOCK_NAME,
+            // the quarantine directory
+            QUARANTINE,
+            // a dot-prefixed json is a sidecar by convention, never an entry
+            ".abc-py3.12-linux-64.json",
+        ] {
+            assert!(!is_verdict_entry_name(name), "{name} is NOT an entry");
+        }
     }
 }

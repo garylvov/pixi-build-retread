@@ -145,9 +145,9 @@ async fn async_main() -> anyhow::Result<()> {
     }
 
     // `retread store-reap
-    //      [--store built-wheels|git-snapshots|shadow|build-requirements|hermetic-envs|sdist-metadata|all]
+    //      [--store built-wheels|git-snapshots|shadow|build-requirements|hermetic-envs|sdist-metadata|built-outputs|path-source-metadata|route-probe-verdicts|all]
     //      [--root <dir>]... [--dry-run|--apply]
-    //      [--max-age-days <n>] [--bytes]`
+    //      [--max-age-days <n>] [--route-probe-max-age-days <n>] [--bytes]`
     //
     // STORE-REAP-2, and it exists because of law 2. The persistent-store
     // reapers had no production caller that could ever reach a persistent

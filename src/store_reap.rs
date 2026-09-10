@@ -77,6 +77,14 @@ pub enum Store {
     /// backend's `initialize` — one lock apart, and this verb is what ages it.
     /// APPENDED, never inserted, on the rule the six before it were.
     PathSourceMetadata,
+    /// REAP-2 (N27-RETREAD-210). The route-probe verdict store, and the NINTH.
+    /// It is the first store here whose entries are FILES in one flat directory
+    /// with a per-entry advisory lock, so it is the first that
+    /// `source_build::reap_marker_store` cannot walk — its reaper lives beside
+    /// its writer in `crate::route_probe_cache`, which is where the writer's
+    /// lock path and quarantine convention are already named.
+    /// APPENDED, never inserted, on the rule the eight before it were.
+    RouteProbeVerdicts,
 }
 
 impl Store {
@@ -91,6 +99,7 @@ impl Store {
             Store::SdistMetadata => crate::sdist_metadata::CACHE_NAMESPACE,
             Store::BuiltOutputs => crate::built_output_store::STORE_DIR,
             Store::PathSourceMetadata => crate::derived_editable_metadata::CACHE_NAMESPACE,
+            Store::RouteProbeVerdicts => crate::route_probe_cache::STORE_DIR,
         }
     }
 
@@ -108,7 +117,7 @@ impl Store {
     /// the resolution is BOTH, in landing order (sdist-metadata landed first,
     /// as B32), never one of them.
     /// METAGEN-1 appends the EIGHTH by the same rule: APPEND, NEVER REORDER.
-    pub const ALL: [Store; 8] = [
+    pub const ALL: [Store; 9] = [
         Store::BuiltWheels,
         Store::GitSnapshots,
         Store::Shadow,
@@ -117,6 +126,7 @@ impl Store {
         Store::SdistMetadata,
         Store::BuiltOutputs,
         Store::PathSourceMetadata,
+        Store::RouteProbeVerdicts,
     ];
 
     fn parse(value: &str) -> Option<Vec<Store>> {
@@ -148,6 +158,17 @@ impl Store {
                 crate::built_output_store::BUILT_OUTPUT_STORE_DEFAULT_MAX_AGE_DAYS
             }
             Store::PathSourceMetadata => crate::derived_editable_metadata::DEFAULT_MAX_AGE_DAYS,
+            // REAP-2 / N27-RETREAD-163. THIS LINE IS THE CONSTANT'S ONLY
+            // READER, and until this landing it had none: the constant was
+            // written by ROUTECACHE-1 beside the store it sizes and
+            // `grep -rn ROUTE_PROBE_STORE_DEFAULT_MAX_AGE_DAYS src/ tests/`
+            // returned exactly one line — its own definition. A default with
+            // no reader is the same defect as a gate criterion with no
+            // producer, so the whole point of the arm below is that the
+            // printed `max_age_days=` field MOVES when this constant moves.
+            Store::RouteProbeVerdicts => {
+                crate::route_probe_cache::ROUTE_PROBE_STORE_DEFAULT_MAX_AGE_DAYS
+            }
         }
     }
 }
@@ -159,6 +180,26 @@ pub fn resolved_max_age_days(store: Store, flag: Option<u64>) -> u64 {
     flag.unwrap_or_else(|| store.default_max_age_days())
 }
 
+/// REAP-2. WHICH `--max-age-days` FLAG APPLIES TO THIS STORE, and it is a
+/// function rather than a line in the loop so a guard can assert the precedence
+/// without a filesystem.
+///
+/// `--route-probe-max-age-days` is a DECLARED argument of its own because the
+/// route-probe store's retention is not the other eight stores' retention: a
+/// verdict file is kilobytes and its loss costs one probe round, while a
+/// built-wheel entry is a 940-second build, so an operator sizing a shared root
+/// must be able to age the cheap store hard without touching the expensive
+/// ones — and with a single `--max-age-days` they could not. Precedence, and
+/// there is no other rung: the store-specific flag, then the general flag, then
+/// [`Store::default_max_age_days`], which for this store IS
+/// `route_probe_cache::ROUTE_PROBE_STORE_DEFAULT_MAX_AGE_DAYS`.
+pub fn max_age_flag_for(store: Store, args: &Args) -> Option<u64> {
+    match store {
+        Store::RouteProbeVerdicts => args.route_probe_max_age_days.or(args.max_age_days),
+        _ => args.max_age_days,
+    }
+}
+
 /// What the verb was asked to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Args {
@@ -168,6 +209,10 @@ pub struct Args {
     pub roots: Vec<PathBuf>,
     pub mode: ReapMode,
     pub max_age_days: Option<u64>,
+    /// REAP-2. `--route-probe-max-age-days`, which applies to the route-probe
+    /// store ONLY and outranks `--max-age-days` there. Absent means the
+    /// store's own constant; see [`max_age_flag_for`].
+    pub route_probe_max_age_days: Option<u64>,
     /// Charge the bytes of every selected entry. OFF by default: the harness
     /// census step runs on every lane job and must stay cheap, while an
     /// operator sizing a reap wants the number and can pay a full walk for it.
@@ -197,6 +242,7 @@ pub fn parse_args(args: &[String]) -> anyhow::Result<Args> {
     let mut roots: Vec<PathBuf> = Vec::new();
     let mut mode = ReapMode::DryRun;
     let mut max_age_days: Option<u64> = None;
+    let mut route_probe_max_age_days: Option<u64> = None;
     let mut bytes = false;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -210,7 +256,7 @@ pub fn parse_args(args: &[String]) -> anyhow::Result<Args> {
                         "store-reap: --store {value}: expected one of \
                          built-wheels, git-snapshots, shadow, \
                          build-requirements, hermetic-envs, sdist-metadata, \
-                         built-outputs, path-source-metadata, all"
+                         built-outputs, path-source-metadata, route-probe-verdicts, all"
                     )
                 })?);
             }
@@ -232,6 +278,19 @@ pub fn parse_args(args: &[String]) -> anyhow::Result<Args> {
                     anyhow::anyhow!("store-reap: --max-age-days {value}: {error}")
                 })?);
             }
+            // REAP-2. Its own flag, and the parse error names the store so a
+            // typo cannot silently become "the general flag applied to all
+            // nine".
+            "--route-probe-max-age-days" => {
+                let value = it.next().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "store-reap: --route-probe-max-age-days <n> requires a value"
+                    )
+                })?;
+                route_probe_max_age_days = Some(value.parse::<u64>().map_err(|error| {
+                    anyhow::anyhow!("store-reap: --route-probe-max-age-days {value}: {error}")
+                })?);
+            }
             "--bytes" => bytes = true,
             other => anyhow::bail!("store-reap: unknown arg {other}"),
         }
@@ -241,6 +300,7 @@ pub fn parse_args(args: &[String]) -> anyhow::Result<Args> {
         roots,
         mode,
         max_age_days,
+        route_probe_max_age_days,
         bytes,
     })
 }
@@ -265,6 +325,17 @@ pub struct StoreOutcome {
     pub layouts_walked: u64,
     pub skipped_concurrent: bool,
     pub bytes: u64,
+    /// REAP-2. Of `selected`, how many were selected because they were
+    /// OVER-AGE. Only the route-probe store fills these two in — the eight
+    /// stores before it have exactly one selection rule, so their `reason_age`
+    /// reads 0 the way their `layouts_walked` does, and a parser never has to
+    /// know which store it is looking at.
+    pub reason_age: u64,
+    /// REAP-2. Of `selected`, how many were selected because no reader can
+    /// ADDRESS the entry any more. See
+    /// `crate::route_probe_cache::entry_is_unreachable` for what that means and
+    /// for what it deliberately is not.
+    pub reason_universe: u64,
 }
 
 /// `retread store-reap`. Returns the process exit code.
@@ -283,7 +354,7 @@ pub fn run(args: &Args) -> anyhow::Result<i32> {
     for root in args.resolved_roots() {
         for store in &args.stores {
             let store = *store;
-            let days = resolved_max_age_days(store, args.max_age_days);
+            let days = resolved_max_age_days(store, max_age_flag_for(store, args));
             let outcome = reap_one(&root, store, days, args.mode, args.bytes)?;
             refused |= outcome.skipped_concurrent;
             total_scanned += outcome.scanned;
@@ -308,6 +379,31 @@ pub fn run(args: &Args) -> anyhow::Result<i32> {
                 outcome.skipped_concurrent,
                 outcome.bytes,
             );
+            // REAP-2. THE ROUTE-PROBE STORE'S OWN ROW, and it exists because
+            // the SUMMARY row above cannot carry a reason split: it has one
+            // selection-count column and this store has two selection RULES.
+            // `mode=` is appended AFTER the briefed fields, not folded into
+            // them, and it is not decoration -- `quarantined=` in a dry run is
+            // a PREDICTION, and the campaign's own rule (`would_evict` vs
+            // `evicted` on the row above) is that a reader must never take one
+            // for bytes reclaimed. The mode is on the same line so a single
+            // grep resolves it.
+            if store == Store::RouteProbeVerdicts {
+                println!(
+                    "### ROUTE PROBE STORE REAP scanned={} quarantined={} kept={} \
+                     max_age_days={} reason_counts=age:{} universe:{} \
+                     skipped_locked={} mode={} root={}",
+                    outcome.scanned,
+                    outcome.selected,
+                    outcome.kept,
+                    days,
+                    outcome.reason_age,
+                    outcome.reason_universe,
+                    outcome.skipped_locked,
+                    args.mode.as_str(),
+                    root.display(),
+                );
+            }
         }
     }
     println!(
@@ -471,6 +567,28 @@ fn reap_one(
             outcome.skipped_locked = report.skipped_locked;
             outcome.versions_walked = report.versions_walked;
             outcome.skipped_concurrent = report.skipped_concurrent;
+            report.entries
+        }
+        // REAP-2. THE ONE STORE THAT IS NOT `reap_marker_store`, and the
+        // reason is a SHAPE, not a setting -- the same judgement C18-1 made
+        // when it refused to parameterise the shadow walk. The eight arms
+        // above walk `<root>/<dir>/<version>/<key>/<marker>`: entry
+        // DIRECTORIES, aged from a marker file inside them. This store is a
+        // flat directory of JSON FILES, each with a `<stem>.lock` advisory
+        // lock its writer takes BLOCKING, and each carrying entries whose
+        // reachability is a property of the file's CONTENT. Sharing a body
+        // across those would need a callback for enumeration, one for the
+        // lock, one for the age and one for the second selection rule.
+        Store::RouteProbeVerdicts => {
+            let report =
+                crate::route_probe_cache::reap_route_probe_store(root, max_age, mode)?;
+            outcome.scanned = report.scanned;
+            outcome.selected = report.quarantined;
+            outcome.kept = report.kept;
+            outcome.skipped_locked = report.skipped_locked;
+            outcome.skipped_concurrent = report.skipped_concurrent;
+            outcome.reason_age = report.selected_age;
+            outcome.reason_universe = report.selected_universe;
             report.entries
         }
         Store::BuiltOutputs => {
@@ -814,6 +932,7 @@ mod tests {
             roots: vec![root.clone()],
             mode: ReapMode::DryRun,
             max_age_days: None,
+            route_probe_max_age_days: None,
             bytes: false,
         })
         .expect("run");
@@ -917,6 +1036,9 @@ mod tests {
             Store::SdistMetadata,
             Store::BuiltOutputs,
             Store::PathSourceMetadata,
+            // REAP-2, the ninth. This list is hand-written on purpose so
+            // `Store::ALL` cannot be its own witness.
+            Store::RouteProbeVerdicts,
         ]
         .into_iter()
         .inspect(|store| match store {
@@ -929,7 +1051,8 @@ mod tests {
             | Store::HermeticEnvironments
             | Store::SdistMetadata
             | Store::BuiltOutputs
-            | Store::PathSourceMetadata => {}
+            | Store::PathSourceMetadata
+            | Store::RouteProbeVerdicts => {}
         })
         .collect();
         assert_eq!(
@@ -997,6 +1120,7 @@ mod tests {
             roots: Vec::new(),
             mode: ReapMode::DryRun,
             max_age_days: None,
+            route_probe_max_age_days: None,
             bytes: false,
         };
         assert_eq!(
@@ -1624,5 +1748,476 @@ mod tests {
             store_dir.join("eeee").is_dir(),
             "a directory with no marker is not an entry and must not be moved"
         );
+    }
+
+    // ================= REAP-2 (N27-RETREAD-210, -163) =================
+    //
+    // The route-probe store's arm. Every fixture below writes a REAL verdict
+    // file — the schema string, the validity key and entries at addresses
+    // `route_probe_cache::probe_digest` actually produces — because a reaper
+    // guard fed hand-waved JSON cannot tell "kept because it is reachable"
+    // from "kept because the parse failed".
+
+    /// A verdict file body whose single entry is REACHABLE: its map key is the
+    /// digest of the very stamp it carries.
+    fn route_probe_reachable_body(stage: &str, universe: &str, specs: &[&str]) -> String {
+        let owned: Vec<String> = specs.iter().map(|s| (*s).to_string()).collect();
+        let digest = crate::route_probe_cache::probe_digest(stage, universe, owned.iter());
+        let mut sorted = owned.clone();
+        sorted.sort();
+        sorted.dedup();
+        let question = sorted.join("\u{1f}");
+        format!(
+            "{{\"schema\":\"v4-route-probe-verdicts\",\"key\":\"file-key\",\"entries\":\
+             {{\"{digest}\":{{\"verdict\":\"Sat\",\"stamp\":{{\"stage\":\"{stage}\",\
+             \"universe\":\"{universe}\",\"question\":{}}}}}}}}}",
+            serde_json::to_string(&question).expect("question"),
+        )
+    }
+
+    /// A verdict file body whose single entry is UNREACHABLE: the stamp says one
+    /// universe and the address was computed from another, which is the p6ab
+    /// cross-writer shape.
+    fn route_probe_unreachable_body(stage: &str, specs: &[&str]) -> String {
+        let owned: Vec<String> = specs.iter().map(|s| (*s).to_string()).collect();
+        let digest = crate::route_probe_cache::probe_digest(stage, "universe-gone", owned.iter());
+        let mut sorted = owned.clone();
+        sorted.sort();
+        sorted.dedup();
+        let question = sorted.join("\u{1f}");
+        format!(
+            "{{\"schema\":\"v4-route-probe-verdicts\",\"key\":\"file-key\",\"entries\":\
+             {{\"{digest}\":{{\"verdict\":\"Sat\",\"stamp\":{{\"stage\":\"{stage}\",\
+             \"universe\":\"universe-live\",\"question\":{}}}}}}}}}",
+            serde_json::to_string(&question).expect("question"),
+        )
+    }
+
+    /// One entry file under `<root>/route-probe-verdicts/<name>`, aged by its
+    /// OWN mtime — the store has no marker sidecar, the file IS the entry.
+    fn route_probe_entry(root: &Path, name: &str, body: &str, ago_days: u64) -> PathBuf {
+        let dir = crate::route_probe_cache::store_dir_in(root);
+        std::fs::create_dir_all(&dir).expect("store dir");
+        let path = dir.join(name);
+        std::fs::write(&path, body.as_bytes()).expect("entry");
+        set_mtime(&path, age(ago_days));
+        path
+    }
+
+    /// Every NON-EMPTY regular file under a directory tree, as `name -> bytes`,
+    /// so a guard can assert NOTHING WAS DELETED rather than only that a count
+    /// happened to match.
+    ///
+    /// Zero-byte files are excluded and that is not a convenience: an apply
+    /// leaves behind the advisory-lock sidecars it took (`<stem>.lock`, and the
+    /// reaper's own `.route-probe-verdicts.reap.lock`), all of which are empty
+    /// by construction. Counting them would make "the store's bytes are
+    /// unchanged" fail for a reason that has nothing to do with an entry.
+    fn files_under(dir: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut out: Vec<(String, Vec<u8>)> = Vec::new();
+        let Ok(children) = std::fs::read_dir(dir) else {
+            return out;
+        };
+        for child in children.flatten() {
+            let path = child.path();
+            if path.is_dir() {
+                out.extend(files_under(&path));
+            } else if path.is_file() {
+                let bytes = std::fs::read(&path).unwrap_or_default();
+                if bytes.is_empty() {
+                    continue;
+                }
+                out.push((
+                    path.file_name().unwrap().to_string_lossy().into_owned(),
+                    bytes,
+                ));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// The three-age fixture the whole arm is judged on: 1, 31 and 91 days,
+    /// every entry REACHABLE so the only rule that can select is the age.
+    fn three_age_store(tag: &str) -> PathBuf {
+        let root = scratch(tag);
+        for (name, ago) in [("a-py3.12-linux-64.json", 1u64),
+                            ("b-py3.12-linux-64.json", 31),
+                            ("c-py3.12-linux-64.json", 91)] {
+            route_probe_entry(
+                &root,
+                name,
+                &route_probe_reachable_body("auto_route_joint_solve", "universe-live", &[name]),
+                ago,
+            );
+        }
+        root
+    }
+
+    /// REAP-2 GUARD 1. THE DRY RUN DECIDES AND MOVES NOTHING.
+    ///
+    /// Ages 1 / 31 / 91 against a 30-day rule: two selected, one kept, and the
+    /// filesystem is byte-for-byte what it was — no `quarantine` directory, all
+    /// three entries where they were, and every reported entry carrying
+    /// `quarantine: None`.
+    ///
+    /// RED ON a83c0a3: `Store` has no `RouteProbeVerdicts` variant, so this
+    /// does not compile — which is the strongest form of red available.
+    #[test]
+    fn reap2_route_probe_dry_run_selects_two_of_three_and_moves_nothing() {
+        let root = three_age_store("rp-dry");
+        let store_dir = crate::route_probe_cache::store_dir_in(&root);
+        let before = files_under(&store_dir);
+
+        let outcome = reap_one(
+            &root,
+            Store::RouteProbeVerdicts,
+            30,
+            ReapMode::DryRun,
+            false,
+        )
+        .expect("dry run");
+
+        assert_eq!(outcome.scanned, 3, "all three entries are scanned");
+        assert_eq!(outcome.selected, 2, "31 and 91 days are over a 30-day rule");
+        assert_eq!(outcome.kept, 1, "1 day is under it");
+        assert_eq!(outcome.reason_age, 2, "both were selected BY AGE");
+        assert_eq!(outcome.reason_universe, 0, "no entry here is unaddressable");
+        assert_eq!(outcome.skipped_locked, 0);
+        assert!(!outcome.skipped_concurrent);
+        assert_eq!(
+            files_under(&store_dir),
+            before,
+            "a dry run must leave the store byte-for-byte as it was",
+        );
+        assert!(
+            !store_dir.join(crate::route_probe_cache::QUARANTINE).exists(),
+            "a dry run must not even CREATE the quarantine directory",
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// REAP-2 GUARD 2. AN APPLY QUARANTINES BY RENAME AND DELETES NOTHING.
+    ///
+    /// The same fixture applied: two entries leave the store directory, both
+    /// appear under `quarantine/` WITH THEIR BYTES, the kept one is untouched,
+    /// and the total set of file CONTENTS under the store is unchanged — which
+    /// is the assertion the mutant "reaper deletes instead of renaming" fails.
+    #[test]
+    fn reap2_route_probe_apply_quarantines_by_rename_and_deletes_nothing() {
+        let root = three_age_store("rp-apply");
+        let store_dir = crate::route_probe_cache::store_dir_in(&root);
+        let mut before: Vec<Vec<u8>> = files_under(&store_dir)
+            .into_iter()
+            .map(|(_, bytes)| bytes)
+            .collect();
+        before.sort();
+
+        let outcome =
+            reap_one(&root, Store::RouteProbeVerdicts, 30, ReapMode::Apply, false).expect("apply");
+
+        assert_eq!(outcome.scanned, 3);
+        assert_eq!(outcome.selected, 2);
+        assert_eq!(outcome.kept, 1);
+        assert_eq!(outcome.reason_age, 2);
+        assert_eq!(outcome.reason_universe, 0);
+
+        // The store directory itself now holds ONE entry, the fresh one.
+        let live: Vec<String> = std::fs::read_dir(&store_dir)
+            .expect("store dir")
+            .flatten()
+            .filter(|e| e.path().is_file())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| crate::route_probe_cache::is_verdict_entry_name(n))
+            .collect();
+        assert_eq!(
+            live,
+            vec!["a-py3.12-linux-64.json".to_string()],
+            "only the 1-day entry may remain live",
+        );
+
+        // NOTHING WAS DELETED: the two selected entries are files under
+        // quarantine/ and their bytes are intact.
+        let quarantine = store_dir.join(crate::route_probe_cache::QUARANTINE);
+        let quarantined = files_under(&quarantine);
+        assert_eq!(
+            quarantined.len(),
+            2,
+            "both selected entries must be present under quarantine/: {quarantined:?}",
+        );
+        for (name, _) in &quarantined {
+            assert!(
+                name.starts_with("b-py3.12-linux-64.json-")
+                    || name.starts_with("c-py3.12-linux-64.json-"),
+                "a quarantine name keeps the entry name and appends <unix>-<pid>: {name}",
+            );
+        }
+        let mut after: Vec<Vec<u8>> = files_under(&store_dir)
+            .into_iter()
+            .map(|(_, bytes)| bytes)
+            .collect();
+        after.sort();
+        assert_eq!(
+            after, before,
+            "every byte that was in the store is still in the store, moved not removed",
+        );
+
+        // And the report says WHERE each one went, which a dry run never does.
+        assert_eq!(outcome.selected as usize, 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// REAP-2 GUARD 3. AN ENTRY A LIVE PUBLISH HOLDS IS SKIPPED AND COUNTED.
+    ///
+    /// Two over-age entries; the lock `route_probe_cache::lock_path_for` names
+    /// for one of them is held EXCLUSIVELY for the duration of the reap, which
+    /// is exactly what `RouteProbeCache::persist` does while it rewrites a
+    /// file. That entry must survive, be counted as `skipped_locked`, and NOT
+    /// be counted as kept-by-policy.
+    ///
+    /// RED IF THE REAPER IGNORES THE LOCK (or tries the wrong path, which is
+    /// what a reaper written against `artifact_cache_lock_path`'s dot form
+    /// would do): `skipped_locked` reads 0 and `selected` reads 2.
+    #[test]
+    fn reap2_route_probe_skips_and_counts_an_entry_a_publish_holds() {
+        let root = scratch("rp-lock");
+        for name in ["a-py3.12-linux-64.json", "b-py3.12-linux-64.json"] {
+            route_probe_entry(
+                &root,
+                name,
+                &route_probe_reachable_body("auto_route_joint_solve", "universe-live", &[name]),
+                91,
+            );
+        }
+        let store_dir = crate::route_probe_cache::store_dir_in(&root);
+        let held_entry = store_dir.join("b-py3.12-linux-64.json");
+        let held_lock = crate::route_probe_cache::lock_path_for(&held_entry);
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&held_lock)
+            .expect("open the entry lock");
+        assert!(
+            fs4::fs_std::FileExt::try_lock_exclusive(&lock).unwrap_or(false),
+            "the fixture must actually hold the lock, or this guard cannot fail",
+        );
+
+        let outcome =
+            reap_one(&root, Store::RouteProbeVerdicts, 30, ReapMode::Apply, false).expect("apply");
+
+        assert_eq!(outcome.scanned, 2);
+        assert_eq!(outcome.selected, 1, "only the unlocked entry moves");
+        assert_eq!(outcome.skipped_locked, 1, "the held entry is COUNTED, not silent");
+        assert_eq!(
+            outcome.kept, 0,
+            "a locked entry is not `kept` — kept means the policy spared it",
+        );
+        assert!(
+            held_entry.is_file(),
+            "the entry a publish holds must still be exactly where it was",
+        );
+        let _ = fs4::fs_std::FileExt::unlock(&lock);
+        drop(lock);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// REAP-2 GUARD 4. AN UNADDRESSABLE FILE IS SELECTED WITH reason=universe,
+    /// AND A REACHABLE ONE OF THE SAME AGE IS NOT.
+    ///
+    /// Both files are ONE DAY old against a 30-day rule, so the age rule cannot
+    /// fire and the only thing separating them is whether any reader can still
+    /// address their entries.
+    #[test]
+    fn reap2_route_probe_quarantines_an_unaddressable_file_and_keeps_a_reachable_one() {
+        let root = scratch("rp-universe");
+        route_probe_entry(
+            &root,
+            "live-py3.12-linux-64.json",
+            &route_probe_reachable_body("auto_route_joint_solve", "universe-live", &["numpy"]),
+            1,
+        );
+        route_probe_entry(
+            &root,
+            "gone-py3.12-linux-64.json",
+            &route_probe_unreachable_body("auto_route_joint_solve", &["numpy"]),
+            1,
+        );
+
+        let outcome =
+            reap_one(&root, Store::RouteProbeVerdicts, 30, ReapMode::Apply, false).expect("apply");
+
+        assert_eq!(outcome.scanned, 2);
+        assert_eq!(outcome.selected, 1);
+        assert_eq!(outcome.kept, 1);
+        assert_eq!(
+            outcome.reason_age, 0,
+            "neither file is over-age; an `age` here would mean the rules are crossed",
+        );
+        assert_eq!(outcome.reason_universe, 1);
+        let store_dir = crate::route_probe_cache::store_dir_in(&root);
+        assert!(
+            store_dir.join("live-py3.12-linux-64.json").is_file(),
+            "a file with a reachable entry is live whatever else is in the store",
+        );
+        assert!(
+            !store_dir.join("gone-py3.12-linux-64.json").exists(),
+            "the unaddressable file must have moved",
+        );
+        assert_eq!(
+            files_under(&store_dir.join(crate::route_probe_cache::QUARANTINE)).len(),
+            1,
+            "and it must be UNDER quarantine, not gone",
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// REAP-2 GUARD 5 (N27-RETREAD-163). THE CONSTANT IS THE DEFAULT OF THE
+    /// DECLARED ARGUMENT, AND THAT IS THE WHOLE DISCHARGE OF -163.
+    ///
+    /// `ROUTE_PROBE_STORE_DEFAULT_MAX_AGE_DAYS` had exactly one occurrence in
+    /// the tree at a83c0a3 — its own definition. This asserts the resolution
+    /// chain that gives it a reader: no flag -> the constant;
+    /// `--max-age-days` -> that; `--route-probe-max-age-days` -> that, and it
+    /// OUTRANKS the general flag for this store only.
+    ///
+    /// RED UNDER THE MUTANT that changes the constant: the first assertion
+    /// compares the resolved number against the constant AND against 14 as a
+    /// literal, so a mutant that moves the constant moves the printed
+    /// `max_age_days=` field and this line names it.
+    #[test]
+    fn reap2_the_route_probe_max_age_flag_defaults_to_the_stores_own_constant() {
+        let bare = parse_args(&["--store".to_string(), "route-probe-verdicts".to_string()])
+            .expect("parse");
+        assert_eq!(bare.stores, vec![Store::RouteProbeVerdicts]);
+        assert_eq!(bare.route_probe_max_age_days, None);
+        let resolved =
+            resolved_max_age_days(Store::RouteProbeVerdicts, max_age_flag_for(Store::RouteProbeVerdicts, &bare));
+        assert_eq!(
+            resolved,
+            crate::route_probe_cache::ROUTE_PROBE_STORE_DEFAULT_MAX_AGE_DAYS,
+            "with no flag the store's own constant IS the default",
+        );
+        assert_eq!(
+            resolved, 14,
+            "and it is 14 today — a literal here so a mutant on the constant reddens this guard",
+        );
+
+        // The general flag reaches it.
+        let general = parse_args(&["--max-age-days".to_string(), "90".to_string()]).expect("parse");
+        assert_eq!(
+            resolved_max_age_days(
+                Store::RouteProbeVerdicts,
+                max_age_flag_for(Store::RouteProbeVerdicts, &general)
+            ),
+            90,
+        );
+
+        // The store's own flag OUTRANKS it, and reaches NO other store.
+        let specific = parse_args(&[
+            "--max-age-days".to_string(),
+            "90".to_string(),
+            "--route-probe-max-age-days".to_string(),
+            "3".to_string(),
+        ])
+        .expect("parse");
+        assert_eq!(specific.route_probe_max_age_days, Some(3));
+        assert_eq!(
+            resolved_max_age_days(
+                Store::RouteProbeVerdicts,
+                max_age_flag_for(Store::RouteProbeVerdicts, &specific)
+            ),
+            3,
+            "the store-specific flag wins for the route-probe store",
+        );
+        for store in Store::ALL {
+            if store == Store::RouteProbeVerdicts {
+                continue;
+            }
+            assert_eq!(
+                max_age_flag_for(store, &specific),
+                Some(90),
+                "--route-probe-max-age-days must not reach {}",
+                store.as_str(),
+            );
+        }
+        assert!(
+            parse_args(&["--route-probe-max-age-days".to_string()]).is_err(),
+            "a flag with no value must refuse, not default silently",
+        );
+    }
+
+    /// REAP-2 GUARD 6. THE STORE IS IN `--store all`, ITS SPELLING IS THE
+    /// STORE'S OWN CONSTANT, AND THE EIGHT BEFORE IT DID NOT MOVE.
+    ///
+    /// The append-never-reorder rule the eight previous stores landed under:
+    /// the merge gate's readers grep summary rows by position.
+    #[test]
+    fn reap2_the_route_probe_store_is_appended_to_store_all() {
+        assert_eq!(Store::ALL.len(), 9, "the ninth store");
+        assert_eq!(
+            Store::ALL[8],
+            Store::RouteProbeVerdicts,
+            "APPENDED, never inserted",
+        );
+        assert_eq!(
+            Store::ALL[..8],
+            [
+                Store::BuiltWheels,
+                Store::GitSnapshots,
+                Store::Shadow,
+                Store::BuildRequirements,
+                Store::HermeticEnvironments,
+                Store::SdistMetadata,
+                Store::BuiltOutputs,
+                Store::PathSourceMetadata,
+            ],
+            "the eight stores before it are in the order they landed in",
+        );
+        assert_eq!(
+            Store::RouteProbeVerdicts.as_str(),
+            crate::route_probe_cache::STORE_DIR,
+            "the `--store` spelling READS the store's own constant",
+        );
+        assert_eq!(
+            parse_args(&["--store".to_string(), "route-probe-verdicts".to_string()])
+                .expect("parse")
+                .stores,
+            vec![Store::RouteProbeVerdicts],
+        );
+        assert_eq!(
+            parse_args(&["--store".to_string(), "all".to_string()])
+                .expect("parse")
+                .stores
+                .len(),
+            9,
+            "`all` fans out to nine, so a census that reads `all` reaches this store",
+        );
+    }
+
+    /// REAP-2 GUARD 7. AN ABSENT STORE IS A CLEAN, EMPTY, NON-REFUSING CENSUS
+    /// — and it must not create the store either.
+    ///
+    /// This is the shape every lane job prints today (every relock job-scopes
+    /// `XDG_CACHE_HOME`), so it is the row the census step actually reads.
+    #[test]
+    fn reap2_an_absent_route_probe_store_scans_nothing_and_creates_nothing() {
+        let root = scratch("rp-absent");
+        for mode in [ReapMode::DryRun, ReapMode::Apply] {
+            let outcome =
+                reap_one(&root, Store::RouteProbeVerdicts, 30, mode, false).expect("absent store");
+            assert_eq!(outcome.scanned, 0);
+            assert_eq!(outcome.selected, 0);
+            assert_eq!(outcome.kept, 0);
+            assert!(
+                !outcome.skipped_concurrent,
+                "an absent store is not a refusal; exit 7 would read as deferral",
+            );
+        }
+        assert!(
+            !crate::route_probe_cache::store_dir_in(&root).exists(),
+            "a census must not bring the store into existence",
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
