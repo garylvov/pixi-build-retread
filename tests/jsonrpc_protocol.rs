@@ -295,3 +295,210 @@ fn broken_entry_surfaces_with_entry_name() {
 
     std::fs::remove_dir_all(&tmp).ok();
 }
+
+/// N27-RETREAD-180, the REAL-TRANSPORT half of the guard.
+///
+/// THE DEFECT THIS EXISTS FOR. `RetreadHandler::initialize` expands
+/// `[retread-subpackages]` rules and reports each one as a
+/// `### PACK SUBPACKAGES ...` row. It reported it with `println!`, and
+/// `src/rpc.rs`'s `serve` owns `tokio::io::stdout()` as the JSON-RPC frame
+/// channel for the life of the process -- so the row went out AHEAD of the
+/// initialize response and pixi's frontend died with `could not initialize the
+/// build-backend ... Unparseable message: expected value at line 1 column 1`
+/// on the first pack that declared a rule (SUBCERT-1, relock 6162669,
+/// environment `hover-gpu`, 18 s of lock wall, no cert).
+///
+/// WHY NO EXISTING TEST COULD SEE IT, which is the whole reason this one is
+/// shaped the way it is. Every test of the capability calls
+/// `crate::subpackages::expand` in process and asserts on the returned
+/// `Vec<String>`. B43's gate ran 1976 library tests and 13 integration targets
+/// and the row never crossed a socket in any of them: in a cargo test, stdout
+/// is not a channel, so a `println!` there is invisible by construction. The
+/// only instrument that sees this class is a REAL PIPE to a REAL PROCESS, which
+/// is what `drive_backend` is -- its per-line `serde_json::from_str` on stdout
+/// is the assertion that fails.
+///
+/// WHY IT IS NOT `#[ignore]`, unlike its three neighbours. Those three need the
+/// network (PyPI simple-index lookups) or pip. This one needs neither: the
+/// enumerated tree is a git repo this test creates in its own temp dir and
+/// `ensure_git_checkout` clones over the local filesystem, and the request
+/// sequence stops at `initialize`, before anything resolves. So it runs in the
+/// gate's integration stage on every landing, offline, in about a second.
+///
+/// FALSIFIABILITY, and the landing gate ran exactly this: change the
+/// `eprintln!("{row}")` in `initialize` back to `println!` and this test fails
+/// inside `drive_backend` with `stdout line 0 is NOT valid JSON-RPC`.
+#[test]
+fn subpackage_expansion_row_does_not_corrupt_stdout() {
+    let tmp = std::env::temp_dir().join(format!(
+        "retread-rpc-subpkg-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    let tree = tmp.join("tree");
+    let cache = tmp.join("cache");
+    std::fs::create_dir_all(&cache).unwrap();
+
+    // The enumerated tree. `alpha` and `beta` carry the two build files
+    // `SUBPACKAGE_BUILD_FILES` accepts; `gamma` carries one and is EXCLUDED by
+    // the rule; `docs` carries none and is SKIPPED. That makes the row's
+    // `found=`, `included=`, `excluded=` and `skipped=` fields all non-trivial,
+    // so a row that reached stderr truncated or empty would not satisfy the
+    // assertions below.
+    for (dir, build_file) in [
+        ("alpha", Some("pyproject.toml")),
+        ("beta", Some("setup.py")),
+        ("gamma", Some("pyproject.toml")),
+        ("docs", None),
+    ] {
+        let d = tree.join("source").join(dir);
+        std::fs::create_dir_all(&d).unwrap();
+        match build_file {
+            Some(name) => std::fs::write(d.join(name), b"# fixture\n").unwrap(),
+            None => std::fs::write(d.join("README.md"), b"not a distribution\n").unwrap(),
+        }
+    }
+
+    // A local repo, committed with an inline identity: the gate redirects HOME
+    // at a private tree, so there is no global git user to inherit and a
+    // `git commit` without `-c` would refuse.
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(&tree)
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr),
+        );
+        String::from_utf8(out.stdout).expect("git stdout is utf-8")
+    };
+    std::fs::create_dir_all(&tree).unwrap();
+    let init = Command::new("git")
+        .args(["init", "-q", "--initial-branch=main"])
+        .current_dir(&tree)
+        .output()
+        .expect("git init");
+    assert!(
+        init.status.success(),
+        "git init failed: {}",
+        String::from_utf8_lossy(&init.stderr),
+    );
+    git(&["add", "-A"]);
+    git(&[
+        "-c",
+        "user.email=guard@retread.invalid",
+        "-c",
+        "user.name=retread guard",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-q",
+        "-m",
+        "subpackage fixture tree",
+    ]);
+    let rev = git(&["rev-parse", "HEAD"]).trim().to_string();
+    assert_eq!(rev.len(), 40, "expected a full sha, got {rev:?}");
+
+    let requests = vec![
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "negotiateCapabilities",
+            "params": { "capabilities": {} }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "initialize",
+            "params": {
+                "manifestPath": tmp.join("pixi.toml"),
+                "sourceDirectory": &tmp,
+                "cacheDirectory": &cache,
+                "configuration": {
+                    // ONE typed entry, and it is not optional scaffolding.
+                    // `retread-wheels` carries no `#[serde(default)]`, so
+                    // omitting the table is `[build.config]: missing field
+                    // `retread-wheels`` (measured: gate 6166699), and
+                    // `initialize`'s `config.retread_wheels.is_empty()` refusal
+                    // runs BEFORE `subpackages::expand`, so an empty table plus
+                    // a rule is `[build.config].wheels must list at least one
+                    // wheel` (measured: gate 6169659). A pack whose wheel set is
+                    // ENTIRELY derived is therefore refused today -- a real
+                    // ordering defect in the enumeration capability, named and
+                    // sized in this commit's message, and NOT this commit's to
+                    // fix: changing that refusal is a production behaviour
+                    // change and needs its own guard. `tomli` resolves nothing
+                    // at initialize (the sequence stops there) and its key
+                    // cannot collide with `alpha`/`beta`, so the request stays
+                    // offline and the derived entries still land beside a typed
+                    // one, which is the shape a converted pack really has.
+                    "retread-wheels": {
+                        "tomli": { "version": "==2.0.1" }
+                    },
+                    "retread-git-sources": {
+                        "fixture": { "url": tree.to_string_lossy(), "rev": &rev }
+                    },
+                    "retread-subpackages": {
+                        "fixture": {
+                            "from": "fixture",
+                            "glob": "source/*",
+                            "expect": 2,
+                            "exclude": ["gamma"]
+                        }
+                    }
+                }
+            }
+        }),
+    ];
+
+    // THE ASSERTION THAT CATCHES THE DEFECT is inside drive_backend: every
+    // stdout line must parse as a JSON-RPC 2.0 frame.
+    let (responses, stderr) = drive_backend(&requests);
+    assert_eq!(
+        responses.len(),
+        2,
+        "expected one frame per request and NOTHING else on stdout; got: {responses:#?}\
+         \n--- stderr ---\n{stderr}"
+    );
+    assert!(
+        responses[1].get("error").is_none(),
+        "initialize must succeed with a rule declared -- if this errors the row \
+         below never printed and the stdout assertion proved nothing: {:#?}",
+        responses[1],
+    );
+
+    // The row still has to be EMITTED, on stderr. Without this half the defect
+    // could be "fixed" by deleting the print, which would trade a corrupt
+    // channel for a silent expansion -- and the expansion is derived, so the
+    // row is the only evidence of which subpackages a pack actually built.
+    let row = stderr
+        .lines()
+        .find(|l| l.contains("### PACK SUBPACKAGES"))
+        .unwrap_or_else(|| {
+            panic!("no `### PACK SUBPACKAGES` row on stderr\n--- stderr ---\n{stderr}")
+        });
+    let expected: Vec<String> = vec![
+        "from=fixture".to_string(),
+        format!("rev={rev}"),
+        "rule=source/*".to_string(),
+        "found=3".to_string(),
+        "names=alpha,beta,gamma".to_string(),
+        "included=2".to_string(),
+        "excluded=gamma".to_string(),
+        "skipped=docs".to_string(),
+    ];
+    for want in &expected {
+        assert!(
+            row.contains(want.as_str()),
+            "the stderr row is missing `{want}`: {row}"
+        );
+    }
+
+    std::fs::remove_dir_all(&tmp).ok();
+}

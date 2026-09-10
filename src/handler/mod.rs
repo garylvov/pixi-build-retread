@@ -5343,7 +5343,31 @@ impl Handler {
                 .map_err(|error| RpcError::invalid_params(format!("{error:#}")))?;
             drop(leases);
             for row in rows {
-                println!("{row}");
+                // N27-RETREAD-180. STDERR, NEVER STDOUT, AND THIS IS NOT A
+                // STYLE CHOICE -- see the identical note on
+                // `### built-outputs REFUSED` below and on `### CONSTRAINS`.
+                // `crate::rpc::serve` owns `tokio::io::stdout()` as the
+                // JSON-RPC channel, so the `println!` that stood here put this
+                // `###` row into the protocol stream as the frontend's first
+                // frame: the relock died at initialize with
+                // `could not initialize the build-backend ... Unparseable
+                // message: expected value at line 1 column 1` on the first
+                // pack that declared a rule (SUBCERT-1, relock 6162669,
+                // environment `hover-gpu`, 18 s of lock wall, no cert). Every
+                // in-process test of this capability calls
+                // `crate::subpackages::expand` and asserts on the returned
+                // `Vec<String>`, so no assertion in 1976 library tests and 13
+                // integration targets ever saw the row cross a socket. The two
+                // readers that DO are
+                // `crate::rpc::tests::no_println_reaches_the_json_rpc_channel`
+                // (static: this needle, in the module that owns stdout) and
+                // `tests/jsonrpc_protocol.rs`'s
+                // `subpackage_expansion_row_does_not_corrupt_stdout` (a real
+                // transport over a real pipe, which is what fails if this
+                // line is ever put back). The harness already tees backend
+                // stderr into `<arm>.backend.log`, so this is where every
+                // other `###` row a lane greps lands.
+                eprintln!("{row}");
                 tracing::info!("{row}");
             }
         }
@@ -5814,9 +5838,18 @@ impl Handler {
                         // CHOICE. `rpc.rs` owns `tokio::io::stdout()` as the
                         // JSON-RPC channel: a `println!` from inside a handler
                         // interleaves a `###` row into the protocol stream and
-                        // corrupts the very lock it is reporting on. There is
-                        // exactly one `println!` anywhere in this module's
-                        // ancestry and it is not in a handler. The harness
+                        // corrupts the very lock it is reporting on. This
+                        // sentence used to read "there is exactly one
+                        // `println!` anywhere in this module's ancestry and it
+                        // is not in a handler", and TREE-ENUM-1 then added one
+                        // to `initialize` in THIS FILE and made the claim
+                        // false, which is how N27-RETREAD-180 happened: a
+                        // count written in prose has no reader. The count now
+                        // has one -- `crate::rpc::tests::
+                        // no_println_reaches_the_json_rpc_channel` refuses if
+                        // the needle appears anywhere under `src/handler/` or
+                        // in `src/rpc.rs`, and requires a named, reasoned
+                        // allow-list entry anywhere else in `src/`. The harness
                         // already tees backend STDERR into `<arm>.backend.log`
                         // (the `SHIM` every relock template writes), so this is
                         // also where every other backend row a lane greps lands.
