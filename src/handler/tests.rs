@@ -11902,13 +11902,15 @@ fn capwins5_the_emission_identity_moves_off_both_claimed_encodings() {
         "retread-built-output-emission-9",
     );
     assert!(
-        crate::lock::EMIT_EPOCH >= 60,
+        crate::lock::EMIT_EPOCH >= 61,
         "EMIT_EPOCH must clear 52 (695f108), 53 (e30b23f's own lineage), 54 (96ff3dd, \
          whose emission-3 records are poisoned), 55 (d51e284, the pre-constrains \
          basis), 56 (0be408a, whose emission-5 records carry the unsatisfiable \
          psutil bound), 57 (ff3795d, whose emission-6 records omit 47 bounds on \
          universe floats) and 58 (28ad0a0, whose emission-7 keep-mode records carry \
-         the collapsed depends lists); got {}",
+         the collapsed depends lists) and 60 (8ccd258, whose path sources lock \
+         `dependencies = []` for any tree whose egg-info lists no Requires-Dist -- \
+         METAGEN-2, N27-RETREAD-223); got {}",
         crate::lock::EMIT_EPOCH,
     );
 }

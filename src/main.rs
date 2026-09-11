@@ -607,10 +607,13 @@ fn run_path_source_manifest(args: &[String]) -> anyhow::Result<()> {
         dynamic,
         generated_records,
     )?;
-    // THE DERIVED-METADATA ROWS, before the records that carry them. One per
-    // source whose dependencies had to be BUILT because the tree states them
-    // nowhere; a run that prints none is a run in which every source stated its
-    // own facts, which is the fast and common case.
+    // THE ROWS, before the records that carry them: METAGEN-2's
+    // `### PATH SOURCE FACTS name=… deps=… requires_dist=… dynamic=…` for EVERY
+    // source, then METAGEN-1's `### EDITABLE METADATA DERIVED` for each source
+    // whose dependencies had to be BUILT. `deps=stated` is the fast and common
+    // case; `deps=derived` paid for a metadata build or read one back out of a
+    // generated record; `deps=absent` is the silent `dependencies = []` drop,
+    // which now says so instead of printing nothing (N27-RETREAD-223).
     for row in &metadata_rows {
         println!("{row}");
     }

@@ -249,9 +249,16 @@ pub struct TreeFacts {
     pub version: Option<TreeFact>,
     pub requires_python: Option<TreeFact>,
     /// `None` = the tree states nothing about its dependencies anywhere, so
-    /// there is nothing to check. `Some(vec![])` = it states that it has
-    /// none (protomotions' PKG-INFO with no `Requires-Dist` lines).
+    /// there is nothing to check and nothing to lock without deriving it.
+    /// `Some(vec![])` = it states that it has none, which ONLY a static
+    /// `[project].dependencies = []` says: see `requires_dist`.
     pub dependencies: Option<(Vec<String>, PathBuf)>,
+    /// How many `Requires-Dist` headers the tree's own `*.egg-info/PKG-INFO`
+    /// states — 0 both when there is no egg-info and when the egg-info lists
+    /// none. METAGEN-2 (N27-RETREAD-223): the two are told apart by
+    /// `dependencies`, and NEITHER is a statement that the tree has none.
+    /// Carried so the decision row can print the count it was decided on.
+    pub requires_dist: usize,
 }
 
 /// Read the tree's own statements of the four fields.
@@ -301,7 +308,28 @@ pub fn tree_facts(dir: &Path) -> Result<TreeFacts> {
                 _ => {}
             }
         }
-        if saw_headers {
+        facts.requires_dist = requires_dist.len();
+        // METAGEN-2 (N27-RETREAD-223). "The tree states its dependencies" means
+        // the metadata ACTUALLY STATES THEM. `saw_headers` was the predicate
+        // here, and it is true for any PKG-INFO carrying any header at all: a
+        // `Metadata-Version`/`Name`/`Version`/`Requires-Python` block with ZERO
+        // `Requires-Dist` lines was therefore read as the statement "this tree
+        // has no dependencies", the isolated build was skipped, and the shim
+        // locked `dependencies = []` with nothing in any log saying so. That is
+        // ProtoMotions' live PKG-INFO shape, measured: `grep -c '^Requires-Dist'`
+        // = 0 with `Metadata-Version: 2.4`.
+        //
+        // An empty `Requires-Dist` list in core metadata is not a statement of
+        // emptiness — for a tree whose `setup.py` COMPUTES `install_requires` it
+        // is the absence of one, and the egg-info a stale checkout carries says
+        // nothing about the tree as it stands today. So the PKG-INFO states the
+        // dependencies only when it LISTS them; the headers still state
+        // `name`/`version`/`requires-python` above, which is why those fields
+        // are read unconditionally and this one is not. A tree that really has
+        // none says so where it cannot be confused with silence: a static
+        // `[project].dependencies = []`, which `static_dependencies` reads and
+        // `derive_records` consults next.
+        if saw_headers && !requires_dist.is_empty() {
             facts.dependencies = Some((requires_dist, pkg_info));
         }
     }
@@ -653,10 +681,13 @@ pub fn materialize_declared_path_sources(
         .map(|d| d as &dyn DynamicDependencySource);
     let generated_records = config.path_source_generated_records.unwrap_or(true);
     let backend = backend_records(&pack_dir, workspace_root, records_dir, &manifest_text, dynamic, generated_records)?;
-    // THE ROWS. One per source whose dependencies had to be built because the
-    // tree states them nowhere. A row is printed for a BUILD, never for a tree
-    // that stated its own facts, so a silent run is the run where nothing was
-    // derived -- which is the common case and the fast one.
+    // THE ROWS. METAGEN-2's `### PATH SOURCE FACTS` row for EVERY source --
+    // which producer supplied its dependencies, how many `Requires-Dist` the
+    // egg-info stated, and whether the pyproject leaves them dynamic -- then
+    // METAGEN-1's `### EDITABLE METADATA DERIVED` row for each source whose
+    // dependencies had to be BUILT. A run in which nothing was built is no
+    // longer a silent run: the row that used to be missing is exactly the one
+    // worth reading (`deps=absent` is the `dependencies = []` drop).
     for row in &backend.metadata_rows {
         tracing::info!("{}", row);
     }
@@ -721,8 +752,9 @@ pub struct BackendRecords {
     /// Sources derived beside this pack whose shim the manifest points
     /// elsewhere — another pack's backend owns them.
     pub elsewhere: Vec<String>,
-    /// METAGEN-1's `### EDITABLE METADATA DERIVED` rows, carried out so
-    /// `initialize` can log them where a verb would print them.
+    /// METAGEN-2's `### PATH SOURCE FACTS` rows followed by METAGEN-1's
+    /// `### EDITABLE METADATA DERIVED` rows, carried out so `initialize` can log
+    /// them where a verb would print them.
     pub metadata_rows: Vec<String>,
 }
 
@@ -765,7 +797,11 @@ pub fn backend_records(
     let mut records = Vec::new();
     let mut confirmed = 0usize;
     let mut elsewhere = derivation.elsewhere;
-    let metadata_rows = derivation.metadata_rows;
+    // METAGEN-2: the decision rows come out on the same channel as the build
+    // rows, facts first, so the backend's `tracing` output and the verb's stdout
+    // carry the same evidence in the same order.
+    let mut metadata_rows = derivation.facts_rows;
+    metadata_rows.extend(derivation.metadata_rows);
     for record in derivation.records {
         let shim_rel = pathdiff_from_root(&canonical_root, &record.shim)?;
         if declares_path(manifest_text, &shim_rel) {
@@ -1551,6 +1587,15 @@ pub struct Derivation {
     /// verb writing to stdout, a backend writing to `tracing`), and a row that
     /// only one of them can emit is a producer half the system cannot read.
     pub metadata_rows: Vec<String>,
+    /// METAGEN-2 (N27-RETREAD-223). One `### PATH SOURCE FACTS` row per source,
+    /// ALWAYS — the decision itself, not the build. Separate from
+    /// `metadata_rows` because that vector's emptiness is a claim several
+    /// guards make ("a silent run is a run in which nothing was built"), while
+    /// this vector is never empty for a manifest that declares a source: the
+    /// case worth reading is exactly the one that used to print nothing
+    /// (`deps=absent`). Both vectors reach the same output channel — every
+    /// caller that prints one prints the other, facts first.
+    pub facts_rows: Vec<String>,
 }
 
 /// METAGEN-1's seam into the derivation: the LAST-RESORT reader of a path
@@ -1711,6 +1756,7 @@ pub fn derive_records(
     let mut derived = Vec::new();
     let mut elsewhere = Vec::new();
     let mut metadata_rows: Vec<String> = Vec::new();
+    let mut facts_rows: Vec<String> = Vec::new();
     let mut derived_records_to_write: Vec<(PathBuf, String)> = Vec::new();
     for (project, (declared_path, scopes, mut pack_candidates)) in candidates {
         if pack_candidates.len() > 1 {
@@ -1792,13 +1838,37 @@ pub fn derive_records(
         //     honestly parse, so before this the derivation emitted
         //     `dependencies = []` SILENTLY and dropped `psutil` and `cmaes`.
         //     Ask the tree's own build backend, in an isolated environment.
+        //
+        // METAGEN-2 (N27-RETREAD-223). `static_dependencies` is ALSO the reader
+        // that decides `dynamic`: it returns `None` when the tree's pyproject
+        // lists `dependencies` in `[project].dynamic`, when it has no `[project]`
+        // table, and when there is no pyproject at all — the three shapes in
+        // which the ONLY honest producer is the tree's own build backend. It
+        // returns `Some(vec![])` for an explicit `dependencies = []`, which IS a
+        // statement of emptiness and must never be built for.
+        let stated_statically = crate::derived_editable_metadata::static_dependencies(&tree)
+            .with_context(|| {
+                format!("reading `{project}`'s own [project] table at {}", tree.display())
+            })?;
+        let dependencies_are_dynamic = stated_statically.is_none();
+        // Where the dependencies that get LOCKED came from, as one word, for the
+        // decision row below: `stated` = the tree itself said them (PKG-INFO
+        // `Requires-Dist` or a static `[project].dependencies`), `derived` = a
+        // metadata build said them (this run's, or one written down in a
+        // generated record), `absent` = nobody said them and `dependencies = []`
+        // is about to be locked. Before METAGEN-2 the third case was
+        // unobservable, which is what made the silence a defect rather than a
+        // choice.
+        let mut deps_source = if facts.dependencies.is_some() {
+            "stated"
+        } else {
+            "absent"
+        };
         if facts.dependencies.is_none()
-            && let Some(stated) =
-                crate::derived_editable_metadata::static_dependencies(&tree).with_context(|| {
-                    format!("reading `{project}`'s own [project] table at {}", tree.display())
-                })?
+            && let Some(stated) = stated_statically
         {
             facts.dependencies = Some((stated, tree.join("pyproject.toml")));
+            deps_source = "stated";
         }
         // THE GENERATED RECORD IS THE RECORD OF TRUTH; THE STORE IS THE CACHE.
         // A record already on disk whose `source-hash` matches the tree's hash
@@ -1830,6 +1900,10 @@ pub fn derive_records(
                         });
                     }
                     recorded = Some(on_disk);
+                    // A generated record IS a derivation, written down. The row
+                    // says `derived` and not `stated` so a reader can never
+                    // mistake the record for the tree's own statement.
+                    deps_source = "derived";
                 } else {
                     record_stale = true;
                 }
@@ -1869,6 +1943,7 @@ pub fn derive_records(
                 if record_stale { "stale-record" } else { "no-record" }
             ));
             derived_records_to_write.push((record_file.clone(), derived.source_hash.clone()));
+            deps_source = "derived";
             facts.dependencies = Some((derived.metadata.requires_dist.clone(), tree.clone()));
             // The same build states these two as well, and a tree that states
             // neither anywhere else would otherwise lose them.
@@ -1889,6 +1964,21 @@ pub fn derive_records(
                 });
             }
         }
+
+        // THE DECISION, AS A ROW, FOR EVERY SOURCE — the reader METAGEN-2 owes.
+        // `### EDITABLE METADATA DERIVED` prints only when a build ran, so the
+        // two cases that lock `dependencies = []` printed NOTHING: the tree
+        // whose PKG-INFO lists no `Requires-Dist` (arm C, ProtoMotions) and the
+        // run with the deriver switched off (arm A-off). One row per source,
+        // always, names which producer supplied the dependencies and the two
+        // facts the choice was made on, so a relock's evidence packet can be
+        // read for `deps=absent` instead of inferring it from a silence.
+        facts_rows.push(format!(
+            "### PATH SOURCE FACTS name={project} deps={deps_source} \
+             requires_dist={} dynamic={}",
+            facts.requires_dist,
+            if dependencies_are_dynamic { "yes" } else { "no" }
+        ));
 
         let seed = PathSourceEntry {
             path: real_path.clone(),
@@ -1977,6 +2067,7 @@ pub fn derive_records(
         records: derived,
         elsewhere,
         metadata_rows,
+        facts_rows,
     })
 }
 /// The canonical manifest, transformed. `text` is what gets locked.
@@ -1988,7 +2079,8 @@ pub struct EffectiveManifest {
     /// caller can print where each one came from: a derivation nobody can read
     /// back is the same defect as a record nobody wrote.
     pub derived: Vec<DerivedRecord>,
-    /// METAGEN-1's `### EDITABLE METADATA DERIVED` rows, in project order.
+    /// METAGEN-2's `### PATH SOURCE FACTS` rows then METAGEN-1's
+    /// `### EDITABLE METADATA DERIVED` rows, in project order.
     pub metadata_rows: Vec<String>,
 }
 
@@ -2069,7 +2161,10 @@ pub fn plan_effective_manifest(
         );
     }
     let derived = derivation.records;
-    let metadata_rows = derivation.metadata_rows;
+    // METAGEN-2: facts rows first, then the build rows — one stream, one order,
+    // whichever caller prints it.
+    let mut metadata_rows = derivation.facts_rows;
+    metadata_rows.extend(derivation.metadata_rows);
 
     // A named pack that stands in for nothing is a gate with no producer: the
     // argument list and the manifest disagree and one of them is stale.
@@ -3643,6 +3738,23 @@ mod effective_manifest_tests {
         }))
         .unwrap();
         cfg.path_source_metadata = Some(true);
+        // METAGEN-2 (N27-RETREAD-223). THE TWO HALVES MUST BE HANDED THE SAME
+        // DEPENDENCY PRODUCER, or this is not a parity test.
+        //
+        // The verb half above is called with `dynamic = None`; the backend half
+        // reads its producer from the config, where the key's default is ON. At
+        // 8ccd258 that difference was invisible, because `tree_facts` treated
+        // `protomotions`' `*.egg-info/PKG-INFO` -- headers, ZERO
+        // `Requires-Dist`, which is the LIVE tree's shape -- as a statement that
+        // the tree has no dependencies, so neither half ever reached a
+        // derivation. With the empty list no longer read as a statement, the
+        // backend half derives and writes a generated record while the verb half
+        // cannot, and the two halves would be compared across DIFFERENT
+        // producers. Declaring the deriver off here keeps the comparison the one
+        // this guard was written to make -- one derivation, one writer, the same
+        // bytes -- and the derivation itself is driven by the five
+        // `metagen2_arm_*` guards, on trees built for it.
+        cfg.derive_editable_metadata = Some(false);
         let manifest_text = std::fs::read_to_string(root.join("pixi.toml")).unwrap();
         let mut rows = Vec::new();
         for pack in &packs {
@@ -4259,6 +4371,270 @@ body
         assert!(
             dem::ConfiguredDeriver::from_config(None, None, &|_| None, std::env::temp_dir())
                 .is_some()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // METAGEN-2 (N27-RETREAD-223). THE FOUR SHAPES OF
+    // `tools/metagen_reachability_fixture.sh`, IN RUST.
+    //
+    // The shell fixture ran on the real binary (job 6217291, node2342, binsnap
+    // `cand-8ccd258`) and measured the defect:
+    //
+    //   arm A     egg_info=0 requires_dist=0 -> derived=1 record=1 deps=[psutil,cmaes]
+    //   arm A-off same bytes, deriver off    -> derived=0 record=0 deps=[]
+    //   arm B     egg_info=1 requires_dist=2 -> derived=0 record=0 deps=[psutil,cmaes]
+    //   arm C     egg_info=1 requires_dist=0 -> derived=0 record=0 deps=[]   <-- DEFECT
+    //
+    // Arm C is ProtoMotions' live PKG-INFO shape and arm B is pace's. These five
+    // guards are the same four arms plus the one that stops the fix from
+    // becoming a threshold, and arm C is the one that is RED at 8ccd258.
+    // -----------------------------------------------------------------------
+
+    /// Write the tree's own `*.egg-info/PKG-INFO` with `rd` `Requires-Dist`
+    /// headers — the ONE file the four arms differ in.
+    fn egg_info(tree: &Path, rd: usize) {
+        let egg = tree.join("pace_sim2real.egg-info");
+        std::fs::create_dir_all(&egg).unwrap();
+        let mut info = String::from(
+            "Metadata-Version: 2.4\nName: pace_sim2real\nVersion: 0.1.2\n\
+             Requires-Python: >=3.10\n",
+        );
+        for dep in STAGED_DEPENDENCIES.iter().take(rd) {
+            info.push_str(&format!("Requires-Dist: {dep}\n"));
+        }
+        info.push_str("\nbody\n");
+        std::fs::write(egg.join("PKG-INFO"), info).unwrap();
+    }
+
+    /// The one `### PATH SOURCE FACTS` row a one-source fixture must print.
+    fn facts_row(derivation: &Derivation) -> String {
+        assert_eq!(
+            derivation.facts_rows.len(),
+            1,
+            "one source, one decision row: {:?}",
+            derivation.facts_rows
+        );
+        derivation.facts_rows[0].clone()
+    }
+
+    fn metagen2_source<'a>(builder: &'a Counting) -> Source<'a> {
+        Source {
+            options: dem::DeriveOptions {
+                enabled: true,
+                store_root: None,
+            },
+            builder,
+        }
+    }
+
+    /// ARM A. No egg-info at all: the derivation fires, writes its record, and
+    /// the decision row says the dependencies were DERIVED.
+    #[test]
+    fn metagen2_arm_a_no_egg_info_derives_and_says_so_in_the_row() {
+        let (root, packs) = fixture("m2-arm-a");
+        let builder = Counting::outside();
+        let source = metagen2_source(&builder);
+        let derivation = derive_records(
+            &packs,
+            &root,
+            RECORDS_DIR_DEFAULT,
+            MANIFEST,
+            Some(&source as &dyn DynamicDependencySource),
+            true,
+        )
+        .unwrap();
+        assert_eq!(builder.calls(), 1, "a tree that states nothing is built");
+        assert_eq!(
+            derivation.records[0].record.entry.dependencies,
+            STAGED_DEPENDENCIES.map(str::to_string).to_vec()
+        );
+        assert!(
+            packs[0]
+                .join(RECORDS_DIR_DEFAULT)
+                .join("pace-sim2real.toml")
+                .is_file(),
+            "the derivation is written down"
+        );
+        assert_eq!(
+            facts_row(&derivation),
+            "### PATH SOURCE FACTS name=pace-sim2real deps=derived \
+             requires_dist=0 dynamic=yes"
+        );
+    }
+
+    /// ARM A-OFF. The same bytes with the deriver switched off: no build, and
+    /// the row NAMES the silent drop that used to print nothing at all. This is
+    /// the control that proves the other arms measure the PKG-INFO and not a
+    /// dead switch — and the row is the whole reader half of METAGEN-2, because
+    /// `dependencies = []` reaches the lock here and always did.
+    #[test]
+    fn metagen2_arm_a_off_locks_an_empty_list_and_the_row_says_absent() {
+        let (root, packs) = fixture("m2-arm-a-off");
+        let derivation =
+            derive_records(&packs, &root, RECORDS_DIR_DEFAULT, MANIFEST, None, true).unwrap();
+        assert!(
+            derivation.records[0].record.entry.dependencies.is_empty(),
+            "with the deriver off the silent drop is what happens"
+        );
+        assert!(
+            derivation.metadata_rows.is_empty(),
+            "nothing was built, so METAGEN-1 prints nothing: {:?}",
+            derivation.metadata_rows
+        );
+        assert_eq!(
+            facts_row(&derivation),
+            "### PATH SOURCE FACTS name=pace-sim2real deps=absent \
+             requires_dist=0 dynamic=yes",
+            "the drop must be READABLE; a run that prints nothing is the defect"
+        );
+    }
+
+    /// ARM B. Production's pace shape — an egg-info that LISTS its two
+    /// dependencies. The right answer without a build, and the row says the
+    /// tree STATED them. This arm must not move: it is the 39 ms class, and a
+    /// fix that made it build would be a regression dressed as a root fix.
+    #[test]
+    fn metagen2_arm_b_an_egg_info_that_lists_requires_dist_is_a_statement() {
+        let (root, packs) = fixture("m2-arm-b");
+        egg_info(&root.join(PACE_REL), 2);
+        let builder = Counting::outside();
+        let source = metagen2_source(&builder);
+        let derivation = derive_records(
+            &packs,
+            &root,
+            RECORDS_DIR_DEFAULT,
+            MANIFEST,
+            Some(&source as &dyn DynamicDependencySource),
+            true,
+        )
+        .unwrap();
+        assert_eq!(builder.calls(), 0, "a stated list must NEVER be built");
+        assert!(derivation.metadata_rows.is_empty(), "{:?}", derivation.metadata_rows);
+        assert_eq!(
+            derivation.records[0].record.entry.dependencies,
+            STAGED_DEPENDENCIES.map(str::to_string).to_vec(),
+            "the PKG-INFO's own list is what gets locked"
+        );
+        assert!(
+            !packs[0]
+                .join(RECORDS_DIR_DEFAULT)
+                .join("pace-sim2real.toml")
+                .exists(),
+            "nothing was derived, so no record is written"
+        );
+        assert_eq!(
+            facts_row(&derivation),
+            "### PATH SOURCE FACTS name=pace-sim2real deps=stated \
+             requires_dist=2 dynamic=yes"
+        );
+    }
+
+    /// ARM C — THE DEFECT, AND THE ARM THAT IS RED AT 8ccd258.
+    ///
+    /// An egg-info carrying only headers and ZERO `Requires-Dist` satisfied
+    /// `if saw_headers` in `tree_facts`, so `facts.dependencies` read
+    /// `Some(vec![])`, the isolated build was skipped, and the shim locked
+    /// `dependencies = []` with nothing saying a derivation had been suppressed.
+    /// At 8ccd258 this test measures `builder.calls() == 0` and an empty list.
+    #[test]
+    fn metagen2_arm_c_an_egg_info_without_requires_dist_does_not_silence_the_derivation() {
+        let (root, packs) = fixture("m2-arm-c");
+        let tree = root.join(PACE_REL);
+        egg_info(&tree, 0);
+
+        // THE PREDICATE ITSELF, one level down: headers state the other three
+        // fields and say NOTHING about dependencies.
+        let facts = tree_facts(&tree).unwrap();
+        assert_eq!(facts.version.as_ref().unwrap().value, "0.1.2");
+        assert_eq!(facts.requires_python.as_ref().unwrap().value, ">=3.10");
+        assert_eq!(facts.requires_dist, 0);
+        assert!(
+            facts.dependencies.is_none(),
+            "an egg-info that lists no Requires-Dist states nothing about deps"
+        );
+
+        let builder = Counting::outside();
+        let source = metagen2_source(&builder);
+        let derivation = derive_records(
+            &packs,
+            &root,
+            RECORDS_DIR_DEFAULT,
+            MANIFEST,
+            Some(&source as &dyn DynamicDependencySource),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            builder.calls(),
+            1,
+            "an egg-info with no Requires-Dist must NOT silence the derivation"
+        );
+        assert_eq!(
+            derivation.records[0].record.entry.dependencies,
+            STAGED_DEPENDENCIES.map(str::to_string).to_vec(),
+            "ProtoMotions' real dependencies must reach the lock"
+        );
+        let record = packs[0].join(RECORDS_DIR_DEFAULT).join("pace-sim2real.toml");
+        assert!(record.is_file(), "the derivation is written down");
+        assert_eq!(derivation.metadata_rows.len(), 2, "{:?}", derivation.metadata_rows);
+        assert!(
+            derivation.metadata_rows[0].starts_with("### EDITABLE METADATA DERIVED path="),
+            "{:?}",
+            derivation.metadata_rows
+        );
+        assert_eq!(
+            facts_row(&derivation),
+            "### PATH SOURCE FACTS name=pace-sim2real deps=derived \
+             requires_dist=0 dynamic=yes"
+        );
+    }
+
+    /// THE FIX IS NOT A THRESHOLD. An EXPLICIT static `dependencies = []` IS a
+    /// statement that the tree has none, so it must never be built for and the
+    /// row must read `deps=stated dynamic=no` — the one place emptiness is
+    /// legible. Without this guard the fix reads as "an empty list always
+    /// means derive", which would pay a metadata build forever for every
+    /// genuinely dependency-free editable.
+    #[test]
+    fn metagen2_an_explicit_empty_static_dependency_list_is_a_statement_and_is_never_built() {
+        let (root, packs) = fixture("m2-static-empty");
+        let tree = root.join(PACE_REL);
+        // Headers only, AND an explicit empty static list: the static table is
+        // the more authoritative of the two statements and settles it.
+        egg_info(&tree, 0);
+        std::fs::write(
+            tree.join("pyproject.toml"),
+            format!(
+                "{PACE_PYPROJECT}\n[project]\nname = \"pace_sim2real\"\n\
+                 version = \"0.1.2\"\nrequires-python = \">=3.10\"\n\
+                 dependencies = []\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            dem::static_dependencies(&tree).unwrap(),
+            Some(Vec::new()),
+            "an explicit empty list is a STATEMENT, not silence"
+        );
+        let builder = Counting::outside();
+        let source = metagen2_source(&builder);
+        let derivation = derive_records(
+            &packs,
+            &root,
+            RECORDS_DIR_DEFAULT,
+            MANIFEST,
+            Some(&source as &dyn DynamicDependencySource),
+            true,
+        )
+        .unwrap();
+        assert_eq!(builder.calls(), 0, "an explicit empty list is never built for");
+        assert!(derivation.records[0].record.entry.dependencies.is_empty());
+        assert!(derivation.metadata_rows.is_empty(), "{:?}", derivation.metadata_rows);
+        assert_eq!(
+            facts_row(&derivation),
+            "### PATH SOURCE FACTS name=pace-sim2real deps=stated \
+             requires_dist=0 dynamic=no"
         );
     }
 

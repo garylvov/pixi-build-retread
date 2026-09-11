@@ -10998,10 +10998,20 @@ pillow = ">=10,<13"
         // (see `crate::lock::EMIT_EPOCH`), which this test does not exercise,
         // so the pin is updated rather than deleted -- a deleted pin is one
         // fewer reader for the constant.
+        //
+        // N27-RETREAD-223 (METAGEN-2) moves it from 60 to 61 for a reason that
+        // is not about this door AT ALL: a path source whose `*.egg-info/PKG-INFO`
+        // lists no `Requires-Dist` now derives its dependencies instead of
+        // locking `dependencies = []`, so the emitted shim and the generated
+        // record can move for the same manifest inputs. Nothing about the
+        // no-lock float case changes, which is exactly why this pin is UPDATED
+        // and not deleted: it is a reader for the constant, and a reader that
+        // cannot notice a bump is not one.
         assert_eq!(
             crate::lock::EMIT_EPOCH,
-            60,
-            "the no-lock case is unchanged; the epoch moved for the keep half only",
+            61,
+            "the no-lock case is unchanged; the epoch moved for the keep half (-221) \
+             and for the path-source derivation (-223)",
         );
     }
 }

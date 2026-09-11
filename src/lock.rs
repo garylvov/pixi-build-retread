@@ -986,7 +986,52 @@ pub const SCHEMA: u32 = 20;
 /// emits exactly what it emitted at 59 -- which is what
 /// `fact1_with_no_lock_the_float_still_decides_and_the_ordinary_case_is_unchanged`
 /// pins.
-pub const EMIT_EPOCH: u32 = 60;
+///
+/// 61 (N27-RETREAD-223, METAGEN-2): an `*.egg-info/PKG-INFO` carrying headers
+/// but ZERO `Requires-Dist` no longer counts as the tree having STATED that it
+/// has no dependencies, so a path source in that shape derives its metadata
+/// instead of locking `dependencies = []`. THE EMITTED BYTES MOVE, AND THE
+/// MEASUREMENT IS THE FIXTURE: `tools/metagen_reachability_fixture.sh` arm C —
+/// `egg_info=1 requires_dist=0`, which is `third_party/ProtoMotions`'s live
+/// PKG-INFO shape (`grep -c '^Requires-Dist'` = 0, `Metadata-Version: 2.4`) —
+/// went `derived=0 record=0 shim_deps=[]` at 60 and `derived=1 record=1
+/// shim_deps=["psutil", "cmaes"]` here. A generated record that now EXISTS
+/// where none did, and a shim whose `[project].dependencies` now lists the
+/// tree's real requirements where it listed none, is an emitted-bytes change
+/// for identical manifest inputs: an environment consuming such a path source
+/// resolves a different pypi set, so a committed lock replayed under epoch 60
+/// would carry the silent `dependencies = []` resolution.
+///
+/// THE ONE NUMBER THAT KEEPS THIS HONEST, MEASURED ON THE LIVE TREE RATHER THAN
+/// ASSUMED: `third_party/ProtoMotions/setup.py` declares NO `install_requires`
+/// at all (`name`, `version`, `packages`, `description`, `author`,
+/// `python_requires` and nothing else) and its egg-info carries no
+/// `requires.txt`, so the metadata build derives an EMPTY list — the same list
+/// that was being locked silently. For today's workspace the lock therefore does
+/// not move; what moves is that the empty list is now a DERIVED, provenanced
+/// statement with a generated record behind it instead of a silence, and the
+/// build is paid once per source hash. The bump is still the right call under
+/// this constant's own rule — the change CAN alter emitted bytes for identical
+/// inputs, and does for any tree in that shape whose backend computes a
+/// non-empty list (the fixture's arm C, `["psutil", "cmaes"]`) — and the rule
+/// says bump when in doubt, because a needless bump costs one cold solve per
+/// pack and a missed one is invisible. Arm B —
+/// `requires_dist=2`, pace's live shape — is UNCHANGED (`derived=0`, the
+/// PKG-INFO's own list locked without a build), and a tree with an explicit
+/// static `dependencies = []` is unchanged too, so the packs that move are
+/// exactly the ones that were locking a list nobody stated.
+///
+/// `BUILT_OUTPUT_SCHEMA` DELIBERATELY DOES NOT MOVE WITH THIS ONE, and the
+/// reason is the arithmetic generations 7–9 spell out, read the other way: it
+/// is folded by `backend_behaviour_identity()` to invalidate `conda/outputs`
+/// RECORDS, and a pack's emitted `depends`/`constrains` are not a function of a
+/// path-source shim. The shim is materialised at `initialize` as a
+/// WORKSPACE-scoped side effect for pixi's own pypi resolver
+/// (`materialize_declared_path_sources` in `Handler::initialize`), and the
+/// built-output key material hashes the pack's `pixi.toml`, not the shim. Every
+/// emission-9 record stays addressable and stays correct; what must not be
+/// replayed is the LOCK, which is what this constant gates.
+pub const EMIT_EPOCH: u32 = 61;
 
 fn parse_stored_glibc(value: Option<&str>) -> Option<Option<(u32, u32)>> {
     match value {
