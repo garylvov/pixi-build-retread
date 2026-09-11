@@ -2511,16 +2511,15 @@ mod tests {
             "a rename would have clobbered the bytes a reader was already handed"
         );
 
-        // And the loser, driven through the production entry point, leaves holding
-        // the winner's world rather than its own.
-        let cell: std::sync::OnceLock<Vec<crate::repodata::RepodataDocument>> =
+        // A backend that arrives AFTER the world is on disk never lists the cache
+        // root at all: it is handed the world at step 2.
+        let late: std::sync::OnceLock<Vec<crate::repodata::RepodataDocument>> =
             std::sync::OnceLock::new();
-        let taken = loser_world.clone();
         let (held, verdict, order) = u1_block_on(crate::repodata::relock_document_world_with(
-            &cell,
+            &late,
             Some(relock.path()),
             cache_root.path(),
-            move || async move { (taken, "listed") },
+            s3_must_not_list,
         ));
         assert_eq!(verdict, crate::repodata::DocumentWorld::Handed);
         assert_eq!(
@@ -2528,6 +2527,65 @@ mod tests {
             "the world was already on disk, so no snapshot was taken at all"
         );
         assert_eq!(held, winner_world);
+
+        // THE RACE ITSELF, AND THIS IS THE ARM THE RE-READ EXISTS FOR. The
+        // previous section cannot test it: with the world already on disk the
+        // loser is handed it at step 2 and never reaches the publish, so removing
+        // the re-read leaves that assertion passing. (Measured: gate 6229906's m3
+        // arm found exactly that and this section is its answer.) The real race is
+        // a backend whose step-2 read found NOTHING and whose OWN LISTING then
+        // took long enough for a sibling to publish -- fourteen launches inside
+        // 21 ms make that the normal case -- so the sibling's publish is staged
+        // from inside the snapshot closure, which is precisely when it happens.
+        let raced_relock = Scratch::new("s3-a2-raced");
+        let raced_path =
+            crate::repodata::relock_world_path(raced_relock.path(), cache_root.path());
+        assert!(
+            crate::repodata::read_relock_document_world(&raced_path, cache_root.path()).is_none(),
+            "the raced relock must start with NO world, or step 2 answers and the \
+             publish is never reached"
+        );
+        let cell: std::sync::OnceLock<Vec<crate::repodata::RepodataDocument>> =
+            std::sync::OnceLock::new();
+        let ours = loser_world.clone();
+        let sibling = winner_world.clone();
+        let sibling_path = raced_path.clone();
+        let sibling_root = cache_root.path().to_path_buf();
+        let (held, verdict, order) = u1_block_on(crate::repodata::relock_document_world_with(
+            &cell,
+            Some(raced_relock.path()),
+            cache_root.path(),
+            move || async move {
+                // The sibling backend wins WHILE this one is listing.
+                assert!(crate::repodata::publish_relock_document_world(
+                    &sibling_path,
+                    &sibling_root,
+                    &sibling
+                ));
+                (ours, "listed")
+            },
+        ));
+        assert_eq!(
+            order,
+            Some("listed"),
+            "this backend DID list the root -- that is what made it the loser"
+        );
+        assert_eq!(
+            verdict,
+            crate::repodata::DocumentWorld::Handed,
+            "a backend whose publish lost must report the world as HANDED, not as \
+             its own"
+        );
+        assert_eq!(
+            held, winner_world,
+            "the loser of the race must leave holding the WINNER's world; its own \
+             bytes reach nobody"
+        );
+        assert_eq!(
+            crate::repodata::read_relock_document_world(&raced_path, cache_root.path()),
+            Some(winner_world.clone()),
+            "and the loser must not have overwritten what it lost to"
+        );
     }
 
     /// STOREV3-3 -- THE HANDED WORLD IS REFUSED WHEN IT IS ABOUT ANOTHER CACHE
