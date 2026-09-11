@@ -5998,6 +5998,15 @@ impl Handler {
         // entry -- so without this the first record this binary refuses makes
         // that key permanently cold for every job that shares the store.
         let mut built_output_store_refused = false;
+        // STOREV3-3 / N27-RETREAD-226. This key's refusal was a LEGACY record --
+        // one that parses, whose world moved, and that carries no relevant set
+        // for the v4 arm to walk -- so the cold compute below is its ONE-TIME
+        // UPGRADE and not a refusal that will recur on every roll. Carried to the
+        // publish, which is where the other half of the claim is measured: a
+        // republish that stamps no relevant set has NOT upgraded anything and
+        // this key will refuse again on the next roll, which is a defect with a
+        // named actuator rather than a silent recurrence.
+        let mut built_output_legacy_upgrade = false;
         // STOREV3-2 / N27-RETREAD-226. Where the process's solved-name log stood
         // BEFORE this request's cold compute. The delta taken at the publish
         // below is THIS record's relevant set; the un-marked whole is the
@@ -6042,40 +6051,56 @@ impl Handler {
             // records at 21:04:01 naming the document it had just replaced, and
             // replaced pytorch again at 21:06: one run, three reader universes,
             // fourteen quarantines, and fourteen byte-identical recomputes.
-            let (reader_documents, consult_order, document_world) =
-                match crate::repodata::frozen_reader_documents() {
-                    Some(frozen) => (
-                        frozen,
-                        "frozen",
-                        crate::repodata::DocumentWorld::Frozen,
-                    ),
-                    None => {
-                        let (documents, order) = if payload.is_some() {
-                            let (documents, primed) =
-                                crate::repodata::snapshot_documents_after_universe(
-                                    &params.channels,
-                                    cache_target.conda_subdir(),
-                                )
+            //
+            // STOREV3-3 / N27-RETREAD-226: AND THE WORLD IS ESTABLISHED ONCE PER
+            // RELOCK, NOT ONCE PER PROCESS. MERGE-B46 §3e measured fourteen
+            // `pixi-build-retread starting` lines inside 21 ms on R2's backend
+            // log -- one BACKEND PROCESS PER PACK, each making exactly one
+            // consult -- so a process `OnceLock` had nothing to prevent and every
+            // row read `world=snapshotted`, never `frozen`. The reference now
+            // travels through `cache_dir`, which is pixi's `initialize`
+            // `cache_directory` param and the same relock-scoped directory the
+            // cross-process `conda/outputs` memo above and the route-probe
+            // verdict store already keep per-relock state in. The first consult
+            // in the relock to find a non-empty snapshot publishes it there
+            // create-once; the other thirteen are HANDED those exact bytes and
+            // never list the cache root at all. STOREV3-2's freeze is now the
+            // CONSUMER of that world rather than the producer of a per-process
+            // one.
+            let have_record = payload.is_some();
+            let channels = params.channels.clone();
+            let subdir = cache_target.conda_subdir().to_string();
+            let (reader_documents, document_world, snapshot_order) =
+                crate::repodata::relock_document_world(Some(cache_dir.as_path()), move || async move {
+                    if have_record {
+                        let (documents, primed) =
+                            crate::repodata::snapshot_documents_after_universe(&channels, &subdir)
                                 .await;
-                            (
-                                documents,
-                                if primed {
-                                    "after-universe"
-                                } else {
-                                    "reader-already-warm"
-                                },
-                            )
-                        } else {
-                            (
-                                crate::repodata::prime_snapshot_documents().await,
-                                "no-record",
-                            )
-                        };
-                        let (documents, world) =
-                            crate::repodata::freeze_reader_documents(documents);
-                        (documents, order, world)
+                        (
+                            documents,
+                            if primed {
+                                "after-universe"
+                            } else {
+                                "reader-already-warm"
+                            },
+                        )
+                    } else {
+                        (
+                            crate::repodata::prime_snapshot_documents().await,
+                            "no-record",
+                        )
                     }
-                };
+                })
+                .await;
+            // `None` means no snapshot was taken, and then the ORDER is the world
+            // itself: this process reused its own freeze, or a sibling backend's
+            // world was handed to it. Neither listed the cache root, which is the
+            // whole point of both arms.
+            let consult_order = snapshot_order.unwrap_or(match document_world {
+                crate::repodata::DocumentWorld::Frozen => "frozen",
+                crate::repodata::DocumentWorld::Handed => "handed",
+                _ => "none",
+            });
             // STDERR, never STDOUT -- `rpc.rs` owns stdout as the JSON-RPC
             // channel, and `rpc::tests::no_println_reaches_the_json_rpc_channel`
             // refuses a `println!` anywhere under `src/handler/`. See the longer
@@ -6154,6 +6179,44 @@ impl Handler {
                                 &record,
                                 &reader_documents,
                                 reader_candidate_universe.as_deref(),
+                            );
+                        }
+                        // STOREV3-3 / N27-RETREAD-226. A LEGACY RECORD IS NOT
+                        // SILENTLY v4-SKIPPED. MERGE-B46's R2 read
+                        // `0 hit / 14 refused` with `relevant=0` and
+                        // `v3=not-computed` on every one of the fourteen, and
+                        // the log said nothing about why the v4 arm never ran or
+                        // whether the republish that followed would end it. The
+                        // two are completely different operational facts: a
+                        // one-time upgrade costs one cold compute per key ever,
+                        // and a recurring refusal costs one per key per roll.
+                        //
+                        // WHY THE SET IS NOT RECOMPUTED FROM THE RECORD'S OWN
+                        // BYTES, which is the cheaper repair and is UNSOUND --
+                        // measured, not argued. On live record
+                        // `262285b84e7c546aab2ded842f5ddc03` the stamped solved
+                        // set holds 216 names while every `"name"` in the whole
+                        // rest of the record holds 28, of which 26 are in the
+                        // solved set: 190 of 216 selected names are NOT in the
+                        // record's emitted spec. A set derived from the spec
+                        // would therefore be a strict SUBSET of the solve, and
+                        // `conda_solve::solved_names_since`'s own note names a
+                        // subset as the one direction that can admit a record
+                        // whose world moved. So the repair is a REFRESH, and the
+                        // refusal that carries it is printed as such.
+                        if crate::built_output_store::needs_legacy_upgrade(&record, &verdict) {
+                            built_output_legacy_upgrade = true;
+                            // STDERR, never STDOUT -- see the `### STORE CONSULT`
+                            // row above.
+                            eprintln!(
+                                "### STORE UNIVERSE legacy-upgrade key={key} stage=consult relevant=0 roots={} v3_recorded={} world={document_world} documents={} -- this record predates the relevant set, so the v4 arm cannot be asked and the cold compute below is its ONE-TIME upgrade; the publish row says whether it took",
+                                record.reachable_roots.len(),
+                                if record.candidate_universe.is_empty() {
+                                    "no"
+                                } else {
+                                    "yes"
+                                },
+                                reader_documents.len(),
                             );
                         }
                         // STDERR, never STDOUT -- see the `### STORE CONSULT`
@@ -7470,6 +7533,37 @@ impl Handler {
                         relevant = solved_names.len(),
                         "bench: built_output_store publishing a record with NO candidate universe; every reader will fall back to whole-document containment (N27-RETREAD-204, narrowed by N27-RETREAD-226)",
                     );
+                }
+                // STOREV3-3 / N27-RETREAD-226. THE OTHER HALF OF THE LEGACY
+                // UPGRADE, and it is the half that makes the "once, not every
+                // roll" claim falsifiable. The consult above printed
+                // `stage=consult` for a record that could not reach the v4 arm;
+                // this row says whether the republish taking its address actually
+                // carries a relevant set. `upgraded=yes` means this key's next
+                // roll is a v4 question. `upgraded=no` means it is NOT -- the key
+                // will refuse again on every roll forever -- and that is loud with
+                // a named actuator rather than left to be inferred from an
+                // unchanging `relevant=0` across nights.
+                if built_output_legacy_upgrade {
+                    // STDERR, never STDOUT -- see the `### STORE CONSULT` row.
+                    eprintln!(
+                        "### STORE UNIVERSE legacy-upgrade key={key} stage=publish upgraded={} relevant={} v3={}",
+                        if solved_names.is_empty() { "no" } else { "yes" },
+                        solved_names.len(),
+                        if candidate_universe.is_empty() {
+                            "none"
+                        } else {
+                            candidate_universe.as_str()
+                        },
+                    );
+                    if solved_names.is_empty() {
+                        tracing::warn!(
+                            key = %key,
+                            root = %store.root().display(),
+                            roots = reachable_roots.len(),
+                            "bench: built_output_store legacy upgrade did NOT take -- this key was refused for a moved world, carried no relevant set, and its replacement carries none either, so every future roll refuses it again and pays a full cold compute. ACTUATOR: this request's cold pass selected no conda package names at all, so `conda_solve::record_solved_names` never ran for it; either this pack genuinely runs no conda solve (in which case the built-output store cannot narrow it and the whole-document bridge is the only rule it will ever have) or the solve path that serves it does not register its selections, which is a missing writer for law 2's pair (N27-RETREAD-226)",
+                        );
+                    }
                 }
                 match crate::built_output_store::encode(
                     &store_key.inputs_digest,

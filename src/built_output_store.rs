@@ -450,6 +450,41 @@ pub fn relevant_set(record: &Record) -> &[String] {
     &record.solved_names
 }
 
+/// STOREV3-3 / N27-RETREAD-226. Is this refusal a LEGACY record's one-time
+/// upgrade rather than a refusal that will recur on every roll?
+///
+/// ONE PRODUCER OF THE CLASSIFICATION, for the reason [`relevant_set`]'s note
+/// gives for being a function: the rule has to hold in the production consult
+/// (`handler::conda_outputs`, which prints
+/// `### STORE UNIVERSE legacy-upgrade … stage=consult` off it and carries the
+/// answer to the publish row) and in the guard that asserts the falsifier, and
+/// two spellings are two places it can be removed from with one of them
+/// unwatched.
+///
+/// THE TWO CONJUNCTS, AND NEITHER IS REDUNDANT. The verdict must have REFUSED --
+/// a record the world still contains was adopted and needs no upgrade, so
+/// claiming one would print an upgrade row for every hit. And the relevant set
+/// must be EMPTY -- a refusal with a relevant set is a genuine roll inside the
+/// record's own closure (`s2_c`'s soundness half), which the cold compute
+/// replaces but does not "upgrade": that key was already at v4 and will be again.
+///
+/// WHY THIS IS A REFRESH AND NOT A RECOMPUTE, MEASURED ON A LIVE RECORD. The
+/// cheaper repair would be to rebuild the relevant set out of the record's own
+/// emitted spec, and it is unsound: on
+/// `/oscar/data/stellex/glvov/agrescap/cache/retread/built-outputs/262285b84e7c546aab2ded842f5ddc03`
+/// the stamped `solved_names` holds 216 names while every `"name"` anywhere else
+/// in the record holds 28, of which 26 are in the solved set -- **190 of 216
+/// selected names are not in the record's own bytes**. A set derived from the
+/// spec is therefore a strict SUBSET of the solve, and
+/// `conda_solve::solved_names_since`'s own note names a subset as the one
+/// direction that can admit a record whose world moved. So the field is
+/// REPUBLISHED once per key by the cold compute the refusal already pays for,
+/// and the only thing this adds is that the refusal SAYS SO -- and that the
+/// publish row says whether it took.
+pub fn needs_legacy_upgrade(record: &Record, verdict: &Result<UniverseMatch, Refusal>) -> bool {
+    verdict.is_err() && relevant_set(record).is_empty()
+}
+
 /// Which of the two universe rules admitted a record.
 ///
 /// The variant is printed, not just logged: an operator reading
@@ -2308,6 +2343,531 @@ mod tests {
         assert_eq!(documents, world);
     }
 
+    // ------------------------------------------------------------------
+    // STOREV3-3 / N27-RETREAD-226: THE WORLD IS PER RELOCK, AND A LEGACY
+    // RECORD IS UPGRADED ONCE RATHER THAN REFUSED FOREVER.
+    // ------------------------------------------------------------------
+
+    /// A snapshot closure that MUST NOT RUN, typed so `relock_document_world_with`
+    /// can still infer what it returns. It is the positive reader for the cost
+    /// claim: the frozen and handed arms do not list the cache root, and that
+    /// listing is an NFS stat-and-hash of every document in it.
+    async fn s3_must_not_list() -> (Vec<crate::repodata::RepodataDocument>, &'static str) {
+        panic!("a frozen or handed backend must not list the cache root")
+    }
+
+    /// STOREV3-3 GUARD (a) -- TWO BACKENDS IN ONE RELOCK, READING DIFFERENT
+    /// OVERLAY STATES, JUDGE AGAINST ONE WORLD.
+    ///
+    /// THE DEFECT STOREV3-2's FREEZE COULD NOT REACH, and it was measured on the
+    /// landing relock. MERGE-B46 §3e: `grep -an 'pixi-build-retread starting'`
+    /// over R2's 103 MB backend log returns **14** lines, `08:58:16.906335Z`
+    /// through `08:58:16.926667Z` -- fourteen backend PROCESSES inside 21 ms, one
+    /// per pack, each making exactly ONE consult. A process `OnceLock` therefore
+    /// had nothing to prevent: `world=` read `snapshotted` on every row of every
+    /// candidate arm and `frozen` on none, and the fourteen agreed on one reader
+    /// universe only because their launches were 21 ms apart. STOREV3-1's own
+    /// shape -- the shared `pixi-overlay/repodata` REPLACED at 21:03 and 21:06,
+    /// inside one run's window -- still splits the world if the replacement lands
+    /// between two launches instead of between two consults.
+    ///
+    /// THE FIXTURE IS THAT SHAPE. Two separate cells are two separate PROCESSES,
+    /// and backend two's listing returns the REPLACED documents -- the state the
+    /// shared root was rewritten into after backend one had already looked.
+    ///
+    /// NON-VACUITY, so no arm passes empty:
+    ///  1. the two worlds genuinely differ;
+    ///  2. backend two's OWN listing, frozen per-process as STOREV3-2 did it,
+    ///     gives the split -- so this guard fails the moment the hand-off is
+    ///     removed;
+    ///  3. the split world REFUSES the record and the handed world ADOPTS it,
+    ///     which is the consequence an operator pays in cold recomputes.
+    #[test]
+    fn s3_a_two_backends_in_one_relock_judge_against_one_world() {
+        let relock = Scratch::new("s3-a-relock");
+        let cache_root = Scratch::new("s3-a-root");
+        let replaced_dir = Scratch::new("s3-a-replaced");
+        let (entry_world, writer, _pub_sparse) = u1_world(cache_root.path(), &u1_base());
+        let (mid_run_world, _w, _s) =
+            u1_world(replaced_dir.path(), &u1_document(&u1_sha('2'), "1.1", ""));
+        // NON-VACUITY 1.
+        assert_ne!(
+            entry_world, mid_run_world,
+            "the fixture must actually replace the shared root's documents, or \
+             this guard is empty"
+        );
+
+        // BACKEND ONE. Its listing is the world at entry, and it is the first in
+        // the relock, so it PUBLISHES.
+        let cell_one: std::sync::OnceLock<Vec<crate::repodata::RepodataDocument>> =
+            std::sync::OnceLock::new();
+        let taken_one = entry_world.clone();
+        let (world_one, verdict_one, order_one) =
+            u1_block_on(crate::repodata::relock_document_world_with(
+                &cell_one,
+                Some(relock.path()),
+                cache_root.path(),
+                move || async move { (taken_one, "listed") },
+            ));
+        assert_eq!(verdict_one, crate::repodata::DocumentWorld::Published);
+        assert_eq!(order_one, Some("listed"));
+        assert_eq!(world_one, entry_world);
+
+        // BACKEND TWO. A DIFFERENT cell -- a different process -- whose own
+        // listing would return the REPLACED world. It must never reach that
+        // listing at all.
+        let cell_two: std::sync::OnceLock<Vec<crate::repodata::RepodataDocument>> =
+            std::sync::OnceLock::new();
+        let (world_two, verdict_two, order_two) =
+            u1_block_on(crate::repodata::relock_document_world_with(
+                &cell_two,
+                Some(relock.path()),
+                cache_root.path(),
+                s3_must_not_list,
+            ));
+        assert_eq!(verdict_two, crate::repodata::DocumentWorld::Handed);
+        assert_eq!(
+            order_two, None,
+            "the handed arm reports no snapshot order because it took no snapshot"
+        );
+        assert_eq!(
+            world_two, entry_world,
+            "a world a sibling backend rewrote is not this relock's containment \
+             reference"
+        );
+        // And the hand-off is frozen into backend two as well, so its own later
+        // consults cannot move it either.
+        assert_eq!(
+            crate::repodata::frozen_reader_documents_in(&cell_two),
+            Some(entry_world.clone()),
+        );
+
+        // NON-VACUITY 2: STOREV3-2's per-process freeze, which is what backend two
+        // did before this fix, gives the SPLIT.
+        let cell_split: std::sync::OnceLock<Vec<crate::repodata::RepodataDocument>> =
+            std::sync::OnceLock::new();
+        let (split, split_world) =
+            crate::repodata::freeze_reader_documents_in(&cell_split, mid_run_world.clone());
+        assert_eq!(split_world, crate::repodata::DocumentWorld::Snapshotted);
+        assert_ne!(split, entry_world);
+
+        // NON-VACUITY 3, and the consequence: one relock, two verdicts.
+        let bytes = u1_record(&[writer.clone()], &["pack-root"], "");
+        let record = parse(&bytes, "digest-u1").unwrap();
+        assert!(
+            matches!(
+                universe_verdict(&record, &split, None),
+                Err(Refusal::Universe { .. })
+            ),
+            "the replaced world MUST refuse -- that is what the split costs"
+        );
+        assert_eq!(
+            universe_verdict(&record, &world_two, None),
+            Ok(UniverseMatch::V2),
+            "and the relock's own world must admit it"
+        );
+    }
+
+    /// STOREV3-3 -- A RACE INTO THE PUBLISH LEAVES BOTH BACKENDS HOLDING THE
+    /// WINNER'S WORLD, AND THE LOSER'S BYTES REACH NOBODY.
+    ///
+    /// Fourteen launches inside 21 ms make this the normal case, not the corner:
+    /// two backends can both find no world on disk and both take a snapshot. The
+    /// publish is create-once (a `hard_link`, which fails `AlreadyExists`, and
+    /// never a `rename`, which would OVERWRITE the bytes a reader had already been
+    /// handed), and the loser RE-READS rather than returning its local -- the same
+    /// rule `freeze_reader_documents_in` applies one layer down.
+    #[test]
+    fn s3_a2_the_loser_of_the_publish_race_holds_the_winners_world() {
+        let relock = Scratch::new("s3-a2-relock");
+        let cache_root = Scratch::new("s3-a2-root");
+        let loser_dir = Scratch::new("s3-a2-loser");
+        let (winner_world, _writer, _s) = u1_world(cache_root.path(), &u1_base());
+        let (loser_world, _w, _s2) =
+            u1_world(loser_dir.path(), &u1_document(&u1_sha('2'), "1.1", ""));
+        assert_ne!(winner_world, loser_world);
+
+        let path = crate::repodata::relock_world_path(relock.path(), cache_root.path());
+        assert!(
+            crate::repodata::publish_relock_document_world(
+                &path,
+                cache_root.path(),
+                &winner_world
+            ),
+            "the first publisher must create the world"
+        );
+        // The second publisher loses, and the file it lost to is untouched.
+        assert!(
+            !crate::repodata::publish_relock_document_world(
+                &path,
+                cache_root.path(),
+                &loser_world
+            ),
+            "create-once: a second publisher must NOT create it"
+        );
+        assert_eq!(
+            crate::repodata::read_relock_document_world(&path, cache_root.path()),
+            Some(winner_world.clone()),
+            "a rename would have clobbered the bytes a reader was already handed"
+        );
+
+        // And the loser, driven through the production entry point, leaves holding
+        // the winner's world rather than its own.
+        let cell: std::sync::OnceLock<Vec<crate::repodata::RepodataDocument>> =
+            std::sync::OnceLock::new();
+        let taken = loser_world.clone();
+        let (held, verdict, order) = u1_block_on(crate::repodata::relock_document_world_with(
+            &cell,
+            Some(relock.path()),
+            cache_root.path(),
+            move || async move { (taken, "listed") },
+        ));
+        assert_eq!(verdict, crate::repodata::DocumentWorld::Handed);
+        assert_eq!(
+            order, None,
+            "the world was already on disk, so no snapshot was taken at all"
+        );
+        assert_eq!(held, winner_world);
+    }
+
+    /// STOREV3-3 -- THE HANDED WORLD IS REFUSED WHEN IT IS ABOUT ANOTHER CACHE
+    /// ROOT, IS TORN, OR IS EMPTY; AND WITH NO RELOCK SCOPE NOTHING CHANGES.
+    ///
+    /// Three refusals and one no-op, because each is a way this mechanism could
+    /// silently hand fourteen readers a world that is not theirs -- which would be
+    /// N27-RETREAD-62's defect with the sign flipped: it would ADMIT rather than
+    /// refuse. The no-op arm is law 2's other half: a backend pixi hands no
+    /// `cache_directory` must behave byte-for-byte as STOREV3-2 shipped.
+    #[test]
+    fn s3_a3_a_world_that_is_not_this_readers_is_refused_not_adopted() {
+        let relock = Scratch::new("s3-a3-relock");
+        let cache_root = Scratch::new("s3-a3-root");
+        let other_root = Scratch::new("s3-a3-other");
+        let (world, _writer, _s) = u1_world(cache_root.path(), &u1_base());
+
+        let path = crate::repodata::relock_world_path(relock.path(), cache_root.path());
+        assert!(crate::repodata::publish_relock_document_world(
+            &path,
+            cache_root.path(),
+            &world
+        ));
+        // The same file read as if it were another cache root's world.
+        assert_eq!(
+            crate::repodata::read_relock_document_world(&path, other_root.path()),
+            None,
+            "a world taken over a different cache root answers a different \
+             question and must not be adopted"
+        );
+        // The path itself separates the two, so the two never collide either.
+        assert_ne!(
+            path,
+            crate::repodata::relock_world_path(relock.path(), other_root.path()),
+        );
+
+        // TORN: the digest no longer folds from the documents.
+        let torn = std::fs::read_to_string(&path).expect("the world must be readable");
+        let broken = torn.replace(
+            &crate::repodata::universe_digest_of(&world),
+            "0000000000000000",
+        );
+        assert_ne!(torn, broken, "the fixture must actually break the digest");
+        std::fs::write(&path, broken).expect("torn fixture");
+        assert_eq!(
+            crate::repodata::read_relock_document_world(&path, cache_root.path()),
+            None,
+            "a world that does not fold to its own digest is a torn write"
+        );
+
+        // EMPTY: never published, and never adopted if it somehow appears.
+        let empty_path = crate::repodata::relock_world_path(relock.path(), other_root.path());
+        assert!(
+            !crate::repodata::publish_relock_document_world(&empty_path, other_root.path(), &[]),
+            "ORDER-1: an empty snapshot is not a world and must not become the \
+             relock's"
+        );
+        assert_eq!(
+            crate::repodata::read_relock_document_world(&empty_path, other_root.path()),
+            None,
+        );
+
+        // NO SCOPE: STOREV3-2's behaviour, unchanged.
+        let cell: std::sync::OnceLock<Vec<crate::repodata::RepodataDocument>> =
+            std::sync::OnceLock::new();
+        let taken = world.clone();
+        let (held, verdict, order) = u1_block_on(crate::repodata::relock_document_world_with(
+            &cell,
+            None,
+            cache_root.path(),
+            move || async move { (taken, "listed") },
+        ));
+        assert_eq!(verdict, crate::repodata::DocumentWorld::Snapshotted);
+        assert_eq!(order, Some("listed"));
+        assert_eq!(held, world);
+        // And the second consult in that process is still frozen, not re-listed.
+        let (held_again, verdict_again, order_again) =
+            u1_block_on(crate::repodata::relock_document_world_with(
+                &cell,
+                None,
+                cache_root.path(),
+                s3_must_not_list,
+            ));
+        assert_eq!(verdict_again, crate::repodata::DocumentWorld::Frozen);
+        assert_eq!(order_again, None);
+        assert_eq!(held_again, world);
+    }
+
+    /// STOREV3-3 -- AN EMPTY SNAPSHOT IS NOT PUBLISHED AS THE RELOCK'S WORLD.
+    ///
+    /// ORDER-1's rule, widened to the new scope and this is the arm that needed
+    /// it most: freezing an empty world costs one process its adoptions, whereas
+    /// PUBLISHING one costs the whole relock every adoption for the rest of the
+    /// run. A cold reader's first snapshot is legitimately empty (DEVPATH-2's job
+    /// 6185774 read the root at `02:47:09.100` and its conda-forge/linux-64
+    /// document landed at `02:47:11.707`), so this is the ordinary path on a cold
+    /// root and not a corner.
+    #[test]
+    fn s3_a4_an_empty_snapshot_never_becomes_the_relocks_world() {
+        let relock = Scratch::new("s3-a4-relock");
+        let cache_root = Scratch::new("s3-a4-root");
+        let (world, _writer, _s) = u1_world(cache_root.path(), &u1_base());
+
+        let cell: std::sync::OnceLock<Vec<crate::repodata::RepodataDocument>> =
+            std::sync::OnceLock::new();
+        let (documents, verdict, order) =
+            u1_block_on(crate::repodata::relock_document_world_with(
+                &cell,
+                Some(relock.path()),
+                cache_root.path(),
+                || async { (Vec::new(), "no-record") },
+            ));
+        assert!(documents.is_empty());
+        assert_eq!(verdict, crate::repodata::DocumentWorld::Unfrozen);
+        assert_eq!(order, Some("no-record"));
+        let path = crate::repodata::relock_world_path(relock.path(), cache_root.path());
+        assert!(
+            !path.exists(),
+            "an empty world must not be on disk for thirteen siblings to adopt"
+        );
+        assert_eq!(crate::repodata::frozen_reader_documents_in(&cell), None);
+
+        // And the SAME process, once its closure has populated the root, both
+        // freezes and publishes -- which is the whole reason empty is not frozen.
+        let taken = world.clone();
+        let (documents, verdict, _order) =
+            u1_block_on(crate::repodata::relock_document_world_with(
+                &cell,
+                Some(relock.path()),
+                cache_root.path(),
+                move || async move { (taken, "after-universe") },
+            ));
+        assert_eq!(verdict, crate::repodata::DocumentWorld::Published);
+        assert_eq!(documents, world);
+        assert_eq!(
+            crate::repodata::read_relock_document_world(&path, cache_root.path()),
+            Some(world),
+        );
+    }
+
+    /// STOREV3-3 GUARD (b) -- A LEGACY RECORD IS UPGRADED ONCE, AND THEN IT HITS
+    /// ACROSS A ROLL.
+    ///
+    /// THE DEFECT, MEASURED ON THE LANDING RELOCK. MERGE-B46's R2 read
+    /// `0 hit / 14 refused / 14 published` with `relevant=0` and
+    /// `v3=not-computed` on all fourteen rows, and a read-only grep of the shared
+    /// store before it found **0 of 358** records carrying a `solved_names`
+    /// field -- so `built_output_store::relevant_set` was empty on every live
+    /// record, the v4 arm was SKIPPED on every one, and the log said nothing
+    /// about either fact. A lane reading that could not tell a ONE-TIME upgrade
+    /// (one cold compute per key, ever) from a RECURRING refusal (one per key per
+    /// roll, forever).
+    ///
+    /// THE RULE: the refusal is classified, the cold compute the refusal already
+    /// pays for republishes the field at the SAME key, and the next roll is a v4
+    /// question. The classification is not recomputed from the record's own bytes
+    /// because that is unsound -- see [`needs_legacy_upgrade`], where the 216 / 28
+    /// measurement is.
+    ///
+    /// FOUR NON-VACUITY ASSERTIONS:
+    ///  1. the legacy record is genuinely pre-v4 (empty relevant set);
+    ///  2. the roll genuinely refuses it, so an upgrade is genuinely owed;
+    ///  3. an ADOPTED record is NOT classified as owing one, so the row does not
+    ///     fire on every hit;
+    ///  4. a refusal WITH a relevant set is NOT classified as one either -- that
+    ///     is `s2_c`'s real roll, which recurs by design.
+    #[test]
+    fn s3_b_a_legacy_record_is_upgraded_once_and_then_hits_across_a_roll() {
+        let publisher = Scratch::new("s3-b-pub");
+        let requester = Scratch::new("s3-b-req");
+        let (intact, writer, pub_sparse) = u1_world(publisher.path(), &u1_base());
+        // The roll: `unrelated` moves, which is outside `pack-root`'s closure and
+        // is exactly the class that refused all fourteen in production.
+        let (rolled, _w, req_sparse) =
+            u1_world(requester.path(), &u1_document(&u1_sha('2'), "1.1", ""));
+
+        const RELEVANT: &[&str] = &["pack-root"];
+
+        // THE LEGACY RECORD: no relevant set, which is 358 of 358 before R2.
+        let legacy_bytes = s2_record(&[writer.clone()], RELEVANT, &[], "");
+        let legacy = parse(&legacy_bytes, "digest-u1").unwrap();
+        // NON-VACUITY 1.
+        assert!(
+            relevant_set(&legacy).is_empty(),
+            "the fixture must be a record from before v4"
+        );
+
+        // NON-VACUITY 2: the roll refuses it, so an upgrade is owed.
+        let refused = universe_verdict(&legacy, &rolled, None);
+        assert!(
+            matches!(refused, Err(Refusal::Universe { .. })),
+            "the rolled world MUST refuse a legacy record -- that is the defect"
+        );
+        assert!(
+            needs_legacy_upgrade(&legacy, &refused),
+            "a refused record with no relevant set is a ONE-TIME upgrade, not a \
+             recurring refusal, and production must say so"
+        );
+
+        // NON-VACUITY 3: an adopted record owes no upgrade.
+        let adopted = universe_verdict(&legacy, &intact, None);
+        assert_eq!(adopted, Ok(UniverseMatch::V2));
+        assert!(
+            !needs_legacy_upgrade(&legacy, &adopted),
+            "an upgrade row on every hit is noise, not a reader"
+        );
+
+        // THE UPGRADE, AT THE SAME KEY. The cold compute the refusal already paid
+        // for republishes the record with the field, and the address is unmoved:
+        // the same `inputs_digest` parses it, so `EMIT_EPOCH` and the emission
+        // schema have nothing to bump -- the bytes gained a field that has been
+        // `serde(default)` since STOREV3-2 and no key material moved.
+        let upgraded_bytes = s2_record(
+            &[writer.clone()],
+            RELEVANT,
+            RELEVANT,
+            &u1_digest_over(&pub_sparse, RELEVANT),
+        );
+        let upgraded = parse(&upgraded_bytes, "digest-u1")
+            .expect("the upgrade republishes at the SAME address, so the digest is unmoved");
+        assert!(
+            !relevant_set(&upgraded).is_empty(),
+            "the upgrade must have stamped the field, or it did not take"
+        );
+
+        // AND NOW IT HITS ACROSS THE SAME ROLL -- through the production
+        // narrowing, not through a literal.
+        let relevant: Vec<&str> = relevant_set(&upgraded).iter().map(String::as_str).collect();
+        let reader_relevant = u1_digest_over(&req_sparse, &relevant);
+        let hit = universe_verdict(&upgraded, &rolled, Some(&reader_relevant));
+        assert_eq!(
+            hit,
+            Ok(UniverseMatch::V3),
+            "the upgraded record must be adopted across the roll that refused it"
+        );
+        // NON-VACUITY 4: a refusal WITH a relevant set is not an upgrade.
+        let inside = Scratch::new("s3-b-inside");
+        let (inside_rolled, _w2, inside_sparse) =
+            u1_world(inside.path(), &u1_document(&u1_sha('9'), "1.0", ""));
+        let inside_relevant = u1_digest_over(&inside_sparse, &relevant);
+        let inside_verdict = universe_verdict(&upgraded, &inside_rolled, Some(&inside_relevant));
+        assert!(
+            matches!(inside_verdict, Err(Refusal::Universe { .. })),
+            "a roll INSIDE the relevant set must still refuse (s2_c's soundness \
+             half)"
+        );
+        assert!(
+            !needs_legacy_upgrade(&upgraded, &inside_verdict),
+            "that refusal recurs by design and must NOT be reported as a one-time \
+             upgrade"
+        );
+    }
+
+    /// STOREV3-3 GUARD (c) -- A v4 RECORD HITS ACROSS A ROLL IN THE RELOCK'S
+    /// HANDED WORLD, THROUGH BOTH HALVES AT ONCE.
+    ///
+    /// Distinct from `s2_b`, which drives the narrowing against a bare document
+    /// vector: this one drives it against the world a SIBLING BACKEND published,
+    /// which is the only world production readers will see once STOREV3-3 lands.
+    /// It is the discharge shape of N27-RETREAD-226 written as a unit: a roll
+    /// lands AFTER a v4 record exists for the key being judged, and the record is
+    /// adopted -- which MERGE-B46 §3d records as the test that "did not run",
+    /// because a v2 refusal only ever landed on records with no relevant set and
+    /// every record WITH one was admitted by v2 first.
+    ///
+    /// THREE NON-VACUITY ASSERTIONS:
+    ///  1. the roll is real: v2 containment refuses against the rolled world;
+    ///  2. the handed world is the rolled one (so v2 cannot rescue this and only
+    ///     v4 can) -- this is the arm that makes the guard about v4 at all;
+    ///  3. the relevant-set digest is non-empty, so the walk really ran.
+    #[test]
+    fn s3_c_a_v4_record_hits_across_a_roll_in_the_relocks_handed_world() {
+        let relock = Scratch::new("s3-c-relock");
+        let publisher = Scratch::new("s3-c-pub");
+        let requester = Scratch::new("s3-c-req");
+        let (_intact, writer, pub_sparse) = u1_world(publisher.path(), &u1_base());
+        let (rolled, _w, req_sparse) =
+            u1_world(requester.path(), &u1_document(&u1_sha('2'), "1.1", ""));
+
+        const RELEVANT: &[&str] = &["pack-root"];
+        let stamped = u1_digest_over(&pub_sparse, RELEVANT);
+        // NON-VACUITY 3.
+        assert!(!stamped.is_empty(), "the writer's walk must have run");
+        let bytes = s2_record(&[writer.clone()], RELEVANT, RELEVANT, &stamped);
+        let record = parse(&bytes, "digest-u1").unwrap();
+
+        // Backend one establishes the relock's world, and it is the ROLLED one --
+        // the roll landed before this relock started, which is the case v2 cannot
+        // and must not rescue.
+        let cell_one: std::sync::OnceLock<Vec<crate::repodata::RepodataDocument>> =
+            std::sync::OnceLock::new();
+        let taken = rolled.clone();
+        let (published, verdict_one, _order) =
+            u1_block_on(crate::repodata::relock_document_world_with(
+                &cell_one,
+                Some(relock.path()),
+                requester.path(),
+                move || async move { (taken, "reader-already-warm") },
+            ));
+        assert_eq!(verdict_one, crate::repodata::DocumentWorld::Published);
+        assert_eq!(published, rolled);
+
+        // Backend two -- the pack that holds this record -- is handed it.
+        let cell_two: std::sync::OnceLock<Vec<crate::repodata::RepodataDocument>> =
+            std::sync::OnceLock::new();
+        let (handed, verdict_two, _order_two) =
+            u1_block_on(crate::repodata::relock_document_world_with(
+                &cell_two,
+                Some(relock.path()),
+                requester.path(),
+                s3_must_not_list,
+            ));
+        assert_eq!(verdict_two, crate::repodata::DocumentWorld::Handed);
+        // NON-VACUITY 2.
+        assert_eq!(handed, rolled);
+
+        // NON-VACUITY 1: the freeze cannot save this one. Only the relevant set can.
+        assert!(
+            matches!(
+                universe_verdict(&record, &handed, None),
+                Err(Refusal::Universe { .. })
+            ),
+            "a roll that landed BEFORE the relock must still refuse under v2 -- \
+             the freeze is not a waiver"
+        );
+        assert!(
+            !needs_legacy_upgrade(&record, &universe_verdict(&record, &handed, None)),
+            "a record that CARRIES a relevant set is never a legacy upgrade"
+        );
+
+        let relevant: Vec<&str> = relevant_set(&record).iter().map(String::as_str).collect();
+        let reader_relevant = u1_digest_over(&req_sparse, &relevant);
+        assert_eq!(
+            universe_verdict(&record, &handed, Some(&reader_relevant)),
+            Ok(UniverseMatch::V3),
+            "N27-RETREAD-226's discharge shape: a roll after a v4 record exists \
+             for the key, and the record is adopted"
+        );
+    }
+
     /// STOREV3-2 GUARD (b) -- STOREV3-1's FALSIFIER. A PACKAGE OUTSIDE THE
     /// RECORD'S SOLVED SET MOVES, AND THE RECORD IS ADOPTED.
     ///
@@ -2663,6 +3223,255 @@ mod tests {
             unfrozen_hits < a.len(),
             "the unfrozen arm must refuse at least one record, or this roll did \
              not reach these records and the measurement is empty"
+        );
+    }
+
+    /// STOREV3-3's FIXTURE ISOLATION RUN, over REAL production record bytes and
+    /// the roll those records actually saw.
+    ///
+    /// `#[ignore]`d and driven by hand for the same reason
+    /// `s2_fixture_fourteen_addresses_across_a_real_roll` is: its input is a live
+    /// built-output store root on this box and not a fixture in the tree, and a
+    /// guard that silently passes when its inputs are absent is worse than no
+    /// guard. It REFUSES when the root is not named and is never part of the
+    /// gate's split. Run it as
+    ///
+    /// ```text
+    /// RETREAD_STOREV3_3_STORE_ROOT=<a READ-ONLY copy of the shared built-output store> \
+    ///   cargo test --lib -- --ignored --exact --nocapture \
+    ///   built_output_store::tests::s3_fixture_real_records_with_legacy_handling
+    /// ```
+    ///
+    /// It reads only. Nothing is published, nothing is renamed, no `.used`
+    /// sidecar is stamped, and the live shared store is never the root passed in.
+    ///
+    /// WHAT IT MEASURES, and it is the -226 rescue read through production's own
+    /// decision function rather than through a row. Every parseable record in the
+    /// root is split by whether it carries a relevant set, and each half is driven
+    /// through `parse` + `universe_verdict` against a ROLLED world:
+    ///
+    ///  * **LEGACY** (`solved_names` empty -- 358 of 358 before MERGE-B46's R2):
+    ///    the rolled world refuses it, [`needs_legacy_upgrade`] classifies it, and
+    ///    the count of those is the number of one-time cold republishes the next
+    ///    roll owes. Predicted: every legacy record refuses, and every refusal is
+    ///    classified.
+    ///  * **v4** (`solved_names` non-empty -- the population R2 and R2' published):
+    ///    the same rolled world refuses it under v2, and the v4 arm with the
+    ///    record's own stamped digest ADOPTS it. Predicted: `0` of N under v2 and
+    ///    `N` of N with the relevant set.
+    ///
+    /// THE ROLL IS THE RECORDS' OWN, NOT A CONSTRUCTION: the world is the union of
+    /// every record's `consulted_repodata` with ONE document's content identity
+    /// advanced, which is byte-for-byte the shape all fourteen refusals named in
+    /// MERGE-B46 §3d (`missing=https://prefix.dev/conda-forge/linux-64#…`, one
+    /// rolled linux-64 document, fourteen times).
+    ///
+    /// HONEST LIMIT, STATED HERE AND NOT ONLY IN A ROW. The v4 arm's reader digest
+    /// is the record's OWN stamped `candidate_universe` and is not re-walked,
+    /// because the repodata documents of these records' generation no longer exist
+    /// on this box -- the shared `retread-repodata` holds one generation and the
+    /// next run overwrote it, which is cause (a) of N27-RETREAD-226 restated. So
+    /// this arm measures the CONDITIONAL the narrowing rests on: given that the
+    /// record's own relevant closure did not move, the v4 arm adopts it where v2
+    /// refuses. `s3_c` drives the re-walk itself over fixture documents, so the
+    /// two halves of the claim each have a reader.
+    #[test]
+    #[ignore]
+    fn s3_fixture_real_records_with_legacy_handling() {
+        let root = std::env::var("RETREAD_STOREV3_3_STORE_ROOT").expect(
+            "name a READ-ONLY built-output store root in RETREAD_STOREV3_3_STORE_ROOT",
+        );
+        // THE CALLER STATES THE POPULATION IT IS POINTING AT, and this refuses
+        // when the measurement disagrees. Without it an arm pointed at a root of
+        // fourteen v4 records would pass its LEGACY assertions on an empty set --
+        // `0 == 0` -- and report a guard that cannot fail. The three arms the gate
+        // runs are deliberately different shapes: KEEPROLL-1's cold root
+        // (14 legacy / 0 v4), R1's cold root (0 legacy / 14 v4), and a read-only
+        // copy of the live shared store (both halves in one root).
+        let expect_legacy: usize = std::env::var("RETREAD_STOREV3_3_EXPECT_LEGACY")
+            .expect("state the number of legacy records in RETREAD_STOREV3_3_EXPECT_LEGACY")
+            .parse()
+            .expect("RETREAD_STOREV3_3_EXPECT_LEGACY must be a count");
+        let expect_v4: usize = std::env::var("RETREAD_STOREV3_3_EXPECT_V4")
+            .expect("state the number of v4 records in RETREAD_STOREV3_3_EXPECT_V4")
+            .parse()
+            .expect("RETREAD_STOREV3_3_EXPECT_V4 must be a count");
+        assert!(
+            expect_legacy + expect_v4 > 0,
+            "an arm that predicts no record at all measures nothing"
+        );
+
+        let mut parsed: Vec<(String, Record)> = Vec::new();
+        let mut unparseable = 0usize;
+        for entry in std::fs::read_dir(&root).expect("the root must be readable") {
+            let dir = entry.expect("walking the root").path();
+            if !dir.is_dir() || dir.file_name().and_then(|n| n.to_str()) == Some(QUARANTINE) {
+                continue;
+            }
+            if !dir.join(MARKER).is_file() {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(dir.join(PAYLOAD)) else {
+                continue;
+            };
+            let Ok(stated) = serde_json::from_slice::<Record>(&bytes) else {
+                unparseable += 1;
+                continue;
+            };
+            let digest = stated.inputs_digest.clone();
+            match parse(&bytes, &digest) {
+                Ok(record) => parsed.push((
+                    dir.file_name().unwrap().to_string_lossy().to_string(),
+                    record,
+                )),
+                // A record at another wire or emission schema never reaches the
+                // relevant-set path at all: `parse` refuses it three checks
+                // earlier. Counted, because the count is the population this
+                // reader can decide anything about.
+                Err(_) => unparseable += 1,
+            }
+        }
+        parsed.sort_by(|left, right| left.0.cmp(&right.0));
+        assert!(!parsed.is_empty(), "the root holds no record this reader parses");
+
+        let (v4, legacy): (Vec<_>, Vec<_>) = parsed
+            .iter()
+            .partition(|(_, record)| !relevant_set(record).is_empty());
+        eprintln!(
+            "### S3 FIXTURE parsed={} unparseable={} legacy={} v4={}",
+            parsed.len(),
+            unparseable,
+            legacy.len(),
+            v4.len(),
+        );
+
+        // THE ROLL: the records' own world with ONE document advanced, which is
+        // the shape every one of MERGE-B46's fourteen refusals named.
+        let mut entry_world: Vec<crate::repodata::RepodataDocument> = parsed
+            .iter()
+            .flat_map(|(_, record)| record.consulted_repodata.iter().cloned())
+            .collect();
+        entry_world.sort();
+        entry_world.dedup();
+        assert!(
+            !entry_world.is_empty(),
+            "these records name no documents, so there is no world to roll"
+        );
+        // THE DOCUMENT TO ROLL IS THE ONE EVERY RECORD CONSULTED, and if there is
+        // no such document this fixture REFUSES rather than rolling an arbitrary
+        // one: a roll that reaches only some of the population cannot produce the
+        // `0 hit / 14 refused` shape MERGE-B46 measured, and the arms below would
+        // then be asserting the wrong thing about the records it missed.
+        let shared = entry_world
+            .iter()
+            .position(|document| {
+                parsed.iter().all(|(_, record)| {
+                    record
+                        .consulted_repodata
+                        .iter()
+                        .any(|consulted| {
+                            consulted.adoption_identity() == document.adoption_identity()
+                        })
+                })
+            })
+            .expect(
+                "no single document is consulted by every record in this root, so one roll \
+                 cannot refuse the whole population and this fixture is not MERGE-B46's shape",
+            );
+        let mut rolled = entry_world.clone();
+        let rolled_label = document_label(&rolled[shared]);
+        rolled[shared].sha256 = u1_sha('f');
+        assert_ne!(entry_world, rolled, "the fixture must actually roll a document");
+        eprintln!(
+            "### S3 FIXTURE documents={} rolled_document={} universe_entry={} universe_rolled={}",
+            entry_world.len(),
+            rolled_label,
+            crate::repodata::universe_digest_of(&entry_world),
+            crate::repodata::universe_digest_of(&rolled),
+        );
+
+        // ARM LEGACY.
+        let mut legacy_refused = 0usize;
+        let mut legacy_classified = 0usize;
+        for (address, record) in &legacy {
+            let verdict = universe_verdict(record, &rolled, None);
+            let classified = needs_legacy_upgrade(record, &verdict);
+            if verdict.is_err() {
+                legacy_refused += 1;
+            }
+            if classified {
+                legacy_classified += 1;
+            }
+            eprintln!(
+                "### S3 FIXTURE LEGACY {address} refused={} legacy_upgrade={classified} roots={}",
+                verdict.is_err(),
+                record.reachable_roots.len(),
+            );
+        }
+
+        // ARM v4: the same rolled world, and the record's own stamped digest.
+        let mut v4_v2_hits = 0usize;
+        let mut v4_hits = 0usize;
+        for (address, record) in &v4 {
+            let under_v2 = universe_verdict(record, &rolled, None);
+            if under_v2.is_ok() {
+                v4_v2_hits += 1;
+            }
+            let with_relevant =
+                universe_verdict(record, &rolled, Some(&record.candidate_universe));
+            if with_relevant.is_ok() {
+                v4_hits += 1;
+            }
+            eprintln!(
+                "### S3 FIXTURE V4 {address} v2={} v4={} relevant={}",
+                under_v2.is_ok(),
+                with_relevant.is_ok(),
+                relevant_set(record).len(),
+            );
+        }
+
+        eprintln!(
+            "### S3 FIXTURE RESULT parsed={} legacy={} legacy_refused={} legacy_classified={} v4={} v4_hits_under_v2={} v4_hits_with_relevant={}",
+            parsed.len(),
+            legacy.len(),
+            legacy_refused,
+            legacy_classified,
+            v4.len(),
+            v4_v2_hits,
+            v4_hits,
+        );
+        // THE POPULATION FIRST: an arm that measured a different root than the
+        // caller thinks it did refuses here, before any arm's numbers are scored.
+        assert_eq!(
+            legacy.len(),
+            expect_legacy,
+            "this root holds a different number of legacy records than the caller predicted"
+        );
+        assert_eq!(
+            v4.len(),
+            expect_v4,
+            "this root holds a different number of v4 records than the caller predicted"
+        );
+        assert_eq!(
+            legacy_refused,
+            legacy.len(),
+            "a rolled world must refuse every record that carries no relevant set"
+        );
+        assert_eq!(
+            legacy_classified, legacy_refused,
+            "every such refusal must be classified as a ONE-TIME upgrade, or the \
+             log cannot tell one from a recurring refusal"
+        );
+        assert_eq!(
+            v4_v2_hits, 0,
+            "NON-VACUITY: v2 containment must refuse every v4 record against this \
+             roll, or the v4 arm is not what admitted them"
+        );
+        assert_eq!(
+            v4_hits,
+            v4.len(),
+            "N27-RETREAD-226's rescue: every record whose own relevant closure \
+             stood must be adopted across a roll that v2 refused"
         );
     }
 }

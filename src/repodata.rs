@@ -1480,10 +1480,23 @@ pub async fn snapshot_documents_after_universe(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DocumentWorld {
     /// This consult took the snapshot and FROZE it for the rest of the process.
+    /// No relock scope was handed to this process, so the world is this
+    /// process's own -- which is byte-for-byte STOREV3-2's behaviour and the
+    /// only shape reachable when pixi hands the backend no `cache_directory`.
     Snapshotted,
     /// An earlier consult in this process froze it; this one reused those bytes
     /// and did not read the cache root at all.
     Frozen,
+    /// STOREV3-3. This consult took the snapshot and PUBLISHED it as the
+    /// relock's world: it was the first consult in the relock to find a
+    /// non-empty one, so every sibling backend judges against these bytes.
+    Published,
+    /// STOREV3-3. A SIBLING BACKEND PROCESS in this relock published the world
+    /// and this consult judged against those bytes. The cache root was not
+    /// listed (`Handed` after a `Frozen` miss) or was listed and then discarded
+    /// in favour of the relock's own (`Handed` after losing the publish race) --
+    /// either way the containment reference is the relock's, not this process's.
+    Handed,
     /// The snapshot was EMPTY, so there was no world to freeze. Nothing is
     /// adoptable against an empty world anyway, and freezing one would make the
     /// whole process unable to adopt after the closure has populated the root.
@@ -1495,6 +1508,8 @@ impl std::fmt::Display for DocumentWorld {
         match self {
             DocumentWorld::Snapshotted => write!(f, "snapshotted"),
             DocumentWorld::Frozen => write!(f, "frozen"),
+            DocumentWorld::Published => write!(f, "published"),
+            DocumentWorld::Handed => write!(f, "handed"),
             DocumentWorld::Unfrozen => write!(f, "unfrozen"),
         }
     }
@@ -1542,18 +1557,25 @@ fn reader_document_world_cell() -> &'static OnceLock<Vec<RepodataDocument>> {
 }
 
 /// The frozen world, if this process has one. `None` means no consult has
-/// frozen one yet and the caller must take a snapshot.
+/// frozen one yet and the caller must reach for the RELOCK's.
 ///
-/// Checked BEFORE the snapshot at the call site, not after, because the whole
-/// point is that a frozen reader does not read the cache root again: the listing
-/// is an NFS stat-and-hash of every document in it.
-pub fn frozen_reader_documents() -> Option<Vec<RepodataDocument>> {
-    frozen_reader_documents_in(reader_document_world_cell())
-}
-
-/// [`frozen_reader_documents`] against an explicit cell, so a guard can drive
-/// the freeze without a process-global one test can move under another — the
-/// same reason `document_identity_memo_poison`'s note gives for not asserting on
+/// Checked BEFORE anything else by [`relock_document_world_with`], not after,
+/// because the whole point is that a frozen reader does not read the cache root
+/// again: the listing is an NFS stat-and-hash of every document in it.
+///
+/// STOREV3-3 DELETED THE TWO PROCESS-GLOBAL WRAPPERS that used to sit here,
+/// `frozen_reader_documents` and `freeze_reader_documents`. Their one production
+/// caller was `handler::conda_outputs`, which now goes through
+/// [`relock_document_world`] so that what a process freezes is the RELOCK's
+/// world; a public wrapper left behind with zero call sites is a built
+/// capability with no production caller, which is law 2's defect in the same
+/// shape as a writer with no reader. The cell-taking forms are now the whole of
+/// the API and [`relock_document_world`] is the one thing that reaches the
+/// global cell.
+///
+/// The cell is a parameter so a guard can drive the freeze without a
+/// process-global one test can move under another — the same reason
+/// `document_identity_memo_poison`'s note gives for not asserting on
 /// `HASH_CALLS`.
 pub(crate) fn frozen_reader_documents_in(
     cell: &OnceLock<Vec<RepodataDocument>>,
@@ -1562,15 +1584,8 @@ pub(crate) fn frozen_reader_documents_in(
 }
 
 /// Freeze `documents` as this process's reader world and return the world every
-/// consult from here on will judge against.
-pub fn freeze_reader_documents(
-    documents: Vec<RepodataDocument>,
-) -> (Vec<RepodataDocument>, DocumentWorld) {
-    freeze_reader_documents_in(reader_document_world_cell(), documents)
-}
-
-/// [`freeze_reader_documents`] against an explicit cell. See
-/// [`frozen_reader_documents_in`] for why the cell is a parameter.
+/// consult from here on will judge against. See [`frozen_reader_documents_in`]
+/// for why the cell is a parameter and why there is no global-cell wrapper.
 pub(crate) fn freeze_reader_documents_in(
     cell: &OnceLock<Vec<RepodataDocument>>,
     documents: Vec<RepodataDocument>,
@@ -1592,6 +1607,357 @@ pub(crate) fn freeze_reader_documents_in(
             .clone(),
         DocumentWorld::Snapshotted,
     )
+}
+
+// ---------------------------------------------------------------------------
+// STOREV3-3 / N27-RETREAD-226: THE DOCUMENT WORLD IS PER RELOCK, NOT PER PROCESS
+// ---------------------------------------------------------------------------
+//
+// THE DEFECT STOREV3-2's FREEZE COULD NOT REACH, and it was measured on the
+// landing relock rather than argued. `freeze_reader_documents` is a process
+// `OnceLock`, and MERGE-B46 §3e measured that this workspace runs FOURTEEN
+// SEPARATE BACKEND PROCESSES: `grep -an 'pixi-build-retread starting'` over R2's
+// 103 MB backend log returns 14 lines, `08:58:16.906335Z` through
+// `08:58:16.926667Z`, fourteen process starts inside 21 ms, one per pack, with
+// two `### STORE CONSULT` rows interleaved mid-line in one stderr stream. Each
+// process makes exactly ONE consult, so the `OnceLock` has nothing to prevent:
+// every row on every candidate arm reads `world=snapshotted` and never `frozen`.
+// The fourteen agreed on one reader universe only because their launches were
+// 21 ms apart, which is a coincidence of scheduling and not a property.
+//
+// A REPLACEMENT AT THE WRONG MOMENT STILL SPLITS THE WORLD. STOREV3-1 measured
+// the shape: both arms' `pixi-overlay/repodata` resolve to ONE shared path and
+// the files there were REPLACED at 21:03 and 21:06, INSIDE the control's own
+// window -- so a run can still hold three reader universes, it just needs the
+// replacement to land between two backend launches instead of between two
+// consults in one process. Nothing in STOREV3-2 prevents that.
+//
+// WHICH SURFACE CARRIES THE WORLD, AND WHY IT IS NOT AN ENV VAR. pixi spawns the
+// backend, so the harness owns no argv here (the note on [`FROZEN_ENV`] says so
+// and takes the env-var way out). But the world does not need a new surface at
+// all: the pixi build protocol's `initialize` params already carry
+// `cache_directory`, `handler::conda_outputs` already keeps a CROSS-PROCESS memo
+// in it (`conda_outputs_disk_cache_path`, whose own doc comment records the
+// collision two sibling packs of ONE workspace caused by hashing to one file
+// there -- direct evidence that the relock's backends share this directory), and
+// the route-probe verdict store already keeps its per-relock cross-pack state
+// there too. MEASURED on MERGE-B46's R2: that directory resolved to
+// `.../certFWA-6227269/g/fast-tmp/retread-glvov/76a1cd176697/job-6227269/caches/retread`
+// -- fasttmp's JOB-SCOPED namespace, one per relock, shared by all fourteen
+// processes. The `rattler` cache root is NOT that: the same arm's
+// `### CACHE PLACEMENT` row reads
+// `rattler=/oscar/data/stellex/glvov/agrescap/cache/retread/rattler`, the SHARED
+// persistent root every lane writes, which is exactly the thing that rolls
+// mid-run. So the world file goes in the relock-scoped directory and describes
+// the shared one.
+//
+// THE FREEZE IS THE CONSUMER, NOT THE PRODUCER. STOREV3-2's `OnceLock` still
+// holds the reference for the life of the process; what changed is what gets
+// frozen INTO it. First consult in the process: reuse the relock's world if a
+// sibling published one, otherwise take a snapshot and offer it. Either way the
+// bytes the process freezes are the relock's.
+
+/// Directory, under the relock-scoped cache directory, holding the relock's ONE
+/// reader document world.
+pub const RELOCK_WORLD_DIR: &str = "retread-reader-document-world";
+
+/// Wire tag of the handed world. Bumped only when the FILE's shape changes;
+/// `RepodataDocument` is the same type both halves of an adoption already
+/// compare, so there is no second spelling of a document here.
+const RELOCK_WORLD_SCHEMA: &str = "retread-reader-document-world-v1";
+
+/// The relock's world, as it sits on disk.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RelockDocumentWorld {
+    schema: String,
+    /// The cache root this world is a snapshot OF. Compared on read: a world
+    /// taken over a different root is a different question, and adopting one
+    /// would be the `channel`-compared-twice defect (N27-RETREAD-62) with the
+    /// sign flipped -- it would ADMIT rather than refuse.
+    cache_root: String,
+    /// [`universe_digest_of`] over `documents`, so a torn or hand-edited file is
+    /// REFUSED by its own bytes instead of handed to fourteen readers.
+    digest: String,
+    documents: Vec<RepodataDocument>,
+}
+
+/// Where this relock keeps the world for `cache_root`.
+///
+/// Keyed by the cache root and not a bare filename: one relock could in
+/// principle point two backends at two rattler roots, and two worlds under one
+/// name is the one-run-three-universes shape this whole mechanism exists to end.
+pub fn relock_world_path(relock_scope: &std::path::Path, cache_root: &std::path::Path) -> PathBuf {
+    let mut hasher = Sha256::new();
+    hasher.update(RELOCK_WORLD_SCHEMA.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(cache_root.to_string_lossy().as_bytes());
+    let hex: String = hasher
+        .finalize()
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    relock_scope
+        .join(RELOCK_WORLD_DIR)
+        .join(format!("{hex}.json"))
+}
+
+/// The relock's world if one is on disk AND it is about `cache_root` AND its own
+/// digest holds. `None` on every other outcome, with a row when the file existed
+/// and was rejected -- a world silently dropped would read as "I was first".
+pub(crate) fn read_relock_document_world(
+    path: &std::path::Path,
+    cache_root: &std::path::Path,
+) -> Option<Vec<RepodataDocument>> {
+    let bytes = std::fs::read(path).ok()?;
+    let world: RelockDocumentWorld = match serde_json::from_slice(&bytes) {
+        Ok(world) => world,
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "repodata: the relock's reader document world does not decode; taking this process's own snapshot instead",
+            );
+            return None;
+        }
+    };
+    if world.schema != RELOCK_WORLD_SCHEMA {
+        tracing::warn!(
+            path = %path.display(),
+            found = %world.schema,
+            expected = RELOCK_WORLD_SCHEMA,
+            "repodata: the relock's reader document world carries another wire schema; taking this process's own snapshot instead",
+        );
+        return None;
+    }
+    if world.cache_root != cache_root.to_string_lossy() {
+        tracing::warn!(
+            path = %path.display(),
+            found = %world.cache_root,
+            expected = %cache_root.display(),
+            "repodata: the relock's reader document world is a snapshot of another cache root; taking this process's own snapshot instead",
+        );
+        return None;
+    }
+    if world.documents.is_empty() {
+        // An empty world is never frozen (see `freeze_reader_documents_in`), so
+        // an empty one on disk is a writer that broke ORDER-1's rule.
+        tracing::warn!(
+            path = %path.display(),
+            "repodata: the relock's reader document world is EMPTY; nothing is adoptable against an empty world, so this process takes its own snapshot",
+        );
+        return None;
+    }
+    let digest = universe_digest_of(&world.documents);
+    if digest != world.digest {
+        tracing::warn!(
+            path = %path.display(),
+            found = %world.digest,
+            recomputed = %digest,
+            "repodata: the relock's reader document world does not fold to its own digest (a torn write); taking this process's own snapshot instead",
+        );
+        return None;
+    }
+    Some(world.documents)
+}
+
+/// Offer `documents` as the relock's world. `true` when THIS call created the
+/// file; `false` when a sibling backend got there first or the write failed.
+///
+/// CREATE-ONCE, AND IT IS A `hard_link` RATHER THAN A `rename` ON PURPOSE. A
+/// rename OVERWRITES, so two racing backends would both believe they had set the
+/// world and the later one would replace the bytes the earlier one had already
+/// handed to a reader -- one relock, two worlds, which is the defect. `hard_link`
+/// fails with `AlreadyExists` when the destination is there, so it is the atomic
+/// create-if-absent the race needs, and the temp file it links FROM is created
+/// with `create_new` so two racers cannot share one temp either.
+pub(crate) fn publish_relock_document_world(
+    path: &std::path::Path,
+    cache_root: &std::path::Path,
+    documents: &[RepodataDocument],
+) -> bool {
+    if documents.is_empty() {
+        return false;
+    }
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    if let Err(error) = std::fs::create_dir_all(parent) {
+        tracing::warn!(
+            path = %parent.display(),
+            error = %error,
+            "repodata: cannot create the relock's reader-document-world directory; this process judges against its own snapshot",
+        );
+        return false;
+    }
+    let world = RelockDocumentWorld {
+        schema: RELOCK_WORLD_SCHEMA.to_string(),
+        cache_root: cache_root.to_string_lossy().to_string(),
+        digest: universe_digest_of(documents),
+        documents: documents.to_vec(),
+    };
+    let bytes = match serde_json::to_vec(&world) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "repodata: cannot serialise the relock's reader document world",
+            );
+            return false;
+        }
+    };
+    let temp = parent.join(format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "world".to_string()),
+        std::process::id(),
+    ));
+    {
+        use std::io::Write as _;
+        let mut handle = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                tracing::warn!(
+                    path = %temp.display(),
+                    error = %error,
+                    "repodata: cannot stage the relock's reader document world",
+                );
+                return false;
+            }
+        };
+        if let Err(error) = handle.write_all(&bytes).and_then(|()| handle.sync_all()) {
+            tracing::warn!(
+                path = %temp.display(),
+                error = %error,
+                "repodata: cannot write the relock's reader document world",
+            );
+            let _ = std::fs::remove_file(&temp);
+            return false;
+        }
+    }
+    let created = match std::fs::hard_link(&temp, path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "repodata: cannot publish the relock's reader document world; this process judges against its own snapshot",
+            );
+            false
+        }
+    };
+    let _ = std::fs::remove_file(&temp);
+    created
+}
+
+/// STOREV3-3. The world every consult in this RELOCK judges against.
+///
+/// `relock_scope` is the backend's `cache_directory` -- pixi's `initialize`
+/// param, the same relock-scoped directory the cross-process `conda/outputs`
+/// memo and the job-scoped route-probe verdict store already live in. `None`
+/// (pixi handed the backend no cache directory) keeps STOREV3-2's behaviour
+/// exactly: a process-local freeze, `world=snapshotted`.
+/// `take_snapshot` returns the documents AND whatever the caller learned while
+/// listing them (`handler::conda_outputs` learns which of ORDER-1's three orders
+/// it took). That second half comes back as an `Option`, and the `None` is the
+/// honest answer on the two arms that never list the cache root at all: there is
+/// no order to report because no snapshot was taken.
+pub async fn relock_document_world<F, Fut, O>(
+    relock_scope: Option<&std::path::Path>,
+    take_snapshot: F,
+) -> (Vec<RepodataDocument>, DocumentWorld, Option<O>)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = (Vec<RepodataDocument>, O)>,
+{
+    relock_document_world_with(
+        reader_document_world_cell(),
+        relock_scope,
+        &dirs_cache_root(),
+        take_snapshot,
+    )
+    .await
+}
+
+/// [`relock_document_world`] against an explicit cell and cache root, so a guard
+/// can drive two "backends" in one relock without a process-global one test can
+/// move under another -- the same reason [`frozen_reader_documents_in`] takes a
+/// cell.
+pub(crate) async fn relock_document_world_with<F, Fut, O>(
+    cell: &OnceLock<Vec<RepodataDocument>>,
+    relock_scope: Option<&std::path::Path>,
+    cache_root: &std::path::Path,
+    take_snapshot: F,
+) -> (Vec<RepodataDocument>, DocumentWorld, Option<O>)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = (Vec<RepodataDocument>, O)>,
+{
+    // 1. This process already froze one. No cache root read, no scope read --
+    //    the cheapest arm, and the reason the frozen check comes first.
+    if let Some(frozen) = frozen_reader_documents_in(cell) {
+        return (frozen, DocumentWorld::Frozen, None);
+    }
+    let world_path = relock_scope.map(|scope| relock_world_path(scope, cache_root));
+    // 2. A sibling backend in this relock already established it. Still no cache
+    //    root read: the listing is an NFS stat-and-hash of every document in it,
+    //    and this is the arm thirteen of fourteen processes take.
+    if let Some(path) = world_path.as_deref() {
+        if let Some(handed) = read_relock_document_world(path, cache_root) {
+            let (documents, _) = freeze_reader_documents_in(cell, handed);
+            return (documents, DocumentWorld::Handed, None);
+        }
+    }
+    // 3. Nobody has. Take one and OFFER it as the relock's.
+    let (taken, learned) = take_snapshot().await;
+    let learned = Some(learned);
+    if taken.is_empty() {
+        // ORDER-1: an empty snapshot is a cold reader whose closure populates the
+        // root seconds later. Freezing one makes every later consult refuse on
+        // evidence it was never allowed to read, and PUBLISHING one would make
+        // that permanent for the whole relock.
+        return (taken, DocumentWorld::Unfrozen, learned);
+    }
+    let Some(path) = world_path.as_deref() else {
+        let (documents, _) = freeze_reader_documents_in(cell, taken);
+        return (documents, DocumentWorld::Snapshotted, learned);
+    };
+    let created = publish_relock_document_world(path, cache_root, &taken);
+    // RE-READ WHOEVER WON, for the reason `freeze_reader_documents_in` re-reads
+    // its cell: two backends racing into this function must both leave holding
+    // the WINNER's world. Returning the local would give the loser a world
+    // nobody else judges against, which is the split this exists to end -- and
+    // with fourteen launches inside 21 ms the race is the normal case, not the
+    // corner.
+    let (world, outcome) = match read_relock_document_world(path, cache_root) {
+        Some(handed) => {
+            let outcome = if created && handed == taken {
+                DocumentWorld::Published
+            } else {
+                DocumentWorld::Handed
+            };
+            (handed, outcome)
+        }
+        // The publish did not survive its own read-back. Loud, and this process
+        // falls back to its own snapshot rather than refusing the lock: a world
+        // it took itself is still a world, and it is what STOREV3-2 shipped.
+        None => {
+            tracing::warn!(
+                path = %path.display(),
+                created,
+                "repodata: the relock's reader document world could not be read back after publishing; this process judges against its own snapshot",
+            );
+            (taken, DocumentWorld::Snapshotted)
+        }
+    };
+    let (documents, _) = freeze_reader_documents_in(cell, world);
+    (documents, outcome, learned)
 }
 
 /// [`snapshot_documents_after_universe`] with the LOAD injected and the root
