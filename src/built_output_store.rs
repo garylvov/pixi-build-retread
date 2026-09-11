@@ -388,6 +388,50 @@ pub struct Record {
     /// fallback and never an adoption.
     #[serde(default)]
     pub candidate_universe: String,
+    /// STOREV3-2 / N27-RETREAD-226. Every package name THIS record's own cold
+    /// compute actually SELECTED, as
+    /// [`conda_solve::solved_names_since`](crate::conda_solve::solved_names_since)
+    /// cut them around that compute. **This is what the reader walks**, and
+    /// [`reachable_roots`](Record::reachable_roots) above became audit-only the
+    /// moment this field existed.
+    ///
+    /// THE DEFECT THIS CLOSES, and it is UNIVERSE-1's own escape hatch failing
+    /// on its first two production rolls. `reachable_roots` is a PROCESS-WIDE
+    /// union: one backend process answers fourteen `conda/outputs` requests, so
+    /// by pack fourteen the registry held 28 to 183 root names and the v3 digest
+    /// folded the transitive closure of all of them. That set's width is the
+    /// compiled ecosystem, not the candidates a verdict can turn on, so an
+    /// upload ANYWHERE in it refused. Measured: v3 rescued **0 of 14** on
+    /// STOREV3-1's roll and **4 of 14** on KEEPROLL-1's, while all fourteen
+    /// payloads were byte-identical across both rolls -- every refusal it failed
+    /// to prevent bought bytes that were already at those addresses.
+    ///
+    /// WHY THE SOLVED SET IS THE VERDICT-RELEVANT SET. The digest is folded over
+    /// the closure `load_records_recursive` walks from these names, so it covers
+    /// (i) every candidate of every package the solve SELECTED -- a new or
+    /// replaced artifact for any of them is exactly what could move the answer,
+    /// since resolvo takes the newest satisfying candidate -- and (ii) every
+    /// candidate of every name those candidates DEPEND on, transitively, which
+    /// is where a re-solve would be forced to move if a dependency's options
+    /// changed. What it deliberately drops is the rest of the process's union:
+    /// names some OTHER pack in the same backend walked, which this record's
+    /// resolution never enumerated and whose motion cannot reach it.
+    ///
+    /// THE RESIDUAL, NAMED RATHER THAN CLAIMED AWAY. A brand-new upload to a
+    /// name reachable from this pack's ROOTS but absent from its solved-set
+    /// closure -- i.e. reachable only through a candidate the solver rejected --
+    /// could in principle open a branch the solver would now prefer. v4 does not
+    /// see that and would adopt. It is the price of the narrowing and it is the
+    /// direction UNIVERSE-1's rule was already willing to pay in kind (it
+    /// dropped everything outside the roots' closure); what is new is that the
+    /// boundary is now drawn per record instead of per process.
+    ///
+    /// `serde(default)` so the field is additive within `SCHEMA`, exactly as
+    /// `advertised`, `repodata_universe`, `reachable_roots` and
+    /// `candidate_universe` were. EMPTY means "written before v4", which falls
+    /// back to v2 containment and never adopts blind.
+    #[serde(default)]
+    pub solved_names: Vec<String>,
 }
 
 /// Which of the two universe rules admitted a record.
@@ -460,6 +504,7 @@ pub fn encode<T: serde::Serialize, A: serde::Serialize>(
     constrains_source: &str,
     reachable_roots: &[String],
     candidate_universe: &str,
+    solved_names: &[String],
     payload: &T,
     advertised: &A,
 ) -> Result<Vec<u8>, serde_json::Error> {
@@ -489,6 +534,15 @@ pub fn encode<T: serde::Serialize, A: serde::Serialize>(
             roots
         },
         candidate_universe: candidate_universe.to_string(),
+        // STOREV3-2: sorted and deduped at the writer for the third time and
+        // the same reason -- two publishers of one key must not write two
+        // orderings of one set, or the reader walks two different root lists.
+        solved_names: {
+            let mut names = solved_names.to_vec();
+            names.sort();
+            names.dedup();
+            names
+        },
     };
     serde_json::to_vec(&record)
 }
@@ -525,10 +579,17 @@ pub fn parse(bytes: &[u8], expected_inputs_digest: &str) -> Result<Record, Refus
 ///
 /// TWO RULES, TRIED IN THIS ORDER, AND THE ORDER IS THE WHOLE OF UNIVERSE-1.
 ///
-/// **v3 — the candidate set (N27-RETREAD-204).** When the record stamped a
-/// `candidate_universe` and the reader recomputed one for the record's OWN roots
+/// **v3/v4 — the candidate set (N27-RETREAD-204, narrowed by
+/// N27-RETREAD-226).** When the record stamped a `candidate_universe` and the
+/// reader recomputed one over the record's own RELEVANT SET
 /// (`reader_candidate_universe`), equality of the two digests is the adoption
-/// test. It is exact, not containment: the reader walked the same roots through
+/// test. STOREV3-2 changed what the relevant set IS -- it is now the record's
+/// own [`solved_names`](Record::solved_names) closure and no longer the
+/// process-wide [`reachable_roots`](Record::reachable_roots) union -- but the
+/// COMPARISON here is untouched, because the reader supplies the digest and this
+/// function only decides. Keeping the narrowing at the call site and not in here
+/// is what lets one guard drive this decision with a hand-built digest pair and
+/// another drive the real walk. It is exact, not containment: the reader walked the same roots through
 /// the same fold, so it can compare an equal thing — which is precisely what
 /// CONDA-OUT-2 said a reader could not do, and it was right about the
 /// alternative it had. Its "the reader has not resolved anything" argument
@@ -947,6 +1008,7 @@ mod tests {
             "universe",
             &[],
             "",
+            &[],
             &serde_json::json!({"outputs": []}),
             &serde_json::json!([{"name": "pack", "build": "py311_hdeadbeef_loose_5"}]),
         )
@@ -1165,6 +1227,7 @@ mod tests {
             "locked",
             &[],
             "",
+            &[],
             &serde_json::json!({"outputs": []}),
             &serde_json::json!([]),
         )
@@ -1818,9 +1881,29 @@ mod tests {
 
     /// A v3 record: the roots the resolution walked, and the digest of the
     /// candidate set it could reach.
+    ///
+    /// STOREV3-2 keeps this door as it was and makes the record's RELEVANT SET
+    /// equal to its roots, which is what UNIVERSE-1's world looked like when the
+    /// process ran ONE pack. Every guard below that is about the v2/v3
+    /// comparison rather than about the set's WIDTH therefore reads unchanged;
+    /// the width guards call [`s2_record`] and state the two sets separately.
     fn u1_record(
         consulted: &[crate::repodata::RepodataDocument],
         roots: &[&str],
+        candidate_universe: &str,
+    ) -> Vec<u8> {
+        s2_record(consulted, roots, roots, candidate_universe)
+    }
+
+    /// STOREV3-2 / N27-RETREAD-226. A record whose PROCESS-WIDE root union and
+    /// whose OWN relevant set are stated separately, which is the only way to
+    /// write a fixture for the defect: in production they differ because one
+    /// backend process answers fourteen `conda/outputs` requests and
+    /// `reachable_roots` unions all fourteen.
+    fn s2_record(
+        consulted: &[crate::repodata::RepodataDocument],
+        roots: &[&str],
+        solved: &[&str],
         candidate_universe: &str,
     ) -> Vec<u8> {
         encode(
@@ -1831,6 +1914,7 @@ mod tests {
             "universe",
             &roots.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
             candidate_universe,
+            &solved.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
             &serde_json::json!({"outputs": []}),
             &serde_json::json!([]),
         )
@@ -1839,11 +1923,18 @@ mod tests {
 
     /// The REAL walk and the REAL fold, over the fixture document.
     fn u1_digest(sparse: &Path) -> String {
+        u1_digest_over(sparse, &["pack-root"])
+    }
+
+    /// [`u1_digest`] with the ROOTS explicit, so a guard can fold the same
+    /// document at two widths and read the difference -- which is the whole of
+    /// STOREV3-2's measurement.
+    fn u1_digest_over(sparse: &Path, roots: &[&str]) -> String {
         u1_block_on(crate::conda_solve::candidate_universe_over_document(
             U1_CHANNEL,
             U1_SUBDIR,
             sparse,
-            &["pack-root"],
+            roots,
         ))
         .expect("the fixture document must yield a candidate universe")
     }
@@ -2084,6 +2175,460 @@ mod tests {
             !after.iter().any(|name| name == "pack-root"),
             "and `pack-root` in particular must not be there: it is the FIXTURE \
              record's root, not any root this process resolved"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // STOREV3-2 / N27-RETREAD-226: the reader's document world is frozen for
+    // one run, and the candidate comparison is over the record's OWN relevant
+    // set.
+    // ------------------------------------------------------------------
+
+    /// STOREV3-2 GUARD (a) -- A DOCUMENT REPLACED AFTER THE SNAPSHOT IS STILL
+    /// CONTAINED.
+    ///
+    /// THE DEFECT, MEASURED. SUBCERT-2's candidate-free control `6220179`
+    /// refused **14 of 14** live built-output records, every refusal
+    /// `Refusal::Universe` from the v2 containment arm and every one naming the
+    /// SAME single document. Both arms' `pixi-overlay/repodata` `readlink -f` to
+    /// ONE shared path; the files there were REPLACED at 21:03 and 21:06, inside
+    /// the control's own window, and the control refused at 21:04:01 naming the
+    /// document IT had just replaced. One run, three reader universes, fourteen
+    /// quarantines -- and the recompute produced byte-identical payloads at all
+    /// fourteen addresses (`payload_SAME=14 payload_DIFF=0`), so 34 minutes of
+    /// node time bought bytes that were already there.
+    ///
+    /// THE RULE: the containment reference is the set of documents snapshotted
+    /// once, and a document replaced after that snapshot is NOT absent.
+    ///
+    /// NON-VACUITY, and it is what makes this a guard rather than a tautology:
+    /// the same record against the REPLACED world is asserted to refuse. If the
+    /// freeze is removed, the first assertion becomes that refusal.
+    #[test]
+    fn s2_a_a_document_replaced_after_the_snapshot_is_still_contained() {
+        let publisher = Scratch::new("s2-a-pub");
+        let replaced = Scratch::new("s2-a-replaced");
+        let (entry_world, writer, _pub_sparse) = u1_world(publisher.path(), &u1_base());
+        // The mid-run replacement: the SAME logical document, different bytes.
+        let (mid_run_world, _w, _s) =
+            u1_world(replaced.path(), &u1_document(&u1_sha('2'), "1.1", ""));
+        assert_ne!(
+            entry_world[0].sha256, mid_run_world[0].sha256,
+            "the fixture must actually replace the document, or this guard is empty"
+        );
+
+        let bytes = u1_record(&[writer.clone()], &["pack-root"], "");
+        let record = parse(&bytes, "digest-u1").unwrap();
+
+        // NON-VACUITY: unfrozen, this is STOREV3-1's exact 14-of-14 shape.
+        assert!(
+            matches!(
+                universe_verdict(&record, &mid_run_world, None),
+                Err(Refusal::Universe { .. })
+            ),
+            "the replaced world MUST refuse this record -- that is the defect"
+        );
+
+        // The run freezes its world at entry.
+        let cell: std::sync::OnceLock<Vec<crate::repodata::RepodataDocument>> =
+            std::sync::OnceLock::new();
+        let (frozen, world) =
+            crate::repodata::freeze_reader_documents_in(&cell, entry_world.clone());
+        assert_eq!(world, crate::repodata::DocumentWorld::Snapshotted);
+        assert_eq!(frozen, entry_world);
+
+        // A LATER consult in the same run cannot move the reference, even when
+        // it hands over the replaced world -- which is what the second and third
+        // refresh of the shared root did to job 6220179.
+        let (frozen_again, world_again) =
+            crate::repodata::freeze_reader_documents_in(&cell, mid_run_world.clone());
+        assert_eq!(world_again, crate::repodata::DocumentWorld::Frozen);
+        assert_eq!(
+            frozen_again, entry_world,
+            "a world the reader rewrites while comparing against it is not a \
+             containment reference"
+        );
+        assert_eq!(
+            crate::repodata::frozen_reader_documents_in(&cell),
+            Some(entry_world.clone()),
+            "and asking for the frozen world must not read the live root again"
+        );
+
+        // THE VERDICT, which is the whole point.
+        assert_eq!(
+            universe_verdict(&record, &frozen_again, None),
+            Ok(UniverseMatch::V2),
+            "a document replaced AFTER the snapshot is not absent from the world \
+             this run agreed to judge in"
+        );
+    }
+
+    /// STOREV3-2 -- AN EMPTY SNAPSHOT IS NOT A WORLD AND IS NOT FROZEN.
+    ///
+    /// ORDER-1's rule, kept intact. The consult runs strictly upstream of every
+    /// repodata fetch, so a cold process's FIRST snapshot is legitimately empty
+    /// and the closure populates the root seconds later. Freezing an empty world
+    /// would make every later consult in that process refuse on evidence it was
+    /// never allowed to read -- DEVPATH-2's defect (job 6185774:
+    /// `reader_documents=0`, `Refusal::Universe`, and a `quarantine_refused`
+    /// that renamed production's record away), made permanent.
+    #[test]
+    fn s2_an_empty_snapshot_is_never_frozen() {
+        let dir = Scratch::new("s2-empty");
+        let (world, _writer, _sparse) = u1_world(dir.path(), &u1_base());
+        let cell: std::sync::OnceLock<Vec<crate::repodata::RepodataDocument>> =
+            std::sync::OnceLock::new();
+        let (documents, verdict) = crate::repodata::freeze_reader_documents_in(&cell, Vec::new());
+        assert!(documents.is_empty());
+        assert_eq!(verdict, crate::repodata::DocumentWorld::Unfrozen);
+        assert_eq!(
+            crate::repodata::frozen_reader_documents_in(&cell),
+            None,
+            "an empty snapshot must leave the cell unset, or a cold reader can \
+             never adopt once its own closure has populated the root"
+        );
+        let (documents, verdict) = crate::repodata::freeze_reader_documents_in(&cell, world.clone());
+        assert_eq!(verdict, crate::repodata::DocumentWorld::Snapshotted);
+        assert_eq!(documents, world);
+    }
+
+    /// STOREV3-2 GUARD (b) -- STOREV3-1's FALSIFIER. A PACKAGE OUTSIDE THE
+    /// RECORD'S SOLVED SET MOVES, AND THE RECORD IS ADOPTED.
+    ///
+    /// THE DEFECT, MEASURED TWICE. `candidate_universe_digest_of` was folded
+    /// over the closure from `Record::reachable_roots`, and that field is the
+    /// PROCESS-WIDE union: one backend process answers fourteen `conda/outputs`
+    /// requests, so the registry held 28 to 183 root names by the last pack and
+    /// the digest covered the compiled ecosystem rather than the candidates a
+    /// verdict can turn on. UNIVERSE-1's escape hatch therefore rescued **0 of
+    /// 14** records on STOREV3-1's roll and **4 of 14** on KEEPROLL-1's, while
+    /// all fourteen payloads were byte-identical across both rolls
+    /// (`payload_SAME=14 payload_DIFF=0`) -- every refusal it failed to prevent
+    /// bought bytes that were already at those addresses.
+    ///
+    /// THE FIXTURE IS THE PRODUCTION SHAPE. `unrelated` is in the process's root
+    /// union (some OTHER pack in the same backend resolved it) and absent from
+    /// THIS record's solved set. It moves 1.0 -> 1.1.
+    ///
+    /// THREE NON-VACUITY ASSERTIONS, so no arm of this can pass empty:
+    ///  1. v2 containment refuses -- the document really rolled.
+    ///  2. the digest at the OLD width (the union's closure) really MOVES, so
+    ///     the narrowing is what admits this and not luck.
+    ///  3. the digest at the NEW width is non-empty, so the walk really ran.
+    #[test]
+    fn s2_b_a_package_outside_the_records_solved_set_moving_still_adopts() {
+        let publisher = Scratch::new("s2-b-pub");
+        let requester = Scratch::new("s2-b-req");
+        let (_pub_reader, writer, pub_sparse) = u1_world(publisher.path(), &u1_base());
+        let (reader, _w, req_sparse) =
+            u1_world(requester.path(), &u1_document(&u1_sha('2'), "1.1", ""));
+
+        const UNION: &[&str] = &["pack-root", "unrelated"];
+        const RELEVANT: &[&str] = &["pack-root"];
+
+        let stamped = u1_digest_over(&pub_sparse, RELEVANT);
+        assert!(!stamped.is_empty(), "the writer's walk must have run");
+        let bytes = s2_record(&[writer.clone()], UNION, RELEVANT, &stamped);
+        let record = parse(&bytes, "digest-u1").unwrap();
+        assert_eq!(record.solved_names, vec!["pack-root".to_string()]);
+        assert_eq!(
+            record.reachable_roots,
+            vec!["pack-root".to_string(), "unrelated".to_string()],
+            "the fixture must keep the process-wide union WIDER than the record's \
+             own relevant set, or it is not this defect"
+        );
+
+        // NON-VACUITY 1: v2 refuses, so something has to rescue this record.
+        assert!(
+            matches!(
+                universe_verdict(&record, &reader, None),
+                Err(Refusal::Universe { .. })
+            ),
+            "v2 containment MUST refuse a rolled document"
+        );
+
+        // NON-VACUITY 2: at UNIVERSE-1's width the digest moves, which is the
+        // 0-of-14 and 4-of-14 that were measured in production.
+        assert_ne!(
+            u1_digest_over(&pub_sparse, UNION),
+            u1_digest_over(&req_sparse, UNION),
+            "at the process-wide root width this roll DOES move the digest -- if \
+             it did not, this guard would pass with the narrowing removed and \
+             would prove nothing"
+        );
+
+        // THE FALSIFIER: the relevant set is untouched, so the record adopts.
+        let reader_relevant = u1_digest_over(&req_sparse, RELEVANT);
+        assert_eq!(
+            reader_relevant, record.candidate_universe,
+            "a package the record's resolution never selected cannot move its \
+             relevant-set digest"
+        );
+        assert_eq!(
+            universe_verdict(&record, &reader, Some(&reader_relevant)),
+            Ok(UniverseMatch::V3),
+            "N27-RETREAD-226's falsifier: the record must be adopted"
+        );
+    }
+
+    /// STOREV3-2 GUARD (c) -- A PACKAGE INSIDE THE RECORD'S SOLVED SET MOVES,
+    /// AND THE REFUSAL STAYS LOUD.
+    ///
+    /// The soundness half. The narrowing is only legitimate if it still refuses
+    /// what it must: `libreach` is in `pack-root`'s own closure, so a replaced
+    /// artifact for it is exactly the class of roll that can change the answer,
+    /// and the record must refuse with the document still named -- the diagnosis
+    /// a lane needs from the row it greps.
+    #[test]
+    fn s2_c_a_package_inside_the_records_solved_set_moving_refuses() {
+        let publisher = Scratch::new("s2-c-pub");
+        let requester = Scratch::new("s2-c-req");
+        let (_pub_reader, writer, pub_sparse) = u1_world(publisher.path(), &u1_base());
+        // `libreach` is reached through `pack-root`'s `depends`, so it is inside
+        // the relevant set even though it is not itself a root.
+        let (reader, _w, req_sparse) =
+            u1_world(requester.path(), &u1_document(&u1_sha('9'), "1.0", ""));
+
+        const UNION: &[&str] = &["pack-root", "unrelated"];
+        const RELEVANT: &[&str] = &["pack-root"];
+
+        let bytes = s2_record(
+            &[writer.clone()],
+            UNION,
+            RELEVANT,
+            &u1_digest_over(&pub_sparse, RELEVANT),
+        );
+        let record = parse(&bytes, "digest-u1").unwrap();
+        let reader_relevant = u1_digest_over(&req_sparse, RELEVANT);
+        assert_ne!(
+            reader_relevant, record.candidate_universe,
+            "a replaced artifact INSIDE the relevant set must move its digest, \
+             or the narrowing has become a waiver"
+        );
+        match universe_verdict(&record, &reader, Some(&reader_relevant)) {
+            Err(Refusal::Universe { recorded, missing }) => {
+                assert_eq!(recorded, 1);
+                assert!(
+                    missing.contains(&writer.sha256),
+                    "the refusal must still name the document that moved: {missing}"
+                );
+            }
+            other => panic!("a moved relevant candidate must refuse: {other:?}"),
+        }
+    }
+
+    /// STOREV3-2 -- THE WRITER STAMPS THE RELEVANT SET WHERE THE READER LOOKS,
+    /// SORTED AND DEDUPED, AND A RECORD WITHOUT ONE FALLS TO THE BRIDGE.
+    ///
+    /// Law 2 in two assertions. The second half matters as much as the first:
+    /// every one of the 358 entries in the shared store was written before this
+    /// field existed, so a record with an empty relevant set must stay adoptable
+    /// by v2 containment (against the FROZEN world) rather than being re-walked
+    /// at UNIVERSE-1's width, which is what rescued 0 of 14 and 4 of 14.
+    #[test]
+    fn s2_the_record_carries_the_relevant_set_and_an_absent_one_falls_to_v2() {
+        let dir = Scratch::new("s2-roundtrip");
+        let (reader, writer, _sparse) = u1_world(dir.path(), &u1_base());
+        let bytes = s2_record(
+            &[writer.clone()],
+            &["zlib", "pack-root"],
+            &["libreach", "pack-root", "libreach"],
+            "cafebabecafebabe",
+        );
+        let record = parse(&bytes, "digest-u1").unwrap();
+        assert_eq!(
+            record.solved_names,
+            vec!["libreach".to_string(), "pack-root".to_string()],
+            "two publishers of one key must not write two orderings of one \
+             relevant set"
+        );
+
+        let pre_v4 = u1_record(&[writer], &[], "");
+        let pre_v4 = parse(&pre_v4, "digest-u1").unwrap();
+        assert!(
+            pre_v4.solved_names.is_empty(),
+            "the fixture must be a record from before v4"
+        );
+        assert_eq!(
+            universe_verdict(&pre_v4, &reader, None),
+            Ok(UniverseMatch::V2),
+            "a pre-v4 record in an intact world must still adopt through the bridge"
+        );
+    }
+
+    /// STOREV3-2's FIXTURE ISOLATION RUN, over REAL production record bytes.
+    ///
+    /// `#[ignore]`d and driven by hand, because its inputs are two per-job cold
+    /// built-output roots on this box and not fixtures in the tree -- a guard
+    /// that silently passes when its inputs are absent is worse than no guard, so
+    /// this one REFUSES when the two roots are not named and is never part of the
+    /// gate's split. Run it as
+    ///
+    /// ```text
+    /// RETREAD_STOREV3_2_ROOT_A=<K1 cold root>/built-outputs-cold \
+    /// RETREAD_STOREV3_2_ROOT_B=<K2 cold root>/built-outputs-cold \
+    ///   cargo test --lib -- --ignored --exact --nocapture \
+    ///   built_output_store::tests::s2_fixture_fourteen_addresses_across_a_real_roll
+    /// ```
+    ///
+    /// WHAT IT MEASURES, and it is KEEPROLL-1's own before/after read through
+    /// production's decision function instead of through `sed`. Both roots hold
+    /// the SAME fourteen addresses (so the folds are not key material, which is
+    /// KEEPROLL-1 row8's finding), the payloads are byte-identical 14 of 14, and
+    /// the v2 fold moved on 13 of 14. Two arms:
+    ///
+    ///  * **UNFROZEN** -- root A's records judged against root B's world, i.e. a
+    ///    reader whose documents were replaced under it mid-run. This is
+    ///    SUBCERT-2 `6220179`'s shape.
+    ///  * **FROZEN** -- the same records against the world snapshotted at entry.
+    ///
+    /// It reads only; it publishes nothing, writes nothing under either root, and
+    /// never touches the shared store.
+    ///
+    /// HONEST LIMIT, STATED IN THE TEST AND NOT ONLY IN A ROW. The "world at
+    /// entry" is reconstructed as the union of root A's records' own
+    /// `consulted_repodata`, because the repodata documents of that generation NO
+    /// LONGER EXIST on this box -- the shared `retread-repodata` holds one
+    /// generation and the next run overwrote it, which is cause (a) of
+    /// N27-RETREAD-226 restated. So the FROZEN arm's containment is true partly
+    /// by construction, and what it demonstrates is the conditional: given a
+    /// stable reference, the v2 arm admits these records. The defect was never
+    /// that the rule is wrong; it is that the reference was not stable. For the
+    /// same reason the v4 arm CANNOT be measured here at all -- recomputing a
+    /// candidate digest needs the documents of both generations -- and its floor
+    /// on this roll is KEEPROLL-1's stamped v3 pair: 10 of 14 moved, 4 stood.
+    #[test]
+    #[ignore]
+    fn s2_fixture_fourteen_addresses_across_a_real_roll() {
+        let root_a = std::env::var("RETREAD_STOREV3_2_ROOT_A")
+            .expect("name the K1 cold built-output root in RETREAD_STOREV3_2_ROOT_A");
+        let root_b = std::env::var("RETREAD_STOREV3_2_ROOT_B")
+            .expect("name the K2 cold built-output root in RETREAD_STOREV3_2_ROOT_B");
+
+        /// Every complete entry under a store root, as `(address, record)`.
+        fn records(root: &str) -> Vec<(String, Record)> {
+            let mut out = Vec::new();
+            for entry in std::fs::read_dir(root).expect("the root must be readable") {
+                let dir = entry.expect("walking the root").path();
+                if !dir.is_dir() || dir.file_name().and_then(|n| n.to_str()) == Some(QUARANTINE) {
+                    continue;
+                }
+                if !dir.join(MARKER).is_file() {
+                    continue;
+                }
+                let bytes = match std::fs::read(dir.join(PAYLOAD)) {
+                    Ok(bytes) => bytes,
+                    Err(_) => continue,
+                };
+                // The record states its own digest; `parse` is driven with it so
+                // the three cheap identity checks pass and this run measures the
+                // UNIVERSE arm, which is the one under test.
+                let stated: Record = match serde_json::from_slice(&bytes) {
+                    Ok(record) => record,
+                    Err(_) => continue,
+                };
+                let digest = stated.inputs_digest.clone();
+                let record = parse(&bytes, &digest).expect("a real record must parse");
+                out.push((
+                    dir.file_name().unwrap().to_string_lossy().to_string(),
+                    record,
+                ));
+            }
+            out.sort_by(|left, right| left.0.cmp(&right.0));
+            out
+        }
+
+        /// The world in which a set of records' answers were true.
+        fn world(records: &[(String, Record)]) -> Vec<crate::repodata::RepodataDocument> {
+            let mut documents: Vec<crate::repodata::RepodataDocument> = records
+                .iter()
+                .flat_map(|(_, record)| record.consulted_repodata.iter().cloned())
+                .collect();
+            documents.sort();
+            documents.dedup();
+            documents
+        }
+
+        let a = records(&root_a);
+        let b = records(&root_b);
+        println!("### S2 FIXTURE addresses_a={} addresses_b={}", a.len(), b.len());
+        assert!(!a.is_empty(), "root A holds no complete entry");
+
+        let entry_world = world(&a);
+        let replaced_world = world(&b);
+        println!(
+            "### S2 FIXTURE documents_entry={} documents_replaced={} universe_entry={} universe_replaced={}",
+            entry_world.len(),
+            replaced_world.len(),
+            crate::repodata::universe_digest_of(&entry_world),
+            crate::repodata::universe_digest_of(&replaced_world),
+        );
+        // NON-VACUITY: the two worlds must genuinely differ, or there is no roll
+        // here and neither arm means anything.
+        assert_ne!(
+            entry_world, replaced_world,
+            "the two roots must straddle a real roll"
+        );
+        for document in &entry_world {
+            if !replaced_world.contains(document) {
+                println!(
+                    "### S2 FIXTURE MOVED document={}",
+                    document_label(document)
+                );
+            }
+        }
+
+        // ARM 1: UNFROZEN. The world was rewritten under the reader.
+        let mut unfrozen_hits = 0usize;
+        for (address, record) in &a {
+            match universe_verdict(record, &replaced_world, None) {
+                Ok(matched) => {
+                    unfrozen_hits += 1;
+                    println!("### S2 FIXTURE UNFROZEN {address} HIT match={matched}");
+                }
+                Err(why) => println!("### S2 FIXTURE UNFROZEN {address} REFUSED {why}"),
+            }
+        }
+
+        // ARM 2: FROZEN. The reference is the set snapshotted at entry, and a
+        // document replaced after that snapshot is not absent.
+        let cell: std::sync::OnceLock<Vec<crate::repodata::RepodataDocument>> =
+            std::sync::OnceLock::new();
+        let (_entry_snapshot, first) =
+            crate::repodata::freeze_reader_documents_in(&cell, entry_world.clone());
+        assert_eq!(first, crate::repodata::DocumentWorld::Snapshotted);
+        // The mid-run replacement, offered to the freeze exactly as a later
+        // consult offers it, and refused exactly as production now refuses it.
+        let (frozen, later) =
+            crate::repodata::freeze_reader_documents_in(&cell, replaced_world.clone());
+        assert_eq!(later, crate::repodata::DocumentWorld::Frozen);
+        assert_eq!(frozen, entry_world);
+        let mut frozen_hits = 0usize;
+        for (address, record) in &a {
+            match universe_verdict(record, &frozen, None) {
+                Ok(matched) => {
+                    frozen_hits += 1;
+                    println!("### S2 FIXTURE FROZEN {address} HIT match={matched}");
+                }
+                Err(why) => println!("### S2 FIXTURE FROZEN {address} REFUSED {why}"),
+            }
+        }
+
+        println!(
+            "### S2 FIXTURE RESULT addresses={} unfrozen_hits={} frozen_hits={}",
+            a.len(),
+            unfrozen_hits,
+            frozen_hits,
+        );
+        assert_eq!(
+            frozen_hits,
+            a.len(),
+            "every record must be contained in the world snapshotted at entry"
+        );
+        assert!(
+            unfrozen_hits < a.len(),
+            "the unfrozen arm must refuse at least one record, or this roll did \
+             not reach these records and the measurement is empty"
         );
     }
 }

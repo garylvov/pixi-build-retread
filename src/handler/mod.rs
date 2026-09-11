@@ -5998,6 +5998,14 @@ impl Handler {
         // entry -- so without this the first record this binary refuses makes
         // that key permanently cold for every job that shares the store.
         let mut built_output_store_refused = false;
+        // STOREV3-2 / N27-RETREAD-226. Where the process's solved-name log stood
+        // BEFORE this request's cold compute. The delta taken at the publish
+        // below is THIS record's relevant set; the un-marked whole is the
+        // fourteen-packs-in-one-process union that made UNIVERSE-1's escape
+        // hatch refuse 14 of 14. Taken here, above the consult, and not lower
+        // down: the consult never solves, so the mark is stable across it, and a
+        // mark taken after an early return would not exist at all.
+        let built_output_solved_mark = crate::conda_solve::solved_names_mark();
         if let (Some(store), Some(store_key)) =
             (built_output_store.as_ref(), built_output_store_key.as_ref())
         {
@@ -6025,32 +6033,61 @@ impl Handler {
             // and a non-empty snapshot is the warm reader that measurably
             // adopts today (job 6167146: hit=14, miss=0, not one repodata row in
             // the log) and must not be refreshed under its own records' feet.
-            let (reader_documents, consult_order) = if payload.is_some() {
-                let (documents, primed) = crate::repodata::snapshot_documents_after_universe(
-                    &params.channels,
-                    cache_target.conda_subdir(),
-                )
-                .await;
-                (
-                    documents,
-                    if primed {
-                        "after-universe"
-                    } else {
-                        "reader-already-warm"
-                    },
-                )
-            } else {
-                (
-                    crate::repodata::prime_snapshot_documents().await,
-                    "no-record",
-                )
-            };
+            //
+            // STOREV3-2 / N27-RETREAD-226: and the world is FROZEN for the run.
+            // The frozen check is FIRST, before any snapshot, because a frozen
+            // reader must not read the cache root again at all -- that read is
+            // both the cost and the defect. SUBCERT-2's control `6220179`
+            // replaced the shared documents at 21:03, refused all fourteen
+            // records at 21:04:01 naming the document it had just replaced, and
+            // replaced pytorch again at 21:06: one run, three reader universes,
+            // fourteen quarantines, and fourteen byte-identical recomputes.
+            let (reader_documents, consult_order, document_world) =
+                match crate::repodata::frozen_reader_documents() {
+                    Some(frozen) => (
+                        frozen,
+                        "frozen",
+                        crate::repodata::DocumentWorld::Frozen,
+                    ),
+                    None => {
+                        let (documents, order) = if payload.is_some() {
+                            let (documents, primed) =
+                                crate::repodata::snapshot_documents_after_universe(
+                                    &params.channels,
+                                    cache_target.conda_subdir(),
+                                )
+                                .await;
+                            (
+                                documents,
+                                if primed {
+                                    "after-universe"
+                                } else {
+                                    "reader-already-warm"
+                                },
+                            )
+                        } else {
+                            (
+                                crate::repodata::prime_snapshot_documents().await,
+                                "no-record",
+                            )
+                        };
+                        let (documents, world) =
+                            crate::repodata::freeze_reader_documents(documents);
+                        (documents, order, world)
+                    }
+                };
             // STDERR, never STDOUT -- `rpc.rs` owns stdout as the JSON-RPC
             // channel, and `rpc::tests::no_println_reaches_the_json_rpc_channel`
             // refuses a `println!` anywhere under `src/handler/`. See the longer
             // note on the `### built-outputs REFUSED` row below.
+            // STOREV3-2 / N27-RETREAD-226 added `world=`: which of the three
+            // things this consult judged against (it took the snapshot and froze
+            // it, it reused an earlier consult's freeze, or the root was empty
+            // and there was nothing to freeze). Without it "one run, three
+            // universes" is only visible by diffing `universe=` across minutes,
+            // which is how STOREV3-1 had to find it.
             eprintln!(
-                "### STORE CONSULT order={consult_order} reader_documents={} universe={}",
+                "### STORE CONSULT order={consult_order} world={document_world} reader_documents={} universe={}",
                 reader_documents.len(),
                 crate::repodata::universe_digest_of(&reader_documents),
             );
@@ -6080,19 +6117,37 @@ impl Handler {
             let mut cached: Option<CondaOutputsResult> = None;
             let mut universe_match: Option<crate::built_output_store::UniverseMatch> = None;
             let mut reader_candidate_universe: Option<String> = None;
+            // STOREV3-2: carried out of the match arm so the REFUSAL row below
+            // can print it -- `record` is consumed by `accept` on the adopting
+            // branch, and a row that can only be printed on the branch that did
+            // not refuse is no use to the lane reading a refusal.
+            let mut record_relevant_set_size: usize = 0;
             if let Some(bytes) = payload.as_deref() {
                 match crate::built_output_store::parse(bytes, &store_key.inputs_digest) {
                     Ok(record) => {
+                        record_relevant_set_size = record.solved_names.len();
                         let mut verdict = crate::built_output_store::universe_verdict(
                             &record,
                             &reader_documents,
                             None,
                         );
-                        if verdict.is_err() && !record.candidate_universe.is_empty() {
+                        // STOREV3-2 / N27-RETREAD-226. THE WALK IS OVER THE
+                        // RECORD'S OWN SOLVED-SET CLOSURE, not over the
+                        // process-wide `reachable_roots` union UNIVERSE-1 stamped.
+                        // A record written before v4 carries no `solved_names`,
+                        // has no relevant set this reader can name, and stays on
+                        // the v2 bridge rather than being re-walked at the old
+                        // width -- re-walking it would reproduce the 0-of-14 and
+                        // 4-of-14 rescues STOREV3-1 and KEEPROLL-1 measured, at
+                        // the cost of a sparse closure per record.
+                        if verdict.is_err()
+                            && !record.candidate_universe.is_empty()
+                            && !record.solved_names.is_empty()
+                        {
                             reader_candidate_universe = crate::conda_solve::candidate_universe(
                                 &params.channels,
                                 cache_target.conda_subdir(),
-                                &record.reachable_roots,
+                                &record.solved_names,
                             )
                             .await;
                             verdict = crate::built_output_store::universe_verdict(
@@ -6103,8 +6158,21 @@ impl Handler {
                         }
                         // STDERR, never STDOUT -- see the `### STORE CONSULT`
                         // row above and `rpc::tests::no_println_reaches_the_json_rpc_channel`.
+                        // STOREV3-2 / N27-RETREAD-226 added the three inputs the
+                        // verdict actually turns on and that no row carried:
+                        // `world=`/`documents=` (which frozen document set this
+                        // decided against, and how many documents were in it) and
+                        // `relevant=` (how many names the record's own relevant
+                        // set holds, against `roots=`, the process-wide union it
+                        // replaced). `v3=` already IS the relevant-set digest and
+                        // `match=` already IS which arm decided; those two are
+                        // unchanged. NO NEW ROW WAS INVENTED -- and the claim
+                        // that `### STORE UNIVERSE` does not exist in this binary
+                        // is false: `grep -ac '### STORE UNIVERSE' cand-e4bc693`
+                        // = 1. The greps that returned 0 were for
+                        // `### STORE UNIVERSE v2=`, and `v3=` comes first.
                         eprintln!(
-                            "### STORE UNIVERSE v3={} v2={} record_v3={} record_v2={} roots={} match={}",
+                            "### STORE UNIVERSE v3={} v2={} record_v3={} record_v2={} roots={} relevant={} world={document_world} documents={} match={}",
                             reader_candidate_universe.as_deref().unwrap_or("not-computed"),
                             crate::repodata::universe_digest_of(&reader_documents),
                             if record.candidate_universe.is_empty() {
@@ -6118,6 +6186,8 @@ impl Handler {
                                 record.repodata_universe.as_str()
                             },
                             record.reachable_roots.len(),
+                            record.solved_names.len(),
+                            reader_documents.len(),
                             match &verdict {
                                 Ok(matched) => matched.to_string(),
                                 Err(_) => "none".to_string(),
@@ -6313,8 +6383,18 @@ impl Handler {
                         // already tees backend STDERR into `<arm>.backend.log`
                         // (the `SHIM` every relock template writes), so this is
                         // also where every other backend row a lane greps lands.
+                        // STOREV3-2 / N27-RETREAD-226 added the verdict's inputs
+                        // to the REFUSAL too, because this is the row a lane
+                        // greps out of a lock log with no backend log beside it:
+                        // how many documents the frozen world held, whether it
+                        // was frozen at all, and how wide the record's relevant
+                        // set was (`relevant=0` means the record predates v4 and
+                        // was decided by document containment alone).
                         eprintln!(
-                            "### built-outputs REFUSED key={key} reason=repodata_universe mismatch stored={missing} job={}",
+                            "### built-outputs REFUSED key={key} reason=repodata_universe mismatch stored={missing} world={document_world} documents={} relevant={} v3={} job={}",
+                            reader_documents.len(),
+                            record_relevant_set_size,
+                            reader_candidate_universe.as_deref().unwrap_or("not-computed"),
                             std::env::var("SLURM_JOB_ID")
                                 .unwrap_or_else(|_| "none".to_string()),
                         );
@@ -7359,11 +7439,27 @@ impl Handler {
                 // spellings. The pairs are already mmapped in this process by
                 // the resolution that just finished, so this walk is a memory
                 // walk and not a fetch.
+                //
+                // STOREV3-2 / N27-RETREAD-226 NARROWED THE ROOTS AND LEFT THE
+                // FOLD ALONE. `reachable_roots` is still stamped, and it is now
+                // AUDIT ONLY: it is the process-wide union, so on a fourteen-pack
+                // relock pack 1's roots were reaching pack 14's digest and every
+                // pack was refused for a roll in a closure it never touched (v3
+                // rescued 0 of 14 on STOREV3-1's roll, 4 of 14 on KEEPROLL-1's,
+                // with all fourteen payloads byte-identical both times). What the
+                // digest is folded from is now the delta of the solved-name log
+                // across THIS request's cold compute -- the candidates this
+                // record's own resolution could have selected, plus their
+                // transitive closure, which is the set a re-solve's verdict can
+                // turn on. The pairs are already mmapped by the resolution that
+                // just finished, so this walk is still a memory walk.
                 let reachable_roots = crate::conda_solve::reachable_roots();
+                let solved_names =
+                    crate::conda_solve::solved_names_since(built_output_solved_mark);
                 let candidate_universe = crate::conda_solve::candidate_universe(
                     &params.channels,
                     cache_target.conda_subdir(),
-                    &reachable_roots,
+                    &solved_names,
                 )
                 .await
                 .unwrap_or_default();
@@ -7371,7 +7467,8 @@ impl Handler {
                     tracing::warn!(
                         key = %key,
                         roots = reachable_roots.len(),
-                        "bench: built_output_store publishing a record with NO candidate universe; every reader will fall back to whole-document containment (N27-RETREAD-204)",
+                        relevant = solved_names.len(),
+                        "bench: built_output_store publishing a record with NO candidate universe; every reader will fall back to whole-document containment (N27-RETREAD-204, narrowed by N27-RETREAD-226)",
                     );
                 }
                 match crate::built_output_store::encode(
@@ -7382,14 +7479,23 @@ impl Handler {
                     &store_key.constrains_source,
                     &reachable_roots,
                     &candidate_universe,
+                    &solved_names,
                     &result,
                     &published_advertised_identities,
                 ) {
                     Ok(bytes) => match store.publish(key, &bytes) {
+                        // STOREV3-2: the writer's half of the relevant set is
+                        // named on the row that already exists, so law 2's pair
+                        // is readable in one grep -- a fleet whose publishes read
+                        // `relevant=0` has stopped stamping and has silently
+                        // returned every reader to v2 containment.
                         Ok(true) => tracing::info!(
                             key = %key,
                             root = %store.root().display(),
                             bytes = bytes.len(),
+                            roots = reachable_roots.len(),
+                            relevant = solved_names.len(),
+                            candidate_universe = %candidate_universe,
                             "bench: built_output_store published",
                         ),
                         Ok(false) => tracing::info!(

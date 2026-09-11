@@ -1474,6 +1474,126 @@ pub async fn snapshot_documents_after_universe(
     .await
 }
 
+/// STOREV3-2 / N27-RETREAD-226. Which world a built-output consult judged
+/// against, so the `### STORE CONSULT` row says it instead of leaving an
+/// operator to infer it from two digests in different minutes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocumentWorld {
+    /// This consult took the snapshot and FROZE it for the rest of the process.
+    Snapshotted,
+    /// An earlier consult in this process froze it; this one reused those bytes
+    /// and did not read the cache root at all.
+    Frozen,
+    /// The snapshot was EMPTY, so there was no world to freeze. Nothing is
+    /// adoptable against an empty world anyway, and freezing one would make the
+    /// whole process unable to adopt after the closure has populated the root.
+    Unfrozen,
+}
+
+impl std::fmt::Display for DocumentWorld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DocumentWorld::Snapshotted => write!(f, "snapshotted"),
+            DocumentWorld::Frozen => write!(f, "frozen"),
+            DocumentWorld::Unfrozen => write!(f, "unfrozen"),
+        }
+    }
+}
+
+/// STOREV3-2 / N27-RETREAD-226. The reader's document world, frozen for the
+/// life of the process.
+///
+/// THE DEFECT THIS CLOSES, and it is measured, not argued. SUBCERT-2's
+/// candidate-free control `6220179` refused **14 of 14** live built-output
+/// records, every one of them `Refusal::Universe` from the v2 containment arm
+/// and every one naming the SAME single document. The cause is that both arms'
+/// `pixi-overlay/repodata` `readlink -f` to ONE shared path, and the files there
+/// were REPLACED at 21:03 and 21:06 — inside the control's own window. The
+/// control refreshed the shared documents at 21:03, refused all fourteen at
+/// 21:04:01 naming the document it had just replaced, then refreshed pytorch at
+/// 21:06. The fourteen were quarantined and recomputed for 34 minutes of node
+/// time, and the recompute produced byte-identical payloads at all fourteen
+/// addresses (STOREV3-1 row 3: `payload_SAME=14 payload_DIFF=0`).
+///
+/// A WORLD THE READER REWRITES WHILE COMPARING AGAINST IT IS NOT A CONTAINMENT
+/// REFERENCE AT ALL. So the reference is fixed once: the FIRST consult in the
+/// process that finds a non-empty snapshot freezes it, and every later consult
+/// judges against those exact bytes. A document replaced after the freeze is
+/// therefore NOT "absent" — the record's world is still intact in the world this
+/// run agreed to judge in, which is the only world in which the question has one
+/// answer.
+///
+/// THE FREEZE IS NOT A WEAKENING, AND THIS IS THE SOUNDNESS ARGUMENT. It never
+/// admits a record whose consulted document was absent at run entry; it only
+/// refuses to let the run's OWN later fetches invalidate a verdict it has
+/// already begun making. A world that genuinely rolled before this process
+/// started still refuses, exactly as it did — which is why KEEPROLL-1's
+/// across-runs roll is untouched by this and is the v4 arm's job, not this one's.
+///
+/// WHY EMPTY IS NOT FROZEN. ORDER-1 established that the consult runs strictly
+/// upstream of every repodata fetch, so a cold process's first snapshot is
+/// legitimately empty and the closure populates the root seconds later.
+/// Freezing an empty world would make every later consult in that process refuse
+/// on evidence it was never allowed to read — DEVPATH-2's defect, made permanent.
+static READER_DOCUMENT_WORLD: OnceLock<Vec<RepodataDocument>> = OnceLock::new();
+
+fn reader_document_world_cell() -> &'static OnceLock<Vec<RepodataDocument>> {
+    &READER_DOCUMENT_WORLD
+}
+
+/// The frozen world, if this process has one. `None` means no consult has
+/// frozen one yet and the caller must take a snapshot.
+///
+/// Checked BEFORE the snapshot at the call site, not after, because the whole
+/// point is that a frozen reader does not read the cache root again: the listing
+/// is an NFS stat-and-hash of every document in it.
+pub fn frozen_reader_documents() -> Option<Vec<RepodataDocument>> {
+    frozen_reader_documents_in(reader_document_world_cell())
+}
+
+/// [`frozen_reader_documents`] against an explicit cell, so a guard can drive
+/// the freeze without a process-global one test can move under another — the
+/// same reason `document_identity_memo_poison`'s note gives for not asserting on
+/// `HASH_CALLS`.
+pub(crate) fn frozen_reader_documents_in(
+    cell: &OnceLock<Vec<RepodataDocument>>,
+) -> Option<Vec<RepodataDocument>> {
+    cell.get().cloned()
+}
+
+/// Freeze `documents` as this process's reader world and return the world every
+/// consult from here on will judge against.
+pub fn freeze_reader_documents(
+    documents: Vec<RepodataDocument>,
+) -> (Vec<RepodataDocument>, DocumentWorld) {
+    freeze_reader_documents_in(reader_document_world_cell(), documents)
+}
+
+/// [`freeze_reader_documents`] against an explicit cell. See
+/// [`frozen_reader_documents_in`] for why the cell is a parameter.
+pub(crate) fn freeze_reader_documents_in(
+    cell: &OnceLock<Vec<RepodataDocument>>,
+    documents: Vec<RepodataDocument>,
+) -> (Vec<RepodataDocument>, DocumentWorld) {
+    if let Some(frozen) = cell.get() {
+        return (frozen.clone(), DocumentWorld::Frozen);
+    }
+    if documents.is_empty() {
+        return (documents, DocumentWorld::Unfrozen);
+    }
+    let _ = cell.set(documents);
+    // Re-read rather than returning the local: two consults racing into this
+    // function must both leave holding the WINNER's world. Returning the local
+    // would give the loser a world nobody else judges against, which is the
+    // one-run-three-universes shape this exists to end.
+    (
+        cell.get()
+            .expect("the cell is set on this path")
+            .clone(),
+        DocumentWorld::Snapshotted,
+    )
+}
+
 /// [`snapshot_documents_after_universe`] with the LOAD injected and the root
 /// explicit, so a guard can drive the ordering rule without a network.
 ///

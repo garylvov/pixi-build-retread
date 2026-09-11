@@ -153,7 +153,16 @@ fn solve_selected_records_from_records_for_target(
     };
     let mut solver = resolvo::Solver;
     match solver.solve(task) {
-        Ok(solution) => Ok(solution.records),
+        Ok(solution) => {
+            // STOREV3-2 / N27-RETREAD-226. The writer's half of the v4 adoption
+            // rule, registered HERE because this is the only place in the
+            // process that learns which candidates a verdict actually turned on.
+            // Every refinement pass and every probe solve registers too, and
+            // that is deliberate: the record's world is everything its cold
+            // compute selected, not only the last solve's answer.
+            record_solved_names(&solution.records);
+            Ok(solution.records)
+        }
         Err(rattler_solve::SolveError::Unsolvable(reasons)) => {
             Err(SharedSolveFailure::Unsolvable(reasons))
         }
@@ -887,7 +896,19 @@ async fn load_selected_records_sparse_from_pairs(
 /// (`retread-conda-universe-v2`) and not a replacement: v2 folds whole
 /// documents, v3 folds the records a resolution could reach, and the store
 /// carries both so a record written before v3 existed stays adoptable.
-pub(crate) const CANDIDATE_UNIVERSE_SCHEMA: &str = "retread-conda-universe-v3";
+///
+/// STOREV3-2 / N27-RETREAD-226 BUMPED IT TO v4, AND THE FOLD IS UNCHANGED — the
+/// ROOTS it is folded from are what moved. v3 walked
+/// [`reachable_roots`](reachable_roots), the process-wide union of every root
+/// any solve in the backend seeded from (28 to 183 names on the run STOREV3-1
+/// measured, because fourteen packs share one process), so an upload anywhere in
+/// the compiled ecosystem's closure refused a pack whose own resolution could
+/// not reach it: the escape hatch returned **0 of 14** on its first production
+/// roll and **4 of 14** on KEEPROLL-1's. v4 walks THIS record's own solved-set
+/// closure ([`solved_names_since`]). A digest folded under the two rules answers
+/// two different questions, so the tag separates them and a v3-stamped record
+/// simply falls to the v2 bridge rather than being compared against a v4.
+pub(crate) const CANDIDATE_UNIVERSE_SCHEMA: &str = "retread-conda-universe-v4";
 
 /// Every exact root name any sparse walk in this process seeded from, unioned.
 ///
@@ -938,6 +959,16 @@ fn record_reachable_roots(names: &[PackageName]) {
 /// Sorted here and not by the caller, for the same reason
 /// [`crate::repodata::universe_digest_of`] sorts its own input: two publishers
 /// of one key must not write two orderings of one set.
+///
+/// STOREV3-2 / N27-RETREAD-226: this is now AUDIT ONLY on the store's side. It
+/// is still stamped into a record and still printed as `roots=` on the
+/// `### STORE UNIVERSE` row, so an operator can see how wide the process's union
+/// grew, but NO reader walks it any more — the v4 arm walks
+/// [`solved_names_since`], which is per-record. The reason is measured, not
+/// aesthetic: this registry is process-wide and a relock answers fourteen
+/// `conda/outputs` requests in one backend process, so pack 1's roots were being
+/// stamped into pack 14's record and every pack was refused for a roll in a
+/// closure it never touched.
 pub(crate) fn reachable_roots() -> Vec<String> {
     reachable_roots_registry()
         .lock()
@@ -945,6 +976,76 @@ pub(crate) fn reachable_roots() -> Vec<String> {
         .iter()
         .cloned()
         .collect()
+}
+
+/// STOREV3-2 / N27-RETREAD-226. Every package name a resolvo solve in this
+/// process actually SELECTED, in registration order and with repeats, so a
+/// caller can take the slice belonging to ONE request.
+///
+/// WHY A VEC AND NOT A SET, which is the shape [`REACHABLE_ROOTS`] uses. A set
+/// can only answer "everything this process ever did", and that is precisely the
+/// defect: one backend process answers fourteen `conda/outputs` requests, and a
+/// record must name ITS OWN resolution's world, not the union of fourteen. An
+/// append-only log with a mark ([`solved_names_mark`]) and a delta
+/// ([`solved_names_since`]) is the cheapest thing that can be cut per request,
+/// and the cut is taken by `handler::conda_outputs` around its own cold compute.
+///
+/// FILLED AT THE ONE SOLVE SITE and nowhere else, for exactly the reason
+/// [`record_reachable_roots`]'s note gives: the store's READER re-walks a stored
+/// record's names through the sparse loader to recompute a v4 digest, and it
+/// never solves — so a reader can never widen what the next publish stamps.
+static SOLVED_NAMES: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> =
+    std::sync::OnceLock::new();
+
+fn solved_names_registry() -> &'static std::sync::Mutex<Vec<String>> {
+    SOLVED_NAMES.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Union the names of `records` into the process's solved-name log.
+fn record_solved_names(records: &[RepoDataRecord]) {
+    let mut registry = solved_names_registry().lock().unwrap();
+    for record in records {
+        registry.push(record.package_record.name.as_normalized().to_string());
+    }
+}
+
+/// Where the solved-name log stands right now. Take this BEFORE a cold compute;
+/// pass it to [`solved_names_since`] after.
+pub(crate) fn solved_names_mark() -> usize {
+    solved_names_registry().lock().unwrap().len()
+}
+
+/// The names selected since `mark`, sorted and deduped.
+///
+/// Sorted and deduped here and not by the caller, for the same reason
+/// [`reachable_roots`] is: two publishers of one key must not write two
+/// orderings of one set.
+///
+/// WHAT THIS IS EXACT ABOUT AND WHAT IT IS NOT, said here rather than in a
+/// commit message. The cut is exact when the backend answers one
+/// `conda/outputs` at a time, which is what it does today (fourteen sequential
+/// `bench: conda_outputs` rows per relock). If two requests ever overlap, the
+/// two deltas OVERLAP — each gets a superset of its own names — which is the
+/// v3 behaviour it replaces, only narrower. It can never be a SUBSET of the
+/// request's own solve, and a subset is the only direction that could admit a
+/// record whose world moved.
+pub(crate) fn solved_names_since(mark: usize) -> Vec<String> {
+    cut_solved_names(&solved_names_registry().lock().unwrap(), mark)
+}
+
+/// The CUT ITSELF, with no process-global anywhere near it.
+///
+/// Split out for the reason `document_identity_uncached`'s note gives for the
+/// same split one module over: `cargo test` runs this suite in ONE process, and
+/// every other test in it that runs a real solve appends to the live log. A
+/// guard that asserted on the live registry would go intermittently RED because
+/// of a solve it is not testing — so the RULE lives here, where a guard can hand
+/// it a literal log, and the registry is just where production keeps one.
+fn cut_solved_names(log: &[String], mark: usize) -> Vec<String> {
+    let mut names: Vec<String> = log.get(mark..).unwrap_or_default().to_vec();
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// Fold a CANDIDATE SET into one digest: every field of every reachable record
@@ -2538,5 +2639,57 @@ mod tests {
             warm_err.is_err(),
             "warm-start must not rescue a genuinely-UNSAT solve"
         );
+    }
+}
+
+
+#[cfg(test)]
+mod storev3_2_tests {
+    /// STOREV3-2 / N27-RETREAD-226 -- THE SOLVED-NAME LOG IS CUT PER REQUEST,
+    /// NOT UNIONED PER PROCESS.
+    ///
+    /// THE DEFECT THIS ASSERTS AGAINST. `reachable_roots` is a `BTreeSet` that
+    /// only ever grows, and one backend process answers FOURTEEN `conda/outputs`
+    /// requests -- so by the last pack the registry held 28 to 183 root names and
+    /// the v3 digest folded the closure of all of them. Pack 1's roots were
+    /// reaching pack 14's record, and every pack was refused for a roll it could
+    /// not touch: v3 rescued 0 of 14 on STOREV3-1's roll and 4 of 14 on
+    /// KEEPROLL-1's, with all fourteen payloads byte-identical both times.
+    ///
+    /// THE ASSERTION IS ON THE PURE RULE and not on the live registry, for the
+    /// reason [`super::cut_solved_names`]'s note gives: every other test in this
+    /// process that runs a real solve appends to the live log, so a guard reading
+    /// it could only be flaky.
+    ///
+    /// NON-VACUITY: the FIRST request's name is asserted ABSENT from the second
+    /// request's cut. A rule that returned the whole log would pass a test that
+    /// only checked the second request's own names are present.
+    #[test]
+    fn s2_the_solved_name_log_is_cut_per_request() {
+        let log: Vec<String> = ["pack-one-only", "libshared", "pack-two-only", "libshared"]
+            .iter()
+            .map(|n| n.to_string())
+            .collect();
+        // Request two began after the first two names were appended.
+        let mark = 2;
+        assert_eq!(
+            super::cut_solved_names(&log, mark),
+            vec!["libshared".to_string(), "pack-two-only".to_string()],
+            "the cut must be THIS request's names, sorted and deduped"
+        );
+        assert!(
+            !super::cut_solved_names(&log, mark)
+                .iter()
+                .any(|name| name == "pack-one-only"),
+            "a name only an EARLIER request selected must not reach this record's \
+             relevant set -- that is the 28-to-183-root defect"
+        );
+        // Nothing is lost: the whole log is still readable at mark 0, which is
+        // what `reachable_roots`' audit-only counterpart reports.
+        assert_eq!(super::cut_solved_names(&log, 0).len(), 3);
+        // A mark past the end is an empty cut, never a panic: a request whose
+        // cold compute solved nothing publishes no relevant set and its readers
+        // fall to the v2 bridge.
+        assert!(super::cut_solved_names(&log, 99).is_empty());
     }
 }
