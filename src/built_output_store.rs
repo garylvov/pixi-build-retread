@@ -434,6 +434,22 @@ pub struct Record {
     pub solved_names: Vec<String>,
 }
 
+/// STOREV3-2 / N27-RETREAD-226. Which names a reader re-walks to recompute a
+/// record's candidate digest.
+///
+/// ONE PRODUCER OF THE NARROWING, and that is the whole reason this is a function
+/// and not two occurrences of a field access. The rule is "the record's OWN
+/// relevant set, never the process-wide union it also stamps", and it has to hold
+/// in the production consult (`handler::conda_outputs`) and in the guard that
+/// asserts the falsifier. Two field accesses are two places a narrowing can be
+/// removed from, and one of them would be the place the guard does not look --
+/// which is how a guard that cannot fail gets written. Mutating this one line
+/// back to `reachable_roots` turns `s2_b_...` red, which is the only evidence
+/// that guard is testing the narrowing at all.
+pub fn relevant_set(record: &Record) -> &[String] {
+    &record.solved_names
+}
+
 /// Which of the two universe rules admitted a record.
 ///
 /// The variant is printed, not just logged: an operator reading
@@ -2358,7 +2374,11 @@ mod tests {
         );
 
         // THE FALSIFIER: the relevant set is untouched, so the record adopts.
-        let reader_relevant = u1_digest_over(&req_sparse, RELEVANT);
+        // THROUGH THE PRODUCTION NARROWING, not through the literal: a guard that
+        // re-states the rule it is testing cannot catch the rule being removed.
+        let relevant: Vec<&str> =
+            relevant_set(&record).iter().map(String::as_str).collect();
+        let reader_relevant = u1_digest_over(&req_sparse, &relevant);
         assert_eq!(
             reader_relevant, record.candidate_universe,
             "a package the record's resolution never selected cannot move its \
@@ -2399,7 +2419,11 @@ mod tests {
             &u1_digest_over(&pub_sparse, RELEVANT),
         );
         let record = parse(&bytes, "digest-u1").unwrap();
-        let reader_relevant = u1_digest_over(&req_sparse, RELEVANT);
+        // THROUGH THE PRODUCTION NARROWING, not through the literal: a guard that
+        // re-states the rule it is testing cannot catch the rule being removed.
+        let relevant: Vec<&str> =
+            relevant_set(&record).iter().map(String::as_str).collect();
+        let reader_relevant = u1_digest_over(&req_sparse, &relevant);
         assert_ne!(
             reader_relevant, record.candidate_universe,
             "a replaced artifact INSIDE the relevant set must move its digest, \
@@ -2485,6 +2509,16 @@ mod tests {
     /// It reads only; it publishes nothing, writes nothing under either root, and
     /// never touches the shared store.
     ///
+    /// ITS ROWS GO TO STDERR, and that is not a style choice either. The
+    /// alternative -- stdout -- puts this file on
+    /// `rpc::tests::no_println_reaches_the_json_rpc_channel`'s allow-list, and
+    /// that list is per-FILE: one entry here would license a `println!` anywhere
+    /// in this module, including in the production consult path, for the sake of
+    /// a hand-driven test. The guard measured this lane doing it (gate 6226860,
+    /// `Unclassified: ["built_output_store.rs (8)"]`) and the right answer was to
+    /// stop writing to stdout, not to widen the guard. Run it with `2>&1` into a
+    /// log, which is what the gate does.
+    ///
     /// HONEST LIMIT, STATED IN THE TEST AND NOT ONLY IN A ROW. The "world at
     /// entry" is reconstructed as the union of root A's records' own
     /// `consulted_repodata`, because the repodata documents of that generation NO
@@ -2551,12 +2585,12 @@ mod tests {
 
         let a = records(&root_a);
         let b = records(&root_b);
-        println!("### S2 FIXTURE addresses_a={} addresses_b={}", a.len(), b.len());
+        eprintln!("### S2 FIXTURE addresses_a={} addresses_b={}", a.len(), b.len());
         assert!(!a.is_empty(), "root A holds no complete entry");
 
         let entry_world = world(&a);
         let replaced_world = world(&b);
-        println!(
+        eprintln!(
             "### S2 FIXTURE documents_entry={} documents_replaced={} universe_entry={} universe_replaced={}",
             entry_world.len(),
             replaced_world.len(),
@@ -2571,7 +2605,7 @@ mod tests {
         );
         for document in &entry_world {
             if !replaced_world.contains(document) {
-                println!(
+                eprintln!(
                     "### S2 FIXTURE MOVED document={}",
                     document_label(document)
                 );
@@ -2584,9 +2618,9 @@ mod tests {
             match universe_verdict(record, &replaced_world, None) {
                 Ok(matched) => {
                     unfrozen_hits += 1;
-                    println!("### S2 FIXTURE UNFROZEN {address} HIT match={matched}");
+                    eprintln!("### S2 FIXTURE UNFROZEN {address} HIT match={matched}");
                 }
-                Err(why) => println!("### S2 FIXTURE UNFROZEN {address} REFUSED {why}"),
+                Err(why) => eprintln!("### S2 FIXTURE UNFROZEN {address} REFUSED {why}"),
             }
         }
 
@@ -2608,13 +2642,13 @@ mod tests {
             match universe_verdict(record, &frozen, None) {
                 Ok(matched) => {
                     frozen_hits += 1;
-                    println!("### S2 FIXTURE FROZEN {address} HIT match={matched}");
+                    eprintln!("### S2 FIXTURE FROZEN {address} HIT match={matched}");
                 }
-                Err(why) => println!("### S2 FIXTURE FROZEN {address} REFUSED {why}"),
+                Err(why) => eprintln!("### S2 FIXTURE FROZEN {address} REFUSED {why}"),
             }
         }
 
-        println!(
+        eprintln!(
             "### S2 FIXTURE RESULT addresses={} unfrozen_hits={} frozen_hits={}",
             a.len(),
             unfrozen_hits,

@@ -6125,7 +6125,7 @@ impl Handler {
             if let Some(bytes) = payload.as_deref() {
                 match crate::built_output_store::parse(bytes, &store_key.inputs_digest) {
                     Ok(record) => {
-                        record_relevant_set_size = record.solved_names.len();
+                        record_relevant_set_size = crate::built_output_store::relevant_set(&record).len();
                         let mut verdict = crate::built_output_store::universe_verdict(
                             &record,
                             &reader_documents,
@@ -6142,12 +6142,12 @@ impl Handler {
                         // the cost of a sparse closure per record.
                         if verdict.is_err()
                             && !record.candidate_universe.is_empty()
-                            && !record.solved_names.is_empty()
+                            && !crate::built_output_store::relevant_set(&record).is_empty()
                         {
                             reader_candidate_universe = crate::conda_solve::candidate_universe(
                                 &params.channels,
                                 cache_target.conda_subdir(),
-                                &record.solved_names,
+                                crate::built_output_store::relevant_set(&record),
                             )
                             .await;
                             verdict = crate::built_output_store::universe_verdict(
@@ -6186,7 +6186,7 @@ impl Handler {
                                 record.repodata_universe.as_str()
                             },
                             record.reachable_roots.len(),
-                            record.solved_names.len(),
+                            crate::built_output_store::relevant_set(&record).len(),
                             reader_documents.len(),
                             match &verdict {
                                 Ok(matched) => matched.to_string(),
