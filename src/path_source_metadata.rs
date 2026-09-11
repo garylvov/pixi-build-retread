@@ -554,7 +554,20 @@ pub fn load_records(pack_dir: &Path, records_dir: &str) -> Result<Vec<PathSource
 /// Serialize a record back to its file's text. Round-trips
 /// [`PathSourceEntry`] exactly, so `refresh --write` produces a diff of only
 /// the fields that moved.
-pub fn render_record(project: &str, entry: &PathSourceEntry) -> String {
+///
+/// METAGEN-3. `requires_dist` is [`TreeFacts::requires_dist`] for the same tree
+/// -- how many `Requires-Dist` headers its own `*.egg-info/PKG-INFO` states --
+/// and it is a PARAMETER rather than a thing this function infers, because it is
+/// the fact the generated prose used to get wrong. The boilerplate said the tree
+/// states its dependencies "NOWHERE a reader can see -- no [project] table, no
+/// *.egg-info/PKG-INFO", and MERGE-B45's R2 measured that as FALSE for the one
+/// tree it fires on: ProtoMotions DOES carry a PKG-INFO, and its
+/// `grep -c '^Requires-Dist'` is 0. The code was right and the prose was stale,
+/// which is the worst shape a comment can be in -- it is the only statement a
+/// human reads before editing the record. So the prose now states exactly what
+/// `### PATH SOURCE FACTS` states for the same source, and takes the number from
+/// the same field that row prints.
+pub fn render_record(project: &str, entry: &PathSourceEntry, requires_dist: usize) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "# Path-source metadata record for `{project}`.\n\
@@ -584,10 +597,23 @@ pub fn render_record(project: &str, entry: &PathSourceEntry) -> String {
     }
     if let Some(hash) = entry.source_hash.as_deref() {
         out.push_str(&format!(
-            "\n# METAGEN-1. `dependencies` above was DERIVED by an isolated PEP 517\n\
-             # metadata build of the tree at `path`, because that tree states them\n\
-             # NOWHERE a reader can see -- no [project] table, no *.egg-info/PKG-INFO.\n\
-             # This is the bounded content hash of that tree at the moment of the\n\
+            "\n# METAGEN-1 / METAGEN-3. `dependencies` above was DERIVED by an isolated\n\
+             # PEP 517 metadata build of the tree at `path`. These are the two facts\n\
+             # that decided it, and they are the same two `### PATH SOURCE FACTS`\n\
+             # prints for this source on every run:\n\
+             #\n\
+             #   deps=derived   requires_dist={requires_dist}\n\
+             #\n\
+             # `requires_dist` is how many `Requires-Dist` headers the tree's own\n\
+             # *.egg-info/PKG-INFO states. ZERO DOES NOT MEAN THE TREE HAS NO\n\
+             # EGG-INFO, and this line replaces boilerplate that said it did (\"no\n\
+             # [project] table, no *.egg-info/PKG-INFO\"), which MERGE-B45's R2\n\
+             # measured as false for the one tree this fires on: ProtoMotions carries\n\
+             # a PKG-INFO whose `grep -c '^Requires-Dist'` is 0. An empty list in core\n\
+             # metadata is not a statement of \"no dependencies\" -- it is the ABSENCE\n\
+             # of a statement, which is why the build ran.\n\
+             #\n\
+             # Below is the bounded content hash of that tree at the moment of the\n\
              # build; if the tree's hash today differs, this record is STALE and the\n\
              # next run rederives it. Editing the tree's setup.py, pyproject.toml,\n\
              # setup.cfg, MANIFEST.in or anything under config/ moves it.\n\
@@ -2011,7 +2037,7 @@ pub fn derive_records(
             .find(|(target, _)| target == &file)
         {
             entry.source_hash = Some(hash.clone());
-            let text = render_record(&project, &entry);
+            let text = render_record(&project, &entry, facts.requires_dist);
             // The containment check runs on the DIRECTORY first, so a records
             // directory outside the pack is refused before it is created.
             let Some(parent) = file.parent() else {
@@ -2465,7 +2491,7 @@ mod tests {
         let dir = root.join(PACK_REL).join(RECORDS_DIR_DEFAULT);
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join(format!("{project}.toml"));
-        std::fs::write(&file, render_record(project, entry)).unwrap();
+        std::fs::write(&file, render_record(project, entry, 0)).unwrap();
         file
     }
 
@@ -2622,7 +2648,7 @@ mod tests {
         std::fs::create_dir_all(fake.join(RECORDS_DIR_DEFAULT)).unwrap();
         std::fs::write(
             fake.join(RECORDS_DIR_DEFAULT).join("pace-sim2real.toml"),
-            render_record("pace-sim2real", &pace_entry()),
+            render_record("pace-sim2real", &pace_entry(), 0),
         )
         .unwrap();
         let error = generate_shims(&fake, &root, RECORDS_DIR_DEFAULT, None)
@@ -2735,7 +2761,7 @@ mod tests {
             "refresh must never move the path; the tree does not state it"
         );
 
-        std::fs::write(&record_file, render_record("pace-sim2real", &refreshed)).unwrap();
+        std::fs::write(&record_file, render_record("pace-sim2real", &refreshed, 0)).unwrap();
         let outcomes = materialize_declared_path_sources(
             &config(Some(true)),
             Some(&root),
@@ -3252,7 +3278,7 @@ mod effective_manifest_tests {
         std::fs::create_dir_all(dir.join(RECORDS_DIR_DEFAULT)).unwrap();
         std::fs::write(
             dir.join(RECORDS_DIR_DEFAULT).join(format!("{project}.toml")),
-            render_record(project, entry),
+            render_record(project, entry, 0),
         )
         .unwrap();
         dir
@@ -3613,7 +3639,7 @@ mod effective_manifest_tests {
             root.join(PM_PACK)
                 .join(RECORDS_DIR_DEFAULT)
                 .join("protomotions.toml"),
-            render_record("protomotions", &lying),
+            render_record("protomotions", &lying, 0),
         )
         .unwrap();
         let error = plan_effective_manifest(&packs, &root, RECORDS_DIR_DEFAULT, CANONICAL, None, true)
@@ -4787,5 +4813,73 @@ body
         assert_eq!(candidates[dem::INTERPRETER_NAMES.len() - 1], PathBuf::from("/a/python"));
         assert_eq!(candidates[dem::INTERPRETER_NAMES.len()], PathBuf::from("/b/python3.13"));
         assert!(dem::path_interpreter_candidates(None).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod metagen3_tests {
+    use super::{PathSourceEntry, render_record};
+
+    /// METAGEN-3 -- THE GENERATED RECORD'S PROSE STATES THE FACTS, NOT A CLAIM
+    /// ABOUT THE TREE THAT IS FALSE OF THE ONE TREE IT FIRES ON.
+    ///
+    /// THE DEFECT, MEASURED BY MERGE-B45's R2 (its row4, finding 2). The
+    /// boilerplate `render_record` writes above `source-hash` said the tree
+    /// states its dependencies "NOWHERE a reader can see -- no [project] table,
+    /// no *.egg-info/PKG-INFO". The ProtoMotions tree DOES carry a PKG-INFO; its
+    /// `grep -c '^Requires-Dist'` is 0, and that zero is the entire subject of
+    /// N27-RETREAD-223. The code was right and the prose was stale, in the one
+    /// place a human reads before editing the record -- so the prose now states
+    /// what `### PATH SOURCE FACTS` states for the same source, from the same
+    /// field that row prints.
+    ///
+    /// NON-VACUITY: the old sentence is asserted ABSENT, and the number is
+    /// asserted to TRACK its argument (0 and 7 render differently). A test that
+    /// only looked for the new text would pass with the false claim still beside
+    /// it.
+    #[test]
+    fn m3_the_generated_prose_states_requires_dist_and_not_a_false_absence() {
+        let derived = PathSourceEntry {
+            path: "third_party/ProtoMotions".to_string(),
+            version: "0.1.0".to_string(),
+            requires_python: Some(">=3.10".to_string()),
+            dependencies: vec!["numpy".to_string()],
+            packages_include: Vec::new(),
+            source_hash: Some("daf492a37fdb0293c5d793250283f30d".to_string()),
+        };
+        let text = render_record("protomotions", &derived, 0);
+        assert!(
+            text.contains("requires_dist=0"),
+            "the prose must state the fact `### PATH SOURCE FACTS` states: {text}"
+        );
+        assert!(
+            text.contains("deps=derived"),
+            "and which producer supplied the dependencies: {text}"
+        );
+        assert!(
+            !text.contains("no [project] table, no *.egg-info/PKG-INFO"),
+            "the false absence claim must be gone -- ProtoMotions carries a \
+             PKG-INFO with zero Requires-Dist (MERGE-B45 R2 finding 2): {text}"
+        );
+        assert!(
+            text.contains("ZERO DOES NOT MEAN THE TREE HAS NO"),
+            "and the prose must say what a zero does and does not mean: {text}"
+        );
+
+        // The number is a fact about THIS tree and must move with it.
+        let seven = render_record("protomotions", &derived, 7);
+        assert!(seven.contains("requires_dist=7"), "{seven}");
+        assert!(!seven.contains("requires_dist=0"), "{seven}");
+
+        // And a record with no `source-hash` is not a derivation, so it carries
+        // none of this block at all -- the prose must not appear on a
+        // hand-written record and claim a build that never ran.
+        let hand_written = PathSourceEntry {
+            source_hash: None,
+            ..derived.clone()
+        };
+        let plain = render_record("protomotions", &hand_written, 0);
+        assert!(!plain.contains("deps=derived"), "{plain}");
+        assert!(!plain.contains("requires_dist="), "{plain}");
     }
 }

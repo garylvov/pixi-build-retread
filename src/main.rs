@@ -457,8 +457,8 @@ fn run_path_source_refresh(args: &[String]) -> anyhow::Result<()> {
                 drifted += 1;
                 println!("path-source-refresh: DRIFT {}\n  {error:#}", record.project);
                 let refreshed = psm::record_from_tree(&record.project, &record.entry, &facts)?;
-                let before = psm::render_record(&record.project, &record.entry);
-                let after = psm::render_record(&record.project, &refreshed);
+                let before = psm::render_record(&record.project, &record.entry, facts.requires_dist);
+                let after = psm::render_record(&record.project, &refreshed, facts.requires_dist);
                 for (b, a) in before.lines().zip(after.lines()) {
                     if b != a {
                         println!("  - {b}");
